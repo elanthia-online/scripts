@@ -1,0 +1,253 @@
+#!/usr/bin/env ruby
+require "ostruct"
+require "openssl"
+require "digest/md5"
+require "socket"
+require "tempfile"
+require "zlib"
+##
+## minimal options parser
+##
+module Opts
+  FLAG_PREFIX    = "--"
+  
+  def self.parse_command(h, c)
+    h[c.to_sym] = true
+  end
+
+  def self.parse_flag(h, f)
+    (name, val) = f[2..-1].split("=")
+    if val.nil?
+      h[name.to_sym] = true
+    else
+      val = val.split(",")
+
+      h[name.to_sym] = val.size == 1 ? val.first : val
+    end
+  end
+
+  def self.parse(args = ARGV)    
+    config = OpenStruct.new  
+
+    if args.size > 0
+      config = OpenStruct.new(**args.reduce(Hash.new) do |h, v|
+        if v.start_with?(FLAG_PREFIX)
+          parse_flag(h, v)
+        else
+          parse_command(h, v)
+        end
+        h
+      end)
+    end
+    
+    config
+  end
+
+  @@cached = nil
+  def self.cached
+    @@cached ||= self.parse
+  end
+
+  def self.method_missing(method, *args)
+    cached.send(method, *args)
+  end
+end
+
+module Repo
+	VERSION  = "2.32"
+	HOST     = "repo.lichproject.org"
+	PORT     = 7157
+	CERT     = OpenSSL::X509::Certificate.new("-----BEGIN CERTIFICATE-----\nMIIDlTCCAn2gAwIBAgIJAKuu65i5NsruMA0GCSqGSIb3DQEBCwUAMGExCzAJBgNV\nBAYTAlVTMREwDwYDVQQIDAhJbGxpbm9pczESMBAGA1UECgwJTWF0dCBMb3dlMQ8w\nDQYDVQQDDAZSb290Q0ExGjAYBgkqhkiG9w0BCQEWC21hdHRAaW80LnVzMB4XDTE0\nMDYwNzE3NDUwMFoXDTI0MDYwNDE3NDUwMFowYTELMAkGA1UEBhMCVVMxETAPBgNV\nBAgMCElsbGlub2lzMRIwEAYDVQQKDAlNYXR0IExvd2UxDzANBgNVBAMMBlJvb3RD\nQTEaMBgGCSqGSIb3DQEJARYLbWF0dEBpbzQudXMwggEiMA0GCSqGSIb3DQEBAQUA\nA4IBDwAwggEKAoIBAQCcIRn0IMCNYeL5agKmkdedgJXsIyTJS8qKrY6EvQsq4tt0\nmO3Or9K8IaDl7qFdQ9nfSJ5phNgoCy9wZ9rDWv5FhY5MnnVHGr3fCa7RkMxJFR/N\nwiD4ihQlixOUly76glceyc/6QQS9bNe96evZDstERGAFfzgHY4qAlyurR6mBu9Mb\nyyCRok6xMRnjrbTMNkvvOsuG0sY9ot+SLHGgU3qT7+wVh/CbWcjeF7/Qwa//fbFk\nmq5c1FuvhU3DanSSz+VuWudPFSyZ3r5pYrLMJWsyomDa4gkL2bJ5jya2BWDMXvSS\nCpdQgPDIlClMfAFLd/Ss8ZIGa6uNFcSK6Xca51ClAgMBAAGjUDBOMB0GA1UdDgQW\nBBScbglRiGzz9yzuhgBwFYjgimeByDAfBgNVHSMEGDAWgBScbglRiGzz9yzuhgBw\nFYjgimeByDAMBgNVHRMEBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQA7MLZYfqam\n5aaSBqQpT6sOGDtVc9koIok59oTQmNXqe+awg2VUnAiesxtLd+FWGUMp8XzHdGWw\nH3O6kAUkPm/in001X7TRAhbgDujfTRbTzxND0XrjuEzDMALs3YpDM1pMXqC7RXWA\n7z+N0gRaUgmh1rMbk/qA3cAfC2dwf2j3NYy3bDw3lMpdyIwAfOQxiZVglYgX3dgT\nU9b//gsUyPCvlpL0mYcmhOOLt6oqQhMJaw1I6A9xMe2kO2L+8KPGK2u1B+P5/Sx0\nFE8LIp5KA3a7yRbOty19NsGR+yW7WwV7BL6c6GOKb/iKJBLYzTmNG6m16hRrxDGj\ntGu91I0ORptB\n-----END CERTIFICATE-----")
+	AUTHOR   = ENV.fetch("AUTHOR")
+	PASSWORD = ENV.fetch("PASSWORD")
+	GAME     = "GS"
+
+	def self.localized(file)
+		abs_file = File.join(
+			Dir.pwd,
+			file,
+		)
+
+		unless File.exist?(file)
+			raise Exception.new %{
+				could not find #{file} from #{Dir.pwd}
+			}
+		end
+
+		[File.basename(file), abs_file]
+	end
+
+	def self.tags(comments)
+		tags = nil
+		for line in comments
+			if line =~ /^[\s\t#]*tags:[\s\t]*([\w,\s\.\d]+)/i
+				tags = $1.strip
+				break
+			end
+		end
+		tags
+	end
+
+	def self.header(file, size, md5sum, tags)
+		{ 
+			"action" => "upload", 
+			"client" => VERSION,
+			"game" => GAME, 
+			"author" => AUTHOR, 
+			"password" => PASSWORD, 
+			"file" => file,
+			"size" => size,
+			"md5sum" => md5sum, 
+			"tags" => tags,
+		}
+	end
+
+	def self.comments(file)
+		fd = File.open(file, "rb")
+		contents = fd.read
+		if contents =~ /^=begin\r?\n?(.+?)^=end/m
+			return $1.split("\n")
+		else
+			comments = Array.new
+			contents.to_s.split("\n").each do |line| 
+				if line =~ /^[\t\s]*#/ 
+					comments.push(line)
+				elsif line !~ /^[\t\s]*$/
+					break
+				end 
+			end
+			return comments
+		end
+		return []
+	end
+
+	def self.dial
+		begin
+			if CERT.not_before > Time.now
+				respond "\n---\n--- warning: The current date is set incorrectly on your computer. This will\n---          cause the SSL certificate verification to fail and prevent this\n---          script from connecting to the server.  Fix it.\n---\n\n"
+				sleep 3
+			end
+			if CERT.not_after < Time.now
+				respond "\n---\n--- warning: Your computer thinks the date is #{Time.now.strftime("%m-%d-%Y")}.  If this is the\n---          correct date, you need an updated version of this script.  If \n---          this is not the correct date, you need to change it.  In either\n---          case, this date makes the SSL certificate in this script invalid\n---          and will prevent the script from connecting to the server.\n---\n\n"
+				sleep 3
+			end
+			cert_store              = OpenSSL::X509::Store.new
+			cert_store.add_cert(CERT)
+			ssl_context             = OpenSSL::SSL::SSLContext.new
+			ssl_context.options     = (OpenSSL::SSL::OP_NO_SSLv2 + OpenSSL::SSL::OP_NO_SSLv3)
+			ssl_context.cert_store  = cert_store
+			if OpenSSL::SSL::VERIFY_PEER == OpenSSL::SSL::VERIFY_NONE
+				# the plat_updater script redefines OpenSSL::SSL::VERIFY_PEER, disabling it for everyone
+				ssl_context.verify_mode = 1 # probably right
+			else
+				ssl_context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+			end
+			socket                  = TCPSocket.new(HOST, PORT)
+			ssl_socket              = OpenSSL::SSL::SSLSocket.new(socket, ssl_context)
+			ssl_socket.connect
+			if (ssl_socket.peer_cert.subject.to_a.find { |n| n[0] == "CN" }[1] != "lichproject.org") and (ssl_socket.peer_cert.subject.to_a.find { |n| n[0] == "CN" }[1] != "Lich Repository")
+				if cmd_force
+					puts "warning: server certificate hostname mismatch"
+				else
+					puts "error: server certificate hostname mismatch"
+					ssl_socket.close rescue nil
+					socket.close rescue nil
+					exit
+				end
+			end
+			def ssl_socket.geth
+				hash = Hash.new
+				gets.scan(/[^\t]+\t[^\t]+(?:\t|\n)/).each { |s| s = s.chomp.split("\t"); hash[s[0].downcase] = s[1] }
+				return hash
+			end
+			def ssl_socket.puth(h)
+				puts h.to_a.flatten.join("\t")
+			end
+		rescue
+			puts "error connecting to server: #{$!}"
+			ssl_socket.close rescue nil
+			socket.close rescue nil
+			exit
+		end
+		[ ssl_socket, socket ]
+	end
+
+	def self.sync(files)
+		## cast to Array from single file
+		files = [files] if files.is_a?(String)
+		
+		files.map do |file| 
+			Repo.localized(file) 
+		end.each do |file_data| 
+			Repo.upload *file_data 
+		end
+	end
+
+	def self.upload(file, abs_file)
+		md5sum   = Digest::MD5.file(abs_file).to_s
+		size     = File.stat(abs_file).size
+		comments = Repo.comments(abs_file)
+		tags     = Repo.tags(comments)
+		req      = Repo.header(file, size, md5sum, tags)
+		if size > 5000
+			tempfilename = Tempfile.new(file)
+			File.open(abs_file, "rb") do |f|
+				Zlib::GzipWriter.open(tempfilename) do |f_gz|
+					while data = f.read(1_000_000)
+						f_gz.write(data) 
+					end
+					data = nil
+				end
+			end
+			filename = tempfilename
+			size = File.stat(filename).size
+			req["size"] = size
+			req["compression"] = "gzip"
+		end
+		begin
+			ssl_socket, socket = Repo.dial
+			ssl_socket.puth(req)
+			response = ssl_socket.geth
+			##
+			## the rest of this is just taken from repository.lic
+			##
+			if response["warning"]
+				puts "warning: server says: #{response["warning"]}"
+			end
+			if response["error"]
+				raise Exception.new response["error"]
+			elsif not response["continue"]
+				raise Exception.new %{ 
+					unrecognized response : #{response.inspect}"
+				}
+			end
+			
+			File.open(filename, "rb") do |f|
+				(size / 1_000_000).times { ssl_socket.write(f.read(1_000_000)) }
+				ssl_socket.write(f.read(size % 1_000_000)) unless (size % 1_000_000) == 0
+			end
+			response = ssl_socket.geth
+			if response["warning"]
+				puts "warning: server says: #{response["warning"]}"
+			end
+			if response["error"]
+				puts "error: server says: #{response["error"]}"
+			elsif response["success"]
+				puts "upload complete"
+			else
+				puts "error: unrecognized response from server: #{response.inspect}"
+			end
+		ensure
+			ssl_socket.close rescue nil
+			socket.close rescue nil
+		end
+	end
+end
+
+unless Opts.files && (Opts.files.is_a?(String) || Opts.files.is_a?(Array))
+	raise Exception.new %{
+		missing required argument --files=<file1, file2,...fileN>
+	}
+end
+
+Repo.sync(Opts.files)
