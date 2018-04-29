@@ -30,7 +30,7 @@
     # because it is in a different thread
     Notify::Sounds.set "zelda/email"
   
-    Notify.notify("Ondreian", from: "taters", body: "i'm important", type: Script.current.name)
+    Notify.notify(to: "Ondreian", from: "taters", body: "i'm important", type: Script.current.name)
 
   notes:
     * to be able to use Notify from another script it must be ;trusted
@@ -220,10 +220,10 @@ module Notify
     end
   
     def read(key)
+      prune
       if value = @data[key]
         touch(key)
         age_keys
-        prune
       end
       value
     end
@@ -327,7 +327,20 @@ module Notify
     def consume()
       @consumer = Thread.new do 
         loop do 
-          handle_message(*@inbox.shift) until @inbox.empty?
+          until @inbox.empty?
+            begin
+              packet, client = @inbox.shift
+              kind, message = packet
+              case kind.to_sym
+              when :ping
+                pong(client)
+              else
+                schedule_notification(kind, message)
+              end
+            rescue => exception
+              Log.out(exception, label: :error)
+            end
+          end
           sleep 0.1
         end
       end
@@ -341,7 +354,7 @@ module Notify
             while message = client.gets
               begin
                 Log.out(message, label: :server_incoming)
-                @inbox << JSON.parse(message)
+                @inbox << [JSON.parse(message), client]
                 sleep 0.1
               rescue => exception
                 Log.out(exception, label: :error)
@@ -353,11 +366,11 @@ module Notify
       end
     end
 
-    def handle_message(char, message)
+    def schedule_notification(char, message)
       begin
         message = Notify.fmt_message(char, message)
         if Notify.should_notify_about?(message)
-          Notify.notify(char, message)
+          Notify.notify(message)
           COOLDOWN.put(message.from, 1)
         else
           Log.out("skipping from #{message.from}", label: :server)
@@ -366,14 +379,46 @@ module Notify
         Log.out(exception, label: :error)
       end
     end
+
+    def pong(client)
+      client << ["pong", 1].to_json + "\n"
+    end
   end
 
   class Sink
-    @@socket = nil
+    @@socket    = nil
+    @@reader    = nil
+    @@ping      = nil
+    @@keepalive = Time.now
 
     def self.link()
       @@socket = TCPSocket.open(Server::HOST, Server::PORT)
+      @@reader = Sink.read()
+      @@ping   = Sink.ping()
       self
+    end
+
+    def self.read()
+      Thread.new do 
+        while from_server = @@socket.gets
+          begin
+            Log.out(JSON.parse(from_server))
+            Sink.consume *JSON.parse(from_server)
+          rescue => exception
+            Log.out(exception, label: :error)
+          end
+          break if Sink.closed?
+        end
+      end
+    end
+
+    def self.consume(kind, message)
+      case kind.to_sym
+      when :pong
+        @@keepalive = Time.now
+      else
+        Log.out(message, label: kind.to_sym)
+      end
     end
 
     def self.close()
@@ -384,8 +429,25 @@ module Notify
     
     def self.cast(message)
       return if @@socket.nil? or @@socket.closed?
-      @@socket << [Char.name, message].to_json + "\n"
+      begin
+        @@socket << [Char.name, message].to_json + "\n"  
+      rescue => exception
+        # reconnect
+      end
       self
+    end
+
+    def self.ping()
+      Thread.new do 
+        loop do
+          @@socket << ["ping"].to_json + "\n"
+          sleep(5)
+        end
+      end
+    end
+
+    def self.closed?
+      @@keepalive < Time.now - 11 || @@socket.closed?
     end
   end
 
@@ -426,9 +488,9 @@ module Notify
   ## system messages on Linux are of a fixed interval
   ## you cannot easily configure this
   ## 
-  def self.show(char, message)
+  def self.show(message)
     message = message.to_struct if message.is_a?(Hash)
-    title = [message.from, char].join(" => ")
+    title = [message.from, message.to || Char.name].join(" => ")
     if OS.linux?
       %x{#{NOTIFY} "#{title} [#{message.type}]" "#{message.body}" --icon=#{ICON} --app-name=#{APP_NAME}}
     elsif OS.mac?
@@ -438,9 +500,9 @@ module Notify
     end
   end
 
-  def self.notify(char, incoming)
+  def self.notify(incoming)
     incoming = incoming.to_struct if incoming.is_a?(Hash)
-    Notify.show(char, incoming)
+    Notify.show(incoming)
     Sounds.play Sounds.current
   end
 
@@ -483,6 +545,10 @@ module Notify
 
     while line = get
       if line =~ MESSAGE_PATTERN
+        if Sink.closed?
+          Log.out("restarting tcp sink service", label: :sink)
+          Notify::Server.link()
+        end
         Sink.cast(line)
       end
     end
@@ -555,7 +621,8 @@ module Notify
     else incoming = line.match(IC_WHISPER).to_struct
       incoming[:type] = "whisper:ic"
     end
-    
+
+    incoming[:to] = char
     return incoming
   end
 
