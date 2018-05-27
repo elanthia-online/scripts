@@ -16,6 +16,12 @@ module Migration
     File.join(Dir.pwd, *parts)
   end
 
+  def self.log(msg, label: %i[])
+    label = [label] unless label.is_a?(Array)
+
+    puts %{[#{label.unshift(self.name).map(&:to_s).join(".")}] >> #{msg}}
+  end
+
   def self.load_tables(tables)
     Hash[tables.map do |table| 
       table = Table.new(table)
@@ -43,11 +49,9 @@ module Migration
     @migrations = Migration.load_migrations(opts.fetch(:migrations), @tables)
     @migrations.each(&:build).each(&:validate).each(&:apply)
     asset = File.join(opts.fetch(:dist), "gameobj-data.xml")
-    puts %{[migration] writing #{asset}}
+    Migration.log %{writing #{asset}}, label: :write
     File.open(asset, %{w+}) do |file|
-      formatter = REXML::Formatters::Pretty.new
-      formatter.compact = true
-      formatter.write(Migration.to_xml(@tables), file)
+      file.write Migration.to_xml(@tables).to_s
     end
   end
 end

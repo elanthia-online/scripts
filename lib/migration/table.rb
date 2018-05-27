@@ -12,6 +12,7 @@ module Migration
     attr_reader :rules, :name, :pending
     def initialize(file)
       @name    = File.basename(file, ".yaml").to_sym
+      Migration.log(%{loading #{file}}, label: %i[table])
       @rules   = Hash[YAML.load_file(file).map do |(k,v)| 
         [Table.normalize_key(k), v] 
       end]
