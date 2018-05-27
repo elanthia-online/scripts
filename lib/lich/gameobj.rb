@@ -291,7 +291,6 @@ class GameObj
           filename = "#{DATA_DIR}/gameobj-data.xml"
         end
       end
-      pp filename
       if File.exists?(filename)
         begin
           @@type_data = Hash.new
