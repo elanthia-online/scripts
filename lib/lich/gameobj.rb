@@ -7,7 +7,7 @@ end
 
 # Tell GameObj where to find the GameObj data XML file
 class GameObj
-  DATA_DIR = Pathname.new('./scripts').expand_path
+  DATA_DIR = Pathname.new('./dist').expand_path
 end
 
 # Lich 4.6.44
@@ -291,6 +291,7 @@ class GameObj
           filename = "#{DATA_DIR}/gameobj-data.xml"
         end
       end
+      pp filename
       if File.exists?(filename)
         begin
           @@type_data = Hash.new
