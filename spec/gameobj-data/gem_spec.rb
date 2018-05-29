@@ -658,18 +658,6 @@ describe GameObj do
       end
     end
 
-    # FIXME: move to alchemy spec
-    describe "alchemy components" do
-      it "knows that powdered gems are reagents" do
-        [
-          %{some powdered white opal}
-        ].each do |reagent|
-          expect(GameObjFactory.item_from_name(reagent).type).to include "reagent"
-          expect(GameObjFactory.item_from_name(reagent).type).to_not include "gem"
-        end
-      end
-    end
-
     describe "skins" do
       [
         %{scaly burgee shell},
