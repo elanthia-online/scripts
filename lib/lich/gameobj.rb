@@ -1,4 +1,5 @@
 require 'rexml/document'
+require 'prettyprint'
 
 # GameObj#load_data depends on this monkey patch
 class NilClass
@@ -8,6 +9,14 @@ end
 # Tell GameObj where to find the GameObj data XML file
 class GameObj
   DATA_DIR = Pathname.new('./dist').expand_path
+end
+
+def echo(*args)
+  pp *args
+end
+
+def respond(*args)
+  echo *args
 end
 
 # Lich 4.6.44
