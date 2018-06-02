@@ -17,6 +17,7 @@ module Migration
         [Table.normalize_key(k), v] 
       end]
       @kind    = rules.fetch(:kind, "type")
+      rules.delete(:kind)
       @pending = []
     end
 
