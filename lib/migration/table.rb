@@ -9,13 +9,14 @@ module Migration
       key.to_s.downcase.to_sym
     end
 
-    attr_reader :rules, :name, :pending
+    attr_reader :rules, :name, :pending, :kind
     def initialize(file)
       @name    = File.basename(file, ".yaml").to_sym
       Migration.log(%{loading #{file}}, label: %i[table])
       @rules   = Hash[YAML.load_file(file).map do |(k,v)| 
         [Table.normalize_key(k), v] 
       end]
+      @kind    = rules.fetch(:kind, "type")
       @pending = []
     end
 
@@ -56,7 +57,7 @@ module Migration
 
     def to_xml()
       ## create a new xml type def
-      xml = Migration.raw_element(%{type})
+      xml = Migration.raw_element(@kind)
       ## create the name that will be used for the type data
       xml.add_attribute %{name}, @name.to_s.gsub("_", " ")
       ## add all definitions to this xml table
