@@ -125,9 +125,11 @@ describe GameObj do
 
       [
         %{ayanad crystal},
+        %{crimson troll king bezoar},
         %{crystal core},
         %{crystalline globe},
         %{elemental core},
+        %{emerald stone giant bezoar},
         %{glimmering blue essence shard},
         %{glimmering blue mote of essence},
         %{glowing violet essence shard},
@@ -141,6 +143,7 @@ describe GameObj do
         %{pristine sprite's hair},
         %{radiant crimson essence shard},
         %{radiant crimson mote of essence},
+        %{saffron gremlock bezoar},
         %{s'ayanad crystal},
         %{small troll tooth},
         %{some essence of air},
@@ -153,6 +156,7 @@ describe GameObj do
         %{t'ayanad crystal},
         %{tiny golden seed},
         %{vial of farlook vitreous humor},
+        %{violet Ithzir bezoar},
       ].each do |reagent|
         it "recognizes #{reagent} as a reagent" do
           expect(GameObjFactory.item_from_name(reagent).type).to include "reagent"
@@ -242,6 +246,8 @@ describe GameObj do
         %{smoky glass vial},
         %{thick glass vial},
         %{slender glass vial},
+        %{black iron cauldron},
+        %{ivory porcelain mortar},
       ].each do |alchemy_equipment|
         it "recognizes #{alchemy_equipment} as alchemy equipment" do
           expect(GameObjFactory.item_from_name(alchemy_equipment).type).to include "alchemy equipment"
