@@ -20,6 +20,7 @@ describe GameObj do
         "bandit",             # npc_spec
         "box",                # picking
         "clothing",           # clothing
+        "collectible",        # collectible
         "cursed",             # item_property
         "ebongate",           # festival
         "escort",             # npc
