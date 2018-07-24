@@ -19,6 +19,7 @@ describe GameObj do
         "armor",              # arms_and_armor
         "bandit",             # npc_spec
         "box",                # picking
+        "collectible",        # collectible
         "clothing",           # clothing
         "cursed",             # item_property
         "ebongate",           # festival
