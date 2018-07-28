@@ -154,7 +154,7 @@ describe GameObj do
           %{brigandine armor},
           %{chain mail},
           %{double chain},
-          # TODO: %{augmented chain},
+          %{augmented chain},
           %{half plate},
           %{full plate},
         ].product(metallic_adjectives, spikes, armor_materials).each do |(base, adj, spike, material)|
