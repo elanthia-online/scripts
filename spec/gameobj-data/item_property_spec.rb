@@ -30,69 +30,68 @@ describe GameObj do
   end
 
   describe "uncommon materials" do
-    uncommon_materials = %w[
-      adamantine
-      alexandrite
-      alum
-      bronze
-      carmiln
-      coraesine
-      deringo
-      drakar
-      drake
-      eahnor
-      eonake
-      faenor
-      faewood
-      feras
-      fireleaf
-      glaes
-      glowbark
-      golvern
-      gornar
-      hoarbeam
-      illthorn
-      imflass
-      invar
-      ipantor
-      iron
-      ironwood
-      kakore
-      kelyn
-      krodera
-      kroderine
-      laje
-      lor
-      mein
-      mesille
-      mithglin
-      mithril
-      modwir
-      mossbark
-      obsidian
-      ora
-      orase
-      razern
-      rhimar
-      rolaren
-      rowan
-      ruic
-      sephwir
-      urglaes
-      urnon
-      vaalin
-      vaalorn
-      veil
-      veil iron
-      veniom
-      villswood
-      vultite
-      widowwood
-      witchwood
-      wyrwood
-      yew
-      zelnorn
-      zorchar
+    uncommon_materials = [
+      %{adamantine},
+      %{alexandrite},
+      %{alum},
+      %{bronze},
+      %{carmiln},
+      %{coraesine},
+      %{deringo},
+      %{drakar},
+      %{drake},
+      %{eahnor},
+      %{eonake},
+      %{faenor},
+      %{faewood},
+      %{feras},
+      %{fireleaf},
+      %{glaes},
+      %{glowbark},
+      %{golvern},
+      %{gornar},
+      %{hoarbeam},
+      %{illthorn},
+      %{imflass},
+      %{invar},
+      %{ipantor},
+      %{iron},
+      %{ironwood},
+      %{kakore},
+      %{kelyn},
+      %{krodera},
+      %{kroderine},
+      %{laje},
+      %{lor},
+      %{mein},
+      %{mesille},
+      %{mithglin},
+      %{mithril},
+      %{modwir},
+      %{mossbark},
+      %{obsidian},
+      %{ora},
+      %{orase},
+      %{razern},
+      %{rhimar},
+      %{rolaren},
+      %{rowan},
+      %{ruic},
+      %{sephwir},
+      %{urglaes},
+      %{urnon},
+      %{vaalin},
+      %{vaalorn},
+      %{veil iron},
+      %{veniom},
+      %{villswood},
+      %{vultite},
+      %{widowwood},
+      %{witchwood},
+      %{wyrwood},
+      %{yew},
+      %{zelnorn},
+      %{zorchar},
     ]
 
     uncommon_materials.each do |material|
@@ -111,6 +110,7 @@ describe GameObj do
       [
         %{arrowhead of two-toned alexandrite},
         %{black iron cauldron},
+        %{white bridal veil},
         %{bronze-hazed beige mekret cabochon},
         %{cloudy alexandrite shard},
         %{flame-singed modwir tree},
