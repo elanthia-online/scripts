@@ -117,23 +117,23 @@ describe GameObj do
       [
         %{awl-pike},
         %{halberd},
-        #%{hammer-of-Kai},
+        %{Hammer of Kai},
         %{harpoon},
         %{lance},
         %{jeddart-axe},
-        #%{naginata},
+        %{naginata},
         %{pilum},
-        #%{pitch fork},
+        %{pitch fork},
         %{pitchfork},
         %{spear},
         %{trident},
         %{voulge},
 
-        #%{faenor bardiche},
-        #%{grey ora glaive},
-        #%{rowan-handled feras warlance},
-        #%{indigo ora pole-axe},
-        #%{glistening mithril scythe},
+        %{faenor bardiche},
+        %{grey ora glaive},
+        %{indigo ora pole-axe},
+        %{glistening mithril scythe},
+        %{rowan-handled feras warlance},
       ].each do |weapon_name|
         it "recognizes #{weapon_name} as weapon" do
           weapon = GameObjFactory.item_from_name(weapon_name)
