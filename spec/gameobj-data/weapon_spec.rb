@@ -91,18 +91,18 @@ describe GameObj do
         %{flamberge},
         %{great axe},
         %{greatsword},
-        #%{military fork},
+        %{military fork},
         %{military pick},
         %{katana},
         %{maul},
         %{quarter staff},
-        #%{quarterstaff},
+        %{quarterstaff},
         %{short-staff},
         %{twohanded sword},
         %{war mattock},
 
         %{bearded axe},
-        #%{teak-hafted gornar scaling fork},
+        %{teak-hafted gornar scaling fork},
         %{cracked mithril-spiked sledgehammer},
       ].each do |weapon_name|
         it "recognizes #{weapon_name} as weapon" do
@@ -112,7 +112,6 @@ describe GameObj do
         end
       end
     end
-
 
     describe "polearms" do
       [
