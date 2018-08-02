@@ -221,9 +221,6 @@ describe GameObj do
         it "recognizes #{weapon_name} as weapon" do
           weapon = GameObjFactory.item_from_name(weapon_name)
           expect(weapon.type).to include "weapon"
-        end
-
-        xit "recognizes #{weapon_name} is NOT sellable" do
           expect(weapon.sellable).to be nil
         end
       end
