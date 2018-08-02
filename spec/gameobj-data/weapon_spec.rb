@@ -57,12 +57,12 @@ describe GameObj do
 
     describe "one-handed blunt" do
       [
-        #%{ball & chain},
+        %{ball & chain},
         %{ball and chain},
         %{club},
         %{crowbill},
         %{cudgel},
-        #%{holy water sprinkler},
+        %{holy water sprinkler},
         %{mace},
         %{morning star},
         %{spikestar},
