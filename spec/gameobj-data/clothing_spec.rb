@@ -108,19 +108,11 @@ describe GameObj do
         %{some flowing robes},
 
         %{Adventurer's Guild voucher pack},
-      ].each do |clothing_name|
-        it "recognizes #{clothing_name} is NOT clothing" do
-          clothing = GameObjFactory.item_from_name(clothing_name)
-          expect(clothing.type.to_s).to_not include "clothing"
-        end
-      end
-
-      [
         %{Elanthian Guilds voucher pack},
-      ].each do |clothing_name|
-        xit "recognizes #{clothing_name} is NOT clothing" do
-          clothing = GameObjFactory.item_from_name(clothing_name)
-          expect(clothing.type.to_s).to_not include "clothing"
+      ].each do |item_name|
+        it "recognizes #{item_name} is NOT clothing" do
+          item = GameObjFactory.item_from_name(item_name)
+          expect(item.type.to_s).to_not include "clothing"
         end
       end
     end
