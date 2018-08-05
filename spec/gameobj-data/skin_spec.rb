@@ -7,6 +7,7 @@ describe GameObj do
       %{agresh bear claw},
       %{aivren gizzard},
       %{antlers},
+      %{ant larva},
       %{ant pincer},
       %{arctic manticore mane},
       %{arctic titan toe},
