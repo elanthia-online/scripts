@@ -144,4 +144,16 @@ describe GameObj do
       end
     end
   end
+
+  describe "Simucoin items" do
+    [
+      %{Adventurer's Guild voucher pack},
+      %{Elanthian Guilds voucher pack},
+    ].each do |item_name|
+      it "recognizes #{item_name} is NOT sellable" do
+        item = GameObjFactory.item_from_name(item_name)
+        expect(item.sellable).to eq nil
+      end
+    end
+  end
 end
