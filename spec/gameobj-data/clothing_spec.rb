@@ -156,6 +156,7 @@ describe GameObj do
         [%{nanjir},        %{some elegant dark brown silk nanjir}],
         [%{neck-kerchief}, %{red-trimmed black suede neck-kerchief},            %{strung with rubies}],
         [%{neckpouch},     %{diminutive brocade neckpouch},                     %{cinched with a leather thong}],
+        [%{nightdress},    %{bright red flannel nightdress}],
         [%{nightgown},     %{lavender flannel nightgown}],
         [%{nightshirt},    %{roomy plaid flannel nightshirt}],
         [%{overdress},     %{inky black satin overdress},                       %{beaded with dark jewel droplets}],
