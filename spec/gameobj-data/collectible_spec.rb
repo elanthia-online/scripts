@@ -81,6 +81,7 @@ describe GameObj do
       %{ornate Aeia statuette},
       %{ornate Jaston statuette},
       %{ornate Kuon statuette},
+      %{ornate Khaarne statuette},
       %{ornate Meyno statuette},
       %{ornate Niima statuette},
       %{ornate Illoke statuette},
