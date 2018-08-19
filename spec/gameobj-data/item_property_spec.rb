@@ -30,69 +30,68 @@ describe GameObj do
   end
 
   describe "uncommon materials" do
-    uncommon_materials = %w[
-      adamantine
-      alexandrite
-      alum
-      bronze
-      carmiln
-      coraesine
-      deringo
-      drakar
-      drake
-      eahnor
-      eonake
-      faenor
-      faewood
-      feras
-      fireleaf
-      glaes
-      glowbark
-      golvern
-      gornar
-      hoarbeam
-      illthorn
-      imflass
-      invar
-      ipantor
-      iron
-      ironwood
-      kakore
-      kelyn
-      krodera
-      kroderine
-      laje
-      lor
-      mein
-      mesille
-      mithglin
-      mithril
-      modwir
-      mossbark
-      obsidian
-      ora
-      orase
-      razern
-      rhimar
-      rolaren
-      rowan
-      ruic
-      sephwir
-      urglaes
-      urnon
-      vaalin
-      vaalorn
-      veil
-      veil iron
-      veniom
-      villswood
-      vultite
-      widowwood
-      witchwood
-      wyrwood
-      yew
-      zelnorn
-      zorchar
+    uncommon_materials = [
+      %{adamantine},
+      %{alexandrite},
+      %{alum},
+      %{bronze},
+      %{carmiln},
+      %{coraesine},
+      %{deringo},
+      %{drakar},
+      %{drake},
+      %{eahnor},
+      %{eonake},
+      %{faenor},
+      %{faewood},
+      %{feras},
+      %{fireleaf},
+      %{glaes},
+      %{glowbark},
+      %{golvern},
+      %{gornar},
+      %{hoarbeam},
+      %{illthorn},
+      %{imflass},
+      %{invar},
+      %{ipantor},
+      %{iron},
+      %{ironwood},
+      %{kakore},
+      %{kelyn},
+      %{krodera},
+      %{kroderine},
+      %{laje},
+      %{lor},
+      %{mein},
+      %{mesille},
+      %{mithglin},
+      %{mithril},
+      %{modwir},
+      %{mossbark},
+      %{obsidian},
+      %{ora},
+      %{orase},
+      %{razern},
+      %{rhimar},
+      %{rolaren},
+      %{rowan},
+      %{ruic},
+      %{sephwir},
+      %{urglaes},
+      %{urnon},
+      %{vaalin},
+      %{vaalorn},
+      %{veil iron},
+      %{veniom},
+      %{villswood},
+      %{vultite},
+      %{widowwood},
+      %{witchwood},
+      %{wyrwood},
+      %{yew},
+      %{zelnorn},
+      %{zorchar},
     ]
 
     uncommon_materials.each do |material|
@@ -107,65 +106,36 @@ describe GameObj do
       end
     end
 
-    describe "uncommon material exceptions" do
+    describe "uncommon material exceptions and counter-examples" do
       [
-=begin
-        ^(?:piece of snowflake obsidian|
-        some lustrous grooved obsidian|
-        piece of iron|
-        slender mithril wand|
-        twisted modwir short\-staff|
-        flame-singed modwir tree|
-
-(?:\w+ )?iron wand|
-black iron cauldron|
-rust-colored laje spoke|
-
-small bronze egg\-shaped geode|
-arrowhead of two-toned alexandrite|
-bronze\-hazed beige mekret cabochon|
-cloudy alexandrite shard)$
-=end
+        %{arrowhead of two-toned alexandrite},
+        %{black iron cauldron},
+        %{white bridal veil},
+        %{bronze-hazed beige mekret cabochon},
+        %{cloudy alexandrite shard},
+        %{flame-singed modwir tree},
+        %{iron wand},
+        %{piece of iron},
+        %{piece of snowflake obsidian},
+        %{rust-colored laje spoke},
+        %{slender mithril wand},
+        %{small bronze egg-shaped geode},
+        %{some lustrous grooved obsidian},
+        %{twisted modwir short-staff},
       ].each do |common_item_name|
         it "recognizes #{common_item_name} is NOT uncommon" do
           common_item = GameObjFactory.item_from_name(common_item_name)
-          expect(common_item.type).to_not include "uncommon"
+          expect(common_item.type.to_s).to_not include "uncommon"
         end
       end
 
-      describe "common gems and valuables" do
-        [
-=begin
-bronze fang|
-iron fang|
-mithril fang|
-silver fang|
-steel fang|
-urglaes fang|
-
-(?:mithril|faenor|rhimar|ora|vultite)\-bloom$|
-
-green alexandrite stone|
-piece of snowflake obsidian|
-piece of spiderweb obsidian|
-some lustrous grooved obsidian
-obsidian eye|
-=end
-        ].each do |common_item_name|
-          it "recognizes #{common_item_name} is NOT uncommon" do
-            common_item = GameObjFactory.item_from_name(common_item_name)
-            expect(common_item.type).to_not include "uncommon"
-          end
+      it "recognizes that an Adventurer's Guild badge is NOT uncommon" do
+        uncommon_materials.each do |material|
+          common_item_name = "#{material} Adventurer's Guild badge"
+          common_item = GameObjFactory.item_from_name(common_item_name)
+          expect(common_item.type.to_s).to_not include "uncommon"
         end
       end
     end
   end
 end
-
-__END__
-
-\bAdventurer's Guild badge$|
-
-\b(?:pin|necklace|crown|talisman|pendant|ring|tiara|anklet|earring|earrings|clasp|bracelet|medallion|amulet|chalice|stickpin|brooch|badge|circlet|buckle|neckchain|band|earcuff|bracer|bowl|torc|ewer|barrette|flagon|urn|tray|cup|platter|stein)$|
-
-

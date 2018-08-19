@@ -61,7 +61,6 @@ describe GameObj do
         %{piece of golden amber},
         %{piece of green jade},
         %{piece of green marble},
-        %{piece of obsidian},
         %{piece of onyx},
         %{piece of petrified thanot},
         %{piece of pink marble},
@@ -105,16 +104,15 @@ describe GameObj do
         %{yellow zircon},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
 
       it "recognizes blue lapis lazuli as a gem" do
         lapis_obj = GameObjFactory.item_from_name("blue lapis lazuli", "lapis")
-        expect(lapis_obj.type).to include "gem"
-        expect(lapis_obj.type).to_not include "valuable"
-        expect(lapis_obj.sellable).to include "gemshop"
+        expect(lapis_obj.type).to eq "gem"
+        expect(lapis_obj.sellable).to eq "gemshop"
       end
     end
 
@@ -124,9 +122,8 @@ describe GameObj do
         %{piece of rosespar},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
     end
@@ -177,8 +174,8 @@ describe GameObj do
         %{yellow hyacinth},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -191,9 +188,8 @@ describe GameObj do
           %{pinch of gold dust},
         ].each do |valuable|
           it "recognizes #{valuable} as a valuable" do
-            expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-            expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+            expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+            expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
           end
         end
       end
@@ -215,8 +211,8 @@ describe GameObj do
         %{snowflake zircon},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -229,9 +225,8 @@ describe GameObj do
         %{platinum nugget},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
     end
@@ -248,7 +243,6 @@ describe GameObj do
         %{eye-of-koar emerald},
         %{faceted black diamond},
         %{faceted midnight blue riftstone},
-        %{glossy black doomstone},
         %{metallic black pearl},
         %{milky quartz eye},
         %{multi-colored wyrdshard},
@@ -257,8 +251,6 @@ describe GameObj do
         %{piece of black riftstone},
         %{radiant opalescent thunderstone},
         %{sanguine wyrm's-eye garnet},
-        %{shard of dragonmist crystal},
-        %{shard of oblivion quartz},
         %{smoky grey thunderstone},
         %{swirling aetherstone},
         %{swirling purple thunderstone},
@@ -269,16 +261,41 @@ describe GameObj do
         %{transparent spherine},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
+        end
+      end
+    end
+
+    describe "cursed gems" do
+      [
+        %{glossy black doomstone},
+        %{shard of oblivion quartz},
+      ].each do |gem|
+        it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to include "cursed"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
+        end
+      end
+    end
+
+    describe "gems with data issues" do
+      [
+        %{shard of dragonmist crystal},
+      ].each do |gem|
+        it "recognizes #{gem} as a gem" do
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+        end
+
+        xit "recognizes #{gem} as sellable at the gemshop" do
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
 
     describe "valuables" do
       [
-        %{chalky yellow cube},
-
         %{bronze fang},
         %{copper fang},
         %{gold fang},
@@ -299,16 +316,15 @@ describe GameObj do
         %{dark-spoked crystalline wheel},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "skin"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
 
       describe "valuables with data issues" do
         [
           %{urglaes fang},
+          %{chalky yellow cube},
         ].each do |valuable|
           it "recognizes #{valuable} as a valuable" do
             expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
@@ -316,7 +332,7 @@ describe GameObj do
           end
 
           xit "recognizes #{valuable} as sellable at the gemshop" do
-            expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+            expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
           end
         end
       end
@@ -367,8 +383,8 @@ describe GameObj do
         %{yellow sunstone},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -376,9 +392,8 @@ describe GameObj do
     describe "valuables" do
       [%{glaesine crystal}].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
     end
@@ -398,8 +413,8 @@ describe GameObj do
         %{vibrant hummingbird saewehna},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -408,7 +423,7 @@ describe GameObj do
   describe "krag dwellers gems" do
     ["brilliant purple opal"].each do |gem|
       it "recognizes #{gem} as a gem" do
-        expect(GameObjFactory.item_from_name(gem).type).to include "gem"
+        expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
       end
     end
   end
@@ -431,8 +446,8 @@ describe GameObj do
         %{yellow sphene},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
 
@@ -442,9 +457,9 @@ describe GameObj do
           %{cinnabar crystal},
         ].each do |gem|
           xit "recognizes #{gem} as a gem" do
-            expect(GameObjFactory.item_from_name(gem).type).to include "gem"
+            expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
             expect(GameObjFactory.item_from_name(gem).type).to_not include "magic"
-            expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+            expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
           end
         end
       end
@@ -465,8 +480,8 @@ describe GameObj do
         %{uncut star-of-tamzyrr diamond},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -505,10 +520,8 @@ describe GameObj do
         %{yellow helmet shell},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "skin"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
     end
@@ -520,10 +533,10 @@ describe GameObj do
       %{petrified mammoth tusk},
     ].each do |valuable|
       it "recognizes #{valuable} as a valuable" do
-        expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
+        expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
         expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
         expect(GameObjFactory.item_from_name(valuable).type).to_not include "skin"
-        expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+        expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
       end
     end
 
@@ -533,7 +546,7 @@ describe GameObj do
           %{piece of petrified maoral},
         ].each do |valuable|
           xit "recognizes #{valuable} as a valuable" do
-            expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
+            expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
             expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
           end
         end
@@ -551,9 +564,9 @@ describe GameObj do
       %{spiked onyx scarab},
     ].each do |scarab|
       it "recognizes #{scarab} as a scarab" do
-        expect(GameObjFactory.item_from_name(scarab).type).to include "scarab"
+        expect(GameObjFactory.item_from_name(scarab).type).to eq "scarab"
         expect(GameObjFactory.item_from_name(scarab).type).to_not include "uncommon"
-        expect(GameObjFactory.item_from_name(scarab).sellable).to include "gemshop"
+        expect(GameObjFactory.item_from_name(scarab).sellable).to eq "gemshop"
       end
     end
   end
