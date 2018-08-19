@@ -209,7 +209,6 @@ describe GameObj do
 
     describe "special weapons" do
       [
-        %{elemental bow},
         %{elemental bow of acid},
         %{elemental bow of lightning},
         %{elemental bow of fire},

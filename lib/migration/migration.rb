@@ -1,6 +1,7 @@
 require "yaml"
 require "rexml/document"
 require "fileutils"
+require_relative "../util/color"
 
 module Migration
   include REXML

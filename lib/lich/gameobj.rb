@@ -1,5 +1,6 @@
 require 'rexml/document'
 require 'prettyprint'
+require 'pathname'
 
 # GameObj#load_data depends on this monkey patch
 class NilClass
@@ -53,7 +54,9 @@ class GameObj
   end
   def type
     GameObj.load_data if @@type_data.empty?
-    list = @@type_data.keys.find_all { |t| (@name =~ @@type_data[t][:name] or @noun =~ @@type_data[t][:noun]) and (@@type_data[t][:exclude].nil? or @name !~ @@type_data[t][:exclude]) }
+    list = @@type_data.keys.find_all { |t| 
+      (@name =~ @@type_data[t][:name] or @noun =~ @@type_data[t][:noun]) and (@@type_data[t][:exclude].nil? or @name !~ @@type_data[t][:exclude]) 
+    }
     if list.empty?
       nil
     else
@@ -62,7 +65,9 @@ class GameObj
   end
   def sellable
     GameObj.load_data if @@sellable_data.empty?
-    list = @@sellable_data.keys.find_all { |t| (@name =~ @@sellable_data[t][:name] or @noun =~ @@sellable_data[t][:noun]) and (@@sellable_data[t][:exclude].nil? or @name !~ @@sellable_data[t][:exclude]) }
+    list = @@sellable_data.keys.find_all { |t| 
+      (@name =~ @@sellable_data[t][:name] or @noun =~ @@sellable_data[t][:noun]) and (@@sellable_data[t][:exclude].nil? or @name !~ @@sellable_data[t][:exclude]) 
+    }
     if list.empty?
       nil
     else
