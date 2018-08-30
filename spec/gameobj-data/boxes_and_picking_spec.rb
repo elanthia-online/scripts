@@ -107,8 +107,8 @@ describe GameObj do
   describe "lm traps" do
     describe "sellable at the pawnshop" do
       [
-        %{steel jaws},
-        %{steel needle},
+        %{pair of small steel jaws},
+        %{slender steel needle},
 
         %{green-tinted vial},
         %{thick glass vial},
