@@ -1,7 +1,7 @@
 module Migration
   module Convert
     # (?:seasoned |grizzled |battle\-scarred |ancient |veteran )?  
-    def self.maybe_pattern_to_regex(maybes = nil, space: space)
+    def self.maybe_pattern_to_regex(maybes = nil, space: nil)
       return %{} if maybes.nil?
       #Migration.log(maybes, label: %i[maybes])
       with_whitespace = maybes.map do |maybe|
