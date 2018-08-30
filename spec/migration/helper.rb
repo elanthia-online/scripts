@@ -1,7 +1,5 @@
 # load all files for this subtest
-Dir[File.join("lib", "migration", "**", "*.rb")].each do |file| 
-  load(file) 
-end
+load("lib/migration.rb")
 
 module Helper
   module Mocks
