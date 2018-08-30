@@ -1,6 +1,4 @@
 require 'rexml/document'
-require 'prettyprint'
-require 'pathname'
 
 # GameObj#load_data depends on this monkey patch
 class NilClass
@@ -9,15 +7,15 @@ end
 
 # Tell GameObj where to find the GameObj data XML file
 class GameObj
-  DATA_DIR = Pathname.new('./dist').expand_path
-end
-
-def echo(*args)
-  pp *args
-end
-
-def respond(*args)
-  echo *args
+  require 'pathname'
+  DATA_DIR = if ENV.fetch("COMPILED", false)
+     Pathname.new('./dist').expand_path
+  else
+     Pathname.new('./scripts').expand_path
+  end
+  # should inform the developer where the data is
+  # being loaded from
+  puts "[GameObj.data_dir] >>> #{DATA_DIR}"
 end
 
 # Lich 4.6.44
@@ -54,9 +52,7 @@ class GameObj
   end
   def type
     GameObj.load_data if @@type_data.empty?
-    list = @@type_data.keys.find_all { |t| 
-      (@name =~ @@type_data[t][:name] or @noun =~ @@type_data[t][:noun]) and (@@type_data[t][:exclude].nil? or @name !~ @@type_data[t][:exclude]) 
-    }
+    list = @@type_data.keys.find_all { |t| (@name =~ @@type_data[t][:name] or @noun =~ @@type_data[t][:noun]) and (@@type_data[t][:exclude].nil? or @name !~ @@type_data[t][:exclude]) }
     if list.empty?
       nil
     else
@@ -65,9 +61,7 @@ class GameObj
   end
   def sellable
     GameObj.load_data if @@sellable_data.empty?
-    list = @@sellable_data.keys.find_all { |t| 
-      (@name =~ @@sellable_data[t][:name] or @noun =~ @@sellable_data[t][:noun]) and (@@sellable_data[t][:exclude].nil? or @name !~ @@sellable_data[t][:exclude]) 
-    }
+    list = @@sellable_data.keys.find_all { |t| (@name =~ @@sellable_data[t][:name] or @noun =~ @@sellable_data[t][:noun]) and (@@sellable_data[t][:exclude].nil? or @name !~ @@sellable_data[t][:exclude]) }
     if list.empty?
       nil
     else
