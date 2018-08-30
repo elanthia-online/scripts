@@ -63,19 +63,28 @@ module Migration
                 :pending,  # you can mark a table pending 
                            # and it will not compile
                            # 
-                :kind      # sellable | type
+                :kind,     # sellable | type
+                :basename, # the basename of the table
+                :log_name  # name to appear in logs
     ##
     ## reads a .yaml definition into memory
     ## so that migrations may be layered ontop
     ##
     def initialize(file)
-      @name    = File.basename(file, ".yaml").to_sym
-      Migration.log(%{loading #{file}}, label: %i[table])
-      @rules   = Hash[YAML.load_file(file).map do |(k,v)| 
+      @name     = File.basename(file, ".yaml").to_sym
+      @log_name = %[Table(:#{@name})]
+      # output something useful
+      # about how we are loading this data
+      Migration.log(%{decoding #{@log_name} from #{file}}, 
+        label: %i[table],
+        color: :blue)
+      
+        @rules   = Hash[YAML.load_file(file).map do |(k,v)| 
         [Table.normalize_key(k), v] 
       end]
       @kind = rules.fetch(:kind, "type")
       Table.validate_ruleset(self, @rules)
+      # this should not be compiled to the XML output
       rules.delete(:kind)
       @pending = []
     end
