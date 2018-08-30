@@ -4,7 +4,7 @@ module Migration
   module Validate
     def self.regexp(table, key, body)
       begin
-        Regexp.new(body)  
+        Regexp.new(body)
       rescue => err
         fail ValidationError, <<~ERROR
           
