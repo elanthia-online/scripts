@@ -4,73 +4,90 @@ require 'spec/factories'
 describe GameObj do
   describe "clothing" do
     describe "randomized treasure system drop nouns" do
-      [
-        %{armband},
-        %{backpack},
-        %{bag},
-        %{bandana},
-        %{belt},
-        %{blouse},
-        %{bodice},
-        %{bonnet},
-        %{boots},
-        %{bow},
-        %{breeches},
-        %{cap},
-        %{cape},
-        %{chemise},
-        %{cloak},
-        %{coat},
-        %{dress},
-        %{frock},
-        %{gloves},
-        %{gown},
-        %{greatcloak},
-        %{harness},
-        %{hat},
-        %{hood},
-        %{jacket},
-        %{kerchief},
-        %{kilt},
-        %{kirtle},
-        %{knapsack},
-        %{leggings},
-        %{longcloak},
-        %{longcoat},
-        %{mantle},
-        %{overcoat},
-        %{pack},
-        %{pants},
-        %{pouch},
-        %{purse},
-        %{quiver},
-        %{ribbon},
-        %{robe},
-        %{robes},
-        %{sack},
-        %{sandals},
-        %{sash},
-        %{satchel},
-        %{scabbard},
-        %{scarf},
-        %{shawl},
-        %{sheath},
-        %{shirt},
-        %{shoes},
-        %{skirt},
-        %{slippers},
-        %{snood},
-        %{socks},
-        %{surcoat},
-        %{tabard},
-        %{trousers},
-        %{tunic},
-        %{vest},
-      ].each do |clothing_name|
-        it "recognizes #{clothing_name} as clothing" do
-          clothing = GameObjFactory.item_from_name(clothing_name)
-          expect(clothing.type).to include "clothing"
-          expect(clothing.sellable.to_s).to include "pawnshop"
+      describe "clothing sellable at the pawnshop" do
+        [
+          %{backpack},
+          %{bag},
+          %{bandana},
+          %{belt},
+          %{blouse},
+          %{bodice},
+          %{bonnet},
+          %{boots},
+          %{bow},
+          %{breeches},
+          %{cap},
+          %{cape},
+          %{chemise},
+          %{cloak},
+          %{coat},
+          %{dress},
+          %{frock},
+          %{gloves},
+          %{gown},
+          %{greatcloak},
+          %{harness},
+          %{hat},
+          %{hood},
+          %{jacket},
+          %{kerchief},
+          %{kilt},
+          %{kirtle},
+          %{knapsack},
+          %{leggings},
+          %{longcloak},
+          %{longcoat},
+          %{mantle},
+          %{overcoat},
+          %{pack},
+          %{pants},
+          %{pouch},
+          %{purse},
+          %{quiver},
+          %{ribbon},
+          %{robe},
+          %{robes},
+          %{sack},
+          %{sandals},
+          %{sash},
+          %{satchel},
+          %{scabbard},
+          %{scarf},
+          %{shawl},
+          %{sheath},
+          %{shirt},
+          %{shoes},
+          %{skirt},
+          %{slippers},
+          %{snood},
+          %{socks},
+          %{surcoat},
+          %{tabard},
+          %{trousers},
+          %{tunic},
+          %{vest},
+        ].each do |clothing_name|
+          it "recognizes #{clothing_name} as clothing" do
+            clothing = GameObjFactory.item_from_name(clothing_name)
+            expect(clothing.type).to include "clothing"
+            expect(clothing.sellable.to_s).to eq "pawnshop"
+          end
+        end
+      end
+
+      describe "clothing sellable at the gem shop and the pawn shop" do
+        [
+          %{armband},
+
+          %{fine ecru armband},
+          %{stained teal armband},
+          %{stone grey armband},
+        ].each do |clothing_name|
+          it "recognizes #{clothing_name} as clothing" do
+            clothing = GameObjFactory.item_from_name(clothing_name)
+            expect(clothing.type).to include "clothing"
+            expect(clothing.sellable.split(",")).to contain_exactly("gemshop", "pawnshop")
+          end
         end
       end
     end

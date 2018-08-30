@@ -139,6 +139,7 @@ describe GameObj do
       [
         %{gritty demon figurine},
         %{glazed clay Imaera miniature},
+        %{glittering steel orb},
         %{diamond-set Tonis sculpture},
         %{silver-inlaid elven maiden statue},
         %{dark maoral lizard statuette},
