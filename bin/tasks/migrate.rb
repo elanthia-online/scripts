@@ -1,7 +1,7 @@
 ##
 ## load all assets
 ##
-Dir[File.join(__dir__, "..", "lib", "migration", "**", "*.rb")].each do |file| require(file) end
+require_relative("../../lib/migration.rb")
 ##
 ## do eeet
 ##
