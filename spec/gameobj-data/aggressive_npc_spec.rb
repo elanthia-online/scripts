@@ -425,6 +425,7 @@ describe GameObj do
         "Illoke mystic",
         "Illoke shaman",
         "Ithzir adept",
+        "Ithzir champion",
         "Ithzir herald",
         "Ithzir initiate",
         "Ithzir janissary",
