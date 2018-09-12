@@ -226,4 +226,32 @@ describe GameObj do
       end
     end
   end
+
+  describe "ammo" do
+    [
+      %{arrow},
+      %{bundle of arrows},
+      %{bolt},
+      %{bundle of bolts},
+      %{discuses},
+      %{quoits},
+    ].each do |ammo_name|
+      it "recognizes #{ammo_name} as ammo" do
+        ammo = GameObjFactory.item_from_name(ammo_name)
+        expect(ammo.type).to include "ammo"
+        expect(ammo.sellable).to be nil
+      end
+    end
+
+    [
+      %{discus},
+      %{quoit},
+    ].each do |ammo_name|
+      it "recognizes #{ammo_name} as ammo" do
+        ammo = GameObjFactory.item_from_name(ammo_name)
+        expect(ammo.type).to include "ammo"
+        expect(ammo.sellable).to eq "pawnshop"
+      end
+    end
+  end
 end

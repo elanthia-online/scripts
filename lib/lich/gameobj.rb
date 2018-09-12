@@ -8,7 +8,7 @@ end
 # Tell GameObj where to find the GameObj data XML file
 class GameObj
   require 'pathname'
-  DATA_DIR = if ENV.fetch("COMPILED", false)
+  DATA_DIR = if ENV.fetch("COMPILED", false) == "true"
      Pathname.new('./dist').expand_path
   else
      Pathname.new('./scripts').expand_path
