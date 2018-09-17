@@ -15,7 +15,6 @@ describe GameObj do
       %{miniature monk figurine},
       %{miniature paladin figurine},
       %{polished stone},
-      %{polished stone},
       %{oblong smooth stone},
       %{glossy smooth stone},
       %{shiny smooth stone},
@@ -103,7 +102,8 @@ describe GameObj do
     ].each do |collectible_name|
       it "recognizes #{collectible_name} as collectible" do
         collectible = GameObjFactory.item_from_name(collectible_name)
-        expect(collectible.type).to include "collectible"
+        expect(collectible.type).to eq "collectible"
+        expect(collectible.sellable).to be nil
       end
     end
   end
