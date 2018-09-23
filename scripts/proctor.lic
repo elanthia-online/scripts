@@ -157,6 +157,26 @@ module Proctor
 end
 
 module Proctor
+  class ProctorError < Exception
+    def initialize(message, room, wayto_id, current_checksum, sibling_checksum, file)
+      super(<<-ERROR
+      \n
+      #{message}
+
+      current checksum: #{current_checksum}
+      pending checksum: #{sibling_checksum}
+                  from: #{room.title.first}:#{room.id}
+                    to: #{Room[wayto_id].title.first}:#{wayto_id}
+                  file: #{file}
+
+      ERROR
+      )
+    end
+  end
+  class DuplicateChecksum < ProctorError; end;
+  class HasUncommitedChanges < ProctorError; end;
+  class NoUncommitedChanges < ProctorError; end;
+
   module Validate
     require 'open3'
 
@@ -170,48 +190,24 @@ module Proctor
     def self.no_duplicates(room, wayto_id, string_proc)
       FS.compare(room, wayto_id, string_proc) do |current_checksum, sibling_checksum, file|
         current_checksum.eql?(sibling_checksum) and
-          fail Exception, <<-ERROR
-            \n 
-            checksum duplicate detected
-            
-            coords: #{room.title.first}:#{room.id} -> #{Room[wayto_id].title.first}:#{wayto_id} 
-
-            file:
-
-            #{file}
-          ERROR
+          raise DuplicateChecksum.new(%[duplicate working file detected], 
+            room, wayto_id, current_checksum, sibling_checksum, file)
       end
     end
 
     def self.no_uncommited_changes(room, wayto_id, string_proc)
       FS.compare(room, wayto_id, string_proc) do |current_checksum, sibling_checksum, file|
         current_checksum.eql?(sibling_checksum) or
-          fail Exception, <<-ERROR
-            \n 
-            detected uncommitted changes 
-            
-            coords: #{room.title.first}:#{room.id} -> #{Room[wayto_id].title.first}:#{wayto_id} 
-
-            file:
-
-            #{file}
-          ERROR
+          raise HasUncommitedChanges.new(%[detected uncommitted changes],
+            room, wayto_id, current_checksum, sibling_checksum, file)
       end
     end
 
     def self.has_uncommited_change(room, wayto_id, string_proc)
       FS.compare(room, wayto_id, string_proc) do |current_checksum, sibling_checksum, file|
         current_checksum.eql?(sibling_checksum) and
-          fail Exception, <<-ERROR
-            \n 
-            no uncommited changes detected 
-            
-            coords: #{room.title.first}:#{room.id} -> #{Room[wayto_id].title.first}:#{wayto_id} 
-
-            file:
-
-            #{file}
-          ERROR
+        raise NoUncommitedChanges.new(%[no uncommitted changes found],
+          room, wayto_id, current_checksum, sibling_checksum, file)
       end
     end
 
@@ -247,7 +243,7 @@ module Proctor
     end
 
     def self.string_proc_array
-      -> sproc { sproc._dump.split(";") }
+      -> sproc { sproc._dump.split(/;|\n/) }
     end
   end
 end 
@@ -256,33 +252,44 @@ module Proctor
   module CLI
     def self.index()
       Proctor.rooms_with_string_procs
-      .take(Opts.index.is_a?(TrueClass) ? 5 : Opts.index.to_i)
-      .each do |room|
-        room.wayto.select do |_, way| way.is_a?(StringProc) end
-        .each do |id, sproc| 
+        .take(Opts.index.is_a?(TrueClass) ? 5 : Opts.index.to_i)
+        .each do |row| 
+          (room, to, sproc) = row
           label =  %i[index id] + [room.id]
           Log.out((["-"] * 50).join, 
             label: label)
-          Log.out("<b>#{room.title.first}:#{room.id} to #{Room[id].title.first}:#{id}</b>",
+          Log.out("<b>#{room.title.first}:#{room.id} to #{to.title.first}:#{to.id}</b>",
             label: label)
           To.string_proc_array.(sproc).each do |line|
             Log.out(line, 
               label: label)
           end
         end
-      end
     end
 
-    def self.edit(room_id, wayto_id)
+    def self.edit(room_id, wayto_id, create: false, 
+                                     silent: false)
+      
       room = Room[room_id] or fail "Room[#{room_id}] does not exist"
       # for fresh changes we need a common fallback
       # so we don't need to litter our code with Maybe type
-      string_proc = room.wayto.fetch(wayto_id, NOOP_STRING_PROC)
+      string_proc = room.wayto.fetch(wayto_id.to_s, NOOP_STRING_PROC)
       out = FS.file_name(room, wayto_id, string_proc)
       pretty_string_proc = Compiler.expand(string_proc)._dump
-      Validate.no_duplicates(room, wayto_id, string_proc)
-      Validate.no_uncommited_changes(room, wayto_id, string_proc)
+      Validate.no_duplicates(room, wayto_id, pretty_string_proc)
+      Validate.no_uncommited_changes(room, wayto_id, pretty_string_proc)
+      string_proc.eql?(NOOP_STRING_PROC) and not create and fail <<-ERROR
+        \n
+        refusing to implicitly create a new StringProc between:
+        
+        from: #{room.title.first}:#{room.id}
+          to: #{Room[wayto_id].title.first}:#{wayto_id} 
+
+        if you wish to do this you can try the --create flag
+        \n\n
+      ERROR
       File.open(out, "w") do |f| f.write(pretty_string_proc) end
+      return if silent
       if string_proc._dump.size.eql?(0)
         Log.out("created new StringProc for #{Room[room_id].title.first} -> #{Room[wayto_id].title.first}\n\tfile: #{out}\n", 
           label: %i[create])
@@ -319,6 +326,45 @@ module Proctor
       Log.out(%{cleaned up commited changes from working directory}, label: %i[string_proc.delete])
     end
 
+    def self.dump()
+      rooms = Proctor.rooms_with_string_procs
+    
+      rooms.select! do |row|
+        (room, to, _) = row
+        room.id and to.id
+      end
+
+      if Opts.location
+        location = Opts.location.eql?("current") ? Room.current.location : Opts.location.downcase
+
+        rooms.select! do |row|
+          row.first.location.downcase.include?(location)
+        end
+
+        rooms.empty? and fail "No rooms found for #{location}"
+      end
+
+      if rooms.size > 100 and not Opts.force
+        Log.out(%[about to attempt writing #{rooms.size} StringProcs to your filesystem you have 10 seconds to cancel this], label: %i[warn])
+        sleep(10)
+      end
+
+      stats = {wrote: 0, duplicates: 0, total: rooms.size}
+
+      rooms.each do |row|
+        (room, to, sproc) = row
+        begin
+          edit(room.id, to.id, silent: true) 
+          stats.merge!({wrote: stats.fetch(:wrote) + 1})
+        rescue DuplicateChecksum
+          stats.merge!({duplicates: stats.fetch(:duplicates) + 1})
+          # silence is golden
+        end
+      end
+
+      Log.out(stats, label: %i[dump.stats])
+    end
+
     def self.help()
       _respond <<-HELP
         \n
@@ -338,6 +384,8 @@ module Proctor
                                                        a new "pending" StringProc will be created if none exists                                           
 
           commit --room={room_id} --wayto={wayto_id}   commit your changes to the MapDB for a an updated StringProc
+
+            dump [--location={location}]               dump a subset of the            
         \n
       HELP
     end
@@ -353,6 +401,11 @@ module Proctor
 
   def self.rooms_with_string_procs()
     Room.list.select(&Filter.has_wayto_string_proc?)
+      .map do |room| 
+        room.wayto.select do |_, way| way.is_a?(StringProc) end.map do |id, sproc| 
+          [room, Room[id], sproc]
+        end 
+      end.flatten(1)
   end
 
   def self.sort_by_distance(from: Room.current, rooms: [])
@@ -366,8 +419,9 @@ module Proctor
 
   def self.main()
     return CLI.index() if Opts.index
-    return CLI.edit(Opts.room, Opts.wayto) if Opts.edit
+    return CLI.edit(Opts.room, Opts.wayto, create: Opts.create || false) if Opts.edit
     return CLI.commit(Opts.room, Opts.wayto) if Opts.commit
+    return CLI.dump() if Opts.dump
     return CLI.help()
   end
 
