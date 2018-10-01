@@ -6,8 +6,8 @@ describe GameObj do
     [
       %{agresh bear claw},
       %{aivren gizzard},
-      %{antlers},
       %{ant larva},
+      %{antlers},
       %{ant pincer},
       %{arctic manticore mane},
       %{arctic titan toe},
@@ -254,8 +254,8 @@ describe GameObj do
     ].each do |skin_name|
       it "recognizes single #{skin_name} as a skin" do
         skin = GameObjFactory.item_from_name(skin_name)
-        expect(skin.type).to include "skin"
-        expect(skin.sellable.to_s).to include "furrier"
+        expect(skin.type).to eq "skin"
+        expect(skin.sellable.to_s).to eq "furrier"
       end
 
       pluralized_skin_name = if skin_name.end_with? "s"
