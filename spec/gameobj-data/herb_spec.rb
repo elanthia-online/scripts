@@ -167,10 +167,30 @@ describe GameObj do
       %{wyrmwood root potion},
       %{wyrmwood root tea},
       %{yabathilium fruit},
+      %{bunch of acantha leaf},
+      %{bunch of wolifrew lichen},
+      %{bunch of torban leaf},
+      %{bunch of woth flower},
+      %{bunch of ambrominas leaf},
+      %{bunch of ephlox moss},
+      %{bunch of cactacae spine},
+      %{bunch of calamia fruit},
+      %{bunch of aloeas stem},
+      %{bunch of haphip root},
+      %{bunch of basal moss},
+      %{bunch of pothinir grass},
+      %{bunch of sovyn clove},
+      %{large bolmara potion},
+      %{large rose-marrow potion},
+      %{large brostheras potion},
+      %{large talneo potion},
+      %{large wingstem potion},
+      %{large bur-clover potion},
     ].each do |herb_name|
       it "recognizes #{herb_name} as an herb" do
         herb = GameObjFactory.item_from_name(herb_name)
         expect(herb.type).to eq "herb"
+        expect(herb.sellable).to be nil
       end
     end
 
