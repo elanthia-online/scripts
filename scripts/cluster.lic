@@ -1,0 +1,300 @@
+require 'redis'
+require 'json'
+require 'ostruct'
+require 'securerandom'
+
+class Cluster
+  PERSONAL_GS_EVENTS = [%[gs], Char.name.downcase, %[*]].join(".")
+  PUBLIC_GS_EVENTS   = [%[gs], %[pub], %[*]].join(".")
+  NOOP               = -> channel, message {}
+  UNSUPPORTED_METHOD = -> channel, message { return {error: "#{channel} is not implemented on #{Char.name}"} }
+  TTL                = 5
+
+  attr_reader :cb_map, :pending_requests, 
+              :connected, :last_publish,
+              :keep_alive, :event_loop,
+              :pub, :sub
+
+  def initialize()
+    @cb_map           ||= {}
+    @pending_requests ||= {}
+    @connected        ||= {}
+    @last_publish     ||= 0
+    _connect()
+    _link()
+    _keepalive()
+  end
+
+  def _connect_local()
+    #Log.out("...connecting to local redis instance...")
+    @pub = Redis.new()
+    @sub = Redis.new()
+  end
+
+  def _connect_remote(url)
+    #Log.out("...connecting to remote redis instance at\n\n\t#{url}\n")
+    @pub = Redis.new(url: url)
+    @sub = Redis.new(url: url)
+  end
+
+  def _connect()
+    if url = Script.current.vars.find do |var| var.start_with?("--url=") end
+      _connect_remote(url.split("=").last)
+    else
+      _connect_local()
+    end
+  end
+
+  def connected
+    @connected
+  end
+
+  def alive?(name)
+    # 30s intervals
+    # 5s safety window for network latency
+    (@connected.fetch(name.capitalize, 0) - Time.now.to_i).to_i.abs < 60
+  end
+
+  def make_channel_name(*parts)
+    [%(gs), *[parts].flatten].compact.map(&:to_s).map(&:downcase).join(".")
+  end
+
+  def publish(*args)
+    @last_publish = Time.now
+    @pub.publish(*args)
+  end
+  
+  def emit(channel, **payload)
+    channel = make_channel_name(Char.name, channel)
+    #Log.out([channel, payload], label: %i[msg out])
+    publish(channel,
+      payload.merge({from: Char.name}).to_json())
+  end
+
+  def broadcast(channel, **payload)
+    channel = make_channel_name(%[pub], channel)
+    #Log.out([channel, payload], label: %i[msg broadcast])
+    publish(channel,
+      payload.merge({from: Char.name}).to_json())
+  end
+
+  def cast(person, channel: nil, **payload)
+    channel = make_channel_name(person, channel)
+    #Log.out([channel, **payload], label: %i[cast to])
+    publish(channel, 
+      payload.merge({from: Char.name}).to_json())
+  end
+
+  def request(person, **payload)
+    req_id = SecureRandom.hex(10)
+    cast(person,  
+      **payload.merge({ 
+        uuid:    req_id,
+        channel: [payload.fetch(:channel), %(request)]
+      }))
+    ttl = Time.now + TTL
+    @pending_requests[req_id] = ttl
+    
+    wait_while do pending_requests[req_id].is_a?(Time) and Time.now < ttl end
+    resp = pending_requests[req_id]
+    pending_requests.delete(req_id)
+    # request timed out
+    return TimeoutError.new("request to #{person} failed in #{TTL}s") if resp.is_a?(Time)
+    # remote or local error happened during response/request cycle
+    return Exception.new(resp.fetch(:error)) if resp.fetch(:error, false)
+    # it's a real boy!
+    return OpenStruct.new(resp)
+  end
+
+  def async_request(*args)
+    Thread.new do request(*args) end
+  end
+
+  def map(people, **payload)
+    people.map do |name| Thread.new do request(name, **payload) end end
+      .map(&:value)
+  end
+
+  def _route_incoming(channel, message)
+    begin
+      kind_of_channel = channel.split(".").last.to_sym
+      incoming = JSON.parse(message, symbolize_names: true)
+      return if incoming.fetch(:from).eql?(Char.name)
+      Log.out(incoming, label: %i[incoming] + channel.split(".")) if Script.current.vars.include?("--debug")
+      # keep alive for connected clients
+      _touch(channel, incoming)
+      return _handle_response(channel, incoming) if incoming[:uuid] and kind_of_channel.eql?(:response)
+      return _handle_request(channel, incoming)  if incoming[:uuid] and kind_of_channel.eql?(:request)
+      _handle_leave(channel, incoming) if kind_of_channel.eql?(:leave)
+      return _handle_cast(channel, incoming)
+    rescue Exception => err
+      Log.out(err, label: %i[dispatch error] + channel.split("."))
+    end
+  end
+
+  def _touch(_, incoming)
+    from = incoming.fetch(:from, false)
+    @connected[from] = Time.now if from
+  end
+
+  def _handle_leave(_, incoming)
+    from = incoming.fetch(:from, false)
+    @connected.delete(from) if from
+  end
+  
+  def _handle_cast(channel, incoming)
+    begin
+      #Log.out([channel, incoming], label: %i[in cast])
+      callback = @cb_map.fetch(channel, NOOP).call(channel, 
+        OpenStruct.new(incoming))
+    rescue Exception => err
+      Log.out(err, label: %i[dispatch error] + channel.split("."))
+    end
+  end
+
+  def _handle_request(channel, incoming)
+    begin 
+      #Log.out([channel, incoming], label: %i[in request])
+      callback = @cb_map.fetch(channel, UNSUPPORTED_METHOD)
+      response = callback.call(channel, 
+        OpenStruct.new(incoming))
+      _dispatch_response_object(incoming, response)
+    rescue Exception => err
+      #Log.out(err, label: %i[local request error] + channel.split("."))
+      _dispatch_response_object(incoming, {error: err.message})
+    end
+  end
+
+  def _handle_response(channel, incoming)
+    begin 
+      #Log.out([channel, incoming], label: %i[in response])
+      resp_id  = incoming.fetch(:uuid)
+      pending  = @pending_requests.fetch(resp_id, false)
+      @pending_requests[resp_id] = incoming if pending
+    rescue Exception => err
+      #Log.out(err, label: %i[local response error] + channel.split("."))
+      @pending_requests[resp_id] = err.message
+    end
+  end
+
+  def _dispatch_response_object(incoming, response)
+    from = incoming.fetch(:from, false) or fail "Request[`from` was missing]"
+    cast(from, 
+      **response.merge({
+          channel: [incoming.fetch(:uuid), %(response)],
+          uuid:    incoming.fetch(:uuid),
+          from:    Char.name,
+        }))
+  end
+
+  def on_broadcast(channel, &block)
+    fail "no block given to Cluster#on_broadcast" unless block_given?
+    @cb_map[%(gs.pub.#{channel.to_s}).downcase] = block
+    self
+  end
+
+  def on_cast(channel, &block)
+    fail "no block given to Cluster#on_cast" unless block_given?
+    @cb_map[%(gs.#{Char.name}.#{channel.to_s}).downcase] = block
+    self
+  end
+
+  def on_request(channel, &block)
+    fail "no block given to Cluster#on_request" unless block_given?
+    @cb_map[%(gs.#{Char.name}.#{channel.to_s}.request).downcase] = block
+    self
+  end
+
+  def _link()
+    @event_loop = Thread.new do 
+      begin
+        @sub.psubscribe(PERSONAL_GS_EVENTS, PUBLIC_GS_EVENTS) do |on|
+          on.psubscribe do |channel| Log.out(channel, label: %i[subscribed]) end
+          on.pmessage do |pattern, channel, message| _route_incoming(channel, message) end
+        end
+      rescue Redis::BaseConnectionError => error
+        Log.out "#{error}, retrying in 1s", label: %i[err conn]
+        sleep 1
+        retry
+      end
+    end
+  end
+
+  def _keepalive()
+    @keepalive = Thread.new do 
+      loop do 
+        broadcast(:ping) if ((Time.now - @last_publish).to_i > 30) # seconds
+        sleep 35
+      end
+    end
+  end
+
+  def destroy()
+    Log.out("cleaning up", label: %i[destroy])
+    broadcast(:leave)
+    [@event_loop, @keepalive].map(&:kill).each(&:join)
+  end
+
+  def self.of()
+    cluster = Cluster.new()
+    before_dying do cluster.destroy() end
+    cluster.on_request(:api) do |_, req| {methods: @cb_map.keys} end
+    cluster.on_broadcast(:announce) do |_, req| cluster.cast(req.from, channel: :ack) end
+    cluster.broadcast(:announce)
+    return cluster
+  end
+  
+  def self.cluster()
+    @cluster
+  end
+
+  def self.method_missing(method, *args, &block)
+    fail Exception, "Cluster.init() must be called before performing singleton Cluster actions" if @cluster.nil?
+    @cluster.send(method, *args, &block)
+  end
+
+  def self.parse(str)
+    JSON.parse(str, symbolize_names: true)
+  end
+
+  @cluster = nil
+  def self.init()
+    return @cluster unless @cluster.nil?
+    @cluster = Cluster.of()
+    @cluster
+  end
+
+  Cluster.init()
+end
+
+class Cluster
+  class Registry
+    attr_reader :namespace
+    def initialize(namespace = Char.name)
+      @namespace = namespace
+    end
+
+    def _key(str)
+      [@namespace, str].map(&:downcase).map(&:to_s).join(".")
+    end
+    
+    def put(key, val)
+      Cluster.pub.set(_key(key), val.to_json)
+    end
+
+    def get(key)
+      Cluster.parse(
+        Cluster.pub.get(
+          _key(key)))
+    end
+  end
+
+  def self.registry(namespace = nil)
+    Registry.new(namespace)
+  end
+end
+
+
+load("scripts/cluster_callbacks.rb") if Script.exists?("cluster_callbacks.rb")
+# keepalive
+loop do sleep(1) end 
