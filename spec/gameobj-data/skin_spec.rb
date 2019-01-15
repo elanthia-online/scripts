@@ -22,7 +22,9 @@ describe GameObj do
         %{black boar hide},
         %{black leopard paw},
         %{black urgh hide},
+        %{bleached thorn},
         %{blood red eagle feather},
+        %{blood-stained leaf},
         %{boar tusk},
         %{bobcat claw},
         %{brown bear skin},
@@ -48,6 +50,7 @@ describe GameObj do
         %{cyclops eye},
         %{daggerbeak wing},
         %{decaying troll eye},
+        %{desiccated stem},
         %{direbear fang},
         %{dirge skin},
         %{dobrem snout},
@@ -61,6 +64,7 @@ describe GameObj do
         %{fire giant mane},
         %{fire rat tail},
         %{fog beetle carapace},
+        %{frosted branch},
         %{frozen scalp},
         %{gak hide},
         %{gak pelt},
@@ -173,6 +177,7 @@ describe GameObj do
         %{shelfae crest},
         %{shelfae scale},
         %{shimmering wasp wing},
+        %{shriveled cutting},
         %{silverback orc knuckle},
         %{silver mane},
         %{silver-tipped horseshoe},
@@ -200,6 +205,7 @@ describe GameObj do
         %{tawny brindlecat hide},
         %{tegursh claw},
         %{tegu tailspike},
+        %{thorn-ridden appendage},
         %{thrak hide},
         %{thrak tail},
         %{tiger incisor},
@@ -322,36 +328,6 @@ describe GameObj do
         skin = GameObjFactory.item_from_name(%{fungal cap})
         expect(skin.type).to include "skin"
         expect(skin.type).to_not include "clothing"
-      end
-
-      describe "Frozen Bramble skins" do
-        [
-          %{blood-stained leaf},
-          %{desiccated stem},
-          %{thorn-ridden appendage},
-        ].each do |skin_name|
-          xit "recognizes #{skin_name} as a skin" do
-            skin = GameObjFactory.item_from_name(skin_name)
-            expect(skin.type).to include "skin"
-            expect(skin.sellable.to_s).to include "furrier"
-          end
-        end
-
-        [
-          %{bleached thorn},
-          %{frosted branch},
-          %{shriveled cutting},
-        ].each do |skin_name|
-          it "recognizes #{skin_name} as a skin" do
-            skin = GameObjFactory.item_from_name(skin_name)
-            expect(skin.type).to include "skin"
-          end
-
-          xit "recognizes #{skin_name} as sellable at the furrier" do
-            skin = GameObjFactory.item_from_name(skin_name)
-            expect(skin.sellable.to_s).to include "furrier"
-          end
-        end
       end
     end
   end
