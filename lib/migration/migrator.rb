@@ -61,9 +61,11 @@ module Migration
         fail TableNotFound, Color.red("Table[:#{table_name}] does not exist")
     end
 
-    def migrate(table_name, &migration)
-      table = assert_table_exists(table_name)
-      @changesets << ChangeSet.run(table, @file, &migration)
+    def migrate(*table_names, &migration)
+      table_names.each do |table_name|
+        table = assert_table_exists(table_name)
+        @changesets << ChangeSet.run(table, @file, &migration)
+      end
       self
     end
   end

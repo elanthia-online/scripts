@@ -10,16 +10,7 @@ migrate :aggressive_npc do
   insert(:name, "treekin sapling")
 end
 
-migrate :skin do
-  insert(:name, "direbear fang")
-  insert(:name, "heavy grey tusk")
-  insert(:name, "red eye")
-  insert(:name, "mossy beard")
-  insert(:name, "(?:some )?blood-stained bark")
-  insert(:name, "pure white feather")
-end
-
-migrate :furrier do
+migrate :skin, :furrier do
   insert(:name, "direbear fang")
   insert(:name, "heavy grey tusk")
   insert(:name, "red eye")
