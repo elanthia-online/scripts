@@ -12,6 +12,5 @@ migrate :furrier do
   insert(:name, "ruff of raptor feathers")
   insert(:name, "scintillating fishscale")
   insert(:name, "lump of black ambergris")
-  insert(:name, "polished shark tooth")
   insert(:name, "lump of grey ambergris")
 end
