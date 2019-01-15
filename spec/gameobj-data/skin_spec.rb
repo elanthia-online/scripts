@@ -32,6 +32,7 @@ describe GameObj do
         %{caedera skin},
         %{cave nipper skin},
         %{centaur hide},
+        %{centaur ranger hide},
         %{cerebralite tentacle},
         %{chimera stinger},
         %{cobra skin},
@@ -159,6 +160,7 @@ describe GameObj do
         %{rolton pelt},
         %{rotted canine},
         %{rotting rolton pelt},
+        %{ruff of raptor feathers},
         %{ruff of vulture feathers},
         %{salamander skin},
         %{scaly burgee shell},
@@ -355,6 +357,24 @@ describe GameObj do
   end
 
   describe "things that aren't skins" do
+    describe "that are sellable at the furrier" do
+      [
+        %{scintillating fishscale},
+        %{lump of black ambergris},
+        %{lump of grey ambergris},
+      ].each do |sellable_name|
+        it "recognizes #{sellable_name} is NOT a skin" do
+          item = GameObjFactory.item_from_name(sellable_name)
+          expect(item.type).to be_nil
+        end
+
+        it "recognizes #{sellable_name} as sellable at the furrier" do
+          item = GameObjFactory.item_from_name(sellable_name)
+          expect(item.sellable.to_s).to include "furrier"
+        end
+      end
+    end
+
     describe "horns that aren't skins" do
       [
         %{carved rowan horn banded with silvery mithril},
