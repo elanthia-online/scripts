@@ -21,3 +21,20 @@ end
 migrate :undead do
   insert(:name, "spectre")
 end
+
+migrate :gem do
+  delete(:noun, %{soulstone})
+  insert(:name, %{fiery viridian soulstone})
+  insert(:name, %{dull white soulstone})
+end
+
+migrate :reagent, :consignment do
+  insert(:name, %{cluster of ayanad crystals})
+  insert(:name, %{cluster of s'ayanad crystals})
+  insert(:name, %{cluster of t'ayanad crystals})
+  insert(:name, %{cracked soulstone})
+end
+
+migrate :consignment do
+  insert(:name, %{swirling grey potion})
+end

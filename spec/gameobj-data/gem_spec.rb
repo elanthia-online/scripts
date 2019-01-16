@@ -240,6 +240,7 @@ describe GameObj do
         %{brilliant wyrm's-tooth amethyst},
         %{deep blue thunderstone},
         %{dragon's-fang quartz},
+        %{dull white soulstone},
         %{eye-of-koar emerald},
         %{faceted black diamond},
         %{faceted midnight blue riftstone},
