@@ -8,11 +8,13 @@ describe GameObj do
         %{black crystal},
         %{blue crystal},
         %{bronze square},
+        %{cracked clay disc},
         %{crystalline prism},
         %{deathstone granules},
         %{dull gold coin},
         %{gold-framed clear crystal lens},
         %{granite triangle},
+        %{handful of fine firestone dust},
         %{heavy moonstone cube},
         %{heavy quartz orb},
         %{powdered iron filings},
@@ -36,12 +38,8 @@ describe GameObj do
         it "recognizes #{magic_item_name} as magic" do
           magic_item = GameObjFactory.item_from_name(magic_item_name)
           expect(magic_item.type).to include "magic"
-          expect(magic_item.sellable).to eq "pawnshop"
-        end
-
-        xit "excludes #{magic_item_name} from the jewelry type" do
-          magic_item = GameObjFactory.item_from_name(magic_item_name)
           expect(magic_item.type).to_not include "jewelry"
+          expect(magic_item.sellable).to eq "pawnshop"
         end
       end
 
@@ -113,10 +111,6 @@ describe GameObj do
         it "recognizes #{magic_item_name} as magic" do
           magic_item = GameObjFactory.item_from_name(magic_item_name)
           expect(magic_item.type).to include "magic"
-        end
-
-        xit "recognizes #{magic_item_name} as sellable at alchemy consignment" do
-          magic_item = GameObjFactory.item_from_name(magic_item_name)
           expect(magic_item.sellable).to eq "consignment"
         end
       end
@@ -165,36 +159,6 @@ describe GameObj do
           expect(magic_item.type).to include "magic"
           expect(magic_item.type).to include "food"
           expect(magic_item.type).to_not include "skin"
-        end
-      end
-    end
-
-    describe "magic items with data issues" do
-      describe "missing sellable data" do
-        [
-          %{handful of fine firestone dust},
-        ].each do |magic_item_name|
-          it "recognizes #{magic_item_name} as magic" do
-            magic_item = GameObjFactory.item_from_name(magic_item_name)
-            expect(magic_item.type).to include "magic"
-          end
-
-          xit "recognizes #{magic_item_name} as sellable at the pawnshop" do
-            magic_item = GameObjFactory.item_from_name(magic_item_name)
-            expect(magic_item.sellable).to eq "pawnshop"
-          end
-        end
-      end
-
-      describe "magic items not in existing data" do
-        [
-          %{cracked clay disc},
-        ].each do |magic_item_name|
-          xit "recognizes #{magic_item_name} as magic" do
-            magic_item = GameObjFactory.item_from_name(magic_item_name)
-            expect(magic_item.type).to include "magic"
-            expect(magic_item.sellable).to eq "pawnshop"
-          end
         end
       end
     end

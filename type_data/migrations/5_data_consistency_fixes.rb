@@ -35,6 +35,7 @@ migrate :reagent, :consignment do
   insert(:name, %{cluster of s'ayanad crystals})
   insert(:name, %{cluster of t'ayanad crystals})
   insert(:name, %{cracked soulstone})
+  insert(:name, %{jagged glossy black shard})
 end
 
 migrate :consignment do
@@ -55,6 +56,9 @@ migrate :uncommon do
 end
 
 migrate :pawnshop do
+  insert(:name, %{handful of fine firestone dust})
+  insert(:name, %{cracked clay disc})
+
   insert(:exclude, %{shard of dragonmist crystal})
   insert(:exclude, %{cinnabar crystal})
   insert(:exclude, %{chalky yellow cube})
@@ -64,10 +68,16 @@ migrate :pawnshop do
 end
 
 migrate :magic do
+  insert(:name, %{cracked clay disc})
+
   insert(:exclude, %{cinnabar crystal})
 end
 
 migrate :food do
   insert(:exclude, %{flower-shaped tart})
   insert(:exclude, %{musk ox tart})
+end
+
+migrate :jewelry do
+  insert(:exclude, %{crystal amulet})
 end
