@@ -63,6 +63,7 @@ describe GameObj do
         %{piece of green marble},
         %{piece of onyx},
         %{piece of petrified thanot},
+        %{piece of petrified maoral},
         %{piece of pink marble},
         %{piece of red jasper},
         %{piece of rose quartz},
@@ -504,19 +505,6 @@ describe GameObj do
         expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
         expect(GameObjFactory.item_from_name(valuable).type).to_not include "skin"
         expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
-      end
-    end
-
-    describe "with data issues" do
-      describe "with conflicting categories" do
-        [
-          %{piece of petrified maoral},
-        ].each do |valuable|
-          xit "recognizes #{valuable} as a valuable" do
-            expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          end
-        end
       end
     end
   end

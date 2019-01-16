@@ -89,3 +89,7 @@ end
 migrate :clothing, :pawnshop do
   insert(:exclude, %{fungal cap})
 end
+
+migrate :valuable do
+  delete(:name, %{piece of petrified maoral})
+end
