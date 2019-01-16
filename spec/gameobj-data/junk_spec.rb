@@ -13,29 +13,13 @@ describe GameObj do
       %{moldy bone},
       %{chipped brick},
       %{some tattered cloth},
+      %{steel shield},
+      %{scratched steel helm},
     ].each do |junk_name|
       it "recognizes #{junk_name} as junk" do
         junk = GameObjFactory.item_from_name(junk_name)
         expect(junk.type).to eq "junk"
         expect(junk.sellable).to be nil
-      end
-    end
-
-    describe "junk armor" do
-      [
-        %{steel shield},
-        %{scratched steel helm},
-      ].each do |junk_name|
-        it "recognizes #{junk_name} as junk" do
-          junk = GameObjFactory.item_from_name(junk_name)
-          expect(junk.type).to include "junk"
-        end
-
-        xit "recognizes #{junk_name} is NOT armor" do
-          junk = GameObjFactory.item_from_name(junk_name)
-          expect(junk.type).to_not include "armor"
-          expect(junk.sellable).to be nil
-        end
       end
     end
 
