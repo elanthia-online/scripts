@@ -34,7 +34,7 @@ describe GameObj do
             expect(junk.type).to eq "junk"
           end
 
-          xit "recognizes #{junk_name} as unsellable" do
+          it "recognizes #{junk_name} as unsellable" do
             junk = GameObjFactory.item_from_name(junk_name)
             expect(junk.sellable).to be nil
           end
@@ -86,6 +86,7 @@ describe GameObj do
         %{polished spike of argent topaz},
         %{polished sunset orange roestone},
         %{polished yellow-tinged sapphire},
+        %{princess-cut alexandrite stone},
         %{puce abyran-etched sphene},
         %{purple bruise-hued opal},
         %{purple plum-shaped pearl},
@@ -104,6 +105,7 @@ describe GameObj do
         %{spiny hedgehog-shaped gem},
         %{splinter of grey-veined azurite},
         %{splinter of pale dragonmist crystal},
+        %{thin-rayed black diamond starburst},
         %{thumb-sized blue-tinged tourmaline},
         %{thumb-sized mint green jade},
         %{thumb-sized sunny yellow dreamstone},
@@ -126,41 +128,6 @@ describe GameObj do
           expect(GameObjFactory.item_from_name(valuable).type).to_not include "uncommon"
 
           expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
-        end
-      end
-
-      describe "with data issues" do
-        [
-          %{thin-rayed black diamond starburst},
-        ].each do |valuable|
-          it "recognizes #{valuable} as a valuable" do
-            expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-            expect(GameObjFactory.item_from_name(valuable).type).to include "ebongate"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "skin"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "uncommon"
-          end
-
-          xit "recognizes #{valuable} as sellable at the gemshop" do
-            expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
-          end
-        end
-
-        [
-          %{princess-cut alexandrite stone},
-        ].each do |valuable|
-          it "recognizes #{valuable} as a valuable" do
-            expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-            expect(GameObjFactory.item_from_name(valuable).type).to include "ebongate"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "skin"
-
-            expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
-          end
-
-          xit "recognizes #{valuable} is NOT uncommon" do
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "uncommon"
-          end
         end
       end
     end

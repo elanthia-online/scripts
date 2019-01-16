@@ -38,3 +38,11 @@ end
 migrate :consignment do
   insert(:name, %{swirling grey potion})
 end
+
+migrate :gemshop do
+  insert(:name, %{thin-rayed black diamond starburst})
+end
+
+migrate :uncommon do
+  insert(:exclude, %{princess-cut alexandrite stone})
+end
