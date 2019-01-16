@@ -66,6 +66,7 @@ describe GameObj do
         %{fog beetle carapace},
         %{frosted branch},
         %{frozen scalp},
+        %{fungal cap},
         %{gak hide},
         %{gak pelt},
         %{ghoul finger},
@@ -320,14 +321,6 @@ describe GameObj do
           skin = GameObjFactory.item_from_name(skin_name)
           expect(skin.type).to include "skin"
         end
-      end
-    end
-
-    describe "skins with data issues" do
-      xit "recognizes fungal cap from shimmering fungus as a skin" do
-        skin = GameObjFactory.item_from_name(%{fungal cap})
-        expect(skin.type).to include "skin"
-        expect(skin.type).to_not include "clothing"
       end
     end
   end

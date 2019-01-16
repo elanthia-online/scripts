@@ -81,3 +81,11 @@ end
 migrate :jewelry do
   insert(:exclude, %{crystal amulet})
 end
+
+migrate :skin, :furrier do
+  insert(:name, %{fungal cap})
+end
+
+migrate :clothing, :pawnshop do
+  insert(:exclude, %{fungal cap})
+end
