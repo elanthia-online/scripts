@@ -125,6 +125,10 @@ describe GameObj do
 
       [
         %{ayanad crystal},
+        %{cluster of ayanad crystals},
+        %{cluster of s'ayanad crystals},
+        %{cluster of t'ayanad crystals},
+        %{cracked soulstone},
         %{crimson troll king bezoar},
         %{crystal core},
         %{crystalline globe},
@@ -166,23 +170,6 @@ describe GameObj do
           expect(GameObjFactory.item_from_name(reagent).sellable).to include "consignment"
         end
       end
-
-      describe "reagents with data issues" do
-        [
-          %{cluster of ayanad crystals},
-          %{cluster of s'ayanad crystals},
-          %{cluster of t'ayanad crystals},
-          %{cracked soulstone},
-        ].each do |reagent|
-          xit "recognizes #{reagent} as a reagent" do
-            expect(GameObjFactory.item_from_name(reagent).type).to include "reagent"
-            expect(GameObjFactory.item_from_name(reagent).type).to_not include "gem"
-            expect(GameObjFactory.item_from_name(reagent).type).to_not include "skin"
-
-            expect(GameObjFactory.item_from_name(reagent).sellable).to include "consignment"
-          end
-        end
-      end
     end
 
     describe "products" do
@@ -208,24 +195,11 @@ describe GameObj do
         %{silvery potion},
         %{diaphanous eight-sided crystal},
         %{dark translucent crystal},
+        %{swirling grey potion},
       ].each do |alchemy_product|
         it "recognizes #{alchemy_product} as an alchemy product" do
           expect(GameObjFactory.item_from_name(alchemy_product).type).to include "alchemy product"
           expect(GameObjFactory.item_from_name(alchemy_product).sellable).to include "consignment"
-        end
-      end
-
-      describe "products with data issues" do
-        [
-          %{swirling grey potion},
-        ].each do |alchemy_product|
-          it "recognizes #{alchemy_product} as an alchemy product" do
-            expect(GameObjFactory.item_from_name(alchemy_product).type).to include "alchemy product"
-          end
-
-          xit "recognizes #{alchemy_product} as sellable at alchemy consignment" do
-            expect(GameObjFactory.item_from_name(alchemy_product).sellable).to include "consignment"
-          end
         end
       end
     end
