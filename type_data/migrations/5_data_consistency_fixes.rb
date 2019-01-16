@@ -58,6 +58,7 @@ migrate :pawnshop do
   insert(:exclude, %{shard of dragonmist crystal})
   insert(:exclude, %{cinnabar crystal})
   insert(:exclude, %{chalky yellow cube})
+  insert(:exclude, %{(?:scratched|corroded|polished|shiny|tarnished|dented|rusty|bent) (?:ring|medallion|earring|anklet|bracelet|fork|plate|coin|cup|nail|spoon|doorknob|horseshoe)$})
 end
 
 migrate :magic do

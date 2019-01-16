@@ -60,10 +60,6 @@ describe GameObj do
         it "recognizes #{junk_name} as junk" do
           junk = GameObjFactory.item_from_name(junk_name)
           expect(junk.type).to eq "junk"
-        end
-
-        xit "recognizes #{junk_name} as unsellable" do
-          junk = GameObjFactory.item_from_name(junk_name)
           expect(junk.sellable).to be nil
         end
       end
