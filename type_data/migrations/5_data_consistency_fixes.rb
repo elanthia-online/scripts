@@ -63,3 +63,8 @@ end
 migrate :magic do
   insert(:exclude, %{cinnabar crystal})
 end
+
+migrate :food do
+  insert(:exclude, %{flower-shaped tart})
+  insert(:exclude, %{musk ox tart})
+end
