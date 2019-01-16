@@ -118,17 +118,13 @@ describe GameObj do
           lm_trap = GameObjFactory.item_from_name(lm_trap_name)
           expect(lm_trap.type).to include "lm trap"
           expect(lm_trap.type).to_not include "magic"
+          expect(lm_trap.type).to_not include "skin"
         end
 
-        xit "recognizes #{lm_trap_name} as sellable at the pawnshop" do
+        it "recognizes #{lm_trap_name} as sellable at the pawnshop" do
           lm_trap = GameObjFactory.item_from_name(lm_trap_name)
-          expect(lm_trap.sellable).to be "pawnshop"
+          expect(lm_trap.sellable).to eq "pawnshop"
         end
-      end
-
-      xit "recognizes steel jaws are NOT skins" do
-        lm_trap = GameObjFactory.item_from_name(%{steel jaws})
-        expect(lm_trap.type).to_not include "skin"
       end
     end
 
@@ -151,9 +147,9 @@ describe GameObj do
           expect(lm_trap.type).to include "magic"
         end
 
-        xit "recognizes #{lm_trap_name} as sellable at the pawnshop" do
+        it "recognizes #{lm_trap_name} as sellable at the gemshop" do
           lm_trap = GameObjFactory.item_from_name(lm_trap_name)
-          expect(lm_trap.sellable).to be "gemshop"
+          expect(lm_trap.sellable).to eq "gemshop"
         end
       end
     end
