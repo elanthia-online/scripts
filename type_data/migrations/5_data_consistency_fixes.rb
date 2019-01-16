@@ -26,6 +26,8 @@ migrate :gem do
   delete(:noun, %{soulstone})
   insert(:name, %{fiery viridian soulstone})
   insert(:name, %{dull white soulstone})
+  insert(:name, %{cinnabar crystal})
+  insert(:name, %{silvery galena})
 end
 
 migrate :reagent, :consignment do
@@ -41,8 +43,21 @@ end
 
 migrate :gemshop do
   insert(:name, %{thin-rayed black diamond starburst})
+  insert(:name, %{urglaes fang})
+  insert(:name, %{cinnabar crystal})
+  insert(:name, %{silvery galena})
 end
 
 migrate :uncommon do
   insert(:exclude, %{princess-cut alexandrite stone})
+end
+
+migrate :pawnshop do
+  insert(:exclude, %{shard of dragonmist crystal})
+  insert(:exclude, %{cinnabar crystal})
+  insert(:exclude, %{chalky yellow cube})
+end
+
+migrate :magic do
+  insert(:exclude, %{cinnabar crystal})
 end
