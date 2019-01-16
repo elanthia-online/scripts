@@ -554,9 +554,7 @@ describe GameObj do
         expect(GameObjFactory.item_from_name(plinite).type).to include "plinite"
         expect(GameObjFactory.item_from_name(plinite).type).to include "valuable"
         expect(GameObjFactory.item_from_name(plinite).type).to_not include "gem"
-      end
 
-      xit "recognizes a #{plinite} as sellable at the gemshop" do
         expect(GameObjFactory.item_from_name(plinite).sellable).to include "gemshop"
       end
     end

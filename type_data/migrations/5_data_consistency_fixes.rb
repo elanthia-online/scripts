@@ -46,6 +46,8 @@ migrate :gemshop do
   insert(:name, %{urglaes fang})
   insert(:name, %{cinnabar crystal})
   insert(:name, %{silvery galena})
+
+  insert(:noun, %{plinite})
 end
 
 migrate :uncommon do
