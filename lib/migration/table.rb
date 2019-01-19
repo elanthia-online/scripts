@@ -125,6 +125,12 @@ module Migration
       end
     end
     #
+    # creates a new key with an empty ruleset
+    #
+    def create_key(key)
+      insert(key)
+    end
+    #
     # dumps the table key/ruleset pairs to 
     # a Map(Key, Regexp) that can be used
     #

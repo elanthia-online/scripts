@@ -93,3 +93,9 @@ end
 migrate :valuable do
   delete(:name, %{piece of petrified maoral})
 end
+
+migrate :armor do
+  create_key(:exclude)
+  insert(:exclude, %{steel shield})
+  insert(:exclude, %{scratched steel helm})
+end
