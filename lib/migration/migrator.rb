@@ -33,7 +33,7 @@ module Migration
     def apply_creations()
       @changesets.each do |changeset|
         changeset.creates.each do |key|
-          Migration.log(%[#{changeset.table.log_name} CREATE KEY "#{key}"],
+          Migration.log(%[#{changeset.table.log_name} CREATE key "#{key}"],
             label: %i[changeset],
             color: :light_blue)
           changeset.table.create_key(key)
@@ -45,7 +45,7 @@ module Migration
       @changesets.each do |changeset| 
         changeset.inserts.each do |key, rules|
           rules.each do |rule|
-            Migration.log(%[#{changeset.table.log_name} INSERT "#{rule}"], 
+            Migration.log(%[#{changeset.table.log_name} INSERT #{key} "#{rule}"],
               label: %i[changeset],
               color: :green)
           end
@@ -58,7 +58,7 @@ module Migration
       @changesets.each do |changeset| 
         changeset.deletes.each do |key, rules|
           rules.each do |rule|
-            Migration.log(%[#{changeset.table.log_name} DELETE "#{rule}"], 
+            Migration.log(%[#{changeset.table.log_name} DELETE #{key} "#{rule}"],
               label: %i[changeset],
               color: :yellow)
           end
