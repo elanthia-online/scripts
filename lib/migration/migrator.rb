@@ -25,8 +25,20 @@ module Migration
     end
 
     def apply()
+      apply_creations()
       apply_insertions()
       apply_deletions()
+    end
+
+    def apply_creations()
+      @changesets.each do |changeset|
+        changeset.creates.each do |key|
+          Migration.log(%[#{changeset.table.log_name} CREATE KEY "#{key}"],
+            label: %i[changeset],
+            color: :light_blue)
+          changeset.table.create_key(key)
+        end
+      end
     end
 
     def apply_insertions()

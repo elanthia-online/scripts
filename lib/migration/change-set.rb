@@ -22,13 +22,18 @@ module Migration
       changeset
     end
 
-    attr_reader :table, :file, :inserts, :deletes
+    attr_reader :table, :file, :inserts, :deletes, :creates
     def initialize(table, file)
       @table   = table
       @file    = file
       @inserts = {}
       @deletes = {}
+      @creates = []
       @table.pending << self
+    end
+
+    def will_create?(key)
+      @creates.include?(key)
     end
 
     def assert_key_missing(key)
@@ -37,12 +42,12 @@ module Migration
     end
 
     def assert_key_exists(key)
-      @table.has_key?(key) or
+      (will_create?(key) || @table.has_key?(key)) or
         fail KeyError.new(self, %{should have key :#{key}})
     end
 
     def assert_rule_missing(key, rule)
-      @table.has_rule?(key, rule) and
+      (!will_create?(key) && @table.has_rule?(key, rule)) and
         fail RuleError.new(self, %{:#{key} already has Rule(#{rule})})
     end
 
@@ -67,9 +72,12 @@ module Migration
       self
     end
 
-    def create_key(key)
-      assert_key_missing(key)
-      fail Exception, "create_key() not implemented yet"
+    def create_key(*keys)
+      keys.each do |key|
+        assert_key_missing(key)
+        @creates = [*@creates, key]
+      end
+      self
     end
   end
 end
