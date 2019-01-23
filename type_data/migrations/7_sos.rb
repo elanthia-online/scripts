@@ -14,8 +14,4 @@ migrate :gem, :gemshop do
   insert(:name, %[oblong blue goldstone])
   insert(:name, %[dull grey crystal])
   insert(:name, %[pink salt crystal])
-  insert(:name, %[square of shale rock])
-  insert(:name, %[cloudy alexandrite shard])
-  insert(:name, %[dull grey crystal])
-  insert(:name, %[pink salt crystal])
 end
