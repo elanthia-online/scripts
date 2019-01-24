@@ -106,7 +106,7 @@ migrate :gem, :gemshop do
   insert(:name, %[ice blue diamond])
   insert(:name, %[nebulous emerald])
   insert(:name, %[lustrous black garnet])
-  insert(:name, %[ethereal blue gem])])
+  insert(:name, %[ethereal blue gem])
   insert(:name, %[teardrop of dark green heliotrope])
   insert(:name, %[spear of lavender-grey iolite])
   insert(:name, %[piece of jet-flecked ivory])
