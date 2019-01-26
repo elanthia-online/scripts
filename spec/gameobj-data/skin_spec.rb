@@ -328,8 +328,6 @@ describe GameObj do
     describe "that are sellable at the furrier" do
       [
         %{scintillating fishscale},
-        %{lump of black ambergris},
-        %{lump of grey ambergris},
       ].each do |sellable_name|
         it "recognizes #{sellable_name} is NOT a skin" do
           item = GameObjFactory.item_from_name(sellable_name)
