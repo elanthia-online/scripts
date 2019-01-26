@@ -12,7 +12,6 @@ describe GameObj do
         %{ant pincer},
         %{arctic manticore mane},
         %{arctic titan toe},
-        %{ash hag nose},
         %{basilisk crest},
         %{bat wing},
         %{bear claw},
