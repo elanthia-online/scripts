@@ -236,6 +236,90 @@ describe GameObj do
           expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
         end
       end
+
+      describe "REIM" do
+        [
+          %[ethereal barbarian],
+          %[ethereal knight],
+          %[ethereal pillager],
+          %[ethereal raider],
+          %[ethereal scout],
+          %[ethereal soldier],
+          %[ethereal waylayer],
+          %[ethereal zealot],
+          %[ethereal guard],
+          %[ethereal guardsman],
+          %[ethereal guardswoman],
+          %[ethereal inmate],
+          %[ethereal lunatic],
+          %[ethereal madman],
+          %[ethereal madwoman],
+          %[ethereal prisoner],
+          %[ethereal squire],
+          %[ethereal swordsman],
+          %[ethereal swordswoman],
+          %[ghostly bandit],
+          %[ghostly highwayman],
+          %[ghostly highwaywoman],
+          %[ghostly marauder],
+          %[ghostly waylayer],
+          %[unworldly barbarian],
+          %[unworldly knight],
+          %[unworldly pillager],
+          %[unworldly raider],
+          %[unworldly scout],
+          %[unworldly soldier],
+          %[unworldly waylayer],
+          %[unworldly zealot],
+          %[unworldly guest],
+          %[unworldly maid],
+          %[unworldly noble],
+          %[unworldly royal guard],
+          %[unworldly royal knight],
+          %[unworldly servant],
+          %[unworldly slave],
+          %[unworldly steward],
+          %[unworldly visitor],
+          %[celestial dancer],
+          %[celestial juggler],
+          %[celestial nomad],
+          %[celestial traveller],
+          %[Butler],
+          %[Cook],
+          %[Knight Captain],
+          %[Foreign Dignitary],
+          %[Royal Prince],
+          %[Royal Princess],
+          %[Royal Jester],
+          %[Royal Emperor],
+          %[Royal Empress],
+          %[Sapper Lord],
+          %[Sapper Lady],
+          %[Raid Leader],
+          %[Dark Knight],
+          %[Massive Butcher],
+          %[Slender Mercenary],
+          %[Darkly Hooded Figure],
+          %[Crimson Count],
+          %[Kennel Master],
+          %[Royal Inquisitor],
+          %[Towering Crusader],
+          %[Hulking Berserker],
+          %[Jester Ser Rets],
+          %[Dame Venti],
+          %[Corrupted Knight Owrym],
+          %[Arch Priest Dlitse],
+          %[Dame Elle Zo],
+          %[Thane Wedge],
+          %[Dark Astrologer Scionae],
+          %[speedy sapper],
+        ].each do |undead|
+          it "recognizes #{undead} as an undead aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+          end
+        end
+      end
     end
 
     describe "living" do
@@ -599,6 +683,34 @@ describe GameObj do
         it "recognizes #{creature} as an aggressive NPC" do
           expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
           expect(GameObjFactory.npc_from_name(creature).type).to_not include "undead"
+        end
+      end
+    end
+
+    describe "Sanctums of Scales NPCs" do
+      describe "living" do
+        [
+          %[lithe veiled sentinel],
+          %[pale scaled shaper],
+          %[deathsworn fanatic],
+          %[white sidewinder],
+        ].each do |creature|
+          it "recognizes #{creature} as an aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(creature).type).to_not include "undead"
+          end
+        end
+      end
+
+      describe "undead" do
+        [
+          %[shambling lurk],
+          %[patchwork flesh monstrosity],
+        ].each do |undead|
+          it "recognizes #{undead} as an undead aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+          end
         end
       end
     end

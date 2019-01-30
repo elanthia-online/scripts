@@ -15,3 +15,8 @@ migrate :gem, :gemshop do
   insert(:name, %[dull grey crystal])
   insert(:name, %[pink salt crystal])
 end
+
+migrate :magic, :pawnshop do
+  insert(:exclude, %[pink salt crystal])
+  insert(:exclude, %[dull grey crystal])
+end

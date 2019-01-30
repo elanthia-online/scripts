@@ -113,3 +113,11 @@ migrate :gem, :gemshop do
   insert(:name, %[silver-cored vortex stone])
   insert(:name, %[sliver of bright green viridine])
 end
+
+migrate :uncommon do
+  insert(:exclude, %[cone of mahogany obsidian])
+end
+
+migrate :magic, :pawnshop do
+  insert(:exclude, %[cluster of sky blue crystal])
+end
