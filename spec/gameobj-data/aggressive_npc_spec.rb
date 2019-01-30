@@ -602,5 +602,33 @@ describe GameObj do
         end
       end
     end
+
+    describe "Sanctums of Scales NPCs" do
+      describe "living" do
+        [
+          %[lithe veiled sentinel],
+          %[pale scaled shaper],
+          %[deathsworn fanatic],
+          %[white sidewinder],
+        ].each do |creature|
+          it "recognizes #{creature} as an aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(creature).type).to_not include "undead"
+          end
+        end
+      end
+
+      describe "undead" do
+        [
+          %[shambling lurk],
+          %[patchwork flesh monstrosity],
+        ].each do |undead|
+          it "recognizes #{undead} as an undead aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+          end
+        end
+      end
+    end
   end
 end

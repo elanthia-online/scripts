@@ -493,6 +493,19 @@ describe GameObj do
         end
       end
     end
+
+    describe "Sanctum of Scales" do
+      [
+        %[oblong blue goldstone],
+        %[dull grey crystal],
+        %[pink salt crystal],
+      ].each do |gem|
+        it "recognizes #{gem} as a gem" do
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
+        end
+      end
+    end
   end
 
   describe "valuable things which are not gems" do
