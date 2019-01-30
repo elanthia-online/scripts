@@ -508,6 +508,52 @@ describe GameObj do
     end
   end
 
+  describe "REIM" do
+    [
+      %[round of milky amber],
+      %[smoky amethyst],
+      %[hexagonal cobalt blue beryl],
+      %[chunk of bronzite],
+      %[marbled green chrysoprase],
+      %[cluster of sky blue crystal],
+      %[ice blue diamond],
+      %[nebulous emerald],
+      %[lustrous black garnet],
+      %[ethereal blue gem],
+      %[teardrop of dark green heliotrope],
+      %[spear of lavender-grey iolite],
+      %[piece of jet-flecked ivory],
+      %[piece of black jade],
+      %[piece of blue jade],
+      %[pebble of orbicular jasper],
+      %[cone of mahogany obsidian],
+      %[heart of blue onyx],
+      %[cloud opal],
+      %[iridescent wood opal],
+      %[jelly opal],
+      %[shard of pink petalite],
+      %[luminous prehnite],
+      %[snow quartz],
+      %[haloed Reim ruby],
+      %[pallid sapphire],
+      %[chunk of pale blue ice stone],
+      %[chunk of pearly grey ice stone],
+      %[chunk of snowy white ice stone],
+      %[slice of ribbon stone],
+      %[dark blue tempest stone],
+      %[faint gold tempest stone],
+      %[pale grey tempest stone],
+      %[ebon-cored vortex stone],
+      %[silver-cored vortex stone],
+      %[sliver of bright green viridine],
+    ].each do |gem|
+      it "recognizes #{gem} as a gem" do
+        expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+        expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
+      end
+    end
+  end
+
   describe "valuable things which are not gems" do
     [
       %{petrified tiger tooth},
