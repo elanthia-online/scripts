@@ -238,32 +238,49 @@ describe GameObj do
     end
 
     describe "clothing exclusions" do
-      [
-        %{composite bow},
-        %{short bow},
-        %{long bow},
+      describe "sellable" do
+        [
+          %{composite bow},
+          %{short bow},
+          %{long bow},
+        ].each do |item_name|
+          it "recognizes #{item_name} is NOT clothing" do
+            item = GameObjFactory.item_from_name(item_name)
+            expect(item.type.to_s).to_not include "clothing"
+          end
+        end
+      end
 
-        %{elemental bow},
-        %{elemental bow of acid},
-        %{elemental bow of lightning},
-        %{elemental bow of fire},
-        %{elemental bow of ice},
-        %{elemental bow of vibration},
+      describe "non-sellable" do
+        [
+          %{elemental bow},
+          %{elemental bow of acid},
+          %{elemental bow of lightning},
+          %{elemental bow of fire},
+          %{elemental bow of ice},
+          %{elemental bow of vibration},
 
-        %{bone vest},
-        %{dirty brown robes},
-        %{leather sandals},
-        %{leather skull cap},
-        %{some leather boots},
-        %{some leather sandals},
-        %{some flowing robes},
+          %{bone vest},
+          %{dirty brown robes},
+          %{leather sandals},
+          %{leather skull cap},
+          %{some flowing robes},
+          %{some heavy leather boots},
+          %{some leather boots},
+          %{some leather sandals},
+          %{some tattered white robes},
+          %{tattered plaid flannel shirt},
+          %{weathered plaid flannel cap},
+          %{woven cloak},
 
-        %{Adventurer's Guild voucher pack},
-        %{Elanthian Guilds voucher pack},
-      ].each do |item_name|
-        it "recognizes #{item_name} is NOT clothing" do
-          item = GameObjFactory.item_from_name(item_name)
-          expect(item.type.to_s).to_not include "clothing"
+          %{Adventurer's Guild voucher pack},
+          %{Elanthian Guilds voucher pack},
+        ].each do |item_name|
+          it "recognizes #{item_name} is NOT clothing" do
+            item = GameObjFactory.item_from_name(item_name)
+            expect(item.type.to_s).to_not include "clothing"
+            expect(item.sellable.to_s).to_not include "pawnshop"
+          end
         end
       end
     end

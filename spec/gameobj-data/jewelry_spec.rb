@@ -48,7 +48,7 @@ describe GameObj do
         end
       end
 
-      describe "randomized treasure system drops" do
+      describe "randomized treasure system drops", slow: true do
         # only have data for wearables so far
         # TODO: armband
         jewelry_nouns = %w[
