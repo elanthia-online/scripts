@@ -1,0 +1,350 @@
+=begin
+  Heal the wounds of another player.  
+  This script does not currently handle healing down
+  I usually run ;healself in background mode
+
+  * this is a beta release, as a triage for the new
+    healing updates.  If bugs are discovered, please
+    message me on discord @ondreian#3875
+  
+  example :
+    ;mend <Player1>, <Player2>,...<PlayerN>
+
+  author:  Ondreian
+  version: 0.0.1
+  tags: healing, beta
+=end
+require "ostruct"
+
+exit if dead?
+
+class String
+  def is_i?
+    !!(self =~ /\A[-+]?[0-9]+\z/)
+  end
+end
+
+class MatchData
+  def to_struct
+    OpenStruct.new to_hash
+  end
+
+  def to_hash
+    Hash[self.names.zip(self.captures.map(&:strip).map do |capture|  
+      if capture.is_i? then capture.to_i else capture end
+    end)]
+  end
+end
+
+class Hash
+  def to_struct
+    OpenStruct.new self
+  end
+end
+
+module Mend
+  ##
+  ## contextual logging
+  ##
+  module Log
+    def self.bold(msg)
+      _respond "<pushBold/>#{msg}<popBold/>"
+    end
+    
+    def self.out(msg, label: :debug)
+      return bold(_view(msg, label)) unless msg.is_a?(Exception)
+      bold _view(%{#{msg.message}#{msg.backtrace.join("\n")}}, :error)    
+    end
+
+    def self._view(msg, label)
+      %{[#{Script.current.name}.#{label}] #{msg}}
+    end
+
+    def self.pp(msg, label = :debug)
+      respond _view(msg, label)
+    end
+
+    def self.dump(*args)
+      pp *args
+    end
+  end
+  ##
+  ## XML utils
+  ##
+  module XML
+    def self.xml_on
+      Script.current.want_downstream_xml = true
+    end
+
+    def self.xml_off
+      Script.current.want_downstream_xml = false
+    end
+
+    def self.tap
+      xml_on
+      result = yield
+      xml_off
+      result
+    end
+
+    def self.lines(&block)
+      tap do 
+        while line = get
+          result = block.call(line)
+          break if result == :yield
+        end
+      end
+    end
+
+    def self.match(cmd, patt, timeout: 5)
+      XML.tap do
+        dothistimeout(cmd, timeout, patt)
+      end
+    end
+  end 
+  ##
+  ## compilable outcome branches
+  ##
+  class Outcomes
+    VAR = %r{\{\{(?<var>.*?)\}\}}
+    attr_reader :branches
+    def initialize(**branches)
+      @branches = branches
+    end
+
+    def method_missing(branch)
+      return @branches.fetch(branch) if @branches.has_key?(branch)
+      super branch
+    end
+
+    def compile(object)
+      Hash[@branches.map do |k, pattern|
+        [k,
+          %r{#{pattern.gsub(VAR) do |name|
+            name = name.match(VAR).to_struct.var.to_sym
+            if object.respond_to?(name)  
+              object.send(name) 
+            elsif object.respond_to?(:fetch) 
+              object.fetch(name)
+            elsif object.respond_to?(:[])
+              object[name]
+            else
+              raise Exception.new "could not serialize var: #{name} of #{object.class.name} in Outcome"
+            end
+          end}}]
+      end]
+    end
+
+    def with(str, object)
+      match(str, 
+        compile(object))
+    end
+
+    def match(str, outcomes = @branches)
+      return [] if str.nil?
+      
+      matches = []
+      outcomes.keys.each do |branch|
+        result = str.match(
+          outcomes.fetch(branch))
+        matches << [branch, result.to_struct] unless result.nil?
+      end
+      matches
+    end
+
+    def to_s
+      inspect
+    end
+
+    def only(str)
+      match(str).first
+    end
+
+    def try(command, outcomes: @branches, timeout: 2)
+      match(dothistimeout(command, timeout, 
+        Regexp.union(outcomes.values)), outcomes)
+    end
+
+    def try_with(command, object, timeout: 2)
+      try(command, 
+        outcomes: compile(object), 
+        timeout: timeout)
+    end
+
+    def try_with_xml(*args, **opts)
+      XML.tap do
+        try_with(*args, **opts)
+      end
+    end
+
+    def try_specific(*args, **opts)
+      try_with_xml(*args, **opts).first
+    end
+  end
+  ##
+  ## outcomes of appraise <Person>
+  ##
+  APPRAISE = Outcomes.new(
+    noop:      %{^You take a quick appraisal of {{noun}} and find that (he|she) has no apparent injuries.$},
+    scars:     %{^(He|She) has},
+    wounds:    %{^You take a quick appraisal of {{noun}} and find that (he|she) has (?<wounds>.*).},
+    not_found: %{^Appraise what?$},
+  )
+  ##
+  ## transfer <Person> <Location>
+  ##
+  TRANSFER_WOUND = Outcomes.new(
+    # Etanamir's head wound gradually fades, forming on your head instead.
+    success:   %{{{noun}}'s (?<location>.*?) wound gradually fades|{{noun}}'s nervous system damage gradually fades},
+    not_found: %{^Transfer from whom?$},
+    retry:     %{simply attempt the healing process again},
+  )
+  ##
+  ##
+  ##
+  TRANSFER_BLOOD = Outcomes.new(
+    some: %{You take some},
+    all:  %{You take all},
+    noop: %{Nothing happens},
+  )
+  ##
+  ## sub outcomes for appraise <Person>
+  ## where <Person> has injuries
+  ##
+  LEVEL_1_WOUNDS = Outcomes.new(
+    eye:    %{a bruised (?<location>.*)},
+    head:   %{minor bruises about the head},
+    neck:   %{minor bruises on (his|her) neck},
+    torso:  %{minor cuts and bruises on (his|her) (?<location>(chest|abdom|back))},
+    limbs:  %{minor cuts and bruises on (his|her) (?<location>(left|right) (arm|hand|leg))},
+    nerves: %{a strange case of muscle twitching},
+  )
+
+  LEVEL_2_WOUNDS = Outcomes.new(
+    eye:    %{a swollen (?<location>.*)},
+    head:   %{minor lacerations about the head and a possible mild concussion},
+    neck:   %{moderate bleeding from (his|her) neck},
+    torso:  %{deep lacerations across (his|her) (?<location>(chest|abdom|back))},
+    limbs:  %{a fractured and bleeding (?<location>(left|right) (arm|hand|leg))},
+    nerves: %{a case of sporadic convulsions}
+  )
+
+  LEVEL_3_WOUNDS = Outcomes.new(
+    eye:    %{a blinded (?<location>.*)},
+    head:   %{severe head trauma and bleeding from the ears},
+    neck:   %{snapped bones and serious bleeding from the neck},
+    torso:  %{deep gashes and serious bleeding from (his|her) (?<location>(chest|abdom|back))},
+    limbs:  %{a completely severed (?<location>(left|right) (arm|hand|leg))},
+    nerves: %{a case of uncontrollable convulsions},
+  )
+
+  WOUNDS = [
+    LEVEL_1_WOUNDS, LEVEL_2_WOUNDS, LEVEL_3_WOUNDS,
+  ]
+
+  WOUND_COSTS = {
+    limbs:  [2, 7],
+    head:   [4, 9],
+    neck:   [4, 9],
+    torso:  [5, 10],
+    eye:    [5, 10],
+    nerves: [3, 8],
+  }
+
+  def self.fetch(target)
+    GameObj.pcs.find do |pc|
+      pc.noun.downcase.start_with?(target.downcase)
+    end
+  end
+
+  def self.scan(name)
+    unless target = fetch(name)
+      Log.out %{could not find #{name}}, label: :not_found
+    else
+      outcome, data = APPRAISE.try_with("appraise ##{target.id}", target).first
+      case outcome
+      when :noop
+        Log.out %{#{target.noun} is not injured}, label: outcome
+      when :not_found
+        Log.out %{#{target.noun} is not here}, label: outcome
+      when :wounds
+        Mend.parse(data.wounds).each_slice(2).with_index do |wound, severity|
+          Mend.transfer_wound(*([target] + wound + [severity + 1]))
+        end
+        ##
+        ## CoL signs + death + bleeders = -40k blood
+        ## 
+        Mend.transfer_blood(target) unless target.status.include?("dead")
+        Mend.heal_down
+      else
+        Log.out Exception.new %{unhandled outcome : #{outcome || :unknown}}
+      end
+    end
+  end
+
+  def self.scan_wounds(outcomes, str)
+    #echo outcomes
+    outcomes.match(str).map do |type, data|
+      [type, data.location || type]
+    end
+  end
+
+  def self.parse(str)
+    WOUNDS.map do |outcomes|
+      scan_wounds(outcomes, str)
+    end.flatten
+  end
+
+  def self.transfer_wound(target, type, location, severity)
+    waitrt?
+    waitcastrt?
+    outcome, data = TRANSFER_WOUND.try_with("transfer ##{target.id} #{location}", target).first
+    case outcome
+    when :not_found
+      raise Exception.new %{#{target.noun} left the area}
+    when :success
+      # silence is golden
+    when :retry
+      return transfer_wound(target, type, location, severity)
+    else
+      Log.out %{Outcome<#{outcome}> did not match for #{location}:#{severity} #{target.noun}}
+    end
+  end
+
+  def self.transfer_blood(target)
+    Mend.cure_blood
+    outcome, data = TRANSFER_BLOOD.try_with("transfer ##{target.id}", target).first
+    return transfer_blood(target) if outcome.eql?(:some)
+  end
+
+  def self.heal_down
+    Mend.cure_blood
+    # defer to healself if it's running
+    return if Script.running?("healself")
+    # TODO: add healdown logic
+  end
+  ##
+  ## lulz
+  ##
+  def self.cure_blood
+    wait_while do
+      checkmana < 10
+    end
+    while percenthealth < 100
+      fput "cure"
+      sleep 3
+      waitcastrt?
+      waitrt?  
+    end
+  end
+
+  def self.run()
+    Script.pause("healself") if Script.running?("healself")
+    Script.current.vars[1..-1].each do |target|
+      Mend.scan(target)
+    end
+    Script.unpause("healself") if Script.running?("healself") and Script.paused?("healself").eql?(true)
+  end
+
+  run()
+end
