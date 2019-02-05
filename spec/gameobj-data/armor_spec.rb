@@ -2,7 +2,14 @@ require 'lich/gameobj'
 require 'spec/factories'
 
 describe GameObj do
+  junk_armor_drops = [
+    %{some dirty brown robes},
+    %{some flowing robes},
+    %{some tattered white robes},
+  ]
+
   describe "armor" do
+
     describe "randomized treasure system drops" do
       spikes = [
         %{},
@@ -82,6 +89,7 @@ describe GameObj do
 
         robe_adjectives.product(colors, materials).each do |(adjective, color, material)|
           armor_name = %{some #{adjective}#{color}#{material}robes}
+          next if junk_armor_drops.include?(armor_name)
 
           it "recognizes #{armor_name} as armor" do
             armor = GameObjFactory.item_from_name(armor_name)
@@ -275,14 +283,28 @@ describe GameObj do
       %{some leathers},
       %{some leather armor},
       %{some chain armor},
+      %{leather breastplate},
+      %{metal breastplate},
       %{some plate armor},
+      %{some full plate},
+      %{some half plate},
 
       %{mantlet},
     ].each do |armor_name|
       it "recognizes #{armor_name} as armor" do
         armor = GameObjFactory.item_from_name(armor_name)
-        expect(armor.type).to include "armor"
+        expect(armor.type).to eq "armor"
         expect(armor.sellable).to eq "pawnshop"
+      end
+    end
+  end
+
+  describe "things that are not armor" do
+    junk_armor_drops.each do |item_name|
+      it "recognizes #{item_name} is NOT armor" do
+        item = GameObjFactory.item_from_name(item_name)
+        expect(item.type.to_s).to_not include "armor"
+        expect(item.sellable.to_s).to_not include "pawnshop"
       end
     end
   end

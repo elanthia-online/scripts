@@ -25,15 +25,27 @@ module Migration
     end
 
     def apply()
+      apply_creations()
       apply_insertions()
       apply_deletions()
+    end
+
+    def apply_creations()
+      @changesets.each do |changeset|
+        changeset.creates.each do |key|
+          Migration.log(%[#{changeset.table.log_name} CREATE key "#{key}"],
+            label: %i[changeset],
+            color: :light_blue)
+          changeset.table.create_key(key)
+        end
+      end
     end
 
     def apply_insertions()
       @changesets.each do |changeset| 
         changeset.inserts.each do |key, rules|
           rules.each do |rule|
-            Migration.log(%[#{changeset.table.log_name} INSERT "#{rule}"], 
+            Migration.log(%[#{changeset.table.log_name} INSERT #{key} "#{rule}"],
               label: %i[changeset],
               color: :green)
           end
@@ -46,7 +58,7 @@ module Migration
       @changesets.each do |changeset| 
         changeset.deletes.each do |key, rules|
           rules.each do |rule|
-            Migration.log(%[#{changeset.table.log_name} DELETE "#{rule}"], 
+            Migration.log(%[#{changeset.table.log_name} DELETE #{key} "#{rule}"],
               label: %i[changeset],
               color: :yellow)
           end
@@ -61,9 +73,11 @@ module Migration
         fail TableNotFound, Color.red("Table[:#{table_name}] does not exist")
     end
 
-    def migrate(table_name, &migration)
-      table = assert_table_exists(table_name)
-      @changesets << ChangeSet.run(table, @file, &migration)
+    def migrate(*table_names, &migration)
+      table_names.each do |table_name|
+        table = assert_table_exists(table_name)
+        @changesets << ChangeSet.run(table, @file, &migration)
+      end
       self
     end
   end

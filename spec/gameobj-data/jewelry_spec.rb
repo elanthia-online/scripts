@@ -24,15 +24,20 @@ describe GameObj do
         earrings
         ewer
         flagon
+        flask
         goblet
         headband
+        jug
         medallion
         neckchain
         necklace
         pendant
         pin
+        pitcher
+        plate
         platter
         ring
+        scepter
         stein
         stickpin
         talisman
@@ -48,7 +53,7 @@ describe GameObj do
         end
       end
 
-      describe "randomized treasure system drops" do
+      describe "randomized treasure system drops", slow: true do
         # only have data for wearables so far
         # TODO: armband
         jewelry_nouns = %w[

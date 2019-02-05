@@ -125,6 +125,12 @@ module Migration
       end
     end
     #
+    # creates a new key with an empty ruleset
+    #
+    def create_key(key)
+      insert(key)
+    end
+    #
     # dumps the table key/ruleset pairs to 
     # a Map(Key, Regexp) that can be used
     #
@@ -136,6 +142,7 @@ module Migration
       # name rules are different, as they can be quite convoluted
       regex_map[:name] = Convert.ruleset_to_regex(name_rules, prefix, suffix) unless name_rules.eql?(false)
       @rules.select do |kind| (%i[name prefix] & [kind]).empty? end.each do |kind, ruleset|
+        next if ruleset.empty?
         regex_map[kind] = Validate.regexp(self, kind,
           Convert.ruleset_to_regex(ruleset))
       end

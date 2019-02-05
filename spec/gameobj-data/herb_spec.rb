@@ -29,7 +29,21 @@ describe GameObj do
       %{brostheras potion},
       %{brown weedroot ale},
       %{bubbling brown ale},
+      %{bunch of acantha leaf},
+      %{bunch of aloeas stem},
+      %{bunch of ambrominas leaf},
+      %{bunch of basal moss},
+      %{bunch of cactacae spine},
+      %{bunch of calamia fruit},
+      %{bunch of ephlox moss},
+      %{bunch of haphip root},
+      %{bunch of pothinir grass},
+      %{bunch of sovyn clove},
+      %{bunch of torban leaf},
+      %{bunch of wolifrew lichen},
+      %{bunch of woth flower},
       %{bur-clover potion},
+      %{candied ptarmigan feather},
       %{chunky black ale},
       %{crushed cavegrass tea},
       %{crystalline bolmara elixir},
@@ -67,6 +81,7 @@ describe GameObj do
       %{flagon of Semak's Smooth ale},
       %{flagon of Volcano Vision ale},
       %{flagon of Wort's Winter ale},
+      %{flower-shaped tart},
       %{gelatinous elk fat tart},
       %{ginkgo nut potion},
       %{glowing mold tea},
@@ -74,10 +89,17 @@ describe GameObj do
       %{grainy black potion},
       %{grey mushroom potion},
       %{iceberry tart},
+      %{large bolmara potion},
+      %{large brostheras potion},
+      %{large bur-clover potion},
+      %{large rose-marrow potion},
+      %{large talneo potion},
+      %{large wingstem potion},
       %{Leaftoe's lichen tart},
       %{Ma Leaftoe's spiced torban tart},
       %{manroot potion},
       %{manroot tea},
+      %{musk ox tart},
       %{pennyroyal potion},
       %{pennyroyal tea},
       %{red lichen potion},
@@ -114,6 +136,7 @@ describe GameObj do
       %{some prickly cactacae spine},
       %{some red lichen tea},
       %{some ripe calamia fruit},
+      %{some rock ptarmigan feathers},
       %{some sovyn clove},
       %{some spicy acantha leaf},
       %{some sugary ambrominas leaf},
@@ -167,66 +190,11 @@ describe GameObj do
       %{wyrmwood root potion},
       %{wyrmwood root tea},
       %{yabathilium fruit},
-      %{bunch of acantha leaf},
-      %{bunch of wolifrew lichen},
-      %{bunch of torban leaf},
-      %{bunch of woth flower},
-      %{bunch of ambrominas leaf},
-      %{bunch of ephlox moss},
-      %{bunch of cactacae spine},
-      %{bunch of calamia fruit},
-      %{bunch of aloeas stem},
-      %{bunch of haphip root},
-      %{bunch of basal moss},
-      %{bunch of pothinir grass},
-      %{bunch of sovyn clove},
-      %{large bolmara potion},
-      %{large rose-marrow potion},
-      %{large brostheras potion},
-      %{large talneo potion},
-      %{large wingstem potion},
-      %{large bur-clover potion},
     ].each do |herb_name|
       it "recognizes #{herb_name} as an herb" do
         herb = GameObjFactory.item_from_name(herb_name)
         expect(herb.type).to eq "herb"
         expect(herb.sellable).to be nil
-      end
-    end
-
-    describe "herbs with data issues" do
-      describe "herbs that need to be excluded from skins" do
-        [
-          %{candied ptarmigan feather},
-          %{some rock ptarmigan feathers},
-        ].each do |herb_name|
-          it "recognizes #{herb_name} as an herb" do
-            herb = GameObjFactory.item_from_name(herb_name)
-            expect(herb.type).to include "herb"
-          end
-
-          xit "recognizes #{herb_name} as NOT a skin" do
-            herb = GameObjFactory.item_from_name(herb_name)
-            expect(herb.type).to_not include "skin"
-          end
-        end
-      end
-
-      describe "herbs that need to be excluded from food" do
-        [
-          %{flower-shaped tart},
-          %{musk ox tart},
-        ].each do |herb_name|
-          it "recognizes #{herb_name} as an herb" do
-            herb = GameObjFactory.item_from_name(herb_name)
-            expect(herb.type).to include "herb"
-          end
-
-          xit "recognizes #{herb_name} as NOT food" do
-            herb = GameObjFactory.item_from_name(herb_name)
-            expect(herb.type).to_not include "food"
-          end
-        end
       end
     end
   end

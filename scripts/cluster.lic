@@ -35,6 +35,12 @@ class Cluster
     def self.dump(*args)
       pp *args
     end
+
+    module Preset
+      def self.as(kind, body)
+        %[<preset id="#{kind}">#{body}</preset>]
+      end
+    end
   end
   ##
   ## minimal options parser
@@ -79,7 +85,7 @@ class Cluster
   PUBLIC_GS_EVENTS   = [%[gs], %[pub], %[*]].join(".")
   NOOP               = -> channel, message {}
   UNSUPPORTED_METHOD = -> channel, message { return {error: "#{channel} is not implemented on #{Char.name}"} }
-  TTL                = 1
+  TTL                = 5
 
   attr_reader :cb_map, :pending_requests, 
               :connected, :last_publish,
@@ -109,7 +115,7 @@ class Cluster
   end
 
   def _connect()
-    if url = Script.current.vars.find do |var| var.start_with?("--url=") end
+    if url = Opts.url
       _connect_remote(url.split("=").last)
     else
       _connect_local()
@@ -163,14 +169,16 @@ class Cluster
         uuid:    req_id,
         channel: [payload.fetch(:channel), %(request)]
       }))
-    ttl = Time.now + TTL
-    @pending_requests[req_id] = ttl
-    
-    wait_while do pending_requests[req_id].is_a?(Time) and Time.now < ttl end
+    ttl = payload.fetch(:timeout, TTL)
+    @pending_requests[req_id] = Thread.current
+    timeout_thread = Thread.new { sleep ttl; @pending_requests[req_id].wakeup }
+    Thread.stop
+
+    timeout_thread.kill
     resp = pending_requests[req_id]
     pending_requests.delete(req_id)
     # request timed out
-    return TimeoutError.new("request to #{person} failed in #{TTL}s") if resp.is_a?(Time)
+    return TimeoutError.new("request to #{person} failed in #{ttl}s") if resp.is_a?(Thread)
     # remote or local error happened during response/request cycle
     return Exception.new(resp.fetch(:error)) if resp.fetch(:error, false)
     # it's a real boy!
@@ -216,7 +224,7 @@ class Cluster
   def _handle_cast(channel, incoming)
     begin
       #Log.out([channel, incoming], label: %i[in cast])
-      callback = @cb_map.fetch(channel, NOOP).call(channel, 
+      _callback = @cb_map.fetch(channel, NOOP).call(channel, 
         OpenStruct.new(incoming))
     rescue Exception => err
       Log.out(err, label: %i[dispatch error] + channel.split(".")) and defined?(Log)
@@ -242,6 +250,7 @@ class Cluster
       resp_id  = incoming.fetch(:uuid)
       pending  = @pending_requests.fetch(resp_id, false)
       @pending_requests[resp_id] = incoming if pending
+      pending.wakeup
     rescue Exception => err
       #Log.out(err, label: %i[local response error] + channel.split("."))
       @pending_requests[resp_id] = err.message
@@ -284,7 +293,7 @@ class Cluster
           on.pmessage do |pattern, channel, message| _route_incoming(channel, message) end
         end
       rescue Redis::BaseConnectionError => error
-        Log.out(err, label: %i[err conn]) and defined?(Log)
+        Log.out(error, label: %i[err conn]) and defined?(Log)
         sleep 1
         retry
       end
@@ -294,7 +303,7 @@ class Cluster
   def _keepalive()
     @keepalive = Thread.new do 
       loop do 
-        broadcast(:ping) if ((Time.now - @last_publish).to_i > 30) # seconds
+        broadcast(:ping)
         sleep 35
       end
     end
@@ -319,8 +328,13 @@ class Cluster
     @cluster
   end
 
+  def self.up?
+    not @cluster.nil?
+  end
+
   def self.method_missing(method, *args, &block)
-    fail Exception, "Cluster.init() must be called before performing singleton Cluster actions" if @cluster.nil?
+    Cluster.init()
+    fail Exception, "Cluster.init() must be called before performing singleton Cluster actions" unless up?
     @cluster.send(method, *args, &block)
   end
 
@@ -330,7 +344,7 @@ class Cluster
 
   @cluster = nil
   def self.init()
-    return @cluster unless @cluster.nil?
+    return @cluster if up?
     @cluster = Cluster.of()
     @cluster
   end

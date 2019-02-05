@@ -43,6 +43,24 @@ describe GameObj do
         box = GameObjFactory.item_from_name(full_box_description)
         expect(box.type).to eq "box"
       end
+
+    end
+
+    short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals)
+    short_box_descriptions.each do |noun, material|
+      short_box_description = "#{material} #{noun}"
+
+      it "recognizes #{short_box_description} as a box" do
+        box = GameObjFactory.item_from_name(short_box_description)
+        expect(box.type).to eq "box"
+      end
+
+      phased_box_description = "shifting #{short_box_description}"
+
+      it "recognizes #{phased_box_description} as a phased box" do
+        box = GameObjFactory.item_from_name(phased_box_description)
+        expect(box.type).to eq "box"
+      end
     end
 
     describe "things that are not boxes" do
@@ -118,17 +136,13 @@ describe GameObj do
           lm_trap = GameObjFactory.item_from_name(lm_trap_name)
           expect(lm_trap.type).to include "lm trap"
           expect(lm_trap.type).to_not include "magic"
+          expect(lm_trap.type).to_not include "skin"
         end
 
-        xit "recognizes #{lm_trap_name} as sellable at the pawnshop" do
+        it "recognizes #{lm_trap_name} as sellable at the pawnshop" do
           lm_trap = GameObjFactory.item_from_name(lm_trap_name)
-          expect(lm_trap.sellable).to be "pawnshop"
+          expect(lm_trap.sellable).to eq "pawnshop"
         end
-      end
-
-      xit "recognizes steel jaws are NOT skins" do
-        lm_trap = GameObjFactory.item_from_name(%{steel jaws})
-        expect(lm_trap.type).to_not include "skin"
       end
     end
 
@@ -151,9 +165,9 @@ describe GameObj do
           expect(lm_trap.type).to include "magic"
         end
 
-        xit "recognizes #{lm_trap_name} as sellable at the pawnshop" do
+        it "recognizes #{lm_trap_name} as sellable at the gemshop" do
           lm_trap = GameObjFactory.item_from_name(lm_trap_name)
-          expect(lm_trap.sellable).to be "gemshop"
+          expect(lm_trap.sellable).to eq "gemshop"
         end
       end
     end

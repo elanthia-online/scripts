@@ -12,7 +12,6 @@ describe GameObj do
         %{ant pincer},
         %{arctic manticore mane},
         %{arctic titan toe},
-        %{ash hag nose},
         %{basilisk crest},
         %{bat wing},
         %{bear claw},
@@ -22,7 +21,9 @@ describe GameObj do
         %{black boar hide},
         %{black leopard paw},
         %{black urgh hide},
+        %{bleached thorn},
         %{blood red eagle feather},
+        %{blood-stained leaf},
         %{boar tusk},
         %{bobcat claw},
         %{brown bear skin},
@@ -32,6 +33,7 @@ describe GameObj do
         %{caedera skin},
         %{cave nipper skin},
         %{centaur hide},
+        %{centaur ranger hide},
         %{cerebralite tentacle},
         %{chimera stinger},
         %{cobra skin},
@@ -46,7 +48,9 @@ describe GameObj do
         %{curved gold-flecked claw},
         %{cyclops eye},
         %{daggerbeak wing},
+        %{dark panther pelt},
         %{decaying troll eye},
+        %{desiccated stem},
         %{direbear fang},
         %{dirge skin},
         %{dobrem snout},
@@ -60,7 +64,9 @@ describe GameObj do
         %{fire giant mane},
         %{fire rat tail},
         %{fog beetle carapace},
+        %{frosted branch},
         %{frozen scalp},
+        %{fungal cap},
         %{gak hide},
         %{gak pelt},
         %{ghoul finger},
@@ -80,6 +86,7 @@ describe GameObj do
         %{griffin pelt},
         %{grifflet pelt},
         %{grizzly bear hide},
+        %{hag nose},
         %{heavy grey tusk},
         %{hisskra crest},
         %{hisskra skin},
@@ -99,6 +106,8 @@ describe GameObj do
         %{krynch shinbone},
         %{leaper hide},
         %{leopard skin},
+        %{lump of black ambergris},
+        %{lump of grey ambergris},
         %{lynx pelt},
         %{madrinol skin},
         %{mammoth arachnid mandible},
@@ -136,10 +145,12 @@ describe GameObj do
         %{orc scalp},
         %{pair of caribou antlers},
         %{pale crab pincer},
+        %{pale troll tongue},
         %{pale white feather},
         %{panther pelt},
         %{plains lion skin},
         %{polar bear skin},
+        %{pra'eda canine},
         %{pulsating firethorn},
         %{puma hide},
         %{puma paw},
@@ -159,18 +170,24 @@ describe GameObj do
         %{rolton pelt},
         %{rotted canine},
         %{rotting rolton pelt},
+        %{ruffed black griffin pelt},
+        %{ruffed tawny griffin pelt},
+        %{ruffed white griffin pelt},
+        %{ruff of raptor feathers},
         %{ruff of vulture feathers},
         %{salamander skin},
         %{scaly burgee shell},
         %{scorched lich finger bone},
         %{scorpion stinger},
         %{scraggly orc scalp},
+        %{scraggly swamp troll scalp},
         %{scrap of troll skin},
         %{seeker eye},
         %{sheer white spider mandible},
         %{shelfae crest},
         %{shelfae scale},
         %{shimmering wasp wing},
+        %{shriveled cutting},
         %{silverback orc knuckle},
         %{silver mane},
         %{silver-tipped horseshoe},
@@ -184,6 +201,8 @@ describe GameObj do
         %{snake skin},
         %{snowcat pelt},
         %{snowy cockatrice tailfeather},
+        %{soft blue griffin feather},
+        %{soft grifflet pelt},
         %{spectre nail},
         %{spectre skin},
         %{spider leg},
@@ -198,6 +217,7 @@ describe GameObj do
         %{tawny brindlecat hide},
         %{tegursh claw},
         %{tegu tailspike},
+        %{thorn-ridden appendage},
         %{thrak hide},
         %{thrak tail},
         %{tiger incisor},
@@ -314,47 +334,25 @@ describe GameObj do
         end
       end
     end
-
-    describe "skins with data issues" do
-      xit "recognizes fungal cap from shimmering fungus as a skin" do
-        skin = GameObjFactory.item_from_name(%{fungal cap})
-        expect(skin.type).to include "skin"
-        expect(skin.type).to_not include "clothing"
-      end
-
-      describe "Frozen Bramble skins" do
-        [
-          %{blood-stained leaf},
-          %{desiccated stem},
-          %{thorn-ridden appendage},
-        ].each do |skin_name|
-          xit "recognizes #{skin_name} as a skin" do
-            skin = GameObjFactory.item_from_name(skin_name)
-            expect(skin.type).to include "skin"
-            expect(skin.sellable.to_s).to include "furrier"
-          end
-        end
-
-        [
-          %{bleached thorn},
-          %{frosted branch},
-          %{shriveled cutting},
-        ].each do |skin_name|
-          it "recognizes #{skin_name} as a skin" do
-            skin = GameObjFactory.item_from_name(skin_name)
-            expect(skin.type).to include "skin"
-          end
-
-          xit "recognizes #{skin_name} as sellable at the furrier" do
-            skin = GameObjFactory.item_from_name(skin_name)
-            expect(skin.sellable.to_s).to include "furrier"
-          end
-        end
-      end
-    end
   end
 
   describe "things that aren't skins" do
+    describe "that are sellable at the furrier" do
+      [
+        %{scintillating fishscale},
+      ].each do |sellable_name|
+        it "recognizes #{sellable_name} is NOT a skin" do
+          item = GameObjFactory.item_from_name(sellable_name)
+          expect(item.type).to be_nil
+        end
+
+        it "recognizes #{sellable_name} as sellable at the furrier" do
+          item = GameObjFactory.item_from_name(sellable_name)
+          expect(item.sellable.to_s).to include "furrier"
+        end
+      end
+    end
+
     describe "horns that aren't skins" do
       [
         %{carved rowan horn banded with silvery mithril},
