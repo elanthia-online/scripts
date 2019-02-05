@@ -97,7 +97,7 @@ describe GameObj do
       ].each do |magic_item_name|
         it "recognizes #{magic_item_name} as magic" do
           magic_item = GameObjFactory.item_from_name(magic_item_name)
-          expect(magic_item.type).to include "magic"
+          expect(magic_item.type).to eq "magic"
           #expect(magic_item.sellable).to eq "pawnshop"
         end
       end
