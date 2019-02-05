@@ -24,15 +24,20 @@ describe GameObj do
         earrings
         ewer
         flagon
+        flask
         goblet
         headband
+        jug
         medallion
         neckchain
         necklace
         pendant
         pin
+        pitcher
+        plate
         platter
         ring
+        scepter
         stein
         stickpin
         talisman

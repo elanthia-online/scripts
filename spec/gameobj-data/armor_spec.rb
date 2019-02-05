@@ -283,13 +283,17 @@ describe GameObj do
       %{some leathers},
       %{some leather armor},
       %{some chain armor},
+      %{leather breastplate},
+      %{metal breastplate},
       %{some plate armor},
+      %{some full plate},
+      %{some half plate},
 
       %{mantlet},
     ].each do |armor_name|
       it "recognizes #{armor_name} as armor" do
         armor = GameObjFactory.item_from_name(armor_name)
-        expect(armor.type).to include "armor"
+        expect(armor.type).to eq "armor"
         expect(armor.sellable).to eq "pawnshop"
       end
     end
