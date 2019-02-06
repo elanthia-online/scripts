@@ -26,7 +26,7 @@ module Migration
 
   def self.load_tables(tables)
     Hash[tables.map do |table| 
-      table = Table.new(table)
+      table = Table.from_yaml(table)
       [table.name, table]
     end]
   end
