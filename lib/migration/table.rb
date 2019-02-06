@@ -76,7 +76,6 @@ module Migration
       @rules    = rules
       @kind     = kind
       @pending = []
-      Table.validate_ruleset(self, @rules)
     end
 
     def self.from_yaml(file)
@@ -148,6 +147,7 @@ module Migration
     # a Map(Key, Regexp) that can be used
     #
     def to_regex()
+      Table.validate_ruleset(self, @rules)
       regex_map = Hash.new
       prefix = Convert.maybe_pattern_to_regex(@rules.fetch(:prefix, nil), space: :right)
       suffix = Convert.maybe_pattern_to_regex(@rules.fetch(:suffix, nil))
