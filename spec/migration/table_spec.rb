@@ -3,7 +3,7 @@ require_relative "./helper.rb"
 describe Migration::Table do
   describe "exlcusion rules" do
     before { 
-      @table = Migration::Table.new(Helper::Mocks.table_path(:exclusions)) 
+      @table = Migration::Table.from_yaml(Helper::Mocks.table_path(:exclusions))
     }
 
     it "creates a valid Regexp" do
