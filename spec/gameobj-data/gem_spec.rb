@@ -548,7 +548,9 @@ describe GameObj do
       %[sliver of bright green viridine],
     ].each do |gem|
       it "recognizes #{gem} as a gem" do
-        expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+        expect(GameObjFactory.item_from_name(gem).type).to include "gem"
+        expect(GameObjFactory.item_from_name(gem).type).to_not include "valuable"
+        expect(GameObjFactory.item_from_name(gem).type).to include "realm:reim"
         expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
       end
     end

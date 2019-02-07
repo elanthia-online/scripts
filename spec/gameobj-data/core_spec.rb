@@ -42,6 +42,7 @@ describe GameObj do
         "plinite",
         "quest",
         "reagent",
+        "realm:reim",
         "scarab",
         "scroll",
         "skin",
