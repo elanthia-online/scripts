@@ -86,6 +86,7 @@ describe GameObj do
         %{golem bone},
         %{greasy troll scalp},
         %{griffin pelt},
+        %{griffin talon},
         %{grifflet pelt},
         %{grizzly bear hide},
         %{hag nose},
