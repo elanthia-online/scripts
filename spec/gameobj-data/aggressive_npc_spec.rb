@@ -370,6 +370,7 @@ describe GameObj do
         "arctic wolverine",
         "ash hag",
         "banded rattlesnake",
+        "bay centaur",
         "bighorn sheep",
         "big ugly kobold",
         "black bear",
