@@ -2,5 +2,4 @@
 
 migrate :furrier do
   insert(:name, %[waxy grey caederine])
-  insert(:name, %[polished shark tooth])
 end
