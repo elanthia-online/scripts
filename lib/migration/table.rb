@@ -70,23 +70,35 @@ module Migration
     ## reads a .yaml definition into memory
     ## so that migrations may be layered ontop
     ##
-    def initialize(file)
-      @name     = File.basename(file, ".yaml").to_sym
+    def initialize(name:, kind:, rules:)
+      @name     = name.to_sym
       @log_name = %[Table(:#{@name})]
+      @rules    = rules
+      @kind     = kind
+      @pending = []
+    end
+
+    def self.from_yaml(file)
+      name     = File.basename(file, ".yaml").to_sym
+      log_name = %[Table(:#{name})]
       # output something useful
       # about how we are loading this data
-      Migration.log(%{decoding #{@log_name} from #{file}}, 
+      Migration.log(%{decoding #{log_name} from #{file}},
         label: %i[table],
         color: :blue)
-      
-        @rules   = Hash[YAML.load_file(file).map do |(k,v)| 
-        [Table.normalize_key(k), v] 
+
+      rules = Hash[YAML.load_file(file).map do |(k,v)|
+        [Table.normalize_key(k), v]
       end]
-      @kind = rules.fetch(:kind, "type")
-      Table.validate_ruleset(self, @rules)
+      kind = rules.fetch(:kind, "type")
+      Table.validate_ruleset(self, rules)
       # this should not be compiled to the XML output
       rules.delete(:kind)
-      @pending = []
+      self.new(
+        name: name,
+        kind: kind,
+        rules: rules
+      )
     end
     #
     # check for existance of a key
@@ -135,6 +147,7 @@ module Migration
     # a Map(Key, Regexp) that can be used
     #
     def to_regex()
+      Table.validate_ruleset(self, @rules)
       regex_map = Hash.new
       prefix = Convert.maybe_pattern_to_regex(@rules.fetch(:prefix, nil), space: :right)
       suffix = Convert.maybe_pattern_to_regex(@rules.fetch(:suffix, nil))

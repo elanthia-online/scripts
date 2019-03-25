@@ -12,6 +12,7 @@ describe GameObj do
         %{ant pincer},
         %{arctic manticore mane},
         %{arctic titan toe},
+        %{barbed cerebralite tentacle},
         %{basilisk crest},
         %{bat wing},
         %{bear claw},
@@ -58,6 +59,7 @@ describe GameObj do
         %{elongated triton spine},
         %{faceted crystal crab shell},
         %{faeroth fang},
+        %{faintly glowing worm skin},
         %{fenghai fur},
         %{fire ant pincer},
         %{fire cat claw},
@@ -84,6 +86,7 @@ describe GameObj do
         %{golem bone},
         %{greasy troll scalp},
         %{griffin pelt},
+        %{griffin talon},
         %{grifflet pelt},
         %{grizzly bear hide},
         %{hag nose},
@@ -106,6 +109,7 @@ describe GameObj do
         %{krynch shinbone},
         %{leaper hide},
         %{leopard skin},
+        %{long fiery red spine},
         %{lump of black ambergris},
         %{lump of grey ambergris},
         %{lynx pelt},
@@ -158,7 +162,6 @@ describe GameObj do
         %{pyrothag hide},
         %{raptor feathers},
         %{rat pelt},
-        %{rattlesnake rattle},
         %{red eye},
         %{red orc scalp},
         %{relnak sail},
@@ -327,10 +330,28 @@ describe GameObj do
         %{rack of four-tined antlers},
         %{rack of five-tined antlers},
         %{wide rack of six-tined antlers},
+        %{wide rack of seven-tined antlers},
       ].each do |skin_name|
         it "recognizes #{skin_name} as a skin" do
           skin = GameObjFactory.item_from_name(skin_name)
           expect(skin.type).to include "skin"
+          expect(skin.sellable.to_s).to include "furrier"
+        end
+      end
+    end
+
+    describe "banded rattlesnake skins" do
+      [
+        %{rattlesnake rattle},
+        %{two-tip rattlesnake rattle},
+        %{three-tip rattlesnake rattle},
+        %{four-tip rattlesnake rattle},
+        %{five-tip rattlesnake rattle},
+      ].each do |skin_name|
+        it "recognizes #{skin_name} as a skin" do
+          skin = GameObjFactory.item_from_name(skin_name)
+          expect(skin.type).to include "skin"
+          expect(skin.sellable.to_s).to include "furrier"
         end
       end
     end

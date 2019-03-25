@@ -1,5 +1,6 @@
 module Migration
   class TableNotFound < Exception; end
+  class DuplicateTable < Exception; end
   ##
   ## loads a migration Ruby instance and executes it
   ## within a ChangeSet context, storing the result
@@ -73,11 +74,27 @@ module Migration
         fail TableNotFound, Color.red("Table[:#{table_name}] does not exist")
     end
 
+    def assert_table_does_not_exist(table_name)
+      table = @tables[Table.normalize_key(table_name)] and
+        fail DuplicateTable, Color.red("Table[:#{table_name}] already exists")
+    end
+
     def migrate(*table_names, &migration)
       table_names.each do |table_name|
         table = assert_table_exists(table_name)
         @changesets << ChangeSet.run(table, @file, &migration)
       end
+      self
+    end
+
+    def create_table(table_name, kind: 'type', keys:[])
+      assert_table_does_not_exist(table_name)
+      normalized_name = Table.normalize_key(table_name)
+      @tables[normalized_name] = Table.new(
+        name: normalized_name,
+        kind: kind,
+        rules: Hash[keys.map { |k| [k, []] }]
+      )
       self
     end
   end
