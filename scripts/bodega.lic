@@ -1,0 +1,174 @@
+require "ostruct"
+require "json"
+require "fileutils"
+require "benchmark"
+
+module Bodega
+  module Messages
+    TOWNS    = %r[Valid options include: (?<towns>.*?)\.]
+    COMMAND  = %r[You can use the (?<command>.*?) command to browse the inventory of a particular shop.]
+    NEW_ROOM = %r[^(?<room_title>.*)\s\((?<branch>\w+)\)$]
+    SIGN     = %r[^Written on]
+    ITEM     = %r[^(?<item_id>\d+)\)]
+  end
+end
+
+module Bodega
+  class Collector
+    attr_reader :start, :close, :command
+    def initialize(start:, close:, command:)
+      @start   = start
+      @close   = close
+      @command = command
+    end
+
+    def blow_up(ttl)
+      fail Exception, "Collector(start: #{@start}, close: #{@close}) failed to complete in #{ttl} seconds"
+    end
+
+    def run(seconds = 5)
+      fput @command
+      result = []
+      ttl    = Time.now + seconds
+      while line = get
+        result.push(line) if line.include?(@start) or not result.empty?
+        return result     if line.include?(@close) and not result.empty?
+        return blow_up()  if Time.now > ttl
+      end
+    end
+  end
+end
+
+module Bodega
+  def self.fetch_towns()
+    case (result = dothistimeout("shop direc", 5, Messages::TOWNS))
+    when Messages::TOWNS
+      result.match(Messages::TOWNS)[:towns].gsub(" and ", ", ").split(", ")
+    else
+      fail "unknown outcome for parsing available towns"
+    end
+  end
+
+  def self.towns()
+    @towns ||= fetch_towns
+  end
+
+  def self.shops(town)
+    coll = Collector.new(
+      start: %[~*~ #{town} Shops ~*~],
+      close: %[You can use the SHOP BROWSE],
+      command: %[shop direc #{town}])
+
+    result = coll.run()
+
+    next_command = result.last.match(Messages::COMMAND)[:command]
+    
+    by_shop_number = result.slice(1..-2)
+      .map(&:strip).map do |row| row.split(/\s{2,}/) end # split columns
+      .flatten.map do |col| col.split(") ") end          # split number/shop name
+
+    if Opts.shop
+      by_shop_number = Hash[by_shop_number.select do |id, title| title.downcase.include?(Opts.shop.downcase) end]
+    end
+
+    Bodega.scan_shops(town, Hash[by_shop_number], next_command)
+  end
+
+  def self.scan_shops(town, shops, cmd_template)
+    max_shop_depth = (Opts["max-shop-depth"] || 10_000).to_i
+    shops.take(max_shop_depth).map do |id, name| 
+      Bodega.scan_inv(town, id, name, 
+        cmd_template.gsub("{SHOP#}", id)) 
+    end 
+  end
+
+  def self.scan_inv(town, id, name, cmd)
+    coll = Collector.new(
+      start:   %[is located in],
+      close:   %[You can use the SHOP INSPECT {STOCK#}],
+      command: cmd)
+    
+    (preamble, *inv) = coll.run()
+
+    { preamble:  preamble,
+      town:      town,
+      id:        id,
+      inv:       parse_inv(inv.map(&:strip)) }
+  end
+
+  def self.add_room(acc, row)
+    acc.push(
+      OpenStruct.new(
+        row.match(Messages::NEW_ROOM).to_h.merge({items: []})))
+  end
+
+  def self.add_sign(acc, row)
+    acc.last.sign ||= []
+    acc.last.sign.push(row)
+  end
+
+  def self.add_item(acc, row)
+    acc.last.items.push(
+      row.match(Messages::ITEM)[:item_id])
+  end
+
+  def self.parse_inv(inv)
+    inv.reduce([]) do |acc, row|
+      # we are at the terminal line for this shop
+      break acc if row.include?("SHOP INSPECT")
+      Bodega.add_room(acc, row) if row.match(Messages::NEW_ROOM)
+      Bodega.add_sign(acc, row) if row.match(Messages::SIGN) or not acc.last.sign.nil?
+      Bodega.add_item(acc, row) if row.match(Messages::ITEM)
+      acc
+    end
+    .map do |room| 
+      max_item_depth = (Opts["max-item-depth"] || 100).to_i
+      room.items = room.items.take(max_item_depth).map do |id| Bodega.scan_item(id) end
+      room
+    end
+    .map(&:to_h)
+  end
+
+  def self.scan_item(id)
+    coll = Collector.new(
+      command: %[shop inspect #{id}],
+      start:   %[You request a thorough inspection of],
+      close:   %[You can use SHOP PURCHASE #{id} to purchase])
+
+    details = coll.run()
+
+    { id:      id, 
+      name:    details.first.gsub("You request a thorough inspection of ", "").gsub(%r[\sfrom [A-Z].*?\.$], ""), 
+      details: details.slice(1..-2) }
+  end
+
+  def self.all()
+    start = Time.now
+    towns_to_search = if Opts.town.nil? then 
+      towns 
+    else 
+      towns.select do |town| town.downcase.include?(Opts.town.downcase) end
+    end
+
+    list = towns_to_search.map do |town| 
+      { town: town, 
+       shops: Bodega.shops(town)} 
+    end
+
+    if Opts.benchmark
+      up = (Time.now - start) / 60
+      Log.out(up.as_time, label: :runtime)
+    end
+
+    return list
+  end
+
+  def self.save(name: Opts.to_h.fetch(out, "shops.json"), dir: "bodega", data:)
+    root = Pathname.new($lich_dir) + dir
+    FileUtils.mkdir_p(root)
+    Log.out("writing >>> #{root + name}")
+    File.open(root + name, 'w') {|f| f.write(data) }
+  end
+
+  Bodega.save(data: JSON.pretty_generate(Bodega.all)) if Opts.save
+end
