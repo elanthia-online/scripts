@@ -10,7 +10,4 @@ end
 migrate :furrier do
   insert(:name, "centaur ranger hide")
   insert(:name, "ruff of raptor feathers")
-  insert(:name, "scintillating fishscale")
-  insert(:name, "lump of black ambergris")
-  insert(:name, "lump of grey ambergris")
 end
