@@ -108,6 +108,7 @@ describe GameObj do
         %{kobold skin},
         %{krynch shinbone},
         %{leaper hide},
+        %{leathery bat wings},
         %{leopard skin},
         %{long fiery red spine},
         %{lump of black ambergris},
