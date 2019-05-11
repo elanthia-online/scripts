@@ -192,6 +192,7 @@ describe GameObj do
         %{shelfae scale},
         %{shimmering wasp wing},
         %{shriveled cutting},
+        %{sidewinder scale},
         %{silverback orc knuckle},
         %{silver mane},
         %{silver-tipped horseshoe},
