@@ -110,6 +110,7 @@ describe GameObj do
         %{leaper hide},
         %{leathery bat wings},
         %{leopard skin},
+        %{lich finger bone},
         %{long fiery red spine},
         %{lump of black ambergris},
         %{lump of grey ambergris},
