@@ -1,7 +1,45 @@
+=begin
+  ** THIS IS THE STABLE CHANNEL **
+
+  This script uses Redis pub/sub from distributed RPC/communications.
+
+  Cluster examples:
+    Cluster.on_broadcast(:dead) do |_, req|
+      Log.out("#{req.from} is dead")
+    end
+
+    Cluster.on_request(:roundtime) do |_, req|
+      Log.out(req, label: %i[req roundtime])
+      {hard: checkrt, soft: checkcastrt}
+    end
+
+    Cluster.on_cast(:go2) do |_, req|
+      req.room.go2
+    end
+
+
+  Contracts examples:
+
+    Contracts.on_contract(:box, 
+      { contract_win:  -> req { Log.out(req, label: :won) },
+        contract_open: -> req { rand }
+      })
+
+
+    Contracts.collect_bids(:box, valid_bidders: GameObj.pcs.map(&:noun)) do |contract|
+      Log.out(contract, label: %i[on_empty_bids])
+    end
+
+  Author: Ondreian
+  Requirements: Ruby >= 2.3, redis
+  version: 0.1
+=end
+
 require 'redis'
 require 'json'
 require 'ostruct'
 require 'securerandom'
+require 'benchmark'
 
 class Cluster
   ##
@@ -9,22 +47,26 @@ class Cluster
   ##
   module Log  
     def self.out(msg, label: :debug)
-      #return unless Opts.debug
-      if msg.is_a?(Exception)
-        msg = %{
-          #{msg.message}
-          #{msg.backtrace.join("\n")}
-        }
-      end
+      return _write _view(msg, label) unless msg.is_a?(Exception)
+      ## pretty-print exception
+      _write _view(msg.message, label)
+      msg.backtrace.to_a.slice(0..5).each do |frame| _write _view(frame, label) end
+    end
 
-      _respond Preset.as(:debug, 
-        _view(msg, label))
+    def self._write(line)
+      if Script.current.vars.include?("--headless") or not defined?(:_respond)
+        $stdout.write(line + "\n")
+      elsif line.include?("<") and line.include?(">")
+        respond(line)
+      else
+        _respond Preset.as(:debug, line)
+      end
     end
 
     def self._view(msg, label)
       label = [Script.current.name, label].flatten.compact.join(".")
       safe = msg.inspect
-      safe = safe.gsub("<", "(").gsub(">", ")") if safe.include?("<") and safe.include?(">")
+      #safe = safe.gsub("<", "&lt;").gsub(">", "&gt;") if safe.include?("<") and safe.include?(">")
       "[#{label}] #{safe}"
     end
 
@@ -33,7 +75,7 @@ class Cluster
     end
 
     def self.dump(*args)
-      pp *args
+      pp(*args)
     end
 
     module Preset
@@ -379,7 +421,136 @@ class Cluster
   end
 end
 
+module Contracts
+  SHOULD_NEVER_RUN = -> req { fail "won invalid contract(#{req})" }
+  INVALID_BID      = -> req {-1}
+  VALID_BID        = (0..1)
+  TTL              = 1
+  OPEN_CONTRACTS ||= {}
+  OPEN_BIDS      ||= {}
+  CALLBACKS      ||= {}
 
-load("scripts/cluster_callbacks.rb") if Script.exists?("cluster_callbacks.rb")
+  module Events
+    CONTRACT_OPEN  = :contract_open
+    CONTRACT_CLOSE = :contract_close
+    CONTRACT_BID   = :contract_bid
+    CONTRACT_WIN   = :contract_win
+  end
+
+  Cluster.on_broadcast(Events::CONTRACT_OPEN) do |_, req|
+    Contracts.prune()
+    Contracts.maybe_bid(req)
+  end
+
+  Cluster.on_cast(Events::CONTRACT_BID) do |_, req|
+    Log.out(req, label: Events::CONTRACT_BID)
+    Contracts.fetch_open_contract(req.contract_id) do |contract|
+      contract[:bids].push(req)
+    end
+  end
+
+  Cluster.on_cast(Events::CONTRACT_WIN) do |_, req|
+    OPEN_BIDS.delete(req.contract_id)
+
+    CALLBACKS.fetch(req.kind.to_sym, {})
+      .fetch(Events::CONTRACT_WIN, SHOULD_NEVER_RUN)
+      .call(req)
+  end
+
+  def self.fetch_open_contract(contract_id)
+    Contracts.prune()
+    if contract = OPEN_CONTRACTS.fetch(contract_id, false)
+      yield(contract)
+    end
+  end
+
+  def self.next_expiry()
+    (Time.now.utc + TTL).to_s
+  end
+
+  def self.prune()
+    [OPEN_CONTRACTS, OPEN_BIDS].each do |kv| 
+      kv.each do |id, contract| 
+        kv.delete(id) if expired?(contract) 
+      end
+    end
+  end
+
+  def self.expired?(contract)
+    Time.now.utc > Time.parse(contract[:expiry])
+  end
+
+  def self.closed?(contract)
+    expired?(contract) or contract.fetch(:bids).size.eql? contract.fetch(:valid_bidders).size
+  end
+
+  def self.make_contract(**args)
+    args.merge({ 
+      contract_id: SecureRandom.hex(10),
+      kind:        args.fetch(:kind).to_s.downcase.to_sym,
+      from:        Char.name,
+      expiry:      next_expiry(),
+      bids:        [],
+    })
+  end
+
+  def self.maybe_bid(contract)
+    return unless contract.valid_bidders.include?(Char.name)
+
+    bid_for_contract = CALLBACKS.fetch(contract.kind.to_sym, {})
+      .fetch(Events::CONTRACT_OPEN, INVALID_BID)
+      .call(contract)
+
+    bid_for_contract = -1 unless bid_for_contract > contract.min_bid
+
+    OPEN_BIDS[contract.contract_id] = contract if VALID_BID.include?(bid_for_contract)
+  
+    Contracts.bid(contract, bid_for_contract)
+  end
+
+  def self.collect_bids(kind, valid_bidders:, min_bid: 0, **vars)
+    Contracts.prune()
+    contract = make_contract(
+      vars.merge({kind: kind, valid_bidders: valid_bidders, min_bid: min_bid}))
+    OPEN_CONTRACTS[contract[:contract_id]] = contract
+    Log.out(contract, label: Events::CONTRACT_OPEN)
+    Cluster.broadcast(Events::CONTRACT_OPEN, **contract)
+    until closed?(contract) do sleep 0.01 end
+    valid_bids = contract[:bids].select do |resp| VALID_BID.include?(resp.bid) end
+    return yield(contract) if (expired?(contract) and valid_bids.empty?) or valid_bids.empty? and block_given?
+    # highest bid wins
+    winning_bid = valid_bids.sort do |a, b| a.bid <=> b.bid end.last
+    Log.out(winning_bid, label: :winning_bid) 
+    Contracts.tell_remote_winner(winning_bid[:from], contract)
+  end
+
+  def self.on_contract(kind, callbacks)
+    # assert we have valid callbacks for this contract
+    callbacks.fetch(Events::CONTRACT_OPEN) and callbacks.fetch(Events::CONTRACT_WIN)
+    CALLBACKS[kind] = callbacks
+    self
+  end
+
+  def self.tell_remote_winner(winner, contract)
+    Cluster.cast(winner, 
+      contract.merge({ channel: Events::CONTRACT_WIN }))
+  end
+
+  def self.bid(contract, value)
+    Log.out("bidding #{value} on Contract(#{contract.contract_id}) from #{contract.from}", label: :bid)
+
+    Cluster.cast(contract[:from], {
+      channel:     Events::CONTRACT_BID, 
+      contract_id: contract[:contract_id],
+      bid:         value,
+    })
+  end
+end
+
+class Cluster
+  load("scripts/cluster_callbacks.rb") if Script.exists?("cluster_callbacks.rb")
+end
+
+
 # keepalive
 loop do sleep(1) end 
