@@ -28,7 +28,7 @@ describe GameObj do
         %{boar tusk},
         %{bobcat claw},
         %{brown bear skin},
-        %{brown boar skin},
+        %{brown boar hide},
         %{brown gak hide},
         %{brown spinner leg},
         %{caedera skin},
