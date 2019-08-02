@@ -49,9 +49,11 @@ describe GameObj do
             soldier
             sorcerer
             sorceress
+            spellbinder
             warchief
             warlock
             warmage
+            warmonger
             warrior
             witch
             wizard
@@ -65,19 +67,6 @@ describe GameObj do
             end
 
             it "recognizes #{grimswarm} as a grimswarm" do
-              expect(GameObjFactory.npc_from_name(grimswarm).type).to include "grimswarm"
-            end
-          end
-
-          %w[warmonger spellbinder].each do |profession|
-            grimswarm = "#{prename}Grimswarm #{race} #{profession}"
-
-            it "recognizes #{grimswarm} as an aggressive NPC" do
-              expect(GameObjFactory.npc_from_name(grimswarm).type).to include "aggressive npc"
-            end
-
-            # FIXME: GameObj should recognize these as grimswarm but current regex in XML is broken
-            xit "recognizes #{grimswarm} as a grimswarm" do
               expect(GameObjFactory.npc_from_name(grimswarm).type).to include "grimswarm"
             end
           end
@@ -134,12 +123,14 @@ describe GameObj do
         "baesrukha",
         "banshee",
         "barghest",
+        "blackened decaying tumbleweed",
         "bog wight",
         "bog wraith",
         "bone golem",
         "carceris",
         "crazed zombie",
         "dark apparition",
+        "dark frosty plant",
         "darkwoode",
         "death dirge",
         "decaying Citadel guardsman",
@@ -151,6 +142,7 @@ describe GameObj do
         "ethereal triton sentry",
         "firephantom",
         "flesh golem",
+        "frostborne lich",
         "frozen corpse",
         "gaunt spectral servant",
         "ghost",
@@ -164,6 +156,8 @@ describe GameObj do
         "greater vruul",
         "ice skeleton",
         "ice wraith",
+        "infernal lich",
+        "large thorned shrub",
         "lesser frost shade",
         "lesser ghoul",
         "lesser moor wight",
@@ -176,8 +170,10 @@ describe GameObj do
         "moaning phantom",
         "moaning spirit",
         "monastic lich",
+        "murky soul siphon",
         "naisirc",
         "n'ecare",
+        "necrotic snake",
         "nedum vereri",
         "night mare",
         "nightmare steed",
@@ -200,6 +196,7 @@ describe GameObj do
         "shadow steed",
         "shadowy spectre",
         "shrickhen",
+        "shriveled icy creeper",
         "skeletal giant",
         "skeletal ice troll",
         "skeletal lord",
@@ -216,56 +213,139 @@ describe GameObj do
         "spectral triton defender",
         "spectral warrior",
         "spectral woodsman",
+        "spectre",
         "tomb wight",
         "tree spirit",
         "troll wraith",
         "vaespilon",
         "vourkha",
         "waern",
+        "warrior shade",
         "werebear",
         "wind wraith",
         "wolfshade",
         "wood wight",
         "wraith",
+        "writhing frost-glazed vine",
+        "writhing icy bush",
         "zombie",
         "zombie rolton",
       ].each do |undead|
-        it "recognizes #{undead} as an aggressive NPC" do
+        it "recognizes #{undead} as an undead aggressive NPC" do
           expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
-        end
-
-        it "recognizes #{undead} as undead" do
           expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
         end
       end
 
-      describe "undead with data issues" do
-        describe "creatures recognized as undead but not aggressive" do
-          [
-            "frostborne lich",
-            "infernal lich",
-            "murky soul siphon",
-            "necrotic snake",
-          ].each do |undead|
-            xit "recognizes #{undead} as an aggressive NPC" do
-              expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
-            end
+      describe "REIM" do
+        [
+          %{ethereal barbarian},
+          %{ethereal commoner},
+          %{ethereal denizen},
+          %{ethereal guard},
+          %{ethereal guardsman},
+          %{ethereal guardswoman},
+          %{ethereal inmate},
+          %{ethereal knight},
+          %{ethereal lunatic},
+          %{ethereal madman},
+          %{ethereal madwoman},
+          %{ethereal peasant},
+          %{ethereal pillager},
+          %{ethereal prisoner},
+          %{ethereal raider},
+          %{ethereal scout},
+          %{ethereal soldier},
+          %{ethereal squire},
+          %{ethereal swordsman},
+          %{ethereal swordswoman},
+          %{ethereal townsman},
+          %{ethereal townswoman},
+          %{ethereal traveller},
+          %{ethereal villager},
+          %{ethereal waylayer},
+          %{ethereal zealot},
 
-            it "recognizes #{undead} as undead" do
-              expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
-            end
-          end
-        end
+          %{ghostly bandit},
+          %{ghostly highwayman},
+          %{ghostly highwaywoman},
+          %{ghostly marauder},
+          %{ghostly waylayer},
 
-        describe "creatures missing from both undead and aggressive" do
-          ["spectre"].each do |undead|
-            xit "recognizes #{undead} as an aggressive NPC" do
-              expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
-            end
+          %{unworldly barbarian},
+          %{unworldly guest},
+          %{unworldly knight},
+          %{unworldly maid},
+          %{unworldly noble},
+          %{unworldly pillager},
+          %{unworldly raider},
+          %{unworldly royal guard},
+          %{unworldly royal knight},
+          %{unworldly scout},
+          %{unworldly servant},
+          %{unworldly slave},
+          %{unworldly soldier},
+          %{unworldly steward},
+          %{unworldly visitor},
+          %{unworldly waylayer},
+          %{unworldly zealot},
 
-            xit "recognizes #{undead} as undead" do
-              expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
-            end
+          %{celestial dancer},
+          %{celestial juggler},
+          %{celestial nomad},
+          %{celestial traveller},
+
+          %{Shopkeeper},
+          %{Innkeeper},
+          %{Bartender},
+          %{Patrol Leader},
+          %{Bandit Lord},
+          %{Bandit Lady},
+          %{Gypsy Queen},
+          %{Gypsy King},
+          %{Guard Captain},
+          %{Wall Captain},
+          %{Drill Sergeant},
+          %{Stable Hostler},
+          %{Dungeon Master},
+          %{Master Torturer},
+          %{Butler},
+          %{Cook},
+          %{Knight Captain},
+          %{Foreign Dignitary},
+          %{Royal Prince},
+          %{Royal Princess},
+          %{Royal Jester},
+          %{Royal Emperor},
+          %{Royal Empress},
+
+          %{speedy sapper},
+
+          %{Sapper Lord},
+          %{Sapper Lady},
+          %{Raid Leader},
+          %{Dark Knight},
+          %{Massive Butcher},
+          %{Slender Mercenary},
+          %{Darkly Hooded Figure},
+          %{Crimson Count},
+          %{Kennel Master},
+          %{Royal Inquisitor},
+          %{Towering Crusader},
+          %{Hulking Berserker},
+          %{Jester Ser Rets},
+          %{Dame Venti},
+          %{Corrupted Knight Owrym},
+          %{Arch Priest Dlitse},
+          %{Dame Elle Zo},
+          %{Thane Wedge},
+          %{Dark Astrologer Scionae},
+        ].each do |undead|
+          it "recognizes #{undead} as an aggressive REIM undead npc" do
+            expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(undead).type).to_not include "passive npc"
+            expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+            expect(GameObjFactory.npc_from_name(undead).type).to include "realm:reim"
           end
         end
       end
@@ -273,15 +353,24 @@ describe GameObj do
 
     describe "living" do
       [
+        "Agresh bear",
+        "Agresh troll chieftain",
+        "Agresh troll scout",
+        "Agresh troll warrior",
         "aivren",
         "albino tomb spider",
         "animated slush",
+        "Arachne acolyte",
+        "Arachne priest",
+        "Arachne priestess",
+        "Arachne servant",
         "arctic manticore",
         "arctic puma",
         "arctic titan",
         "arctic wolverine",
         "ash hag",
         "banded rattlesnake",
+        "bay centaur",
         "bighorn sheep",
         "big ugly kobold",
         "black bear",
@@ -404,6 +493,8 @@ describe GameObj do
         "grey orc",
         "grifflet",
         "grizzly bear",
+        "Grutik savage",
+        "Grutik shaman",
         "hill troll",
         "hisskra chieftain",
         "hisskra shaman",
@@ -425,6 +516,7 @@ describe GameObj do
         "Illoke mystic",
         "Illoke shaman",
         "Ithzir adept",
+        "Ithzir champion",
         "Ithzir herald",
         "Ithzir initiate",
         "Ithzir janissary",
@@ -494,6 +586,7 @@ describe GameObj do
         "mud wasp",
         "muscular supplicant",
         "Neartofar orc",
+        "Neartofar troll",
         "night golem",
         "ogre warrior",
         "orange myklian",
@@ -597,7 +690,6 @@ describe GameObj do
         "Vvrael witch",
         "wall guardian",
         "war griffin",
-        "warrior shade",
         "warthog",
         "war troll",
         "wasp nest",
@@ -607,6 +699,7 @@ describe GameObj do
         "water wyrd",
         "whiptail",
         "white vysan",
+        "wild dog",
         "wild hound",
         "wind witch",
         "wolverine",
@@ -619,37 +712,34 @@ describe GameObj do
       ].each do |creature|
         it "recognizes #{creature} as an aggressive NPC" do
           expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
+          expect(GameObjFactory.npc_from_name(creature).type).to_not include "undead"
+        end
+      end
+    end
+
+    describe "Sanctums of Scales NPCs" do
+      describe "living" do
+        [
+          %[lithe veiled sentinel],
+          %[pale scaled shaper],
+          %[deathsworn fanatic],
+          %[white sidewinder],
+        ].each do |creature|
+          it "recognizes #{creature} as an aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(creature).type).to_not include "undead"
+          end
         end
       end
 
-      describe "creatures with data issues" do
-        describe "incorrect capitalization" do
-          [
-            "Agresh bear",
-            "Agresh troll chieftain",
-            "Agresh troll scout",
-            "Agresh troll warrior",
-            "Arachne acolyte",
-            "Arachne priest",
-            "Arachne priestess",
-            "Arachne servant",
-            "Grutik savage",
-            "Grutik shaman",
-            "Neartofar troll",
-          ].each do |creature|
-            xit "recognizes #{creature} as an aggressive NPC" do
-              expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
-            end
-          end
-        end
-
-        describe "missing from data" do
-          [
-            "wild dog",
-          ].each do |creature|
-            xit "recognizes #{creature} as an aggressive NPC" do
-              expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
-            end
+      describe "undead" do
+        [
+          %[shambling lurk],
+          %[patchwork flesh monstrosity],
+        ].each do |undead|
+          it "recognizes #{undead} as an undead aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
           end
         end
       end

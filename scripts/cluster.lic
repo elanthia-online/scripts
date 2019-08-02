@@ -1,0 +1,556 @@
+=begin
+  ** THIS IS THE STABLE CHANNEL **
+
+  This script uses Redis pub/sub from distributed RPC/communications.
+
+  Cluster examples:
+    Cluster.on_broadcast(:dead) do |_, req|
+      Log.out("#{req.from} is dead")
+    end
+
+    Cluster.on_request(:roundtime) do |_, req|
+      Log.out(req, label: %i[req roundtime])
+      {hard: checkrt, soft: checkcastrt}
+    end
+
+    Cluster.on_cast(:go2) do |_, req|
+      req.room.go2
+    end
+
+
+  Contracts examples:
+
+    Contracts.on_contract(:box, 
+      { contract_win:  -> req { Log.out(req, label: :won) },
+        contract_open: -> req { rand }
+      })
+
+
+    Contracts.collect_bids(:box, valid_bidders: GameObj.pcs.map(&:noun)) do |contract|
+      Log.out(contract, label: %i[on_empty_bids])
+    end
+
+  Author: Ondreian
+  Requirements: Ruby >= 2.3, redis
+  version: 0.1
+=end
+
+require 'redis'
+require 'json'
+require 'ostruct'
+require 'securerandom'
+require 'benchmark'
+
+class Cluster
+  ##
+  ## contextual logging
+  ##
+  module Log  
+    def self.out(msg, label: :debug)
+      return _write _view(msg, label) unless msg.is_a?(Exception)
+      ## pretty-print exception
+      _write _view(msg.message, label)
+      msg.backtrace.to_a.slice(0..5).each do |frame| _write _view(frame, label) end
+    end
+
+    def self._write(line)
+      if Script.current.vars.include?("--headless") or not defined?(:_respond)
+        $stdout.write(line + "\n")
+      elsif line.include?("<") and line.include?(">")
+        respond(line)
+      else
+        _respond Preset.as(:debug, line)
+      end
+    end
+
+    def self._view(msg, label)
+      label = [Script.current.name, label].flatten.compact.join(".")
+      safe = msg.inspect
+      #safe = safe.gsub("<", "&lt;").gsub(">", "&gt;") if safe.include?("<") and safe.include?(">")
+      "[#{label}] #{safe}"
+    end
+
+    def self.pp(msg, label = :debug)
+      respond _view(msg, label)
+    end
+
+    def self.dump(*args)
+      pp(*args)
+    end
+
+    module Preset
+      def self.as(kind, body)
+        %[<preset id="#{kind}">#{body}</preset>]
+      end
+    end
+  end
+  ##
+  ## minimal options parser
+  ##
+  module Opts
+    FLAG_PREFIX    = "--"
+    
+    def self.parse_command(h, c)
+      h[c.to_sym] = true
+    end
+
+    def self.parse_flag(h, f)
+      (name, val) = f[2..-1].split("=")
+      if val.nil?
+        h[name.to_sym] = true
+      else
+        val = val.split(",")
+
+        h[name.to_sym] = val.size == 1 ? val.first : val
+      end
+    end
+
+    def self.parse(args = Script.current.vars[1..-1])        
+      OpenStruct.new(**args.to_a.reduce(Hash.new) do |opts, v|
+        if v.start_with?(FLAG_PREFIX)
+          Opts.parse_flag(opts, v)
+        else
+          Opts.parse_command(opts, v)
+        end
+        opts
+      end)
+    end
+
+    def self.method_missing(method, *args)
+      parse.send(method, *args)
+    end
+  end
+end
+
+class Cluster
+  PERSONAL_GS_EVENTS = [%[gs], Char.name.downcase, %[*]].join(".")
+  PUBLIC_GS_EVENTS   = [%[gs], %[pub], %[*]].join(".")
+  NOOP               = -> channel, message {}
+  UNSUPPORTED_METHOD = -> channel, message { return {error: "#{channel} is not implemented on #{Char.name}"} }
+  TTL                = 5
+
+  attr_reader :cb_map, :pending_requests, 
+              :connected, :last_publish,
+              :keep_alive, :event_loop,
+              :pub, :sub
+
+  def initialize()
+    @cb_map           ||= {}
+    @pending_requests ||= {}
+    @connected        ||= {}
+    @last_publish     ||= 0
+    _connect()
+    _link()
+    _keepalive()
+  end
+
+  def _connect_local()
+    #Log.out("...connecting to local redis instance...")
+    @pub = Redis.new()
+    @sub = Redis.new()
+  end
+
+  def _connect_remote(url)
+    #Log.out("...connecting to remote redis instance at\n\n\t#{url}\n")
+    @pub = Redis.new(url: url)
+    @sub = Redis.new(url: url)
+  end
+
+  def _connect()
+    if url = Opts.url
+      _connect_remote(url.split("=").last)
+    else
+      _connect_local()
+    end
+  end
+
+  def connected
+    @connected.keys.select do |name| alive?(name) end
+  end
+
+  def alive?(name)
+    # 30s intervals
+    # 5s safety window for network latency
+    (@connected.fetch(name.capitalize, 0) - Time.now.to_i).to_i.abs < 60
+  end
+
+  def make_channel_name(*parts)
+    [%(gs), *[parts].flatten].compact.map(&:to_s).map(&:downcase).join(".")
+  end
+
+  def publish(*args)
+    @last_publish = Time.now
+    @pub.publish(*args)
+  end
+  
+  def emit(channel, **payload)
+    channel = make_channel_name(Char.name, channel)
+    #Log.out([channel, payload], label: %i[msg out])
+    publish(channel,
+      payload.merge({from: Char.name}).to_json())
+  end
+
+  def broadcast(channel, **payload)
+    channel = make_channel_name(%[pub], channel)
+    #Log.out([channel, payload], label: %i[msg broadcast])
+    publish(channel,
+      payload.merge({from: Char.name}).to_json())
+  end
+
+  def cast(person, channel: nil, **payload)
+    channel = make_channel_name(person, channel)
+    #Log.out([channel, **payload], label: %i[cast to])
+    publish(channel, 
+      payload.merge({from: Char.name}).to_json())
+  end
+
+  def request(person, **payload)
+    req_id = SecureRandom.hex(10)
+    cast(person,  
+      **payload.merge({ 
+        uuid:    req_id,
+        channel: [payload.fetch(:channel), %(request)]
+      }))
+    ttl = payload.fetch(:timeout, TTL)
+    @pending_requests[req_id] = Thread.current
+    timeout_thread = Thread.new { sleep ttl; @pending_requests[req_id].wakeup }
+    Thread.stop
+
+    timeout_thread.kill
+    resp = pending_requests[req_id]
+    pending_requests.delete(req_id)
+    # request timed out
+    return TimeoutError.new("request to #{person} failed in #{ttl}s") if resp.is_a?(Thread)
+    # remote or local error happened during response/request cycle
+    return Exception.new(resp.fetch(:error)) if resp.fetch(:error, false)
+    # it's a real boy!
+    return OpenStruct.new(resp)
+  end
+
+  def async_request(*args)
+    Thread.new do request(*args) end
+  end
+
+  def map(people, **payload)
+    people.map do |name| Thread.new do request(name, **payload) end end
+      .map(&:value)
+  end
+
+  def _route_incoming(channel, message)
+    begin
+      kind_of_channel = channel.split(".").last.to_sym
+      incoming = JSON.parse(message, symbolize_names: true)
+      return if incoming.fetch(:from).eql?(Char.name)
+      Log.out(incoming, label: %i[incoming] + channel.split(".")) if Script.current.vars.include?("--debug") and defined?(Log)
+      # keep alive for connected clients
+      _touch(channel, incoming)
+      return _handle_response(channel, incoming) if incoming[:uuid] and kind_of_channel.eql?(:response)
+      return _handle_request(channel, incoming)  if incoming[:uuid] and kind_of_channel.eql?(:request)
+      _handle_leave(channel, incoming) if kind_of_channel.eql?(:leave)
+      return _handle_cast(channel, incoming)
+    rescue Exception => err
+      Log.out(err, label: %i[dispatch error] + channel.split(".")) and defined?(Log)
+    end
+  end
+
+  def _touch(_, incoming)
+    from = incoming.fetch(:from, false)
+    @connected[from] = Time.now if from
+  end
+
+  def _handle_leave(_, incoming)
+    from = incoming.fetch(:from, false)
+    @connected.delete(from) if from
+  end
+  
+  def _handle_cast(channel, incoming)
+    begin
+      #Log.out([channel, incoming], label: %i[in cast])
+      _callback = @cb_map.fetch(channel, NOOP).call(channel, 
+        OpenStruct.new(incoming))
+    rescue Exception => err
+      Log.out(err, label: %i[dispatch error] + channel.split(".")) and defined?(Log)
+    end
+  end
+
+  def _handle_request(channel, incoming)
+    begin 
+      #Log.out([channel, incoming], label: %i[in request])
+      callback = @cb_map.fetch(channel, UNSUPPORTED_METHOD)
+      response = callback.call(channel, 
+        OpenStruct.new(incoming))
+      _dispatch_response_object(incoming, response)
+    rescue Exception => err
+      #Log.out(err, label: %i[local request error] + channel.split("."))
+      _dispatch_response_object(incoming, {error: err.message})
+    end
+  end
+
+  def _handle_response(channel, incoming)
+    begin 
+      #Log.out([channel, incoming], label: %i[in response])
+      resp_id  = incoming.fetch(:uuid)
+      pending  = @pending_requests.fetch(resp_id, false)
+      @pending_requests[resp_id] = incoming if pending
+      pending.wakeup
+    rescue Exception => err
+      #Log.out(err, label: %i[local response error] + channel.split("."))
+      @pending_requests[resp_id] = err.message
+    end
+  end
+
+  def _dispatch_response_object(incoming, response)
+    from = incoming.fetch(:from, false) or fail "Request[`from` was missing]"
+    cast(from, 
+      **response.merge({
+          channel: [incoming.fetch(:uuid), %(response)],
+          uuid:    incoming.fetch(:uuid),
+          from:    Char.name,
+        }))
+  end
+
+  def on_broadcast(channel, &block)
+    fail "no block given to Cluster#on_broadcast" unless block_given?
+    @cb_map[%(gs.pub.#{channel.to_s}).downcase] = block
+    self
+  end
+
+  def on_cast(channel, &block)
+    fail "no block given to Cluster#on_cast" unless block_given?
+    @cb_map[%(gs.#{Char.name}.#{channel.to_s}).downcase] = block
+    self
+  end
+
+  def on_request(channel, &block)
+    fail "no block given to Cluster#on_request" unless block_given?
+    @cb_map[%(gs.#{Char.name}.#{channel.to_s}.request).downcase] = block
+    self
+  end
+
+  def _link()
+    @event_loop = Thread.new do 
+      begin
+        @sub.psubscribe(PERSONAL_GS_EVENTS, PUBLIC_GS_EVENTS) do |on|
+          on.psubscribe do |channel| Log.out(channel, label: %i[subscribed]) end
+          on.pmessage do |pattern, channel, message| _route_incoming(channel, message) end
+        end
+      rescue Redis::BaseConnectionError => error
+        Log.out(error, label: %i[err conn]) and defined?(Log)
+        sleep 1
+        retry
+      end
+    end
+  end
+
+  def _keepalive()
+    @keepalive = Thread.new do 
+      loop do 
+        broadcast(:ping)
+        sleep 35
+      end
+    end
+  end
+
+  def destroy()
+    Log.out("cleaning up", label: %i[destroy]) and defined?(Log)
+    broadcast(:leave)
+    [@event_loop, @keepalive].map(&:kill).each(&:join)
+  end
+
+  def self.of()
+    cluster = Cluster.new()
+    before_dying do cluster.destroy() end
+    cluster.on_request(:api) do |_, req| {methods: cluster.cb_map.keys} end
+    cluster.on_broadcast(:announce) do |_, req| cluster.cast(req.from, channel: :ack) end
+    cluster.broadcast(:announce)
+    return cluster
+  end
+  
+  def self.cluster()
+    @cluster
+  end
+
+  def self.up?
+    not @cluster.nil?
+  end
+
+  def self.method_missing(method, *args, &block)
+    Cluster.init()
+    fail Exception, "Cluster.init() must be called before performing singleton Cluster actions" unless up?
+    @cluster.send(method, *args, &block)
+  end
+
+  def self.parse(str)
+    JSON.parse(str, symbolize_names: true)
+  end
+
+  @cluster = nil
+  def self.init()
+    return @cluster if up?
+    @cluster = Cluster.of()
+    @cluster
+  end
+
+  Cluster.init()
+end
+
+class Cluster
+  class Registry
+    attr_reader :namespace
+    def initialize(namespace = Char.name)
+      @namespace = namespace
+    end
+
+    def _key(str)
+      [@namespace, str].map(&:downcase).map(&:to_s).join(".")
+    end
+    
+    def put(key, val)
+      Cluster.pub.set(_key(key), val.to_json)
+    end
+
+    def get(key)
+      Cluster.parse(
+        Cluster.pub.get(
+          _key(key)))
+    end
+  end
+
+  def self.registry(namespace = nil)
+    Registry.new(namespace)
+  end
+end
+
+module Contracts
+  SHOULD_NEVER_RUN = -> req { fail "won invalid contract(#{req})" }
+  INVALID_BID      = -> req {-1}
+  VALID_BID        = (0..1)
+  TTL              = 1
+  OPEN_CONTRACTS ||= {}
+  OPEN_BIDS      ||= {}
+  CALLBACKS      ||= {}
+
+  module Events
+    CONTRACT_OPEN  = :contract_open
+    CONTRACT_CLOSE = :contract_close
+    CONTRACT_BID   = :contract_bid
+    CONTRACT_WIN   = :contract_win
+  end
+
+  Cluster.on_broadcast(Events::CONTRACT_OPEN) do |_, req|
+    Contracts.prune()
+    Contracts.maybe_bid(req)
+  end
+
+  Cluster.on_cast(Events::CONTRACT_BID) do |_, req|
+    Log.out(req, label: Events::CONTRACT_BID)
+    Contracts.fetch_open_contract(req.contract_id) do |contract|
+      contract[:bids].push(req)
+    end
+  end
+
+  Cluster.on_cast(Events::CONTRACT_WIN) do |_, req|
+    OPEN_BIDS.delete(req.contract_id)
+
+    CALLBACKS.fetch(req.kind.to_sym, {})
+      .fetch(Events::CONTRACT_WIN, SHOULD_NEVER_RUN)
+      .call(req)
+  end
+
+  def self.fetch_open_contract(contract_id)
+    Contracts.prune()
+    if contract = OPEN_CONTRACTS.fetch(contract_id, false)
+      yield(contract)
+    end
+  end
+
+  def self.next_expiry()
+    (Time.now.utc + TTL).to_s
+  end
+
+  def self.prune()
+    [OPEN_CONTRACTS, OPEN_BIDS].each do |kv| 
+      kv.each do |id, contract| 
+        kv.delete(id) if expired?(contract) 
+      end
+    end
+  end
+
+  def self.expired?(contract)
+    Time.now.utc > Time.parse(contract[:expiry])
+  end
+
+  def self.closed?(contract)
+    expired?(contract) or contract.fetch(:bids).size.eql? contract.fetch(:valid_bidders).size
+  end
+
+  def self.make_contract(**args)
+    args.merge({ 
+      contract_id: SecureRandom.hex(10),
+      kind:        args.fetch(:kind).to_s.downcase.to_sym,
+      from:        Char.name,
+      expiry:      next_expiry(),
+      bids:        [],
+    })
+  end
+
+  def self.maybe_bid(contract)
+    return unless contract.valid_bidders.include?(Char.name)
+
+    bid_for_contract = CALLBACKS.fetch(contract.kind.to_sym, {})
+      .fetch(Events::CONTRACT_OPEN, INVALID_BID)
+      .call(contract)
+
+    bid_for_contract = -1 unless bid_for_contract > contract.min_bid
+
+    OPEN_BIDS[contract.contract_id] = contract if VALID_BID.include?(bid_for_contract)
+  
+    Contracts.bid(contract, bid_for_contract)
+  end
+
+  def self.collect_bids(kind, valid_bidders:, min_bid: 0, **vars)
+    Contracts.prune()
+    contract = make_contract(
+      vars.merge({kind: kind, valid_bidders: valid_bidders, min_bid: min_bid}))
+    OPEN_CONTRACTS[contract[:contract_id]] = contract
+    Log.out(contract, label: Events::CONTRACT_OPEN)
+    Cluster.broadcast(Events::CONTRACT_OPEN, **contract)
+    until closed?(contract) do sleep 0.01 end
+    valid_bids = contract[:bids].select do |resp| VALID_BID.include?(resp.bid) end
+    return yield(contract) if (expired?(contract) and valid_bids.empty?) or valid_bids.empty? and block_given?
+    # highest bid wins
+    winning_bid = valid_bids.sort do |a, b| a.bid <=> b.bid end.last
+    Log.out(winning_bid, label: :winning_bid) 
+    Contracts.tell_remote_winner(winning_bid[:from], contract)
+  end
+
+  def self.on_contract(kind, callbacks)
+    # assert we have valid callbacks for this contract
+    callbacks.fetch(Events::CONTRACT_OPEN) and callbacks.fetch(Events::CONTRACT_WIN)
+    CALLBACKS[kind] = callbacks
+    self
+  end
+
+  def self.tell_remote_winner(winner, contract)
+    Cluster.cast(winner, 
+      contract.merge({ channel: Events::CONTRACT_WIN }))
+  end
+
+  def self.bid(contract, value)
+    Log.out("bidding #{value} on Contract(#{contract.contract_id}) from #{contract.from}", label: :bid)
+
+    Cluster.cast(contract[:from], {
+      channel:     Events::CONTRACT_BID, 
+      contract_id: contract[:contract_id],
+      bid:         value,
+    })
+  end
+end
+
+class Cluster
+  load("scripts/cluster_callbacks.rb") if Script.exists?("cluster_callbacks.rb")
+end
+
+
+# keepalive
+loop do sleep(1) end 

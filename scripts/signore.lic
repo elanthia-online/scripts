@@ -1,0 +1,341 @@
+=begin
+  Society power manager that responds to anti-magic rooms
+
+  usage:
+    ;signore setup            launches the GUI
+    ;signore room:list        lists all rooms currently tagged as anti-magic
+    ;signore room:rm  <num>   the anti-magic tag from room <num>
+  
+  changelog:
+    2-18-2017           Settings now only exist per character
+    8-15-2017           Signore now waits to cast while go2 is running
+    2-23-2019  v0.0.4   Fix using Gtk.queue for Windows
+    2-24-2019  v0.0.5   add Sigil of Concentration
+  
+  Required: Lich 4.3.12
+  Author: Ondreian
+  version: 0.0.5
+  Tags:col, Signore
+  
+=end
+
+HELP = "
+;signore setup            launches the GUI
+;signore room:list        lists all rooms currently tagged as anti-magic
+;signore room:rm  <num>   the anti-magic tag from room <num>
+"
+require "gtk2"
+
+class Try
+  attr_accessor :result, :task
+  
+  def self.of(&task)
+    proc { Try.new task }
+  end
+
+  def initialize(&task)
+    @task = task
+    run!
+  end
+
+  private def run!
+    begin
+      result = @task.call
+      # handle recursives
+      if result.class == Try
+        @result = result.result
+      else
+        @result = result
+      end
+    rescue Exception => e
+      @result = e
+    end
+  end
+
+  def failed?
+    [Exception, NameError].include? @result.class
+  end
+
+  def success?
+    !failed?
+  end
+end
+
+module Signore
+  LIST = [
+    # CoL
+    Spell[9903],
+    Spell[9904],
+    #Spell[9905],
+    Spell[9906],
+    Spell[9907],
+    Spell[9908],
+    Spell[9909],
+    Spell[9910],
+    Spell[9912],
+    Spell[9913],
+    Spell[9914],
+    # Voln
+    Spell[9805],
+    Spell[9806],
+    Spell[9816],
+    # GoS
+    Spell[9704],
+    Spell[9705],
+    Spell[9707],
+    Spell[9708],
+    Spell[9710],
+    Spell[9711],
+    Spell[9714],
+    Spell[9715],
+    Spell[9716],
+    Spell[9719], 
+  ]
+
+  MAIN       = Script.current
+  PUNISHMENT = Spell[9012]
+  ANTIMAGIC  = /^The power from your sign dissipates into the air.$/
+  SUCCESS    = Regexp.union(
+      /^You flex your muscles with renewed vigor!$/,
+      /^You grip your (.*?) with renewed vigor!$/,
+      /^Your veins throb and your blood sings.$/,
+      /^Magic flows towards you, but does not reach you.$/,
+      /^You feel magical energies distort and flow around you.$/,
+      /^Your dancing fingers weave a web of protection around you!$/,
+      /^Repeating the sign has no effect!/,
+      /^Your hypnotic gesture makes your mind receptive to the thoughts/,
+      /^You feel more courageous.$/,
+      /^You feel a layer of protection surround you.$/,
+      /.*surrounds you.$/,
+      /^You begin to focus sharply upon the task at hand/,
+      /^A faint blue glow surrounds your hands, subtly guiding your movements./,
+      /You feel your mind and body gird themselves against magical interference/,
+      /^As you concentrate on your sigil/,
+      /^You feel infused with a collective knowledge on the undead and their weaknesses.$/)
+
+  BERSERK = /^You cannot do that while berserking.$/
+
+  ##
+  ## @brief      makes the GTK thread join the Script thread
+  ##             for the writing to the db
+  ##
+  def self.in_main_thread
+    original_thread_group = Thread.current.group
+    if original_thread_group != MAIN.thread_group
+      unless MAIN.thread_group.list.include?(Thread.current)
+        MAIN.thread_group.add Thread.current
+      end
+    end
+    res = Try.new { yield }
+    if original_thread_group != MAIN.thread_group
+      original_thread_group.add Thread.current
+    end
+    res
+  end
+
+  def self.soulless?(power)
+    [Spell[9913], Spell[9914]].include?(power) && percentspirit < 80
+  end
+
+  def self.punished?
+    PUNISHMENT.active?
+  end
+
+  def self.available
+    LIST.select {|spell| spell.known? }
+  end
+
+  def self.save(key, state)
+    in_main_thread {
+      CharSettings[key.to_s] = state
+      CharSettings.save
+    }
+  end
+
+  def self.active?(key)
+    in_main_thread {
+      CharSettings[key.to_s] || false
+    }.result
+  end
+
+  def self.toggle(power)
+    save power, !active?(power)
+  end
+
+  def self.add_anti_magic_room(num)
+    unless Settings[:antimagic_rooms].include?(num)
+      _respond "#{$monsterboldstart}adding #{num} as antimagic#{$monsterboldend}"
+      _respond Settings[:antimagic_rooms].join(", ")
+      list = Settings[:antimagic_rooms] 
+      list.push num
+      Settings[:antimagic_rooms] = list
+      Settings.save
+    end
+  end
+
+  def self.reset_anti_magic_rooms!
+    Settings[:antimagic_rooms] = []
+    Settings.save
+  end
+
+  def self.berserk_timeout!
+    wait_until {
+      while line = get
+        break if line =~ /The redness fades from the world and you begin to breathe harder./
+      end
+      true
+    }
+  end
+
+  def self.cast(power)
+    return if soulless?(power)
+    ##
+    ## prevent go2 typeahead errors
+    ##
+    wait_while do Script.running?("go2") end
+
+    if power.affordable? && active?(power) && !power.active? && !antimagic_room?
+      result = dothistimeout(power.to_s, 5, 
+        Regexp.union(ANTIMAGIC, SUCCESS))
+      case result
+      when SUCCESS   then true
+      when ANTIMAGIC then Signore.add_anti_magic_room(Room.current.id)
+      when BERSERK   then berserk_timeout!
+      else
+        until line=get do sleep(1) end
+        sleep(1) # game is responsive again
+      end
+    end
+  end
+
+  def self.antimagic_room?
+    Settings[:antimagic_rooms].include?(Room.current.id)
+  end
+
+  def self.cast!
+    available
+      .select { |power| !power.active? }
+      .each { |power| cast power }
+  end
+end
+
+Settings[:antimagic_rooms] ||= []
+
+module Gui 
+
+  class Toggle < Gtk::CheckButton
+    attr_accessor :power, :parent
+    
+    def initialize(power, parent)
+      @power = power
+      super @power.to_s
+      set_active Signore.active?(@power)
+
+      signal_connect("clicked") { 
+        if on_clicked.failed?
+          respond "Signore.error >> " + on_clicked.result.message
+        end
+      }
+      parent.add self
+    end
+
+    def on_clicked
+      power = @power
+      Try.new { Signore.toggle power }
+    end
+  end
+
+  class Menu < Gtk::Window
+    attr_accessor :toggles, :layout, :closed
+
+    def initialize(toggleables)
+      super Gtk::Window::TOPLEVEL
+      @closed = false
+      @layout = Gtk::VBox.new(false, 0)
+
+      set_title "Signore::Setup"
+      set_border_width 10
+
+      toggleables.each { |toggleable| Toggle.new(toggleable, @layout) }
+
+      signal_connect("destroy") { on_quit_clicked }
+
+      add @layout
+
+      show_all
+    end
+
+    def closed?
+      @closed
+    end
+
+    def on_quit_clicked
+      @closed = true
+    end
+  end
+end
+
+wait_while do 
+  Script.running?("repository") end
+
+Signore.add_anti_magic_room(2642)
+
+if Signore.available.empty?
+  respond "[signore.error] you do not know any societal powers..."
+  exit
+end
+
+if script.vars.include?("room:list")
+  respond "antimagic rooms: #{Settings[:antimagic_rooms].join(", ")}"
+  exit
+end
+
+if script.vars.include?("room:reset")
+  Signore.reset_anti_magic_rooms!
+  respond "reset all antimagic rooms"
+  exit
+end
+
+if script.vars.include?("room:rm")
+  to_delete = script.vars[2]
+  if to_delete.nil?
+    respond "you must pass a room to delete"
+    exit
+  end
+  Settings[:antimagic_rooms] = Settings[:antimagic_rooms].reject { |id|  
+    id == to_delete.to_i
+  }
+  CharSettings.save
+  respond "antimagic rooms: #{Settings[:antimagic_rooms].join(", ")}"
+  exit
+end
+
+if script.vars.include?("setup") || script.vars.include?("options")
+  window = nil
+  Gtk.queue    { window = Gui::Menu.new Signore.available }
+  wait_while   { window.nil? }
+  before_dying { window.destroy }
+  wait_until   { window.closed? }
+  Script.current.clear_exit_procs
+end
+
+if Signore.punished?
+  respond "--- you are currently under PUNISHMENT ---"
+  exit
+end
+
+if running? "repository"
+  echo "waiting for repository service..."
+  wait_while { running? "repository" }
+end
+
+unless running? "infomon"
+  echo "waiting for infomon service..." 
+  wait_until { running? "infomon" }
+end
+
+loop {
+  exit if dead?
+  Signore.cast!
+  sleep 0.1
+}

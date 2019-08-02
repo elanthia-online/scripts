@@ -7,7 +7,11 @@ end
 
 # Tell GameObj where to find the GameObj data XML file
 class GameObj
-  DATA_DIR = Pathname.new('./scripts').expand_path
+  require 'pathname'
+  DATA_DIR = Pathname.new('./dist').expand_path
+  # should inform the developer where the data is
+  # being loaded from
+  puts "[GameObj.data_dir] >>> #{DATA_DIR}"
 end
 
 # Lich 4.6.44

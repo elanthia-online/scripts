@@ -151,6 +151,7 @@ describe GameObj do
         "tunnel sweeper",
         "wizened gnome",
         "yellow canary",
+        "Fleet Captain",
       ].each do |npc|
         it "recognizes #{npc} as a passive NPC" do
           expect(GameObjFactory.npc_from_name(npc).type).to include "passive npc"

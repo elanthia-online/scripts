@@ -1,0 +1,233 @@
+=begin
+  samaritan will pull your companions to their feet, 
+  unstuns them (if you know 108 or 1040), and keeps you 
+  on your feet while engaged in battle.
+
+  The script may also be started with the --invasion flag, 
+  for when you need to defend your city within it's walls.
+
+    * special thanks to Jemiquist for helping test & bard logic!
+
+  examples:
+    ;samaritan
+    ;samaritan --invasion
+
+  Required: Lich 4.3.12
+  Author: Ondreian
+  Tags: util
+  
+=end
+require "Olib"
+
+class String
+  def is_i?
+    !!(self =~ /\A[-+]?[0-9]+\z/)
+  end
+end
+
+module Samaratin
+  include Actor
+  TTL       = Hash.new
+  CALLBACKS = Hash.new
+
+  BLACKLIST = []
+
+  BLACKLIST.clear
+
+  DEMEANOR_IS_COLD = /looks content/
+
+  PULL_FAIL = Regexp.union(
+    /^You pull (.*?) falls over!$/,
+    /^You are unable to pull/,
+    DEMEANOR_IS_COLD,
+  )
+
+  PULL_SUCCESS = Regexp.union(
+    /You pull (.*?) to (his|her) feet./,
+    /You try to pull (.*?) towards you./,
+  )
+
+  PULL_OUTCOMES = Regexp.union(PULL_FAIL, PULL_SUCCESS)
+
+  RALLY_SUCCESS = Regexp.union(
+    /^You break free from your senseless daze!$/,
+    /^(.*?) somehow rises smoothly to (her|his) feet!/,
+    /^(.*?) manages to break free from (her|his) senseless daze!/,
+  )
+
+  RALLY_FAIL = Regexp.union(
+    /^A sense of invigoration courses through your legs as you rise smoothly to your feet!$/,
+    /^(.*?) muscles twitch slightly in response to the sound, but (he|she) remains stunned./
+  )
+
+  RALLY_OUTCOMES = Regexp.union(RALLY_FAIL, RALLY_SUCCESS)
+
+  TRAPS = /Suddenly, a carefully concealed net springs up from the floor, completely entangling you!/
+
+  UNSTUN    = Spell[108]
+  RALLY     = Spell[1040]
+  UNTRAMMEL = Spell[209]
+
+  def self.flag_exists?(flag)
+    Script.current.vars.include?("--#{flag}")
+  end
+
+  def self.invasion?
+    flag_exists?("invasion")
+  end
+
+  def self.debug(msg)
+    if flag_exists?("debug")
+      echo "[debug] #{msg}"
+    end
+  end
+
+  def self.blacklist(char)
+    debug("blacklisting #{char.name} for this session")
+    BLACKLIST << char.name
+    self
+  end
+
+  def self.can_help?(char)
+    (
+      !BLACKLIST.include?(char.name) && 
+      standing? && 
+      !stunned? && 
+      !char.status.include?(:dead) && 
+      !char.status.empty? &&
+      !cooldown?(char)
+    )
+  end
+
+  def self.cooldown?(char)
+    return false if TTL[char.name].nil?
+    elapsed = (Time.now - TTL[char.name]) > 3
+    debug "#{char.name}.cooldown : #{elapsed}"
+    TTL.delete(char.name) if elapsed
+    elapsed
+  end
+
+  def self.in_town?
+    return false if invasion?
+    Room.current.location =~ /kharam|teras|landing|sol|icemule trace|mist|vaalor|illistim|rest|cysaegir|logoth/i
+  end
+
+  def self.surge(char)
+    if Spell[1107].affordable?
+      Spell.lock_cast
+      multifput "prep 1107", "cast ##{char.id}"
+      Spell.unlock_cast
+    end
+  end
+
+  def self.pull(char)
+    return self if Room.current.title.first.include?("Table")
+    return surge(char) if Room.current.location.downcase.include?("stone valley")
+    return self unless can_help?(char)
+    waitrt?
+    result = dothistimeout "pull ##{char.id}", 1, PULL_OUTCOMES
+
+    case result
+    when DEMEANOR_IS_COLD
+      return blacklist(char)
+    when PULL_FAIL
+      TTL[char.name] = Time.now
+      return self
+    else
+      return self
+    end
+  end
+
+  def self.unstun(char)
+    Spell.lock_cast
+    UNSTUN.cast(char.name) if UNSTUN.known? && checkprep.downcase.to_sym.eql?(:none)
+    rally if RALLY.known?
+    Spell.unlock_cast
+    if Char.prof.eql?("Empath")
+      Script.run("mend", char.noun)
+    end
+  end
+
+  def self.untrammel(char)
+    UNTRAMMEL.cast(char.name)
+  end
+
+  def self.rally
+    if checkmana > 70
+      result = dothistimeout "shout 1040", 3, RALLY_OUTCOMES
+      rally if result =~ RALLY_FAIL
+    end
+    self
+  end
+  ##
+  ## always help yourself first
+  ##
+  def self.check_your_self!
+    self.yield(:await) while in_town?
+    self.yield(:await) while !standing? || (stunned? && !RALLY.known?) || dead? || sleeping?
+  end
+
+  def self.afflicted(*statuses)
+    Group.members.select do |member| 
+      !(member.status & statuses).empty? 
+    end
+  end
+
+  add :await do
+    sleep 0.1
+  end
+
+  add :bail do
+    exit if dead?
+  end
+
+  add :pull do
+    check_your_self!
+  
+    afflicted(:prone, :sitting)
+      .each do |member| pull(member) end 
+  end
+
+  add :wake_up do
+    check_your_self!
+
+    afflicted(:sleeping)
+      .each do |member|
+        fput "poke ##{member.id}"
+      end
+  end
+
+  if UNTRAMMEL.known?
+    add :untrammel do
+      check_your_self!
+      
+      afflicted(:webbed)
+        .each do |member| untrammel(member) end
+    end
+  end
+
+  if UNSTUN.known?
+    add :unstun do
+      check_your_self!
+  
+      afflicted(:stunned)
+        .each do |member| unstun(member) end 
+    end
+  end
+
+  if RALLY.known?
+    BREAKABLE = [
+      :stunned, :webbed, :rooted, :immobile
+    ]
+
+    add :rally do
+      check_your_self!
+      debug "rallying #{afflicted(*BREAKABLE)}"
+      rally if afflicted(*BREAKABLE).size > 0 || stunned?
+    end
+  end
+
+  start :stand
+  debug Group.check
+  link!
+end

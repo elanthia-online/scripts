@@ -61,9 +61,9 @@ describe GameObj do
         %{piece of golden amber},
         %{piece of green jade},
         %{piece of green marble},
-        %{piece of obsidian},
         %{piece of onyx},
         %{piece of petrified thanot},
+        %{piece of petrified maoral},
         %{piece of pink marble},
         %{piece of red jasper},
         %{piece of rose quartz},
@@ -105,16 +105,15 @@ describe GameObj do
         %{yellow zircon},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
 
       it "recognizes blue lapis lazuli as a gem" do
         lapis_obj = GameObjFactory.item_from_name("blue lapis lazuli", "lapis")
-        expect(lapis_obj.type).to include "gem"
-        expect(lapis_obj.type).to_not include "valuable"
-        expect(lapis_obj.sellable).to include "gemshop"
+        expect(lapis_obj.type).to eq "gem"
+        expect(lapis_obj.sellable).to eq "gemshop"
       end
     end
 
@@ -124,9 +123,8 @@ describe GameObj do
         %{piece of rosespar},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
     end
@@ -177,8 +175,8 @@ describe GameObj do
         %{yellow hyacinth},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -191,9 +189,8 @@ describe GameObj do
           %{pinch of gold dust},
         ].each do |valuable|
           it "recognizes #{valuable} as a valuable" do
-            expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-            expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+            expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+            expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
           end
         end
       end
@@ -215,8 +212,8 @@ describe GameObj do
         %{snowflake zircon},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -229,9 +226,8 @@ describe GameObj do
         %{platinum nugget},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
     end
@@ -245,18 +241,19 @@ describe GameObj do
         %{brilliant wyrm's-tooth amethyst},
         %{deep blue thunderstone},
         %{dragon's-fang quartz},
+        %{dull white soulstone},
         %{eye-of-koar emerald},
         %{faceted black diamond},
         %{faceted midnight blue riftstone},
-        %{glossy black doomstone},
         %{metallic black pearl},
+        %{milky quartz eye},
         %{multi-colored wyrdshard},
+        %{obsidian eye},
         %{pale violet riftstone},
         %{piece of black riftstone},
         %{radiant opalescent thunderstone},
         %{sanguine wyrm's-eye garnet},
         %{shard of dragonmist crystal},
-        %{shard of oblivion quartz},
         %{smoky grey thunderstone},
         %{swirling aetherstone},
         %{swirling purple thunderstone},
@@ -267,16 +264,27 @@ describe GameObj do
         %{transparent spherine},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
+        end
+      end
+    end
+
+    describe "cursed gems" do
+      [
+        %{glossy black doomstone},
+        %{shard of oblivion quartz},
+      ].each do |gem|
+        it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to include "cursed"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
 
     describe "valuables" do
       [
-        %{chalky yellow cube},
-
         %{bronze fang},
         %{copper fang},
         %{gold fang},
@@ -285,6 +293,7 @@ describe GameObj do
         %{platinum fang},
         %{silver fang},
         %{steel fang},
+        %{urglaes fang},
         %{golden firemote orb},
         %{murky shadowglass orb},
 
@@ -295,26 +304,15 @@ describe GameObj do
 
         %{small crystal-spoked wheel},
         %{dark-spoked crystalline wheel},
+
+        %{chalky yellow cube},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
           expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
+          expect(GameObjFactory.item_from_name(valuable).type).to_not include "uncommon"
           expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
-        end
-      end
 
-      describe "valuables with data issues" do
-        [
-          %{urglaes fang},
-        ].each do |valuable|
-          it "recognizes #{valuable} as a valuable" do
-            expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-            expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          end
-
-          xit "recognizes #{valuable} as sellable at the gemshop" do
-            expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
-          end
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
     end
@@ -346,6 +344,7 @@ describe GameObj do
         %{green peridot},
         %{green starstone},
         %{grey moonstone},
+        %{heart of smooth black glaes},
         %{leopard quartz},
         %{opaline moonstone},
         %{pink dreamstone},
@@ -364,8 +363,8 @@ describe GameObj do
         %{yellow sunstone},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -373,9 +372,8 @@ describe GameObj do
     describe "valuables" do
       [%{glaesine crystal}].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
     end
@@ -395,8 +393,8 @@ describe GameObj do
         %{vibrant hummingbird saewehna},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -405,7 +403,7 @@ describe GameObj do
   describe "krag dwellers gems" do
     ["brilliant purple opal"].each do |gem|
       it "recognizes #{gem} as a gem" do
-        expect(GameObjFactory.item_from_name(gem).type).to include "gem"
+        expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
       end
     end
   end
@@ -419,30 +417,19 @@ describe GameObj do
         %{boulder opal},
         %{bright bluerock},
         %{brown sphene},
+        %{cinnabar crystal},
         %{deep blue eostone},
         %{piece of azurite},
         %{piece of corestone},
         %{piece of grey chalcedony},
+        %{silvery galena},
         %{tangerine quartz},
         %{white sphene},
         %{yellow sphene},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
-        end
-      end
-
-      describe "gems with data issues" do
-        [
-          %{silvery galena},
-          %{cinnabar crystal},
-        ].each do |gem|
-          xit "recognizes #{gem} as a gem" do
-            expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-            expect(GameObjFactory.item_from_name(gem).type).to_not include "magic"
-            expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
-          end
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -462,8 +449,8 @@ describe GameObj do
         %{uncut star-of-tamzyrr diamond},
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
-          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
     end
@@ -502,110 +489,84 @@ describe GameObj do
         %{yellow helmet shell},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
+      end
+    end
+
+    describe "Sanctum of Scales" do
+      [
+        %[oblong blue goldstone],
+        %[dull grey crystal],
+        %[pink salt crystal],
+      ].each do |gem|
+        it "recognizes #{gem} as a gem" do
+          expect(GameObjFactory.item_from_name(gem).type).to eq "gem"
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
+        end
+      end
+    end
+  end
+
+  describe "REIM" do
+    [
+      %[round of milky amber],
+      %[smoky amethyst],
+      %[hexagonal cobalt blue beryl],
+      %[chunk of bronzite],
+      %[marbled green chrysoprase],
+      %[cluster of sky blue crystal],
+      %[ice blue diamond],
+      %[nebulous emerald],
+      %[lustrous black garnet],
+      %[ethereal blue gem],
+      %[teardrop of dark green heliotrope],
+      %[spear of lavender-grey iolite],
+      %[piece of jet-flecked ivory],
+      %[piece of black jade],
+      %[piece of blue jade],
+      %[pebble of orbicular jasper],
+      %[cone of mahogany obsidian],
+      %[heart of blue onyx],
+      %[cloud opal],
+      %[iridescent wood opal],
+      %[jelly opal],
+      %[shard of pink petalite],
+      %[luminous prehnite],
+      %[snow quartz],
+      %[haloed Reim ruby],
+      %[pallid sapphire],
+      %[chunk of pale blue ice stone],
+      %[chunk of pearly grey ice stone],
+      %[chunk of snowy white ice stone],
+      %[slice of ribbon stone],
+      %[dark blue tempest stone],
+      %[faint gold tempest stone],
+      %[pale grey tempest stone],
+      %[ebon-cored vortex stone],
+      %[silver-cored vortex stone],
+      %[sliver of bright green viridine],
+    ].each do |gem|
+      it "recognizes #{gem} as a gem" do
+        expect(GameObjFactory.item_from_name(gem).type).to include "gem"
+        expect(GameObjFactory.item_from_name(gem).type).to_not include "valuable"
+        expect(GameObjFactory.item_from_name(gem).type).to include "realm:reim"
+        expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
       end
     end
   end
 
   describe "valuable things which are not gems" do
     [
-      %{black-cored faceted star emerald},
-      %{blackened angular bloodstone},
-      %{block of beaver brown beryl},
-      %{blossom of blushed ivory chalcedony},
-      %{blue-swirled snow white garnet},
-      %{bright red eyeball-shaped agate},
-      %{cloud-shaped smoky grey smoldereye},
-      %{copper-leafed pale green emerald},
-      %{cracked crimson-flecked soulstone},
-      %{crimson vathor-incised bloodjewel},
-      %{cushion-cut circular violet sapphire},
-      %{deep black silver-flecked starstone},
-      %{deep green bug-filled amber},
-      %{deep umber paw-shaped stone},
-      %{ebon-ringed ruby},
-      %{faceted blue-tinged quartz},
-      %{faceted mint green sapphire},
-      %{faceted ocean blue roestone},
-      %{faceted yellow-tinged roestone},
-      %{fist-sized sunset orange coral},
-      %{flake of green and brown jade},
-      %{fractured spiderweb turquoise},
-      %{grey-hazed thistle purple jade},
-      %{hollow pasty white pearl},
-      %{hooked shard of inky deathstone},
-      %{hunk of verlok-carved marble},
-      %{indigo-cored blue sapphire},
-      %{irregular dull grey opal},
-      %{kaleidoscopic oblong saewehna},
-      %{keen-edged fiery red garnet},
-      %{large peridot},
-      %{lucid icy blue diamond},
-      %{mottled pink and white riftstone},
-      %{murky green scale-patterned quartz},
-      %{nightshade berry-hued moonstone},
-      %{nugget of green-tinged quartz},
-      %{pale piece of imp-shaped marble},
-      %{piece of perfectly clear topaz},
-      %{pitted ghostly white pearl},
-      %{polished spike of argent topaz},
-      %{polished sunset orange roestone},
-      %{polished yellow-tinged sapphire},
-      %{princess-cut alexandrite stone},
-      %{puce abyran-etched sphene},
-      %{purple bruise-hued opal},
-      %{purple plum-shaped pearl},
-      %{scratched spherical sapphire},
-      %{sickle of brittle pink quartz},
-      %{sliver of blue-tinged dreamstone},
-      %{sliver of green-tinged glimaerstone},
-      %{sliver of orange-tinged tourmaline},
-      %{sliver of pale violet zircon},
-      %{small key of ink blue riftstone},
-      %{smooth disk of firestone},
-      %{solid orb of zombie-engraved hematite},
-      %{speckled rose pink ruby},
-      %{sphere of animal-carved ivory},
-      %{spherical smoky plum pearl},
-      %{spiny hedgehog-shaped gem},
-      %{splinter of grey-veined azurite},
-      %{splinter of pale dragonmist crystal},
-      %{thumb-sized blue-tinged tourmaline},
-      %{thumb-sized mint green jade},
-      %{thumb-sized sunny yellow dreamstone},
-      %{twist of mint green sapphire},
-      %{twisted and cracked indigo amethyst},
-      %{very small sliver of jasper},
-      %{very tiny sea green glimaerstone},
-      %{vibrant orange and red sunstone},
-      %{wave-edged aquamarine spherine},
-      %{some deep green bug-filled amber},
-      %{some gnarled pitch black coral},
-      %{some pale fine-grained gypsum},
-      %{some lustrous grooved obsidian},
+      %{petrified tiger tooth},
+      %{petrified mammoth tusk},
     ].each do |valuable|
       it "recognizes #{valuable} as a valuable" do
-        expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
+        expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
         expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-        expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
-      end
-    end
-
-    describe "valuables with data issues" do
-      [
-        %{thin-rayed black diamond starburst},
-      ].each do |valuable|
-        it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
-          expect(GameObjFactory.item_from_name(valuable).type).to_not include "gem"
-        end
-
-        xit "recognizes #{valuable} as sellable at the gemshop" do
-          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
-        end
+        expect(GameObjFactory.item_from_name(valuable).type).to_not include "skin"
+        expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
       end
     end
   end
@@ -620,8 +581,9 @@ describe GameObj do
       %{spiked onyx scarab},
     ].each do |scarab|
       it "recognizes #{scarab} as a scarab" do
-        expect(GameObjFactory.item_from_name(scarab).type).to include "scarab"
-        expect(GameObjFactory.item_from_name(scarab).sellable).to include "gemshop"
+        expect(GameObjFactory.item_from_name(scarab).type).to eq "scarab"
+        expect(GameObjFactory.item_from_name(scarab).type).to_not include "uncommon"
+        expect(GameObjFactory.item_from_name(scarab).sellable).to eq "gemshop"
       end
     end
   end
@@ -642,9 +604,7 @@ describe GameObj do
         expect(GameObjFactory.item_from_name(plinite).type).to include "plinite"
         expect(GameObjFactory.item_from_name(plinite).type).to include "valuable"
         expect(GameObjFactory.item_from_name(plinite).type).to_not include "gem"
-      end
 
-      xit "recognizes a #{plinite} as sellable at the gemshop" do
         expect(GameObjFactory.item_from_name(plinite).sellable).to include "gemshop"
       end
     end

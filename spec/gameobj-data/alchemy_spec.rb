@@ -125,9 +125,15 @@ describe GameObj do
 
       [
         %{ayanad crystal},
+        %{cluster of ayanad crystals},
+        %{cluster of s'ayanad crystals},
+        %{cluster of t'ayanad crystals},
+        %{cracked soulstone},
+        %{crimson troll king bezoar},
         %{crystal core},
         %{crystalline globe},
         %{elemental core},
+        %{emerald stone giant bezoar},
         %{glimmering blue essence shard},
         %{glimmering blue mote of essence},
         %{glowing violet essence shard},
@@ -141,18 +147,24 @@ describe GameObj do
         %{pristine sprite's hair},
         %{radiant crimson essence shard},
         %{radiant crimson mote of essence},
+        %{saffron gremlock bezoar},
         %{s'ayanad crystal},
         %{small troll tooth},
         %{some essence of air},
         %{some essence of earth},
         %{some essence of fire},
         %{some essence of water},
+        %{essence of greater earth},
+        %{essence of greater air},
+        %{essence of greater fire},
+        %{essence of greater water},
         %{some glimmering blue essence dust},
         %{some glowing violet essence dust},
         %{some radiant crimson essence dust},
         %{t'ayanad crystal},
         %{tiny golden seed},
         %{vial of farlook vitreous humor},
+        %{violet Ithzir bezoar},
       ].each do |reagent|
         it "recognizes #{reagent} as a reagent" do
           expect(GameObjFactory.item_from_name(reagent).type).to include "reagent"
@@ -160,23 +172,6 @@ describe GameObj do
           expect(GameObjFactory.item_from_name(reagent).type).to_not include "skin"
 
           expect(GameObjFactory.item_from_name(reagent).sellable).to include "consignment"
-        end
-      end
-
-      describe "reagents with data issues" do
-        [
-          %{cluster of ayanad crystals},
-          %{cluster of s'ayanad crystals},
-          %{cluster of t'ayanad crystals},
-          %{cracked soulstone},
-        ].each do |reagent|
-          xit "recognizes #{reagent} as a reagent" do
-            expect(GameObjFactory.item_from_name(reagent).type).to include "reagent"
-            expect(GameObjFactory.item_from_name(reagent).type).to_not include "gem"
-            expect(GameObjFactory.item_from_name(reagent).type).to_not include "skin"
-
-            expect(GameObjFactory.item_from_name(reagent).sellable).to include "consignment"
-          end
         end
       end
     end
@@ -204,24 +199,11 @@ describe GameObj do
         %{silvery potion},
         %{diaphanous eight-sided crystal},
         %{dark translucent crystal},
+        %{swirling grey potion},
       ].each do |alchemy_product|
         it "recognizes #{alchemy_product} as an alchemy product" do
           expect(GameObjFactory.item_from_name(alchemy_product).type).to include "alchemy product"
           expect(GameObjFactory.item_from_name(alchemy_product).sellable).to include "consignment"
-        end
-      end
-
-      describe "products with data issues" do
-        [
-          %{swirling grey potion},
-        ].each do |alchemy_product|
-          it "recognizes #{alchemy_product} as an alchemy product" do
-            expect(GameObjFactory.item_from_name(alchemy_product).type).to include "alchemy product"
-          end
-
-          xit "recognizes #{alchemy_product} as sellable at alchemy consignment" do
-            expect(GameObjFactory.item_from_name(alchemy_product).sellable).to include "consignment"
-          end
         end
       end
     end
@@ -242,6 +224,8 @@ describe GameObj do
         %{smoky glass vial},
         %{thick glass vial},
         %{slender glass vial},
+        %{black iron cauldron},
+        %{ivory porcelain mortar},
       ].each do |alchemy_equipment|
         it "recognizes #{alchemy_equipment} as alchemy equipment" do
           expect(GameObjFactory.item_from_name(alchemy_equipment).type).to include "alchemy equipment"
