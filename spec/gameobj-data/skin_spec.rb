@@ -5,7 +5,7 @@ describe GameObj do
   describe "skins" do
     describe "with singular base nouns" do
       [
-        %{agresh bear claw},
+        %{Agresh bear claw},
         %{aivren gizzard},
         %{ant larva},
         %{antlers},
