@@ -344,6 +344,7 @@ describe GameObj do
         %{green peridot},
         %{green starstone},
         %{grey moonstone},
+        %{heart of smooth black glaes},
         %{leopard quartz},
         %{opaline moonstone},
         %{pink dreamstone},

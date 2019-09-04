@@ -16,6 +16,10 @@ migrate :gem, :gemshop do
   insert(:name, %[pink salt crystal])
 end
 
+migrate :skin, :furrier do
+  insert(:name, %[sidewinder scale])
+end
+
 migrate :magic, :pawnshop do
   insert(:exclude, %[pink salt crystal])
   insert(:exclude, %[dull grey crystal])

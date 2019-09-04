@@ -1,0 +1,800 @@
+=begin
+
+  this script uses the new playershop system by Naos to parse in-game shop directories 
+  and generate JSON files that can be consumed by external systems.
+
+  This script also exposes the Bodega module that other scripts may call.
+
+  ;bodega --help is your friend
+ 
+  Author: Ondreian
+  Requirements: Ruby >= 2.3
+  version: 0.1
+  tags: playershops
+
+=end
+require "ostruct"
+require "json"
+require "net/http"
+require "fileutils"
+require "pp"
+require "pathname"
+
+unless Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("2.3")
+  fail "your ruby@#{RUBY_VERSION} is too old"
+end
+##
+## check if a String is an int
+##
+class String
+  def is_i?
+    !!(self =~ /\A[-+]?[0-9]+\z/)
+  end
+end
+##
+## polyfill for working with MatchData
+##
+class MatchData
+  def to_struct
+    OpenStruct.new to_h
+  end
+
+  def to_h
+    Hash[self.names.map(&:to_sym).zip(self.captures.map(&:strip).map do |capture|  
+      if capture.is_i? then capture.to_i else capture end
+    end)]
+  end
+end
+
+module Bodega
+  ##
+  ## contextual logging
+  ##
+  module Log  
+    def self.out(msg, label: :debug)
+      if msg.is_a?(Exception)
+        msg = %{
+          #{msg.message}
+          #{msg.backtrace.join("\n")}
+        }
+      end
+
+      msg = _view(msg, label)
+
+      if Opts.headless
+        $stdout.write(msg + "\n")
+      else
+        _respond Preset.as(:debug, msg)
+      end
+    end
+
+    def self._view(msg, label)
+      label = [Script.current.name, label].flatten.compact.join(".")
+      safe = msg.inspect
+      safe = safe.gsub("<", "(").gsub(">", ")") if safe.include?("<") and safe.include?(">")
+      "[#{label}] #{safe}"
+    end
+
+    def self.pp(msg, label = :debug)
+      respond _view(msg, label)
+    end
+
+    def self.dump(*args)
+      pp(*args)
+    end
+
+    module Preset
+      def self.as(kind, body)
+        %[<preset id="#{kind}">#{body}</preset>]
+      end
+    end
+  end
+  ##
+  ## minimal options parser
+  ##
+  module Opts
+    FLAG_PREFIX = "--"
+    
+    def self.parse_command(h, c)
+      h[c.to_sym] = true
+    end
+
+    def self.parse_flag(h, f)
+      (name, val) = f[2..-1].split("=")
+      if val.nil?
+        h[name.to_sym] = true
+      else
+        val = val.split(",")
+
+        h[name.to_sym] = val.size == 1 ? val.first : val
+      end
+    end
+
+    def self.parse(args = Script.current.vars[1..-1])        
+      return @opts ||= _parse(args) if @script.eql?(Script.current)
+      @script = Script.current
+      return @opts = _parse(args) if @script.eql?(Script.current)
+    end
+
+    def self._parse(args)
+      OpenStruct.new(**args.to_a.reduce(Hash.new) do |opts, v|
+        if v.start_with?(FLAG_PREFIX)
+          Opts.parse_flag(opts, v)
+        else
+          Opts.parse_command(opts, v)
+        end
+        opts
+      end)
+    end
+
+    def self.method_missing(method, *args)
+      parse.send(method, *args)
+    end
+  end
+end
+
+module Bodega
+  module Messages
+    TOWNS    = %r[Valid options include: (?<towns>.*?)\.]
+    COMMAND  = %r[You can use the (?<command>.*?) command to browse the inventory of a particular shop.]
+    NEW_ROOM = %r[^(?<room_title>.*)\s\((?<branch>\w+)\)$]
+    SIGN     = %r[^Written on]
+    ITEM     = %r[^(?<item_id>\d+)\)]
+  end
+end
+
+module Bodega
+  class Collector
+    MAX_TRIES = Opts.to_h.fetch("max-tries", 3)
+
+    attr_reader :start, :close, :command
+    def initialize(start:, close:, command:)
+      @start   = start
+      @close   = close
+      @command = command
+    end
+
+    def blow_up(ttl)
+      fail Exception, "Collector(start: #{@start}, close: #{@close}) failed to complete in #{ttl} seconds"
+    end
+
+    def compare(line, pattern)
+      return line.include?(pattern) if pattern.is_a?(String)
+      return pattern.match(line)    if pattern.is_a?(Regexp)
+      fail "Unable to compare #{pattern.class} <=> #{line.class}"
+    end
+
+    def run(seconds = 5, tries: 0)
+      Log.out(@command, label: :retry) if tries > 0
+      fput @command
+      result = []
+      ttl    = Time.now + seconds
+      while(Time.now < ttl) 
+        line = get?
+        if line.nil?
+          sleep 0.1
+          next
+        end
+        result.push(line) if compare(line, @start) or not result.empty?
+        return result     if compare(line, @close) and not result.empty?
+      end
+
+      return run(seconds, tries: tries + 1) if Time.now > ttl and tries < Collector::MAX_TRIES
+      return blow_up(seconds) if Time.now > ttl and tries > Collector::MAX_TRIES
+    end
+  end
+end
+
+module Bodega
+  class Extractor
+    BLACKLIST = Regexp.union(
+      %r[^There is nothing there to read\.$],
+      %r[^You carefully inspect],
+      %r[^You get no sense of whether or not (.*?) may be further lightened.],
+      %r[there is no recorded information on that item],
+      %r[^You determine that you could not wear the shard\.],
+      %r[^You see nothing unusual\.$],
+      %r[^It imparts no bonus more than usual\.$],
+      %r[^It is difficult to see the (.*?) clearly from this distance\.])
+
+    ENHANCIVE = {
+          boost: %r[^It provides a boost of (?<boost>\d+) to (?<ability>.*?)\.],
+      level_req: %r[^This enhancement may not be used by adventurers who have not trained (?<level>\d+) times.],
+    }
+
+    BOOLS = {
+        max_deep: %r[pockets could not possibly get any deeper],
+       max_light: %r[^You can tell that the (?:.*?) is as light as it can get],
+         purpose: %r[appears to serve some purpose],
+      deepenable: %r[you might be able to have a talented merchant deepen its pockets for you],
+     lightenable: %r[You might be able to have a talented merchant lighten (.*?) for you.],
+        persists: %r[^It will persist after its last charge is depleted|^It will persist after its last enhancive charge],
+         crumbly: %r[but crumble after its last enhancive charge is depleted|^It will crumble into dust after its last charge is depleted\.$|^It will disintegrate after its last charge is depleted\.$],
+           small: %r[^It is a small item, under a pound],
+      imbeddable: %r[^It is a magical item which could be imbedded with a spell],
+    not_wearable: %r[^You determine that you could not wear],
+            holy: %r[^It is a holy item\.],
+    }
+
+    PROPS = {
+        skill: %r[requires skill in (?<skill>.*?) to use effectively\.],
+      enchant: %r[^It imparts a bonus of \+(?<enchant>\d+) more than usual\.],
+      weight: %r[^It appears to weigh about (?<weight>\d+) pounds.],
+        flare: %r[^It has been infused with the power of (a|an) (?<flare>.*?)\.],
+    material: %r[^It looks like this item has been mainly crafted out of (?<material>.*?)\.],
+        cost: %r[will cost (?<cost>\d+) coins\.$],
+        worn: %r[You determine that you could wear the (?:.*?)(, slinging it| around| on| over) (?<worn>.*?)\.],
+    activator: %r[^It could be activated by (?<activator>\w+) it\.$],
+        spell: %r[^It is currently imbedded with the (?<spell>.*?) spell.],
+      charges: %r[The (?:\w+) looks to have (?<charges>.*?) charges remaining\.$|It has (?<charges>.*?) charges remaining.],
+  shield_size: %r[Your careful inspection of an ornate villswood shield allows you to conclude that it is a (?<size>\w+) shield that],
+   armor_type: %r[ allows you to conclude that it is (?<armor_type>.*?)\.],
+        flare: %r[It has been infused with (?<flare>.*?)\.$],
+  }
+    
+    def self.of(details)
+      # todo: implement detail extractor
+      return new(details).to_h
+    end
+
+    attr_reader :props
+    def initialize(details)
+      @props   = {raw: [], tags: []}
+      _extract(details)
+    end
+
+    def maybe_raw(line, *others)
+      return if BLACKLIST.match(line)
+      return if others.any? {|identity| identity}
+      @props[:raw] << line
+    end
+
+    def _extract(details)
+      details.each do |line| 
+        maybe_raw(line,
+          _props(line),
+          _bools(line), 
+          _enhancive(line.strip))
+      end
+    end
+
+    def _bools(line)
+      BOOLS.select do |prop, pattern|
+        line.match(pattern) and @props[:tags].push(prop)
+      end.size > 0
+    end
+
+    def _enhancive(line)
+      if boost = line.match(ENHANCIVE[:boost])
+        enhancives = @props[:enhancives] ||= []
+        enhancives.push(boost.to_h)
+        return true
+      end
+
+      if level_req = line.match(ENHANCIVE[:level_req])
+        enhancives.last.merge!(level_req.to_h)
+        return true
+      end
+
+      return false
+    end
+
+    def _props(line)
+      PROPS.select do |prop, pattern|
+        if result = line.match(pattern)
+          @props.merge!(result.to_h)
+        else
+          false
+        end
+      end.size > 0
+    end
+
+    def to_h
+      @props
+    end
+  end
+end
+
+module Bodega
+  module Assets
+    $lich_dir = "/tmp" unless defined? $lich_dir
+
+    LOCAL_FS_ROOT = Pathname.new($lich_dir) + (Opts.local_dir || "bodega")
+    URL           = Opts.remote || "https://bodega.surge.sh"
+
+    begin
+      FileUtils.mkdir_p(LOCAL_FS_ROOT)  
+    rescue => exception
+      Log.out(exception.message)
+      exit
+    end    
+
+    def self.local_path(file)
+      LOCAL_FS_ROOT + file
+    end
+
+    def self.remote_path(file)
+      [URL, file].join("/")
+    end
+
+    def self.checksum(file)
+      require "digest"
+      file = local_path(file)
+      if File.exists?(file)
+        Digest::SHA256.file(file).hexdigest
+      else
+        false
+      end
+    end
+
+    def self.glob(pattern)
+      Dir[LOCAL_FS_ROOT + pattern]
+    end
+
+    def self.read_local_json(file)
+      Utils.read_json local_path(file)
+    end
+
+    def self.write_local_json(data, file)
+      Utils.write_json(data, 
+        local_path(file + ".json"))
+    end
+
+    def self.get_remote(file)
+      url = remote_path(file)
+      uri = URI(url)
+      Net::HTTP.get(uri)
+    end
+
+    def self.is_stale?(remote)
+      remote = OpenStruct.new(remote)
+      not Assets.checksum(remote.base_name).eql?(remote.checksum)
+    end
+
+    def self.cached_files()
+      glob("*.json").reject do |f| f.include?("manifest.json") end
+    end
+
+    def self.stream_download(remote)
+      require("open-uri")
+      remote = OpenStruct.new(remote)
+      path = local_path(remote.base_name)
+      Log.out("updating".rjust(10) + " ... #{remote.base_name.gsub(".json", "").rjust(20)} >> #{remote.size}", label: :download)
+      IO.copy_stream(open(remote.url), path)
+    end
+  end
+end
+
+module Bodega
+  module Utils
+    def self.parse_json(str)
+      begin
+        JSON.parse(str, symbolize_names: true)
+      rescue => exception
+        Script.log(exception)
+        Script.log(exception.backtrace)
+        return {}
+      end
+    end
+
+    def self.read_json(file)
+      parse_json File.read(file)
+    end
+
+    def self.write_json(data, file)
+      Log.out("... writing #{file}", label: :filesystem)
+      File.open(file, 'w') do |f| 
+        data = JSON.pretty_generate(data) unless data.is_a?(String)
+        f.write(data)
+      end
+    end
+
+    def self.fmt_time(diff)
+      return "#{(diff * 1_000.0).to_i}ms" if diff < 1
+      (h, m, s) = (diff / 60).as_time.split(":").map(&:to_i)
+
+      h = h % 24
+      d = h / 24
+
+      fmted = []
+      fmted << d.to_s.rjust(2, "0") + "d" if d > 0
+      fmted << h.to_s.rjust(2, "0") + "h" if h > 0
+      fmted << m.to_s.rjust(2, "0") + "m" if m > 0
+      fmted << s.to_s.rjust(2, "0") + "s" if s > 0
+      return fmted.join(" ")
+    end
+
+    def self.benchmark(**args)
+      template = args.fetch(:template, "{{run_time}}")
+      label    = args.fetch(:label, :benchmark)
+      start    = Time.now
+      result   = yield
+      run_time = Utils.fmt_time(Time.now - start)
+      Log.out(template.gsub("{{run_time}}", run_time), label: label)
+      return result
+    end
+
+    def self.safe_string(t)
+      t.to_s.downcase
+      .gsub("ta'", "ta_")
+      .gsub(/'|,/, "")
+      .gsub(/-|\s/, "_")
+    end
+
+    def self.pp(o)
+      begin
+        _respond PP.pp(o, "")
+      rescue => _ex
+        respond o.inspect
+      end
+    end
+  end
+end
+
+module Bodega
+  module Parser
+    def self.fetch_towns()
+      case (result = dothistimeout("shop direc", 5, Messages::TOWNS))
+      when Messages::TOWNS
+        result.match(Messages::TOWNS)[:towns].gsub(" and ", ", ").split(", ")
+      else
+        fail "unknown outcome for parsing available towns"
+      end
+    end
+
+    def self.towns()
+      @towns ||= fetch_towns
+    end
+
+    def self.shops(town)
+      coll = Collector.new(
+        command: %[shop direc #{town}],
+        start:   %r[~*~ (?<title>.*?) Shops ~*~],
+        close:   %[You can use the SHOP BROWSE])
+
+      result = coll.run()
+
+      next_command = result.last.match(Messages::COMMAND)[:command]
+      
+      by_shop_number = result.slice(1..-2)
+        .map(&:strip).map do |row| row.split(/\s{2,}/) end # split columns
+        .flatten.map do |col| col.split(") ") end          # split number/shop name
+
+      if Opts.shop
+        by_shop_number = Hash[by_shop_number.select do |id, title| title.downcase.include?(Opts.shop.downcase) end]
+      end
+
+      Parser.scan_shops(town, Hash[by_shop_number], next_command)
+    end
+
+    def self.scan_shops(town, shops, cmd_template)
+      max_shop_depth = (Opts["max-shop-depth"] || 10_000).to_i
+      shops = shops.take(max_shop_depth)
+      shops.map.with_index do |k_v, idx|
+        (id, name) = k_v 
+        right_col = "scanning [#{idx + 1}/#{shops.size}]".rjust(30)
+        Log.out(right_col + " ... Shop(id: #{id}, name: #{name})", 
+          label: Utils.safe_string(town))
+        begin
+          Parser.scan_inv(town, id, name, 
+            cmd_template.gsub("{SHOP#}", id))
+        rescue => exception
+          Log.out(exception)
+          nil
+        end
+      end.compact # prune errored shops
+    end
+
+    def self.scan_inv(town, id, name, cmd)
+      coll = Collector.new(
+        start:   %[is located in],
+        close:   %[You can use the SHOP INSPECT {STOCK#}],
+        command: cmd)
+      
+      (preamble, *inv) = coll.run()
+
+      { preamble:  preamble,
+        town:      town,
+        id:        id,
+        inv:       parse_inv(inv.map(&:strip)) }
+    end
+
+    def self.add_room(acc, row)
+      acc.push(
+        OpenStruct.new(
+          row.match(Messages::NEW_ROOM).to_h.merge({items: []})))
+    end
+
+    def self.add_sign(acc, row)
+      acc.last.sign ||= []
+      acc.last.sign.push(row)
+    end
+
+    def self.add_item(acc, row)
+      acc.last.items.push(
+        row.match(Messages::ITEM)[:item_id])
+    end
+
+    def self.parse_inv(inv)
+      inv.reduce([]) do |acc, row|
+        # we are at the terminal line for this shop
+        break acc if row.include?("SHOP INSPECT")
+        Parser.add_room(acc, row) if row.match(Messages::NEW_ROOM)
+        Parser.add_sign(acc, row) if row.match(Messages::SIGN) or not acc.last.sign.nil?
+        Parser.add_item(acc, row) if row.match(Messages::ITEM) and acc.last.sign.nil?
+        acc
+      end
+      .map do |room| 
+        max_item_depth = (Opts["max-item-depth"] || 100).to_i
+        room.items = room.items.take(max_item_depth).map do |id| Parser.scan_item(id) end
+        room
+      end
+      .map(&:to_h)
+    end
+
+    def self.scan_item(id)
+      coll = Collector.new(
+        command: %[shop inspect #{id}],
+        start:   %[You request a thorough inspection of],
+        close:   %[You can use SHOP PURCHASE #{id} to purchase])
+
+      details = coll.run()
+
+      { id:      id, 
+        name:    details.first.gsub("You request a thorough inspection of ", "").gsub(%r[\sfrom [A-Z].*?\.$], ""), 
+        details: Extractor.of(details.slice(1..-2)) }
+    end
+
+    def self.towns_to_search()
+      if Opts.town.nil? then 
+        towns 
+      else 
+        towns.select do |town| town.downcase.include?(Opts.town.downcase) end
+      end
+    end
+
+    def self.all()   
+      towns_to_search.map do |town| 
+        { town: town, 
+          shops: Parser.shops(town) } 
+      end
+    end
+
+    def self.to_json()
+      Utils.benchmark(template: "scanned shops in {{run_time}}") do
+        towns_to_search.each do |town|
+          start = Time.now
+          shops = Parser.shops(town)
+
+          next if shops.empty?
+
+          data = { 
+            created_at: Time.now.utc,
+              run_time: Utils.fmt_time(Time.now - start),
+                  town: town,
+                shops: shops,
+          }
+
+          save_json(name: town, 
+                    data: data)
+        end
+      end
+    end
+
+    def self.save_json(name:, data:) 
+      return Utils.pp(data) if Opts["dry-run"]
+      Assets.write_local_json(data, 
+        Utils.safe_string(Opts.to_h
+            .fetch(:shop, name)))
+    end
+
+    def self.manifest(url_root: Opts.to_h.fetch(:url, Assets::URL), file: nil)
+      assets = Assets.cached_files()
+      fail "no assets found" if assets.empty?
+      assets = assets.map do |asset| 
+        abs_file_name = Assets.local_path(asset)
+        base_name     = File.basename(asset)
+        data          = Utils.read_json(abs_file_name)
+        {       url: url_root + "/" + base_name,
+          base_name: base_name,
+               size: '%.2fmb' % (File.size(abs_file_name).to_f / (2**20)), # mbs
+           run_time: data.fetch(:run_time, nil),
+           checksum: Assets.checksum(asset),
+         updated_at: data.fetch(:created_at, nil)}
+      end
+    
+      manifest = { created_at: Time.now.utc, assets: assets }
+      Utils.pp(manifest)
+      return if Opts["dry-run"]
+      Assets.write_local_json(manifest, "manifest")
+    end
+  end
+end
+
+module Bodega
+  class Index
+    class DuplicateIndexError < Exception; end
+
+    STAR = "*"
+
+    SPECIAL_GS_WORDS = %w(ora)
+
+    def self.keywords(str)
+      str.split(/\s+/).reject do |token|
+        COMMON_TOKENS.include?(token)
+      end
+    end
+
+    attr_reader :lookup
+
+    def initialize()
+      clear()
+    end
+
+    def clear()
+      @lookup = {
+       by_keyword: {},
+            by_id: {},
+          by_shop: {},
+          by_item: {},
+          by_town: {}}
+    end
+
+    def by_id(id)
+      @lookup[:by_id].fetch(id, nil)
+    end
+
+    def has_id?(id)
+      not by_id(id).nil?
+    end
+
+    def add_id(id, obj)
+      id = id.to_s
+      fail Exception, "nil id" if id.nil?
+      # shop id
+      return if has_id?(id)
+      if has_id?(id)
+        _respond <<~ERROR
+          DuplicateIdError: 
+            new: \n#{PP.pp(obj, "")}\n
+            old: \n#{PP.pp(by_id(id), "")}\n
+        ERROR
+      end
+      @lookup[:by_id][id] = obj
+    end
+
+    def add_keyword(word, id)
+      # skip short words
+      return if word.size < 4 and not (SPECIAL_GS_WORDS.include?(word) or word.is_i?)
+      Log.out(word)
+    end
+    ##
+    ## shop table storage
+    ##
+    def _sts(town:)
+      all = Assets.glob("*.json")
+      return all if town.eql?(STAR)
+      all.select do |file| file.include?(town) end
+    end
+
+    def _load(town: STAR)
+      _sts(town: town).each do |town_fs_data|
+        town = Utils.read_json(town_fs_data)
+        town.fetch(:shops, []).each do |shop|
+          shop[:id] = shop[:town] + shop[:id]
+          # numbers auto increment for each town
+          # which means duplicate ids for each town
+          add_id(shop[:id], shop)
+          shop[:inv].each do |room|
+            room[:items].each do |item|
+              add_id(item[:id], item.merge(
+                {     branch: room[:branch], 
+                  room_title: room[:room_title] }))
+            end
+          end
+        end
+      end
+    end
+
+    def query(**params)
+    end
+  end
+end
+
+module Bodega
+  module SearchEngine
+    ##
+    ## resync raw assets from the CDN
+    ##
+    def self.sync()
+      manifest = Utils.parse_json Bodega::Assets.get_remote("manifest.json")
+      stale = manifest.fetch(:assets, []).select do |remote| Assets.is_stale?(remote) or Opts.flush end
+      return if stale.empty?
+      Utils.benchmark(template: ("sync".rjust(10) + " ... " + "completed".rjust(20) + " >> {{run_time}}"), label: :download) do
+        stale.map do |remote|
+          begin
+            Thread.new do Assets.stream_download(remote) end
+          rescue => exception
+            Log.out(exception)
+            Log.out(exception.backtrace)
+          end
+        end.map(&:value)
+      end
+    end
+    ##
+    ## the base index object
+    ##
+    @index ||= Index.new
+
+    @index.clear if Opts["flush-index"]
+
+    def self.build_index()
+      Utils.benchmark(template: "built index in {{run_time}}") do 
+        @index._load()
+      end
+    end
+
+    def self._index
+      @index
+    end
+
+    def self.attach()
+      SearchEngine.sync()
+      SearchEngine.build_index() if Opts["force-index"]
+    end
+  end
+end
+
+module Bodega
+  module CLI
+    def self.help_menu()
+      <<~HELP_MENU 
+        \n
+      bodega.lic
+
+        this script uses the new playershop system by Naos to parse in-game shop directories 
+        and generate JSON files that can be consumed by external systems.
+
+        This script also exposes the Bodega module that other scripts may call.
+
+      parse mode:
+        --dry-run             run but print JSON to your FE                 [used primarily for testing]
+        --town                index all shops in one town                   [used primarily for testing]
+        --max-shop-depth      index only a certain number of shops per town [used primarily for testing]
+        --max-item-depth      index only a certain number of items per shop [used primarily for testing]
+        --shop                index a shop by name                          [used primarily for testing]
+        --save                dump the results to the filesystem            [required in standalone mode]
+        --out                 the location on the filesystem to write to    [defaults to $lich_dir/bodega/]
+        --manifest            create a manifest file of the assets
+
+      search mode:
+        --flush               forces a resync of the search index from the CDN
+        --force-index         forces the search index to be built as fast as possible
+        \n
+      HELP_MENU
+    end
+    begin
+      ##
+      ## HALP
+      ##
+      if Opts.help
+        respond CLI.help_menu()
+        exit
+      end
+      ##
+      ## handle Parser command
+      ##
+      if Opts.parser
+        Log.out(Opts.to_h, label: :opts)
+        Bodega::Parser.to_json()  if (Opts.save or Opts["dry-run"])
+        Bodega::Parser.manifest() if Opts.manifest
+      end
+
+      if Opts.search
+        Bodega::SearchEngine.attach()
+      end
+    rescue => exception
+      Log.out(exception)
+    end
+  end
+end

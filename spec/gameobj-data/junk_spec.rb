@@ -23,6 +23,18 @@ describe GameObj do
       end
     end
 
+    describe "junk specific to certain creatures" do
+      [
+        %{hollow smooth black glaes},
+      ].each do |junk_name|
+        it "recognizes critter dropped #{junk_name} as junk" do
+          junk = GameObjFactory.item_from_name(junk_name)
+          expect(junk.type).to eq "junk"
+          expect(junk.sellable).to be nil
+        end
+      end
+    end
+
     describe "randomized junk names from treasure system" do
       junk_nouns = %w[coin cup doorknob fork horseshoe nail spoon]
       junk_descriptors = %w[bent corroded dented polished rusty scratched shiny tarnished]
