@@ -5,7 +5,7 @@ describe GameObj do
   describe "skins" do
     describe "with singular base nouns" do
       [
-        %{agresh bear claw},
+        %{Agresh bear claw},
         %{aivren gizzard},
         %{ant larva},
         %{antlers},
@@ -28,7 +28,7 @@ describe GameObj do
         %{boar tusk},
         %{bobcat claw},
         %{brown bear skin},
-        %{brown boar skin},
+        %{brown boar hide},
         %{brown gak hide},
         %{brown spinner leg},
         %{caedera skin},
@@ -108,8 +108,9 @@ describe GameObj do
         %{kobold skin},
         %{krynch shinbone},
         %{leaper hide},
-        %{leathery bat wings},
+        %{leathery bat wing},
         %{leopard skin},
+        %{lich finger bone},
         %{long fiery red spine},
         %{lump of black ambergris},
         %{lump of grey ambergris},
