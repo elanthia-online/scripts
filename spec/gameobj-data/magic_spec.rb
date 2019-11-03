@@ -34,6 +34,10 @@ describe GameObj do
       [
         %{crystal amulet},
         %{ruby amulet},
+
+        # EG variants
+        %{gritty crystal amulet},
+        %{dirt-caked crystal amulet},
       ].each do |magic_item_name|
         it "recognizes #{magic_item_name} as magic" do
           magic_item = GameObjFactory.item_from_name(magic_item_name)
