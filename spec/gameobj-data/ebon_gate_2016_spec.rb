@@ -132,4 +132,154 @@ describe GameObj do
       end
     end
   end
+
+  describe "Ebon Gate 2019" do
+    describe "gems" do
+      [
+        %{blackened feystone core},
+        %{dark grey dreamstone fragment},
+        %{fossilized thrak tooth},
+        %{grooved burnt orange sea star},
+        %{limpid dark indigo tidal pearl},
+        %{piece of petrified wyrmwood},
+        %{prismatic rose-gold fire agate},
+        %{radiant lush viridian star emerald},
+        %{rich cerulean mermaid's-tear sapphire},
+        %{shard of pale grey shadowglass},
+        %{spiny fan of lustrous black coral},
+        %{stellular dragon's-tear diamond},
+        %{teardrop of murky sanguine ruby},
+        %{rainbow-hued oval abalone shell},
+        %{rust-speckled ivory slipper shell},
+        %{burnished sepia moonsnail shell},
+        %{pale-spotted rosy sea urchin shell},
+        %{misty silver crystalline spiral},
+        %{branch of petrified driftwood},
+        %{rough-edged matte white soulstone},
+        %{honey-washed violet water sapphire},
+        %{ebon-cored ruddy almandine garnet},
+        %{wedge of ocher and ebony ambergris},
+        %{cabochon of milky azure aquamarine},
+        %{thin blade of verdant sea glass},
+        %{purple-banded razor clam shell},
+        %{five-pointed seafoam white sandsilver},
+        %{triangular charcoal shark tooth},
+        %{wine-tinged calico scallop shell},
+      ].each do |gem|
+        it "recognizes #{gem} as an Ebon Gate gem" do
+          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
+          expect(GameObjFactory.item_from_name(gem).type).to include "ebongate"
+          expect(GameObjFactory.item_from_name(gem).type).to_not include "valuable"
+          expect(GameObjFactory.item_from_name(gem).type).to_not include "skin"
+          expect(GameObjFactory.item_from_name(gem).type).to_not include "uncommon"
+
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
+        end
+      end
+    end
+
+    describe "quest items" do
+      [
+        %{smooth grey boulder},
+        %{tumbled grey stone},
+
+        %{blocky pine beam},
+        %{forged horseshoe nail},
+        %{rough oak post},
+        %{rough piece of driftwood},
+        %{smooth wooden plank},
+
+        %{fistful of iron nails},
+        %{square of thin grey shale},
+        %{bluish grey slate tile},
+
+        %{painted wood casing},
+        %{warped wooden door},
+        %{smooth glaesine window pane},
+
+        %{tiny blue mosaic tile},
+        %{bright red mosaic tile},
+        %{some indigo and silver tiles},
+        %{some green and white tiles},
+
+        %{oak-handled diorite chisel},
+        %{tumbled grey stone},
+        %{smooth grey boulder},
+        %{porous lava block},
+        %{small eel-carved stone},
+      ].each do |quest_item|
+        it "recognizes #{quest_item} as an Ebon Gate quest item" do
+          expect(GameObjFactory.item_from_name(quest_item).type).to include "ebongate"
+          expect(GameObjFactory.item_from_name(quest_item).type).to include "quest"
+
+          expect(GameObjFactory.item_from_name(quest_item).sellable.to_s).to be_empty
+
+          expect(GameObjFactory.item_from_name(quest_item).type).to_not include "clothing"
+          expect(GameObjFactory.item_from_name(quest_item).type).to_not include "gem"
+          expect(GameObjFactory.item_from_name(quest_item).type).to_not include "valuable"
+        end
+      end
+
+      [
+        [%{waterproof bag}, %{of powdered lime}],
+        [%{waterproof sack}, %{of mortar}],
+        [%{small vial}, %{of black tar}],
+      ].each do |(item_name, after_name)|
+        it "recognizes #{item_name} #{after_name} as an Ebon Gate quest item" do
+          quest_item = GameObjFactory.item_from_name(item_name, after_name)
+          expect(quest_item.type).to include "ebongate"
+          expect(quest_item.type).to include "quest"
+
+          expect(quest_item.sellable.to_s).to be_empty
+
+          expect(quest_item.type).to_not include "clothing"
+          expect(quest_item.type).to_not include "gem"
+          expect(quest_item.type).to_not include "valuable"
+        end
+      end
+    end
+
+    describe "junk" do
+      junk_nouns = [
+        %{iron doorknob},
+        %{iron horseshoe},
+        %{stone brick},
+        %{table leg},
+      ]
+      junk_descriptors = %w[
+        dirt-caked
+        dirty
+        encrusted
+        gritty
+        marred
+        misshapen
+        murky
+        sand-caked
+        scorched
+        slimy
+      ]
+
+      junk_nouns.product(junk_descriptors).each do |noun, desc|
+        junk_name = "#{desc} #{noun}"
+
+        it "recognizes #{junk_name} as EG-flavored junk" do
+          junk = GameObjFactory.item_from_name(junk_name)
+          expect(junk.type).to eq "junk"
+          expect(junk.sellable).to be nil
+        end
+      end
+    end
+
+    describe "other items" do
+      [
+        %{short-handled rusted steel shovel},
+        %{eel-etched raffle token},
+        %{some indigo-black seashells},
+      ].each do |quest_item|
+        it "recognizes #{quest_item} as an Ebon Gate item" do
+          expect(GameObjFactory.item_from_name(quest_item).type).to eq "ebongate"
+        end
+      end
+    end
+  end
 end

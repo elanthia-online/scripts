@@ -6,10 +6,12 @@ migrate :jewelry do
   insert(:noun, %{jug})
   insert(:noun, %{pitcher})
   insert(:noun, %{scepter})
+  insert(:noun, %{sceptre})
 
   insert(:exclude, %{white flask})
 end
 
 migrate :gemshop do
   insert(:noun, %{scepter})
+  insert(:noun, %{sceptre})
 end

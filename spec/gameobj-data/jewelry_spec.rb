@@ -38,6 +38,7 @@ describe GameObj do
         platter
         ring
         scepter
+        sceptre
         stein
         stickpin
         talisman
