@@ -134,6 +134,7 @@ describe GameObj do
         %{indigo ora pole-axe},
         %{glistening mithril scythe},
         %{rowan-handled feras warlance},
+        %{barbed mithril-tipped pike},
       ].each do |weapon_name|
         it "recognizes #{weapon_name} as weapon" do
           weapon = GameObjFactory.item_from_name(weapon_name)
