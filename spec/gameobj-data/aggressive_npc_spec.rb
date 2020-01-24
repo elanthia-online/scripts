@@ -318,6 +318,8 @@ describe GameObj do
           %{Royal Jester},
           %{Royal Emperor},
           %{Royal Empress},
+          %{berserk Royal Emperor},
+          %{berserk Royal Empress},
 
           %{speedy sapper},
 
