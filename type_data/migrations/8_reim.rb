@@ -1,4 +1,30 @@
-migrate :aggressive_npc, :undead do
+create_table "realm:reim", keys: [:name]
+
+migrate :undead, "realm:reim" do
+  insert(:name, %{Shopkeeper})
+  insert(:name, %{Innkeeper})
+  insert(:name, %{Bartender})
+  insert(:name, %{Patrol Leader})
+  insert(:name, %{Bandit Lord})
+  insert(:name, %{Bandit Lady})
+  insert(:name, %{Gypsy Queen})
+  insert(:name, %{Gypsy King})
+  insert(:name, %{Guard Captain})
+  insert(:name, %{Wall Captain})
+  insert(:name, %{Drill Sergeant})
+  insert(:name, %{Stable Hostler})
+  insert(:name, %{Dungeon Master})
+  insert(:name, %{Master Torturer})
+end
+
+migrate :aggressive_npc, :undead, "realm:reim" do
+  insert(:name, %{ethereal commoner})
+  insert(:name, %{ethereal denizen})
+  insert(:name, %{ethereal peasant})
+  insert(:name, %{ethereal townsman})
+  insert(:name, %{ethereal townswoman})
+  insert(:name, %{ethereal traveller})
+  insert(:name, %{ethereal villager})
   insert(:name, %[ethereal barbarian])
   insert(:name, %[ethereal knight])
   insert(:name, %[ethereal pillager])
@@ -53,6 +79,8 @@ migrate :aggressive_npc, :undead do
   insert(:name, %[Royal Jester])
   insert(:name, %[Royal Emperor])
   insert(:name, %[Royal Empress])
+  insert(:name, %[berserk Royal Emperor])
+  insert(:name, %[berserk Royal Empress])
   insert(:name, %[Sapper Lord])
   insert(:name, %[Sapper Lady])
   insert(:name, %[Raid Leader])
@@ -75,7 +103,7 @@ migrate :aggressive_npc, :undead do
   insert(:name, %[speedy sapper])
 end
 
-migrate :gem, :gemshop do
+migrate :gem, :gemshop, "realm:reim" do
   insert(:name, %[round of milky amber])
   insert(:name, %[smoky amethyst])
   insert(:name, %[hexagonal cobalt blue beryl])
@@ -112,6 +140,11 @@ migrate :gem, :gemshop do
   insert(:name, %[ebon-cored vortex stone])
   insert(:name, %[silver-cored vortex stone])
   insert(:name, %[sliver of bright green viridine])
+end
+
+migrate :passive_npc do
+  insert(:exclude, %{ethereal traveller})
+  insert(:exclude, %{celestial traveller})
 end
 
 migrate :uncommon do
