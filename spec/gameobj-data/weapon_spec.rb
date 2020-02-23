@@ -47,6 +47,7 @@ describe GameObj do
         %{scorched gornar warblade},
         %{ancient faenor yataghan},
         %{purple rolaren-studded shillelagh},
+        %{maple-hafted vaalorn fauchard},
       ].each do |weapon_name|
         it "recognizes #{weapon_name} as weapon" do
           weapon = GameObjFactory.item_from_name(weapon_name)
