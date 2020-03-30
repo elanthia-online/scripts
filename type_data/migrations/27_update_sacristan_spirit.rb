@@ -1,3 +1,3 @@
-migrate :undead, :passive_npcs do
+migrate :undead, :passive_npc do
   insert(:name, %{sacristan spirit})
 end
