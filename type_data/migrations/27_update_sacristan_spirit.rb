@@ -3,5 +3,5 @@ migrate :undead do
 end
 
 migrate :passive_npc do
-  insert(:exclue, %{sacristan spirit})
+  insert(:exclude, %{sacristan spirit})
 end
