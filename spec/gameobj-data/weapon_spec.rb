@@ -49,6 +49,8 @@ describe GameObj do
         %{purple rolaren-studded shillelagh},
         %{maple-hafted vaalorn fauchard},
         %{saw-toothed zorchar cutlass},
+        %{perfect steel-hilted steel short-sword},
+        %{thanot-hafted glaes-spiked tetsubo},
       ].each do |weapon_name|
         it "recognizes #{weapon_name} as weapon" do
           weapon = GameObjFactory.item_from_name(weapon_name)
