@@ -5,10 +5,15 @@
      author: Daedeus (updates by Tysong/Ragz)
        name: briefcombat
        tags: brief, briefcombat, condensing, condense, combat, squelch
-    version: 0.0.5
+    version: 0.0.6
 
     changelog:
-        0.0.5 (2020-05-01
+        0.0.6 (2020-05-05)
+            Revert 0.0.5 changes and added a bunch of new code
+            Detection of most common AOE spells, and more aggressive shortening of their text
+            when no damage is dealt, will preserve last message.  This allows most buffs (117, 515, etc) to show correctly.
+            Hopefully improved detection of 709 arms decaying
+        0.0.5 (2020-05-01)
             fix for additional condensing of various casting
             fix to now show player deaths (previously would squelch/hide)
         0.0.4 (2017-05-15)
@@ -20,6 +25,10 @@
             cleaned up some comments, unused code
         0.0.1 (unknown)
             initial release
+			
+    Known Issues:
+        will show an npc's status as knocked down or stunned, if they were stunned/prone before the spell in question.
+	
 =end
 
 $debug = false
@@ -29,130 +38,192 @@ put 'set MonsterBold On' #required for monster recognition
 #  for casters it's probably gesture/channel.
 pc_or_you = '<a exist="(-\d+)" noun="\w+">\w+<\/a>|You'
 verbs = ['gestures? at',
-		 'gestures.',
-         'sings with renewed vigor',
-         'continues to sing a disruptive song.',
-		 'skillfully begins to weave another verse into',
-		 'skillfully weaves another verse into',
+         'gestures?\.',
          'channels? at',
          '(?:hurl|fire|swing|thrust)s? an? [\w \-\']+ at',
          'swings? an? [\w \-\']+ at',
-         'thrusts?(?: with)? an? [\w \-\']+ at',
-         'punches?(?: with)? an? [\w \-\']+ at',
-         'releases',
-         'release',
-         'directing the sound of (?:his|her|your) voice at',
-		 'to strike at',
+         'thrusts?(?: with)? a [\w \-\']+ at',
+         'continues to sing a disruptive song',
+         'skillfully begins to weave another verse into (?:.*) harmony',
+         'voice carries the power of thunder as (?:.*) calls out an angry incantation in an unknown language',
+         '(?:.*) directing the sound of (?:.*) voice at',
+         'punches?(?: with)? an? [\w \-\']+ at',         
          '(?:make a precise )?attempts? to (?:punch|jab|grapple|kick)']
-		 
+
 target = '<pushBold\/>(.*)<popBold\/>' #npc targets are in bold thanks to MonsterBold setting
 
-$combat_regex = /(#{pc_or_you}) (#{verbs.join('|')})/
+$combat_regex = /(#{pc_or_you}) (#{verbs.join('|')})(?: (#{target}))?/
 
 n = -1
 $compressing = false
 $compressed = nil
+$compress_last = nil
 $targets_damage = nil
 $target = nil
 $targets_last_message = nil
 $targets_status = nil
+$is_no_target = false
+$is_buff = false
+$shorteningSearch = false 
+$is_self = false
 
-$shortening = true
+
+def SpellName(id)
+    if id == "709"
+        return "Grasp of the Grave" #because Spell[709].name returns "Quake"
+    else
+        return Spell[id].name
+    end
+end
 
 unless script.vars.empty? 
     n = script.vars[0].strip.to_i
 end
 
+$compressing_spell_guess = nil
 def begin_compress(s, targetstr)
-    targetstr =~ /<a exist="([\S\d]+)"/
+    targetstr =~ /<a exist="(\d+)"/
     targetid = $1
+    $is_no_target = targetid.nil?
+    
     $miss_message = ' is unaffected'
     $prev_message = nil
     
     unless $compressing
         $compressing = true
+        $compressing_spell_guess = nil
+        #$compressing_mstrike = s.include? "looks determined and focused"
+        $compressing_better_action_message = nil
         $targets_damage = Hash.new
         $targets_last_message = Hash.new
         $targets_status = Hash.new
+        $compress_last = nil
+        $is_buff = false
 
-        $compressed = Array.new
-        $target = targetid
-    
+        $compressed = Array.new    
         $compressed.push(s.chomp)
-        $targets_damage[targetid] = 0 #begin counting damage
-        $targets_last_message[targetid] = s
+        $target = nil
+
+        unless targetid.nil?
+            $target = targetid
+            $targets_damage[targetid] = 0 if #begin counting damage
+            $targets_last_message[targetid] = s
+            #echo "lastmsg: #{s}"
+        end 
     end
 end
 
 def end_compress(s)
     $compressing = false
     num_targets = $targets_damage.length
-    #echo num_targets if Char.name == "Tysong"
-    #echo $targets_damage if Char.name == "Tysong"
-    if num_targets > 2
+
+    #if we identified the AOE spell, we can add some detail
+    unless $compressing_spell_guess.nil?
+        if $compressing_spell_guess == "ball"
+            $compressed[0] = $compressing_better_action_message
+        else
+            literal = "casts #{SpellName($compressing_spell_guess)} (#{$compressing_spell_guess})"
+            $compressed[0] = $compressed[0].gsub(/gestures/, literal)
+        end
+    end
+
+    if num_targets == 0
+        $compressed.push($compress_last)
+    elsif $is_no_target
+        $compressed[0] += " #{num_targets} targets affected."
+    elsif num_targets > 1
         $compressed[0].chop! #remove punctuation mark
-        $compressed[0] += " and 1 other." if num_targets == 3
-        $compressed[0] += " and #{num_targets-1} others." if num_targets > 3
-    else
-        #$compressed[0] = nil
+        $compressed[0] += " and 1 other." if num_targets == 2
+        $compressed[0] += " and #{num_targets-1} others." if num_targets > 2
     end
 
     #tiny sleep to allow GameObj to update npcs in memory
     sleep 0.05
-    
-    $targets_damage.each { |targetid,damage| 
 
-        if GameObj.npcs.any?{ |i| i.id == targetid}
+    if !$compressing_spell_guess.nil? && num_targets > 0
+        #aoe attack spell
+        #primarily a knockdown spell
+        num_prone = 0
+        num_stunned = 0
+        num_knockdown = 0
+        num_dead = 0
+        total_damage = 0
+        $targets_damage.each { |targetid, damage| 
             targ = GameObj.npcs.find{ |i| i.id == targetid}
-        elsif GameObj.pcs.any?{ |i| i.id == targetid}
-            targ = GameObj.pcs.find{ |i| i.id == targetid}
-        end
-        
-        str = "A <pushBold/><a exist=\"#{targ.id}\">#{targ.name}</a><popBold/> "
-        
-        str.concat "takes #{damage} damage and " if damage > 0
-        
-        if targ.status =~ /dead|gone/
-            str.concat "is <pushBold/>DEAD!<popBold/>!"
-        elsif !$targets_status[targetid].nil? && $targets_status[targetid].any?
-            str.concat 'is '
-            #target acquired a status (stunned, proned, etc)
-            str.concat $targets_status[targetid].join(' and ')
-            str.concat '!'
-        elsif damage > 0
-            #no status acquired, target not dead, damage only
-            str.sub!(/ and /, '!')
+            num_dead += 1 if targ.status =~ /dead|gone/
+            num_stunned += 1 if targ.status =~ /stunned|frozen/
+            num_knockdown +=1 if targ.status =~ /prone|kneeling/
+            total_damage += damage
+            
+        }
+
+        if num_dead + num_stunned + num_knockdown + total_damage == 0
+            #echo "Possible buff spell, last was #{$compress_last}"
+            #probably a buff spell or something else, just send the previous message
+            $compressed.push($compress_last)
         else
-            #no damage, no status, probably a miss or something this script doesn't check
-            if $targets_last_message[targetid] =~ /(close|clean) miss/ && $targets_damage.length > 1
-                str.concat "is missed." #when more than one target, "A clean miss!" is too ambiguous
-            elsif 
-                $targets_last_message[targetid] =~ /Warded off!/ && $targets_damage.length > 1
-                str.concat "wards off the spell." #when more than one target, "Warded off!" is too ambiguous
+            str = []
+            str.push "#{num_dead} targets <pushBold/>KILLED<popBold/>" if num_dead > 0
+            str.push "#{num_knockdown} targets knocked down" if num_knockdown > 0
+            str.push "#{num_stunned} targets stunned" if num_stunned > 0
+            str.push "#{total_damage} damage dealt" if total_damage > 0
+            $compressed.push(str.join(', ').concat '!')
+        end
+    elsif num_targets > 0
+        $targets_damage.each { |targetid,damage| 
+
+            targ = GameObj.npcs.find{ |i| i.id == targetid}
+            
+            str = "A <pushBold/><a exist=\"#{targ.id}\">#{targ.name}</a><popBold/> "
+            
+            str.concat "takes #{damage} damage and " if damage > 0
+            
+            if targ.status =~ /dead|gone/
+                str.concat "is <pushBold/>DEAD!<popBold/>!"
             else
-                if $targets_last_message[targetid]
-                    str = $targets_last_message[targetid]
-                else 
-                    str.concat "is unaffected."
+                if !$targets_status[targetid].nil? && $targets_status[targetid].any?
+                    str.concat 'is '
+                    #target acquired a status (stunned, proned, etc)
+                    str.concat $targets_status[targetid].join(' and ')
+                    str.concat '!'
+                elsif damage > 0
+                    #no status acquired, target not dead, damage only
+                    str.sub!(/ and /, '!')
+                else
+                    #no damage, no status, probably a miss or something this script doesn't check
+                    if $targets_last_message[targetid] =~ /(close|clean) miss/ && $targets_damage.length > 1
+                        str.concat "is missed." #when more than one target, "A clean miss!" is too ambiguous
+                    elsif 
+                        $targets_last_message[targetid] =~ /Warded off!/ && $targets_damage.length > 1
+                        str.concat "wards off the spell." #when more than one target, "Warded off!" is too ambiguous
+                    else
+                        if $targets_last_message[targetid].length > 0
+                            str = $targets_last_message[targetid]
+                        else 
+                            str.concat "is unaffected."
+                        end
+                    end
                 end
             end
-        end
 
-        $compressed.push(str) 
-    }
+            $compressed.push(str)
+        }
+    end
 
     $compressed.push(s) #add the prompt
-    result = $compressed.compact.join("\n")
-    #echo result.inspect
+    result = $compressed.join("\n")
     return result
 end
 
 def compress(s)
+    return if s =~ /Cast Roundtime/
+    $compress_last = s
+
     s.chomp!
     checkstatus = proc { |s, targetid|
         $targets_status[$target] = Array.new if $target_status[$target].nil?
 
-        if s =~ /stunned|falls over|(dragged|knocked|down) to the (w+)|buffeted by the dark ethereal waves/
+        if s =~ /stunned|freezes|falls over|(dragged|knocked|down) to the (w+)|buffeted by the dark ethereal waves/
             $targets_status[$target].push($&)
         end
     }
@@ -160,24 +231,48 @@ def compress(s)
     if s =~ /(\d+) points of damage/
         #assume the last target took the damage
         $targets_damage[$target] += $1.to_i
-    elsif s =~ /<a exist="([\d]+)"/
-        #possible target change
-        if GameObj.npcs.any? {|npc| npc.id == $1}
-            $target = $1 
-        elsif GameObj.pcs.any? {|pc| pc.id == $1}
-            $target = $1 
-        end
+    elsif s =~ /<a exist="(\d+)"/
+        #game messaging indicates a possible target change
+        $target = $1 if GameObj.npcs.any? {|npc| npc.id == $1} #set $target to the new target's id
         $targets_damage[$target] = 0 unless $targets_damage.has_key?($target)
         checkstatus.call s
 
         $targets_last_message[$target] = s
-    elsif s !~ /Cast Roundtime|Forcing stance down|Feeling nervous yet/
+    elsif s !~ /Cast Roundtime|Forcing stance down|appears to gain succour|Feeling nervous yet|A hit/
         #this will catch "A clean miss" or 'Warded Off'.... probably
         $targets_last_message[$target] = s
+    elsif s =~ /CS:|AS:|UAF:/
     end
-end
 
+    if s =~ /arms snatch viciously|grotesque limbs/
+        $compressing_spell_guess = '709'
+    elsif s =~ /dark ethereal (waves|sphere)/
+        $compressing_spell_guess = '410'
+    elsif s =~ /ethereal (waves|sphere)|formless black (ripples|waves|sphere)/
+        #sphere of formless black ripples expands outward
+        $compressing_spell_guess = '435'
+    elsif s =~ /radiant burst of light/
+        $compressing_spell_guess = '135'
+    elsif s =~ /The surroundings advance upon/
+        $compressing_spell_guess = '635'
+    elsif s =~ /thick block of ice/
+        $compressing_spell_guess = '512'
+    elsif s =~ /force of the sonic vibrations/
+        $compressing_spell_guess = '1030'
+    elsif s =~ /(?:hurl|fire|swing|thrust)s? an? [\w \-\']+ at'/
+        $compressing_spell_guess = 'ball'
+        $compressing_better_action_message = s
+    elsif s =~ /flurry of golden snowflake-shaped motes/
+        $compressing_spell_guess = '335'
+    elsif s =~ /an invisible force guides|considerably more powerful|feel the magic surge through you/
+        #$is_buff = true
+    end
+
+end
+#debris explodes from the ground beneath
+#the main enchilada - this method gets attached to the DownstreamHook, s = the string from the server
 def brief(s)
+
     no_self_spells = proc{ |s|
         if s =~ /(<castTime value='\d+'\/>)/;
           return s[0,$~.end(0)]
@@ -193,57 +288,57 @@ def brief(s)
     }
 
     no_709_decay = proc { |s|
-        return nil if s =~ /thrash(es)? about briefly before decaying into dust./
-    }
-    no_gesturing = proc{ |s|
-        return nil if s =~ /gestures.$/
+        return nil if s =~ /briefly before decaying into dust./
     }
     no_mstrike_prep = proc { |s| 
-        return nil if s =~ /In a breathtaking display of ability and combat mastery/
+        return nil if s =~ /In a breathtaking display of ability and combat mastery|spins about looking mighty stirred up/
+    }
+    no_spinning = proc { |s|
+        return nil if s =~ /looks determined and focused/
     }
     no_get_arrow = proc { |s|
         return nil if s =~ /removes a single(.*)from/
     }
-    #proc that compresses combat messaging for your personal targeted attacks
-    compress_combat = proc{ |s|
-        if s =~ $combat_regex
-            target_string = $4
-            is_my_action = $1 == 'You'
-
-            if is_my_action
-                begin_compress(s, target_string)
-            else
-                # is_pc = GameObj.pcs.any?{|g| g.id == $2.to_i}
-                begin_compress(s, target_string) # if is_pc
-            end
-            #don't compress if a creature is swinging
-            return nil
-        end
+    no_arrow_nock = proc { |s| 
+        return nil if s =~ /nocks? an?/
     }
 
     no_self_search = proc{ |s|
         if s =~ /You search the <pushBold\/>|<pushBold\/>.*<popBold\/> (had nothing of interest|didn't carry any silver|had nothing else of value)/
-            return nil
+            return nil 
         end
     }
-
+    
     shorten_searches = proc{ |s| 
-        if s =~ /<a exist="(-\d+)" noun="\w+">\w+<\/a> searches <pushBold\/>/
-            $shortening = true
+        #<a exist="-10425992" noun="Tziporah">Tziporah</a> searches <pushBold/>an <a exist="117327336" noun="commoner">ethereal commoner</a><popBold/>.
+        if s =~ /(<a exist="(?:-\d+)" noun="\w+">\w+<\/a>) searches (<pushBold\/>.*<popBold\/>)/
+            $shorteningSearch = true 
+            return s
         end
     }
 
-    #main
-    no_roundtime.call s
-
-    if $shortening
-        if s =~ /<prompt/
-            $shortening = false
+    if $shorteningSearch #if we are in the middle of search action
+        if s =~ /<prompt/ #a new prompt indicates the search is finished for one mob
+            #echo "search done: #{s}"
+            $shorteningSearch = false
             return s
         else
-            return nil
+            #echo "not a prompt, squelching search: #{s}"
+            return nil #squelch the search message
         end
     end
+
+    #proc that compresses combat messaging for your personal targeted attacks
+    compress_combat = proc{ |s|
+        if s =~ $combat_regex
+            target_string = $4
+            $is_self = $1 == 'You'
+
+            #echo "beginning compress on: #{s}"
+            begin_compress(s, target_string) # if is_pc
+            return nil
+        end
+    }
 
     if $compressing
         return end_compress(s) if s =~ /<prompt/
@@ -252,14 +347,17 @@ def brief(s)
         return nil
     end
 
+    #main code
+    no_roundtime.call s #squelch any mention of roundtime
+
     compress_combat.call s
     no_self_spells.call s
-    no_gesturing.call s
     no_self_search.call s
     shorten_searches.call s
     no_mstrike_prep.call s
     no_709_decay.call s
     no_get_arrow.call s
+    no_arrow_nock.call s
 
     s
 end
