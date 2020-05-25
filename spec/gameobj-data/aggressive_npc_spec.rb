@@ -119,6 +119,8 @@ describe GameObj do
     describe "undead" do
       [
         "ancient ghoul master",
+        "ancient triton defender",
+        "ancient triton sentry",
         "arch wight",
         "baesrukha",
         "banshee",
