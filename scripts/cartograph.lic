@@ -4,7 +4,7 @@
   repo: https://github.com/elanthia-online/cartograph
   Required: Lich 4.3.12
   Author: Ondreian
-  version: 0.0.1-rc
+  version: 0.0.1-rc.1
   Tags: mapdb, cartograph
   
 =end
@@ -16,6 +16,7 @@ require "zlib"
 require "fileutils"
 require "open-uri"
 require "ostruct"
+require "json"
 
 module Cartograph
   ##
@@ -107,18 +108,34 @@ end
 
 module Cartograph
   CARTO_DIR       = File.join($data_dir, "_cartograph")
-  CURRENT_MAP_DIR = File.join(CARTO_DIR, "current")
-  STAGING_MAP_DIR = File.join(CARTO_DIR, "_staging")
-  
-  REPO     = "https://github.com/elanthia-online/cartograph/tarball/master"
-  CHECKSUM = "https://raw.githubusercontent.com/elanthia-online/cartograph/master/checksum"
+  CURRENT_MAP_DIR = File.join(Cartograph::CARTO_DIR, "current")
+  STAGING_MAP_DIR = File.join(Cartograph::CARTO_DIR, "_staging")
+end
+
+module Cartograph::Updater
+  REPO         = "https://github.com/elanthia-online/cartograph/tarball/master"
+  CHECKSUM     = "https://raw.githubusercontent.com/elanthia-online/cartograph/master/checksum"
+  RELEASES_URI = %[https://api.github.com/repos/elanthia-online/cartograph/releases]
 
   def self.setup_dirs()
-    FileUtils.mkdir_p STAGING_MAP_DIR
+    FileUtils.mkdir_p(Cartograph::STAGING_MAP_DIR)
   end
 
-  def self.get_checksum()
-    Net::HTTP.get URI.parse CHECKSUM
+  def self.releases()
+    @_releases ||= JSON.parse(
+      Net::HTTP.get(URI.parse(RELEASES_URI)), symbolize_names: true)
+  end
+
+  def self.newest_release()
+    OpenStruct.new releases.first
+  end
+
+  def self.newest_hmr()
+    OpenStruct.new newest_release.assets.first
+  end
+
+  def self.get_remote_checksum()
+    newest_release.tag_name.split(".").last
   end
 
   def self.staging_archive()
@@ -126,15 +143,19 @@ module Cartograph
   end
 
   def self.staging_path(*rest)
-    File.join(STAGING_MAP_DIR, *rest)
+    File.join(Cartograph::STAGING_MAP_DIR, *rest)
+  end
+
+  def self.asset(*rest)
+    File.join(Cartograph::CURRENT_MAP_DIR, "maps", XMLData.game.downcase, *rest)
   end
 
   def self.remote_checksum()
-    @_remote_checksum ||= get_checksum()
+    @_remote_checksum ||= get_remote_checksum()
   end
 
   def self.current_checksum()
-    local_checksum_file = File.join(CURRENT_MAP_DIR, "checksum")
+    local_checksum_file = File.join(Cartograph::CURRENT_MAP_DIR, "checksum")
     return nil unless File.exists? local_checksum_file
     File.read local_checksum_file
   end
@@ -142,8 +163,9 @@ module Cartograph
   def self.download_mapdb()
     setup_dirs
     download = File.new(staging_archive, "wb")
-    Log.out("... downloading tarball from #{REPO}", label: :download)
-    stream = open URI.parse REPO
+    tarball_url = newest_release.tarball_url
+    Log.out("... downloading tarball from #{tarball_url}", label: :download)
+    stream = open URI.parse tarball_url
     download.write(stream.read)
     # extra the tarball path
     return File.basename stream.meta["content-disposition"].split(" ").last, ".tar.gz"
@@ -158,12 +180,26 @@ module Cartograph
       extraction_dir)
   end
 
+  def self.download_hmr()
+    new_mapdb = Dir[staging_path(remote_checksum, "/elanthia-online-cartograph-*")].first
+    staging_hmr = File.join(new_mapdb, "map.hmr")
+    download = File.new(staging_hmr, "wb")
+    stream = open URI.parse newest_hmr.browser_download_url
+    download.write(stream.read)
+    Log.out("downloaded newest hmr for #{remote_checksum} to #{staging_hmr}")
+  end
+
   def self.swap_staging_to_current()
     old_checksum = current_checksum
     new_mapdb = Dir[staging_path(remote_checksum, "/elanthia-online-cartograph-*")].first
-    FileUtils.mv(CURRENT_MAP_DIR, File.join(CARTO_DIR, "rev-#{old_checksum}")) unless old_checksum.nil?
+    historical_copy = File.join(Cartograph::CARTO_DIR, "rev-#{old_checksum}")
+    if File.directory? historical_copy
+      historical_copy = historical_copy + "-#{Time.now.to_i}"
+    end
+
+    FileUtils.mv(Cartograph::CURRENT_MAP_DIR, historical_copy) unless old_checksum.nil?
     #Log.out("swapping #{new_mapdb} to :current")
-    FileUtils.mv(new_mapdb, CURRENT_MAP_DIR)
+    FileUtils.mv(new_mapdb, Cartograph::CURRENT_MAP_DIR)
     Log.out("updated mapdb from #{old_checksum || ":none"} -> #{current_checksum}", label: :ok)
   end
 
@@ -176,10 +212,11 @@ module Cartograph
   end
 
   def self.try_update(force: false)
-    return :noop if current_checksum.eql?(remote_checksum)
+    return :noop if current_checksum.eql?(remote_checksum) and force.eql?(false)
     runtime = Benchmark.realtime { 
       download_mapdb() unless (File.exists?(staging_archive) and not force)
       extract_tarball_mapdb() unless (Dir.exists?(staging_path(remote_checksum)) and not force)
+      download_hmr()
       swap_staging_to_current()
       cleanup_stage()
     }
@@ -187,10 +224,92 @@ module Cartograph
     :ok
   end
 
-  def self.main()
-    return try_update(force: true) if Opts["force-update"]
-    try_update()
+  def self.update
+    Log.out("comparing remote(#{remote_checksum}) against local(#{current_checksum})")
+    return try_update(force: true) if Opts["force"]
+    if try_update.eql?(:noop)
+      Log.out("cartograph map already up to date")
+    end
   end
 
-  main()
+  update() if Opts.update
+end
+
+module Cartograph
+  class Graph
+    @rooms        ||= {}
+    @string_procs ||= {}
+
+    def self.hmr()
+      File.join(Cartograph::CARTO_DIR, "current", "map.hmr")
+    end
+
+    def self.dump()
+      File.write(
+        hmr,
+        Marshal.dump({rooms: @rooms, string_procs: @string_procs}))
+    end
+
+    def self.rooms()
+      @rooms
+    end
+
+    def self.string_procs()
+      @string_procs
+    end
+
+    def self.clear()
+      [@rooms, @string_procs].each(&:clear)
+    end
+
+    def self.load_room(id)
+      JSON.parse File.read Cartograph.asset("rooms", "#{id}.json")
+    end
+
+    def self.load_string_proc(kind, from, to)
+      from = from.to_i
+      to   = to.to_i
+      file = Cartograph.asset("string_procs", kind.to_s, "#{from}_#{to}.rb")
+      @string_procs[kind.to_sym] ||= {}
+      @string_procs[kind.to_sym][from] ||= {}
+      @string_procs[kind.to_sym][from][to] = StringProc.new(%(eval File.read "#{file}"))
+      return @string_procs[kind.to_sym][from][to]
+    end
+
+    def self.load_from_repo()
+      Dir[Cartograph.asset("rooms", "*.json")].each do |file|
+        room = load_room File.basename(file, ".json")
+        @rooms[room["id"]] = room
+        %w(wayto timeto).each do |kind|
+          room[kind].map do |k, v|
+            [k, 
+              v.is_a?(Hash) ? load_string_proc(kind, room["id"], k) : v ]
+          end
+        end
+      end
+    end
+
+    def self.load_hmr()
+      Log.out("using hmr at #{hmr}", label: :hmr)
+      cached = Marshal.load File.open(hmr, 'rb')
+      @rooms = cached[:rooms]
+      @string_procs = cached[:string_procs]
+    end
+      
+    def self.init()
+      Graph.clear()
+      if File.exists?(hmr) and not Opts.marshal
+        runtime = Benchmark.realtime { load_hmr }
+        Log.out "marshal: loaded #{@rooms.size} rooms in #{runtime.round}s", label: :perf
+      else
+        runtime = Benchmark.realtime { load_from_repo }
+        Graph.dump
+        Log.out "json: loaded #{@rooms.size} rooms in #{runtime.round}s", label: :perf
+      end
+    end
+
+    Graph.init  if Opts["graph-load"]
+    Graph.dump  if Opts["graph-dump"]
+    Graph.clear if Opts["graph-flush"]
+  end
 end
