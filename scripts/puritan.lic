@@ -3,9 +3,15 @@
 
   ;puritan --help is useful
 
-  Required: Lich 4.3.12
-  Author: Ondreian
-  Tags: util, gems, 1004, purify
+  changelog:
+    1.0.1 - remove debug output for 1004 result
+    1.1.0 - add --min-value flag
+            slimmer sitrep and less debug messaging
+
+  version: 1.1.0
+  required: Lich 4.3.12
+  author: Ondreian
+  tags: util, gems, 1004, purify
   
 =end
 require 'benchmark'
@@ -32,6 +38,19 @@ unless (Char.respond_to?(:total_wound_severity) and Char.respond_to?(:only_minor
     end
   end
 end
+
+module Puritan 
+  module Never
+    def self.method_missing(*args)
+      fail Exception, <<-ERROR
+        tried to touch a Never object which means there is a logical error
+        please capture the stack trace and open an error at: 
+          https://github.com/elanthia-online/scripts/issues/new
+      ERROR
+    end
+  end
+end
+
 
 module Puritan
   ##
@@ -139,7 +158,7 @@ module Puritan
 end
 
 module Puritan
-  VERSION = "1.0.1"
+  VERSION = "1.1.0"
   module Help
     MENU = <<-HELP
       \n
@@ -152,8 +171,11 @@ module Puritan
       --orbs="velvet sack"              where to put orb gems
       --mage="leather case"             where to put mage rechargeable gems
       --loresing                        if we should check the purpose of a gem for sorting
-      --skip_armor                      don't remove & rewear armor
+      --skip-armor                      don't remove & rewear armor
       --silent                          skip sitrep reports
+      --min-value=800                   only sing to gems above a certain value ex: 800 silvers
+      --filter="diamond,sapphire"       only sing to gems that match substrings
+
       \n
     HELP
 
@@ -248,7 +270,7 @@ module Puritan
     container = find_container(param)
     fput "look in ##{container.id}" if container.contents.nil?
     ttl = Time.now + 1
-    wait_while do container.contents.nil? or Time.now > ttl end
+    wait_while do container.contents.nil? and Time.now < ttl end
     return container
   end
 
@@ -260,16 +282,31 @@ module Puritan
   ##
   @orb_gems       = Opts.orbs ? Puritan.container(Opts.orbs) : @sung_gems
   @mage_gems      = Opts.mage ? Puritan.container(Opts.mage) : @sung_gems
+  @low_value_gems = Opts["min-value"] ? Puritan.container(Opts["low-value"]) : Never
   @start_time     = Time.now
   @starting_armor = GameObj.inv.select do |i| i.type.include?("armor") end
   @times          = []
+  @earnings       = nil
 
   def self.uptime()
     Time.now - @start_time
   end
 
+  # reset the state btween runs
+  @_raw_gems = nil
+
   def self.raw_gems()
-    @raw_gems.contents.select(&Filter.is_gem).reject do |gem| gem.name =~ BLACKLIST end
+    @_raw_gems ||= _fetch_raw_gems()
+  end
+
+  def self._fetch_raw_gems()
+    candidates = @raw_gems.contents.select(&Filter.is_gem).reject do |gem| gem.name =~ BLACKLIST end
+    return candidates if Opts.filter.nil?
+    wanted = Opts.filter.is_a?(Array) ? Opts.filter : [Opts.filter]
+    #Log.out("filtering to #{wanted.join(", ")}", label: :filter)
+    candidates.select do |gem| 
+      wanted.any? {|substr| gem.name.include?(substr) }
+    end
   end
 
   def self.sung_gems()
@@ -360,7 +397,6 @@ module Puritan
     if wait_for_own_song().eql?(:ok)
       result = Puritan.select_outcome_from_1004_output()
       Spell.unlock_cast()
-      Log.out(result, label: %w(1004))
       return result
     end
   end
@@ -372,6 +408,7 @@ module Puritan
 
   def self.sitrep(runtime)
     return if Opts.silent
+    return sitrep_v2(runtime) unless Opts["sitrep-v1"]
     @times << runtime
     average = @times.reduce(&:+) / @times.size
     stats = <<-MESSAGE
@@ -388,20 +425,65 @@ module Puritan
     Log.out(stats, label: %i[stats])
   end
 
+  def self.fmt_time(seconds)
+    days    = (seconds / 86_400).floor
+    seconds = seconds - (days * 86_400)
+    hours   = (seconds / 3_600).floor
+    seconds = seconds - (hours * 3_600)
+    minutes = (seconds / 60).floor
+    seconds = (seconds - (minutes * 60)).floor
+
+    [days, hours, minutes, seconds]
+      .zip(%w(d h m s))
+      .select { |f| f.first > 0 }
+      .map {|f| f.first.to_s.rjust(2, "0") + f.last }
+      .reduce("") { |acc, col| acc + " " + col }
+      .strip
+  end
+
+  def self._gems(n)
+    n == 1 ? "gem" : "gems"
+  end
+
+  def self.sitrep_v2(runtime)
+    return if Opts.silent
+    @times << runtime
+    average = @times.reduce(&:+) / @times.size
+    sung  = sung_gems.size - @presung_count 
+    stats = ("\nsung #{sung} #{_gems(sung)} with #{raw_gems.size} #{_gems(raw_gems.size)} remaining") +
+            ("\nremaining time: #{fmt_time(average * raw_gems.size)}") +
+            ("\n       runtime: #{fmt_time(Puritan.uptime)}") +
+            ( @earnings.nil? ? "" : "\n      earnings: #{@earnings.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse}")
+    Log.out(stats, label: %i[stats])
+  end
+
   def self.loresing(gem)
     case Loresing.check(gem)
     when :orb
-      Log.out(gem, label: %i[orb gem])
+      #Log.out(gem, label: %i[orb gem])
       return Puritan.add_to_bag(@orb_gems, gem)
     when :mage
-      Log.out(gem, label: %i[mage rechargeable])
+      #Log.out(gem, label: %i[mage rechargeable])
       return Puritan.add_to_bag(@mage_gems, gem)
     else
       return Puritan.add_to_sung_bag(gem)
     end
   end
 
-  def self.purify_gem(gem, round: 0)
+  APPRAISE = %r[and worth approximately (?<value>\d+) silvers.]
+  def self.appraise_gem(gem)
+    return nil unless Skills.trading > 24
+    result = dothistimeout("appraise ##{gem.id}", 3, APPRAISE)
+    return 0 if result.nil?
+    result.match(APPRAISE)[:value].to_i
+  end
+
+  def self.track_earnings(start_value, final_value)
+    return if start_value.nil? or final_value.nil?
+    @earnings = @earnings + (final_value - start_value)
+  end
+
+  def self.purify_gem(gem, round: 0, start_value: nil)
     return Puritan.add_to_sung_bag(GameObj.right_hand) if Opts.max_rounds and round.eql?(Opts.max_rounds.to_i)
     #
     # fail-safe for logical errors
@@ -417,28 +499,43 @@ module Puritan
     fmap(:before_each_round, 
       [:hold, gem])
     #
+    # for tracking earnings
+    #
+    start_value = appraise_gem(GameObj.right_hand) if start_value.nil? and round.eql?(0)
+    #
+    # check to ensure that the value of the gem is something
+    # we want to spend time processing if we are pruning lower values
+    #
+    if Opts["min-value"] and round.eql?(0)
+      return Puritan.add_to_bag(@low_value_gems, GameObj.right_hand) if start_value < Opts["min-value"].to_i
+    end
+    #
     # pattern match outcomes
     #
     case outcome_of_1004(gem)
     when Outcomes::MISFIRE
-      Log.out(GameObj.right_hand, label: %i[err misfire])
-      return Puritan.add_to_bag(@sung_gems, GameObj.right_hand)
+      track_earnings(start_value, appraise_gem(gem))
+      return Puritan.add_to_sung_bag(GameObj.right_hand)
     when Outcomes::PURE
-      Log.out(GameObj.right_hand, label: %i[pure])
+      track_earnings(start_value, appraise_gem(gem))
       return Puritan.add_to_bag(@orb_gems, GameObj.right_hand)
     when Outcomes::MAX
       # handle maybe naturally pure gem
       if round.eql?(0) and Opts.loresing
+        track_earnings(start_value, appraise_gem(gem))
         return loresing(GameObj.right_hand)
       else
+        track_earnings(start_value, appraise_gem(gem))
         return Puritan.add_to_sung_bag(GameObj.right_hand)
       end
     when Outcomes::STRAIN
+      track_earnings(start_value, appraise_gem(gem))
       return Puritan.add_to_sung_bag(GameObj.right_hand)
     when Outcomes::SHATTERED
+      track_earnings(start_value, 0)
       return [:err, :healing]
     else
-      purify_gem(GameObj.right_hand, round: round + 1)
+      purify_gem(GameObj.right_hand, round: round + 1, start_value: start_value)
     end
   end
 
@@ -483,12 +580,12 @@ module Puritan
   def self.main()
     empty_hands
 
-    unless Opts.skip_armor or XMLData.active_spells.fetch("Song of Peace", false)
+    unless Opts.skip_armor or Opts["skip-armor"] or XMLData.active_spells.fetch("Song of Peace", false)
       fmap(:remove_armor)
       before_dying do fmap(:wear_armor) end
     end
-  
-    raw_gems.each do |gem| 
+
+    while gem = raw_gems.shift
       fmap([:sitrep, 
         Benchmark.realtime do Puritan.fmap([:purify_gem, gem]) end])
     end
@@ -496,7 +593,23 @@ module Puritan
     fill_hands
   end
 
+  def self.validate_low_value_bag()
+    Opts["low-value"] or fail Exception, <<-ERROR
+      When using --min-value=<value> you must also pass --low-value=<container>
+      so that puritan can sort them out of the processing pipeline
+    ERROR
+  end
+
+  def self.validate_value_opts()
+    return validate_low_value_bag() if Skills.trading > 24
+    fail Exception, <<-ERROR
+      --min-value=<value> cannot be used when you have fewer than 25 ranks of trading
+      more info: https://gswiki.play.net/APPRAISE_(verb)
+    ERROR
+  end
+
   def self.preflight()
+    validate_value_opts() if Opts["min-value"]
     return if Opts.loresing.nil?
     # validate the options passed or throw useful errors
     @sung_gems.eql?(@orb_gems) and fail Exception, <<-ERROR
