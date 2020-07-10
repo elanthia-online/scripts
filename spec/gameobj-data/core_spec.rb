@@ -18,6 +18,7 @@ describe GameObj do
         "ammo",
         "armor",
         "bandit",
+        "boon",
         "box",
         "clothing",
         "collectible",
