@@ -61,9 +61,10 @@ describe GameObj do
         %{piece of golden amber},
         %{piece of green jade},
         %{piece of green marble},
+        %{piece of jet black obsidian},
         %{piece of onyx},
-        %{piece of petrified thanot},
         %{piece of petrified maoral},
+        %{piece of petrified thanot},
         %{piece of pink marble},
         %{piece of red jasper},
         %{piece of rose quartz},
@@ -125,6 +126,28 @@ describe GameObj do
         it "recognizes #{valuable} as a valuable" do
           expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
           expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
+        end
+      end
+
+      describe "tradebars" do
+        [
+          %{},
+          %{small },
+          %{large },
+        ].each do |size|
+          %w[
+            bronze
+            copper
+            gold
+            platinum
+            silver
+          ].each do |metal|
+            valuable = "#{size}#{metal} tradebar"
+            it "recognizes #{valuable} as a valuable" do
+              expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+              expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
+            end
+          end
         end
       end
     end

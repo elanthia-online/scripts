@@ -53,6 +53,7 @@ end
 
 migrate :uncommon do
   insert(:exclude, %{princess-cut alexandrite stone})
+  insert(:exclude, %{piece of jet black obsidian})
 end
 
 migrate :pawnshop do

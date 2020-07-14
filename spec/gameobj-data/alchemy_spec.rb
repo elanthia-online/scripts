@@ -174,6 +174,22 @@ describe GameObj do
           expect(GameObjFactory.item_from_name(reagent).sellable).to include "consignment"
         end
       end
+
+      describe "sellable at the furrier" do
+        [
+          %{lump of black ambergris},
+          %{lump of grey ambergris},
+          %{some waxy grey caederine},
+        ].each do |reagent|
+          it "recognizes #{reagent} as a reagent" do
+            expect(GameObjFactory.item_from_name(reagent).type).to include "reagent"
+            expect(GameObjFactory.item_from_name(reagent).type).to_not include "gem"
+            expect(GameObjFactory.item_from_name(reagent).type).to_not include "skin"
+
+            expect(GameObjFactory.item_from_name(reagent).sellable).to include "furrier"
+          end
+        end
+      end
     end
 
     describe "products" do

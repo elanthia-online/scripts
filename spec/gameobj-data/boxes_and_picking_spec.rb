@@ -128,9 +128,13 @@ describe GameObj do
         %{pair of small steel jaws},
         %{slender steel needle},
 
+        %{clear glass vial of light yellow acid},
+        %{green-tinted vial filled with thick acrid smoke},
+        %{thick glass vial filled with murky red liquid},
+
+        %{clear glass vial},
         %{green-tinted vial},
         %{thick glass vial},
-        %{clear glass vial},
       ].each do |lm_trap_name|
         it "recognizes #{lm_trap_name} as an lm trap" do
           lm_trap = GameObjFactory.item_from_name(lm_trap_name)
@@ -149,6 +153,7 @@ describe GameObj do
     describe "sellable at the gemshop" do
       [
         %{dark crystal},
+        %{small dark crystal},
 
         %{amethyst sphere},
         %{dark red sphere},
@@ -158,6 +163,15 @@ describe GameObj do
         %{reddish-brown sphere},
         %{stone grey sphere},
         %{wavering sphere},
+
+        %{small amethyst sphere},
+        %{small dark red sphere},
+        %{miniature emerald sphere},
+        %{small icy blue sphere},
+        %{small light violet sphere},
+        %{small dark reddish-brown sphere},
+        %{tiny stone grey sphere},
+        %{tiny wavering sphere},
       ].each do |lm_trap_name|
         it "recognizes #{lm_trap_name} as an lm trap" do
           lm_trap = GameObjFactory.item_from_name(lm_trap_name)

@@ -112,8 +112,6 @@ describe GameObj do
         %{leopard skin},
         %{lich finger bone},
         %{long fiery red spine},
-        %{lump of black ambergris},
-        %{lump of grey ambergris},
         %{lynx pelt},
         %{madrinol skin},
         %{mammoth arachnid mandible},
