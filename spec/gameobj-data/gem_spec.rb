@@ -128,6 +128,28 @@ describe GameObj do
           expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
         end
       end
+
+      describe "tradebars" do
+        [
+          %{},
+          %{small },
+          %{large },
+        ].each do |size|
+          %w[
+            bronze
+            copper
+            gold
+            platinum
+            silver
+          ].each do |metal|
+            valuable = "#{size}#{metal} tradebar"
+            it "recognizes #{valuable} as a valuable" do
+              expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
+              expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
+            end
+          end
+        end
+      end
     end
   end
 

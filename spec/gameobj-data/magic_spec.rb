@@ -26,6 +26,8 @@ describe GameObj do
           magic_item = GameObjFactory.item_from_name(magic_item_name)
           expect(magic_item.type).to include "magic"
           expect(magic_item.sellable).to eq "pawnshop"
+
+          expect(magic_item.type).to_not include "uncommon"
         end
       end
     end
