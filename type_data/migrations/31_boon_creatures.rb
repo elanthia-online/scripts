@@ -600,6 +600,8 @@ migrate :boon do
   insert(:name, %{white sidewinder})
   insert(:name, %{shambling lurk})
   insert(:name, %{patchwork flesh monstrosity})
+  insert(:name, %{ancient triton defender})
+  insert(:name, %{ancient triton sentry})
 
   insert(:exclude, %{ethereal triton sentry})
   insert(:exclude, %{shadowy spectre})
