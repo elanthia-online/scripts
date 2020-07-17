@@ -8,6 +8,7 @@ end
 migrate :aggressive_npc, :undead do
   insert(:name, %[shambling lurk])
   insert(:name, %[patchwork flesh monstrosity])
+  insert(:name, %[ancient flesh monstrosity])
 end
 
 migrate :gem, :gemshop do

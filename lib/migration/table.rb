@@ -8,7 +8,7 @@ module Migration
     # metadata keys used by migration tool
     # to understand more details about a table
     #
-    METADATA_KEYS     = %i[kind prefix suffix]
+    METADATA_KEYS     = %i[kind prefix prefix_required suffix]
     #
     # keys that gameobj-data.xml expects
     #
@@ -150,11 +150,16 @@ module Migration
       Table.validate_ruleset(self, @rules)
       regex_map = Hash.new
       prefix = Convert.maybe_pattern_to_regex(@rules.fetch(:prefix, nil), space: :right)
+      prefix_required = Convert.maybe_pattern_to_regex(@rules.fetch(:prefix_required, nil), space: :right, required_match: true)
       suffix = Convert.maybe_pattern_to_regex(@rules.fetch(:suffix, nil))
       name_rules = @rules.fetch(:name, false)
       # name rules are different, as they can be quite convoluted
-      regex_map[:name] = Convert.ruleset_to_regex(name_rules, prefix, suffix) unless name_rules.eql?(false)
-      @rules.select do |kind| (%i[name prefix] & [kind]).empty? end.each do |kind, ruleset|
+      if prefix_required.empty?
+        regex_map[:name] = Convert.ruleset_to_regex(name_rules, prefix, suffix) unless name_rules.eql?(false)
+      else
+        regex_map[:name] = Convert.ruleset_to_regex(name_rules, prefix_required, suffix) unless name_rules.eql?(false)
+      end
+      @rules.select do |kind| (%i[name prefix prefix_required] & [kind]).empty? end.each do |kind, ruleset|
         next if ruleset.empty?
         regex_map[kind] = Validate.regexp(self, kind,
           Convert.ruleset_to_regex(ruleset))
