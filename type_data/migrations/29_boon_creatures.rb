@@ -1,4 +1,4 @@
-create_table "boon", keys: [:prefix_required, :name]
+create_table "boon", keys: [:prefix_required, :name, :exclude]
 
 migrate :boon do
   insert(:prefix_required, %{adroit})
@@ -600,6 +600,9 @@ migrate :boon do
   insert(:name, %{white sidewinder})
   insert(:name, %{shambling lurk})
   insert(:name, %{patchwork flesh monstrosity})
+
+  insert(:exclude, %{ethereal triton sentry})
+  insert(:exclude, %{shadowy spectre})
 end
 
 migrate :aggressive_npc, :undead do

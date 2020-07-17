@@ -2,6 +2,72 @@ require 'lich/gameobj'
 require 'spec/factories'
 
 describe GameObj do
+  grizzled_prefixes = %w[grizzled ancient]
+  all_boon_prefixes = [
+    %{adroit},
+    %{afflicted},
+    %{apt},
+    %{barbed},
+    %{belligerent},
+    %{blurry},
+    %{canny},
+    %{dazzling},
+    %{deft},
+    %{dreary},
+    %{ethereal},
+    %{flashy},
+    %{flickering},
+    %{flexile},
+    %{flinty},
+    %{frenzied},
+    %{ghastly},
+    %{ghostly},
+    %{gleaming},
+    %{glittering},
+    %{glorious},
+    %{glowing},
+    %{gory},
+    %{grotesque},
+    %{hardy},
+    %{illustrious},
+    %{indistinct},
+    %{keen},
+    %{lanky},
+    %{lustrous},
+    %{muculent},
+    %{nebulous},
+    %{oozing},
+    %{pestilent},
+    %{putrid},
+    %{radiant},
+    %{raging},
+    %{ready},
+    %{rune-covered},
+    %{robust},
+    %{scintillating},
+    %{shadowy},
+    %{shielded},
+    %{shifting},
+    %{shimmering},
+    %{shining},
+    %{sickly green},
+    %{slime covered},
+    %{slimy},
+    %{sparkling},
+    %{spindly},
+    %{spiny},
+    %{stalwart},
+    %{stately},
+    %{steadfast},
+    %{stout},
+    %{tattooed},
+    %{tenebrous},
+    %{tough},
+    %{twinkling},
+    %{wavering},
+    %{wispy},
+  ]
+
   describe "aggressive NPCs" do
     describe "grimswarm" do
       [
@@ -62,12 +128,11 @@ describe GameObj do
           ].each do |profession|
             grimswarm = "#{prename}Grimswarm #{race} #{profession}"
 
-            it "recognizes #{grimswarm} as an aggressive NPC" do
-              expect(GameObjFactory.npc_from_name(grimswarm).type).to include "aggressive npc"
-            end
-
             it "recognizes #{grimswarm} as a grimswarm" do
+              expect(GameObjFactory.npc_from_name(grimswarm).type).to include "aggressive npc"
               expect(GameObjFactory.npc_from_name(grimswarm).type).to include "grimswarm"
+
+              expect(GameObjFactory.npc_from_name(grimswarm).type).to_not include "boon"
             end
           end
         end
@@ -104,12 +169,11 @@ describe GameObj do
           ].each do |profession|
             bandit = "#{prename}#{race} #{profession}"
 
-            it "recognizes #{bandit} as an aggressive NPC" do
-              expect(GameObjFactory.npc_from_name(bandit).type).to include "aggressive npc"
-            end
-
             it "recognizes #{bandit} as a bandit" do
+              expect(GameObjFactory.npc_from_name(bandit).type).to include "aggressive npc"
               expect(GameObjFactory.npc_from_name(bandit).type).to include "bandit"
+
+              expect(GameObjFactory.npc_from_name(bandit).type).to_not include "boon"
             end
           end
         end
@@ -236,6 +300,31 @@ describe GameObj do
         it "recognizes #{undead} as an undead aggressive NPC" do
           expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
           expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+
+          expect(GameObjFactory.npc_from_name(undead).type).to_not include "boon"
+        end
+
+        grizzled_name = "ancient #{undead}"
+        it "recognizes #{grizzled_name} as an undead aggressive NPC" do
+          expect(GameObjFactory.npc_from_name(grizzled_name).type).to include "aggressive npc"
+          expect(GameObjFactory.npc_from_name(grizzled_name).type).to include "undead"
+
+          expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "boon"
+        end
+
+        boon_name_collisions = [
+          %{shadowy spectre},
+        ]
+
+        all_boon_prefixes.each do |boon_prefix|
+          boon_creature = "#{boon_prefix} #{undead}"
+          unless boon_name_collisions.include?(boon_creature)
+            it "recognizes #{boon_creature} as an undead aggressive NPC with a boon" do
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "aggressive npc"
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "undead"
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "boon"
+            end
+          end
         end
       end
 
@@ -347,9 +436,11 @@ describe GameObj do
         ].each do |undead|
           it "recognizes #{undead} as an aggressive REIM undead npc" do
             expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
-            expect(GameObjFactory.npc_from_name(undead).type).to_not include "passive npc"
             expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
             expect(GameObjFactory.npc_from_name(undead).type).to include "realm:reim"
+
+            expect(GameObjFactory.npc_from_name(undead).type).to_not include "passive npc"
+            expect(GameObjFactory.npc_from_name(undead).type).to_not include "boon"
           end
         end
       end
@@ -717,6 +808,25 @@ describe GameObj do
         it "recognizes #{creature} as an aggressive NPC" do
           expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
           expect(GameObjFactory.npc_from_name(creature).type).to_not include "undead"
+          expect(GameObjFactory.npc_from_name(creature).type).to_not include "boon"
+        end
+
+        grizzled_prefixes.each do |grizzled_prefix|
+          grizzled_name = "#{grizzled_prefix} #{creature}"
+          it "recognizes #{grizzled_name} as an aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(grizzled_name).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "undead"
+            expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "boon"
+          end
+        end
+
+        all_boon_prefixes.each do |boon_prefix|
+          boon_creature = "#{boon_prefix} #{creature}"
+          it "recognizes #{boon_creature} as an aggressive NPC with a boon" do
+            expect(GameObjFactory.npc_from_name(boon_creature).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(boon_creature).type).to include "boon"
+            expect(GameObjFactory.npc_from_name(boon_creature).type).to_not include "undead"
+          end
         end
       end
     end
@@ -732,6 +842,25 @@ describe GameObj do
           it "recognizes #{creature} as an aggressive NPC" do
             expect(GameObjFactory.npc_from_name(creature).type).to include "aggressive npc"
             expect(GameObjFactory.npc_from_name(creature).type).to_not include "undead"
+            expect(GameObjFactory.npc_from_name(creature).type).to_not include "boon"
+          end
+
+          grizzled_prefixes.each do |grizzled_prefix|
+            grizzled_name = "#{grizzled_prefix} #{creature}"
+            it "recognizes #{grizzled_name} as an aggressive NPC" do
+              expect(GameObjFactory.npc_from_name(grizzled_name).type).to include "aggressive npc"
+              expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "undead"
+              expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "boon"
+            end
+          end
+
+          all_boon_prefixes.each do |boon_prefix|
+            boon_creature = "#{boon_prefix} #{creature}"
+            it "recognizes #{boon_creature} as an aggressive NPC with a boon" do
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "aggressive npc"
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "boon"
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to_not include "undead"
+            end
           end
         end
       end
@@ -739,11 +868,42 @@ describe GameObj do
       describe "undead" do
         [
           %[shambling lurk],
-          %[patchwork flesh monstrosity],
         ].each do |undead|
           it "recognizes #{undead} as an undead aggressive NPC" do
             expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
             expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+            expect(GameObjFactory.npc_from_name(undead).type).to_not include "boon"
+          end
+
+          grizzled_name = "ancient #{undead}"
+          it "recognizes #{grizzled_name} as an undead aggressive NPC" do
+            expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
+            expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+
+            expect(GameObjFactory.npc_from_name(undead).type).to_not include "boon"
+          end
+        end
+
+        describe "irregular grizzled names" do
+          [
+            %[patchwork flesh monstrosity],
+          ].each do |undead|
+            it "recognizes #{undead} as an undead aggressive NPC" do
+              expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
+              expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+              expect(GameObjFactory.npc_from_name(undead).type).to_not include "boon"
+            end
+          end
+
+          [
+            %[ancient flesh monstrosity],
+          ].each do |grizzled_name|
+            it "recognizes #{grizzled_name} as an undead aggressive NPC" do
+              expect(GameObjFactory.npc_from_name(grizzled_name).type).to include "aggressive npc"
+              expect(GameObjFactory.npc_from_name(grizzled_name).type).to include "undead"
+
+              expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "boon"
+            end
           end
         end
       end
