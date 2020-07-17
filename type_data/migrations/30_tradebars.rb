@@ -15,3 +15,10 @@ migrate :gemshop, :valuable do
   insert(:name, %{large gold tradebar})
   insert(:name, %{large platinum tradebar})
 end
+
+migrate :uncommon do
+  insert(:exclude, %{bronze tradebar})
+  insert(:exclude, %{small bronze tradebar})
+  insert(:exclude, %{large bronze tradebar})
+  insert(:exclude, %{bronze square})
+end
