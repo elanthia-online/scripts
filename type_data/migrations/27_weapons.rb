@@ -1,4 +1,5 @@
 migrate :weapon, :pawnshop do
+  insert(:noun, %{arbalest})
   insert(:noun, %{cutlass})
   insert(:noun, %{fauchard})
   insert(:noun, %{pike})
