@@ -37,6 +37,7 @@ describe GameObj do
         "lm tool",
         "lm trap",
         "lockpick",
+        "manna bread",
         "magic",
         "note",
         "passive npc",
