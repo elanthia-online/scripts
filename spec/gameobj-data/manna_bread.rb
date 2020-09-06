@@ -2,7 +2,7 @@ require 'lich/gameobj'
 require 'spec/factories'
 
 describe GameObj do
-  describe "manna bread" do
+  describe "manna breads" do
     [
       %{some manna bread},
       %{round of ground acorn bread},
