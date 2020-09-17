@@ -51,7 +51,6 @@ migrate :boon do
   insert(:prefix_required, %{shimmering})
   insert(:prefix_required, %{shining})
   insert(:prefix_required, %{sickly green})
-  insert(:prefix_required, %{sickly-green})
   insert(:prefix_required, %{slime covered})
   insert(:prefix_required, %{slimy})
   insert(:prefix_required, %{sparkling})
