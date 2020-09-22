@@ -89,6 +89,7 @@ migrate :aggressive_npc do
   insert(:name, %{weathered hulking krolvin archmage})
   insert(:name, %{weathered hulking krolvin destroyer})
   insert(:name, %{weathered hulking krolvin warden})
+  insert(:name, %{barbed cavern urchin})
   insert(:name, %{crazed canine})
   insert(:name, %{ebon swine})
   insert(:name, %{hobgoblin acolyte})
