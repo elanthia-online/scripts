@@ -93,10 +93,12 @@ migrate :aggressive_npc do
   insert(:name, %{ebon swine})
   insert(:name, %{hobgoblin acolyte})
   insert(:name, %{imposing elk})
+  insert(:name, %{luminous worm})
   insert(:name, %{muddy hog})
   insert(:name, %{muscular brindlecat})
   insert(:name, %{shelfae assailant})
   insert(:name, %{shelfae guard})
+  insert(:name, %{speckled cave lizard})
   insert(:name, %{spectacled bear})
 end
 
