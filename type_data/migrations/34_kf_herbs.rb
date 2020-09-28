@@ -8,7 +8,6 @@ migrate :herb do
   insert(:name, %{tiny emerald glass bottle filled with bur-clover elixir})
   insert(:name, %{bur-clover elixir})
   insert(:name, %{cumin-rubbed piece of sovyn clove})
-  insert(:name, %{sovyn clove})
   insert(:name, %{some caramelized piece of calamia fruit})
   insert(:name, %{calamia fruit})
   insert(:name, %{twine-tied ball of ephlox moss})
