@@ -1,3 +1,7 @@
+migrate :skin do
+  insert(:name, %{hobgoblin acolyte ear})
+end
+
 migrate :herb do
   insert(:name, %{rice paper-wrapped tkaro root})
   insert(:name, %{tkaro root})
