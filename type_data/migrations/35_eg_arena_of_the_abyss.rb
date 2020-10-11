@@ -8,8 +8,13 @@ migrate :aggressive_npc, :undead do
   insert(:name, %{inky-wisped gaunt figure})
   insert(:name, %{massive-armed hulking dybbuk})
   insert(:name, %{mindless abomination})
+  insert(:name, %{multi-headed rotting chimera})
   insert(:name, %{phantasmal combatant})
   insert(:name, %{rotting dwarven guard})
   insert(:name, %{sore-covered zombie})
   insert(:name, %{spectral dwarven miner})
+end
+
+migrate :boon do
+  insert(:exclude, %{wispy phantasma})
 end
