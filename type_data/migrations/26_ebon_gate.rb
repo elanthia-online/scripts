@@ -7,6 +7,7 @@ migrate :ebongate, :gem, :gemshop do
   insert(:name, %{cabochon of milky azure aquamarine})
   insert(:name, %{thin blade of verdant sea glass})
   insert(:name, %{triangular charcoal shark tooth})
+  insert(:name, %{sickle-shaped opaque white soulstone})
 end
 
 migrate :gemshop do
@@ -118,4 +119,12 @@ end
 migrate :jewelry, :gemshop do
   insert(:exclude, %{gritty crystal amulet})
   insert(:exclude, %{dirt-caked crystal amulet})
+end
+
+migrate :ebongate, :quest do
+  insert(:name, %{pair of dark tin species})
+  insert(:name, %{pair of dented pewter species})
+  insert(:name, %{pair of scratched gold species})
+  insert(:name, %{pair of tarnished steel species})
+  insert(:name, %{pair of thin copper species})
 end

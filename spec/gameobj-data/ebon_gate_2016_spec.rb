@@ -282,4 +282,37 @@ describe GameObj do
       end
     end
   end
+
+  describe "Ebon Gate 2020" do
+    describe "gems" do
+      [
+        %{sickle-shaped opaque white soulstone},
+      ].each do |gem|
+        it "recognizes #{gem} as an Ebon Gate gem" do
+          expect(GameObjFactory.item_from_name(gem).type).to include "gem"
+          expect(GameObjFactory.item_from_name(gem).type).to include "ebongate"
+          expect(GameObjFactory.item_from_name(gem).type).to_not include "valuable"
+          expect(GameObjFactory.item_from_name(gem).type).to_not include "skin"
+          expect(GameObjFactory.item_from_name(gem).type).to_not include "uncommon"
+
+          expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
+        end
+      end
+    end
+
+    describe "quest items" do
+      [
+        %{pair of dark tin species},
+        %{pair of dented pewter species},
+        %{pair of scratched gold species},
+        %{pair of tarnished steel species},
+        %{pair of thin copper species},
+      ].each do |quest_item_name|
+        it "recognizes #{quest_item_name} as an Ebon Gate quest item" do
+          expect(GameObjFactory.item_from_name(quest_item_name).type).to include "ebongate"
+          expect(GameObjFactory.item_from_name(quest_item_name).type).to include "quest"
+        end
+      end
+    end
+  end
 end
