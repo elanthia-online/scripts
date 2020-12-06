@@ -1,0 +1,455 @@
+=begin
+  Package Manager
+=end
+require 'fileutils'
+require 'yaml'
+require 'json'
+require 'net/https'
+require 'net/http'
+require 'open-uri'
+
+module Jinx
+  module Log  
+    def self.out(msg, label: :debug)
+      return _write _view(msg, label) unless msg.is_a?(Exception)
+      ## pretty-print exception
+      _write _view(msg.message, label)
+      msg.backtrace.to_a.slice(0..5).each do |frame| _write _view(frame, label) end
+    end
+
+    def self._write(line)
+      if Script.current.vars.include?("--headless") or not defined?(:_respond)
+        $stdout.write(line + "\n")
+      elsif line.include?("<") and line.include?(">")
+        respond(line)
+      else
+        _respond Preset.as(:debug, line)
+      end
+    end
+
+    def self._view(msg, label)
+      label = [Script.current.name, label].flatten.compact.join(".")
+      safe = msg.inspect
+      #safe = safe.gsub("<", "&lt;").gsub(">", "&gt;") if safe.include?("<") and safe.include?(">")
+      "[#{label}] #{safe}"
+    end
+
+    def self.pp(msg, label = :debug)
+      respond _view(msg, label)
+    end
+
+    def self.dump(*args)
+      pp(*args)
+    end
+
+    module Preset
+      def self.as(kind, body)
+        %[<preset id="#{kind}">#{body}</preset>]
+      end
+    end
+  end
+end
+
+module Jinx
+  module Util
+    def self.parse_json(str)
+      begin
+        [:ok, JSON.parse(str, symbolize_names: true)]
+      rescue => exception
+        return [:err, exception]
+      end
+    end
+
+    def self.fmt_time(seconds)
+      days    = (seconds / 86_400).floor
+      seconds = seconds - (days * 86_400)
+      hours   = (seconds / 3_600).floor
+      seconds = seconds - (hours * 3_600)
+      minutes = (seconds / 60).floor
+      seconds = (seconds - (minutes * 60)).floor
+
+      [days, hours, minutes, seconds]
+        .zip(%w(d h m s))
+        .select { |f| f.first > 0 }
+        .map {|f| f.first.to_s.rjust(2, "0") + f.last }
+        .reduce("") { |acc, col| acc + " " + col }
+        .strip
+    end
+  end
+end
+
+module Jinx
+  module Seed
+    ElanthiaOnline = {
+      name: "core",  
+      url: %[https://repo.elanthia.online]
+    }
+  end
+end
+
+module Jinx
+  module Folder
+    DIR  = File.join($data_dir, "_jinx")
+    LOCK = Mutex.new
+
+    def self.path(*args)
+      File.join(DIR, *args.map(&:to_s))
+    end
+
+    def self.read(*args)
+      File.read path(*args)
+    end
+
+    def self.write(file, data)
+      File.write(
+        path(file), 
+        data)
+    end
+
+    def self.read_yaml(*args)
+      YAML.load(read(*args)) || {}
+    end
+
+    def self.write_yaml(file, data)
+      Folder.write(file, data.to_yaml)
+    end
+
+    def self.glob(*args)
+      Dir.glob path(*args)
+    end
+
+    def self.mkdir(*args)
+      folder = path(*args)
+      Dir.mkdir folder
+    end
+
+    def self.atomic(path)
+      LOCK.synchronize {
+        current_state = Folder.read_yaml(path)
+        return current_state unless block_given?
+        updated_state = yield(current_state)
+        Folder.write_yaml(path, 
+          updated_state.is_a?(Hash) ? updated_state : current_state)
+      }
+    end
+  end
+end
+
+module Jinx
+  module Repo
+    class << self
+      include Enumerable
+
+      FILE = "repos.yaml"
+
+      def atomic()
+        Folder.atomic(FILE) {|repos| yield(repos)}
+      end
+
+      def manifest(repo)
+        uri = URI(repo[:url] + "/manifest.json")
+        begin
+          fetched = Net::HTTP.get(uri)
+        rescue => err
+          return repo.merge({err: err.message, available: []})
+        end
+        res, decoded = Util.parse_json fetched
+        return repo.merge(decoded) if res.eql?(:ok) && decoded[:available].is_a?(Array)
+        return Log.out(decoded[:error] || "repo is misconfigured", label: %i(repo error)) if decoded.is_a?(Hash)
+        Log.out(decoded.message, label: %i(repo error))
+        Log.out(decoded.backtrace, label: %i(repo error))
+      end
+
+      def each()
+        Repo.atomic {|repos|
+          repos.each {|repo|
+            (name, info) = repo
+            yield({name: name}.merge(info))
+          }
+        }
+      end
+
+      def lookup(repo_name)
+        Repo.find {|repo|
+          repo[:name].eql?(repo_name.to_sym)
+        } or fail Jinx::Error, "repo(%s) is not known" % repo_name
+      end
+
+      def exists?(repo_name)
+        any? {|repo| repo[:name].eql?(repo_name.to_sym) }
+      end
+
+      def create(**argv)
+        name = argv.fetch(:name).to_sym
+        fail "repo(%s) requires a url" % name unless argv[:url].is_a?(String)
+        Repo.atomic { |repos|
+          fail "repo(%s) already exists" % name if repos[name]
+          argv.delete(:name)
+          Log.out("registering repo(%s) at %s" % [name, argv[:url]], label: %i(repo create))
+          Folder.mkdir(name)
+          repos[name] = argv
+          repos
+        }
+      end
+
+      def dump(repo, scripts: false)
+        _respond "<b>%s:</b>" % repo[:name]
+        _respond "url=".rjust(10) + repo[:url]
+        _respond "error=".rjust(10) + repo[:err] if repo[:err]
+        _respond "updated=".rjust(10) + "%s ago" % Util.fmt_time(Time.now.to_i - repo[:last_updated]) if repo[:last_updated]
+        if repo[:available].is_a?(Array) && scripts
+          _respond "scripts:".rjust(10)
+          repo[:available].each_with_index {|script, i|
+            _respond "%s> %s" % [(i+1).to_s.rjust(10), File.basename(script[:file])]
+          }
+        end
+      end
+    end
+  end
+end
+
+module Jinx
+  module Installer
+    def self.ensure_specific(script, sources)
+      advertised = sources.select {|repo|
+        repo[:available].any? {|remote_asset|
+          File.basename(remote_asset[:file]).eql?(script)
+        }
+      }
+
+      if advertised.size > 1
+        fail Jinx::Error, <<~ERROR
+          <b>Error: more than one repo has script(#{script})</b>
+
+          please be more specific by adding repo={name}
+
+          available from:
+            -#{advertised.map {|repo| repo[:name]}.join("\n-")}
+        ERROR
+      end
+
+      if advertised.size.eql?(0)
+        fail Jinx::Error, <<~ERROR
+          <b>Error: no known repos have script(#{script}) available</b>
+
+          please double-check your typing
+        ERROR
+      end
+
+      return advertised.first
+    end
+
+    def self.normalize_filename(script)
+      return script if script.include?(".")
+      return "%s.lic" % script
+    end
+
+    def self.download(repo, asset, dest)
+      remote_location = repo[:url] + asset[:file]
+      local_location  = File.join(dest, File.basename(asset[:file]))
+      open(remote_location) { |remote|
+        File.open(local_location, "wb") { |local|
+          local.write(remote.read)
+        }
+      }
+      Log.out("script downloaded to %s" % local_location, 
+        label: %i(installer download))
+    end
+  end
+end
+
+module Jinx
+  module LichScript
+    def self.install(script, sources)
+      script  = Installer.normalize_filename(script)
+      sources = sources.map {|source| Repo.manifest(source) }
+      repo = Installer.ensure_specific(script, sources)
+      Log.out("installing %s from repo:%s" % [script, repo[:name]], 
+        label: %i(install lich))
+      asset = repo[:available].find {|remote_asset| 
+        File.basename(remote_asset[:file]).eql?(script) 
+      }
+      Installer.download(repo, asset, $script_dir)
+    end
+  end
+end
+
+module Jinx
+  module CabalScript
+    def self.install(script, sources)
+      script  = Installer.normalize_filename(script)
+      sources = sources.map {|source| Repo.manifest(source) }
+      repo = Installer.ensure_specific(script, sources)
+      Log.out("installing %s from repo:%s" % [script, repo[:name]], 
+        label: %i(install cabal))
+      local_repo_dir = File.join($script_dir, repo[:name].to_s)
+      unless Dir.exists?(local_repo_dir)
+        Log.out("creating local repo directory at %s" % local_repo_dir, 
+          label: %i(repo setup))
+        Dir.mkdir(local_repo_dir)
+      end
+      asset = repo[:available].find {|remote_asset| 
+        File.basename(remote_asset[:file]).eql?(script) 
+      }
+      Installer.download(repo, asset, local_repo_dir)
+    end
+  end
+end
+
+module Jinx
+  module Setup
+    def self.apply()
+      # setup jinx folder
+      unless Dir.exists?(Folder::DIR)
+        Log.out("creating %s" % Folder::DIR, label: %i(setup))
+        Dir.mkdir(Folder::DIR) 
+      end
+      # setup repo source list
+      unless File.exists? Folder.path("repos.yaml")
+        Log.out("creating %s" % Folder.path("repos.yaml"), label: %i(setup))
+        FileUtils.touch Folder.path("repos.yaml")
+      end
+      # seed elanthia-online repo
+      unless Repo.exists?(Seed::ElanthiaOnline[:name])
+        Repo.create(**Seed::ElanthiaOnline)
+      end
+    end
+  end
+end
+
+module Jinx
+  class Error < Exception; end
+
+  module Service
+    @cmd     = "<c>/jinx"
+    @hook    = "/cli/jinx"
+    @pending = Queue.new()
+  
+    def self.attach()
+      before_dying {UpstreamHook.remove(@hook)}
+      UpstreamHook.add(@hook, -> incoming {
+        return incoming unless incoming.start_with?(@cmd)
+        @pending << incoming.slice(@cmd.size+1, incoming.size)
+        return nil
+      })
+
+      loop {
+        wait_while {@pending.empty?}
+        try { Service.route(@pending.shift) }
+      }
+    end
+
+    def self.try()
+      begin
+        yield
+      rescue Jinx::Error => e
+        _respond(e.message)
+      rescue Exception => e
+        respond e.message
+        respond e.backtrace
+      end
+    end
+
+    def self.route(cmd)
+      case cmd
+      when /^help$/
+        CLI.help()
+      when /^repo list/
+        CLI.repo_list()
+      when /^repo info (\w+)/
+        CLI.repo_info($1.strip)
+      when /^repo add (\w+) (.*?)$/
+        CLI.repo_add($1.strip, $2.strip)
+      when /^script list$/
+        CLI.script_list()
+      when /^script list repo=(\w+)/
+        CLI.script_list($1.strip)
+      when /^script info (\w+)/
+        CLI.script_info($1.strip)
+      when /^script install/
+        repo = $1 if cmd =~ /repo=(\w+)/
+        script = cmd.split(" ").last
+        CLI.script_istall(script, repo)
+      when /^script update (\w+)/
+        CLI.script_update($1.strip)
+      when /^script rm (\w+)/
+        CLI.script_rm($1.strip)
+      else
+        Log.out("unknown command", label: %i(jinx cli))
+        CLI.help()
+      end
+    end
+  end
+end
+
+module Jinx
+  module CLI
+    def self.help()
+      _respond <<~HELP
+        <b>jinx</b>
+        
+        a federated script repository daemon
+
+        /jinx repo
+          list                            list all currently known repositories
+          add    {repo:name} {repo:url}   add a repository from an http url
+          info   {repo:name}              show detailed info about a specific repo
+          rm     {repo:name}              remove a repository by name
+
+        /jinx script
+          list                                      list all currently known scripts
+          list    repo={repo:name}                  list all scripts available from a specific repo
+          info    {script:name}                     shows known info about a remote script
+          install {script:name}                     attempt to install a script
+          install repo={repo:name} {script:name}    attempt to install a script
+          update  {script:name}                     attempts to update an installed script
+          rm      {script:name}                     remove an installed script
+      HELP
+    end
+
+    def self.repo_list()
+      Repo.each {|repo| Repo.dump(repo) }
+    end
+
+    def self.repo_add(repo_name, repo_url)
+      Repo.create(name: repo_name, url: repo_url)
+    end
+
+    def self.repo_info(repo_name)
+      repo = Repo.lookup(repo_name)
+      Repo.dump Repo.manifest repo
+    end
+
+    def self.repo_rm(repo_name)
+      repo = Repo.lookup(repo_name)
+      Repo.atomic {|repos|
+        repos.delete(repo[:name])
+        repos
+      }
+    end
+
+    def self.script_list(repo_name = nil)
+      Repo
+        .filter { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+        .map    { |repo| repo.merge(Repo.manifest(repo)) }
+        .each   { |repo| Repo.dump(repo, scripts: true) }
+    end
+
+    def self.script_info(script, repo_name = nil)
+    end
+
+    def self.script_istall(script, repo_name = nil)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.find(repo_name).first]
+      if defined?(Cabal)
+        Jinx::CabalScript.install(script, sources)
+      else
+        Jinx::LichScript.install(script, sources)
+      end
+    end
+  end
+end
+
+if defined?(Lich) or defined?(Cabal)
+  Jinx::Setup.apply()
+  Jinx::Service.attach()
+end
