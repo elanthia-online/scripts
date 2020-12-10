@@ -314,6 +314,7 @@ describe GameObj do
 
         boon_name_collisions = [
           %{shadowy spectre},
+          %{wispy phantasma},
         ]
 
         all_boon_prefixes.each do |boon_prefix|
@@ -905,6 +906,35 @@ describe GameObj do
               expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "boon"
             end
           end
+        end
+      end
+    end
+
+    describe "Ebon Gate's Arena of the Abyss creatures" do
+      [
+        %{ancient ghoul horror},
+        %{contorted ghoul master},
+        %{ethereal battlemaster},
+        %{fanged nebulous figure},
+        %{fiery-eyed eidolon},
+        %{hunchbacked arch wight},
+        %{inky-wisped gaunt figure},
+        %{massive-armed hulking dybbuk},
+        %{mindless abomination},
+        %{multi-headed rotting chimera},
+        %{nonomino},
+        %{phantasmal combatant},
+        %{rotting dwarven guard},
+        %{sore-covered zombie},
+        %{spectral dwarven miner},
+        %{wispy phantasma},
+      ].each do |undead|
+        it "recognizes #{undead} as an undead aggressive NPC" do
+          expect(GameObjFactory.npc_from_name(undead).type).to include "aggressive npc"
+          expect(GameObjFactory.npc_from_name(undead).type).to include "undead"
+
+          expect(GameObjFactory.npc_from_name(undead).type).to_not include "passive npc"
+          expect(GameObjFactory.npc_from_name(undead).type).to_not include "boon"
         end
       end
     end

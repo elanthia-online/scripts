@@ -1,0 +1,187 @@
+# frozen_string_literal: true
+
+#
+# Script for configurable squelching of incoming lines.
+#
+# author: Ineum
+# game: Gemstone IV
+# tags: squelching, squelch
+# version: 0.2.0
+#
+# changelog:
+#   0.2.0 (2020-12-03)
+#     Introduced export command for exporting squelches compatible with import.
+#   0.1.0 (2020-12-02)
+#     Now has ability to import ignores from a StormFront XML file.
+#     Accept arguments on first run, and improve help documentation with examples.
+#   0.0.3 (2020-11-30)
+#     Defined instance variable for usage, simplified the default configuration creation.
+#   0.0.2 (2020-10-22)
+#     Refactored code to pass rubocop linting.
+#   0.0.1 (2020-10-21)
+#     Initial release.
+
+require 'English'
+require 'rexml/document'
+require 'rexml/xpath'
+
+@script_name = Script.current.name
+
+CMD_STRING = "#{$lich_char}#{@script_name}"
+DOWNSTREAM_HOOK_NAME = "#{@script_name} filter"
+@regex_mutex = Mutex.new
+
+Vars[@script_name] ||= { squelches: [] }
+
+def rebuild_regex
+  # Function to rebuild regex when necessary, respecting the lock for threading.
+  @regex_mutex.synchronize do
+    enabled_squelches = Vars[@script_name][:squelches].select { |entry| entry[:enabled] }
+    @regex = Regexp.union(enabled_squelches.map { |val| val[:text] })
+  end
+end
+
+def remove_squelch(index, verbose: true)
+  if index >= Vars[@script_name][:squelches].length
+    respond "Invalid index #{index} cannot be removed" if verbose
+    return false
+  end
+  text = Vars[@script_name][:squelches][index][:text]
+  Vars[@script_name][:squelches].delete_at(index)
+  respond "Removed \/#{text}\/" if verbose
+  true
+end
+
+def toggle_squelch(index, state, state_text = '', verbose: true)
+  # Toggle squelch at the specified index.
+  if index >= Vars[@script_name][:squelches].length
+    respond 'Cannot access invalid entry' if verbose
+    return false
+  end
+  Vars[@script_name][:squelches][index][:enabled] = state
+  puts "${Vars[@script_name][:squelches][index]} is now #{state_text}d." if verbose
+  true
+end
+
+def print_squelches
+  if Vars[@script_name][:squelches].empty?
+    respond 'No squelch entries recorded.'
+  else
+    Vars[@script_name][:squelches].each_with_index do |squelch, i|
+      respond "#{i}. \/#{squelch[:text]}\/ (#{squelch[:enabled] ? 'enabled' : 'disabled'})"
+    end
+  end
+end
+
+def print_help
+  respond 'Usage: ;isquelch <command> [arguments]'
+  respond ''
+  respond 'Commands:'
+  respond 'add <REGEX>:            Adds REGEX to the list of squelched expressions.'
+  respond 'enable <INDEX>:         Enables the regular expression stored at the specified INDEX.'
+  respond 'disable <INDEX>:        Disables the regular expression stored at the specified INDEX.'
+  respond 'import <FILE>:          Read the specified StormFront XML file and import all squelches.'
+  respond 'export <FILE> [IDX...]: Export squelches, either all or the indexes specified'
+  respond 'remove <INDEX>:         Removes the regular expression stored at the specified INDEX.'
+  respond 'list:                   Lists all regular expressions.'
+  respond 'stop:                   Quit isquelch from running'
+  respond 'rm <INDEX>:             Alias for "remove INDEX"'
+  respond 'ls:                     Alias for "list"'
+  respond ''
+  respond ''
+  respond 'Examples:'
+  respond ';isquelch tossing the sand aside\.$"    - squelch any line digging at Ebon Gate'
+  respond '";isquelch list"                        - list the saved squelches'
+  respond '";isquelch disable 0"                   - disable the first stored squelch'
+  respond '";isquelch enable 0"                    - enable the first store squelch'
+  respond '";isquelch remove 0"                    - permanently delete the first stored squelch'
+  respond '";isquelch import ../../StormFront.xml" - import squelches from file just outside lich'
+  respond '";isquelch export test.xml              - export all squelches to test.xml'
+  respond '";isquelch export test.xml 0 2 4        - exports squelches 0, 2, and 4 to test.xml'
+  respond '";isquelch stop                         - quit isquelch'
+end
+
+check_squelch = proc { |server_string|
+  if server_string.strip.empty?
+    server_string
+  else
+    pass_line = true
+    @regex_mutex.synchronize do
+      pass_line = !(@regex.match? server_string)
+    end
+    pass_line ? server_string : nil
+  end
+}
+
+DownstreamHook.add DOWNSTREAM_HOOK_NAME, check_squelch
+
+before_dying do
+  DownstreamHook.remove DOWNSTREAM_HOOK_NAME
+end
+
+rebuild_regex
+
+toggle_upstream
+
+get_next_line = false
+
+loop do
+  line = get_next_line ? upstream_get : "#{CMD_STRING} #{script.vars[1..-1].join(' ')}"
+  get_next_line = true
+  # Exit early if the command isn't for us
+  next unless line =~ /#{CMD_STRING}\s*(?<command>\w+)\s*(?<argument>.*)/
+
+  match = $LAST_MATCH_INFO.named_captures
+  command = match['command']
+  argument = match['argument']
+  update_regex = false
+  case command
+  when /add/
+    Vars[@script_name][:squelches].push({ text: argument, enabled: true })
+    respond "Added \/#{argument}\/"
+    update_regex = true
+  when /(?<state>en|dis)able/
+    state_text = $LAST_MATCH_INFO.named_captures['state']
+    update_regex = toggle_squelch(argument.strip.to_i, state_text == 'en', state_text)
+  when /remove|rm/
+    index = argument.strip.to_i
+    update_regex = remove_squelch(index)
+  when /list|ls/
+    print_squelches
+  when /import/
+    import = File.open(argument)
+    document = REXML::Document.new(import)
+    REXML::XPath.each(document, '//settings/ignores/*/@text') do |elem|
+      Vars[@script_name][:squelches].push({ text: Regexp.escape(elem.to_s), enabled: true })
+    end
+    update_regex = true
+  when /export/
+    arguments = argument.split(' ')
+    if arguments.empty?
+      print_help
+      next
+    end
+    out_path = arguments.shift
+    # Build list of ignore lines from chosen set.
+    ignore_lines = []
+    if arguments.empty?
+      Vars[@script_name][:squelches].each do |squelch|
+        ignore_lines.push("<h text=\"#{squelch[:text]}\"/>")
+      end
+    else
+      arguments.each do |index|
+        text = Vars[@script_name][:squelches][index.to_i][:text]
+        ignore_lines.push("<h text=\"#{text}\"/>")
+      end
+    end
+    export = File.open(out_path, 'w')
+    REXML::Document.new("<settings><ignores>#{ignore_lines.join("\n")}</ignores></settings>").write(output: export, indent: 2)
+    export.close
+  when /stop/
+    break
+  else
+    print_help
+  end
+
+  rebuild_regex if update_regex
+end
