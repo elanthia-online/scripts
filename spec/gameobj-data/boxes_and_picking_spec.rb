@@ -7,6 +7,19 @@ describe GameObj do
     box_metals = %w[brass gold iron mithril silver steel]
     box_woods = %w[fel haon maoral modwir monir tanik thanot wooden]
 
+    boon_box_nouns = %w[box chest coffer strongbox trunk case] # Similar to box_nouns -> use as material
+    boon_box_types = %w[austered gilded ornate crude brass-inlaid carved delicate red cracked deeply-scored] # Similar to Box_metals -> use as desc
+
+    boon_box_descriptions = [
+      %{painted with a resplendent sun on the top},
+      %{with tiny clawed feet},
+      %{with frayed ropes for handles},
+      %{decorated with bits of colorful glass},
+      %{wrapped in red silk},
+      %{swathed in rust-red symbols},
+      %{engraved with the image of a pile of gems},
+    ] # Similar to metal_descriptions -> use as noun
+
     metal_descriptions = [
       %{acid-pitted},
       %{badly damaged},
@@ -35,8 +48,9 @@ describe GameObj do
 
     wooden_boxes = box_nouns.product(box_woods, wood_descriptions)
     metal_boxes = box_nouns.product(box_metals, metal_descriptions)
+    boon_boxes = boon_box_descriptions.product(boon_box_types, boon_box_nouns) # Ordered different to match end goal order
 
-    (wooden_boxes + metal_boxes).each do |noun, material, desc|
+    (wooden_boxes + metal_boxes + boon_boxes).each do |noun, material, desc|
       full_box_description = "#{desc} #{material} #{noun}"
 
       it "recognizes #{full_box_description} as a box" do
@@ -46,7 +60,8 @@ describe GameObj do
 
     end
 
-    short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals)
+    base_short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals) + boon_box_nouns.product(boon_box_types)
+
     short_box_descriptions.each do |noun, material|
       short_box_description = "#{material} #{noun}"
 
