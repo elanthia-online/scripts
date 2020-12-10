@@ -51,6 +51,42 @@ module Jinx
 end
 
 module Jinx
+  module Opts
+    FLAG_PREFIX    = "--"
+    
+    def self.parse_command(h, c)
+      h[c.to_sym] = true
+    end
+
+    def self.parse_flag(h, f)
+      (name, val) = f[2..-1].split("=")
+      if val.nil?
+        h[name.to_sym] = true
+      else
+        val = val.split(",")
+
+        h[name.to_sym] = val.size == 1 ? val.first : val
+      end
+    end
+
+    def self.parse(args = Script.current.vars[1..-1])
+      OpenStruct.new(**args.to_a.reduce(Hash.new) do |opts, v|
+        if v.start_with?(FLAG_PREFIX)
+          Opts.parse_flag(opts, v)
+        else
+          Opts.parse_command(opts, v)
+        end
+        opts
+      end)
+    end
+
+    def self.method_missing(method, *args)
+      parse.send(method, *args)
+    end
+  end
+end
+
+module Jinx
   module Util
     def self.parse_json(str)
       begin
@@ -74,6 +110,18 @@ module Jinx
         .map {|f| f.first.to_s.rjust(2, "0") + f.last }
         .reduce("") { |acc, col| acc + " " + col }
         .strip
+    end
+
+    def self.unwrap()
+      begin
+        yield
+      rescue Jinx::Error => exception
+        _respond <<~ERROR
+          <b>Jinx::Error:</b>
+
+          #{exception.message}
+        ERROR
+      end
     end
   end
 end
@@ -219,9 +267,9 @@ module Jinx
 
       if advertised.size > 1
         fail Jinx::Error, <<~ERROR
-          <b>Error: more than one repo has script(#{script})</b>
+          more than one repo has script(#{script})
 
-          please be more specific by adding repo={name}
+          please be more specific by adding --repo={name}
 
           available from:
             -#{advertised.map {|repo| repo[:name]}.join("\n-")}
@@ -230,9 +278,7 @@ module Jinx
 
       if advertised.size.eql?(0)
         fail Jinx::Error, <<~ERROR
-          <b>Error: no known repos have script(#{script}) available</b>
-
-          please double-check your typing
+          no known repos have script(#{script}) available
         ERROR
       end
 
@@ -244,44 +290,50 @@ module Jinx
       return "%s.lic" % script
     end
 
-    def self.download(repo, asset, dest)
-      remote_location = repo[:url] + asset[:file]
-      local_location  = File.join(dest, File.basename(asset[:file]))
+    def self.download(repo, asset, local_location)
+      remote_location = repo[:url] + asset[:file] 
       open(remote_location) { |remote|
         File.open(local_location, "wb") { |local|
           local.write(remote.read)
         }
       }
       Log.out("script downloaded to %s" % local_location, 
-        label: %i(installer download))
+        label: %i(install download))
     end
   end
 end
 
 module Jinx
   module LichScript
-    def self.install(script, sources)
+    def self.install(script, sources, overwrite: false)
       script  = Installer.normalize_filename(script)
       sources = sources.map {|source| Repo.manifest(source) }
       repo = Installer.ensure_specific(script, sources)
-      Log.out("installing %s from repo:%s" % [script, repo[:name]], 
-        label: %i(install lich))
       asset = repo[:available].find {|remote_asset| 
         File.basename(remote_asset[:file]).eql?(script) 
       }
-      Installer.download(repo, asset, $script_dir)
+      local_asset = File.join($script_dir, File.basename(asset[:file]))
+      if File.exists?(local_asset) && !overwrite
+        fail Jinx::Error, <<~ALREADY_EXISTS
+          #{local_asset} already exists
+          
+          if the overwrite is intentional rerun as:
+            ;jinx #{Script.current.vars[0].gsub(" install ", " update ")}
+        ALREADY_EXISTS
+      end
+      Log.out("installing %s from repo:%s with md5(%s)" % [script, repo[:name], asset[:md5]], 
+        label: %i(install env lich))
+      Installer.download(repo, asset, local_asset)
     end
   end
 end
 
 module Jinx
   module CabalScript
-    def self.install(script, sources)
+    def self.install(script, sources, overwrite: false)
       script  = Installer.normalize_filename(script)
       sources = sources.map {|source| Repo.manifest(source) }
       repo = Installer.ensure_specific(script, sources)
-      Log.out("installing %s from repo:%s" % [script, repo[:name]], 
-        label: %i(install cabal))
       local_repo_dir = File.join($script_dir, repo[:name].to_s)
       unless Dir.exists?(local_repo_dir)
         Log.out("creating local repo directory at %s" % local_repo_dir, 
@@ -291,7 +343,19 @@ module Jinx
       asset = repo[:available].find {|remote_asset| 
         File.basename(remote_asset[:file]).eql?(script) 
       }
-      Installer.download(repo, asset, local_repo_dir)
+      local_asset = File.join(local_repo_dir, File.basename(asset[:file]))
+      # todo: compare md5 checksums and skip if eql
+      if File.exists?(local_asset) && !overwrite
+        fail Jinx::Error, <<~ALREADY_EXISTS
+          #{local_asset} already exists
+
+          if the overwrite is intentional rerun as:
+            ;jinx #{Script.current.vars[0].gsub(" install ", " update ")}
+        ALREADY_EXISTS
+      end
+      Log.out("installing %s from repo:%s with md5(%s)" % [script, repo[:name], asset[:md5]], 
+        label: %i(install env cabal))
+      Installer.download(repo, asset, local_asset)
     end
   end
 end
@@ -319,65 +383,54 @@ end
 
 module Jinx
   class Error < Exception; end
+end
 
+module Jinx
   module Service
-    @cmd     = "<c>/jinx"
-    @hook    = "/cli/jinx"
-    @pending = Queue.new()
-  
-    def self.attach()
-      before_dying {UpstreamHook.remove(@hook)}
-      UpstreamHook.add(@hook, -> incoming {
-        return incoming unless incoming.start_with?(@cmd)
-        @pending << incoming.slice(@cmd.size+1, incoming.size)
-        return nil
-      })
-
-      loop {
-        wait_while {@pending.empty?}
-        try { Service.route(@pending.shift) }
-      }
-    end
-
-    def self.try()
-      begin
-        yield
-      rescue Jinx::Error => e
-        _respond(e.message)
-      rescue Exception => e
-        respond e.message
-        respond e.backtrace
+    def self.main(args)
+      argv = Opts.parse(args)
+      # Log.out([args, argv], label: %i(argv))
+      # help
+      if argv.help
+        return CLI.help()
       end
-    end
-
-    def self.route(cmd)
-      case cmd
-      when /^help$/
-        CLI.help()
-      when /^repo list/
-        CLI.repo_list()
-      when /^repo info (\w+)/
-        CLI.repo_info($1.strip)
-      when /^repo add (\w+) (.*?)$/
-        CLI.repo_add($1.strip, $2.strip)
-      when /^script list$/
-        CLI.script_list()
-      when /^script list repo=(\w+)/
-        CLI.script_list($1.strip)
-      when /^script info (\w+)/
-        CLI.script_info($1.strip)
-      when /^script install/
-        repo = $1 if cmd =~ /repo=(\w+)/
-        script = cmd.split(" ").last
-        CLI.script_install(script, repo)
-      when /^script update (\w+)/
-        CLI.script_update($1.strip)
-      when /^script rm (\w+)/
-        CLI.script_rm($1.strip)
-      else
-        Log.out("unknown command", label: %i(jinx cli))
-        CLI.help()
+      # repo list
+      if argv.repo && argv.list
+        return CLI.repo_list()
       end
+      # repo info <repo_name>
+      if argv.repo && argv.info
+        return CLI.repo_info(args.last)
+      end
+      # repo add <repo_name> <repo_url>
+      if argv.repo && argv.add
+        url = args.at(-1)
+        repo_name = args.at(-2)
+        unless url.start_with?("http://") or url.start_with?("https://")
+          fail Jinx::Error, 
+            "invalid scheme only http/https supported\nurl=%s" % url
+        end
+        return CLI.repo_add(repo_name, url)
+      end
+      # script list
+      if argv.script && argv.list
+        return CLI.script_list(argv.repo)
+      end
+      # script info <script_name>
+      if argv.script && argv.info
+        return CLI.script_info(args.last)
+      end
+      # script install <script_name>
+      if argv.script && argv.install && args.size > 2
+        return CLI.script_install(args.last, argv.repo)
+      end
+      # script update <script_name>
+      if argv.script && argv.update && args.size.eql?(3)
+        return CLI.script_update(args.last)
+      end
+
+      Log.out("unknown command", label: %i(jinx cli))
+      CLI.help()
     end
   end
 end
@@ -388,7 +441,7 @@ module Jinx
       _respond <<~HELP
         <b>jinx</b>
         
-        a federated script repository daemon
+        a federated script repository manager
 
         /jinx repo
           list                            list all currently known repositories
@@ -398,12 +451,11 @@ module Jinx
 
         /jinx script
           list                                      list all currently known scripts
-          list    repo={repo:name}                  list all scripts available from a specific repo
+          list    --repo={repo:name}                list all scripts available from a specific repo
           info    {script:name}                     shows known info about a remote script
           install {script:name}                     attempt to install a script
-          install repo={repo:name} {script:name}    attempt to install a script
+          install --repo={repo:name} {script:name}  attempt to install a script
           update  {script:name}                     attempts to update an installed script
-          rm      {script:name}                     remove an installed script
       HELP
     end
 
@@ -436,20 +488,27 @@ module Jinx
     end
 
     def self.script_info(script, repo_name = nil)
+      fail Jinx::Error, 
+        "not implemented yet, working on adding Markdown documentation support"
     end
 
     def self.script_install(script, repo_name = nil)
       sources = repo_name.nil? ? Repo.to_a : [Repo.find(repo_name).first]
-      if defined?(Cabal)
-        Jinx::CabalScript.install(script, sources)
-      else
-        Jinx::LichScript.install(script, sources)
-      end
+      env = defined?(Cabal) ? Jinx::CabalScript : Jinx::LichScript
+      env.install(script, sources, overwrite: false)
+    end
+
+    def self.script_update(script, repo_name = nil)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.find(repo_name).first]
+      env = defined?(Cabal) ? Jinx::CabalScript : Jinx::LichScript
+      env.install(script, sources, overwrite: true)
     end
   end
 end
 
 if defined?(Lich) or defined?(Cabal)
   Jinx::Setup.apply()
-  Jinx::Service.attach()
+  Jinx::Util.unwrap {
+    Jinx::Service.main(Script.current.vars.slice(1..-1))
+  }
 end
