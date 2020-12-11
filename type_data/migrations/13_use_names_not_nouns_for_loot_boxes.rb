@@ -12,4 +12,5 @@ migrate :box do
   create_key(:name)
   insert(:name, %{(?:(?:acid-pitted|badly damaged|battered|corroded|dented|engraved|enruned|plain|scratched|sturdy) )?(?:brass|gold|iron|mithril|silver|steel) (?:box|chest|coffer|strongbox|trunk)})
   insert(:name, %{(?:(?:badly damaged|engraved|enruned|iron-bound|plain|rotting|scratched|simple|sturdy|weathered) )?(?:fel|haon|maoral|modwir|monir|tanik|thanot|wooden) (?:box|chest|coffer|strongbox|trunk)})
+  insert(:name, %{(?:austered|gilded|ornate|crude|brass-inlaid|carved|delicate|red|cracked|deeply-scored) (?:box|chest|coffer|strongbox|trunk|case)})
 end

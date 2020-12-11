@@ -7,6 +7,19 @@ describe GameObj do
     box_metals = %w[brass gold iron mithril silver steel]
     box_woods = %w[fel haon maoral modwir monir tanik thanot wooden]
 
+    boon_box_nouns = %w[box chest coffer strongbox trunk case]
+    boon_box_prefixes = %w[austered gilded ornate crude brass-inlaid carved delicate red cracked deeply-scored] # Similar to Box_metals -> use as desc
+
+    boon_box_after_names = [
+      %{painted with a resplendent sun on the top},
+      %{with tiny clawed feet},
+      %{with frayed ropes for handles},
+      %{decorated with bits of colorful glass},
+      %{wrapped in red silk},
+      %{swathed in rust-red symbols},
+      %{engraved with the image of a pile of gems},
+    ] # Similar to metal_descriptions -> use as noun
+
     metal_descriptions = [
       %{acid-pitted},
       %{badly damaged},
@@ -46,8 +59,23 @@ describe GameObj do
 
     end
 
-    short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals)
-    short_box_descriptions.each do |noun, material|
+    boon_boxes = boon_box_nouns.product(boon_box_prefixes, boon_box_after_names)
+
+    boon_boxes.each do |noun, prefix, after_name|
+      it "recognizes #{prefix} #{noun} #{after_name} as a box" do
+        box = GameObjFactory.item_from_name("#{prefix} #{noun}", noun, after_name)
+        expect(box.type).to eq "box"
+      end
+
+      it "recognizes shifting #{prefix} #{noun} #{after_name} as a phased box" do
+        box = GameObjFactory.item_from_name("shifting #{prefix} #{noun}", noun, after_name)
+        expect(box.type).to eq "box"
+      end
+    end
+
+    base_short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals)
+
+    base_short_box_descriptions.each do |noun, material|
       short_box_description = "#{material} #{noun}"
 
       it "recognizes #{short_box_description} as a box" do
