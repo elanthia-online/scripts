@@ -96,9 +96,14 @@ module Jinx
       Service.run("repo add archive https://archive.lich.elanthia.online")
       # now two repos advertise bigshot, so it should error
       expect {Service.run("script info bigshot")}
-        .to raise_error(Jinx::Error, %r[more than one repo has script\(bigshot.lic\)])
+        .to raise_error(Jinx::Error, 
+          %r[more than one repo has script\(bigshot.lic\)])
+
+      expect {Service.run("script info bigshot --repo=core")}
+        .to raise_error(Jinx::Error, 
+          %r[repo\(core\) does not advertise script\(bigshot.lic\)])
       game_output # clear
-      # make sure it checks the core repo
+      # make sure it checks the elanthia-online repo
       Service.run("script info bigshot --repo=elanthia-online")
       info_output = game_output
       expect(info_output).to include("bigshot (repo: elanthia-online, modified:")
