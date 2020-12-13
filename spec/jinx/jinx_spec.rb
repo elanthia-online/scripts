@@ -20,17 +20,15 @@ module Jinx
     end
 
     it "creates the $data_dir/_jinx folder" do
-      Dir.mktmpdir {|dir|
-        $data_dir = dir
-        Setup.apply
-        Repo.lookup("core")
-        Repo.lookup("elanthia-online")
-      }
+      $data_dir = Dir.mktmpdir()
+      Setup.apply
+      Repo.lookup("core")
+      Repo.lookup("elanthia-online")
     end
   end
 
   describe Service do
-    before(:context) do
+    before(:each) do
       $data_dir =  Dir.mktmpdir("data")
       $script_dir = Dir.mktmpdir("scripts")
       Setup.apply
@@ -89,6 +87,25 @@ module Jinx
       Service.run("script update go2 --repo=archive")
       update_output = game_output
       expect(update_output).to include("installing go2.lic from repo:archive")
+    end
+
+    it "script info" do
+      Service.run("script info bigshot")
+      info_output = game_output
+      expect(info_output).to include("bigshot (repo: elanthia-online, modified:")
+      Service.run("repo add archive https://archive.lich.elanthia.online")
+      # now two repos advertise bigshot, so it should error
+      expect {Service.run("script info bigshot")}
+        .to raise_error(Jinx::Error, %r[more than one repo has script\(bigshot.lic\)])
+      game_output # clear
+      # make sure it checks the core repo
+      Service.run("script info bigshot --repo=elanthia-online")
+      info_output = game_output
+      expect(info_output).to include("bigshot (repo: elanthia-online, modified:")
+      # make sure it checks the archive repo
+      Service.run("script info bigshot --repo=archive")
+      info_output = game_output
+      expect(info_output).to include("bigshot (repo: archive, modified:")
     end
   end
 end
