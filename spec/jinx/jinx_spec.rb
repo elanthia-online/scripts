@@ -129,6 +129,11 @@ module Jinx
       Service.run("script search ^bigshot.lic")
       search_output = game_output
       expect(search_output).to include("found 2 matches")
+      # repo specific search
+      Service.run("script search ^bigshot.lic --repo=archive")
+      search_output = game_output
+      expect(search_output).to include("found 1 match")
+      expect(search_output).to include("archive>")
     end
   end
 end
