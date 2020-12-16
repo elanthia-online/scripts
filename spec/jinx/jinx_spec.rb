@@ -32,6 +32,7 @@ module Jinx
       $data_dir =  Dir.mktmpdir("data")
       $script_dir = Dir.mktmpdir("scripts")
       Setup.apply
+      game_output
     end
     
     it "repo list" do
@@ -52,13 +53,13 @@ module Jinx
     it "(core) script install" do
       # will install the first time cleanly on 1-to-1
       Service.run("script install go2")
-      first_attempt = game_output
+      _first_attempt = game_output
       local_script = File.join($script_dir, "go2.lic")
       expect(File.exist?(local_script)).to be true
       # will not accidentally overwrite already existing script
       expect {Service.run("script install go2")}
         .to raise_error(Jinx::Error, /go2.lic already exists/)
-      second_attempt = game_output # clear
+      _second_attempt = game_output # clear
     end
 
     it "(core) script update" do
@@ -111,6 +112,23 @@ module Jinx
       Service.run("script info bigshot --repo=archive")
       info_output = game_output
       expect(info_output).to include("bigshot (repo: archive, modified:")
+    end
+
+    it "script search" do
+      Service.run("script search infomon")
+      search_output = game_output
+      expect(search_output).to include("found 1 match")
+      Service.run("script search asdfasdfjahksdkfajsdhfka")
+      search_output = game_output
+      expect(search_output).to include("found 0 matches")
+      Service.run("script search bigshot")
+      search_output = game_output
+      expect(search_output).to include("found 1 match")
+      Service.run("repo add archive https://archive.lich.elanthia.online")
+      # regex search
+      Service.run("script search ^bigshot.lic")
+      search_output = game_output
+      expect(search_output).to include("found 2 matches")
     end
   end
 end
