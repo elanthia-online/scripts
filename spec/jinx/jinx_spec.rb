@@ -143,6 +143,9 @@ module Jinx
       expect(Repo.find {|repo| repo[:name].eql?(:archive)})
         .to be_nil
       
+      rm_output = game_output
+      expect(rm_output).to include("repo(archive) has been removed")
+      
       expect {Service.run("repo rm archive")}
         .to raise_error(Jinx::Error, 
           %r[repo\(archive\) is not known])
