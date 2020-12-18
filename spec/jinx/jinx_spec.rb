@@ -135,5 +135,17 @@ module Jinx
       expect(search_output).to include("found 1 match")
       expect(search_output).to include("archive>")
     end
+
+    it "repo rm" do
+      Service.run("repo add archive https://archive.lich.elanthia.online")
+      game_output
+      Service.run("repo rm archive")
+      expect(Repo.find {|repo| repo[:name].eql?(:archive)})
+        .to be_nil
+      
+      expect {Service.run("repo rm archive")}
+        .to raise_error(Jinx::Error, 
+          %r[repo\(archive\) is not known])
+    end
   end
 end
