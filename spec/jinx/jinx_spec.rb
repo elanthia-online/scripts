@@ -91,46 +91,46 @@ module Jinx
     end
 
     it "script info" do
-      Service.run("script info bigshot")
+      Service.run("script info noop")
       info_output = game_output
-      expect(info_output).to include("bigshot (repo: elanthia-online, modified:")
+      expect(info_output).to include("noop (repo: elanthia-online, modified:")
       Service.run("repo add archive https://archive.lich.elanthia.online")
-      # now two repos advertise bigshot, so it should error
-      expect {Service.run("script info bigshot")}
+      # now two repos advertise noop, so it should error
+      expect {Service.run("script info noop")}
         .to raise_error(Jinx::Error, 
-          %r[more than one repo has script\(bigshot.lic\)])
+          %r[more than one repo has script\(noop.lic\)])
 
-      expect {Service.run("script info bigshot --repo=core")}
+      expect {Service.run("script info noop --repo=core")}
         .to raise_error(Jinx::Error, 
           %r[repo\(core\) does not advertise script\(bigshot.lic\)])
       game_output # clear
       # make sure it checks the elanthia-online repo
-      Service.run("script info bigshot --repo=elanthia-online")
+      Service.run("script info noop --repo=elanthia-online")
       info_output = game_output
-      expect(info_output).to include("bigshot (repo: elanthia-online, modified:")
+      expect(info_output).to include("noop (repo: elanthia-online, modified:")
       # make sure it checks the archive repo
-      Service.run("script info bigshot --repo=archive")
+      Service.run("script info noop --repo=archive")
       info_output = game_output
-      expect(info_output).to include("bigshot (repo: archive, modified:")
+      expect(info_output).to include("noop (repo: archive, modified:")
     end
 
     it "script search" do
-      Service.run("script search infomon")
+      Service.run("script search noop")
       search_output = game_output
       expect(search_output).to include("found 1 match")
       Service.run("script search asdfasdfjahksdkfajsdhfka")
       search_output = game_output
       expect(search_output).to include("found 0 matches")
-      Service.run("script search bigshot")
+      Service.run("script search noop")
       search_output = game_output
       expect(search_output).to include("found 1 match")
       Service.run("repo add archive https://archive.lich.elanthia.online")
       # regex search
-      Service.run("script search ^bigshot.lic")
+      Service.run("script search ^noop.lic")
       search_output = game_output
       expect(search_output).to include("found 2 matches")
       # repo specific search
-      Service.run("script search ^bigshot.lic --repo=archive")
+      Service.run("script search ^noop.lic --repo=archive")
       search_output = game_output
       expect(search_output).to include("found 1 match")
       expect(search_output).to include("archive>")
