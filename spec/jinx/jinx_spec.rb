@@ -70,24 +70,24 @@ module Jinx
       Service.run("repo add archive https://archive.lich.elanthia.online")
       Repo.lookup("archive")
       # specificity is required
-      expect {Service.run("script install go2")}
+      expect {Service.run("script install noop")}
         .to raise_error(Jinx::Error, /more than one repo has/)
 
       # make a clean script dir
       $script_dir = Dir.mktmpdir("scripts")
       # ensure installing go2 from this archive works
       game_output # clear
-      Service.run("script install go2 --repo=archive")
+      Service.run("script install go2 --repo=core")
       installed_file = File.join($script_dir, "go2.lic")
       expect(File.exist?(installed_file)).to be true
       install_output = game_output
-      expect(install_output).to include("installing go2.lic from repo:archive")
-      expect {Service.run("script install go2 --repo=archive")}
+      expect(install_output).to include("installing go2.lic from repo:core")
+      expect {Service.run("script install go2 --repo=core")}
         .to raise_error(Jinx::Error, /go2.lic already exists/)
       game_output # clear
-      Service.run("script update go2 --repo=archive")
+      Service.run("script update go2 --repo=core")
       update_output = game_output
-      expect(update_output).to include("installing go2.lic from repo:archive")
+      expect(update_output).to include("installing go2.lic from repo:core")
     end
 
     it "script info" do
