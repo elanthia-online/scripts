@@ -102,7 +102,7 @@ module Jinx
 
       expect {Service.run("script info noop --repo=core")}
         .to raise_error(Jinx::Error, 
-          %r[repo\(core\) does not advertise script\(bigshot.lic\)])
+          %r[repo\(core\) does not advertise script\(noop.lic\)])
       game_output # clear
       # make sure it checks the elanthia-online repo
       Service.run("script info noop --repo=elanthia-online")
