@@ -150,5 +150,17 @@ module Jinx
         .to raise_error(Jinx::Error, 
           %r[repo\(archive\) is not known])
     end
+
+    it "repo change {repo:name} {repo:url}" do
+      Service.run("repo change core https://example.com")
+      change_output = game_output
+      expect(change_output).to include("repo(core) has been changed")
+      core = Repo.lookup("core")
+      expect(core[:url]).to eq(%[https://example.com])
+
+      expect { Service.run("repo change _fake_ https://example.com") }
+        .to raise_error(Jinx::Error, 
+          %r[repo\(_fake_\) is not known])
+    end
   end
 end
