@@ -7,19 +7,6 @@ describe GameObj do
     box_metals = %w[brass gold iron mithril silver steel]
     box_woods = %w[fel haon maoral modwir monir tanik thanot wooden]
 
-    boon_box_nouns = %w[box chest coffer strongbox trunk case]
-    boon_box_prefixes = %w[austered gilded ornate crude brass-inlaid carved delicate red cracked deeply-scored] # Similar to Box_metals -> use as desc
-
-    boon_box_after_names = [
-      %{painted with a resplendent sun on the top},
-      %{with tiny clawed feet},
-      %{with frayed ropes for handles},
-      %{decorated with bits of colorful glass},
-      %{wrapped in red silk},
-      %{swathed in rust-red symbols},
-      %{engraved with the image of a pile of gems},
-    ] # Similar to metal_descriptions -> use as noun
-
     metal_descriptions = [
       %{acid-pitted},
       %{badly damaged},
@@ -46,6 +33,48 @@ describe GameObj do
       %{weathered},
     ]
 
+    # Separating Boon boxes to make it easier to read
+    # Removing boon_box_prefixes as this was found to be inaccurate after closer review
+    #boon_box_prefixes = %w[austered gilded ornate crude brass-inlaid carved delicate red cracked deeply-scored] # Similar to Box_metals -> use as desc
+
+    # Boon are described by (in order):
+    #   {description} {material} {noun} {after_names}
+
+    boon_box_nouns = %w[box chest coffer strongbox trunk case]
+
+    boon_box_descriptions = [
+      %{austere},
+      %{brass-inlaid},
+      %{crude},
+      %{gilded},
+      %{ornate},
+      %{scorched},
+    ]
+
+    boon_box_material = [
+      %{carved modwir},
+      %{cracked},
+      %{deeply-scored},
+      %{delicate},
+      %{red lacquered},
+      %{stained},
+    ] # Similar to box_metals or box_woods
+
+    boon_box_after_names = [
+      %{covered with tiny worm holes},
+      %{decorated with bits of colorful glass},
+      %{engraved with the image of a pile of gems},
+      %{held together with ragged iron straps},
+      %{painted with a resplendent sun on the top},
+      %{swathed in rust-red symbols},
+      %{with a broken and rusted chain attached},
+      %{with frayed ropes for handles},
+      %{with tiny clawed feet},
+      %{wrapped in red silk},
+      %{wrapped in green silk},
+      %{wrapped in black silk},
+    ] # Long Description
+
     wooden_boxes = box_nouns.product(box_woods, wood_descriptions)
     metal_boxes = box_nouns.product(box_metals, metal_descriptions)
 
@@ -59,12 +88,17 @@ describe GameObj do
 
     end
 
-    boon_boxes = boon_box_nouns.product(boon_box_prefixes, boon_box_after_names)
+    boon_boxes = boon_box_nouns.product(boon_box_material, boon_box_descriptions)
 
-    boon_boxes.each do |noun, prefix, after_name|
-      it "recognizes #{prefix} #{noun} #{after_name} as a box" do
-        box = GameObjFactory.item_from_name("#{prefix} #{noun}", noun, after_name)
+    boon_boxes.each do |noun, material, desc|
+      full_boon_box_description = "#{desc} #{material} #{noun}"
+      it "recognizes #{full_boon_box_description} as a box" do
+        box = GameObjFactory.item_from_name(full_boon_box_description)
         expect(box.type).to eq "box"
+      # Removed because long description should not need to be counted - ???
+      #it "recognizes #{desc} #{material} #{noun} as a box" do
+      #  box = GameObjFactory.item_from_name("#{prefix} #{noun}", noun, after_name)
+      #  expect(box.type).to eq "box"
       end
 
       it "recognizes shifting #{prefix} #{noun} #{after_name} as a phased box" do
