@@ -48,6 +48,7 @@ module Jinx
       expect(output).to include("scripts:")
       expect(output).to include("go2.lic")
       expect(output).to include("infomon.lic")
+      # TODO: expect data info in repo info response too
     end
 
     it "(core) script install" do
@@ -161,6 +162,35 @@ module Jinx
       expect { Service.run("repo change _fake_ https://example.com") }
         .to raise_error(Jinx::Error, 
           %r[repo\(_fake_\) is not known])
+    end
+
+    describe "data" do
+      before do
+        Service.run("repo add FIXME http://localhost:6969")
+      end
+
+      it "install" do
+        # will install the first time cleanly on 1-to-1
+        Service.run("data install empty.xml")
+        _first_attempt = game_output
+        local_data = File.join($data_dir, "empty.xml")
+        expect(File.exist?(local_data)).to be true
+        # will not accidentally overwrite already existing data
+        expect {Service.run("data install empty.xml")}
+          .to raise_error(Jinx::Error, /empty.xml already exists/)
+        _second_attempt = game_output # clear
+      end
+
+      it "update" do
+        Service.run("data update empty.xml")
+      end
+
+      it "list" do
+        Service.run("data list")
+        output = game_output
+        expect(output).to include("data:")
+        expect(output).to include("empty.xml")
+      end
     end
   end
 end
