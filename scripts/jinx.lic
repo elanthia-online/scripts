@@ -244,7 +244,11 @@ module Jinx
           return repo.merge({err: err.message, available: []})
         end
         res, decoded = Util.parse_json fetched
-        return repo.merge!(decoded) if res.eql?(:ok) && decoded[:available].is_a?(Array)
+        if res.eql?(:ok) && decoded[:available].is_a?(Array)
+          # For backwards compatibility with servers that don't include the type attribute
+          decoded[:available].each { |f| f[:type] ||= "script" }
+          return repo.merge!(decoded) 
+        end
         return Log.out(decoded[:error] || "repo is misconfigured", label: %i(repo error)) if decoded.is_a?(Hash)
         Log.out(decoded.message, label: %i(repo error))
         Log.out(decoded.backtrace, label: %i(repo error))
@@ -282,23 +286,40 @@ module Jinx
         }
       end
 
-      def dump(repo, scripts: false)
+      def scripts(repo)
+        (repo[:available] || []).select { |f| f[:type] == "script" }
+      end
+
+      def data(repo)
+        (repo[:available] || []).select { |f| f[:type] == "data" }
+      end
+
+      def print_info(script, i)
+        _respond("%s> %s %s" % [
+          (i+1).to_s.rjust(4), 
+          File.basename(script[:file]).ljust(20),
+          "(modified: %s ago)" % Util.ago(script[:last_commit])
+        ])
+      end
+
+      def print_numbered_list(entries)
+        entries
+          .sort {|a,b| b[:last_commit] - a[:last_commit] }
+          .each_with_index(&method(:print_info))
+      end
+
+      def dump(repo, scripts: false, data: false)
         _respond "<b>%s:</b>" % repo[:name]
         _respond "url=".rjust(10) + repo[:url]
         _respond "error=".rjust(10) + repo[:err] if repo[:err]
         _respond "updated=".rjust(10) + "%s ago" % Util.ago(repo[:last_updated]) if repo[:last_updated]
-        if repo[:available].is_a?(Array) && scripts
+        if scripts && self.scripts(repo).any?
           _respond "scripts:".rjust(10)
-          repo[:available]
-          .sort {|a,b| b[:last_commit] - a[:last_commit] }
-          .each_with_index {|script, i|
-            _respond("%s> %s %s" % [
-              (i+1).to_s.rjust(4), 
-              File.basename(script[:file]).ljust(20),
-              "(modified: %s ago)" % Util.ago(script[:last_commit])
-                
-            ])
-          }
+          print_numbered_list scripts(repo)
+        end
+        if data && self.data(repo).any?
+          _respond "data:".rjust(7)
+          print_numbered_list data(repo)
         end
       end
     end
@@ -370,7 +391,7 @@ module Jinx
       script  = Installer.normalize_filename(script)
       sources = sources.map {|source| Repo.manifest(source) }
       repo = Installer.ensure_specific(script, sources)
-      asset = repo[:available].find {|remote_asset| 
+      asset = Repo.scripts(repo).find {|remote_asset| 
         File.basename(remote_asset[:file]).eql?(script) 
       }
       local_asset = File.join(Folder.script_dir, File.basename(asset[:file]))
@@ -401,7 +422,7 @@ module Jinx
           label: %i(repo setup))
         Dir.mkdir(local_repo_dir)
       end
-      asset = repo[:available].find {|remote_asset| 
+      asset = Repo.scripts(repo).find {|remote_asset| 
         File.basename(remote_asset[:file]).eql?(script) 
       }
       local_asset = File.join(local_repo_dir, File.basename(asset[:file]))
@@ -522,6 +543,22 @@ module Jinx
       if argv.script.eql?(true) && argv.search.eql?(true)
         return CLI.script_search(args.last, argv.repo)
       end
+      # data list
+      if argv.data.eql?(true) && argv.list.eql?(true)
+        return CLI.data_list(argv.repo)
+      end
+      # data info <data_name>
+      if argv.data.eql?(true) && argv.info.eql?(true)
+        return CLI.data_info(args.last, argv.repo)
+      end
+      # data install <data_name>
+      if argv.data.eql?(true) && argv.install.eql?(true)
+        return CLI.data_install(args.last, argv.repo)
+      end
+      # data update <data_name>
+      if argv.data.eql?(true) && argv.update.eql?(true)
+        return CLI.data_update(args.last, argv.repo)
+      end
 
       Log.out("unknown command", label: %i(cli))
       CLI.help()
@@ -570,7 +607,7 @@ module Jinx
       repo = Repo.lookup(repo_name)
       Repo.dump(
         Repo.manifest(repo), 
-        scripts: true)
+        scripts: true, data: true)
     end
 
     def self.repo_rm(repo_name)
@@ -606,7 +643,7 @@ module Jinx
     def self.script_info(script_name, repo_name = nil)
       repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       repo = Installer.ensure_specific(script_name, repos)
-      script_metadata = repo[:available].find {|asset| 
+      script_metadata = Repo.scripts(repo).find {|asset| 
         File.basename(asset[:file])
           .eql?(Installer.normalize_filename(script_name))
       }
@@ -640,7 +677,7 @@ module Jinx
       matches = candidate_repos
         .each {|repo| Repo.manifest(repo) }
         .select {|repo| repo[:available].is_a?(Array) }
-        .map {|repo| repo[:available].map {|script| script.merge({repo: repo[:name]}) } }
+        .map {|repo| Repo.scripts(repo).map {|script| script.merge({repo: repo[:name]}) } }
         .flatten(1)
         .select {|script| File.basename(script[:file]) =~ pattern }
         
@@ -651,6 +688,45 @@ module Jinx
           File.basename(script[:file]).rjust(20),
           Util.ago(script[:last_commit])]
       }
+    end
+
+    def self.data_list(repo_name = nil)
+      Log.out(repo_name, label: %i(data_list))
+      Repo
+        .select { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+        .map    { |repo| repo.merge(Repo.manifest(repo)) }
+        .each   { |repo| Repo.dump(repo, data: true) }
+    end
+
+    def self.data_info(datafile_name, repo_name = nil)
+      repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      repo = Installer.ensure_specific(datafile_name, repos)
+      datafile_metadata = Repo.data(repo).find {|asset| 
+        File.basename(asset[:file])
+          .eql?(Installer.normalize_filename(datafile_name))
+      }
+
+      _respond("<b>%s (repo: %s, modified: %s)</b>" % 
+        [datafile_name, repo[:name],
+        Util.ago(datafile_metadata[:last_commit]) + " ago"
+        ])
+      if datafile_metadata[:header]
+        _respond Repo.header(repo, datafile_metadata)
+      else
+        _respond "no documentation"
+      end
+    end
+
+    def self.data_install(datafile, repo_name = nil)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      env = defined?(Cabal) ? Jinx::CabalData : Jinx::LichData
+      env.install(datafile, sources, overwrite: false)
+    end
+
+    def self.data_update(datafile, repo_name = nil)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      env = defined?(Cabal) ? Jinx::CabalData : Jinx::LichData
+      env.install(datafile, sources, overwrite: true)
     end
   end
 end
