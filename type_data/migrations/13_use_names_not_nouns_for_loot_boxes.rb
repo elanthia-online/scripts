@@ -20,14 +20,10 @@ end
 
 # Exclude all boxes from uncommon
 migrate :uncommon do
-  create_key(:prefix)
-  insert(:prefix, %{shifting})
-
-  #create_key(:exclude)
-  insert(:exclude, %{(?:(?:acid-pitted|badly damaged|battered|corroded|dented|engraved|enruned|plain|scratched|sturdy) )?(?:brass|gold|iron|mithril|silver|steel) (?:box|chest|coffer|strongbox|trunk)})
-  insert(:exclude, %{(?:(?:badly damaged|engraved|enruned|iron-bound|plain|rotting|scratched|simple|sturdy|weathered) )?(?:fel|haon|maoral|modwir|monir|tanik|thanot|wooden) (?:box|chest|coffer|strongbox|trunk)})
+  insert(:exclude, %{(?:(?:shifting) )?(?:(?:acid-pitted|badly damaged|battered|corroded|dented|engraved|enruned|plain|scratched|sturdy) )?(?:brass|gold|iron|mithril|silver|steel) (?:box|chest|coffer|strongbox|trunk)})
+  insert(:exclude, %{(?:(?:shifting) )?(?:(?:badly damaged|engraved|enruned|iron-bound|plain|rotting|scratched|simple|sturdy|weathered) )?(?:fel|haon|maoral|modwir|monir|tanik|thanot|wooden) (?:box|chest|coffer|strongbox|trunk)})
   #short
-  insert(:exclude, %{(?:carved modwir|cracked|deeply-scored|delicate|red lacquered|stained) (?:box|chest|coffer|strongbox|trunk|case)})
+  insert(:exclude, %{(?:(?:shifting) )?(?:carved modwir|cracked|deeply-scored|delicate|red lacquered|stained) (?:box|chest|coffer|strongbox|trunk|case)})
   #long
   insert(:exclude, %{(?:austere|brass-inlaid|crude|gilded|ornate|scorched) (?:carved modwir|cracked|deeply-scored|delicate|red lacquered|stained) (?:box|chest|coffer|strongbox|trunk|case) (?:covered with tiny worm holes|decorated with bits of colorful glass|engraved with the image of a pile of gems|held together with ragged iron straps|painted with a resplendent sun on the top|swathed in rust-red symbols|with a broken and rusted chain attached|with frayed ropes for handles|with tiny clawed feet|wrapped in red silk|wrapped in green silk|wrapped in black silk)})
 end
