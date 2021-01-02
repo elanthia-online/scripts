@@ -23,7 +23,7 @@ migrate :uncommon do
   create_key(:prefix)
   insert(:prefix, %{shifting})
 
-  create_key(:exclude)
+  #create_key(:exclude)
   insert(:exclude, %{(?:(?:acid-pitted|badly damaged|battered|corroded|dented|engraved|enruned|plain|scratched|sturdy) )?(?:brass|gold|iron|mithril|silver|steel) (?:box|chest|coffer|strongbox|trunk)})
   insert(:exclude, %{(?:(?:badly damaged|engraved|enruned|iron-bound|plain|rotting|scratched|simple|sturdy|weathered) )?(?:fel|haon|maoral|modwir|monir|tanik|thanot|wooden) (?:box|chest|coffer|strongbox|trunk)})
   #short
