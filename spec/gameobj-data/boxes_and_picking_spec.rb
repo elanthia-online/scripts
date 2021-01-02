@@ -34,11 +34,8 @@ describe GameObj do
     ]
 
     # Separating Boon boxes to make it easier to read
-    # Removing boon_box_prefixes as this was found to be inaccurate after closer review
-    #boon_box_prefixes = %w[austered gilded ornate crude brass-inlaid carved delicate red cracked deeply-scored] # Similar to Box_metals -> use as desc
-
     # Boon are described by (in order):
-    #   {description} {material} {noun} {after_names}
+    #   {description} {material} {noun} {long}
 
     boon_box_nouns = %w[box chest coffer strongbox trunk case]
 
@@ -60,7 +57,7 @@ describe GameObj do
       %{stained},
     ] # Similar to box_metals or box_woods
 
-    boon_box_after_names = [
+    boon_box_long = [
       %{covered with tiny worm holes},
       %{decorated with bits of colorful glass},
       %{engraved with the image of a pile of gems},
@@ -73,7 +70,7 @@ describe GameObj do
       %{wrapped in red silk},
       %{wrapped in green silk},
       %{wrapped in black silk},
-    ] # Long Description
+    ] # Long Description - unique to boon boxes
 
     wooden_boxes = box_nouns.product(box_woods, wood_descriptions)
     metal_boxes = box_nouns.product(box_metals, metal_descriptions)
@@ -86,25 +83,6 @@ describe GameObj do
         expect(box.type).to eq "box"
       end
 
-    end
-
-    boon_boxes = boon_box_nouns.product(boon_box_materials, boon_box_descriptions)
-
-    boon_boxes.each do |noun, material, desc|
-      full_boon_box_description = "#{desc} #{material} #{noun}"
-      it "recognizes #{full_boon_box_description} as a box" do
-        box = GameObjFactory.item_from_name(full_boon_box_description)
-        expect(box.type).to eq "box"
-      # Removed because long description should not need to be counted - ???
-      #it "recognizes #{desc} #{material} #{noun} as a box" do
-      #  box = GameObjFactory.item_from_name("#{prefix} #{noun}", noun, after_name)
-      #  expect(box.type).to eq "box"
-      end
-
-      it "recognizes shifting #{prefix} #{noun} #{after_name} as a phased box" do
-        box = GameObjFactory.item_from_name("shifting #{prefix} #{noun}", noun, after_name)
-        expect(box.type).to eq "box"
-      end
     end
 
     base_short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals) + boon_box_nouns.product(boon_box_materials)
@@ -121,6 +99,31 @@ describe GameObj do
 
       it "recognizes #{phased_box_description} as a phased box" do
         box = GameObjFactory.item_from_name(phased_box_description)
+        expect(box.type).to eq "box"
+      end
+    end
+
+    # Separating Boon boxes for clarity
+
+    boon_boxes = boon_box_nouns.product(boon_box_materials, boon_box_descriptions, boon_box_long)
+
+    boon_boxes.each do |noun, material, desc, long|
+      full_boon_box_description = "#{desc} #{material} #{noun} #{long}"
+      short_boon_box_description = "#{material} #{noun}"
+      phased_boon_box_description = "shifting #{short_boon_box_description}"
+
+      it "recognizes #{full_boon_box_description} as a box" do
+        box = GameObjFactory.item_from_name(full_boon_box_description)
+        expect(box.type).to eq "box"
+      end
+
+      it "recognizes #{short_boon_box_description} as a box" do
+        box = GameObjFactory.item_from_name(short_boon_box_description)
+        expect(box.type).to eq "box"
+      end
+
+      it "recognizes #{phased_boon_box_description} as a phased box" do
+        box = GameObjFactory.item_from_name(phased_boon_box_description)
         expect(box.type).to eq "box"
       end
     end
