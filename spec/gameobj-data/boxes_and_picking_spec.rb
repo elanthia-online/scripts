@@ -85,7 +85,7 @@ describe GameObj do
 
     end
 
-    base_short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals) + boon_box_nouns.product(boon_box_materials)
+    base_short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals)
 
     base_short_box_descriptions.each do |noun, material|
       short_box_description = "#{material} #{noun}"
