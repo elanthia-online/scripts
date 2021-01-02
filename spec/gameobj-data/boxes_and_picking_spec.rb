@@ -72,30 +72,47 @@ describe GameObj do
       %{wrapped in black silk},
     ] # Long Description - unique to boon boxes
 
+    # full descriptions of normal boxes
     wooden_boxes = box_nouns.product(box_woods, wood_descriptions)
     metal_boxes = box_nouns.product(box_metals, metal_descriptions)
 
     (wooden_boxes + metal_boxes).each do |noun, material, desc|
       full_box_description = "#{desc} #{material} #{noun}"
 
+      # all boxes are not uncommon
+      it "recognizes #{full_box_description} is NOT uncommon" do
+        common_item = GameObjFactory.item_from_name(full_box_description)
+        expect(common_item.type.to_s).to_not include "uncommon"
+      end
+
       it "recognizes #{full_box_description} as a box" do
         box = GameObjFactory.item_from_name(full_box_description)
         expect(box.type).to eq "box"
       end
-
     end
 
+    # short descriptions of normal boxes
     base_short_box_descriptions = box_nouns.product(box_woods) + box_nouns.product(box_metals)
 
     base_short_box_descriptions.each do |noun, material|
       short_box_description = "#{material} #{noun}"
+      phased_box_description = "shifting #{short_box_description}"
+
+      # all boxes are not uncommon
+      it "recognizes #{short_box_description} is NOT uncommon" do
+        common_item = GameObjFactory.item_from_name(short_box_description)
+        expect(common_item.type.to_s).to_not include "uncommon"
+      end
+
+      it "recognizes #{phased_box_description} is NOT uncommon" do
+        common_item = GameObjFactory.item_from_name(phased_box_description)
+        expect(common_item.type).to_not include "uncommon"
+      end
 
       it "recognizes #{short_box_description} as a box" do
         box = GameObjFactory.item_from_name(short_box_description)
         expect(box.type).to eq "box"
       end
-
-      phased_box_description = "shifting #{short_box_description}"
 
       it "recognizes #{phased_box_description} as a phased box" do
         box = GameObjFactory.item_from_name(phased_box_description)
@@ -103,14 +120,29 @@ describe GameObj do
       end
     end
 
-    # Separating Boon boxes for clarity
-
+    # Boon boxes
     boon_boxes = boon_box_nouns.product(boon_box_materials, boon_box_descriptions, boon_box_long)
 
     boon_boxes.each do |noun, material, desc, long|
       full_boon_box_description = "#{desc} #{material} #{noun} #{long}"
       short_boon_box_description = "#{material} #{noun}"
       phased_boon_box_description = "shifting #{short_boon_box_description}"
+
+      # All boon boxes are not uncommon
+      it "recognizes #{full_boon_box_description} is NOT uncommon" do
+        common_item = GameObjFactory.item_from_name(full_boon_box_description)
+        expect(common_item.type.to_s).to_not include "uncommon"
+      end
+
+      it "recognizes #{short_boon_box_description} is NOT uncommon" do
+        common_item = GameObjFactory.item_from_name(short_boon_box_description)
+        expect(common_item.type.to_s).to_not include "uncommon"
+      end
+
+      it "recognizes #{phased_boon_box_description} is NOT uncommon" do
+        common_item = GameObjFactory.item_from_name(phased_boon_box_description)
+        expect(common_item.type).to_not include "uncommon"
+      end
 
       it "recognizes #{full_boon_box_description} as a box" do
         box = GameObjFactory.item_from_name(full_boon_box_description)
