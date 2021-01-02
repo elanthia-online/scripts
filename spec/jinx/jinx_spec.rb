@@ -165,31 +165,27 @@ module Jinx
     end
 
     describe "data" do
-      before do
-        Service.run("repo add FIXME http://localhost:6969")
-      end
-
       it "install" do
         # will install the first time cleanly on 1-to-1
-        Service.run("data install empty.xml")
+        Service.run("data install spell-list.xml")
         _first_attempt = game_output
-        local_data = File.join($data_dir, "empty.xml")
+        local_data = File.join($data_dir, "spell-list.xml")
         expect(File.exist?(local_data)).to be true
         # will not accidentally overwrite already existing data
-        expect {Service.run("data install empty.xml")}
-          .to raise_error(Jinx::Error, /empty.xml already exists/)
+        expect {Service.run("data install spell-list.xml")}
+          .to raise_error(Jinx::Error, /spell-list.xml already exists/)
         _second_attempt = game_output # clear
       end
 
       it "update" do
-        Service.run("data update empty.xml")
+        Service.run("data update spell-list.xml")
       end
 
       it "list" do
         Service.run("data list")
         output = game_output
         expect(output).to include("data:")
-        expect(output).to include("empty.xml")
+        expect(output).to include("spell-list.xml")
       end
     end
   end
