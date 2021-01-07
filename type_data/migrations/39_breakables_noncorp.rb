@@ -1,7 +1,7 @@
-create_table "breakables", keys: [:name]
+create_table "breakable", keys: [:name]
 create_table "noncorporeal", keys: [:prefix, :name, :exclude]
 
-migrate "breakables" do
+migrate "breakable" do
   insert(:name, %{large clump of barnacles})
   insert(:name, %{slimy thick-shelled carapace})
   insert(:name, %{ashy lump of charcoal})
