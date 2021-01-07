@@ -1,4 +1,5 @@
-# shared scripts [![Build Status](https://travis-ci.com/elanthia-online/scripts.svg?branch=master)](https://travis-ci.com/elanthia-online/scripts)
+# shared scripts [![Build Status](https://github.com/elanthia-online/scripts/workflows/Build/badge.svg?branch=master)](https://github.com/elanthia-online/scripts/actions)
+)](https://travis-ci.com/elanthia-online/scripts)
 
 this project is here to easily automate shared collaboration on scripts for Lich.
 
