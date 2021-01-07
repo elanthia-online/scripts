@@ -19,5 +19,5 @@ end
 migrate :uncommon do
   insert(:exclude, %{(?:(?:shifting) )?(?:(?:acid-pitted|badly damaged|battered|corroded|dented|engraved|enruned|plain|scratched|sturdy) )?(?:brass|gold|iron|mithril|silver|steel) (?:box|chest|coffer|strongbox|trunk)})
   insert(:exclude, %{(?:(?:shifting) )?(?:(?:badly damaged|engraved|enruned|iron-bound|plain|rotting|scratched|simple|sturdy|weathered) )?(?:fel|haon|maoral|modwir|monir|tanik|thanot|wooden) (?:box|chest|coffer|strongbox|trunk)})
-  insert(:exclude, %{(?:(?:austere|brass-inlaid|crude|gilded|ornate|scorched) )?(?:carved modwir|cracked|deeply-scored|delicate|red lacquered|stained) (?:box|chest|coffer|strongbox|trunk|case)})
+  insert(:exclude, %{(?:(?:shifting) )?(?:austere|brass-inlaid|crude|gilded|ornate|scorched) )?(?:carved modwir|cracked|deeply-scored|delicate|red lacquered|stained) (?:box|chest|coffer|strongbox|trunk|case)})
 end
