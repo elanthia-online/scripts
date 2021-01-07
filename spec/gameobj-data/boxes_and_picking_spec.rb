@@ -57,6 +57,7 @@ describe GameObj do
       %{stained},
     ] # Similar to box_metals or box_woods
 
+    # Leaving in descriptions in case they are used in the future
     boon_box_long = [
       %{covered with tiny worm holes},
       %{decorated with bits of colorful glass},
@@ -121,10 +122,10 @@ describe GameObj do
     end
 
     # Boon boxes
-    boon_boxes = boon_box_nouns.product(boon_box_materials, boon_box_descriptions, boon_box_long)
+    boon_boxes = boon_box_nouns.product(boon_box_materials, boon_box_descriptions)
 
-    boon_boxes.each do |noun, material, desc, long|
-      full_boon_box_description = "#{desc} #{material} #{noun} #{long}"
+    boon_boxes.each do |noun, material, desc|
+      full_boon_box_description = "#{desc} #{material} #{noun}"
       short_boon_box_description = "#{material} #{noun}"
       phased_boon_box_description = "shifting #{short_boon_box_description}"
 
