@@ -57,7 +57,16 @@ module Jinx
       _first_attempt = game_output
       local_script = File.join($script_dir, "go2.lic")
       expect(File.exist?(local_script)).to be true
-      # will not accidentally overwrite already existing script
+
+      # is a noop is the local file matches the expected digest
+      Service.run("script install go2")
+      output = game_output
+      expect(output).to include("go2.lic from repo:core already installed")
+      expect(File.exist?(local_script)).to be true
+
+      local_script = File.join($script_dir, "go2.lic")
+      File.write(local_script, "modified")
+      # will not accidentally overwrite already existing script if the digests don't match
       expect {Service.run("script install go2")}
         .to raise_error(Jinx::Error, /go2.lic already exists/)
       _second_attempt = game_output # clear
@@ -83,12 +92,12 @@ module Jinx
       expect(File.exist?(installed_file)).to be true
       install_output = game_output
       expect(install_output).to include("installing go2.lic from repo:core")
-      expect {Service.run("script install go2 --repo=core")}
-        .to raise_error(Jinx::Error, /go2.lic already exists/)
-      game_output # clear
+      Service.run("script install go2 --repo=core")
+      install_output = game_output
+      expect(install_output).to include("go2.lic from repo:core already installed")
       Service.run("script update go2 --repo=core")
       update_output = game_output
-      expect(update_output).to include("installing go2.lic from repo:core")
+      expect(update_output).to include("go2.lic from repo:core already installed")
     end
 
     it "script info" do
@@ -171,7 +180,16 @@ module Jinx
         _first_attempt = game_output
         local_data = File.join($data_dir, "spell-list.xml")
         expect(File.exist?(local_data)).to be true
-        # will not accidentally overwrite already existing data
+
+        # is a noop is the local file matches the expected digest
+        Service.run("data install spell-list.xml")
+        output = game_output
+        expect(output).to include("spell-list.xml from repo:core already installed")
+        expect(File.exist?(local_data)).to be true
+
+        # will not accidentally overwrite already existing script if the digests don't match
+        local_data = File.join($data_dir, "spell-list.xml")
+        File.write(local_data, "modified")
         expect {Service.run("data install spell-list.xml")}
           .to raise_error(Jinx::Error, /spell-list.xml already exists/)
         _second_attempt = game_output # clear
