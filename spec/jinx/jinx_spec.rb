@@ -1,4 +1,7 @@
 require 'tmpdir'
+require "rack"
+require 'webmock'
+
 load "scripts/jinx.lic"
 
 $fake_game_output = ""
@@ -28,6 +31,20 @@ module Jinx
   end
 
   describe Service do
+    unless ENV['ENABLE_EXTERNAL_NETWORKING'] && !%w[false no n 0].include?(ENV['ENABLE_EXTERNAL_NETWORKING'].downcase)
+      before(:all) do
+        WebMock.enable!
+        { 'core' => 'repo', 'extras' => 'extras.repo', 'archive' => 'archive.lich' }.each do |(dir, domain)|
+          WebMock.stub_request(:any, %r{https://#{domain}.elanthia.online})
+            .to_rack(Rack::Directory.new(File.join(__dir__, 'repos', dir)))
+        end
+      end
+
+      after(:all) do
+        WebMock.disable!
+      end
+    end
+
     before(:each) do
       $data_dir =  Dir.mktmpdir("data")
       $script_dir = Dir.mktmpdir("scripts")

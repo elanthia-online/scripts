@@ -4,4 +4,6 @@ group :development do
   gem "rspec"
   gem "guard"
   gem "guard-rspec"
+  gem "webmock"
+  gem "rack"
 end
