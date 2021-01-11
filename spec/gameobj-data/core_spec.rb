@@ -27,6 +27,7 @@ describe GameObj do
         "ebongate",
         "escort",
         "event:duskruin",
+        "familiar",
         "food",
         "gem",
         "grimswarm",
