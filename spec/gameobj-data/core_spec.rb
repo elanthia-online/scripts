@@ -23,6 +23,7 @@ describe GameObj do
         "breakable",
         "clothing",
         "collectible",
+        "companion",
         "cursed",
         "ebongate",
         "escort",
