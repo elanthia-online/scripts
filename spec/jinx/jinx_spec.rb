@@ -115,6 +115,8 @@ module Jinx
       Service.run("script update go2 --repo=core")
       update_output = game_output
       expect(update_output).to include("go2.lic from repo:core already installed")
+
+      expect(File.exist?(File.join($data_dir, '_jinx', 'repos.yaml'))).to be true
     end
 
     it "script info" do
