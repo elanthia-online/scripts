@@ -343,6 +343,90 @@ module Jinx
 end
 
 module Jinx
+  module Metadata
+    module Base
+      include Enumerable
+
+      def atomic()
+        Folder.atomic(@file) {|entries| yield(entries)}
+      end
+
+      def update(repo, asset)
+        name = File.basename(asset.fetch(:file))
+        repo_name = repo.fetch(:name)
+        Log.out("updating %s file metadata for %s from %s" % [asset[:type], name, repo_name], label: %i(metadata update))
+        create({name: name, repo: repo_name, digest: asset.fetch(:md5)})
+      end
+
+      def each
+        self.atomic {|entries|
+          entries.each {|entry|
+            yield(entry)
+          }
+        }
+      end
+
+      def find_for_asset(asset)
+        name = File.basename(asset.fetch(:file)).to_s
+        self.atomic do |entries|
+          return entries[name]
+        end
+      end
+
+      def create(**argv)
+        name = argv.fetch(:name).to_s
+        repo = argv.fetch(:repo).to_s
+        fail "metadata record(%s) requires a name" % name unless argv[:name].is_a?(String)
+        fail "metadata record(%s) requires a repo" % repo unless argv[:repo].is_a?(Symbol)
+        self.atomic { |entries|
+          argv.delete(:name)
+          entries[name] = argv
+          entries
+        }
+      end
+    end
+
+    class << self
+      def update(repo, asset)
+        case asset[:type]
+        when "script", nil
+          ScriptMetadata.update(repo, asset)
+        when "data"
+          DatafileMetadata.update(repo, asset)
+        else
+          fail Jinx::Error, "don't recognize #{local_asset} type of #{asset[:type]}"
+        end
+      end
+
+      def for(asset)
+        case asset[:type]
+        when "script", nil
+          ScriptMetadata.find_for_asset(asset)
+        when "data"
+          DatafileMetadata.find_for_asset(asset)
+        else
+          fail Jinx::Error, "don't recognize #{local_asset} type of #{asset[:type]}"
+        end
+      end
+    end
+  end
+end
+
+module Jinx
+  module DatafileMetadata
+    extend Metadata::Base
+
+    @file = "data.yaml"
+  end
+
+  module ScriptMetadata
+    extend Metadata::Base
+
+    @file = "scripts.yaml"
+  end
+end
+
+module Jinx
   module Installer
     # ensure an installer command is specific enough that
     # there is exactly 1 script that matches
@@ -403,7 +487,7 @@ end
 
 module Jinx
   module LichInstaller
-    def self.install(script, sources, local_asset_path, overwrite: false)
+    def self.install(script, sources, local_asset_path, overwrite: false, force: false)
       script  = Installer.normalize_filename(script)
       sources = sources.map {|source| Repo.manifest(source) }
       repo = Installer.ensure_specific(script, sources)
@@ -420,34 +504,44 @@ module Jinx
           Log.out("%s from repo:%s already installed with md5(%s)" % [script, repo[:name], asset[:md5]],
                   label: %i(install env lich))
           return
-        elsif !overwrite
+        elsif !overwrite && !force
           fail Jinx::Error, <<~ALREADY_EXISTS
             #{local_asset} already exists
 
             if the overwrite is intentional rerun as:
               ;jinx #{Jinx::Service.vars[0].gsub(" install ", " update ")}
           ALREADY_EXISTS
+        elsif !force && metadata = Metadata.for(asset)
+          if digest.base64digest != metadata[:digest]
+            fail Jinx::Error, <<~LOCALLY_MODIFIED
+              #{local_asset} has been modified since last download.
+
+              if the overwrite is intentional rerun as:
+                ;jinx #{Jinx::Service.vars[0]} --force
+            LOCALLY_MODIFIED
+          end
         end
       end
       Log.out("installing %s from repo:%s with md5(%s)" % [script, repo[:name], asset[:md5]],
         label: %i(install env lich))
       Installer.download(repo, asset, local_asset)
+      Metadata.update(repo, asset)
     end
   end
 end
 
 module Jinx
   module LichScript
-    def self.install(script, sources, overwrite: false)
-      LichInstaller.install(script, sources, Folder.script_dir, overwrite: overwrite)
+    def self.install(script, sources, overwrite: false, force: false)
+      LichInstaller.install(script, sources, Folder.script_dir, overwrite: overwrite, force: force)
     end
   end
 end
 
 module Jinx
   module LichData
-    def self.install(script, sources, overwrite: false)
-      LichInstaller.install(script, sources, Folder.data_dir, overwrite: overwrite)
+    def self.install(script, sources, overwrite: false, force: false)
+      LichInstaller.install(script, sources, Folder.data_dir, overwrite: overwrite, force: force)
     end
   end
 end
@@ -501,6 +595,16 @@ module Jinx
       [Seed::ElanthiaOnlineCore, Seed::ElanthiaOnlineExtras].each {|repo|
         Repo.create(**repo) unless Repo.exists?(repo[:name])
       }
+      # setup script metadata
+      unless File.exists? Folder.path("scripts.yaml")
+        Log.out("creating %s" % Folder.path("scripts.yaml"), label: %i(setup))
+        FileUtils.touch Folder.path("scripts.yaml")
+      end
+      # setup data file metadata
+      unless File.exists? Folder.path("data.yaml")
+        Log.out("creating %s" % Folder.path("data.yaml"), label: %i(setup))
+        FileUtils.touch Folder.path("data.yaml")
+      end
     end
   end
 end
@@ -575,11 +679,11 @@ module Jinx
       end
       # script install <script_name>
       if argv.script.eql?(true) && argv.install.eql?(true)
-        return CLI.script_install(args.last, argv.repo)
+        return CLI.script_install(args.last, argv.repo, force: argv.force)
       end
       # script update <script_name>
       if argv.script.eql?(true) && argv.update.eql?(true)
-        return CLI.script_update(args.last, argv.repo)
+        return CLI.script_update(args.last, argv.repo, force: argv.force)
       end
       # script search <substring>
       if argv.script.eql?(true) && argv.search.eql?(true)
@@ -595,11 +699,11 @@ module Jinx
       end
       # data install <data_name>
       if argv.data.eql?(true) && argv.install.eql?(true)
-        return CLI.data_install(args.last, argv.repo)
+        return CLI.data_install(args.last, argv.repo, force: argv.force)
       end
       # data update <data_name>
       if argv.data.eql?(true) && argv.update.eql?(true)
-        return CLI.data_update(args.last, argv.repo)
+        return CLI.data_update(args.last, argv.repo, force: argv.force)
       end
 
       Log.out("unknown command", label: %i(cli))
@@ -709,16 +813,16 @@ module Jinx
       end
     end
 
-    def self.script_install(script, repo_name = nil)
+    def self.script_install(script, repo_name = nil, force: false)
       sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       env = defined?(Cabal) ? Jinx::CabalScript : Jinx::LichScript
-      env.install(script, sources, overwrite: false)
+      env.install(script, sources, overwrite: force, force: force)
     end
 
-    def self.script_update(script, repo_name = nil)
+    def self.script_update(script, repo_name = nil, force: false)
       sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       env = defined?(Cabal) ? Jinx::CabalScript : Jinx::LichScript
-      env.install(script, sources, overwrite: true)
+      env.install(script, sources, overwrite: true, force: force)
     end
 
     def self.script_search(pattern, repo_name)
@@ -767,16 +871,16 @@ module Jinx
       end
     end
 
-    def self.data_install(datafile, repo_name = nil)
+    def self.data_install(datafile, repo_name = nil, force: false)
       sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       env = defined?(Cabal) ? Jinx::CabalData : Jinx::LichData
-      env.install(datafile, sources, overwrite: false)
+      env.install(datafile, sources, overwrite: force, force: force)
     end
 
-    def self.data_update(datafile, repo_name = nil)
+    def self.data_update(datafile, repo_name = nil, force: false)
       sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       env = defined?(Cabal) ? Jinx::CabalData : Jinx::LichData
-      env.install(datafile, sources, overwrite: true)
+      env.install(datafile, sources, overwrite: true, force: force)
     end
   end
 end
