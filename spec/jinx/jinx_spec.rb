@@ -51,7 +51,7 @@ module Jinx
       Setup.apply
       game_output
     end
-    
+
     it "repo list" do
       Service.run("repo list")
       output = game_output
@@ -68,29 +68,99 @@ module Jinx
       # TODO: expect data info in repo info response too
     end
 
-    it "(core) script install" do
-      # will install the first time cleanly on 1-to-1
-      Service.run("script install go2")
-      _first_attempt = game_output
-      local_script = File.join($script_dir, "go2.lic")
-      expect(File.exist?(local_script)).to be true
+    describe "(core) script install" do
+      let(:local_asset_path) { File.join($script_dir, "go2.lic") }
 
-      # is a noop is the local file matches the expected digest
-      Service.run("script install go2")
-      output = game_output
-      expect(output).to include("go2.lic from repo:core already installed")
-      expect(File.exist?(local_script)).to be true
+      it "will install the first time cleanly on 1-to-1" do
+        Service.run("script install go2")
 
-      local_script = File.join($script_dir, "go2.lic")
-      File.write(local_script, "modified")
-      # will not accidentally overwrite already existing script if the digests don't match
-      expect {Service.run("script install go2")}
-        .to raise_error(Jinx::Error, /go2.lic already exists/)
-      _second_attempt = game_output # clear
+        _first_attempt = game_output
+        expect(File.exist?(local_asset_path)).to be true
+      end
+
+      it "is a noop is the local file matches the expected digest" do
+        Service.run("script install go2")
+        game_output # clear
+        Service.run("script install go2")
+        output = game_output
+
+        expect(output).to include("go2.lic from repo:core already installed")
+        expect(File.exist?(local_asset_path)).to be true
+      end
+
+      it "will not accidentally overwrite already existing script if the digests don't match" do
+        Service.run("script install go2")
+        game_output # clear
+        File.write(local_asset_path, "modified")
+
+        expect {Service.run("script install go2")}
+          .to raise_error(Jinx::Error, /go2.lic already exists/)
+        _second_attempt = game_output # clear
+      end
+
+      it "will install over existing script if given --force" do
+        Service.run("script install go2")
+        game_output # clear
+        clean_digest = Digest::SHA1.new
+        clean_digest.update(File.read(local_asset_path))
+        File.write(local_asset_path, "modified")
+        modified_digest = Digest::SHA1.new
+        modified_digest.update(File.read(local_asset_path))
+        expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
+
+        Service.run("script install --force go2")
+
+        updated_digest = Digest::SHA1.new
+        updated_digest.update(File.read(local_asset_path))
+        expect(updated_digest.base64digest).to eq clean_digest.base64digest
+      end
     end
 
-    it "(core) script update" do
-      Service.run("script update go2")
+    describe "(core) script update" do
+      let(:local_asset_path) { File.join($script_dir, "go2.lic") }
+
+      it "will install the first time cleanly on 1-to-1"  do
+        Service.run("script update go2")
+
+        _first_attempt = game_output
+        expect(File.exist?(local_asset_path)).to be true
+      end
+
+      it "is a noop is the local file matches the expected digest" do
+        Service.run("script install go2")
+        game_output # clear
+        Service.run("script update go2")
+        output = game_output
+
+        expect(output).to include("go2.lic from repo:core already installed")
+        expect(File.exist?(local_asset_path)).to be true
+      end
+
+      it "will not accidentally overwrite already existing script if the digests don't match" do
+        Service.run("script install go2")
+        game_output # clear
+        File.write(local_asset_path, "modified")
+
+        expect {Service.run("script update go2")}
+          .to raise_error(Jinx::Error, /go2.lic has been modified/)
+      end
+
+      it "will overwrite a modified script if given --force" do
+        Service.run("script install go2")
+        game_output # clear
+        clean_digest = Digest::SHA1.new
+        clean_digest.update(File.read(local_asset_path))
+        File.write(local_asset_path, "modified")
+        modified_digest = Digest::SHA1.new
+        modified_digest.update(File.read(local_asset_path))
+        expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
+
+        Service.run("script update go2 --force")
+
+        updated_digest = Digest::SHA1.new
+        updated_digest.update(File.read(local_asset_path))
+        expect(updated_digest.base64digest).to eq clean_digest.base64digest
+      end
     end
 
     it "repo add" do
@@ -117,6 +187,7 @@ module Jinx
       expect(update_output).to include("go2.lic from repo:core already installed")
 
       expect(File.exist?(File.join($data_dir, '_jinx', 'repos.yaml'))).to be true
+      expect(File.exist?(File.join($data_dir, '_jinx', 'scripts.yaml'))).to be true
     end
 
     it "script info" do
@@ -193,29 +264,96 @@ module Jinx
     end
 
     describe "data" do
-      it "install" do
-        # will install the first time cleanly on 1-to-1
-        Service.run("data install spell-list.xml")
-        _first_attempt = game_output
-        local_data = File.join($data_dir, "spell-list.xml")
-        expect(File.exist?(local_data)).to be true
+      let(:local_asset_path) { File.join($data_dir, "spell-list.xml") }
 
-        # is a noop is the local file matches the expected digest
-        Service.run("data install spell-list.xml")
-        output = game_output
-        expect(output).to include("spell-list.xml from repo:core already installed")
-        expect(File.exist?(local_data)).to be true
+      describe "install" do
+        it "will install the first time cleanly on 1-to-1" do
+          Service.run("data install spell-list.xml")
 
-        # will not accidentally overwrite already existing script if the digests don't match
-        local_data = File.join($data_dir, "spell-list.xml")
-        File.write(local_data, "modified")
-        expect {Service.run("data install spell-list.xml")}
-          .to raise_error(Jinx::Error, /spell-list.xml already exists/)
-        _second_attempt = game_output # clear
+          _first_attempt = game_output
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "is a noop is the local file matches the expected digest" do
+          Service.run("data install spell-list.xml")
+          game_output # clear
+          Service.run("data install spell-list.xml")
+          output = game_output
+
+          expect(output).to include("spell-list.xml from repo:core already installed")
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "will not accidentally overwrite already existing file if the digests don't match" do
+          Service.run("data install spell-list.xml")
+          game_output # clear
+          File.write(local_asset_path, "modified")
+
+          expect {Service.run("data install spell-list.xml")}
+            .to raise_error(Jinx::Error, /spell-list.xml already exists/)
+        end
+
+        it "will install over existing file if given --force" do
+          Service.run("data install spell-list.xml")
+          game_output # clear
+          clean_digest = Digest::SHA1.new
+          clean_digest.update(File.read(local_asset_path))
+          File.write(local_asset_path, "modified")
+          modified_digest = Digest::SHA1.new
+          modified_digest.update(File.read(local_asset_path))
+          expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
+
+          Service.run("data install spell-list.xml --force")
+
+          updated_digest = Digest::SHA1.new
+          updated_digest.update(File.read(local_asset_path))
+          expect(updated_digest.base64digest).to eq clean_digest.base64digest
+        end
       end
 
-      it "update" do
-        Service.run("data update spell-list.xml")
+      describe "update" do
+        it "will install the first time cleanly on 1-to-1"  do
+          Service.run("data update spell-list.xml")
+
+          _first_attempt = game_output
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "is a noop is the local file matches the expected digest" do
+          Service.run("data install spell-list.xml")
+          game_output # clear
+          Service.run("data update spell-list.xml")
+          output = game_output
+
+          expect(output).to include("spell-list.xml from repo:core already installed")
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "will not accidentally overwrite already existing script if the digests don't match" do
+          Service.run("data install spell-list.xml")
+          game_output # clear
+          File.write(local_asset_path, "modified")
+
+          expect {Service.run("data update spell-list.xml")}
+            .to raise_error(Jinx::Error, /spell-list.xml has been modified/)
+        end
+
+        it "will overwrite a modified script if given --force" do
+          Service.run("data install spell-list.xml")
+          game_output # clear
+          clean_digest = Digest::SHA1.new
+          clean_digest.update(File.read(local_asset_path))
+          File.write(local_asset_path, "modified")
+          modified_digest = Digest::SHA1.new
+          modified_digest.update(File.read(local_asset_path))
+          expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
+
+          Service.run("data update spell-list.xml --force")
+
+          updated_digest = Digest::SHA1.new
+          updated_digest.update(File.read(local_asset_path))
+          expect(updated_digest.base64digest).to eq clean_digest.base64digest
+        end
       end
 
       it "list" do
