@@ -161,6 +161,17 @@ describe GameObj do
       end
     end
 
+    describe "legendary loot boxes" do
+      [
+        %{filigreed rolaren reliquary},
+      ].each do |box_desc|
+        it "recognizes #{box_desc} as a box" do
+        box = GameObjFactory.item_from_name(box_desc)
+          expect(box.type).to include "box"
+        end
+      end
+    end
+
     describe "things that are not boxes" do
       [
         %{polished modwir box},
