@@ -1,6 +1,22 @@
 =begin
   Package Manager
+
+  ** THIS SCRIPT REQUIRES RUBY 2.3+ **
+
+  https://gswiki.play.net/Lich_(software)/Installation
+
+  A modern, federated package manager for Lich. This script provides similiar
+  functionality to the ;repository, but aims to make it much easier to share
+  updates to scripts and avoid relying anyone as a single point-of-failure.
+  Instead of a single server, jinx supports multiple repositories to be more
+  resilient against infrastructure outages or players leaving the community.
+
+   author: elanthia-online
+     tags: utility, util, repository, repo, update, upgrade, meta, ruby, development
+  version: 0.2.0
+
 =end
+
 require 'fileutils'
 require 'ostruct'
 require 'yaml'
@@ -163,9 +179,13 @@ module Jinx
     LOCK = Mutex.new
     # dynamic reference to the $data_dir/_jinx folder
     # this will be useful for testing
+    def self.jinx_data_dir()
+      File.join(data_dir, "_jinx")
+    end
+
     def self.data_dir()
       $data_dir.is_a?(String) or fail Jinx::Error, "$data_dir is not String"
-      File.join($data_dir, "_jinx")
+      $data_dir
     end
 
     def self.script_dir()
@@ -174,7 +194,7 @@ module Jinx
     end
 
     def self.path(*args)
-      File.join(data_dir, *args.map(&:to_s))
+      File.join(jinx_data_dir, *args.map(&:to_s))
     end
 
     def self.read(*args)
@@ -282,26 +302,124 @@ module Jinx
         }
       end
 
-      def dump(repo, scripts: false)
+      def scripts(repo)
+        (repo[:available] || []).select { |f| f[:type].nil? || f[:type] == "script" }
+      end
+
+      def data(repo)
+        (repo[:available] || []).select { |f| f[:type] == "data" }
+      end
+
+      def print_info(script, i)
+        _respond("%s> %s %s" % [
+          (i+1).to_s.rjust(4), 
+          File.basename(script[:file]).ljust(20),
+          "(modified: %s ago)" % Util.ago(script[:last_commit])
+        ])
+      end
+
+      def print_numbered_list(entries)
+        entries
+          .sort {|a,b| b[:last_commit] - a[:last_commit] }
+          .each_with_index(&method(:print_info))
+      end
+
+      def dump(repo, scripts: false, data: false)
         _respond "<b>%s:</b>" % repo[:name]
         _respond "url=".rjust(10) + repo[:url]
         _respond "error=".rjust(10) + repo[:err] if repo[:err]
         _respond "updated=".rjust(10) + "%s ago" % Util.ago(repo[:last_updated]) if repo[:last_updated]
-        if repo[:available].is_a?(Array) && scripts
+        if scripts && self.scripts(repo).any?
           _respond "scripts:".rjust(10)
-          repo[:available]
-          .sort {|a,b| b[:last_commit] - a[:last_commit] }
-          .each_with_index {|script, i|
-            _respond("%s> %s %s" % [
-              (i+1).to_s.rjust(4), 
-              File.basename(script[:file]).ljust(20),
-              "(modified: %s ago)" % Util.ago(script[:last_commit])
-                
-            ])
-          }
+          print_numbered_list scripts(repo)
+        end
+        if data && self.data(repo).any?
+          _respond "data:".rjust(7)
+          print_numbered_list data(repo)
         end
       end
     end
+  end
+end
+
+module Jinx
+  module Metadata
+    module Base
+      include Enumerable
+
+      def atomic()
+        Folder.atomic(@file) {|entries| yield(entries)}
+      end
+
+      def update(repo, asset)
+        name = File.basename(asset.fetch(:file))
+        repo_name = repo.fetch(:name)
+        Log.out("updating %s file metadata for %s from %s" % [asset[:type], name, repo_name], label: %i(metadata update))
+        create(**{name: name, repo: repo_name, digest: asset.fetch(:md5)})
+      end
+
+      def each
+        self.atomic {|entries|
+          entries.each {|entry|
+            yield(entry)
+          }
+        }
+      end
+
+      def find_for_asset(asset)
+        name = File.basename(asset.fetch(:file)).to_s
+        self.atomic do |entries|
+          return entries[name]
+        end
+      end
+
+      def create(**argv)
+        name = argv.fetch(:name).to_s
+        repo = argv.fetch(:repo).to_s
+        fail "metadata record(%s) requires a name" % name unless argv[:name].is_a?(String)
+        fail "metadata record(%s) requires a repo" % repo unless argv[:repo].is_a?(Symbol)
+        self.atomic { |entries|
+          argv.delete(:name)
+          entries[name] = argv
+          entries
+        }
+      end
+    end
+
+    class << self
+      def class_for(asset)
+        case asset[:type]
+        when "script", :script, nil
+          ScriptMetadata
+        when "data", :data
+          DatafileMetadata
+        else
+          fail Jinx::Error, "don't recognize #{asset[:type]} type for #{asset[:file]}"
+        end
+      end
+
+      def update(repo, asset)
+        class_for(asset).update(repo, asset)
+      end
+
+      def for(asset)
+        class_for(asset).find_for_asset(asset)
+      end
+    end
+  end
+end
+
+module Jinx
+  module DatafileMetadata
+    extend Metadata::Base
+
+    @file = "data.yaml"
+  end
+
+  module ScriptMetadata
+    extend Metadata::Base
+
+    @file = "scripts.yaml"
   end
 end
 
@@ -351,47 +469,95 @@ module Jinx
       return "%s.lic" % script
     end
 
+    def self.open(resource, &block)
+      # modern ruby
+      return URI.open(resource, &block) if defined?(URI) && URI.respond_to?(:open)
+      # older rubies where URI.open/2 doesn't exist
+      return Kernel::open(resource, &block)
+    end
+
     def self.download(repo, asset, local_location)
       remote_location = repo[:url] + asset[:file] 
-      open(remote_location) { |remote|
+      self.open(remote_location) { |remote|
         File.open(local_location, "wb") { |local|
           local.write(remote.read)
         }
       }
-      Log.out("script downloaded to %s" % local_location, 
+      Log.out("file downloaded to %s" % local_location,
         label: %i(install download))
     end
   end
 end
 
 module Jinx
-  module LichScript
-    def self.install(script, sources, overwrite: false)
+  module LichInstaller
+    def self.install(script, sources, local_asset_path, overwrite: false, force: false)
       script  = Installer.normalize_filename(script)
       sources = sources.map {|source| Repo.manifest(source) }
       repo = Installer.ensure_specific(script, sources)
-      asset = repo[:available].find {|remote_asset| 
-        File.basename(remote_asset[:file]).eql?(script) 
+      asset = repo[:available].find {|remote_asset|
+        File.basename(remote_asset[:file]).eql?(script)
       }
-      local_asset = File.join(Folder.script_dir, File.basename(asset[:file]))
-      if File.exists?(local_asset) && !overwrite
-        fail Jinx::Error, <<~ALREADY_EXISTS
-          #{local_asset} already exists
-          
-          if the overwrite is intentional rerun as:
-            ;jinx #{Jinx::Service.vars[0].gsub(" install ", " update ")}
-        ALREADY_EXISTS
+      local_asset = File.join(local_asset_path, File.basename(asset[:file]))
+      if !force && File.exists?(local_asset)
+        source = File.read(local_asset)
+        digest = Digest::SHA1.new
+        digest.update(source)
+
+        if digest.base64digest == asset[:md5]
+          Log.out("%s from repo:%s already installed with md5(%s)" % [script, repo[:name], asset[:md5]],
+                  label: %i(install env lich))
+          return
+        elsif !overwrite
+          fail Jinx::Error, <<~ALREADY_EXISTS
+            #{local_asset} already exists
+
+            if the overwrite is intentional rerun as:
+              ;jinx #{Jinx::Service.vars[0].gsub(" install ", " update ")}
+          ALREADY_EXISTS
+        elsif metadata = Metadata.for(asset)
+          if digest.base64digest != metadata[:digest]
+            fail Jinx::Error, <<~LOCALLY_MODIFIED
+              #{local_asset} has been modified since last download.
+
+              if the overwrite is intentional rerun as:
+                ;jinx #{Jinx::Service.vars[0]} --force
+            LOCALLY_MODIFIED
+          end
+        end
       end
-      Log.out("installing %s from repo:%s with md5(%s)" % [script, repo[:name], asset[:md5]], 
+      Log.out("installing %s from repo:%s with md5(%s)" % [script, repo[:name], asset[:md5]],
         label: %i(install env lich))
       Installer.download(repo, asset, local_asset)
+      Metadata.update(repo, asset)
+      Log.out("successfully installed %s" % [script], label: %i(install env lich))
     end
   end
 end
 
 module Jinx
-  module CabalScript
-    def self.install(script, sources, overwrite: false)
+  module LichScript
+    def self.install(script, sources, overwrite: false, force: false)
+      LichInstaller.install(script, sources, Folder.script_dir, overwrite: overwrite, force: force)
+    end
+  end
+end
+
+module Jinx
+  module LichData
+    def self.install(script, sources, overwrite: false, force: false)
+      LichInstaller.install(script, sources, Folder.data_dir, overwrite: overwrite, force: force)
+    end
+  end
+end
+
+module Jinx
+  module CabalInstaller
+    ##
+    # cabal allows for nested script dirs, this ensures local scripts are namespace by repo
+    # ex: $script_dir/core/do_the_thing -> ;core/do_the_thing
+    #
+    def self.ensure_local_repo_dir(script, sources)
       script  = Installer.normalize_filename(script)
       sources = sources.map {|source| Repo.manifest(source) }
       repo = Installer.ensure_specific(script, sources)
@@ -401,22 +567,29 @@ module Jinx
           label: %i(repo setup))
         Dir.mkdir(local_repo_dir)
       end
-      asset = repo[:available].find {|remote_asset| 
-        File.basename(remote_asset[:file]).eql?(script) 
-      }
-      local_asset = File.join(local_repo_dir, File.basename(asset[:file]))
-      # todo: compare md5 checksums and skip if eql
-      if File.exists?(local_asset) && !overwrite
-        fail Jinx::Error, <<~ALREADY_EXISTS
-          #{local_asset} already exists
 
-          if the overwrite is intentional rerun as:
-            ;jinx #{Script.current.vars[0].gsub(" install ", " update ")}
-        ALREADY_EXISTS
-      end
-      Log.out("installing %s from repo:%s with md5(%s)" % [script, repo[:name], asset[:md5]], 
-        label: %i(install env cabal))
-      Installer.download(repo, asset, local_asset)
+      return local_repo_dir
+    end
+  end
+end
+
+module Jinx
+  module CabalScript
+    def self.install(script, sources, overwrite: false, force: true)
+      local_repo_dir = CabalInstaller.ensure_local_repo_dir(script, sources)
+      # we normalized it for the LichInstaller module now
+      LichInstaller.install(script, sources, local_repo_dir, overwrite: overwrite, force: force)
+    end
+  end
+end
+
+module Jinx
+  module CabalData
+    ##
+    # cabal uses the same api for data as lich currently
+    #
+    def self.install(script, sources, overwrite: false, force: false)
+      LichInstaller.install(script, sources, Folder.data_dir, overwrite: overwrite, force: force)
     end
   end
 end
@@ -425,9 +598,9 @@ module Jinx
   module Setup
     def self.apply()
       # setup jinx folder
-      unless Dir.exists?(Folder.data_dir)
-        Log.out("creating %s" % Folder.data_dir, label: %i(setup))
-        Dir.mkdir(Folder.data_dir)
+      unless Dir.exists?(Folder.jinx_data_dir)
+        Log.out("creating %s" % Folder.jinx_data_dir, label: %i(setup))
+        Dir.mkdir(Folder.jinx_data_dir)
       end
       # setup repo source list
       unless File.exists? Folder.path("repos.yaml")
@@ -438,6 +611,16 @@ module Jinx
       [Seed::ElanthiaOnlineCore, Seed::ElanthiaOnlineExtras].each {|repo|
         Repo.create(**repo) unless Repo.exists?(repo[:name])
       }
+      # setup script metadata
+      unless File.exists? Folder.path("scripts.yaml")
+        Log.out("creating %s" % Folder.path("scripts.yaml"), label: %i(setup scripts))
+        FileUtils.touch Folder.path("scripts.yaml")
+      end
+      # setup data file metadata
+      unless File.exists? Folder.path("data.yaml")
+        Log.out("creating %s" % Folder.path("data.yaml"), label: %i(setup data))
+        FileUtils.touch Folder.path("data.yaml")
+      end
     end
   end
 end
@@ -468,15 +651,16 @@ module Jinx
         return CLI.help()
       end
       # repo list
-      if argv.repo.eql?(true) && argv.list
+      if argv.repo.eql?(true) && argv.list.eql?(true)
         return CLI.repo_list()
       end
       # repo info <repo_name>
-      if argv.repo.eql?(true) && argv.info
+      if argv.repo.eql?(true) && argv.info.eql?(true)
         return CLI.repo_info(args.last)
       end
       # repo add <repo_name> <repo_url>
-      if argv.repo.eql?(true) && argv.add
+      
+      if argv.repo.eql?(true) && argv.add.eql?(true)
         url = args.at(-1)
         repo_name = args.at(-2)
         unless url.start_with?("http://") or url.start_with?("https://")
@@ -485,8 +669,24 @@ module Jinx
         end
         return CLI.repo_add(repo_name, url)
       end
+
+      if argv.repo.eql?(true) && argv.change.eql?(true)
+        url = args.at(-1)
+        repo_name = args.at(-2)
+        (url.start_with?("http://") or url.start_with?("https://") or
+          fail Jinx::Error, 
+            "invalid scheme only http/https supported\nurl=%s" % url)
+        
+        return CLI.repo_change(repo_name, url)
+      end
+
+      # repo rm <repo_name>
+      if argv.repo.eql?(true) && argv.rm.eql?(true)
+        repo_name = args.at(-1)
+        return CLI.repo_rm(repo_name)
+      end
       # script list
-      if argv.script.eql?(true) && argv.list
+      if argv.script.eql?(true) && argv.list.eql?(true)
         return CLI.script_list(argv.repo)
       end
       # script info <script_name>
@@ -495,18 +695,34 @@ module Jinx
       end
       # script install <script_name>
       if argv.script.eql?(true) && argv.install.eql?(true)
-        return CLI.script_install(args.last, argv.repo)
+        return CLI.script_install(args.last, argv.repo, force: argv.force)
       end
       # script update <script_name>
       if argv.script.eql?(true) && argv.update.eql?(true)
-        return CLI.script_update(args.last, argv.repo)
+        return CLI.script_update(args.last, argv.repo, force: argv.force)
       end
       # script search <substring>
       if argv.script.eql?(true) && argv.search.eql?(true)
         return CLI.script_search(args.last, argv.repo)
       end
+      # data list
+      if argv.data.eql?(true) && argv.list.eql?(true)
+        return CLI.data_list(argv.repo)
+      end
+      # data info <data_name>
+      if argv.data.eql?(true) && argv.info.eql?(true)
+        return CLI.data_info(args.last, argv.repo)
+      end
+      # data install <data_name>
+      if argv.data.eql?(true) && argv.install.eql?(true)
+        return CLI.data_install(args.last, argv.repo, force: argv.force)
+      end
+      # data update <data_name>
+      if argv.data.eql?(true) && argv.update.eql?(true)
+        return CLI.data_update(args.last, argv.repo, force: argv.force)
+      end
 
-      Log.out("unknown command", label: %i(jinx cli))
+      Log.out("unknown command", label: %i(cli))
       CLI.help()
     end
   end
@@ -527,6 +743,7 @@ module Jinx
           repo add    {repo:name} {repo:url}               add a repository from an http url
           repo info   {repo:name}                          show detailed info about a specific repo
           repo rm     {repo:name}                          remove a repository by name
+          repo change {repo:name} {repo:url}               changes the url for a given repo
 
         Script commands:
           script list                                      list all currently known scripts
@@ -534,9 +751,17 @@ module Jinx
           script install {script:name}                     attempt to install a script
           script update  {script:name}                     attempts to update an installed script
           script search  {pattern}                         searches for any script matching the pattern
-        Script commands all take an optional --repo={repo:name} argument to perform the action on a
-        specified repo. Without the argument, the action will be attempted on all repos that have
-        been added.
+
+        Data commands:
+          data list                                        list all currently known data files
+          data info    {datafile:name}                     shows known info about a remote data file
+          data install {datafile:name}                     attempt to install a data file
+          data update  {datafile:name}                     attempts to update an installed data file
+          data search  {pattern}                           searches for data files matching the pattern
+
+        Script and data commands all take an optional --repo={repo:name} argument to perform the
+        action on a specified repo. Without the argument, the action will be attempted on all repos
+        that have been added.
       HELP
     end
 
@@ -552,13 +777,27 @@ module Jinx
       repo = Repo.lookup(repo_name)
       Repo.dump(
         Repo.manifest(repo), 
-        scripts: true)
+        scripts: true, data: true)
     end
 
     def self.repo_rm(repo_name)
       repo = Repo.lookup(repo_name)
       Repo.atomic {|repos|
         repos.delete(repo[:name])
+        _respond("<b>repo(%s) has been removed</b>" % repo_name)
+        repos
+      }
+    end
+
+    def self.repo_change(repo_name, repo_url)
+      repo = Repo.lookup(repo_name)
+      Repo.atomic {|repos|
+        repos[repo[:name]] = repo.merge({url: repo_url})
+        _respond("<b>repo(%s) has been changed from</b>\nold=%s\nnew=%s" % [
+          repo_name,
+          repo[:url],
+          repo_url
+          ])
         repos
       }
     end
@@ -574,7 +813,7 @@ module Jinx
     def self.script_info(script_name, repo_name = nil)
       repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       repo = Installer.ensure_specific(script_name, repos)
-      script_metadata = repo[:available].find {|asset| 
+      script_metadata = Repo.scripts(repo).find {|asset| 
         File.basename(asset[:file])
           .eql?(Installer.normalize_filename(script_name))
       }
@@ -590,16 +829,16 @@ module Jinx
       end
     end
 
-    def self.script_install(script, repo_name = nil)
+    def self.script_install(script, repo_name = nil, force: false)
       sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       env = defined?(Cabal) ? Jinx::CabalScript : Jinx::LichScript
-      env.install(script, sources, overwrite: false)
+      env.install(script, sources, overwrite: force, force: force)
     end
 
-    def self.script_update(script, repo_name = nil)
+    def self.script_update(script, repo_name = nil, force: false)
       sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       env = defined?(Cabal) ? Jinx::CabalScript : Jinx::LichScript
-      env.install(script, sources, overwrite: true)
+      env.install(script, sources, overwrite: true, force: force)
     end
 
     def self.script_search(pattern, repo_name)
@@ -608,7 +847,7 @@ module Jinx
       matches = candidate_repos
         .each {|repo| Repo.manifest(repo) }
         .select {|repo| repo[:available].is_a?(Array) }
-        .map {|repo| repo[:available].map {|script| script.merge({repo: repo[:name]}) } }
+        .map {|repo| Repo.scripts(repo).map {|script| script.merge({repo: repo[:name]}) } }
         .flatten(1)
         .select {|script| File.basename(script[:file]) =~ pattern }
         
@@ -619,6 +858,45 @@ module Jinx
           File.basename(script[:file]).rjust(20),
           Util.ago(script[:last_commit])]
       }
+    end
+
+    def self.data_list(repo_name = nil)
+      Log.out(repo_name, label: %i(data_list))
+      Repo
+        .select { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+        .map    { |repo| repo.merge(Repo.manifest(repo)) }
+        .each   { |repo| Repo.dump(repo, data: true) }
+    end
+
+    def self.data_info(datafile_name, repo_name = nil)
+      repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      repo = Installer.ensure_specific(datafile_name, repos)
+      datafile_metadata = Repo.data(repo).find {|asset| 
+        File.basename(asset[:file])
+          .eql?(Installer.normalize_filename(datafile_name))
+      }
+
+      _respond("<b>%s (repo: %s, modified: %s)</b>" % 
+        [datafile_name, repo[:name],
+        Util.ago(datafile_metadata[:last_commit]) + " ago"
+        ])
+      if datafile_metadata[:header]
+        _respond Repo.header(repo, datafile_metadata)
+      else
+        _respond "no documentation"
+      end
+    end
+
+    def self.data_install(datafile, repo_name = nil, force: false)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      env = defined?(Cabal) ? Jinx::CabalData : Jinx::LichData
+      env.install(datafile, sources, overwrite: force, force: force)
+    end
+
+    def self.data_update(datafile, repo_name = nil, force: false)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      env = defined?(Cabal) ? Jinx::CabalData : Jinx::LichData
+      env.install(datafile, sources, overwrite: true, force: force)
     end
   end
 end
