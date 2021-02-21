@@ -193,6 +193,11 @@ module Jinx
       $script_dir
     end
 
+    def self.engine_dir()
+      $lich_dir.is_a?(String) or fail Jinx::Error, "$lich_dir is not String"
+      $lich_dir
+    end
+
     def self.path(*args)
       File.join(jinx_data_dir, *args.map(&:to_s))
     end
@@ -302,12 +307,20 @@ module Jinx
         }
       end
 
+      def assets_in(repo)
+        repo.fetch(:available, [])
+      end
+
       def scripts(repo)
-        (repo[:available] || []).select { |f| f[:type].nil? || f[:type] == "script" }
+        assets_in(repo).select { |f| f[:type].nil? || f[:type] == "script" }
       end
 
       def data(repo)
-        (repo[:available] || []).select { |f| f[:type] == "data" }
+        assets_in(repo).select { |f| f[:type] == "data" }
+      end
+
+      def engines(repo)
+        assets_in(repo).select { |f| f[:type] == "engine" }
       end
 
       def print_info(script, i)
@@ -324,11 +337,15 @@ module Jinx
           .each_with_index(&method(:print_info))
       end
 
-      def dump(repo, scripts: false, data: false)
+      def dump(repo, scripts: false, data: false, engines: false)
         _respond "<b>%s:</b>" % repo[:name]
         _respond "url=".rjust(10) + repo[:url]
         _respond "error=".rjust(10) + repo[:err] if repo[:err]
         _respond "updated=".rjust(10) + "%s ago" % Util.ago(repo[:last_updated]) if repo[:last_updated]
+        if engines && self.engines(repo).any?
+          _respond "engines:".rjust(10)
+          print_numbered_list engines(repo)
+        end
         if scripts && self.scripts(repo).any?
           _respond "scripts:".rjust(10)
           print_numbered_list scripts(repo)
@@ -393,6 +410,8 @@ module Jinx
           ScriptMetadata
         when "data", :data
           DatafileMetadata
+        when "engine", :engine
+          EngineMetadata
         else
           fail Jinx::Error, "don't recognize #{asset[:type]} type for #{asset[:file]}"
         end
@@ -420,6 +439,12 @@ module Jinx
     extend Metadata::Base
 
     @file = "scripts.yaml"
+  end
+
+  module EngineMetadata
+    extend Metadata::Base
+
+    @file = "engine.yaml"
   end
 end
 
@@ -491,21 +516,22 @@ end
 
 module Jinx
   module LichInstaller
-    def self.install(script, sources, local_asset_path, overwrite: false, force: false)
-      script  = Installer.normalize_filename(script)
+    def self.install(remote_name, sources, local_asset_directory, local_asset_name = nil, overwrite: false, force: false)
+      remote_name  = Installer.normalize_filename(remote_name)
       sources = sources.map {|source| Repo.manifest(source) }
-      repo = Installer.ensure_specific(script, sources)
+      repo = Installer.ensure_specific(remote_name, sources)
       asset = repo[:available].find {|remote_asset|
-        File.basename(remote_asset[:file]).eql?(script)
+        File.basename(remote_asset[:file]).eql?(remote_name)
       }
-      local_asset = File.join(local_asset_path, File.basename(asset[:file]))
+      local_asset_name = File.basename(local_asset_name || asset[:file])
+      local_asset = File.join(local_asset_directory, local_asset_name)
       if !force && File.exists?(local_asset)
         source = File.read(local_asset)
         digest = Digest::SHA1.new
         digest.update(source)
 
         if digest.base64digest == asset[:md5]
-          Log.out("%s from repo:%s already installed with md5(%s)" % [script, repo[:name], asset[:md5]],
+          Log.out("%s from repo:%s already installed with md5(%s) at %s" % [remote_name, repo[:name], asset[:md5], local_asset],
                   label: %i(install env lich))
           return
         elsif !overwrite
@@ -526,11 +552,11 @@ module Jinx
           end
         end
       end
-      Log.out("installing %s from repo:%s with md5(%s)" % [script, repo[:name], asset[:md5]],
+      Log.out("installing %s from repo:%s with md5(%s)" % [remote_name, repo[:name], asset[:md5]],
         label: %i(install env lich))
       Installer.download(repo, asset, local_asset)
       Metadata.update(repo, asset)
-      Log.out("successfully installed %s" % [script], label: %i(install env lich))
+      Log.out("successfully installed %s" % [remote_name], label: %i(install env lich))
     end
   end
 end
@@ -547,6 +573,36 @@ module Jinx
   module LichData
     def self.install(script, sources, overwrite: false, force: false)
       LichInstaller.install(script, sources, Folder.data_dir, overwrite: overwrite, force: force)
+    end
+  end
+end
+
+module Jinx
+  module LichEngine
+    DEFAULT_ENGINE = "lich.rb"
+
+    def self.install(engine, sources, overwrite: false, force: false)
+      LichInstaller.install(
+        normalize_name(engine),
+        sources,
+        Folder.engine_dir,
+        current_engine,
+        overwrite: overwrite, force: force,
+      )
+    end
+
+    def self.normalize_name(raw_engine_name)
+      raw_engine_name ||= DEFAULT_ENGINE
+      case raw_engine_name.chomp.downcase
+      when /^$/, /^lich[.]rbw?$/, /^lich$/
+        DEFAULT_ENGINE
+      else
+        raw_engine_name
+      end
+    end
+
+    def self.current_engine
+      File.basename($PROGRAM_NAME)
     end
   end
 end
@@ -620,6 +676,11 @@ module Jinx
       unless File.exists? Folder.path("data.yaml")
         Log.out("creating %s" % Folder.path("data.yaml"), label: %i(setup data))
         FileUtils.touch Folder.path("data.yaml")
+      end
+      # setup engine metadata
+      unless File.exists? Folder.path("engine.yaml")
+        Log.out("creating %s" % Folder.path("engine.yaml"), label: %i(setup engine))
+        FileUtils.touch Folder.path("engine.yaml")
       end
     end
   end
@@ -721,6 +782,14 @@ module Jinx
       if argv.data.eql?(true) && argv.update.eql?(true)
         return CLI.data_update(args.last, argv.repo, force: argv.force)
       end
+      # engine list
+      if argv.engine.eql?(true) && argv.list.eql?(true)
+        return CLI.engine_list(argv.repo)
+      end
+      # engine update <engine_name>
+      if argv.engine.eql?(true) && argv.update.eql?(true)
+        return CLI.engine_update(args[2], argv.repo, force: argv.force)
+      end
 
       Log.out("unknown command", label: %i(cli))
       CLI.help()
@@ -759,9 +828,13 @@ module Jinx
           data update  {datafile:name}                     attempts to update an installed data file
           data search  {pattern}                           searches for data files matching the pattern
 
-        Script and data commands all take an optional --repo={repo:name} argument to perform the
-        action on a specified repo. Without the argument, the action will be attempted on all repos
-        that have been added.
+        Engine commands:
+          engine list                                      list all currently known scripting engines
+          engine update {engine:name}                      attempts to update your scripting engine
+
+        Script, data, and engine commands all take an optional --repo={repo:name} argument to perform
+        the action on a specified repo. Without the argument, the action will be attempted on all
+        repos that have been added.
       HELP
     end
 
@@ -777,7 +850,7 @@ module Jinx
       repo = Repo.lookup(repo_name)
       Repo.dump(
         Repo.manifest(repo), 
-        scripts: true, data: true)
+        scripts: true, data: true, engines: true)
     end
 
     def self.repo_rm(repo_name)
@@ -897,6 +970,20 @@ module Jinx
       sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       env = defined?(Cabal) ? Jinx::CabalData : Jinx::LichData
       env.install(datafile, sources, overwrite: true, force: force)
+    end
+
+    def self.engine_list(repo_name = nil)
+      Log.out(repo_name, label: %i(engine_list)) if repo_name
+      Repo
+        .select { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+        .map    { |repo| repo.merge(Repo.manifest(repo)) }
+        .each   { |repo| Repo.dump(repo, engines: true) }
+    end
+
+    def self.engine_update(engine, repo_name = nil, force: false)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      env = defined?(Cabal) ? Jinx::CabalEngine : Jinx::LichEngine
+      env.install(engine, sources, overwrite: true, force: force)
     end
   end
 end
