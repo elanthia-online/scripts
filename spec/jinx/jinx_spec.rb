@@ -48,6 +48,7 @@ module Jinx
     before(:each) do
       $data_dir =  Dir.mktmpdir("data")
       $script_dir = Dir.mktmpdir("scripts")
+      $lich_dir = Dir.mktmpdir("lich")
       Setup.apply
       game_output
     end
@@ -361,6 +362,84 @@ module Jinx
         output = game_output
         expect(output).to include("data:")
         expect(output).to include("spell-list.xml")
+      end
+    end
+
+    describe "engine" do
+      it "list" do
+        Service.run("engine list")
+        output = game_output
+        expect(output).to include("engines:")
+        expect(output).to include("lich.rb")
+      end
+
+      describe "update" do
+        let(:local_asset_path) { File.join($lich_dir, File.basename($PROGRAM_NAME)) }
+
+        it "will install the first time cleanly on 1-to-1"  do
+          Service.run("engine update")
+
+          _first_attempt = game_output
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "is a noop is the local file matches the expected digest" do
+          Service.run("engine update")
+          game_output # clear
+          Service.run("engine update")
+          output = game_output
+
+          expect(output).to include("lich.rb from repo:core already installed")
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "will not accidentally overwrite already existing script if the digests don't match" do
+          Service.run("engine update")
+          game_output # clear
+          File.write(local_asset_path, "modified")
+
+          expect { Service.run("engine update") }
+            .to raise_error(Jinx::Error, /has been modified/)
+        end
+
+        it "will overwrite a modified script if given --force" do
+          Service.run("engine update")
+          game_output # clear
+          clean_digest = Digest::SHA1.new
+          clean_digest.update(File.read(local_asset_path))
+          File.write(local_asset_path, "modified")
+          modified_digest = Digest::SHA1.new
+          modified_digest.update(File.read(local_asset_path))
+          expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
+
+          Service.run("engine update --force")
+
+          updated_digest = Digest::SHA1.new
+          updated_digest.update(File.read(local_asset_path))
+          expect(updated_digest.base64digest).to eq clean_digest.base64digest
+        end
+      end
+    end
+
+    describe LichEngine do
+      describe "normalize_name" do
+        it "given a fully specified name" do
+          expect(LichEngine.normalize_name("forked-engine.rb")).to eq "forked-engine.rb"
+        end
+
+        it "given nil (e.g. no CLI argument)" do
+          expect(LichEngine.normalize_name(nil)).to eq "lich.rb"
+        end
+
+        it "given an empty string" do
+          expect(LichEngine.normalize_name("")).to eq "lich.rb"
+        end
+
+        it "given something probably intended to be lich.rb" do
+          expect(LichEngine.normalize_name("lich.rbw")).to eq "lich.rb"
+          expect(LichEngine.normalize_name("lich.rb")).to eq "lich.rb"
+          expect(LichEngine.normalize_name("lich")).to eq "lich.rb"
+        end
       end
     end
   end
