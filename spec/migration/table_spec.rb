@@ -2,7 +2,7 @@ require_relative "./helper.rb"
 
 describe Migration::Table do
   describe "exlcusion rules" do
-    before { 
+    before {
       @table = Migration::Table.from_yaml(Helper::Mocks.table_path(:exclusions))
     }
 
