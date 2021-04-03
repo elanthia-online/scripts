@@ -48,7 +48,6 @@ migrate :weapon, :pawnshop do
   insert(:noun, %{falcastra})
   insert(:noun, %{falcata})
   insert(:noun, %{falx})
-  insert(:noun, %{fang})
   insert(:noun, %{fauchard})
   insert(:noun, %{fleuret})
   insert(:noun, %{flyssa})

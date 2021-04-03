@@ -220,7 +220,6 @@ describe GameObj do
         %{spikestar},
 
         %{war hammer},
-        %{fang},
         %{hammerbeak},
         %{hoolurge},
         %{horseman's hammer},
