@@ -86,12 +86,17 @@ describe GameObj do
         end
       end
 
-      it "knows that tree spirits and moaning spirits are not passive spirit servants" do
+      describe "NPCs with the spirit noun which are not spirit servants" do
         [
           "moaning spirit",
+          "ancient moaning spirit",
           "tree spirit",
+          "elder tree spirit",
+          "ancient tree spirit",
         ].each do |spirit|
-          expect(GameObjFactory.npc_from_name(spirit).type).to_not include "passive npc"
+          it "knows that #{spirit} is not a passive spirit servant" do
+            expect(GameObjFactory.npc_from_name(spirit).type).to_not include "passive npc"
+          end
         end
       end
     end
