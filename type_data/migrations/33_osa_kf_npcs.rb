@@ -182,7 +182,6 @@ migrate :aggressive_npc do
   insert(:name, %{seasoned krolvin warden})
   insert(:name, %{seasoned krolvin warmage})
   insert(:name, %{seasoned krolvin watcher})
-  insert(:name, %{The Ethereal Captain})
   insert(:name, %{The Krolvin Captain})
   insert(:name, %{The Pirate Captain})
   insert(:name, %{towering krolvin archmage})
@@ -196,8 +195,6 @@ migrate :aggressive_npc do
   insert(:name, %{towering krolvin tormentor})
   insert(:name, %{towering krolvin triggerman})
   insert(:name, %{towering krolvin warlord})
-  insert(:name, %{unworldly brigand})
-  insert(:name, %{unworldly pirate})
   insert(:name, %{vile krolvin battlechanter})
   insert(:name, %{vile krolvin harrower})
   insert(:name, %{vile krolvin huntmaster})
@@ -241,6 +238,9 @@ migrate :undead, :aggressive_npc do
   insert(:name, %{ghostly half-elven waylayer})
   insert(:name, %{ghostly half-krolvin scout})
   insert(:name, %{ghostly human pillager})
+  insert(:name, %{The Ethereal Captain})
+  insert(:name, %{unworldly brigand})
+  insert(:name, %{unworldly pirate})
 end
 
 #Kraken Falls mobs
