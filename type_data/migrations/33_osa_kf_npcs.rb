@@ -143,6 +143,7 @@ migrate :aggressive_npc do
   insert(:name, %{menacing krolvin tormentor})
   insert(:name, %{menacing krolvin triggerman})
   insert(:name, %{menacing krolvin warlord})
+  insert(:name, %{puny krolvin page})
   insert(:name, %{raging krolvin battlechanter})
   insert(:name, %{raging krolvin harrower})
   insert(:name, %{raging krolvin huntmaster})
