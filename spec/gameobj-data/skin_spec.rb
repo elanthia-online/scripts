@@ -94,6 +94,7 @@ describe GameObj do
         %{hisskra crest},
         %{hisskra skin},
         %{hisskra tooth},
+        %{hobgoblin acolyte ear},
         %{hobgoblin scalp},
         %{hobgoblin shaman ear},
         %{hornet stinger},

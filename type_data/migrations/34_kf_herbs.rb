@@ -1,4 +1,4 @@
-migrate :skin do
+migrate :skin, :furrier do
   insert(:name, %{hobgoblin acolyte ear})
 end
 
