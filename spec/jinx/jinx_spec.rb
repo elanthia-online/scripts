@@ -252,6 +252,17 @@ module Jinx
           %r[repo\(archive\) is not known])
     end
 
+    it "repo can readd a previously removed repo" do
+      Service.run("repo add archive https://archive.lich.elanthia.online")
+      game_output
+      Service.run("repo rm archive")
+      expect(Repo.find {|repo| repo[:name].eql?(:archive)})
+        .to be_nil
+
+      Service.run("repo add archive https://archive.lich.elanthia.online")
+      Repo.lookup("archive")
+    end
+
     it "repo change {repo:name} {repo:url}" do
       Service.run("repo change core https://example.com")
       change_output = game_output
