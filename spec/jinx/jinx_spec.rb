@@ -199,11 +199,11 @@ module Jinx
       # now two repos advertise noop, so it should error
       expect {Service.run("script info noop")}
         .to raise_error(Jinx::Error, 
-          %r[more than one repo has script\(noop.lic\)])
+          %r[more than one repo has asset\(noop.lic\)])
 
       expect {Service.run("script info noop --repo=core")}
         .to raise_error(Jinx::Error, 
-          %r[repo\(core\) does not advertise script\(noop.lic\)])
+          %r[repo\(core\) does not advertise asset\(noop.lic\)])
       game_output # clear
       # make sure it checks the elanthia-online repo
       Service.run("script info noop --repo=elanthia-online")
@@ -252,6 +252,17 @@ module Jinx
           %r[repo\(archive\) is not known])
     end
 
+    it "repo can readd a previously removed repo" do
+      Service.run("repo add archive https://archive.lich.elanthia.online")
+      game_output
+      Service.run("repo rm archive")
+      expect(Repo.find {|repo| repo[:name].eql?(:archive)})
+        .to be_nil
+
+      Service.run("repo add archive https://archive.lich.elanthia.online")
+      Repo.lookup("archive")
+    end
+
     it "repo change {repo:name} {repo:url}" do
       Service.run("repo change core https://example.com")
       change_output = game_output
@@ -268,11 +279,25 @@ module Jinx
       let(:local_asset_path) { File.join($data_dir, "spell-list.xml") }
 
       describe "install" do
+        class Spell
+          def self.load
+          end
+        end
+
         it "will install the first time cleanly on 1-to-1" do
+          allow(Spell).to receive(:load)
           Service.run("data install spell-list.xml")
 
           _first_attempt = game_output
           expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "runs the post-install hook after installing" do
+          allow(Spell).to receive(:load)
+          Service.run("data install spell-list.xml")
+
+          _first_attempt = game_output
+          expect(Spell).to have_received(:load)
         end
 
         it "is a noop is the local file matches the expected digest" do
