@@ -34,8 +34,14 @@ module Jinx
     unless ENV['ENABLE_EXTERNAL_NETWORKING'] && !%w[false no n 0].include?(ENV['ENABLE_EXTERNAL_NETWORKING'].downcase)
       before(:all) do
         WebMock.enable!
-        { 'core' => 'repo', 'extras' => 'extras.repo', 'archive' => 'archive.lich' }.each do |(dir, domain)|
-          WebMock.stub_request(:any, %r{https://#{domain}.elanthia.online})
+        {
+          'core'    => 'repo.elanthia.online',
+          'extras'  => 'extras.repo.elanthia.online',
+          'archive' => 'archive.lich.elanthia.online',
+          'gtk3'    => 'gtk3.elanthia.online',
+          'mirror'  => 'ffnglichrepoarchive.netlify.app',
+        }.each do |(dir, domain)|
+          WebMock.stub_request(:any, %r{https://#{domain}})
             .to_rack(Rack::Directory.new(File.join(__dir__, 'repos', dir)))
         end
       end
