@@ -5,6 +5,7 @@ migrate :skin, :furrier do
   insert(:name, %{pale troll tongue})
   insert(:name, %{scraggly swamp troll scalp})
   insert(:name, %{brown boar hide})
+  insert(:name, %{moor eagle talon})
 end
 
 migrate :skin, :furrier do
