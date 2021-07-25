@@ -1,0 +1,2278 @@
+=begin
+
+  this script does the following:
+    1. picks boxes in the locksmithing pool
+    2. repairs lockpicks
+    3. creates lockpicks
+    4. tracks created lockpicks and their estimated modifiers
+    5. wedges boxes if necessary
+    6. handles plinites in the pool
+    7. handles boss boxes in the pool
+    8. manages vials for plated boxes to maximize exp
+
+  why does this script exist?
+
+    most of the lockpicking scripts make considerably suboptimal decisions,
+    which results in less experience per 13 minute window that would be available
+    with better simulated outcomes.
+
+  READ THIS OR ELSE:
+    1. you cannot use this script unless you have completed the lock mastery skill tree
+    2. it is not designed to be configurable, it is designed to work off all common/crafted gear
+    3. do not put anything of value in your locksmith bag 
+       it treats everything in there as ephemereal easily replaced gear
+    4. this script requires the terminal-table gem
+    5. this script requires the lockpicks.yaml file to be downloaded to your data dir
+  
+  GETTING STARTED:
+    1. you must "seed" your locksmith container with the types of lockpicks you want it to use
+      example:
+
+  In the leather belt:
+    Weapons [1]: a twisted dagger
+    Containers [1]: a dark leather locksmith's toolkit
+    Lockpicks [16]: a copper lockpick, a veniom lockpick, a silver lockpick, an ora lockpick, 
+                    a mithril lockpick, a steel lockpick, a laje lockpick, a vultite lockpick, 
+                    a gold lockpick, a vaalin lockpick (2), a brass lockpick, a brass-edged golvern lockpick, 
+                    an alum lockpick, a red-speckled sturdy invar lockpick, a kelyn lockpick
+    Special [2]: a set of professional calipers, a superior wooden wedge
+    Total items: 20
+
+    from there on it will replace/repair locksmiths as needed, and refill toolkits as needed.
+    Your toolkit must be a commonly purchasable one, you must have a "dagger" noun in the bag.
+    You must have calipers in the bag.
+
+  you must set the following vars:
+    ;vars set locksmith <container name>
+
+    example:
+    ;vars set locksmith "oiled leather belt"
+
+    take note that my scripts **always** require the exact name to ensure conflicts do not arise in your inventory.
+
+  the follow vars are optional:
+    ;vars set spa-min-tip <number> (default is 100)
+
+  useful subroutines:
+    ;spa --make=<metal>          will create a lockpick at the workbench of the given metal if possible
+    ;spa --skills                will print out what spa thinks your skills are as well as estimates of lockpicks and ranges
+    ;spa --repair                will attempt to repair the lockpick in your right hand is possible
+    ;spa --refill                will refill your locksmith's toolkit if possible
+
+    
+  author=Ondreian
+  version=1.0.0
+
+=end
+
+require "ostruct"
+require "terminal-table"
+
+unless (Char.respond_to?(:total_wound_severity) and Char.respond_to?(:only_minor_wounds?)) and not Script.current.vars.include?("--polyfill")
+  ##
+  ## polyfill total wound severity check
+  ##
+  class Char
+    INJURIES = %i(arms limbs torso back 
+      leftHand rightHand head rightArm 
+      abdomen leftEye leftArm chest 
+      leftFoot rightFoot rightLeg 
+      neck leftLeg nsys rightEye)
+
+    def Char.total_wound_severity()
+      INJURIES
+        .reduce(0) do |sum, method| sum + Wounds.send(method) end
+    end
+
+    def Char.only_minor_wounds?
+      (INJURIES.find do |injury| Wounds.send(injury) > 1 end or 
+      INJURIES.find do |injury| Scars.send(injury) > 1 end).nil?
+    end
+  end
+end
+
+module Spa
+ module Log  
+    def self.out(msg, label: :debug)
+      return _write _view(msg, label) unless msg.is_a?(Exception)
+      ## pretty-print exception
+      _write _view(msg.message, label)
+      msg.backtrace.to_a.slice(0..5).each do |frame| _write _view(frame, label) end
+    end
+
+    def self._write(line)
+      if Script.current.vars.include?("--headless") or not defined?(:_respond)
+        $stdout.write(line + "\n")
+      elsif line.include?("<") and line.include?(">")
+        respond(line)
+      else
+        _respond Preset.as(:debug, line)
+      end
+    end
+
+    def self._view(msg, label)
+      label = [Script.current.name, label].flatten.compact.join(".")
+      safe = msg.inspect
+      #safe = safe.gsub("<", "&lt;").gsub(">", "&gt;") if safe.include?("<") and safe.include?(">")
+      "[#{label}] #{safe}"
+    end
+
+    def self.pp(msg, label = :debug)
+      respond _view(msg, label)
+    end
+
+    def self.dump(*args)
+      pp(*args)
+    end
+
+    module Preset
+      def self.as(kind, body)
+        %[<preset id="#{kind}">#{body}</preset>]
+      end
+    end
+  end
+end
+
+module Spa
+  def self.try_or_fail(seconds: 5, command: nil, tries: 0, max: 3, &block)
+    waitrt?
+    fput(command)
+    expiry = Time.now + seconds
+    wait_until do yield or Time.now > expiry end
+    return try_or_fail(seconds: seconds, command: command, tries: tries + 1, &block) if Time.now > expiry && tries < max
+    fail "Error[command: #{command}, seconds: #{seconds}]" if Time.now > expiry && tries > max
+  end
+end
+
+module Spa
+  module Util
+    def self.wealth()
+      wealth_pattern = /^You have (no silver|[,\d]+|but one) coins?/
+      wealth = dothistimeout 'wealth quiet',2, wealth_pattern
+      coins = 0
+      if wealth.gsub('but one','1') =~ wealth_pattern
+        coins = $1.gsub(',','').to_i
+      end
+      return coins
+    end
+
+    def self.with_commas(str)
+      str.to_s.reverse
+        .gsub(/(\d{3})(?=\d)/, '\\1,')
+        .reverse
+    end
+
+    def self.fmt_time(seconds)
+      days    = (seconds / 86_400).floor
+      seconds = seconds - (days * 86_400)
+      hours   = (seconds / 3_600).floor
+      seconds = seconds - (hours * 3_600)
+      minutes = (seconds / 60).floor
+      seconds = (seconds - (minutes * 60)).floor
+
+      [days, hours, minutes, seconds]
+        .zip(%w(d h m s))
+        .select { |f| f.first > 0 }
+        .map {|f| f.first.to_s.rjust(2, "0") + f.last }
+        .reduce("") { |acc, col| acc + " " + col }
+        .strip
+    end
+  end
+end
+
+module Interactive
+  def self.system_notification(msg)
+    return unless defined? Notify
+    if Notify::Sounds.to_a.grep(/small_heart/) 
+      Notify::Sounds.play("small_heart")
+    else
+      Notify::Sounds.play Notify::Sounds.to_a.sample
+    end
+    Notify.show(body: msg)
+  end
+
+  def self.capture(msg, pattern)
+    _respond "<b>%s</b>" % msg
+    system_notification(msg)
+    while line = get 
+      return line if line.strip =~ pattern
+    end
+  end
+end
+
+module Spa
+  module Containers
+    module Query
+      MatchAttrs = -> thing, attrs {
+        attrs.select { |method, val|
+          if val.is_a?(Regexp)
+            thing.send(method) =~ val
+          else
+            thing.send(method).eql?(val)
+          end
+        }
+        .size.eql?(attrs.keys.size)
+      }
+    end
+    
+    EXIST         =  %r{<a exist=(?:'|")(?<id>.*?)(?:'|") noun=(?:'|")(?<noun>.*?)(?:'|")>(?<name>.*?)</a>}
+    START_INV     = %{You are currently wearing and carrying:}
+    END_INV       = %{displayed.)}
+    @containers ||= []
+    @containers   = [] if Script.current.vars.include?("--flush")
+    
+    def self.refresh()
+      begin
+        @containers = []
+        Script.current.want_downstream_xml = true
+        fput "inv full containers"
+        in_inv = false
+        while line = get
+          in_inv = true if line.include?(START_INV)
+          next unless in_inv
+          # skip nested containers
+          indentation =  (line.size - line.strip.size)
+          next unless indentation.eql?(2) or indentation.eql?(0)
+          line.scan(EXIST).each do |matches| @containers << GameObj.new(*matches) end
+          break if line.include?(END_INV)
+        end
+      ensure
+        Script.current.want_downstream_xml = false
+      end
+    end
+
+    def self.containers()
+      @containers
+    end
+  
+    def self.fetch()
+      refresh() if @containers.empty?
+      @containers
+    end
+
+    def self.find(**attrs)
+      fetch.find do |container| Query::MatchAttrs.(container, attrs) end
+    end
+  
+    def self.scan()
+      fetch.each do |container|
+        fput "look in ##{container.id}" if GameObj.containers[container.id].nil?
+        wait_until {GameObj.containers[container.id].is_a?(Array)}
+      end
+    end
+
+    def self.access(**attrs)
+      container = find_container_of(**attrs)
+      attrs.delete(:container)
+      item = container && GameObj.containers[container.id].find do |item| Query::MatchAttrs.(item, attrs) end
+      [container, item]
+    end
+
+    def self.use(**attrs)
+      (container, item) = access(**attrs)
+      fail "could not find item matching #{attrs}" unless item && container
+      Spa.try_or_fail(command: "_drag #%s right" % item.id) {
+        GameObj.right_hand.id.eql?(item.id)
+      }
+      outcome = yield(item)
+      waitrt?
+      GameObj.right_hand.id.eql?(item.id) && Spa.try_or_fail(command: "_drag #%s #%s" % [item.id, container.id]) {
+        GameObj.containers[container.id].map(&:id).include?(item.id)
+      }
+      return outcome
+    end
+
+    def self.find_container_of(**attrs)
+      if container_name = attrs[:container]
+        attrs.delete(:container)
+        fetch.find do |container|
+          container.name.eql?(container_name)
+        end
+      end
+
+      fetch.find do |container| 
+        fput "look in ##{container.id}" if GameObj.containers[container.id].nil?
+        wait_until {GameObj.containers[container.id].is_a?(Array)}
+        not container.contents.find do |item| Query::MatchAttrs.(item, attrs) end.nil?
+      end
+    end
+
+    def self.add(container, item)
+      Spa.try_or_fail(command: "_drag #%s #%s" % [item.id, container.id]) {
+        GameObj.containers[container.id].map(&:id).include?(item.id)
+      }
+    end
+
+    def self.method_missing(method, *args, &block)
+      fetch.send(method, *args, &block)
+    end
+  end
+end
+
+module Spa
+  module Errand
+    def self.go2(id)
+      Script.run("go2", "%s" % id)
+      ttl = Time.now + 3
+      wait_until {Room.current.id.eql?(id) or Room.current.tags.include?(id) or Time.now > ttl}
+      fail "error traveling to %s" % id unless Room.current.id.eql?(id) or Room.current.tags.include?(id)
+    end
+
+    def self.run(target_id)
+      fail "target cannot be nil" if target_id.nil?
+      starting_room_id = Room.current.id
+      go2(target_id)
+      outcome = yield
+      go2(starting_room_id)
+      return outcome
+    end
+  end
+end
+
+module Spa
+  module Rooms
+    @rooms = [
+      {
+        "town"=> "Cysaegir",
+        "room_title"=> "[Locksmithery, Side Room]",
+        "npc"=> "slender aelotoi woman",
+        "prime"=> 28718,
+        "plat"=> 27021,
+        "bench" => "tile-inlaid counter"
+      },
+      {
+        "town"=> "Icemule Trace",
+        "room_title"=> "[Tavern Burrow, Ale Street]",
+        "npc"=> "shivering burghal gnome boss",
+        "prime"=> 2400,
+        "plat"=> 2400,
+      },
+      {
+        "town"=> "Kharam-Dzu",
+        "room_title"=> "[Adventurers' Rest, Deck]",
+        "npc"=> "disheveled dwarven attendant",
+        "prime"=> 12537,
+        "plat"=> 12537,
+      },
+      {
+        "town"=> "Mist Harbor",
+        "room_title"=> "[Western Harbor, Docks]",
+        "npc"=> "pudgy forest gnome attendant",
+        "prime"=> 17589,
+        "bench" => "elegant mahogany table",
+        "plat"=> 17589,
+      },
+      {
+        "town"=> "River's Rest",
+        "room_title"=> "[Lalena's Box Emporium]",
+        "npc"=> "slender half-elven woman",
+        "bench"=> "rough walnut table",
+        "prime"=> 28717,
+        "plat"=> 27023,
+      },
+      {
+        "town"=> "Solhaven",
+        "room_title"=> "[Fat Jahck's]",
+        "npc"=> "proprietor Jahck",
+        "bench" => "long oak counter",
+        "prime"=> 28719,
+        "plat"=> 27024,
+      },
+      {
+        "town"=> "Ta'Illistim",
+        "room_title"=> "[Shadowed Alcove]",
+        "npc"=> "small greasy gnome",
+        "bench" => "polished maoral table",
+        "prime"=> 18687,
+        "plat"=> 27025,
+      },
+      {
+        "town"=> "Ta'Vaalor",
+        "room_title"=> "[Ta'Vaalor, King's Court]",
+        "npc"=> "well-dressed elven merchant",
+        "prime"=> 3544,
+        "plat"=> 3544,
+      },
+      {
+        "town"=> "Wehnimer's Landing",
+        "room_title"=> "[Land Tower East, Office]",
+        "npc"=> "scruffy human worker",
+        "bench" => "sturdy wooden table",
+        "prime"=> 3807,
+        "plat"=> 3807,
+      },
+      {
+        "town"=> "Zul Logoth",
+        "room_title"=> "[Zul Logoth, Emerald Tunnel]",
+        "npc"=> "shady looking dwarf",
+        "prime"=> nil,
+        "plat"=> 5751,
+      }
+    ]
+
+    @rooms_by_id = @rooms.each_with_object({}) { |room, acc|
+      acc[room["prime"]] = room if room["prime"]
+    }
+
+    def self.by_id()
+      @rooms_by_id
+    end
+
+    def self.closest_to(anchor: Room.current.id)
+      fail "unknown id #{anchor}" unless anchor.is_a?(Integer)
+      Room[anchor].find_nearest(@rooms_by_id.keys)
+    end
+
+    def self.go2_closest(*args)
+      closest_worker = closest_to(*args)
+      Errand.go2(closest_worker)
+      Worker.npc
+      Worker.bench
+    end
+  end
+end
+
+module Spa
+  module Workbench
+    @rooms = %w(17978 16574 17960 17881)
+
+    def self.nearest_workbench()
+      Room.current.find_nearest(@rooms)
+    end
+
+    def self.menu()
+      put "read sign"
+      menu = Capture.apply(start: /^\|\s+1\./, done: %r[\|\s+\|$])
+      fail "could not capture menu from game feed" if menu.is_a?(Array) && menu.first.eql?(:timeout)
+      menu.split("\n").slice(0..-2).map {|option|
+        (number, desc, price) = option.gsub(/^\|\s+/, "")
+          .gsub(/\s+\|$/, "")
+          .gsub(".)", "  ")
+          .split(%r[\s{3,}])
+        OpenStruct.new Hash[%w(number desc price).zip([number, desc, price.to_i])]
+      }
+    end
+
+    def self.order(option)
+      fail "Workbench.order() option cannot be nil" if option.nil?
+      wealth = Util.wealth
+      if wealth < option.price
+        move "out"
+        Errand.run("bank") { fput("withdraw #{option.price - wealth} silver") }
+        move "go toolbench"
+      end
+      wealth >= option.price or Util.wealth >= option.price or fail "could not withdraw silvers"
+      fput "order %s" % option.number
+      fput "buy"
+      ttl = Time.now + 3
+      wait_until { 
+        GameObj.left_hand.noun.eql?(option.desc.split(" ").last) or 
+        GameObj.right_hand.noun.eql?(option.desc.split(" ").last) or
+        Time.now > ttl 
+      }
+      bought = [GameObj.left_hand, GameObj.right_hand].find {|hand| hand.noun.eql?(option.desc.split(" ").last) }
+      fail "could not buy Option(%s -> %s)" % [option.number, option.desc] unless bought
+      return bought
+    end
+
+    def self.go2()
+      Errand.run(nearest_workbench) {
+        checksum = XMLData.room_count.to_s + XMLData.room_title
+        move "go toolbench"
+        wait_while { (XMLData.room_count.to_s + XMLData.room_title).eql?(checksum) }
+        yield
+        waitrt?
+        move "out"
+      }
+    end
+
+    def self.repair(pick:)
+      Workbench.go2 {
+        _noun, metal = pick.name.split(" ").reverse
+        Workbench.order menu.find {|option| option.desc.include?(metal) && option.desc.include?(%[wire])}
+        fput "lmas repair #%s" % GameObj.right_hand.id
+      }
+    end
+
+    class Create
+      class Outcomes
+        Average = %r[fairly average]
+        Below   = %r[far below average] 
+        Above   = %r[exceptional]
+        All     = Regexp.union(Average, Below, Above)
+      end
+    end
+
+    Vars["spa-crafting"] ||= {}
+
+    def self.get_crafting_modifier(metal)
+      Vars["spa-crafting"][metal.to_s] || 0
+    end
+
+    def self.get_crafting_quality(metal)
+      case self.get_crafting_modifier(metal)
+      when 0 then :average
+      when 0.5 then :exceptional
+      when -0.5 then :below_average
+      else :unknown
+      end
+    end
+
+    def self.save_crafting_result(metal, outcome)
+      current_state = Vars["spa-crafting"]
+      case outcome
+      when Create::Outcomes::Below
+        current_state[metal] = -0.05
+      when Create::Outcomes::Above
+        current_state[metal] = 0.05
+      when Create::Outcomes::Average
+        current_state[metal] = 0
+      else
+        fail "could not create #{metal} lockpick"
+      end
+
+      Vars["spa-crafting"] = current_state
+    end
+
+    def self.replace(pick:)
+      if pick.respond_to?(:noun) && pick.noun
+        fput "drop #%s" % pick.id
+        ttl = Time.now + 3
+        wait_while { GameObj.right_hand.id.eql?(pick.id) and Time.now < ttl }
+        fail "could not throw away %s" % pick.name if GameObj.right_hand.id.eql?(pick.id)
+      end
+
+      Workbench.go2 {
+        metal = nil
+        if pick.is_a?(String)
+          metal = pick
+        else
+          _noun, metal = pick.name.split(" ").reverse
+        end
+
+        fail "could not parse metal" unless metal.is_a?(String)
+        #Interactive.capture("making a %s lockpick" % metal, /^ok$/)
+        Workbench.order menu.find {|option| option.desc.include?("bar of %s" % metal)}
+        10.times {
+          outcome = dothistimeout("lmas create", 5, Create::Outcomes::All)
+          self.save_crafting_result(metal, outcome)
+          waitrt?
+          break if GameObj.left_hand.noun.eql?("lockpick")
+        }
+        fail "could not make a %s lockpick" % metal unless GameObj.left_hand.noun.eql?("lockpick")
+      }
+    end
+  end
+
+  if Script.current.vars.include?("--test-workbench-menu")
+    Log.out(Workbench.menu)
+  end
+end
+
+module Spa
+  module Worker
+    def self.metadata(key = nil)
+      return Rooms.by_id[Room.current.id.to_i] if key.nil?
+      val = Rooms.by_id[Room.current.id.to_i][key.to_s]
+      fail "could not find #{key} for Room:#{Room.current.id} in #{Rooms.by_id.keys}" unless val
+      return val
+    end
+
+    def self.find_or_fail(key, candidates)
+      expected_name = metadata(key)
+      candidates.find {|item| item.name.eql?(expected_name)} or
+        fail "could not find match for #{key} in #{candidates.map(&:name)}"
+    end
+
+    def self.bench()
+      find_or_fail(:bench, GameObj.room_desc.to_a + GameObj.loot.to_a)
+    end
+
+    Forbidden = %r[You probably shouldn't do that.]
+    Owned     = %r[You see nothing unusual.]
+    Posession = Regexp.union(Owned, Forbidden)
+
+    def self.box(noun)
+      unless bench.contents
+        fput "look on #%s" % bench.id
+        wait_until {bench.contents.is_a?(Array)}
+      end
+      task = bench.contents.find {|item| item.name.include?(Char.name)}
+      return task unless task.nil?
+      fail "could not find your box by your name and no noun provided" if noun.nil?
+      bench.contents.select {|item| 
+        item.noun.eql?(noun) && item.name.downcase.eql?(item.name)
+      }.find { |box| 
+        dothistimeout("look at #%s" % box.id, 3, Posession) =~ Owned
+      } or fail "could not find box(%s)" % noun
+    end
+
+    def self.npc()
+      find_or_fail(:npc, GameObj.npcs.to_a)
+    end
+  end
+end
+
+module Spa
+  module Task
+    TaskInfo            = %r{says, "Ah, here we are.  The client is offering a tip of (?<tip>[\d|,]+) silvers and mentioned it being from (?:a|an) (?<creature>.*) \(level (?<level>\d+)\)\.  The (?<noun>\w+) is}
+    TaskInfoUnknown     = %r{says, "Ah, here we are.  The client is offering a tip of (?<tip>[\d|,]+) silvers and they aren't sure where it came from.  The (?<noun>\w+) is}
+    TaskInProgress      = %r[You should finish the job you're working on first]
+
+    CooldownOneMinute   = %r{Why don't you ask me again about a minute from now.}
+    CooldownFewMinutes  = %r{Why don't you ask me again a few minutes from now.}
+    CooldownManyMinutes = %r{Why don't you ask me again about \d+ minutes from now.}
+    CooldownMind        = %r{You've done enough for a while.  Why don't you rest your mind a bit?}
+    CooldownEmptyPool   = %r{We don't have any jobs for you at the moment.  Why don't you try again later?}
+    CooldownInfo = Regexp.union(
+      CooldownOneMinute,
+      CooldownFewMinutes,
+      CooldownManyMinutes,
+    )
+
+    TaskGiveup = Regexp.union(
+      %r[You should finish the trunk first.  If you want to give up, ASK me to CHECK it again within 30 seconds],
+      %r[Too tough for ya, eh?  Alright, we'll let someone else have a crack at it.]
+    )
+
+    TaskRequestOutcome = Regexp.union(
+      TaskInfo, 
+      TaskInProgress,
+      TaskInfoUnknown,
+      CooldownInfo,
+      CooldownMind,
+      CooldownEmptyPool)
+
+    CheckOk = %r{says, "That's some quality work.  Here's your payment of ([\d,]+) silvers."}
+    TaskCheckOutcome = Regexp.union(
+      CheckOk
+    )
+
+    def self.parse_task_info(info)
+      return OpenStruct.new(
+        tip: info[:tip].gsub(",", "").to_i,
+        creature: info[:creature],
+        level: info[:level].to_i,
+        box_noun: info[:noun]
+      )
+    end
+
+    def self.match(outcome)
+      return [:cooldown, 2] if outcome =~ CooldownOneMinute
+      return [:cooldown, 5] if outcome =~ CooldownFewMinutes
+      return [:cooldown, :mind] if outcome =~ CooldownMind
+      return [:cooldown, :empty_pool] if outcome =~ CooldownEmptyPool
+      return [:cooldown, outcome.scan(/\d+/).first.to_i + 2] if outcome =~ CooldownManyMinutes
+      return [:task, OpenStruct.new] if outcome =~ TaskInProgress
+      return [:task, OpenStruct.new] if outcome =~ TaskInfoUnknown
+      if outcome =~ TaskInfo
+        data = outcome.match(TaskInfo)
+        return [:task, parse_task_info(data)] 
+      end
+      fail "could not match outcome(#{outcome})"
+    end
+
+    Vars["spa-minimum-tip"] ||= 100
+    
+    if Script.current.vars.include?("--test")
+      Log.out Task.match("You've done enough boxes for now.  Why don't you ask me again about a minute from now.")
+      Log.out Task.match("You've done enough boxes for now.  Why don't you ask me again a few minutes from now.")
+      Log.out Task.match("You've done enough boxes for now.  Why don't you ask me again about 10 minutes from now.")
+      Log.out Task.match(%[The worker says, "Ah, here we are.  The client is offering a tip of 50 silvers and mentioned it being from a wood sprite (level 38).  The coffer is set up on the table for you.  When you're finished, ASK me to CHECK your work."])
+      Log.out Task.match(%[Jahck says, "Ah, here we are.  The client is offering a tip of 502 silvers and mentioned it being from a night mare (level 41).  The strongbox is set up on the counter for you.  When you're finished, ASK me to CHECK your work."])
+      Log.out Task.match(%[Jahck says, "Ah, here we are.  The client is offering a tip of 400 silvers and mentioned it being from a Vvrael warlock (level 86).  The box is set up on the counter for you.  When you're finished, ASK me to CHECK your work."])
+      Log.out Task.match(%[Jahck says, "Ah, here we are.  The client is offering a tip of 1,000 silvers and mentioned it being from a Vvrael warlock (level 86).  The box is set up on the counter for you.  When you're finished, ASK me to CHECK your work."])
+      Log.out Vars["spa-minimum-tip"], label: %i(minimum tip)
+    end
+
+    def self.ask_for_job(worker: Worker.npc)
+      ask = "ask #%s for job minimum 100" % [worker.id, Vars["minimum-tip"]]
+      result = dothistimeout(ask, 10, TaskRequestOutcome)
+      fail "failure to match :ask_for_job outcome" if result.nil?
+      return Task.match(result)
+    end
+
+    def self.ask_for_check(worker: Worker.npc)
+      result = dothistimeout("ask #%s for check" % worker.id, 10, TaskCheckOutcome)
+      fail "failure to match :ask_for_check outcome" if result.nil?
+      return :ok if result =~ CheckOk
+      return :err
+    end
+
+    def self.perform(info)
+      owned_task = Worker.box(info.box_noun)
+      fail "could not find your task on the bench" unless owned_task
+      return Locksmith.extract(owned_task) if owned_task.noun.eql?("plinite")
+      box_state = BoxState.new(owned_task)
+      Task.complete(box_state)
+      fail "fatal: wounded!" if Char.total_wound_severity > 0
+      return box_state
+    end
+
+    def self.give_up(box_state, worker: Worker.npc)
+      2.times { fput("ask #%s for check" % worker.id) }
+    end
+
+    def self.complete(box_state)
+      until box_state.done? or box_state.give_up? or box_state.wedged? or Char.total_wound_severity > 0
+        Log.out(box_state, label: %i(box state))
+        Locksmith.advance(box_state)
+      end
+    end
+  end
+end
+
+module Spa
+  module Capture
+    def self.compare(line, other)
+      return line =~ other if other.is_a?(Regexp)
+      return line.start_with?(other) if other.is_a?(String)
+      fail "unknown comparitor type %s" % other.class.name
+    end
+
+    def self.apply(start:, done:, xml: false, ttl: 8)
+      captured = []
+      timer = Time.now + ttl
+      Script.current.want_downstream_xml = true if xml
+      until compare(captured.last, done)
+        line = get?
+        return [:timeout, captured] if Time.now > timer
+        if line.nil? then sleep 0.1; next end
+        if line =~ /...wait (\d+) seconds./
+          sleep $1.to_i
+          return apply(start: start, done: done, xml: xml, ttl: ttl) 
+        end
+        if compare(line, done) && captured.size > 0
+          Script.current.want_downstream_xml = false if xml
+          return captured.concat([line]).join("\n") 
+        end
+        captured << line if captured.size > 0
+        captured << line if captured.empty? && compare(line, start)
+      end
+    end
+  end
+end
+
+module Spa
+  module Traps
+    ROUNDTIME   = %r{Roundtime: (?<rt>\d+) sec.}
+    DIFFICULTY  = %r{It looks like (a|an) (?<complexity>.*?) trap \((about \-|\-)(?<difficulty>\d+)\).}
+    FUMBLE      = %r{Something just went horribly awry!}
+    DISARM_FAIL = Regexp.union(
+      %r{You are not able to disarm the trap},
+      %r{The darn thing is built too tightly.  You can't seem to get the trap disarmed without setting it off by accident!},
+    )
+    DISARM_SUCCESS = Regexp.union(
+      %r{You carefully nudge},
+      %r{You manage},
+      %r{the metal plate covering the lock begins to melt away},
+      %r{cover the tip with a bit of putty.},
+      %r{you knock the gem free of its metal housing and poke it out through the back of the lock},
+      %r{With a little force applied to the springs, you manage to pop them inside},
+      %r{Using the pair of metal grips, you manage to pull out the two pins that hold the upper and lower jaw pieces together.},
+      %r{That should block whatever it's meant to deploy.},
+      %r{You carefully push a small ball of cotton into the lock mechanism, surrounding and protecting the small vial from anything that may shatter it.},
+      %r{With great care you take a pair of metal grips and bend the sensitive metal rods out of alignment},
+      %r{gently nudge the tiny gem until it begins to work loose and its inner glow begins to fade},
+      %r{Knowing how delicate magical glyphs can be, you scrape some extra lines into the markings hoping to alter their meaning and defeat the spell they may hold.},
+      %r{As the air hits the gel, it begins to harden and turn to dust, blowing away},
+      %r{You gently slide your dagger into the space under the lid and slice through the cord.  That oughta do it.},
+      %r{hopefully sufficient to prevent sparks when the metal arm strikes it.},
+      %r{you manage to block the tiny hole in the lock plate.},
+      %r{and bend the weak metal out of striking},
+      %r{With a little ingenuity you manage to grind down parts of the lock mechanism with your metal file},
+    )
+    DISARM_OUTCOME = Regexp.union(
+      DISARM_FAIL, 
+      DISARM_SUCCESS,
+      FUMBLE)
+
+    
+
+    CRUFT = Regexp.union(
+      %r{You carefully begin to examine}, 
+      %r{Having discovered a trap on the},
+    )
+
+    NONE    = %r{You discover no traps.}
+    BOOMER  = %r{you feel around the lock and notice the inside chamber is coated with a strange white substance.}
+    BLADDER = %r{Feeling around the inside of the lock, you notice that the casing is coated with a rough, grainy substance.  You lean forward and peer between the walls of the casing.  Examining the lock closely, you notice a small bladder filled with a strange liquid wedged between the tumblers.  With your face this close to the lock, you pick up the faintest scent of sulphur.}
+    SPORE   = %r{The tube is capped with a thin membrane}
+    SPRINGS = %r{Seems rather odd to have a (.*?) designed to spring open when it is unlocked.}
+    SPHERE  = %r{you locate a (?<color>.*?) sphere held in a metal bracket towards the back of the lock mechanism}
+    JAWS    = %r{You notice a discolored oval ring around the outside of the (.*?) which makes you suspicious.}
+    PLATE   = %r{There appears to be a plate over the lock, sealing it and preventing any access to the tumblers.}
+    SCARAB  = %r{you spy (a|an) (?<kind>.*?) scarab wedged into the lock mechanism.}
+    VIAL    = %r{Peering closely into the lock, you spy a tiny vial placed just past the tumblers of the lock mechanism.}
+    RODS    = %r{Looking closely into the keyhole, you notice a pair of small metal rods a hair's width from touching each other.}
+    GLYPH   = %r{You notice some spiderweb-like scratches on the lock plate which seem, after some bit of scrutiny, too organized to be just wear and tear -- it might be some type of glyph spell.}
+    SCALES  = %r{Closer examination reveals the "scales" to be razor sharp at the edges and possessing of a downward-facing needlelike tip.}
+    SCALES_PICKED = %r{You figure that if you had a dagger, you could probably cut the cord.}
+    SLIVER = %r{you can see what appears to be a tiny hole next to the lock plate which doesn't seem to belong there.}
+    PLATED = %r{There appears to be a plate over the lock, sealing it and preventing any access to the tumblers.}
+    IMMO   = %r{Looking closely into the keyhole of the lock, you spy a small vial of (fire-red |)liquid and a tiny hammer device}
+    CRYSTAL = %r{you spy a small, dark crystal which seems imbedded in the locking mechanism}
+    NEEDS_WEDGE = Regexp.union(
+      %r{You peer inside the lock and see that the tumblers have been fused into a lump of useless metal},
+      %r{You see a pair of metal jaws clamped tightly before the lockplate},
+    )
+    NORMAL  = Regexp.union(
+      BOOMER, 
+      SPORE, 
+      CRYSTAL,
+      BLADDER, 
+      JAWS, 
+      SPRINGS,
+      VIAL,
+      RODS,
+      GLYPH,
+      SLIVER,
+      IMMO,
+    )
+
+    SURPRISE = %r{You blink in surprise}
+
+    NEEDS_TOOLS = Regexp.union(
+      %r{You figure that if you had some sort of putty or paste, you could block the end of the tube.},
+    )
+
+    DISARMED = Regexp.union(
+      %r{cover the tip with a bit of putty},
+      %r{Feeling around the inside of the lock, you notice that the casing is coated with a rough, grainy substance.  A small section of the casing has been scraped clean of the strange substance.  You lean forward and peer between the walls of the casing.  Examining the lock closely, you notice a deflated bladder wedged between the tumblers.  There is a small hole in the bladder, most likely from whatever ruptured it.  The lock emanates a strong scent of sulphur.},
+      %r{The lock appears to be free of all obstructions.},
+      %r{but the pins that hold the jaws together have been pushed out.},
+      %r{It appears as though the tube has been plugged with something.},
+      %r{A small ball of cotton has been pushed up against the vial, protecting it},
+      %r{^Looking closely into the keyhole, you notice a pair of small metal rods that have been bent in opposite directions of each other.},
+      %r{A thorough search of the area inside the tumblers reveals what appears to be a metal bracket of some sort, although it seems to be empty now.},
+      %r{This may prevent any magical nature they have from manifesting itself.},
+      %r{Peering in through the crack between the lid and the casing, you see what appears to be a thin cord dangling from the case.  It looks to have been sliced through.},
+      %r{A thin layer of mud or putty has been dabbed on the connecting point of the striking arm and the white substance to prevent it from igniting the coffer when it is unlocked.},
+      %r{You see a tiny hole next to the lock plate which has been completely plugged.},
+      %r{you spy a small vial of fire-red liquid and a tiny hammer device which has been bent from striking range of},
+      %r{parts of the mechanism have been ground away to avoid unwanted contact with the crystal},
+      %r{A thin layer of mud or putty has been dabbed},
+      %r{bent back slightly},
+      %r{You discover no traps},
+      %r{You see a metal plate covering the lock plate, but it appears to have been melted through, granting sufficient access to the lock to attempt picking it.},
+      %r{but further examination gives the impression that some vital part of whatever trap},
+      %r{it has torn mostly away, and greyish-green powder covers the area around it},
+      %r{However, nothing about it seems to indicate cause for alarm},
+      %r{you spy a small metal housing set just inside the lock mechanism, but it appears empty},
+      %r{you spy a small metal housing, which appears to be empty},
+      %r{Looking closely into the keyhole of the lock, you spy a small vial of liquid and a tiny hammer device which has been bent from striking range of the vial.}
+    )
+
+    def self.parse_difficulty(lines)
+      info = DIFFICULTY.match(lines) or fail "failed to parse trap difficulty"
+  
+      diff = OpenStruct.new(
+        complexity: info[:complexity], 
+        difficulty: info[:difficulty].to_i
+      )
+
+      if lines =~ SCARAB
+        diff[:scarab] = $1.dup.gsub(/^(miniature|tiny)/, "")
+          .gsub("blood red", "blood red teardrop-etched")
+          .strip + " scarab"
+      end
+        
+      return diff
+    end
+
+    def self.match_type(lines)
+      #Log.out(lines, label: %i(Trap match_type))
+      return [:needs_tools] if lines.match(NEEDS_TOOLS)
+      return [:none]        if lines.match(NONE) or lines.match(DISARMED)
+      return [:normal, parse_difficulty(lines)] if lines.match(NORMAL)
+      return [:scales, parse_difficulty(lines)] if lines.match(SCALES) or lines.match(SCALES_PICKED)
+      return [:scarab, parse_difficulty(lines)] if lines.match(SCARAB)
+      return [:sphere, parse_difficulty(lines)] if lines.match(SPHERE)
+      return [:plated, parse_difficulty(lines)] if lines.match(PLATED)
+      return [:wedge] if lines.match(NEEDS_WEDGE)
+      fail "unhandled Traps.match_type outcome"
+    end
+
+    if Script.current.vars.include?("--test-trap-parser")
+      scarab_info = Traps.match_type <<~TRAP
+        Peering closely into the lock, you spy a miniature sky-blue glaes scarab wedged into the lock mechanism.  The scarab's surface is etched with tiny runes that seem to writhe as the light strikes them.
+        It looks like an amazingly difficult trap (about -419).
+        You still have a good enough picture of the trap in your mind, that you could try to disarm it.
+        Roundtime: 3 sec.
+      TRAP
+
+      Log.out([scarab_info.first, scarab_info.last.to_h])
+
+      Log.out Traps.match_type <<~TRAP
+        You carefully begin to examine an engraved steel chest for traps...
+        You discover no traps.
+        Roundtime: 3 sec.
+      TRAP
+
+      Log.out Traps.match_type <<~TRAP
+        You carefully begin to examine a mithril Ondreian's box for traps...
+        You see a pair of metal jaws clamped tightly before the lockplate on the box.
+      TRAP
+
+      Log.out Traps.match_type <<~TRAP
+        You carefully begin to examine a weathered haon trunk for traps...
+        Looking closely into the keyhole, you notice a pair of small metal rods a hair's width from touching each other.  Peering around the inside of the keyhole, you can see that the lock would push the two rods together should the lock be tampered with.
+        It looks like a somewhat difficult trap (-116).
+        You still have a good enough picture of the trap in your mind, that you could try to disarm it.
+        Roundtime: 3 sec.
+      TRAP
+
+      vial_disarm = <<~TRAP
+        Having discovered a trap on the strongbox you begin to carefully attempt to disarm it...
+        You feel like you've made an excellent attempt (d100=94).
+        You take a vial out of your locksmith's toolkit and carefully pour the contents onto the Ondreian's strongbox where you think the keyhole ought to be.  Amidst a cloud of acrid smoke, the metal plate covering the lock begins to melt away.
+        (You have 2 vials of acid remaining.)
+        Roundtime: 3 sec.
+      TRAP
+
+      Log.out(vial_disarm.match(DISARM_SUCCESS), label: %i(test vial))
+
+    end
+  end
+end
+
+module Spa
+  module Locks
+    ROUNDTIME  = Traps::ROUNDTIME
+    BROKEN     = %r{fumble about for a bit before you realize you are using a broken lockpick.}
+    ROLL       = %r{\(d100=(?<roll>\d+)\).}
+    OPEN       = Regexp.union(
+      %r{It opens!},
+      %r{CLICK!},
+      %r{It does not appear to be locked.},
+      %r{Um, but it's open.}
+    )
+    
+    BROKEN_PICK = %r{\* SNAP \*  Crud!}
+    BENT_PICK = %r{You carefully try to work it free but end up bending the tip!}
+
+    BLIND_FAIL = Regexp.union(
+      %r{You are not able to pick},
+      %r{You carefully try to work it free, but it may have been weakened by the stress},
+      %r{You are not able to pick the lock, but you get a feeling that it is within your abilities},
+      %r{You make a fumbling attempt},
+    )
+
+    FAIL_WITH_DIFFICULTY = %r{^You are not able to pick the (?:\w+), but you get a sense that it has (.*?) lock.  About a -(?<difficulty>\d+) difficulty lock}
+
+    FAIL = Regexp.union(BLIND_FAIL, FAIL_WITH_DIFFICULTY)
+
+    def self.parse_difficulty(lines)
+      info = lines.match(/(?<difficulty>\d+) difficulty lock/)
+      info && info[:difficulty].to_i
+    end
+
+    def self.parse_roll(lines)
+      info = lines.match(ROLL)
+      info && info[:roll].to_i
+    end
+
+    def self.match(lines)
+      return [:broken_pick] if lines =~ BROKEN_PICK or lines =~ BROKEN
+      return [:bent_pick]   if lines =~ BENT_PICK
+      return [:open]        if lines =~ OPEN
+      return [:retry, parse_difficulty(lines), parse_roll(lines)] if lines =~ FAIL
+      fail "Locks.match: no match for:\n#{lines}"
+    end
+
+    if Script.current.vars.include?("--test-locks")
+      Log.out Locks.match("It does not appear to be locked.")
+      Log.out Locks.match <<~LOCKPICK
+        You settle into the difficult task of picking the lock.
+        You make a miserable attempt (d100=18).
+        Your lockpick gets stuck in the lock!  You carefully try to work it free but end up bending the tip!
+        Roundtime: 5 sec.
+      LOCKPICK
+
+      Log.out Locks.match <<~LOCKPICK
+        You settle into the difficult task of picking the lock.
+        You make a talented attempt (d100=84).
+        You are not able to pick the trunk, but you get a sense that it has an extremely complex lock.  About a -1050 difficulty lock (in thief-lingo).
+        Roundtime: 5 sec.
+      LOCKPICK
+    end
+  end
+end
+
+module Spa
+  module Plinite
+    Ok = %r{You carefully work your lockpick into the cracks of the plinite and manage to hook onto the glowing core}
+    Explosion = %r{You struggle to work your lockpick into the cracks of the plinite.  As you do you so, you push just a little too hard and rupture the core}
+    Failure = %r{You carefully work your lockpick into the cracks of the plinite, but cannot manage to safely hook onto the glowing core}
+    Complete = %r{You promptly discover that the core has already been extracted}
+    Outcomes = Regexp.union(
+      Ok, 
+      Explosion,
+      Complete, 
+      Failure)
+
+    def self.extract(plinite)
+      Locksmith.cast(403)
+      case dothistimeout("extract #%s" % plinite.id, 5, Plinite::Outcomes)
+      when Plinite::Ok, Plinite::Complete
+        return :ok
+      when Plinite::Failure
+        return extract(plinite)
+      when Plinite::Explosion
+        return :hurt
+      end
+    end
+
+    def self.parse_difficulty(outcome)
+      Log.out(outcome, label: %i(plinite parse difficulty))
+      return :complete if outcome =~ Plinite::Complete
+      # parse difficulty
+      return $1.to_i if outcome =~ %r[\(-(\d+)\)]
+      return :unknown
+    end
+
+    def self.detect(plinite, max_tries: 5, tries: 0)
+      fail "too many retries" if tries >= max_tries
+      Locksmith.cast(402)
+      put "detect #%s" % plinite.id
+      difficulty = parse_difficulty Capture.apply(
+        start: %[You settle into the task of attempting to estimate],
+         done: Regexp.union(%r[It looks like it would be], Plinite::Complete))
+      waitrt?
+      
+      return detect(plinite, tries: tries + 1) if difficulty.eql?(:unknown)
+      return difficulty
+    end
+
+    if Script.current.vars.include?("--test-plinite")
+      Log.out Plinite.parse_difficulty <<~PLINITE
+        You settle into the task of attempting to estimate the difficulty involved in extracting the core of the Greys's plinite without damaging the valuable casing.
+
+        It looks like it would be a very complex extraction (-891).
+      PLINITE
+      exit
+    end
+  end
+end
+
+module Spa
+  class BoxState
+    STATES = %i(unknown detect disarm caliper pick done give_up wedged)
+    TRAPS  = %i(scales sphere normal scarab plated)
+
+    attr_reader :state, :trap, :lock
+    def initialize(game_obj)
+      @game_obj = game_obj
+      @state    = :unknown
+      @trap     = nil
+      @lock     = nil
+      $spa_box_state = self
+    end
+
+    def id
+      @game_obj.id
+    end
+
+    def dangerous?
+      return false if plated?
+      return (@trap.is_a?(Array) && @trap.size == 2 && @trap.last.difficulty > Maximums.penalized_max_trap)
+    end
+
+    def give_up()
+      @state = :give_up
+    end
+
+    def add_trap(trap)
+      @trap = trap
+      kind, _difficulty = trap
+      case kind
+      when :scales, :none
+        @state = :caliper
+      else
+        @state = :disarm
+      end
+    end
+
+    def add_lock(lock)
+      return @state = :disarm if lock.eql?(-1) && scales?
+      return @state = :done   if lock.eql?(-1)
+      fail "attempted to add a measurement that was not an integer" unless lock.is_a?(Integer)
+      @lock = lock
+      @state = :pick
+    end
+
+    def set_state(state)
+      @state = state
+    end
+
+    def picked()
+      if scales?
+        @state = :disarm
+      else
+        @state = :done
+      end
+    end
+
+    def wedge?
+      @trap.is_a?(Array) && @trap.first.eql?(:wedge)
+    end
+
+
+    TRAPS.each do |trap|
+      send(:define_method, trap.to_s + "?") do
+        @trap.is_a?(Array) && @trap.first.eql?(trap)
+      end
+    end
+
+    STATES.each do |state|
+      send(:define_method, state.to_s + "?") do
+        @state.eql?(state)
+      end
+    end
+  end
+end
+
+module Spa
+  module Calipers
+    Measurement = %r[\(-(\d+) in thief-lingo difficulty ranking\)\.]
+    CalibrateMore = %r[^Roundtime:]
+    CalibrateMax  = %r[They practically glow with calibration!|Those calipers could not be more perfectly calibrated.]
+    CalibrateOutcome = Regexp.union(CalibrateMore, CalibrateMax)
+
+    CharSettings[:calipers] ||= 0
+    # calipers can be off by +/-10
+    # we want to mitigate the risk for 100% of all boxes (25% retain +5 mitigation)
+    # and completely for 75% of cases
+    def self.risk_mitigation()
+      return 5
+    end
+
+    def self.parse(measure)
+      return $1.to_i if measure =~ Measurement
+      fail "unable to match calipers:measure:parse(%s)" % measure
+    end
+
+    def self.increment_usage()
+      CharSettings[:calipers] += 1
+      CharSettings.save()
+    end
+
+    def self.usage()
+      CharSettings[:calipers]
+    end
+
+    def self.needs_calibration?
+      usage > 15
+    end
+
+    def self._calibrate(calipers)
+      outcome = dothistimeout("lmastery calibrate #%s" % calipers.id,
+          10, CalibrateOutcome)
+      waitrt?
+      case outcome
+      when CalibrateMore
+        return _calibrate(calipers)
+      when CalibrateMax
+        return :ok
+      else
+        fail "failed to handle calibrate outcome"
+      end
+    end
+
+    def self.calibrate()
+      Containers.use(noun: "calipers") { |calipers|
+        _calibrate(calipers)
+      }
+    end
+
+    if Script.current.vars.include?("--test")
+      Log.out Calipers.parse <<~LOCK
+        Using your professional calipers, you carefully begin to measure the lock...
+        Roundtime: 4 sec.
+        Measuring carefully, it looks to be a simple lock (-295 in thief-lingo difficulty ranking).
+      LOCK
+    end
+  end
+end
+
+module Spa
+  module Config
+    def self.locksmith()
+      Vars["locksmith"] or fail ";vars set locksmith=<container> is requred"
+      container = Containers.find(name: Vars["locksmith"])
+      container or fail "could not find #{Vars["locksmith"]} in your inventory"
+      if container.contents.nil?
+        fput "look in #%s" % container.id
+        wait_while("loading locksmith contents") {container.contents.nil?}
+      end
+      container
+    end
+
+    def self.lootsack()
+      Vars["lootsack"] or fail ";vars set lootsack=<container> is required"
+      lootsack = Spa::Containers.find(name: Vars["lootsack"])
+      lootsack or fail "could not find your lootsack"
+    end
+  end
+end
+
+module Spa
+  # cannibalized from LostRanger's maxlock2
+  # instead of returning a string, 
+  # suggest_lockpick will return a candidate list
+  module Maximums
+      require "yaml"
+      # https://gswiki.play.net/Lockpicks
+      @lockpicks = YAML.load File.read File.join(DATA_DIR, "lockpicks.yaml")
+      # default simulated roll (31% success rate)
+      DEFAULT_ROLL = 69
+      ABSOLUTE_MAX_RISK = 75
+
+      class << self
+          def _lock_skill; Skills.to_bonus(Skills.pickinglocks); end
+          def _trap_skill
+            return Skills.to_bonus(Opts.trap_skill.to_i) if defined?(Opts) && Opts.trap_skill
+            Skills.to_bonus(Skills.disarmingtraps);
+          end
+
+          def _lockpicks()
+            available_picks = Config.locksmith.contents
+              .select {|item| item.noun.eql?("lockpick") }
+            @lockpicks.select {|kind|
+              available_picks.any? {|lockpick|
+                lockpick.name.end_with?("%s lockpick" % kind)
+              }
+            }
+          end
+
+          def _dex_bonus
+            return Stats.enhanced_dex[1] if defined?(Stats.enhanced_dex) and Stats.enhanced_dex[0] > 0
+            return Stats.dex[1]
+          end
+
+          def _lore_bonus(spell, skill, selfcast=nil)
+            selfcast = Spell[spell].known? if selfcast.nil?
+            bonus = (Char.level/2).floor + (skill*0.1).floor + _dex_bonus + (Spells.minorelemental/4).floor
+            bonus = skill if bonus > skill
+            bonus = (bonus/2).floor unless selfcast
+            return bonus
+          end
+
+          def _locklore_bonus(selfcast=nil)
+            return _lore_bonus(403, _lock_skill, selfcast)
+          end
+
+          def _traplore_bonus(selfcast=nil)
+            return _lore_bonus(404, _trap_skill, selfcast)
+          end
+
+          def unlored()
+            _dex_bonus + _lock_skill
+          end
+
+          def lored()
+            unlored + _locklore_bonus
+          end
+
+          def lored_lockpick_estimates
+            _lockpicks.map {|kind, multiplier|
+                multiplier = (multiplier + Spa::Workbench.get_crafting_modifier(kind)).round(2)
+                OpenStruct.new(
+                  kind: kind,
+                  quality: Spa::Workbench.get_crafting_quality(kind),
+                  multiplier: multiplier,
+                  lored: true,
+                  range: ((lored * multiplier).floor - 101)..(lored * multiplier).floor - 1,
+                )
+              }
+          end
+
+          def unlored_lockpick_estimates
+            _lockpicks.map {|kind, multiplier|
+                multiplier = (multiplier + Spa::Workbench.get_crafting_modifier(kind)).round(2)
+                OpenStruct.new(
+                  kind: kind,
+                  quality: Spa::Workbench.get_crafting_quality(kind),
+                  multiplier: multiplier,
+                  lored: false,
+                  range: ((unlored * multiplier).floor - 101)..(unlored * multiplier).floor - 1,
+                )
+              }
+          end
+
+          def lockpick_ranges()
+            unlored_lockpick_estimates + lored_lockpick_estimates
+          end
+
+          def min_roll(difficulty, lockpick)
+            lockpick[:roll] = [2, difficulty - lockpick.range.first].max
+            lockpick
+          end
+
+          def sorted_suggestions(difficulty, simulated_roll)
+            lockpick_ranges
+              .reject { |lockpick| difficulty > (lockpick.range.first + simulated_roll) }
+              .map {|lockpick| min_roll(difficulty, lockpick) }
+              .sort_by {|lockpick| lockpick.range.first }
+          end
+
+          def suggest_lockpick(difficulty, simulated_roll=DEFAULT_ROLL)
+            simulated_suggestions = []
+            max_risk = [ABSOLUTE_MAX_RISK, simulated_roll + 20].min
+            initial_simulated_roll = simulated_roll
+            initial_suggestions = sorted_suggestions(difficulty, simulated_roll)
+            #Log.out("{simulated=%s, roll=%s, lockpick=%s}" % 
+            #  [simulated_roll, 
+            #   initial_suggestions.first.roll,
+            #   initial_suggestions.first.kind])
+            # if we already have a lored outcome return early
+            simulated_suggestions << initial_suggestions.first if initial_suggestions.first.lored
+            # upward expansion
+            simulated_roll = initial_simulated_roll + 1
+            until simulated_roll > max_risk
+              riskier_suggestions = sorted_suggestions(difficulty, simulated_roll)
+              #Log.out("{simulated=%s, roll=%s, lockpick=%s}" % 
+              #  [simulated_roll, 
+              #  riskier_suggestions.first.roll,
+              #  riskier_suggestions.first.kind])
+              simulated_suggestions << riskier_suggestions.first if riskier_suggestions.first.lored
+              simulated_roll += 1
+            end
+            # downward expansion
+            simulated_roll = initial_simulated_roll - 1
+            until simulated_roll < 3
+              safer_suggestions = sorted_suggestions(difficulty, simulated_roll)
+              simulated_suggestions << safer_suggestions.first if safer_suggestions.first.lored
+              simulated_roll = simulated_roll - 1
+            end
+            
+            return initial_suggestions if simulated_suggestions.empty?
+            return simulated_suggestions.sort_by {|suggestion| -suggestion.roll}
+          end
+
+          def max_trap()
+            unlored = _dex_bonus + _trap_skill - 1
+            [unlored, unlored + _traplore_bonus]
+          end
+
+          def penalized_max_trap()
+            (max_trap.last * 0.9) + 10
+          end
+
+          if Script.current.vars.include?("--skills")
+            respond <<~SKILL
+  Traps:
+            unlored=#{Maximums.max_trap.first}
+              lored=#{Maximums.max_trap.last}
+
+            SKILL
+            respond <<~SKILL
+  Locks:
+              skill=#{Maximums._lock_skill}
+                dex=#{Maximums._dex_bonus}
+        max unlored=#{Maximums.unlored}
+          403 bonus=#{Maximums._locklore_bonus}
+          max lored=#{Maximums.lored}
+
+          lock estimates are min..max (d100)
+          ---------------------------
+            SKILL
+            Maximums.lockpick_ranges
+              .each {|lockpick| 
+                respond("%s > %s * %s %s | range=%s%s" % 
+                  [ lockpick.kind.rjust(10), 
+                    Maximums.lored, 
+                    lockpick.multiplier.to_s.rjust(4), 
+                    ("lored=%s" % [lockpick.lored]).rjust(14),
+                    lockpick.range.first.to_s.ljust(6, "."), 
+                    lockpick.range.last.to_s
+                  ])
+              }
+            exit
+          end
+
+          if Script.current.vars.include?("--test-maximums")
+            Log.out Maximums._lockpicks, label: %(test lockpicks)
+            Log.out Maximums.penalized_max_trap, label: %(test maximum trap penalized)
+            Log.out Maximums._lock_skill, label: %i(lock skill)
+            Log.out Maximums._trap_skill, label: %i(trap skill)
+            Log.out Maximums._dex_bonus, label: %i(dex bonus)
+            exit
+          end
+
+          unless Script.current.vars.grep(/^--suggest=(\d+)/).empty?
+            lock = Script.current.vars.grep(/^--suggest=(\d+)$/).first.split("=").last.to_i
+            roll = Script.current.vars.grep(/^--roll=(\d+)/).first.split("=").last.to_i
+            roll = DEFAULT_ROLL if roll == 0
+            Log.out("{lock=%s, roll=%s}" % [lock, roll], label: :simulate)
+            suggestions = Maximums.suggest_lockpick(lock, roll)
+            _respond("<b>:none</b>") if suggestions.empty?
+            suggestions.each_with_index {|suggestion, i|
+              respond "%s> %s (lore: %s) | roll=%s" % [
+                (i + 1).to_s.rjust(2), 
+                suggestion.kind.rjust(10),
+                suggestion.lored.to_s.rjust(5), 
+                suggestion.roll
+              ]
+            }
+            exit(:suggested)
+          end
+      end
+  end
+end
+
+module Spa
+  module Lockpick
+    def self.suggest(*args)
+      Maximums.suggest_lockpick(*args).first
+    end
+
+    def self.use(kind)
+      Containers.use(
+        container: Config.locksmith.name, 
+        name: Regexp.compile("%s lockpick" % kind)) { |lockpick| yield(lockpick) }
+    end
+
+    def self.exist?(kind)
+      Config.locksmith.contents.any? {|tool|
+        tool.name.end_with?(%[%s lockpick] % kind)
+      }
+    end
+
+    def self.appraise(lockpick)
+      waitrt?
+      put "lm appraise #%s" % lockpick.id
+      app = Capture.apply(start: "You examine the", done: "Roundtime:")
+      return 0 if app =~ /has never been repaired/
+      return $1.to_i if app =~ /has been repaired about (\d+) times/
+    end
+
+    if Script.current.vars.include?("--test-lockpick")
+      Log.out Lockpick.suggest(11100), label: %i(test suggest impossible)
+      Log.out Lockpick.suggest(1110), label: %i(test suggest hard)
+      Log.out Lockpick.suggest(910), label: %i(test suggest gap)
+      Log.out Lockpick.suggest(10), label: %i(test suggest easy)
+      exit
+    end
+
+    if Script.current.vars.include?("--test-lockpick-appraise")
+      Log.out Lockpick.appraise GameObj.right_hand
+      exit
+    end
+  end
+end
+
+module Spa
+  module Toolkit
+    # todo: add EN rooms
+    # 4024/15
+    @rooms_and_order = Hash[%w(
+      5725/11 5612/11 
+      4663/11 4024/15
+      10434/11
+    )
+      .map {|room| room.split("/")}]
+    @rooms = @rooms_and_order.keys
+
+    @query = { 
+      container: Config.locksmith.name,
+      name: %r[kit$]
+    }
+
+    def self.cached_state()
+      @state ||= state()
+    end
+
+    def self.shop_menu()
+      put "order"
+      Capture.apply(
+        start: %r[\s+Catalog],
+        done:  "You can APPRAISE",
+      ).split("\n").slice(2..-2).join("\s").strip.split(/\s{2,}/)
+        .map {|entry| entry.split(". ") }
+    end
+
+    def self.use()
+      Containers.use(**@query).use {|kit| yield(kit)}
+    end
+
+    def self.add(obj)
+      tools = Containers.find(name: Vars["locksmith"])
+      fail "could not find your toolkit" unless tools
+      Spa.try_or_fail(command: "_drag #%s #%s" % [obj.id, tools.id]) {
+        tools.contents.map(&:id).include?(obj.id)
+      }
+    end
+
+    def self.find_toolkit()
+      tools = Containers.find(name: Vars["locksmith"])
+      # ensure contents of the locksmith sack are loaded
+      unless GameObj.containers[tools.id].is_a?(Array)
+        fput "look in #%s" % tools.id
+        wait_until {GameObj.containers[tools.id].is_a?(Array)}
+      end
+      # find the locksmith toolkit inside
+      return (tools.contents.find {|item| item.name =~ /kit$/} or 
+        fail "could not find your toolkit")
+    end
+
+    def self.state(contents = nil)
+      contents = if contents.nil? then
+        kit = find_toolkit()
+        dothistimeout("look in #%s" % kit.id, 10, /^Peering into the/)
+      else
+        contents
+      end
+      # bail if this messaging ever changes
+      fail "could not fetch toolkit contents" if contents.nil?
+
+      vials  = match_vials(contents)
+      putty  = match_putty(contents)
+      cotton = match_cotton(contents)
+      @state = OpenStruct.new(vials: vials, putty: putty, cotton: cotton)
+      return @state
+    end
+
+    # pure refill that will always try to bundle 
+    # for testing purposes
+    def self._refill_pure()
+      Interactive.system_notification("refilling toolkit")
+      kit = find_toolkit()
+      Errand.run("bank") {fput "withdraw 300"} if Util.wealth < 300
+      Errand.run(Room.current.find_nearest(@rooms)) {
+        Containers.use(id: kit.id) {
+          multifput "order %s" % @rooms_and_order[Room.current.id.to_s], "buy"
+          wait_until {checkleft}
+          fput("open #%s" % GameObj.left_hand.id)
+          fput("bundle")
+          fput("drop #%s" % GameObj.left_hand.id)
+        }
+      }
+    end
+
+    def self.refill()
+      kit = find_toolkit()
+      state = Toolkit.state()
+      Log.out(state.to_h, 
+        label: %i(parsed toolkit state))
+    
+      refill_vials(state.vials, kit) if state.vials < 8
+      return :ok if state.putty > 20 and state.cotton > 20
+      _refill_pure()
+    end
+
+    def self.match_cotton(contents)
+      return 1       if contents =~ /a single little ball/
+      return $1.to_i if contents =~ /([\d]+) little balls/
+      return 0
+    end
+
+    def self.match_putty(contents)
+      return 1       if contents =~ /a single pinch left/
+      return $1.to_i if contents =~ /([\d]+) pinches left/
+      return 0
+    end
+
+    def self.match_vials(contents)
+      return 1       if contents =~ /a single vial of liquid/
+      return $1.to_i if contents =~ /([\d]+) vials of liquid/
+      return 0
+    end
+
+    def self.refill_vials(vials, kit)
+      available_vials = Containers.find(name: Vars["lootsack"])
+        .contents
+        .select {|item| item.noun.eql?("vial")}
+      
+      #fail "no vials available" if available_vials.size == 0 && vials.eql?(0)
+      return if available_vials.size.eql?(0)
+      
+      Containers.use(id: kit.id) {
+        available_vials.take([10 - vials, 10].min).each {|vial|
+          Spa.try_or_fail(command: "_drag #%s left" % vial.id) {
+            GameObj.left_hand.id.eql?(vial.id)
+          }
+          fput "bundle"
+        }
+      }
+    
+    end
+
+    def self.wedge()
+      Containers.access(
+        container: Vars["locksmith"],
+        noun: %[wedge]).last
+    end
+
+    if Script.current.vars.include?("--test-toolkit-refill-pure")
+      Log.out Toolkit._refill_pure
+    end
+
+    if Script.current.vars.include?("--test-toolkit-state")
+      Log.out Toolkit.state <<~TOOLKIT
+        Peering into the locksmith's toolkit, you see a lump of squishy white putty with about 47 pinches left, 75 little balls of cotton, a set of narrow metal grips, a thin metal file, a thick steel needle and 10 vials of liquid.
+      TOOLKIT
+
+      Log.out Toolkit.state <<~TOOLKIT
+        Peering into the leather kit, you see a lump of squishy white putty with about 13 pinches left, 66 little balls of cotton, a set of narrow metal grips, a thin metal file, a thick steel needle and 10 vials of liquid.
+      TOOLKIT
+    end
+
+    if Script.current.vars.include?("--test-toolkit-refill") or Script.current.vars.include?("--refill")
+      Toolkit.refill()
+    end
+  end
+end
+
+module Spa
+  module Wedge
+    Fracture = %r{Your wedge fractures into several smaller pieces!}
+    Open = %r{suddenly splits away from the casing amidst}
+
+    def self.make()
+      Workbench.go2 {
+        Workbench.order Workbench.menu.find {|option| option.desc.include?("uncarved")}
+        10.times {
+          put "carve #%s" % GameObj.right_hand.id
+          carved = Capture.apply(start: "Grabbing a small knife", done: "Roundtime:") =~ /RUB/
+          waitrt?
+          break if carved
+        }
+        GameObj.right_hand.noun.eql?("wedge") or fail "wedge did not work"
+        fput "rub my wedge"
+        wait_until {GameObj.right_hand.noun.eql?("wedge")}
+        Toolkit.add(GameObj.right_hand)
+        Toolkit.wedge or fail "could not find your newly created wedge"
+      }
+    end
+
+    def self.parse_outcome(lines)
+      return :complete if lines =~ Open
+      return :retry
+    end
+
+    def self.holding_wedge?
+      checkright.eql?("wedge")
+    end
+
+    def self.hold_wedge()
+      tools = Containers.find(name: Vars["locksmith"])
+      wedge = tools.contents.find {|item| item.noun.eql?("wedge")} or Wedge.make()
+      Log.out(wedge, label: %i(wedge))
+      Spa.try_or_fail(command: "_drag #%s right" % wedge.id) {
+        GameObj.right_hand.id.eql?(wedge.id)
+      }
+    end
+
+    def self.store_wedge()
+      tools = Containers.find(name: Vars["locksmith"])
+      wedge = GameObj.right_hand
+      Spa.try_or_fail(command: "_drag #%s #%s" % [wedge.id, tools.id]) {
+        tools.contents.map(&:id).include?(wedge.id)
+      }
+    end
+
+    def self.use(box)
+      hold_wedge() unless holding_wedge?
+      put "lm wedge #%s" % box.id
+      outcome = parse_outcome Capture.apply(
+        start: "You insert the tip of your wedge just under the lid",
+        done: "Roundtime:")
+
+      waitrt?
+
+      if outcome.eql?(:complete)
+        store_wedge() unless not holding_wedge?
+        return outcome
+      end
+
+      return use(box)
+    end
+
+    if Script.current.vars.include?("--test-wedge")
+      log = -> o { Log.out(o, label: %i(test wedge)) }
+      log.call Wedge.parse_outcome <<~WEDGE
+        You insert the tip of your wedge just under the lid of your chest and carefully work it back and forth until it is firmly seated.  You try to jam the thin wooden wedge in further with the palm of your hand but only manage to splinter it as the tip is deflected along the side.
+
+        Your wedge takes massive damage!
+
+        The lid of a mithril Greys's chest suddenly splits away from the casing amidst the grating screech of tearing metal!
+        Jahck says, "That's some quality work.  Here's your payment of 424 silvers."
+        Roundtime: 5 sec.
+      WEDGE
+
+      log.call Wedge.parse_outcome <<~WEDGE
+        You insert the tip of your wedge just under the lid of your chest and carefully work it back and forth until it is firmly seated.  You try to jam the thin wooden wedge in further with the palm of your hand but only manage to splinter it as the tip is deflected along the side.
+        Your wedge takes massive damage!
+        Roundtime: 5 sec.
+      WEDGE
+    end
+
+    if Script.current.vars.include?("--wedge")
+      Wedge.make()
+      exit
+    end
+  end
+end
+
+module Spa
+  module Locksmith
+    def self.cast(num)
+      # always lore, safely
+      if Spell[num].timeleft < 1
+        wait_until {Spell[num].affordable?}
+        result = Spell[num].cast()
+        return cast(num) if result.include?("Spell Hindrance")
+      end
+    end
+
+    def self.advance(box)
+      return detect(box)  if box.unknown?
+      return disarm(box)  if box.disarm?
+      return caliper(box) if box.caliper?
+      return pick(box)    if box.pick?
+      fail "unhandled state"
+    end
+
+    def self.detect(box)
+      Locksmith.cast(402)
+      put("detect #%s" % box.id)
+      result = Traps.match_type Capture.apply(
+        start: /You carefully begin to examine|You blink in surprise as though just becoming aware of/,
+         done: Regexp.union(Traps::ROUNDTIME, Traps::DISARMED, Traps::NEEDS_WEDGE),
+         xml: true,
+      )
+
+      return box.give_up() if result =~ %r[You blink in surprise as though just becoming aware of]
+      
+      waitrt?
+      box.add_trap(result)
+      Log.out({detected: result, 
+               max_penalized_trap: Maximums.penalized_max_trap, 
+               dangerous: box.dangerous?}, 
+               label: %i(detect))
+      return box.give_up() if box.dangerous?
+      box
+    end
+
+    # private, pure disarm which doesn't need to know
+    # about any external state other than the box
+    def self._disarm(box, try: 1, max_tries: 5)
+      Locksmith.cast(402)
+      Locksmith.cast(404)
+      waitrt?
+      put("disarm #%s" % box.id)
+      attempt = Capture.apply(
+        start: %r[You carefully begin to examine|Having discovered a trap],
+         done: Traps::DISARM_OUTCOME,
+         xml: true
+      )
+      waitrt?
+      case attempt
+      when Traps::DISARM_FAIL
+        return _disarm(box)
+      when Traps::FUMBLE
+        Interactive.capture("YOU FUMBLED", /^ok$/)
+        return box.add_trap([:none, nil])
+      when Traps::DISARM_SUCCESS
+        [GameObj.left_hand, GameObj.right_hand]
+        .reject {|item| item.noun.eql?("lockpick") or item.noun.eql?("dagger") or item.id.nil?}
+        .each {|trap_component| Containers.add(Config.lootsack, trap_component)}
+        box.add_trap([:none, nil])
+        return :ok
+      else
+        return fail "unknown disarm attempt outcome -> #{attempt}" if try >= max_tries
+        _disarm(box, try: try+1, max_tries: max_tries)
+      end
+    end
+
+    def self.disarm_plate(box)
+      _disarm(box)
+      waitrt?
+      box.add_trap([:none, nil])
+    end
+
+    def self.disarm_scales(box)
+      Containers.use(container: Config.locksmith.name, noun: "dagger") {
+        #Interactive.capture(";send ok to disarm scales", /^ok$/)
+        _disarm(box)
+        box.add_trap([:none, nil])
+        box.add_lock(-1)
+      }
+    end
+
+    class Scarab
+      class Outcomes
+        Unknown = %r[You feel like you probably rendered the translucent scarab harmless, but can't be sure.]
+        Unknown2 = %r[Deciphering the runes is relatively simple, and you're pretty sure you were successful.]
+        Ok = %r[If that had been any easier, you could have done it blindfolded.]
+        All = Regexp.union(Unknown, Unknown2, Ok)
+      end
+    end
+
+    def self.disarm_floor_scarab(scarab, tries: 1)
+      puts "\b"
+      fail "could not figure out what is going on with the scarab after %s tries" % tries if tries > 3
+      result = dothistimeout(
+        "disarm #%s" % scarab.id, 10, Scarab::Outcomes::All)
+      return disarm_floor_scarab(scarab, tries: tries + 1) if result.nil?
+      return :ok if result =~ Scarab::Outcomes::Ok
+      fail "for some reason you were not able to 100% disarm this scarab\ncheck your skillz and try again?"
+    end
+
+    def self.disarm_scarab(box)
+      other_scarabs = GameObj.loot.select {|item| item.noun.eql?("scarab")}
+        .map(&:id)
+      Log.out("detected %s other scarabs" % other_scarabs.size, label: %(scarabs)) if other_scarabs.size > 0
+      # save this for scarab matching
+      trap = box.trap
+      outcome = _disarm(box)
+      return disarm_scarab(box) unless outcome.eql?(:ok)
+      respond({other_scarabs: other_scarabs,  
+               my: trap.last.scarab, 
+               trap: trap,
+              })
+      #Interactive.capture(";send ok to continue", /^ok$/)
+      my_scarab = GameObj.loot.find {|item| 
+        item.name.end_with?(trap.last.scarab) && !other_scarabs.include?(item.id)
+      }
+      fail "could not find your scarab" if my_scarab.nil?
+      self.disarm_floor_scarab(my_scarab)
+      Containers.add(Config.lootsack, my_scarab)
+      :ok
+    end
+
+    def self.disarm_sphere(box)
+      Containers.use(container: Config.locksmith.name, noun: "lockpick") {
+        _disarm(box)
+      }
+    end
+
+    def self.disarm(box)
+      return wedge(box)         if box.wedge?
+      return disarm_scales(box) if box.scales?
+      return disarm_scarab(box) if box.scarab?
+      return disarm_sphere(box) if box.sphere?
+      return wedge(box)         if box.plated? && Toolkit.cached_state.vials.eql?(0)
+      return disarm_plate(box)  if box.plated?
+      _disarm(box)
+    end
+
+    def self.repair_bent_pick()
+      (dothistimeout("lm repair #%s" % GameObj.right_hand.id, 3, %r[You carefully go about reshaping the]) or 
+        fail "unknown outcome when repairing a bent lockpick")
+      waitrt?
+    end
+
+    def self.caliper(box)
+      Containers.use(noun: "calipers") { 
+        put "lm measure #%s" % box.id
+        measure = Calipers.parse Capture.apply(
+          start: %r[Using your .* calipers, you carefully begin to measure the lock],
+          done: "Measuring carefully, it looks to be",
+          ttl: 10,
+        )
+        Log.out("add lock difficulty of %s + %s" % [measure, Calipers.risk_mitigation], 
+          label: :caliper)
+        box.add_lock(measure + Calipers.risk_mitigation)
+        Calipers.increment_usage()
+      }
+      return box
+    end
+
+    def self.replace_old_lockpick(lockpick, suggestion)
+      # if we have another
+      if Lockpick.exist?(suggestion.kind)
+        Interactive.capture("going to use a backup #{lockpick.name} | send ok to continue", /^ok$/)
+        return fput "drop #%s" % lockpick.id 
+      end
+
+      Workbench.replace(pick: lockpick)
+      if checkleft.include?("lockpick")
+        fput "swap"
+        ttl = Time.now + 10
+        wait_until {checkright.include?("lockpick") or Time.now > ttl}
+      end
+      GameObj.right_hand.noun.eql?("lockpick") or fail "could not create your lockpick"
+      Toolkit.add(GameObj.right_hand)
+    end
+
+    def self.check_repairs(lockpick)
+      waitrt?
+      repairs = nil
+      loop do
+        repairs = Lockpick.appraise(lockpick)
+        break if repairs.is_a?(Integer)
+      end
+      Log.out("{repairs=%s}" % repairs)
+      return repairs
+    end
+
+    def self.pick(box)
+      suggestion = Lockpick.suggest(box.lock)
+      Log.out([box.lock, suggestion], label: %i(lockpick suggestion))
+      #Interactive.capture(";send ok to continue", /^ok$/)
+      # give up if this is too risky, better to not break picks
+      if suggestion.nil? and box.scales?
+        Interactive.capture(";send ok to give up (:tough, :scales)", /^ok$/) if Script.current.vars.include?("--guard-give-up")
+        return box.give_up()
+      end
+      # too hard, but safe to wedge (or ask for user input)
+      if suggestion.nil?
+        Locksmith.wedge(box)
+        return box.set_state(:wedged)
+      end
+      if suggestion.lored
+        Locksmith.cast(403)
+      else
+        fput "stop 403" if Spell[403].active?
+      end
+      waitrt?
+      Lockpick.use(suggestion.kind) { |lockpick|
+        put "pick #%s with #%s" % [box.id, lockpick.id]
+        (outcome, difficulty, roll) = Locks.match Capture.apply(
+          start: %r[It does not appear to be locked|You settle into the difficult task of picking the lock|You fumble around],
+          done: %r[<prompt],
+          xml: true,
+        )
+        unless outcome.eql?(:open)
+          Log.out("{calipers=%s, difficulty=%s, roll=%s}" % [box.lock, difficulty, roll])
+          # correct when estimates were off
+          Locksmith.correct_lock(box, suggestion, difficulty, roll)
+          # sanity check the corrected lock
+          fail "some sort of logical error in correcting the lock" if box.lock < 1
+        end
+        
+        waitrt?
+        case outcome
+        when :open
+          box.add_lock(-1)
+        when :broken_pick
+          $spa_task_state.increment(:breaks)
+          repairs = self.check_repairs(lockpick)
+          if repairs < 3
+            Workbench.repair(pick: lockpick)
+          else
+            replace_old_lockpick(lockpick, suggestion)
+          end
+        when :bent_pick
+          $spa_task_state.increment(:bends)
+          repairs = self.check_repairs(lockpick)
+          if repairs < 3
+            repair_bent_pick()
+          else
+            replace_old_lockpick(lockpick, suggestion)
+          end
+        when :retry
+          # signal to retry
+          :retry
+        else
+          fail "Locksmith.pick: unhandled outcome"
+        end
+      }
+    end
+
+    def self.correct_lock(box, suggestion, difficulty, roll)
+      if difficulty.is_a?(Integer) && difficulty > box.lock
+        Log.out("correcting caliper randomness %s -> %s" % [box.lock, difficulty],
+          label: %i(correct caliper estimate))
+        return box.add_lock(difficulty)
+      end
+
+      if roll > suggestion.roll
+        # artificially increase difficulty until we swap picks or give up
+        artificial_lock = box.lock + (suggestion.roll - roll).abs
+        Log.out("artificially increasing difficulty %s -> %s" % [box.lock, artificial_lock], 
+          label: %i(artificial lock))
+        box.add_lock(artificial_lock)
+      end
+    end
+
+    def self.wedge(box)
+      Wedge.use(box)
+      box.add_lock(-1)
+      box.add_trap([:none, nil])
+      box.set_state(:wedged)
+    end
+
+    def self.extract(plinite)
+      difficulty = Plinite.detect(plinite)
+      return :ok if difficulty.eql?(:complete)
+      fail "could not detect difficulty" unless difficulty.is_a?(Integer)
+      suggestion = Lockpick.suggest(difficulty)
+      # give up if this is too risky, better to not break picks
+      if suggestion.nil?
+        Interactive.capture(";send ok to give up", /^ok$/) if Script.current.vars.include?("--guard-give-up")
+        return :give_up
+      end
+      Locksmith.cast(403)
+      waitrt?
+      outcome = :unknown
+      Lockpick.use(suggestion.kind) { |lockpick| 
+        outcome = Plinite.extract(plinite) 
+      }
+      return outcome
+    end
+  end
+end
+
+module Spa
+  def self.run_callback(hook)
+    Log.out("running hook(%s)" % hook)
+    Script.run("spa_#{hook.to_s}") if Script.exists?("spa_#{hook}")
+  end
+
+  module Stage
+    def self.send(*args)
+      Spa.debug? {Log.out([args], label: args.first)}
+      super(*args)
+    end
+
+    def self.before_task(state)
+      Interactive.capture("EMPTY YOUR HANDS and then ;send ok", /^ok$/) if checkleft or checkright
+      Interactive.capture("you are wounded", /^ok$/) if Char.total_wound_severity > 0
+      Toolkit.state()
+      wait_while("wounded") { Char.total_wound_severity > 0 }
+      Spa.run_callback(:before_task)
+      #Interactive.capture("<b>;send ok to ask for a task</b>", /^ok$/)
+    end
+
+  
+    def self.task(state)
+      (outcome, info) = Task.ask_for_job()
+      Log.out([outcome, info], label: %i(ask_for_job))
+      # todo: analytics with info
+      return state.set(outcome, info) if outcome.eql?(:cooldown)
+      state.add_job(info) if info.tip
+      performance = Task.perform(info)
+      Log.out(performance, label: :performance)
+      # todo: track wedges?
+      if performance.is_a?(BoxState) && performance.wedged?
+        state.increment(:wedges, 1)
+        return state
+      end
+
+      if (performance.is_a?(BoxState) && performance.give_up?) || performance.eql?(:give_up)
+        state.increment(:give_ups, 1)
+        Task.give_up(performance)
+      else
+        state.increment(:tips, info.tip) if info && info.tip
+        Task.ask_for_check()
+      end
+    end
+
+    def self.after_task(state)
+      Spa.run_callback(:after_task)
+      rate_limit_timeout = Time.now + 33
+      Toolkit.refill()
+      Calipers.calibrate()
+      state.increment(:tasks)
+      #_respond state.sitrep()
+      wait_until("test:rate_limiting:33s") { Time.now > rate_limit_timeout } if Script.current.vars.include?("--trickle")
+    end
+
+    def self.before_cooldown(state)
+      $spa_working_room = Room.current.id
+      @cooldown = Time.now + (state.info * 60) if state.info.is_a?(Integer)
+      #Toolkit.refill()
+      #Calipers.calibrate()
+      Spa.run_callback(:before_cooldown)
+    end
+
+    def self.cooldown(state)
+      #Log.out(state, label: %i(cooldown state))
+      case state.info
+      when Integer
+        state.increment(:cooldowns)
+      when :mind
+        state.increment(:full_minds)
+      when :empty_pool
+        state.increment(:empty_pools)
+        ttl = Time.now + 60 * 5
+        wait_until("waiting #{Util.fmt_time(ttl - Time.now)} for the pool to refill") {
+          Time.now > ttl
+        }
+      end
+      _respond state.sitrep()
+      # output interactive status
+      if Time.now > @last_interactivity_check_expiry
+        Log.out("interactive for %s" % 
+          Util.fmt_time(@last_interactivity_check_expiry - Time.now), 
+            label: %i(interactivity))
+      end
+
+      hms = Util.fmt_time(@cooldown - Time.now)
+      wait_until("cooldown:waiting %s" % hms) {Time.now > @cooldown} if state.info.is_a?(Integer)
+      wait_while {percentmind == 100}
+    end
+
+    IDLE_EPOC = 60 * 30 # ten minutes
+    @last_interactivity_check_expiry = Time.now + IDLE_EPOC
+    def self.after_cooldown(state)
+      if @last_interactivity_check_expiry < Time.now
+        Interactive.capture("interactivity check | ;send ok", /^ok$/)
+        @last_interactivity_check_expiry = Time.now + IDLE_EPOC
+        Log.out("setting interactive for %s" % 
+          Util.fmt_time(@last_interactivity_check_expiry - Time.now), 
+            label: %i(interactivity))
+      else
+        Interactive.system_notification("starting another session")
+      end
+
+      unless Room.current.id.eql?($spa_working_room)
+        wait_until("waiting for return to %s" % Room[$spa_working_room].title.first) {
+          Room.current.id.eql?($spa_working_room)
+        }
+        Interactive.capture("you left the workzone | ;send ok to restart", /^ok$/)
+      end
+
+      Spa.run_callback(:after_cooldown)
+      state.set(:task, nil)
+    end
+  end
+end
+
+module Spa
+  class TaskState
+    ALLOWED_STATES = %i(task cooldown)
+
+    attr_reader :state, :info, :analytics, :jobs
+    def initialize()
+      @state = :task
+      @info  = nil
+      @jobs  = []
+      @analytics = make_analytics()
+      $spa_task_state = self
+    end
+
+    def make_analytics()
+      {        tasks: 0,
+              wedges: 0,
+           cooldowns: 0,
+          full_minds: 0,
+            bad_tips: 0,
+                tips: 0,
+              breaks: 0,
+               bends: 0,
+         empty_pools: 0,
+            give_ups: 0,
+          start_time: Time.now,
+        starting_exp: Stats.exp,
+      }
+    end
+
+    def assert_valid_state(state)
+      ALLOWED_STATES.include?(state) or fail "%s is not a valid state" % state
+    end
+
+    def increment(key, val = 1)
+      @analytics[key] ||= 0
+      @analytics[key] = @analytics[key] + val
+    end
+
+    def sitrep()
+      rows = []
+      rows << ["tasks", @analytics[:tasks]]
+      rows << ["wedges", @analytics[:wedges]]
+      rows << ["give ups", @analytics[:give_ups]]
+      rows << ["bends", @analytics[:bends]]
+      rows << ["breaks", @analytics[:breaks]]
+      rows << ["tips", Util.with_commas(@analytics[:tips])]
+      rows << ["cooldowns", @analytics[:cooldowns]]
+      rows << ["empty pool", @analytics[:empty_pools]] if @analytics[:empty_pools] > 0
+      rows << ["full minds", @analytics[:full_minds]]
+      rows << ["experience earned", Util.with_commas(Stats.exp - @analytics[:starting_exp])]
+      rows << ["uptime", Util.fmt_time(Time.now - @analytics[:start_time])]
+
+      tips = @jobs
+        .sort_by(&:tip).reverse.take(10).map {|job| [job.creature, job.level, job.tip] }
+
+      Terminal::Table.new(rows: rows).to_s + "\nTips:\n" + Terminal::Table.new(rows: tips).to_s
+    end 
+
+    def add_job(job)
+      # skip flat tips like 250/500/750
+      return unless job.tip
+      sql_insert(job)
+      @jobs << job
+      @jobs.shift while @jobs.size > 100
+    end
+
+    def sql_insert(job)
+      return unless defined?(Spa::Analytics)
+      Spa::Analytics.insert_task(job)
+    end
+
+    def set(state, info)
+      assert_valid_state(state)
+      @state = state
+      @info = info
+      @analytics[:tasks] = @analytics[:tasks] + 1 if state.eql?(:task)
+    end
+
+    ALLOWED_STATES.each do |state|
+      send(:define_method, state.to_s + "?") do
+        @state.eql?(state)
+      end
+    end
+  end
+end
+
+module Spa
+  def self.debug?
+    yield if Script.current.vars.include?("--debug")
+    #sleep 2
+  end
+
+  def self.assert_vars_set()
+    Vars["locksmith"] or fail ";vars set locksmith=<container full name> is required"
+    Vars["lootsack"] or fail ";vars set lootsack=<container full name> is required"
+  end
+
+  def self.make_decision(state)
+    %i(before_task task after_task).each {|stage|
+      Stage.send(stage, state) if state.task?
+    }
+
+    %i(before_cooldown cooldown after_cooldown).each {|stage|
+      Stage.send(stage, state) if state.cooldown?
+    }
+  end
+
+  def self.main()
+    Script.run("spa_analytics") if Script.exists?("spa_analytics")
+    assert_vars_set()
+    Toolkit.refill()
+    Calipers.calibrate()
+    Rooms.go2_closest unless Rooms.by_id.keys.include?(Room.current.id)
+    task_state = TaskState.new
+    loop { 
+      make_decision(task_state)
+      sleep 0.1
+    }
+  end
+  exit if Script.current.vars[0].include?("load")
+  
+  if Script.current.vars.include?("--repair")
+    Log.out Workbench.repair(pick: GameObj.right_hand)
+    exit
+  end
+
+  if Script.current.vars.include?("--replace")
+    Log.out Workbench.replace(pick: GameObj.right_hand)
+    exit
+  end
+
+  if Script.current.vars.find {|argv| argv =~ /--make=([a-z]+)/}
+    #Interactive.capture("making a %s" % $1, /^ok$/)
+    Log.out Workbench.replace(pick: $1)
+    exit
+  end
+
+  unless Script.current.vars.empty?
+    Log.out(Script.current.vars)
+    exit(:unknown_arguments)
+  end
+  
+  Spa.main() unless Script.current.vars[0].include?("test")
+end
