@@ -1,0 +1,406 @@
+=begin
+  exchange.lic: Exchanges boxes at the locksmith pool
+
+        author: Deysh
+    maintainer: elanthia-online
+  contributers: Deysh, Athias
+          game: Gemstone
+          tags: lockpool,loot
+       version: 1.0.0
+
+  v1.0.0 (2021-06-02)
+    - Original Upload based on exchange used in Shattered
+=end
+
+VERSION = 1.0
+
+module Basics
+  def self.version
+    sVersion = "The current version of this exchange is #{VERSION.to_s}"    
+    return msg(sVersion)
+  end
+
+  def msg(msg)
+
+    msg = msg.to_s
+
+    if $frontend == 'stormfront' || $frontend == 'profanity'
+      msg = REXML::Text.new(msg, respect_whitespace: true).to_s
+      msg.gsub!(/@@(.*?)@@/, '<pushBold/>\1<popBold/>')
+      msg.gsub!(/!!(.*?)!!/, '<preset id="thought">\1</preset>')
+      msg.gsub!(/\*\*(.*?)\*\*/, '<preset id="whisper">\1</preset>')
+      msg.gsub!(/`(.*?)`/, '<preset id="speech">\1</preset>')
+      msg = "<output class=\"mono\" />\n#{msg}\n<output class=\"\" />"
+      puts msg
+    else
+      msg.gsub!('**', '')
+      msg.gsub!('`', '')
+      msg.gsub!('!!', '')
+      msg.gsub!('@@', '')
+      respond msg
+    end
+  end
+end
+
+class Exchange
+  include Basics
+  attr_accessor :lootsack, :gemsack, :mainbank, :return_room, :put_regex, :get_regex 
+
+  def initialize
+
+    @put_regex = /^You (?:put|(?:discreetly )?tuck|attach|attempt to shield your|place|.* place|slip|wipe off the blade and sheathe|absent-mindedly drop|carefully add|find an incomplete bundle|untie your drawstring pouch)|^The .+ is already a bundle|^Your bundle would be too large if you if you tried to add that|^The .+ is too large to be bundled\.|^As you place your .+ inside your .+, you notice another .+ inside the .+ and carefully arrange the two .+ into a neat bundle\.|If you wish to continue, throw the item away again within fifteen seconds|you feel pleased with yourself at having cleaned up the surrounding area|over your shoulder|two items in that location/
+    @get_regex = /^You (?:shield the opening of .*? from view as you |discreetly |carefully |deftly )?(?:remove|draw|grab|reach|slip|tuck|retrieve|already have|unsheathe|detach|swap)|^Get what\?$|^Why don't you leave some for others\?$|^You need a free hand|^You already have that/
+
+    @lootsack = (GameObj.inv.find { |obj| obj.noun == UserVars.lootsack })
+    @gemsack = (GameObj.inv.find { |obj| obj.noun == UserVars.gemsack })
+    @return_room = Room.current.id
+
+    userbank = UserVars.mainbank
+    required_scripts = ["go2"]
+
+    required_scripts.each { |cur_script|
+      unless Script.exists?(cur_script)
+        msg("Script #{cur_script} is required, downloading now")
+        do_client(";repository download #{cur_script}.lic")
+        wait_while { running?('repository') }
+        sleep 0.5
+      end
+    }
+
+    # Lootsack and gemsack check
+      unless @lootsack.id  
+      msg 'ERROR: Please set your lootsack:'
+      msg '  ;vars set lootsack=(my_lootsack)'
+      exit
+    end
+    unless @gemsack.id
+      msg 'ERROR: Please set your gemsack:'
+      msg '  ;vars set gemsack=(my_gemsack)'
+      exit
+    end
+
+    #mainbank check
+    bank_room = {
+      "mist"        => "3672",
+      "icemule"     => "3370",
+      "landing"     => "400",
+      "solhaven"    => "5710",
+      "illistim"    => "11",
+      "zul"         => "9472",
+      "vaalor"      => "3519",
+      "kraken"      => "21541", #GSF
+      "teras"       => "1838",
+    }
+
+    unless userbank =~ /mist|icemule|landing|solhaven|illistim|vaalor|zul|teras/
+      msg 'ERROR: Please set your mainbank location:'
+      msg '  ;vars set mainbank=(my_mainbank)'
+      msg 'acceptable locations:'
+      msg '  mist, icemule, landing, solhaven'
+      msg '  illistim, zul, vaalor, kraken, teras'
+      exit
+    end
+
+    @mainbank = bank_room[userbank]
+
+    go2("locksmith pool")
+    give_boxes
+    return_boxes
+    go2(@return_room)
+  end
+
+  def quiet_command(command, start_pattern, end_pattern = /<prompt/, include_end = false, timeout=5)
+    result = []
+    name = "Pickbot:: -#{Time.now.tv_sec}.#{Time.now.tv_usec}-#{Random.rand(10000)}"
+
+    filter = false
+
+    begin
+      Timeout::timeout(timeout, Interrupt) {
+        DownstreamHook.add(name, proc {|xml|
+          if filter
+            if xml =~ end_pattern
+              DownstreamHook.remove(name)
+              filter = false
+            else
+              # result << xml.rstrip
+              next(nil)
+            end
+          elsif xml =~ start_pattern
+            filter = true
+            # result << xml.rstrip
+            next(nil)
+          else
+            xml
+          end
+        })
+        status_tags
+        fput command
+
+        until (xml = get) =~ start_pattern; end
+        result << xml.rstrip
+        until (xml = get) =~ end_pattern
+          result << xml.rstrip
+        end
+        if include_end
+          result << xml.rstrip
+        end
+        status_tags
+      }
+    ensure
+      DownstreamHook.remove(name)
+    end
+    return result
+  end
+
+  def check_silver
+    silvers = 0
+
+    lines = quiet_command(
+      "info",
+      /Name: <a exist=.*? noun/
+    )
+
+    lines.each do |line|
+      next unless line =~ /^\s*Mana\:\s+\-?[0-9]+\s+Silver\:\s+([0-9,]+)/
+      silvers = $1.delete(",").to_i
+    end
+
+    return silvers
+  end
+
+  def withdraw_silver(amount, starting_room)
+    go2(@mainbank)
+    fput "withdraw #{amount} silvers"
+    go2(starting_room)
+  end
+
+  def go2(cur_loc)
+    set_locations = {
+      "nexus"   => "20239", #GSF
+      "cubby"   => "20728", #GSF
+      "garrett" => "20727", #GSF
+      "fwi"     => "3668",
+      "park"    => "288",
+    }
+
+    if set_locations.include? cur_loc
+      location = set_locations[cur_loc]
+    else
+      location = cur_loc
+    end
+
+    return if Room.current.id == location.to_i or Room.current.tags.include?(location)
+
+    fput "unhide"if hidden? or invisible?
+    waitrt?
+    waitcastrt?
+    Script.run("go2", "#{location.to_s} --disable-confirm", flags = { :quiet => true })
+    sleep 0.2
+  end
+
+  def in_hand(item)
+    if item.class == GameObj
+      return true if GameObj.right_hand.id == item.id || GameObj.left_hand.id == item.id
+    elsif item.class == Integer
+      return true if GameObj.right_hand.id.to_i == item || GameObj.left_hand.id.to_i == item
+    else
+      return true if GameObj.right_hand.name =~ /#{item}/ || GameObj.left_hand.name =~ /#{item}/
+    end
+    return false
+  end
+
+  def trash_this(item)
+
+    trash = GameObj[/Sarlacc pit|wastebasket|Recycle Bin|barrel|battered casket|wooden crate/]
+
+    if trash
+      begin
+        result = dothistimeout "_drag ##{item.id} ##{trash.id}", 5, /Are you crazy|^You put|As you place|^You need a free hand to pick that up\.|It's closed!|^Your .*? won't fit in .*?\.$|^I could not find what you were referring to\.|^Do you want to put that in or on|If you wish to continue/
+          if result =~ /If you wish to continue/
+            raise
+          end
+          fput "drop #{item}" if result =~ /Are you crazy/
+      rescue
+        retry
+      end
+    else
+      fput "drop #{item}"
+    end
+    sleep 0.1
+
+    fput "stow right" if GameObj.right_hand.name !~ /empty/
+    fput "stow left" if GameObj.left_hand.name !~ /empty/
+  end
+
+  def gather_my_loot(box)
+
+    if box.class == GameObj
+      get_it = "get ##{box.id}"
+    elsif box.class == Integer
+      get_it = "get ##{box}"
+    else
+      get_it = "get #{box}"
+    end
+
+    while !in_hand(box)
+      result = dothistimeout "get ##{box.id}", 2, /^You|Get what/
+      break if result =~ /^You can't pick that up\.$|Get what?|crumbles and decays away.$|crumbles into a pile of dust!$/
+      sleep 0.1
+    end
+
+    if in_hand(box) 
+      res = dothistimeout("open ##{box.id}", 3, /open|locked/)
+      if box.contents.nil?
+        dothistimeout("look in ##{box.id}", 3, /^In the/)
+        30.times { break if not box.contents.nil?; sleep 0.10 }
+      end
+
+      for obj in box.contents
+        next if obj.name =~ /doomstone|oblivion quartz|black ora|urglaes fang|steel spring/
+        next if obj.type =~ /cursed|junk|food/
+        #next if obj.type =~ /clothing|herb/
+        #next if obj.name =~ /drake|feras/
+        if obj.name =~ /coins/i
+          get_result = dothistimeout "get coins from ##{GameObj.right_hand.id}", 5, /^You gather the remaining|^Get what\?/
+          echo 'fixme (open_solo coins)' unless get_result =~ /^You gather the remaining/
+          waitrt?
+        elsif obj.type =~ /gem/
+          dothistimeout "_drag ##{obj.id} ##{@gemsack.id}", 3, @put_regex
+        else
+          dothistimeout "_drag ##{obj.id} ##{@lootsack.id}", 3, @put_regex 
+        end
+      end 
+      trash_this(box) 
+    end
+    return
+  end
+
+  def give_boxes
+    boxes = Array.new
+    containers = Array.new
+    disk = nil
+    worker = GameObj[/worker|trickster|Jahck|woman|attendant|gnome|merchant|dwarf/]
+
+    # Get list of containers
+    GameObj.inv.each { |item|
+      if GameObj.containers[item.id]
+        containers.push(item)
+      end
+    }
+
+    # Get boxes from containers
+    containers.each { |bag|
+      fput "look in ##{bag}" if bag.contents == nil
+      bag.contents.find_all { |obj|
+        boxes.push(obj) if obj.type =~ /box/
+      }
+    }
+
+    # find the disk
+    unless disk = GameObj.loot.find { |o| o.name =~ /#{Char.name} (?:disk|coffin)$/ }
+      # if there is no disk, look back into the buffer to see if a disk was following recently
+      if reget.any? { |line| line =~ /^Your (?:disk|coffin) arrives, following you dutifully\.\r?$/ }
+        # if there was a disk, wait for it to arrive
+        50.times {
+          break if GameObj.loot.any? { |o|
+            o.name =~ /#{Char.name} (?:disk|coffin)$/
+          }
+          sleep 0.1
+        }
+        # find the disk again
+        disk = GameObj.loot.find { |o| o.name =~ /#{Char.name} (?:disk|coffin)$/ }
+      end
+    end
+
+    if disk
+      # the disk is assumed to be open; fix that here if you want
+      # look in the disk if needed
+      if disk.contents.nil?
+        dothistimeout "look in ##{disk.id}", 5, /^In the|There is nothing/
+      end
+      # drop everything from the disk
+      # since you're not targetting boxes, you could just turn the disk, I suppose
+      boxes += disk.contents.to_a.find_all { |obj| obj.type =~ /box/ }
+    end
+
+    if worker
+      boxpool_full = false
+      boxes.each{|thing|
+        break if boxpool_full == true
+        empty_hands
+
+        while !in_hand(thing)
+          result = dothistimeout "get ##{thing.id}", 2, @get_regex
+          break if result =~ /^You can't pick that up\.$|Get what?|crumbles and decays away.$|crumbles into a pile of dust!$/
+          sleep 0.1
+        end
+
+        while in_hand(thing)
+          res = dothistimeout "give ##{worker.id} 10 percent", 3, /You don't have that much|takes your|is already unlocked|is already open|You are requesting a locksmith|You want a locksmith to open|Sorry, we're already holding as many boxes for you as we can\.|try that again with a box in your right hand|take care of that on your own/
+          if res =~ /You don't have that much/
+            withdraw_silver(10000 - check_silver(),Room.current.id)
+          elsif res =~ /is already unlocked|is already open|take care of that on your own/
+            box = nil
+            if GameObj.right_hand.type =~ /box/
+              box = GameObj.right_hand
+            end
+            fput "open ##{box.id}"
+            gather_my_loot(box)
+          elsif res =~ /Sorry, we're already holding as many boxes for you as we can\./
+            box = nil
+            if GameObj.right_hand.type =~ /box/
+              box = GameObj.right_hand
+            end
+            fput "stow ##{box.id}"
+            msg "NOTICE: The boxpool is full, you must go to a town locksmith"
+            boxpool_full == true
+            break
+            exit
+          elsif res =~ /try that again with a box in your right hand/
+            newres = dothistimeout "swap", 3, /You can't swap in your condition!|You don't have anything to swap!/
+            if newres =~ /You can't swap in your condition!/
+              msg("Your arm is probably missing or something - go figure it out!")
+              exit
+            elsif newres =~ /You don't have anything to swap!/
+              nil
+            end
+          end
+        end
+      }
+    end
+  end
+
+  def return_boxes
+    worker = GameObj[/worker|trickster|Jahck|woman|attendant|gnome|merchant|dwarf/]
+
+     loop do
+      res = dothistimeout "ask ##{worker.id} for return", 3, /We don't have any boxes|We don't seem to have that box|Alright, here's your/
+      # no more boxes left
+      if res !~ /Alright, here's your/
+        break
+      end
+
+      box = nil
+      if GameObj.right_hand.type =~ /box/
+        box = GameObj.right_hand
+      elsif GameObj.left_hand.type =~ /box/
+        box = GameObj.left_hand
+      else
+        msg("failed to find the box you were supposed to get")
+        break
+      end
+
+      gather_my_loot(box)
+
+      sleep(0.50)
+      end
+  end
+end
+
+if script.vars[1] =~ /version/
+  Basics.version
+  exit
+end
+
+Exchange.new
