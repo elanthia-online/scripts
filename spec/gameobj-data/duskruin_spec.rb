@@ -85,5 +85,38 @@ describe GameObj do
         end
       end
     end
+
+    describe "event-specific items" do
+      [
+        %{bright crimson glass sphere},
+        %{carved ur-barath totem},
+        %{dull black glass sphere},
+        %{dull grey rabbit's foot},
+        %{rat-shaped vial},
+        %{sharp toxin-covered misericord},
+        %{sickly green glass sphere},
+        %{silky white rabbit's foot},
+        %{silver raffle token},
+        %{silvery white glass sphere},
+        %{vibrant yellow glass sphere},
+      ].each do |item|
+        it "recognizes #{item} as a Duskruin-specific item" do
+          expect(GameObjFactory.item_from_name(item).type).to eq "event:duskruin"
+        end
+      end
+    end
+
+    describe "bag of holding parts" do
+      [
+        %{material swatch},
+        %{slender wooden rod},
+        %{handful of sparkling dust},
+        %{strand of veniom thread},
+      ].each do |item|
+        it "#{item} doesn't collide with other categories" do
+          expect(GameObjFactory.item_from_name(item).type).to be_nil
+        end
+      end
+    end
   end
 end
