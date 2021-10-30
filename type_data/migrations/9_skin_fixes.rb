@@ -6,6 +6,7 @@ migrate :skin, :furrier do
   insert(:name, %{scraggly swamp troll scalp})
   insert(:name, %{brown boar hide})
   insert(:name, %{moor eagle talon})
+  insert(:name, %{mountain snowcat pelt})
 end
 
 migrate :skin, :furrier do
