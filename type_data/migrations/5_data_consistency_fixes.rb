@@ -20,6 +20,7 @@ end
 
 migrate :undead do
   insert(:name, "spectre")
+  insert(:name, "darken")
 end
 
 migrate :gem do
