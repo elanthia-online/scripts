@@ -109,6 +109,7 @@ describe GameObj do
             ranger
             scourge
             scout
+            sentinel
             shaman
             skirmisher
             sniper
