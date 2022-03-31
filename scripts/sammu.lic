@@ -1,0 +1,1154 @@
+=begin
+
+ Description: SAmmu is an ammunition script to create arrows, bolts, and even
+			  darts. It supports all methods of customizing your ammo and
+			  even buys the ingredients for you.
+Dependencies: SLib 3.07132009+
+
+	maintainer: Elanthia-Online
+		author: spiffyjr
+		name: SAmmu
+		tags: ammo, ammunition
+	 version: 1.1
+
+	  changelog:
+			1.1 (2021-10-11) updates to support GTK3  
+			1.0 * Initial release
+
+=end
+
+##############################
+# DEFINITIONS
+##############################
+# Returns the number of silver you currently have
+def checksilver
+	silvers = nil
+	action = proc { |server_string|
+		if server_string =~ /^\s*Name\:|^\s*Gender\:|^\s*Normal \(Bonus\)|^\s*Strength \(STR\)\:|^\s*Constitution \(CON\)\:|^\s*Dexterity \(DEX\)\:|^\s*Agility \(AGI\)\:|^\s*Discipline \(DIS\)\:|^\s*Aura \(AUR\)\:|^\s*Logic \(LOG\)\:|^\s*Intuition \(INT\)\:|^\s*Wisdom \(WIS\)\:|^\s*Influence \(INF\)\:/
+			nil
+		elsif server_string =~ /^\s*Mana\:\s+\-?[0-9]+\s+Silver\:\s+([0-9]+)/
+			silvers = $1.to_i
+			DownstreamHook.remove("slib_check_silvers")
+			nil
+		else
+			server_string
+		end
+	}
+	DownstreamHook.add("slib_check_silvers", action)
+	$_SERVER_.puts "#{$cmd_prefix}info\n"
+	wait_until { silvers }
+	silvers
+end
+
+# Checks if a script is running. Only matches ABSOLUTE names.
+def script_running?(script)
+	Script.running.any? { |s| s.name == script }
+end
+
+def get_lich_server
+	begin
+		lich_server = TCPSocket.open('204.232.207.222', 7153)
+	rescue
+		lich_server.close rescue()
+		lich_server = nil
+		echo "error connecting to server: #{$!}"
+	end
+	lich_server
+end
+
+def script_updated?(script_name = Script.self.name)
+	updated = false
+
+	if lich_server = get_lich_server
+		lich_server.sync = true
+		lich_server.write('L')
+
+		while line = lich_server.gets
+			name,size,time = line.split(';;')
+			if name == script_name and (not File.exists?("#{$script_dir}#{name}") or (time.to_i > (File.mtime("#{$script_dir}#{name}").to_i)))
+				updated = true
+				break
+			end
+		end
+		lich_server.close
+	end
+
+	updated
+end
+
+def check_haste
+end
+
+def convert_to_string(item)
+	return "##{item.to_s}" if item.class == Integer
+	item.to_s
+end
+
+def handsfull?
+	not handsempty?
+end
+
+def handsempty?
+	(checkleft and checkright).nil?
+end
+
+def holding?(item)
+	item = item.to_s
+	right = GameObj.right_hand
+	left = GameObj.left_hand
+
+	right.id.to_s == item or left.id.to_s == item or
+	right.noun == item or left.noun == item or
+	right.name == item or left.name == item
+end
+
+def get_inventory(sack)
+	GameObj.inv.find { |inv| inv.name =~ /^#{sack}$/ or inv.noun =~ /\b#{sack}\b/ }
+end
+
+def get_inventory_id(sack)
+	get_inventory(sack).id.to_i
+end
+
+def	get_item(item, sack = nil)
+	return nil if holding?(item)
+	waitrt?
+	item = convert_to_string(item)
+
+	line = "get #{item}"
+	unless sack.nil?
+		unless sack.class == Fixnum
+			found = get_inventory_id(sack)
+			sack = found unless found == 4
+		end
+
+		sack = convert_to_string(sack)
+		line += " from #{sack}"
+	end
+
+	res = dothistimeout line, 2, /You pick|You get|You remove|what\?|could not|can't|free/i
+	return res if res =~ /You pick|You get|You remove/i or holding?(item)
+
+	return nil
+end
+
+def go2(room)
+	return if Room.current.id.to_s == room.to_s
+	waitrt?
+
+	wait_while{ running?('go2') }
+	start_script('go2', [ room.to_s, '_disable_confirm_' ]);
+	wait_while{ running?('go2') }
+end
+
+def put_item(item, sack = nil)
+	return nil unless holding?(item)
+	waitrt?
+	item = convert_to_string(item)
+
+	if sack.nil?
+		line = "stow #{item}"
+	else
+		line = "put #{item} in "
+		unless sack.class == Fixnum
+			found = get_inventory_id(sack)
+			sack = found unless found == 4
+		end
+
+		sack = convert_to_string(sack)
+		line += sack
+	end
+
+	res = dothistimeout line, 2, /You put|not set|could not|won't fit|closed\!|As you place/i
+	if res =~ /not set|could not|won't fit/ or res.nil?
+		return nil
+	elsif res =~ /closed/
+		dothistimeout "open #{sack}", 2, /open|already/
+		res = put_item(item, sack)
+		dothistimeout "close #{sack}", 2, /close|already/
+	end
+
+	return nil if holding?(item)
+
+	res
+end
+
+def find_path(destination)
+	unless current_room = Room.current
+		smsg 'Current room is not in the map database', :bold
+		return nil
+	end
+	previous, shortest_distances = Map.dijkstra(current_room.id, destination)
+	unless previous[destination]
+		smsg "You can't get there from here", :bold
+		return nil
+	end
+	path = [ destination ]
+	path.push(previous[path[-1]]) until previous[path[-1]] == nil
+	path.reverse!
+end
+
+def go_next_room(destination)
+	path = Array.new
+
+	unless current_room = Room.current
+		smsg 'Current room is not in the map database', :bold
+		return nil
+	end
+	unless current_room.id == destination
+		path = find_path(destination) unless path.include?(current_room.id)
+		next_id = path[path.index(current_room.id)+1].to_s
+		#if miniscript = better_miniscript["#{current_room.id},#{next_id}"]
+		#	miniscript.call
+		#else
+			way = current_room.wayto[next_id]
+			if way.class == Proc
+				way.call
+			elsif way.class == String
+				current_room.wayto.delete(next_id) if (move(way) == false) and not muckled?
+			else
+				path = Array.new
+			end
+		#end
+		sleep 0.1
+	end
+end
+
+def shortest_path_from_list(target_list, start_room = Room.current)
+	least_time = nil
+	least_target = nil
+	previous, shortest_distances = Map.dijkstra(start_room.id)
+	for target in target_list
+		target = target.to_i
+		return target if start_room.id == target
+		est_time = shortest_distances[target]
+		if !est_time.nil? and (least_time.nil? or least_time > est_time)
+			least_target = target
+			least_time = est_time
+		end
+	end
+	return least_target
+end
+
+def smsg(msg, type = :none)
+	start_string = ""
+	end_string = ""
+
+	if type == :bold or type == :all
+		if $fake_stormfront
+			start_string += "\034GSL\r\n"
+			end_string += "\034GSM\r\n\r\n"
+		else
+			start_string += "<pushBold\/>"
+			end_string += "<popBold\/>"
+		end
+	end
+
+	if (type == :mono or type == :all) and not $fake_stormfront
+		start_string += "<output class=\"mono\"/>"
+		end_string += "\r\n<output class=\"\"/>"
+	end
+
+	puts sprintf '%s%s%s', start_string, msg, end_string
+end
+
+##############################
+# CLASSES
+##############################
+
+# Helps with creating GUIs
+class SGui
+	attr_accessor :button, :checkbutton, :entry, :combo, :window
+
+	def initialize(title = nil, settings = nil)
+		@button ||= Hash.new
+		@checkbutton ||= { :local => {}, :global => {} }
+		@combo ||= { :local => {}, :global => {} }
+		@entry ||= { :local => {}, :global => {} }
+		@window = Gtk::Window.new(title) unless title.nil?
+
+		if not settings.nil? and not title.nil?
+			@window.move(settings['window_position'][0], settings['window_position'][1]) if settings['window_position']
+			if @window.allocation.width + @window.position[0] > Gdk::Screen.default.width or @window.allocation.height + @window.position[1] > Gdk::Screen.default.height
+				@window.move(0, 0)
+			end
+		end
+	end
+
+	def add_button(table, row, col, label, name)
+		button = Gtk::Button.new(:label => label)
+		table.attach(button, col, col + 1, row, row + 1)
+
+		@button[name] = button
+	end
+
+	def add_checkbutton(table, row, col, label, name, default = false, type = :local, tooltip = nil)
+		checkbutton = Gtk::CheckButton.new label
+		checkbutton.active = default
+
+		table.attach(checkbutton, col, col + 1, row, row + 1)
+
+		# tooltip
+		unless tooltip.nil? or tooltip.empty?
+#			tt = Gtk::Tooltips.new
+#			tt.enable
+			checkbutton.set_tooltip_text(tooltip)
+		end
+
+		@checkbutton[type][name] = checkbutton
+	end
+
+	def add_combo(table, row, col, label, name, default = '', type = :local, tooltip = nil)
+		label = Gtk::Label.new(label)
+		align = Gtk::Alignment.new 1, 1, 0, 1
+		align.add(label)
+		table.attach(align, col, col + 1, row, row + 1)
+
+		# combo
+		combo = Gtk::ComboBox.new(true)
+		#combo.text = default.to_s
+		table.attach(combo, col + 1, col + 2, row, row + 1)
+
+		# tooltip
+		unless tooltip.nil? or tooltip.empty?
+#			tt = Gtk::Tooltips.new
+#			tt.enable
+			combo.set_tooltip_text(tooltip)
+		end
+
+		@combo[type][name] = combo
+	end
+
+	def add_entry(table, row, col, label, name, default = '', type = :local, tooltip = nil)
+		label = Gtk::Label.new(label)
+		align = Gtk::Alignment.new 1, 1, 0, 1
+		align.add(label)
+		table.attach(align, col, col + 1, row, row + 1)
+
+		# entry
+		entry = Gtk::Entry.new
+		entry.text = default.to_s
+		table.attach(entry, col + 1, col + 2, row, row + 1)
+
+		# tooltip
+		unless tooltip.nil? or tooltip.empty?
+#			tt = Gtk::Tooltips.new
+#			tt.enable
+			entry.set_tooltip_text(tooltip)
+		end
+
+		@entry[type][name] = entry
+	end
+
+	def save_new
+		@entry[:global].each_pair { |key, value| UserVars.change(key, value.text, :char) }
+		@checkbutton[:global].each_pair { |key, value| UserVars.change(key, value.active?, :char) }
+
+		@entry[:local].each_pair { |key, value| CharSettings[key] = value.text }
+		@checkbutton[:local].each_pair { |key, value| CharSettings[key] = value.active? }
+
+		UserVars.save
+	end
+
+	def save(local_val = nil)
+		save_new
+	end
+
+	def destroy_window(settings = nil)
+		unless settings.nil?
+			window_position = window_width = window_height = nil
+			Gtk.queue {
+				window_position = @window.position
+				window_width = @indow.allocation.width
+				window_height = @window.allocation.height
+			}
+
+			sleep 0.01 while window_height.nil?
+
+			settings['window_height'] = window_position
+			settings['window_position'] = window_position
+			settings['window_width'] = window_position
+		end
+
+		Gtk.queue { @window.destroy }
+	end
+end
+
+# Class uses GameObj to make find and find_all a bit easier
+class SGameObj
+	@@obj_valid = [ 'inv', 'loot', 'npcs', 'pcs' ]
+	@obj
+
+	def SGameObj.valid_obj?
+		unless @@obj_valid.include?(@obj)
+			smsg sprintf('SGameObj: error - invalid object type "%s"', @obj.class.to_s), :bold
+			return false
+		end
+
+		true
+	end
+
+	def SGameObj.find(query = '', type = 'noun')
+		return nil unless valid_obj?
+
+		if query.class == Regexp
+			GameObj.send(@obj).find { |o| o.send(type) =~ query }
+		else
+			GameObj.send(@obj).find { |o| o.send(type) == query.to_s }
+		end
+	end
+
+	def SGameObj.find_all(query = '', type = 'noun')
+		return Array.new unless valid_obj?
+		GameObj.send(@obj).find_all { |o| o.send(type) =~ /#{query}/i }
+	end
+end
+
+class SInv < SGameObj
+	@obj = 'inv'
+end
+
+class SLoot < SGameObj
+	@obj = 'loot'
+end
+
+class SNpcs < SGameObj
+	@obj = 'npcs'
+end
+
+class SPcs < SGameObj
+	@obj = 'pcs'
+end
+
+class SAmmu
+	attr_accessor :count, :fletch_mode
+
+	@shaft
+	@settings
+	@state = :pare
+
+	@@name = 'SAmmu'
+	@@author = 'SpiffyJr'
+	@@email = 'SpiffyJr@gmail.com'
+	@@version = 3.08202010
+
+	def initialize
+		@settings = CharSettings.to_hash
+		@shaft = nil
+	end
+
+	def setup
+		done = false
+		save = false
+
+		# Create a SGtk window
+		gtk = SGui.new("#{@@name} v#{@@version} configuration for #{Char.name}", @settings)
+		gtk.window.resizable = false
+
+		Gtk.queue {
+			# Primary window
+			vb = Gtk::Box.new(:vertical)
+			vb.set_border_width(5)
+			gtk.window.add(vb)
+
+			# Notebook
+			nb = Gtk::Notebook.new
+			nb.set_show_border(true)
+			vb.pack_start(nb)
+
+			# Buttons
+			tbl_btns = Gtk::Table.new(1, 6, true)
+			gtk.add_button(tbl_btns, 0, 5, 'Save', 'save')
+			gtk.add_button(tbl_btns, 0, 6, 'Close', 'close')
+
+			vb.pack_start(tbl_btns)
+
+			# Items
+			tbl = Gtk::Table.new(7, 4, false)
+			tbl.set_border_width(5)
+			tbl.row_spacings = 3
+			tbl.column_spacings = 3
+
+			vb = Gtk::Box.new(:vertical, 0)
+			vb.pack_start(tbl, :expand => false, :fill => false, :padding => 0)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b><big>Items</big></b>\nUse the fields below to setup item names for SAmmu. You are only required to fill in fields for items\nyou plan on using. You can hover over some fields for more information.")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(0, 10, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 0, 1)
+
+			gtk.add_entry(tbl, 1, 0, 'Knife:', 'knife', @settings['knife'], :local)
+			gtk.add_entry(tbl, 1, 2, 'Axe:', 'axe', @settings['axe'], :local)
+			gtk.add_entry(tbl, 2, 0, 'Product:', 'product', @settings['product'], :local, 'Should be set to "arrow", "bolt", or "dart"')
+			gtk.add_entry(tbl, 2, 2, 'Cap:', 'cap', @settings['cap'], :local, 'Should be set to "arrowhead" or "cap" if you plan on capping your ammo')
+			gtk.add_entry(tbl, 3, 0, 'Weapon ready:', 'weapon_ready', @settings['weapon_ready'], :local, 'Command used to retrieve your weapon for measuring')
+			gtk.add_entry(tbl, 3, 2, 'Weapon store:', 'weapon_store', @settings['weapon_store'], :local, 'Command used to store your weapon after measurement')
+			gtk.add_entry(tbl, 4, 0, 'Band paint:', 'band_paint_one', @settings['band_paint'], :local, 'Name of paint for band one')
+			gtk.add_entry(tbl, 4, 2, 'Band paint two:', 'band_paint_two', @settings['band_paint_two'], :local, 'Name of paint for band two')
+			gtk.add_entry(tbl, 5, 0, 'Shaft paint:', 'shaft_paint', @settings['shaft_paint'], :local, 'Name of paint for shaft, e.g. "black vial"')
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b>PRO TIP: For ranking up you only need to set the knife and axe names!</b>")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(15, 0, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 6, 7)
+
+			nb.append_page(vb, Gtk::Label.new('Items'))
+
+			# Containers
+			tbl = Gtk::Table.new(7, 4, false)
+			tbl.set_border_width(5)
+			tbl.row_spacings = 3
+			tbl.column_spacings = 3
+
+			vb = Gtk::Box.new(:vertical, 0)
+			vb.pack_start(tbl, :expand => false, :fill => false, :padding => 0)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b><big>Containers</big></b>\nUse the fields below to set the containers where each fletching item is stored. You can hover over\nsome fields for more information.")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(0, 10, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 0, 1)
+
+			gtk.add_entry(tbl, 1, 0, 'Wood/Shafts:', 'woodsack', @settings['woodsack'], :local)
+			gtk.add_entry(tbl, 1, 2, 'Finished:', 'donesack', @settings['donesack'], :local)
+			gtk.add_entry(tbl, 2, 0, 'Waste:', 'wastesack', @settings['wastesack'], :local, 'This is used to dispose of your shafts in rank mode\nIt must be different than your shaft sack!')
+			gtk.add_entry(tbl, 2, 2, 'Knife:', 'knifesack', @settings['knifesack'], :local)
+			gtk.add_entry(tbl, 3, 0, 'Axe:', 'axesack', @settings['axesack'], :local)
+			gtk.add_entry(tbl, 3, 2, 'Glue:', 'gluesack', @settings['gluesack'], :local)
+			gtk.add_entry(tbl, 4, 0, 'Fletchings:', 'fletchingsack', @settings['fletchingsack'], :local)
+			gtk.add_entry(tbl, 4, 2, 'Caps:', 'capsack', @settings['capsack'], :local)
+			gtk.add_entry(tbl, 5, 0, 'Paint:', 'paintsack', @settings['paintsack'], :local)
+			gtk.add_entry(tbl, 5, 2, 'Scribe:', 'scribesack', @settings['scribesack'], :local)
+			gtk.add_entry(tbl, 6, 0, 'Drill:', 'drillsack', @settings['drillsack'], :local)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b>PRO TIP: For ranking up you only need to specify the shaft, waste, axe, and knife containers!</b>")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(15, 0, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 7, 8)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b>PRO TIP: For ranking up the waste container must be different than the shaft container!</b>")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(0, 0, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 8, 9)
+
+			nb.append_page(vb, Gtk::Label.new('Containers'))
+
+			# Rooms
+			tbl = Gtk::Table.new(7, 4, false)
+			tbl.set_border_width(5)
+			tbl.row_spacings = 3
+			tbl.column_spacings = 3
+
+			vb = Gtk::Box.new(:vertical, 0)
+			vb.pack_start(tbl, :expand => false, :fill => false, :padding => 0)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b><big>Rooms</big></b>\nRooms are used for SAmmu navigation. Enter the go2 ids or names and the enter/exit commands if\nrequired.  You can hover over some fields for more information.")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(0, 10, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 0, 1)
+
+			gtk.add_entry(tbl, 1, 0, 'Ordering:', 'order_room', @settings['order_room'], :local, 'Room name or number of your local fletcher\nMost of the time "fletcher" is sufficient')
+			gtk.add_entry(tbl, 1, 2, 'Fletching:', 'fletch_room', @settings['fletch_room'], :local, 'Room where you do your fletching')
+			gtk.add_entry(tbl, 2, 0, 'Fletch enter commands:', 'fletch_room_enter', @settings['fletch_room_enter'], :local, 'go table, sit')
+			gtk.add_entry(tbl, 2, 2, 'Fletch exit commands:', 'fletch_room_exit', @settings['fletch_room_exit'], :local, 'stand, out')
+			gtk.add_entry(tbl, 3, 0, 'Shaft discard:', 'waste_room', @settings['waste_room'], :local, 'Room where you want to trash your shafts (rank mode only)')
+			gtk.add_entry(tbl, 3, 2, 'Shaft discard enter commands:', 'waste_room_enter', @settings['waste_room_enter'], :local, 'go tower')
+			gtk.add_entry(tbl, 4, 0, 'Shaft discard exit commands:', 'waste_room_exit', @settings['waste_room_exit'], :local, 'out')
+			gtk.add_entry(tbl, 4, 2, 'Shaft discard command:', 'waste_command', @settings['waste_command'], :local, 'Command to dispose of shafts\ni.e., put shaft in wastebasket')
+
+			nb.append_page(vb, Gtk::Label.new('Rooms'))
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b>PRO TIP: Shaft discard room only needs to be set for ranking up!</b>")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(15, 0, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 5, 6)
+
+			# Buying
+			tbl = Gtk::Table.new(8, 4, false)
+			tbl.set_border_width(5)
+			tbl.row_spacings = 3
+			tbl.column_spacings = 3
+
+			vb = Gtk::Box.new(:vertical, 0)
+			vb.pack_start(tbl, :expand => false, :fill => false, :padding => 0)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b><big>Buying</big></b>\nFill in the fields below to setup buying for SAmmu. The order number should be what's listed when\nyou type \"order\" at your order room. The count is the number of items you want to buy.\nYou can hover over some fields for more information.")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(0, 10, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 0, 1)
+
+			gtk.add_entry(tbl, 1, 0, 'Wood order #:', 'buy_wood_order', @settings['buy_wood_order'], :local, 'Enter the number you use to purchase wood')
+			gtk.add_entry(tbl, 1, 2, 'Wood count #:', 'buy_wood_count', @settings['buy_wood_count'], :local, 'How much wood do you want to buy?')
+			gtk.add_entry(tbl, 2, 0, 'Shaft paint order #:', 'buy_shaft_paint_order', @settings['buy_shaft_paint_order'], :local, 'Enter the number you use to purchase wood')
+			gtk.add_entry(tbl, 2, 2, 'Shaft paint count #:', 'buy_shaft_paint_count', @settings['buy_shaft_paint_count'], :local, 'How much wood do you want to buy?')
+			gtk.add_entry(tbl, 3, 0, 'Band one order #:', 'buy_band_paint_order', @settings['buy_band_paint_order'], :local, 'Enter the number you use to purchase band paint')
+			gtk.add_entry(tbl, 3, 2, 'Band one count #:', 'buy_band_paint_count', @settings['buy_band_paint_count'], :local, 'How much band paint do you want to buy?')
+			gtk.add_entry(tbl, 4, 0, 'Band two order #:', 'buy_band_paint_two_order', @settings['buy_band_paint_two_order'], :local, 'Enter the number you use to purchase band paint two')
+			gtk.add_entry(tbl, 4, 2, 'Band two count #:', 'buy_band_paint_two_count', @settings['buy_band_paint_two_count'], :local, 'How much band paint two do you want to buy?')
+			gtk.add_entry(tbl, 5, 0, 'Glue order #:', 'buy_glue_order', @settings['buy_glue_order'], :local, 'Enter the number you use to purchase glue')
+			gtk.add_entry(tbl, 5, 2, 'Glue count #:', 'buy_glue_count', @settings['buy_glue_count'], :local, 'How much glue two do you want to buy?')
+			gtk.add_entry(tbl, 6, 0, 'Fletching order #:', 'buy_fletching_order', @settings['buy_fletching_order'], :local, 'Enter the number you use to purchase fletchings')
+			gtk.add_entry(tbl, 6, 2, 'Fletching count #:', 'buy_fletching_count', @settings['buy_fletching_count'], :local, 'How many fletchings two do you want to buy?')
+            gtk.add_entry(tbl, 7, 0, 'Cap order #:', 'buy_cap_order', @settings['buy_cap_order'], :local, 'For buying regular arrows')
+            gtk.add_entry(tbl, 7, 2, 'Cap count #:', 'buy_cap_count', @settings['buy_cap_count'], :local, 'For buying regular arrows')
+			gtk.add_entry(tbl, 8, 0, 'Arrows #:', 'buy_arrows', @settings['buy_arrows'], :local, 'For buying regular arrows')
+
+			nb.append_page(vb, Gtk::Label.new('Buying'))
+
+			# Mind
+			tbl = Gtk::Table.new(5, 4, false)
+			tbl.set_border_width(5)
+			tbl.row_spacings = 3
+			tbl.column_spacings = 3
+
+			vb = Gtk::Box.new(:vertical, 0)
+			vb.pack_start(tbl, :expand => false, :fill => false, :padding => 0)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b><big>Mind</big></b>\nUse the fields below to specify when SAmmu should craft and when it should exit.")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(0, 10, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 0, 1)
+
+			gtk.add_entry(tbl, 1, 0, 'Pause when mind >', 'mind_pause', @settings['mind_pause'], :local)
+			gtk.add_entry(tbl, 1, 2, 'Exit when mind <', 'mind_exit', @settings['mind_exit'], :local)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b>PRO TIP: Setting \"pause when mind &gt;\" to \"auto\" will adjust the setting automatically!</b>")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(15, 0, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 2, 3)
+
+			lbl = Gtk::Label.new
+			lbl.set_markup("<b>PRO TIP: Setting \"exit when mind &lt;\" to \"bigshot\" will close SAmmu when Bigshot is ready to hunt!</b>")
+            align = Gtk::Alignment.new(0, 0, 0, 0)
+            align.set_padding(0, 0, 0, 0)
+            align.add(lbl)
+            tbl.attach(align, 0, 4, 4, 5)
+
+			nb.append_page(vb, Gtk::Label.new('Mind'))
+
+			# Signals
+			gtk.window.signal_connect('delete_event') { done = true }
+			gtk.button['close'].signal_connect('clicked') { done = true }
+			gtk.button['save'].signal_connect('clicked') { save = true }
+			gtk.window.show_all
+		}
+
+		before_dying { gtk.destroy_window(@settings)	}
+
+		loop {
+			if save
+				smsg '-- settings saved', :all
+				gtk.save_new
+
+				save = false
+			end
+			break if done
+
+			sleep 0.10
+		}
+		exit
+	end
+
+	def crash(msg)
+		smsg '-- sorry, a fatal error has occured', :all
+		smsg msg
+		exit
+	end
+
+	def get_and_buy(item)
+		save_shaft
+
+		unless get_item(item, @settings["#{item}sack"])
+			buy(item)
+
+			unless get_item(item, @settings["#{item}sack"])
+				crash "Could not locate your #{item}!"
+			end
+		end
+
+		get_shaft unless @shift.id.nil? or holding?('shaft')
+
+		return GameObj.right_hand if GameObj.right_hand.name =~ /#{item}/
+		return GameObj.left_hand if GameObj.left_hand.name =~ /#{item}/
+	end
+
+	def buy(item)
+        if item =~ /arrowhead|cap/
+            order = @settings["buy_cap_order"]
+            count = @settings["buy_cap_count"]
+        else
+            order = @settings["buy_#{item}_order"]
+            count = @settings["buy_#{item}_count"]
+        end
+
+        if order.nil? or order.empty?
+            crash "missing order data for item: #{item}, #{order}, #{count}"
+        end
+
+		if count.nil? or count.empty?
+			crash "missing order count data for item: #{item}, #{order}, #{count}"
+		end
+
+		# Require empty hands
+		empty_hands
+
+		# Get some coins
+		@settings['fletch_room_exit'].split(',').each { |x| fput x }
+		go2('bank')
+		dothistimeout "withdraw 10000 silver", 2, /withdraw|The teller/
+
+		# Go buy it
+		go2(@settings['order_room'])
+
+		if item =~ /paint/
+			sack = @settings['paintsack']
+		else
+			sack = @settings["#{item}sack"]
+		end
+
+		count.to_i.times {
+			dothistimeout "order #{order}", 3, /You ask|haggle/
+			dothistimeout "buy", 3, /accept|hands you/
+			put_item(GameObj.right_hand.id.to_i, sack)
+		}
+
+		# Require empty hands
+		empty_hands
+
+		# Deposit remaining coins
+		go2('bank')
+		dothistimeout "deposit all", 3, /deposit/
+
+		# Return to fletching room
+		go2(@settings['fletch_room'])
+		@settings['fletch_room_enter'].split(',').each { |x| fput x }
+	end
+
+	def enabled?(setting)
+		return (0 == (@settings[setting] =~ /yes|y|true|1/)) || true == @settings[setting]
+	end
+
+	def empty_hands
+		empty_hand('left')
+		empty_hand('right')
+	end
+
+	def empty_hand(hand)
+		waitrt?
+		item = GameObj.send("#{hand}_hand")
+		return nil if item.noun.nil?
+
+		case item.noun
+			when /shaft|wood/
+				put_item(item.id.to_i, @settings['woodsack'])
+			when /bow|cross|dart/
+				fput @settings['weapon_store']
+			when /fletching/
+				put_item(item.id.to_i, @settings['fletchingsack'])
+			when /glue/
+				put_item(item.id.to_i, @settings['gluesack'])
+			when /drill/
+				put_item(item.id.to_i, @settings['drillsack'])
+			when /scribe/
+				put_item(item.id.to_i, @settings['scribesack'])
+			when /paint/
+				put_item(item.id.to_i, @settings['paintsack'])
+            when /cap/
+                put_item(item.id.to_i, @settings['capsack'])
+			when /arrow|bolt|dart/
+				fput "put ##{item.id} in #{@settings['product']}s in #{@settings['donesack']}"
+				put_item(item.id.to_i, @settings['donesack']) if holding?(item.noun)
+			when /#{@settings['knife']}/
+				put_item(item.id.to_i, @settings['knifesack'])
+			when /#{@settings['axe']}/
+				put_item(item.id.to_i, @settings['axesack'])
+		end
+
+		#sleep 0.25
+
+		#unless GameObj.send("#{hand}_hand").noun.nil?
+		#	crash "Error while trying to empty #{hand} hand"
+		#end
+	end
+
+	def get_shaft
+		unless @shaft.nil?
+			get_item(@shaft.id.to_i)
+			return
+		end
+
+		unless get_item('1 my shaft', @settings['woodsack'])
+			woodsack = get_inventory(@settings['woodsack'])
+			fput "look in ##{woodsack.id}" if woodsack.contents.nil?
+
+			buy('wood') if woodsack.contents.find_all { |obj| obj.noun =~ /^wood$/ }.size == 0
+
+			unless get_item('wood', @settings['woodsack'])
+				crash 'Failed to buy wood!'
+			end
+
+			unless get_item(@settings['axe'], @settings['axesack'])
+				crash 'Unable to locate your axe'
+			end
+
+			type = 'arrow'
+			type = @settings['product'] unless @fletch_mode == :rank
+
+			dothistimeout "cut #{type} shaft from my wood", 3, /With carefully placed cuts|so you just decide to use it as-is./
+			empty_hands
+
+			unless get_item('1 shaft', @settings['woodsack'])
+				crash 'Out of shafts and buying failed'
+			end
+		end
+	end
+
+	def check_state
+		empty_hand('left') if checkleft
+
+		unless checkright =~ /shaft/
+			empty_hand('right')
+			get_shaft
+		end
+
+		res = dothistimeout 'look at my shaft', 3, /You see/
+		case res
+			when /drilled/
+				@state = :cap
+				@state = :waste if @fletch_mode == :rank
+			when /fletched/
+				@state = :whittle
+				@state = :drill if (not @settings['cap'].empty? or not @settings['cap'].nil?) and @settings['cap'] =~ /arrowhead/i
+                @state = :cap if (not @settings['cap'].empty? or not @settings['cap'].nil?) and @settings['cap'] =~ /cap/i
+				@state = :flip unless @settings['flip'].empty? or @settings['flip'].to_i == 0
+				@state = :waste if @fletch_mode == :rank
+            when /drilled/
+                @state = :cap
+			when /cut to length/
+				@state = :fletch
+				@state = :waste if @fletch_mode == :rank
+			when /nocked|cut with nocks/
+				@state = :measure_and_cut
+				@state = :waste if @fletch_mode == :rank
+			when /a single \w+ band/
+				@state = :nock
+				@state = :paint_band_two unless @settings['band_two_paint'].empty?
+				@state = :waste if @fletch_mode == :rank
+			when /covers the shaft/
+				@state = :nock
+				@state = :paint_band if enabled?('paint_band')
+				@state = :waste if @fletch_mode == :rank
+			when /pared down and smoothed/
+				@state = :nock
+				@state = :measure_and_cut if @settings['product'].strip =~ /dart/
+				@state = :paint_band if enabled?('paint_band')
+				@state = :paint_shaft if enabled?('paint_shaft')
+			else
+				@state = :pare
+		end
+
+		smsg "-- current state: #{@state.to_s}", :all
+	end
+
+	def knife_command(cmd, match)
+		if not holding?(@settings['knife'])
+		    if not get_item(@settings['knife'], @settings['knifesack'])
+    			crash 'Unable to locate your knife!'
+			end
+		end
+
+		return dothistimeout "#{cmd} ##{GameObj.right_hand.id} with ##{GameObj.left_hand.id}", 3, match
+	end
+
+	def save_shaft
+		@shaft = nil
+		@shaft = GameObj.right_hand if GameObj.right_hand.noun =~ /shaft/
+		@shaft = GameObj.left_hand if GameObj.left_hand.noun =~ /shaft/
+	end
+
+    def finish
+        bundle
+
+		@shaft = nil
+		@count -= 1
+
+		smsg "-- you have #{@count} more to make"
+    end
+
+	def do_state_fletch
+		glue = get_and_buy('glue')
+
+		dothistimeout "put ##{glue.id} on ##{@shaft.id}", 3, /You carefully/
+
+		unless put_item(glue.id.to_i, @settings['gluesack'])
+			smsg '-- You ran out of glue!', :all
+		end
+
+		fletching = get_and_buy('fletching')
+
+		res = dothistimeout "put ##{fletching.id} on ##{@shaft.id}", 3, /You attach your/
+		unless res
+			empty_hands
+            @shaft = nil
+			return
+		end
+
+		unless put_item(fletching.id.to_i, @settings['fletchingsack'])
+			smsg '-- You ran out of fletchings!', :all
+		end
+
+		start_time = Time.now.to_f
+
+		loop {
+			break if get =~ /The glue on your .* shaft has dried\./
+			break if (Time.now.to_f - start_time) > 30
+		}
+	end
+
+    def do_state_cap
+        cap = get_and_buy(@settings['cap'])
+        dothistimeout "turn ##{cap.id}", 3, /You put/
+
+        finish
+    end
+
+    def do_state_drill
+        drill = get_item('drill', @settings['drillsack'])
+        res   = dothistimeout "turn my drill", 3, /Setting the tip/
+
+        unless res
+            crash 'failed to drill shaft'
+        end
+    end
+
+	def do_state_measure_and_cut
+		dothistimeout @settings['weapon_ready'], 3, /You sling|You remove|You get/
+		unless checkleft =~ /bow|dart|cross/
+			crash 'Could not locate your weapon!'
+		end
+
+		dothistimeout "measure ##{GameObj.right_hand.id} with ##{GameObj.left_hand.id}", 3, /slice|mark|carefully/
+		empty_hand('left')
+		knife_command('cut', /Using/)
+	end
+
+	def do_state_pare
+		knife_command('cut', /You begin|You pare/)
+	end
+
+	def do_state_nock
+		res = knife_command('cut nock in', /Generally|You begin|You carefully/)
+		if res =~ /Generally/
+			return do_state_nock
+		end
+	end
+
+	def do_state_whittle
+		res = knife_command('cut', /You whittle|If you cut this now/)
+		if res =~ /If you cut this now/
+			return do_state_whittle
+		end
+
+		finish
+	end
+
+	def do_state_waste
+		unless put_item('shaft', @settings['wastesack'])
+			@settings['fletch_room_exit'].split(',').each { |x| fput x }
+			go2(@settings['waste_room'])
+			@settings['waste_room_enter'].split(',') { |command| fput command.strip }
+
+			loop {
+				fput @settings['waste_command'] if holding?('shaft')
+				dothistimeout "get shaft from #{@settings['wastesack']}", 3, /could not|You remove|what\?/
+				break unless holding?('shaft')
+			}
+
+			@settings['waste_room_exit'].split(',') { |command| fput command.strip }
+			go2(@settings['fletch_room'])
+			@settings['fletch_room_enter'].split(',').each { |x| fput x }
+		end
+	end
+
+	# Bundles your arrows
+	def bundle
+		empty_hands
+
+		quiver = GameObj.inv.find { |inv| inv.name=~ /#{@settings['donesack'].to_s}/i }
+		fput "look in ##{quiver.id}" if quiver.contents.nil?
+        pause 0.1 until quiver.contents
+
+		quiver.contents.each { |item|
+			if item.name =~ /[^a-zA-Z]#{@settings['product']}s?/i
+				fput "get ##{item.id}"
+				fput "bundle" if checkleft and checkright
+			end
+		}
+
+		empty_hands
+	end
+
+	# Attempts to refill ammunition
+	def refill(type, count)
+		if type.nil?
+			smsg '-- please specify buy or fletch', :all
+			smsg '-- ;sammu refill [buy|fletch]', :all
+			exit
+		end
+
+		smsg "-- Refilling ammo to #{count}", :all
+
+		# Get current arrow count
+		quiver = GameObj.inv.find { |inv| inv.name =~ /#{@settings['donesack'].to_s}/i }
+		fput "look in ##{quiver.id}"
+		contents = quiver.contents
+
+		arrows = 0
+		contents.each { |item|
+			if item.name =~ /bundle of.*#{@settings['product']}/
+				line = dothistimeout "look at ##{item.id}", 3, /You carefully count|You see a bundle/
+				if line =~ /You carefully count the .* and find (\d+) in the bundle|you quickly count (\d+) of them/
+					arrows += $1.to_i
+				end
+			elsif item.name =~ /[^a-zA-Z]#{@settings['product']}s?[^a-zA-Z]/i
+				arrows += 1
+			end
+		}
+
+		return unless (count - arrows) > 0
+
+		smsg "-- You need #{(count - arrows)} more arrows", :all
+
+		case type
+			when 'fletch'
+				fletch(count-arrows)
+			when 'buy'
+				bundle_count = (count-arrows) / 20
+				return if bundle_count < 1
+				go2('bank')
+				fput "withdraw #{bundle_count*100} silvers"
+				go2(@settings['order_room'])
+
+				bundle_count.to_i.times {
+					fput "order #{@settings['buy_arrows']}"
+					fput "buy"
+					put_item(GameObj.right_hand.id.to_i, @settings['donesack'])
+				}
+
+				go2('bank')
+				fput "deposit all"
+				go2(@settings['fletch_room'])
+
+				bundle
+		end
+	end
+
+	def check_mind
+		if @settings['mind_pause'].strip == 'auto'
+			line = dothistimeout 'art skil', 1, /In the skill of fletching|You are yet to begin/
+
+			cur_ranks = 0
+			cur_ranks = $1.to_i if line =~ /In the skill of fletching, you are a .* with (\d+) ranks\./
+
+			if cur_ranks == 500
+			    echo "-- congrats, you mastered!"
+			    exit
+			end
+
+			total_mind = (800 + Stats.log[0] + Stats.dis[0]).to_f
+			pause_percent = ((total_mind - (cur_ranks + 1)) / total_mind) * 100
+		else
+			pause_percent = @settings['mind_pause'].to_i
+		end
+
+		loop {
+		    if (@settings['mind_exit'].strip == 'bigshot' and percentmind < UserVars.op['rest_till_exp'].to_i) or percentmind < @settings['mind_exit'].to_i
+		        exit
+	        end
+
+			break unless percentmind > pause_percent
+
+			@me.msg "Waiting on mind, current: #{percentmind}% continue at: #{pause_percent}%", true
+			sleep 60
+		}
+	end
+
+	def check_haste
+	end
+
+	def fletch(count = 1, mode = :normal)
+		@fletch_mode = mode
+		@count = count
+
+		loop {
+			waitrt?
+
+			check_mind
+			check_haste
+			check_state
+
+			self.send("do_state_#{@state.to_s}")
+
+			break unless @count > 0
+		}
+	end
+end
+
+if script.vars[0].nil?
+	smsg "-- you're doing it wrong!", :all
+	exit
+end
+
+sammu = SAmmu.new
+
+before_dying { sammu.empty_hands }
+
+case script.vars[1]
+	when /^bundle$/i
+		smsg '-- Bundling', :all
+		sammu.bundle
+	when /^refill$/i
+		sammu.refill(script.vars[2], script.vars[3].to_i)
+	when /^setup$/i
+		sammu.setup
+
+		exit
+	when /^rank(?:s)?$/i
+		smsg '-- Running in rank mode', :all
+		sammu.fletch(9999, :rank)
+	when /^\d+$/i
+		smsg '-- Running in normal mode', :all
+		sammu.fletch(script.vars[1].to_i)
+	when /^(?:help|\?)$/
+		smsg 'SAmmu', :all
+		smsg (sprintf '%17s: SpiffyJr &lt;spiffyjr@gmail.com&gt;', 'Author'), :mono
+		smsg (sprintf '%17s: SAmmu is the only fletching script you will ever need!', 'Description'), :mono
+		respond
+		smsg (sprintf '%17s     %s', 'help, ?', 'show this help message'), :mono
+		smsg (sprintf '%17s     %s', 'setup', 'run the GUI configuration'), :mono
+		respond
+		smsg (sprintf '%17s     %s', 'bundle', 'attempts to bundle your ammunition'), :mono
+		smsg (sprintf '%17s     %s', 'refill', 'refills ammo to amount using method specified'), :mono
+		respond
+		smsg (sprintf '%17s     %s', 'rank', 'runs in rank-up mode'), :mono
+		smsg (sprintf '%17s     %s', '#', 'runs in regular mode fletching # product(s)'), :mono
+end

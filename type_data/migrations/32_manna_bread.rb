@@ -1,7 +1,7 @@
 create_table "manna_bread", keys: [:name]
 
 migrate :manna_bread do
-  insert(:name, %{some manna bread},)
+  insert(:name, %{some manna bread})
   insert(:name, %{round of ground acorn bread})
   insert(:name, %{tiered honey-infused flatbread})
   insert(:name, %{cherry-filled loaf of dark bread})
@@ -43,7 +43,7 @@ migrate :manna_bread do
   insert(:name, %{onion and garlic-stuffed bread})
   insert(:name, %{thin crisp of hummus-topped bread})
   insert(:name, %{swirled disk of blue and yellow ground cornmeal})
-  insert(:name, %{small wild rice and millet cake laced with maple syrup},%{dark orc})
+  insert(:name, %{small wild rice and millet cake laced with maple syrup})
   insert(:name, %{round of fried dough branded with a charred design})
   insert(:name, %{wafer of candied seeds})
   insert(:name, %{slice of banana walnut bread})
