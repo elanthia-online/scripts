@@ -46,7 +46,6 @@ describe GameObj do
         %{crocodile snout},
         %{crooked crone finger},
         %{crooked witch nose},
-        %{curved gold-flecked claw},
         %{cyclops eye},
         %{daggerbeak wing},
         %{dark panther pelt},
@@ -56,7 +55,6 @@ describe GameObj do
         %{dirge skin},
         %{dobrem snout},
         %{eagle talon},
-        %{elongated triton spine},
         %{faceted crystal crab shell},
         %{faeroth fang},
         %{faintly glowing worm skin},
@@ -100,7 +98,6 @@ describe GameObj do
         %{hornet stinger},
         %{ice hound ear},
         %{ice troll scalp},
-        %{iridescent triton hide},
         %{jagged rift crawler tooth},
         %{kappa fin},
         %{kiramon mandible},
@@ -314,6 +311,33 @@ describe GameObj do
                                 base_skin_name
                               else
                                 "#{base_skin_name}s"
+                              end
+
+        it "recognizes bundle of #{pluralized_skin_name} as a skin" do
+          skin = GameObjFactory.item_from_name("bundle of #{pluralized_skin_name}")
+          expect(skin.type).to include "skin"
+          expect(skin.sellable.to_s).to include "furrier"
+        end
+      end
+    end
+
+    describe "modified base skin name after bundle" do
+      [
+        %{triton spine},
+        %{triton hide},
+        %{red firebird feather},
+        %{gold-flecked claw},
+      ].each do |skin_name|
+        it "doesn't recognizes single #{skin_name} as a skin" do
+          skin = GameObjFactory.item_from_name(skin_name)
+          expect(skin.type).not_to eq "skin"
+          expect(skin.sellable.to_s).not_to eq "furrier"
+        end
+
+        pluralized_skin_name = if skin_name.end_with? "s"
+                                skin_name
+                              else
+                                "#{skin_name}s"
                               end
 
         it "recognizes bundle of #{pluralized_skin_name} as a skin" do
