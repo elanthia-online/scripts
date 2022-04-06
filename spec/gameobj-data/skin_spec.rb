@@ -342,8 +342,8 @@ describe GameObj do
 
         it "recognizes bundle of #{pluralized_skin_name} as a skin" do
           skin = GameObjFactory.item_from_name("bundle of #{pluralized_skin_name}")
-          expect(skin.type).not_to include "skin"
-          expect(skin.sellable.to_s).not_to include "furrier"
+          expect(skin.type).to_not include "skin"
+          expect(skin.sellable.to_s).to_not include "furrier"
         end
       end
     end
