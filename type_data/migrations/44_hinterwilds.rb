@@ -69,3 +69,15 @@ migrate :gem, :gemshop do
   insert(:name, %{virescent nephrite shard})
   insert(:name, %{vivid cobalt blue spinel})
 end
+
+migrate :skin, :furrier do
+  create_key(:exclude)
+  insert(:name, %{niveous warg pelt})
+  insert(:name, %{warg pelt})
+  insert(:name, %{golden hinterboar mane})
+  insert(:name, %{hinterboar mane})
+  insert(:exclude, %{warg pelt})
+  insert(:exclude, %{hinterboar mane})
+  insert(:exclude, %{bundle of niveous warg pelt})
+  insert(:exclude, %{bundle of sgolden hinterboar mane})
+end
