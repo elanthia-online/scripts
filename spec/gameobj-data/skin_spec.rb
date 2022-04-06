@@ -321,7 +321,34 @@ describe GameObj do
       end
     end
 
-    describe "modified base skin name after bundle" do
+    describe "bundle skin oddities - recognize single skin, but not bundle" do
+      [
+        %{elongated triton spine},
+        %{iridescent triton hide},
+        %{soft red firebird feather},
+        %{curved gold-flecked claw},
+      ].each do |skin_name|
+        it "doesn't recognizes single #{skin_name} as a skin" do
+          skin = GameObjFactory.item_from_name(skin_name)
+          expect(skin.type).to eq "skin"
+          expect(skin.sellable.to_s).to eq "furrier"
+        end
+
+        pluralized_skin_name = if skin_name.end_with? "s"
+                                skin_name
+                              else
+                                "#{skin_name}s"
+                              end
+
+        it "recognizes bundle of #{pluralized_skin_name} as a skin" do
+          skin = GameObjFactory.item_from_name("bundle of #{pluralized_skin_name}")
+          expect(skin.type).not_to include "skin"
+          expect(skin.sellable.to_s).not_to include "furrier"
+        end
+      end
+    end
+
+    describe "bundle skin oddities - recognize bundle, but not single skin" do
       [
         %{triton spine},
         %{triton hide},
