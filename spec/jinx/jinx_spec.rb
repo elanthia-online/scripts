@@ -25,7 +25,7 @@ module Jinx
     it "creates the $data_dir/_jinx folder" do
       $data_dir = Dir.mktmpdir()
       Setup.apply
-      Repo.lookup("core")
+      Repo.lookup("mirror")
       Repo.lookup("elanthia-online")
     end
   end
@@ -62,12 +62,12 @@ module Jinx
     it "repo list" do
       Service.run("repo list")
       output = game_output
-      expect(output).to include("core:")
+      expect(output).to include("mirror:")
       expect(output).to include("elanthia-online:")
     end
 
-    it "(core) repo info" do
-      Service.run("repo info core")
+    it "(elanthia-online) repo info" do
+      Service.run("repo info elanthia-online")
       output = game_output
       expect(output).to include("scripts:")
       expect(output).to include("go2.lic")
@@ -75,7 +75,7 @@ module Jinx
       # TODO: expect data info in repo info response too
     end
 
-    describe "(core) script install" do
+    describe "(elanthia-online) script install" do
       let(:local_asset_path) { File.join($script_dir, "go2.lic") }
 
       it "will install the first time cleanly on 1-to-1" do
@@ -91,7 +91,7 @@ module Jinx
         Service.run("script install go2")
         output = game_output
 
-        expect(output).to include("go2.lic from repo:core already installed")
+        expect(output).to include("go2.lic from repo:elanthia-online already installed")
         expect(File.exist?(local_asset_path)).to be true
       end
 
@@ -123,7 +123,7 @@ module Jinx
       end
     end
 
-    describe "(core) script update" do
+    describe "(elanthia-online) script update" do
       let(:local_asset_path) { File.join($script_dir, "go2.lic") }
 
       it "will install the first time cleanly on 1-to-1"  do
@@ -139,7 +139,7 @@ module Jinx
         Service.run("script update go2")
         output = game_output
 
-        expect(output).to include("go2.lic from repo:core already installed")
+        expect(output).to include("go2.lic from repo:elanthia-online already installed")
         expect(File.exist?(local_asset_path)).to be true
       end
 
@@ -181,17 +181,17 @@ module Jinx
       $script_dir = Dir.mktmpdir("scripts")
       # ensure installing go2 from this archive works
       game_output # clear
-      Service.run("script install go2 --repo=core")
+      Service.run("script install go2 --repo=elanthia-online")
       installed_file = File.join($script_dir, "go2.lic")
       expect(File.exist?(installed_file)).to be true
       install_output = game_output
-      expect(install_output).to include("installing go2.lic from repo:core")
-      Service.run("script install go2 --repo=core")
+      expect(install_output).to include("installing go2.lic from repo:elanthia-online")
+      Service.run("script install go2 --repo=elanthia-online")
       install_output = game_output
-      expect(install_output).to include("go2.lic from repo:core already installed")
-      Service.run("script update go2 --repo=core")
+      expect(install_output).to include("go2.lic from repo:elanthia-online already installed")
+      Service.run("script update go2 --repo=elanthia-online")
       update_output = game_output
-      expect(update_output).to include("go2.lic from repo:core already installed")
+      expect(update_output).to include("go2.lic from repo:elanthia-online already installed")
 
       expect(File.exist?(File.join($data_dir, '_jinx', 'repos.yaml'))).to be true
       expect(File.exist?(File.join($data_dir, '_jinx', 'scripts.yaml'))).to be true
@@ -207,9 +207,9 @@ module Jinx
         .to raise_error(Jinx::Error, 
           %r[more than one repo has asset\(noop.lic\)])
 
-      expect {Service.run("script info noop --repo=core")}
+      expect {Service.run("script info noop --repo=elanthia-online")}
         .to raise_error(Jinx::Error, 
-          %r[repo\(core\) does not advertise asset\(noop.lic\)])
+          %r[repo\(elanthia-online\) does not advertise asset\(noop.lic\)])
       game_output # clear
       # make sure it checks the elanthia-online repo
       Service.run("script info noop --repo=elanthia-online")
@@ -270,10 +270,10 @@ module Jinx
     end
 
     it "repo change {repo:name} {repo:url}" do
-      Service.run("repo change core https://example.com")
+      Service.run("repo change elanthia-online https://example.com")
       change_output = game_output
-      expect(change_output).to include("repo(core) has been changed")
-      core = Repo.lookup("core")
+      expect(change_output).to include("repo(elanthia-online) has been changed")
+      core = Repo.lookup("elanthia-online")
       expect(core[:url]).to eq(%[https://example.com])
 
       expect { Service.run("repo change _fake_ https://example.com") }
@@ -312,7 +312,7 @@ module Jinx
           Service.run("data install spell-list.xml")
           output = game_output
 
-          expect(output).to include("spell-list.xml from repo:core already installed")
+          expect(output).to include("spell-list.xml from repo:elanthia-online already installed")
           expect(File.exist?(local_asset_path)).to be true
         end
 
@@ -357,7 +357,7 @@ module Jinx
           Service.run("data update spell-list.xml")
           output = game_output
 
-          expect(output).to include("spell-list.xml from repo:core already installed")
+          expect(output).to include("spell-list.xml from repo:elanthia-online already installed")
           expect(File.exist?(local_asset_path)).to be true
         end
 
@@ -398,6 +398,7 @@ module Jinx
 
     describe "engine" do
       it "list" do
+        Service.run("repo add coreengine https://repo.elanthia.online")
         Service.run("engine list")
         output = game_output
         expect(output).to include("engines:")
@@ -420,7 +421,7 @@ module Jinx
           Service.run("engine update")
           output = game_output
 
-          expect(output).to include("lich.rb from repo:core already installed")
+          expect(output).to include("lich.rb from repo:coreengine already installed")
           expect(File.exist?(local_asset_path)).to be true
         end
 
