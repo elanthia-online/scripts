@@ -328,7 +328,7 @@ describe GameObj do
         %{soft red firebird feather},
         %{curved gold-flecked claw},
       ].each do |skin_name|
-        it "doesn't recognizes single #{skin_name} as a skin" do
+        it "does recognizes single #{skin_name} as a skin" do
           skin = GameObjFactory.item_from_name(skin_name)
           expect(skin.type).to eq "skin"
           expect(skin.sellable.to_s).to eq "furrier"
@@ -340,7 +340,7 @@ describe GameObj do
                                 "#{skin_name}s"
                               end
 
-        it "recognizes bundle of #{pluralized_skin_name} as a skin" do
+        it "doesn't recognizes bundle of #{pluralized_skin_name} as a skin" do
           skin = GameObjFactory.item_from_name("bundle of #{pluralized_skin_name}")
           expect(skin.type).not_to eq "skin"
           expect(skin.sellable.to_s).not_to eq "furrier"
