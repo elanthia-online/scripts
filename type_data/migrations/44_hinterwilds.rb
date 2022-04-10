@@ -26,6 +26,7 @@ migrate :undead, :aggressive_npc, :noncorporeal do
 end
 
 migrate :gem, :gemshop do
+  insert(:name, %{blue lace agate})
   insert(:name, %{blue-violet chunk of kornerupine})
   insert(:name, %{bluish black razern-bloom})
   insert(:name, %{carved basalt teardrop})
@@ -40,6 +41,7 @@ migrate :gem, :gemshop do
   insert(:name, %{frosted pale violet amethyst})
   insert(:name, %{gold-banded onyx})
   insert(:name, %{gold-green auroral emerald})
+  insert(:name, %{green alexandrite stone})
   insert(:name, %{green and pink zoisite})
   insert(:name, %{grey-streaked malachite stone})
   insert(:name, %{inky black nightstone})
@@ -54,6 +56,7 @@ migrate :gem, :gemshop do
   insert(:name, %{piece of clear oligoclase})
   insert(:name, %{piece of coppery titanite})
   insert(:name, %{piece of dusky blue sapphire})
+  insert(:name, %{piece of polished ivory})
   insert(:name, %{rainbowed ammolite shard})
   insert(:name, %{royal blue boreal topaz})
   insert(:name, %{rutilated twilight tourmaline})
@@ -79,10 +82,14 @@ migrate :skin, :furrier do
   insert(:name, %{hinterboar mane})
   insert(:name, %{inky black valravn plume})
   insert(:name, %{valravn plume})
+  insert(:name, %{handful of undansormr scales})
+  insert(:name, %{undansormr scale})
   insert(:exclude, %{warg pelt})
   insert(:exclude, %{hinterboar mane})
   insert(:exclude, %{valravn plume})
   insert(:exclude, %{bundle of niveous warg pelt})
   insert(:exclude, %{bundle of golden hinterboar mane})
   insert(:exclude, %{bundle of inky black valravn plume})
+  insert(:exclude, %{undansormr scale})
+  insert(:exclude, %{bundle of undansormr scales})
 end
