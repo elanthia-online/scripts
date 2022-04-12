@@ -174,13 +174,11 @@ module Jinx
         end
 
         it "will not install/update script when using data option" do
-          Service.run("data install go2")
-          output = game_output
-          expect(output).to include("Attempted to download")
+          expect {Service.run("data install go2")}
+            .to raise_error(Jinx::Error, /Attempted to download/)
 
-          Service.run("data update go2")
-          output = game_output
-          expect(output).to include("Attempted to download")
+          expect {Service.run("data update go2")}
+            .to raise_error(Jinx::Error, /Attempted to download/)
         end
 
         it "will install over existing script if given --force" do
@@ -410,13 +408,11 @@ module Jinx
       end
 
       it "will not install/update data when using script option" do
-        Service.run("script install spell-list.xml")
-        output = game_output
-        expect(output).to include("Attempted to download")
+        expect {Service.run("script install spell-list.xml")}
+          .to raise_error(Jinx::Error, /Attempted to download/)
 
-        Service.run("script update spell-list.xml")
-        output = game_output
-        expect(output).to include("Attempted to download")
+        expect {Service.run("script update spell-list.xml")}
+          .to raise_error(Jinx::Error, /Attempted to download/)
       end
     end
 
