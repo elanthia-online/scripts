@@ -78,18 +78,21 @@ migrate :skin, :furrier do
   create_key(:exclude)
   insert(:name, %{niveous warg pelt})
   insert(:name, %{warg pelt})
+  insert(:exclude, %{warg pelt})
+  insert(:exclude, %{bundle of niveous warg pelt})
+  
   insert(:name, %{golden hinterboar mane})
   insert(:name, %{hinterboar mane})
+  insert(:exclude, %{hinterboar mane})
+  insert(:exclude, %{bundle of golden hinterboar mane})
+
   insert(:name, %{inky black valravn plume})
   insert(:name, %{valravn plume})
+  insert(:exclude, %{valravn plume})
+  insert(:exclude, %{bundle of inky black valravn plume})
+
   insert(:name, %{handful of undansormr scales})
   insert(:name, %{undansormr scale})
-  insert(:exclude, %{warg pelt})
-  insert(:exclude, %{hinterboar mane})
-  insert(:exclude, %{valravn plume})
-  insert(:exclude, %{bundle of niveous warg pelt})
-  insert(:exclude, %{bundle of golden hinterboar mane})
-  insert(:exclude, %{bundle of inky black valravn plume})
   insert(:exclude, %{undansormr scale})
   insert(:exclude, %{bundle of undansormr scales})
 end
