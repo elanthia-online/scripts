@@ -58,227 +58,239 @@ module Jinx
       Setup.apply
       game_output
     end
-
-    it "repo list" do
-      Service.run("repo list")
-      output = game_output
-      expect(output).to include("core:")
-      expect(output).to include("elanthia-online:")
-    end
-
-    it "(core) repo info" do
-      Service.run("repo info core")
-      output = game_output
-      expect(output).to include("scripts:")
-      expect(output).to include("go2.lic")
-      expect(output).to include("infomon.lic")
-      # TODO: expect data info in repo info response too
-    end
-
-    describe "(core) script install" do
-      let(:local_asset_path) { File.join($script_dir, "go2.lic") }
-
-      it "will install the first time cleanly on 1-to-1" do
-        Service.run("script install go2")
-
-        _first_attempt = game_output
-        expect(File.exist?(local_asset_path)).to be true
-      end
-
-      it "is a noop is the local file matches the expected digest" do
-        Service.run("script install go2")
-        game_output # clear
-        Service.run("script install go2")
+    
+    describe "repo" do
+      it "repo list" do
+        Service.run("repo list")
         output = game_output
-
-        expect(output).to include("go2.lic from repo:core already installed")
-        expect(File.exist?(local_asset_path)).to be true
+        expect(output).to include("core:")
+        expect(output).to include("elanthia-online:")
       end
-
-      it "will not accidentally overwrite already existing script if the digests don't match" do
-        Service.run("script install go2")
-        game_output # clear
-        File.write(local_asset_path, "modified")
-
-        expect {Service.run("script install go2")}
-          .to raise_error(Jinx::Error, /go2.lic already exists/)
-        _second_attempt = game_output # clear
-      end
-
-      it "will install over existing script if given --force" do
-        Service.run("script install go2")
-        game_output # clear
-        clean_digest = Digest::SHA1.new
-        clean_digest.update(File.read(local_asset_path))
-        File.write(local_asset_path, "modified")
-        modified_digest = Digest::SHA1.new
-        modified_digest.update(File.read(local_asset_path))
-        expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
-
-        Service.run("script install --force go2")
-
-        updated_digest = Digest::SHA1.new
-        updated_digest.update(File.read(local_asset_path))
-        expect(updated_digest.base64digest).to eq clean_digest.base64digest
-      end
-    end
-
-    describe "(core) script update" do
-      let(:local_asset_path) { File.join($script_dir, "go2.lic") }
-
-      it "will install the first time cleanly on 1-to-1"  do
-        Service.run("script update go2")
-
-        _first_attempt = game_output
-        expect(File.exist?(local_asset_path)).to be true
-      end
-
-      it "is a noop is the local file matches the expected digest" do
-        Service.run("script install go2")
-        game_output # clear
-        Service.run("script update go2")
+      
+      it "(core) repo info" do
+        Service.run("repo info core")
         output = game_output
-
-        expect(output).to include("go2.lic from repo:core already installed")
-        expect(File.exist?(local_asset_path)).to be true
+        expect(output).to include("scripts:")
+        expect(output).to include("go2.lic")
+        expect(output).to include("infomon.lic")
+        # TODO: expect data info in repo info response too
       end
-
-      it "will not accidentally overwrite already existing script if the digests don't match" do
-        Service.run("script install go2")
-        game_output # clear
-        File.write(local_asset_path, "modified")
-
-        expect {Service.run("script update go2")}
-          .to raise_error(Jinx::Error, /go2.lic has been modified/)
-      end
-
-      it "will overwrite a modified script if given --force" do
-        Service.run("script install go2")
-        game_output # clear
-        clean_digest = Digest::SHA1.new
-        clean_digest.update(File.read(local_asset_path))
-        File.write(local_asset_path, "modified")
-        modified_digest = Digest::SHA1.new
-        modified_digest.update(File.read(local_asset_path))
-        expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
-
-        Service.run("script update go2 --force")
-
-        updated_digest = Digest::SHA1.new
-        updated_digest.update(File.read(local_asset_path))
-        expect(updated_digest.base64digest).to eq clean_digest.base64digest
-      end
-    end
-
-    it "repo add" do
-      Service.run("repo add archive https://archive.lich.elanthia.online")
-      Repo.lookup("archive")
-      # specificity is required
-      expect {Service.run("script install noop")}
-        .to raise_error(Jinx::Error, /more than one repo has/)
-
-      # make a clean script dir
-      $script_dir = Dir.mktmpdir("scripts")
-      # ensure installing go2 from this archive works
-      game_output # clear
-      Service.run("script install go2 --repo=core")
-      installed_file = File.join($script_dir, "go2.lic")
-      expect(File.exist?(installed_file)).to be true
-      install_output = game_output
-      expect(install_output).to include("installing go2.lic from repo:core")
-      Service.run("script install go2 --repo=core")
-      install_output = game_output
-      expect(install_output).to include("go2.lic from repo:core already installed")
-      Service.run("script update go2 --repo=core")
-      update_output = game_output
-      expect(update_output).to include("go2.lic from repo:core already installed")
-
-      expect(File.exist?(File.join($data_dir, '_jinx', 'repos.yaml'))).to be true
-      expect(File.exist?(File.join($data_dir, '_jinx', 'scripts.yaml'))).to be true
-    end
-
-    it "script info" do
-      Service.run("script info noop")
-      info_output = game_output
-      expect(info_output).to include("noop (repo: elanthia-online, modified:")
-      Service.run("repo add archive https://archive.lich.elanthia.online")
-      # now two repos advertise noop, so it should error
-      expect {Service.run("script info noop")}
-        .to raise_error(Jinx::Error, 
-          %r[more than one repo has asset\(noop.lic\)])
-
-      expect {Service.run("script info noop --repo=core")}
-        .to raise_error(Jinx::Error, 
-          %r[repo\(core\) does not advertise asset\(noop.lic\)])
-      game_output # clear
-      # make sure it checks the elanthia-online repo
-      Service.run("script info noop --repo=elanthia-online")
-      info_output = game_output
-      expect(info_output).to include("noop (repo: elanthia-online, modified:")
-      # make sure it checks the archive repo
-      Service.run("script info noop --repo=archive")
-      info_output = game_output
-      expect(info_output).to include("noop (repo: archive, modified:")
-    end
-
-    it "script search" do
-      Service.run("script search noop")
-      search_output = game_output
-      expect(search_output).to include("found 1 match")
-      Service.run("script search asdfasdfjahksdkfajsdhfka")
-      search_output = game_output
-      expect(search_output).to include("found 0 matches")
-      Service.run("script search noop")
-      search_output = game_output
-      expect(search_output).to include("found 1 match")
-      Service.run("repo add archive https://archive.lich.elanthia.online")
-      # regex search
-      Service.run("script search ^noop.lic")
-      search_output = game_output
-      expect(search_output).to include("found 2 matches")
-      # repo specific search
-      Service.run("script search ^noop.lic --repo=archive")
-      search_output = game_output
-      expect(search_output).to include("found 1 match")
-      expect(search_output).to include("archive>")
-    end
-
-    it "repo rm" do
-      Service.run("repo add archive https://archive.lich.elanthia.online")
-      game_output
-      Service.run("repo rm archive")
-      expect(Repo.find {|repo| repo[:name].eql?(:archive)})
-        .to be_nil
       
-      rm_output = game_output
-      expect(rm_output).to include("repo(archive) has been removed")
+      it "repo add" do
+        Service.run("repo add archive https://archive.lich.elanthia.online")
+        Repo.lookup("archive")
+        # specificity is required
+        expect {Service.run("script install noop")}
+          .to raise_error(Jinx::Error, /more than one repo has/)
+
+        # make a clean script dir
+        $script_dir = Dir.mktmpdir("scripts")
+        # ensure installing go2 from this archive works
+        game_output # clear
+        Service.run("script install go2 --repo=core")
+        installed_file = File.join($script_dir, "go2.lic")
+        expect(File.exist?(installed_file)).to be true
+        install_output = game_output
+        expect(install_output).to include("installing go2.lic from repo:core")
+        Service.run("script install go2 --repo=core")
+        install_output = game_output
+        expect(install_output).to include("go2.lic from repo:core already installed")
+        Service.run("script update go2 --repo=core")
+        update_output = game_output
+        expect(update_output).to include("go2.lic from repo:core already installed")
+
+        expect(File.exist?(File.join($data_dir, '_jinx', 'repos.yaml'))).to be true
+        expect(File.exist?(File.join($data_dir, '_jinx', 'scripts.yaml'))).to be true
+      end
       
-      expect {Service.run("repo rm archive")}
-        .to raise_error(Jinx::Error, 
-          %r[repo\(archive\) is not known])
+      it "repo rm" do
+        Service.run("repo add archive https://archive.lich.elanthia.online")
+        game_output
+        Service.run("repo rm archive")
+        expect(Repo.find {|repo| repo[:name].eql?(:archive)})
+          .to be_nil
+      
+        rm_output = game_output
+        expect(rm_output).to include("repo(archive) has been removed")
+      
+        expect {Service.run("repo rm archive")}
+          .to raise_error(Jinx::Error, 
+            %r[repo\(archive\) is not known])
+      end
+
+      it "repo can readd a previously removed repo" do
+        Service.run("repo add archive https://archive.lich.elanthia.online")
+        game_output
+        Service.run("repo rm archive")
+        expect(Repo.find {|repo| repo[:name].eql?(:archive)})
+          .to be_nil
+
+        Service.run("repo add archive https://archive.lich.elanthia.online")
+        Repo.lookup("archive")
+      end
+
+      it "repo change {repo:name} {repo:url}" do
+        Service.run("repo change core https://example.com")
+        change_output = game_output
+        expect(change_output).to include("repo(core) has been changed")
+        core = Repo.lookup("core")
+        expect(core[:url]).to eq(%[https://example.com])
+
+        expect { Service.run("repo change _fake_ https://example.com") }
+          .to raise_error(Jinx::Error, 
+            %r[repo\(_fake_\) is not known])
+      end
     end
 
-    it "repo can readd a previously removed repo" do
-      Service.run("repo add archive https://archive.lich.elanthia.online")
-      game_output
-      Service.run("repo rm archive")
-      expect(Repo.find {|repo| repo[:name].eql?(:archive)})
-        .to be_nil
+    describe "script" do
+      describe "(core) script install" do
+        let(:local_asset_path) { File.join($script_dir, "go2.lic") }
 
-      Service.run("repo add archive https://archive.lich.elanthia.online")
-      Repo.lookup("archive")
-    end
+        it "will install the first time cleanly on 1-to-1" do
+          Service.run("script install go2")
 
-    it "repo change {repo:name} {repo:url}" do
-      Service.run("repo change core https://example.com")
-      change_output = game_output
-      expect(change_output).to include("repo(core) has been changed")
-      core = Repo.lookup("core")
-      expect(core[:url]).to eq(%[https://example.com])
+          _first_attempt = game_output
+          expect(File.exist?(local_asset_path)).to be true
+        end
 
-      expect { Service.run("repo change _fake_ https://example.com") }
-        .to raise_error(Jinx::Error, 
-          %r[repo\(_fake_\) is not known])
+        it "is a noop is the local file matches the expected digest" do
+          Service.run("script install go2")
+          game_output # clear
+          Service.run("script install go2")
+          output = game_output
+
+          expect(output).to include("go2.lic from repo:core already installed")
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "will not accidentally overwrite already existing script if the digests don't match" do
+          Service.run("script install go2")
+          game_output # clear
+          File.write(local_asset_path, "modified")
+  
+          expect {Service.run("script install go2")}
+            .to raise_error(Jinx::Error, /go2.lic already exists/)
+          _second_attempt = game_output # clear
+        end
+
+        it "will not install/update script when using data option" do
+          expect {Service.run("data install go2")}
+            .to raise_error(Jinx::Error, /Attempted to download/)
+
+          expect {Service.run("data update go2")}
+            .to raise_error(Jinx::Error, /Attempted to download/)
+        end
+
+        it "will install over existing script if given --force" do
+          Service.run("script install go2")
+          game_output # clear
+          clean_digest = Digest::SHA1.new
+          clean_digest.update(File.read(local_asset_path))
+          File.write(local_asset_path, "modified")
+          modified_digest = Digest::SHA1.new
+          modified_digest.update(File.read(local_asset_path))
+          expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
+
+          Service.run("script install --force go2")
+
+          updated_digest = Digest::SHA1.new
+          updated_digest.update(File.read(local_asset_path))
+          expect(updated_digest.base64digest).to eq clean_digest.base64digest
+        end
+      end
+      
+      describe "(core) script update" do
+        let(:local_asset_path) { File.join($script_dir, "go2.lic") }
+
+        it "will install the first time cleanly on 1-to-1"  do
+          Service.run("script update go2")
+
+          _first_attempt = game_output
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "is a noop is the local file matches the expected digest" do
+          Service.run("script install go2")
+          game_output # clear
+          Service.run("script update go2")
+          output = game_output
+
+          expect(output).to include("go2.lic from repo:core already installed")
+          expect(File.exist?(local_asset_path)).to be true
+        end
+
+        it "will not accidentally overwrite already existing script if the digests don't match" do
+          Service.run("script install go2")
+          game_output # clear
+          File.write(local_asset_path, "modified")
+ 
+          expect {Service.run("script update go2")}
+            .to raise_error(Jinx::Error, /go2.lic has been modified/)
+        end
+
+        it "will overwrite a modified script if given --force" do
+          Service.run("script install go2")
+          game_output # clear
+          clean_digest = Digest::SHA1.new
+          clean_digest.update(File.read(local_asset_path))
+          File.write(local_asset_path, "modified")
+          modified_digest = Digest::SHA1.new
+          modified_digest.update(File.read(local_asset_path))
+          expect(modified_digest.base64digest).to_not eq clean_digest.base64digest
+ 
+          Service.run("script update go2 --force")
+ 
+          updated_digest = Digest::SHA1.new
+          updated_digest.update(File.read(local_asset_path))
+          expect(updated_digest.base64digest).to eq clean_digest.base64digest
+        end
+      end
+      
+      it "script info" do
+        Service.run("script info noop")
+        info_output = game_output
+        expect(info_output).to include("noop (repo: elanthia-online, modified:")
+        Service.run("repo add archive https://archive.lich.elanthia.online")
+        # now two repos advertise noop, so it should error
+        expect {Service.run("script info noop")}
+          .to raise_error(Jinx::Error, 
+            %r[more than one repo has asset\(noop.lic\)])
+  
+        expect {Service.run("script info noop --repo=core")}
+          .to raise_error(Jinx::Error, 
+            %r[repo\(core\) does not advertise asset\(noop.lic\)])
+        game_output # clear
+        # make sure it checks the elanthia-online repo
+        Service.run("script info noop --repo=elanthia-online")
+        info_output = game_output
+        expect(info_output).to include("noop (repo: elanthia-online, modified:")
+        # make sure it checks the archive repo
+        Service.run("script info noop --repo=archive")
+        info_output = game_output
+        expect(info_output).to include("noop (repo: archive, modified:")
+      end
+
+      it "script search" do
+        Service.run("script search noop")
+        search_output = game_output
+        expect(search_output).to include("found 1 match")
+        Service.run("script search asdfasdfjahksdkfajsdhfka")
+        search_output = game_output
+        expect(search_output).to include("found 0 matches")
+        Service.run("script search noop")
+        search_output = game_output
+        expect(search_output).to include("found 1 match")
+        Service.run("repo add archive https://archive.lich.elanthia.online")
+        # regex search
+        Service.run("script search ^noop.lic")
+        search_output = game_output
+        expect(search_output).to include("found 2 matches")
+        # repo specific search
+        Service.run("script search ^noop.lic --repo=archive")
+        search_output = game_output
+        expect(search_output).to include("found 1 match")
+        expect(search_output).to include("archive>")
+      end
     end
 
     describe "data" do
@@ -393,6 +405,14 @@ module Jinx
         output = game_output
         expect(output).to include("data:")
         expect(output).to include("spell-list.xml")
+      end
+
+      it "will not install/update data when using script option" do
+        expect {Service.run("script install spell-list.xml")}
+          .to raise_error(Jinx::Error, /Attempted to download/)
+
+        expect {Service.run("script update spell-list.xml")}
+          .to raise_error(Jinx::Error, /Attempted to download/)
       end
     end
 
