@@ -96,8 +96,8 @@ migrate :skin, :furrier do
   insert(:exclude, %{undansormr scale})
   insert(:exclude, %{bundle of undansormr scales})
   
-  insert(:name, %{woolly mastodon trunk}}
-  insert(:name, %{mastodon trunk}}
-  insert(:exclude, %{mastodon trunk}}
-  insert(:exclude, %{bundle of woolly mastodon trunk}}
+  insert(:name, %{woolly mastodon trunk})
+  insert(:name, %{mastodon trunk})
+  insert(:exclude, %{mastodon trunk})
+  insert(:exclude, %{bundle of woolly mastodon trunk})
 end
