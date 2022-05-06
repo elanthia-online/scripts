@@ -216,7 +216,6 @@ describe GameObj do
         %{stone heart},
         %{striped relnak sail},
         %{swamp troll scalp},
-        %{tawny brindlecat hide},
         %{tegursh claw},
         %{tegu tailspike},
         %{thorn-ridden appendage},
@@ -324,6 +323,7 @@ describe GameObj do
     describe "bundle skin oddities - recognize single skin, but not bundle" do
       [
         %{elongated triton spine},
+        %{tawny brindlecat hide},
         %{iridescent triton hide},
         %{soft red firebird feather},
         %{curved gold-flecked claw},
@@ -353,6 +353,7 @@ describe GameObj do
         %{triton spine},
         %{triton hide},
         %{red firebird feather},
+        %{brindlecat hide},
         %{gold-flecked claw},
       ].each do |skin_name|
         it "doesn't recognizes single #{skin_name} as a skin" do
