@@ -65,6 +65,7 @@ migrate :gem, :gemshop do
   insert(:name, %{shard of streaked blue spectrolite})
   insert(:name, %{silver-hite palladium nugget})
   insert(:name, %{silvery nimbus opal})
+  insert(:name, %{small flaxen citrine})
   insert(:name, %{some dark ivory aranthium-bloom})
   insert(:name, %{stark white snowstone})
   insert(:name, %{teal chrome diopside})
