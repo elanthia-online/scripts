@@ -18,5 +18,5 @@ migrate :skin, :furrier do
   
   insert(:name, %{brindlecat hide})
   insert(:exclude, %{brindlecat hide})
-  insert(:exclude, %{bundle of brindlecat hides})
+  insert(:exclude, %{bundle of tawny brindlecat hides})
 end
