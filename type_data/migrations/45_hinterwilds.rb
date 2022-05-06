@@ -31,6 +31,7 @@ migrate :gem, :gemshop do
   insert(:name, %{bluish black razern-bloom})
   insert(:name, %{carved basalt teardrop})
   insert(:name, %{chunk of pale marble})
+  insert(:name, %{chunk of ruddy bauxite})
   insert(:name, %{cylindrical red beryl})
   insert(:name, %{dark ivory aranthium-bloom})
   insert(:name, %{deep red-violet garnet})
