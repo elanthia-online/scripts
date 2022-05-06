@@ -94,9 +94,9 @@ migrate :skin, :furrier do
   insert(:exclude, %{bundle of inky black valravn plume})
 
   insert(:name, %{handful of undansormr scales})
-  insert(:name, %{undansormr scale})
-  insert(:exclude, %{undansormr scale})
-  insert(:exclude, %{bundle of undansormr scales})
+  insert(:name, %{undansormr scales})
+  insert(:exclude, %{undansormr scales})
+  insert(:exclude, %{bundle of handful of undansormr scales})
   
   insert(:name, %{woolly mastodon trunk})
   insert(:name, %{mastodon trunk})
