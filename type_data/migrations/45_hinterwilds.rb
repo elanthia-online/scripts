@@ -65,6 +65,7 @@ migrate :gem, :gemshop do
   insert(:name, %{shard of streaked blue spectrolite})
   insert(:name, %{silver-hite palladium nugget})
   insert(:name, %{silvery nimbus opal})
+  insert(:name, %{small flaxen citrine})
   insert(:name, %{some dark ivory aranthium-bloom})
   insert(:name, %{stark white snowstone})
   insert(:name, %{teal chrome diopside})
@@ -93,9 +94,9 @@ migrate :skin, :furrier do
   insert(:exclude, %{bundle of inky black valravn plume})
 
   insert(:name, %{handful of undansormr scales})
-  insert(:name, %{undansormr scale})
-  insert(:exclude, %{undansormr scale})
-  insert(:exclude, %{bundle of undansormr scales})
+  insert(:name, %{undansormr scales})
+  insert(:exclude, %{undansormr scales})
+  insert(:exclude, %{bundle of handful of undansormr scales})
   
   insert(:name, %{woolly mastodon trunk})
   insert(:name, %{mastodon trunk})
