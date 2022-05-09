@@ -12,6 +12,7 @@ migrate :undead, :aggressive_npc, :boon do
 end
 
 migrate :skin, :furrier do
+  create_key(:exclude)
   insert(:name, %{curved black claw})
   insert(:name, %{black claw})
   insert(:exclude, %{black claw})
