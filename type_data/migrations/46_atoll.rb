@@ -13,6 +13,17 @@ end
 
 migrate :skin, :furrier do
   insert(:name, %{curved black claw})
+  insert(:name, %{black claw})
+  insert(:exclude, %{black claw})
+  insert(:exclude, %{bundle of curved black claw})
+
   insert(:name, %{darkened triton hide})
+  insert(:name, %{triton hide})
+  insert(:exclude, %{triton hide})
+  insert(:exclude, %{bundle of darkened triton hide})
+
   insert(:name, %{thick triton spine})
+  insert(:name, %{triton spine})
+  insert(:exclude, %{triton spine})
+  insert(:exclude, %{bundle of thick triton spine})
 end
