@@ -1,4 +1,4 @@
-migrate :aggressive_npc do
+migrate :aggressive_npc, :boon do
   insert(:name, %{triton assassin})
   insert(:name, %{triton brawler})
   insert(:name, %{triton fanatic})
@@ -6,7 +6,7 @@ migrate :aggressive_npc do
   insert(:name, %{triton warlock})
 end
 
-migrate :undead, :aggressive_npc do
+migrate :undead, :aggressive_npc, :boon do
   insert(:name, %{ethereal triton psionicist})
   insert(:name, %{spectral triton protector})
 end
