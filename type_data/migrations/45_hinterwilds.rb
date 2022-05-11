@@ -103,3 +103,7 @@ migrate :skin, :furrier do
   insert(:exclude, %{mastodon trunk})
   insert(:exclude, %{bundle of woolly mastodon trunk})
 end
+
+migrate :uncommon do
+  insert(:name, %{stygian valravn quill})
+end
