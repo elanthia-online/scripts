@@ -15,6 +15,10 @@ migrate :aggressive_npc do
   insert(:name, %{tattooed gigas berserker})
 end
 
+migrate :boon do
+  insert(:exclude, %{tattooed gigas berserker})
+end
+
 migrate :undead, :aggressive_npc do
   insert(:name, %{eyeless black valravn})
   insert(:name, %{shining winged disir})
