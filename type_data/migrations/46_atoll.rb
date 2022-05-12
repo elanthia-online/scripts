@@ -6,14 +6,12 @@ migrate :aggressive_npc, :boon do
   insert(:name, %{triton warlock})
 end
 
-migrate :undead, :aggressive_npc do
-  insert(:name, %{ethereal triton psionicist})
-  insert(:name, %{spectral triton protector})
+migrate :undead, :aggressive_npc, :boon do
+  insert(:name, %{triton psionicist})
+  insert(:name, %{triton protector})
 end
 
 migrate :boon do
-  insert(:name, %{triton psionicist})
-  insert(:name, %{triton protector})
   insert(:exclude, %{ethereal triton psionicist})
 end
 
