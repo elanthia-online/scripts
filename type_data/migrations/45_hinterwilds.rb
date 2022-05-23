@@ -1,7 +1,9 @@
 migrate :aggressive_npc do
+  insert(:name, %{azure-scaled cold wyrm})
   insert(:name, %{behemothic gorefrost golem})
   insert(:name, %{bloody halfling cannibal})
   insert(:name, %{brawny gigas shield-maiden})
+  insert(:name, %{cinereous chthonian sybil})
   insert(:name, %{colossal boreal undansormr})
   insert(:name, %{flayed gigas disciple})
   insert(:name, %{grim gigas skald})
@@ -10,6 +12,7 @@ migrate :aggressive_npc do
   insert(:name, %{niveous giant warg})
   insert(:name, %{quivering sanguine ooze})
   insert(:name, %{savage fork-tongued wendigo})
+  insert(:name, %{snowy warg packmother})
   insert(:name, %{squamous reptilian mutant})
   insert(:name, %{stunted halfling bloodspeaker})
   insert(:name, %{tattooed gigas berserker})
