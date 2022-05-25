@@ -20,6 +20,9 @@
     - removed tryin to phase a box in a disk, that doesn't work
     - fixed bug in furrier selling routine
     - added support for separating and selling pelt bundles for bounties
+    - reworked some selling logic to reduce number of container checks
+    - added a check to address "...wait" performance lag
+    - moved ;eloot pool to it's own method
   
   v1.3.4 (2022-05-16)
     - corrected some messaging in loot_bag method
@@ -922,6 +925,7 @@ module ELoot
         /Sliding the lever on the side/i,
         /You rub your hand/i,
         /There doesn't seem to be any way/i,
+        /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i,
       )
       @needs_closed = Regexp.union(
         /You throw back/i,
@@ -967,13 +971,9 @@ module ELoot
       }
     
       #Add the skin weapons & sheath if set
-     # @ready_list.store("skin_weapon", items.find { |i| i.type =~/weapon/ && i.name =~ /#{@settings[:skin_weapon]}/ if !@settings[:skin_weapon].empty? && !@settings[:skin_weapon].nil?})
-     # @ready_list.store("skin_blunt", items.find { |i| i.type =~/weapon/ && i.name =~ /#{@settings[:skin_weapon_blunt]}/ if !@settings[:skin_weapon_blunt].empty? && !@settings[:skin_weapon_blunt].nil?})
       @ready_list.store("skin_sheath", items.find { |i| i.name =~ /#{@settings[:skin_sheath]}/ if !@settings[:skin_sheath].empty? && !@settings[:skin_sheath].nil?})
       @ready_list.store("skin_sheath_blunt", items.find { |i| i.name =~ /#{@settings[:skin_sheath_blunt]}/ if !@settings[:skin_sheath_blunt].empty? && !@settings[:skin_sheath_blunt].nil?})
-      
-     
-      
+          
       @ready_list.delete("")
    
       #Finding the Stow list
@@ -1452,7 +1452,7 @@ module ELoot
         #we had to open it so lets remember that
         @sell_containers.push(container) unless @sell_containers.include?(container) 
       end
-    
+       
     end
   
     def self.close_container(bag)    
@@ -1523,7 +1523,7 @@ module ELoot
 
     def self.open_loot_containers(item)
       #Method intended for opening containers that will receive loot from the loot room or loot item command
-
+      ELoot.msg("debug", " Start of open_loot_containers(item)")
       return unless ELoot.data.settings[:keep_closed]
     
       Inventory.open_single_container(ELoot.data.sacks["default"])
@@ -1541,10 +1541,21 @@ module ELoot
     end
   
     def self.open_single_container(sack)
- 
+      return if sack.nil? || sack.empty?
       container = sack.class == GameObj ? sack : ELoot.data.sacks[sack]
-      
-      lines = ELoot.silent_command("open ##{container.id}",ELoot.data.silent_open) 
+      ELoot.msg("debug", " open_single_container(sack): before open sack - #{sack} container: #{container}")
+      lines = []
+      loop {
+        lines = ELoot.silent_command("open ##{container.id}",ELoot.data.silent_open)
+        ELoot.msg("debug", " open_single_container(sack): open lines - #{lines}")
+        if lines.any? { |l| l =~ /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i }
+          waitrt?
+          next
+        else
+          break
+        end
+      }
+      ELoot.msg("debug", " open_single_container(sack): end of loop")
       if lines.any?{ |line| line =~ ELoot.data.needs_closed }
         @sell_containers.push(container) unless @sell_containers.include?(container)
       end  
@@ -1893,9 +1904,7 @@ module ELoot
         Sell.save_trash_box(box)
         return 
       end
-      #Open sacks for looting the box
-      Inventory.open_loot_containers(objs)
-      
+           
       #If handled, we reject them since they're already looted.
       types = ["box", "clothing", "collectible", "cursed", "jewelry"]
       objs = objs.reject do |thing|
@@ -2271,27 +2280,31 @@ module ELoot
     
       #Save the box if we want to sell it
       if ELoot.data.settings[:sell_loot_types].include?("box") && box.contents.empty? && box.name =~ /gold|mithril|silver/
+        ELoot.msg("debug", " save_trash_box(box): inside first if")
         Inventory.single_drag(box,false)
         return
       end
       
+      ELoot.msg("debug", " save_trash_box(box): looking for a trashcan")
       trash = ELoot.find_trash
       
       if trash.nil?
         fput("drop ##{box.id}")
       else
-        2.times do
-          if [GameObj.right_hand.id, GameObj.left_hand.id].include?(box.id)
-            fput("put ##{box.id} in ##{trash.id}")
-            sleep(0.5)
+        ELoot.msg("debug", " save_trash_box(box): putting it in trash")
+        #use a loop, dothistimeout and a timer - getting stuck with a ...wait after getting coins
+        t = Time.now + 3
+        loop {
+          dothistimeout "put ##{box.id} in ##{trash.id}", 1, /As you place|If you wish to continue/
+          if ![GameObj.right_hand.id, GameObj.left_hand.id].include?(box.id) || Time.now > t
+            break
           end       
-        end
-         
+        }    
       end
 
+     
       fput("drop ##{box.id}") if [GameObj.right_hand.id, GameObj.left_hand.id].include?(box.id)
-    
-    
+      
     end
      
     def self.dump_herbs_junk
@@ -2844,6 +2857,25 @@ module ELoot
           
     end
 
+    def self.pool
+    
+      #Make sure we can see all the containers
+      ELoot.data.sacks.keys.each{ |item|
+        Inventory.check_sell_container(item)      
+      }
+    
+      room = Room.current.id
+      ELoot.disk_usage 
+      boxes = ELoot.find_boxes
+      ELoot.data.right_hand = GameObj.right_hand
+      ELoot.data.left_hand = GameObj.left_hand
+      Inventory.free_hands(both: true)
+      Sell.locksmith_pool(boxes)
+      ELoot.go2(room)
+      Inventory.return_hands
+       
+    end
+
     def self.sell
     
       $sell_ignore ||= Array.new
@@ -3047,15 +3079,7 @@ when 'sell'
   ELoot.sell
   ELoot.go2(room)
 when 'pool'
-  room = Room.current.id
-  ELoot.disk_usage 
-  boxes = ELoot.find_boxes
-  ELoot.data.right_hand = GameObj.right_hand
-  ELoot.data.left_hand = GameObj.left_hand
-  ELoot::Inventory.free_hands(both: true)
-  ELoot::Sell.locksmith_pool(boxes)
-  ELoot.go2(room)
-  ELoot::Inventory.return_hands
+  ELoot::Sell.pool
 when 'setup'
   ELoot::Setup.new(ELoot.data.settings).start
   ELoot.load(ELoot.load_profile())
