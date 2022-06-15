@@ -1,4 +1,5 @@
-# shared scripts [![Build Status](https://github.com/elanthia-online/scripts/workflows/Build/badge.svg?branch=master)](https://github.com/elanthia-online/scripts/actions)
+# shared scripts [![Build Status](https://github.com/elanthia-online/scripts/workflows/Build/badge.svg?branch=master)](https://github.com/elanthia-online/scripts/actions) [![Netlify Status](https://api.netlify.com/api/v1/badges/e54c4660-3793-40d5-964b-37cef0fb6a5e/deploy-status)](https://app.netlify.com/sites/goofy-einstein-b3362c/deploys)
+
 
 This project is here to easily automate shared collaboration on scripts for Lich.
 
