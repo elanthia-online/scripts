@@ -8,9 +8,11 @@
     ;tags --rm  [tag1] [tag2]...[tagN]   removes a list of tags from the room
     ;tags --sense                        attempt to use your survival skill to add missing herbs to a room
     ;tags --ls                           shows all current tags for the room
-    ;tags --crawl <location>             crawl an area using survival sense
     ;tags --crawl current                crawl the current area using survival sense
-  
+    ;tags --crawl <location>             crawl an area using survival sense, pauses before moving more than 100 rooms
+    ;tags --crawl <location> confirm     crawl an area and don't pause when moving more than 100 rooms away
+    ;tags --crawl <location> all         crawl an area and don't skip recently sensed rooms
+    
   single tag operations:
     ;tags + [tag]                        add a single tag, no need to use quotes
     ;tags - [tag]                        remove a single tag, no need to use quotes
@@ -22,10 +24,22 @@
   Required: Lich 4.3.12
   Tags: tags
   Author: Ondreian
-
+  Contibutors: Xanlin
+  Version: 1.3.1
 
 =end
+=begin
+  Version: 1.3.1 (2022-09-12): Xanlin: added uniq and compact to tags
+  Version: 1.3.0 (2022-09-12): Xanlin:
+    - added planewalker option, just keeps crawling, less messaging.  Still some work to do before adding to usage.
+  Version: 1.2.0 (2022-09-09): Xanlin:
+    - added pause for traveling over 100 rooms, e.g. 'the grasslands' is both near the Landing, and a location near Ta'Vaalor.
+    - added skipping/not skipping sensing rooms that have already been done this month/time of day, helpful if resuming from partial completion
+    - when sensed, removes old meta tags for a room with the same time of day
+  Version: 1.1.0 (2022-08-05): Xanlin:
+    - added forage sense tags, time of day checking
 
+=end
 module Tags
   vars = Script.current.vars[1..-1]
   type, *tags = vars
@@ -36,9 +50,17 @@ module Tags
   SENSE       = %{--sense}
   CRAWL       = %{--crawl}
   TIME_OF_DAY = %{--time}
+  PLANEWALKER = %{--planewalker}
   ADD_ONE     = %{+}
   REMOVE_ONE  = %{-}
-
+  
+  @disable_confirm = false;
+  @skip_sensed = true;
+  @verbose = true;
+  
+  @last_time_of_day = nil;
+  @last_time_of_day_tag = nil;
+  
   def self.log(*messages)
     messages.each do |msg|
       if msg.is_a?(Array)
@@ -48,7 +70,11 @@ module Tags
       end
     end
   end
-
+  
+  @script_name = Script.current.name;
+  def self.anon_hook(prefix = '');now = Time.now;"#{@script_name}::#{prefix}-#{now.tv_sec}.#{now.tv_usec}-#{Random.rand(10000)}";end;
+  def self.dothisquiet(command, timeout=5, start_pattern=/.*?/, quiet = true, end_pattern = /^(?:<popBold\/>)?<prompt/, include_end = false);result = [];name   = self.anon_hook;filter = false;begin;Timeout::timeout(timeout, Interrupt) {DownstreamHook.add(name, proc {|xml|if filter;if xml =~ end_pattern;DownstreamHook.remove(name);filter = false;else;next(nil) if quiet;xml if !quiet;end;elsif xml =~ start_pattern;filter = true;next(nil) if quiet;xml if !quiet;else;next(nil) if xml.strip.length == 0;xml;end;});fput command;until (xml = get) =~ start_pattern; end;result << xml.rstrip;until (xml = get) =~ end_pattern;result << xml.rstrip;end;if include_end;result << xml.rstrip;end;};rescue Interrupt;DownstreamHook.remove(name);nil;end;return result;end;
+  
   def self.time_of_day
     h = {
         "after midnight" => "night",
@@ -62,17 +88,31 @@ module Tags
         }
     daynight = "???"
     pattern = /^Today is/
-    result = dothistimeout "time",3, pattern;
+    #result = dothistimeout "time",3, pattern;
+    save_want_downstream = Script.current.want_downstream;
+    save_want_downstream_xml = Script.current.want_downstream_xml;
+    Script.current.want_downstream = false;
+    Script.current.want_downstream_xml = true;
+    result = dothisquiet("time", 3, pattern, !@verbose).first
+    Script.current.want_downstream_xml = save_want_downstream_xml;
+    Script.current.want_downstream = save_want_downstream;
+
     if result =~ /It is currently (.*?)\./
       c = $1
       daynight = h[c]
     end
+    @last_time_of_day = daynight
     return daynight
   end
   
+  def self.time_of_day_tag();
+    @last_time_of_day_tag = "meta:forage-sensed:#{self.time_of_day}:#{Time.now.utc.strftime("%Y-%m")}";
+    return @last_time_of_day_tag;
+  end;
+  
   def self.list()
     Tags.uniq()
-    _respond "<b>tags: #{Room.current.tags.join(", ")}</b>"
+    Tags.log("tags: #{Room.current.tags.join(", ")}")
     :ok
   end
 
@@ -84,17 +124,18 @@ module Tags
     end
 
     added_tags = Room.current.tags - prev
-    Tags.log(if added_tags.empty?
-      %{no tags were added}
+    if added_tags.empty?
+      Tags.log(%{no tags were added})
     else
-      [%{[Tags.previous] #{prev.join(", ")}},
-       %{[Tags.added] #{added_tags.join(", ")}}
-      ]
-    end)
+      Tags.log(%{[Tags.previous] #{prev.join(", ")}}) if @verbose;
+      Tags.log(%{[Tags.added] #{added_tags.join(", ")}})
+    end
     :ok
   end
 
   def self.remove(*tags)
+    tags_removed = tags & Room.current.tags;
+    Tags.log("removed the following tags: #{tags_removed.join(', ')}") if !tags_removed.empty?
     tags.each do |tag|
       Room.current.tags.delete(tag)
     end
@@ -103,31 +144,65 @@ module Tags
 
   def self.raise_not_enough_survival()
     raise Exception.new <<-ERROR
-      you do not have enough survival for this
+      You do not have enough survival for this.
     ERROR
   end
 
   def self.crawl(location)
-    raise_not_enough_survival() if Skills.survival < 25
+    if location =~ /\bconfirm/i;
+      @disable_confirm = true;
+      location = location.gsub(/[_ -]*disable[_ -]confirm[_-]/i,'');
+    end
+    if location.split(' ')[-1] =~ /^[@!-]*all$/i
+      location = location.split(' ')[0..-2].join(' ');
+      @skip_sensed = false;
+      Tags.log("Will include rooms already marked as forage sensed for this month and time of day.")
+    end
+    raise_not_enough_survival() if Skills.survival < 25;
+    
     location = Room.current.location if location.eql?(%{current})
     anchor = Room.current.id
-    rooms = Map.list.select do |room| room.location.eql?(location) end
-    raise "no rooms found for #{location}" if rooms.empty?
-    Tags.log %{going to crawl #{rooms.size} rooms in 5 seconds}
-    sleep 5
+    bad_tags = ['no-forageables','no-auto-map','closed','duplicate','gone','missing','rewritten']
+    rooms = Map.list.select {|room| 
+      room.location.eql?(location) and (room.tags & bad_tags).empty?
+    }
     room_ids = rooms.map(&:id)
+    (Tags.log("No rooms found for #{location}");return) if rooms.empty?
+    
+    skip_tag = self.time_of_day_tag();
+    if @skip_sensed == true;
+      skip_list = Map.list.select{ |r| r.location.eql?(location) and r.tags.include?(@last_time_of_day_tag) }.map(&:id)
+      if skip_list.size > 0;
+        Tags.log("Skipping #{skip_list.size} room(s) because they are already tagged as being sensed for this month and this time of day.")
+        room_ids = (room_ids - skip_list)
+      end
+      (Tags.log("No rooms left to crawl for #{location}");return) if room_ids.empty?
+    end
+    
+    Tags.log %{Going to crawl #{room_ids.size} rooms in #{location.inspect} starting in 5 seconds.}
+    sleep 5
+    
     until room_ids.empty?
       closest = Room.current.find_nearest(room_ids)
       room_ids.delete(closest)
+      if !@disable_confirm == true
+        path_length = Room.current.path_to(closest).length
+        if Room.current.path_to(closest).length > 100
+          Tags.log("There are approximately #{path_length} rooms between you and #{closest}: #{Room[closest].title[0]}")
+          Tags.log("\nTo continue, unpause the script.  To abort, kill the script.")
+          pause_script
+        end
+      end
       Script.run("go2", closest.to_s)
       Tags.add(*Tags.sense())
+      Tags.remove(*Tags.old_meta())
+      Tags.uniq()
     end
     Script.run("go2", anchor.to_s)
   end
   
   def self.parse_sense(line)
     sense_tags = []
-    #return [] if line.eql?(%{Glancing about, you doubt that anything interesting could be foraged here.})
     if !line.eql?(%{Glancing about, you doubt that anything interesting could be foraged here.}) 
       sense_tags = line
         .gsub("Glancing about, you notice the immediate area should support specimens of ", "")
@@ -135,28 +210,71 @@ module Tags
         .gsub(".", "")
         .split(", ")
     else
-      #sense_tags << "no-forageables" # redundant
+      sense_tags << "no-forageables"
     end
     sense_tags << "meta:forage-sensed"
-    sense_tags << "meta:forage-sensed:#{self.time_of_day}:#{Time.now.strftime("%Y-%m")}"
+    sense_tags << self.time_of_day_tag
     return sense_tags
   end
 
   def self.sense()
     raise_not_enough_survival() if Skills.survival < 25
-    fput "forage sense"
-    while line=get
-      if line=~ %r{^Glancing about}
-        return parse_sense(line)
-      end
-    end
+    #fput "forage sense"
+    #while line=get
+    #  if line=~ %r{^Glancing about}
+    #    return parse_sense(line)
+    #  end
+    #end
+    save_want_downstream = Script.current.want_downstream;
+    save_want_downstream_xml = Script.current.want_downstream_xml;
+    Script.current.want_downstream = false;
+    Script.current.want_downstream_xml = true;
+    line = dothisquiet("forage sense",3,/Glancing about, /, !@verbose).first.gsub(/<[^>]*?>/,'')
+    Script.current.want_downstream_xml = save_want_downstream_xml;
+    Script.current.want_downstream = save_want_downstream;
+    return parse_sense(line)
   end
 
+  def self.old_meta()
+    self.time_of_day_tag if @last_time_of_day_tag.nil?;
+    old_tags =  Room.current.tags.select{ |t| t =~ /meta:forage-sensed:#{@last_time_of_day}/} - [ @last_time_of_day_tag]
+    return old_tags
+  end
+  
   def self.uniq()
     Room.current.tags.uniq!
     :ok
   end
 
+  
+  def self.location_neighbors(location_from)
+    neighbors = []
+    rooms = Map.list.select{|r| r if r.location.eql?(location_from) }
+    rooms.each{ |r| 
+      r.wayto.each { |k,v| 
+        l = Map[k.to_i].location
+        if (!l.nil? and l != false and l != location_from );
+          neighbors << l if !neighbors.include?(l);
+        end
+      }
+    }
+    return neighbors
+  end
+  
+  @queue = [];
+  @visited = [];
+  def self.planewalker()
+    @verbose = false;
+    location = Map.current.location
+    @queue << Map.current.location
+    while !@queue.empty?
+      location = @queue.shift
+      @visited << location
+      self.crawl(location)
+      @queue = (self.location_neighbors(location) | @queue) - @visited - ['the grasslands'];
+    end
+  end
+  
   case type
   when ADD
     Tags.add(*tags) && Tags.list()
@@ -169,30 +287,34 @@ module Tags
   when REMOVE_ONE
     Tags.remove(tags.join(" ")) && Tags.list()
   when SENSE
-    Tags.add(*Tags.sense())
+    Tags.add(*Tags.sense()) 
+    Tags.remove(*Tags.old_meta())
+    Tags.uniq()
   when CRAWL
     Tags.crawl(*tags.join(" "))
+  when PLANEWALKER
+    Tags.planewalker()
   when TIME_OF_DAY
-    echo Tags.time_of_day
+    Tags.log(Tags.time_of_day)
   else
     respond <<-HELP
-      usage:
-
-        ;tags --add [tag1] [tag2]...[tagN]   adds a list of tags to the room
-        ;tags --rm  [tag1] [tag2]...[tagN]   removes a list of tags from the room
-        ;tags --sense                        attempt to use your survival skill to add missing herbs to a room
-        ;tags --ls                           shows all current tags for the room
-        ;tags --crawl <location>             crawl an area using survival sense
-        ;tags --crawl current                crawl the immediate area using survival sense
-      
-      single tag operations:
-        ;tags + [tag]                        add a single tag, no need to use quotes
-        ;tags - [tag]                        remove a single tag, no need to use quotes
-
-      for --add/--rm operations with spaces in the name, you must use quotes
-
-      ;tags --add "small tomato" "onion skin"
-      ;tags --rm "small tomato" "onion skin"
+  usage:
+    ;tags --add [tag1] [tag2]...[tagN]   adds a list of tags to the room
+    ;tags --rm  [tag1] [tag2]...[tagN]   removes a list of tags from the room
+    ;tags --sense                        attempt to use your survival skill to add missing herbs to a room
+    ;tags --ls                           shows all current tags for the room
+    ;tags --crawl current                crawl the current area using survival sense
+    ;tags --crawl <location>             crawl an area using survival sense, pauses before moving more than 100 rooms
+    ;tags --crawl <location> confirm     crawl an area and don't pause when moving more than 100 rooms away
+    ;tags --crawl <location> all         crawl an area and don't skip recently sensed rooms
+    
+  single tag operations:
+    ;tags + [tag]                        add a single tag, no need to use quotes
+    ;tags - [tag]                        remove a single tag, no need to use quotes
+    
+  for --add/--rm operations with spaces in the name, you must use quotes
+    ;tags --add "small tomato" "onion skin"
+    ;tags --rm "small tomato" "onion skin"
     HELP
   end
 end
