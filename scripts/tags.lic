@@ -12,7 +12,8 @@
     ;tags --crawl <location>             crawl an area using survival sense, pauses before moving more than 100 rooms
     ;tags --crawl <location> confirm     crawl an area and don't pause when moving more than 100 rooms away
     ;tags --crawl <location> all         crawl an area and don't skip recently sensed rooms
-    
+    ;tags --list <location>              list rooms for a location, whether to skip or crawl
+
   single tag operations:
     ;tags + [tag]                        add a single tag, no need to use quotes
     ;tags - [tag]                        remove a single tag, no need to use quotes
@@ -25,10 +26,13 @@
   Tags: tags
   Author: Ondreian
   Contibutors: Xanlin
-  Version: 1.3.1
+  Version: 1.4.2
 
 =end
 =begin
+  Version: 1.4.2 (2022-09-22): Xanlin: added exclusion for tables
+  Version: 1.4.1 (2022-09-21): Xanlin: added --api, --list, split crawl into crawl and crawl_rooms, added exclusions/ignore_rooms
+  Version: 1.4.0 (2022-09-14): Xanlin: added diff for forage sense
   Version: 1.3.1 (2022-09-12): Xanlin: added uniq and compact to tags
   Version: 1.3.0 (2022-09-12): Xanlin:
     - added planewalker option, just keeps crawling, less messaging.  Still some work to do before adding to usage.
@@ -45,6 +49,7 @@ module Tags
   type, *tags = vars
 
   ADD         = %{--add}
+  DIFF        = %{--diff}
   REMOVE      = %{--rm}
   LIST        = %{--ls}
   SENSE       = %{--sense}
@@ -53,6 +58,11 @@ module Tags
   PLANEWALKER = %{--planewalker}
   ADD_ONE     = %{+}
   REMOVE_ONE  = %{-}
+  API         = %{--api}
+  LIST_ROOMS  = %{--list}
+  
+  IGNORE_TAGS    = ['no forageables','no-auto-map','closed','duplicate','gone',
+    'missing','rewritten','private property'].sort
   
   @disable_confirm = false;
   @skip_sensed = true;
@@ -148,7 +158,78 @@ module Tags
     ERROR
   end
 
+  def self.list_rooms_print(id, note=nil)
+     r = Room[id]
+     format = "  %-5d  %-9s | %-44s %s"
+     format = "  %-5d  %-9s | %s" if note.nil? 
+     respond format % [id, (r.uid.empty? ? "" : "u#{r.uid.first}"), r.title[0], note.nil? ? "" : "| #{note}" ]
+  end
+  def self.list_rooms(location)
+    location = Room.current.location if location.nil? or location.strip == ""
+    
+    room_ids, ignore_room_ids, skip_list, location = self.crawl_rooms(location);
+    if (room_ids + ignore_room_ids + skip_list).empty?
+      Tags.log("No rooms founds for location: #{location.inspect}.")    
+    end
+
+    Tags.log("Skipping #{skip_list.size} room(s) because they are already tagged as being sensed for this month and this time of day.")
+    if !skip_list.empty?
+      skip_list.each { |id| self.list_rooms_print(id) }
+    end
+    
+    Tags.log("Ignoring #{ignore_room_ids.size} room(s) because they are tagged with at least one of the following: #{IGNORE_TAGS.inspect}.")
+    if !ignore_room_ids.empty?
+      ignore_room_ids.each { |id| self.list_rooms_print(id, (Map[id].tags & IGNORE_TAGS).empty? ? "Table" : (Map[id].tags & IGNORE_TAGS)) }
+    end
+    
+    Tags.log("Remaining #{room_ids.size} rooms in #{location.inspect}:")
+    if !room_ids.empty?
+      room_ids.each { |id| self.list_rooms_print(id) }
+    end
+  end
+  
+  def self.crawl_rooms(location)
+    room_ids = [];
+    skip_list = [];
+    ignore_room_ids = [];
+    
+    location = Map.current.location if location == "current";
+    if !Map.list.find { |r| r.location.eql?(location) }
+      if alt = Map.list.find { |r| r.location =~ /#{location}/i }
+        Tags.log("Exact match for #{location.inspect} not found, using #{alt.location.inspect} instead.")
+        location = alt.location
+      end
+    end
+    
+    room_ids = Map.list.select {|room| 
+      room.location.eql?(location)
+    }.map(&:id)
+    
+    if !room_ids.empty? 
+      if @skip_sensed == true;
+        # remove already sensed rooms
+        skip_tag = self.time_of_day_tag();
+        skip_list = Map.list.select{ |r| r.location.eql?(location) and r.tags.include?(skip_tag) }.map(&:id) - ignore_room_ids
+        if skip_list.size > 0;
+          #Tags.log("Skipping #{skip_list.size} room(s) because they are already tagged as being sensed for this month and this time of day.")
+          room_ids = (room_ids - skip_list)
+        end
+        if room_ids.empty?;
+          #Tags.log("No rooms left to crawl for #{location}")
+        end
+      end
+      # remove bad tags      
+      ignore_room_ids = Map.list.select {|room| 
+        room.location.eql?(location) and (!(room.tags & IGNORE_TAGS).empty? or room.title[0] =~ / Table\]$/)
+      }.map(&:id) - skip_list
+      
+      room_ids = (room_ids - ignore_room_ids) if !ignore_room_ids.empty?
+    end
+    return room_ids, ignore_room_ids, skip_list, location;
+  end
+  
   def self.crawl(location)
+    anchor = Room.current.id
     if location =~ /\bconfirm/i;
       @disable_confirm = true;
       location = location.gsub(/[_ -]*disable[_ -]confirm[_-]/i,'');
@@ -160,30 +241,29 @@ module Tags
     end
     raise_not_enough_survival() if Skills.survival < 25;
     
-    location = Room.current.location if location.eql?(%{current})
-    anchor = Room.current.id
-    bad_tags = ['no-forageables','no-auto-map','closed','duplicate','gone','missing','rewritten']
-    rooms = Map.list.select {|room| 
-      room.location.eql?(location) and (room.tags & bad_tags).empty?
-    }
-    room_ids = rooms.map(&:id)
-    (Tags.log("No rooms found for #{location}");return) if rooms.empty?
+    location = Room.current.location if location.nil? or location.strip == ""
+    room_ids, ignore_room_ids, skip_list, location = self.crawl_rooms(location);
     
-    skip_tag = self.time_of_day_tag();
-    if @skip_sensed == true;
-      skip_list = Map.list.select{ |r| r.location.eql?(location) and r.tags.include?(@last_time_of_day_tag) }.map(&:id)
-      if skip_list.size > 0;
-        Tags.log("Skipping #{skip_list.size} room(s) because they are already tagged as being sensed for this month and this time of day.")
-        room_ids = (room_ids - skip_list)
-      end
-      (Tags.log("No rooms left to crawl for #{location}");return) if room_ids.empty?
+    if room_ids.empty? and skip_list.empty?
+      Tags.log("No rooms found for #{location}.")
+      return
+    elsif room_ids.empty? and (!skip_list.empty? or !ignore_room_ids.empty?)
+      Tags.log("No rooms left to crawl for #{location}.")
+      return
+    elsif !room_ids.empty? 
+      Tags.log("Skipping #{skip_list.size} room(s) because they are already tagged as being sensed for this month and this time of day.") if !skip_list.empty?
+      Tags.log("Ignoring #{ignore_room_ids.size} room(s) because they are tagged with at least one of the following: #{IGNORE_TAGS.inspect}.") if !ignore_room_ids.empty?
+      Tags.log("Going to crawl #{room_ids.size} rooms in #{location.inspect} starting in 5 seconds.")
+      sleep 5
     end
-    
-    Tags.log %{Going to crawl #{room_ids.size} rooms in #{location.inspect} starting in 5 seconds.}
-    sleep 5
     
     until room_ids.empty?
       closest = Room.current.find_nearest(room_ids)
+      if closest.nil?
+        Tags.log("None of the remaining rooms seem to have a path from here to there.")
+        room_ids.each { |id| self.list_rooms_print(id) }
+        break
+      end
       room_ids.delete(closest)
       if !@disable_confirm == true
         path_length = Room.current.path_to(closest).length
@@ -210,7 +290,7 @@ module Tags
         .gsub(".", "")
         .split(", ")
     else
-      sense_tags << "no-forageables"
+      sense_tags << "no forageables"
     end
     sense_tags << "meta:forage-sensed"
     sense_tags << self.time_of_day_tag
@@ -219,12 +299,6 @@ module Tags
 
   def self.sense()
     raise_not_enough_survival() if Skills.survival < 25
-    #fput "forage sense"
-    #while line=get
-    #  if line=~ %r{^Glancing about}
-    #    return parse_sense(line)
-    #  end
-    #end
     save_want_downstream = Script.current.want_downstream;
     save_want_downstream_xml = Script.current.want_downstream_xml;
     Script.current.want_downstream = false;
@@ -245,7 +319,6 @@ module Tags
     Room.current.tags.uniq!
     :ok
   end
-
   
   def self.location_neighbors(location_from)
     neighbors = []
@@ -275,6 +348,28 @@ module Tags
     end
   end
   
+  @gs_interesting_tags = [ "advguard", "advguard2", "advguild", "advpickup", "alchemist", "armorshop", "bakery", "bank", "bardguild", "boutique", "chronomage", "clericguild", "clericshop", "collectibles", "consignment", "empathguild", "exchange", "fletcher", "forge", "furrier", "gemshop", "general store", "herbalist", "inn", "locksmith pool", "locksmith", "mail", "movers", "npccleric", "npchealer", "pawnshop", "postoffice", "rangerguild", "smokeshop", "sorcererguild", "sunfist", "town", "voln", "warriorguild", "weaponshop", "wizardguild"  ]
+  @gs_other_tags = ['urchin-access', 'node','supernode', 'locksmithpool']
+  def self.diff()
+    sense = self.sense();
+    sense.delete_if { |t| t=~ /^meta/i}
+    
+    tags = Map.current.tags.dup;
+    tags.delete_if { |t| t =~ /^(meta|map|urchin)/i }
+    tags = tags - (IGNORE_TAGS - ["no forageables"]) - @gs_interesting_tags - @gs_other_tags
+    same = tags & sense
+    spoof_some = sense.each_with_object([]){|s,a| a << "some #{s}"}
+
+    not_in_sense = tags - sense - spoof_some
+    not_in_tags = sense - tags
+    respond "\nIgnoring these tags: #{Map.current.tags.dup - tags}"
+    respond "\nForage sense(#{sense.size}): #{sense.sort.inspect}"
+    respond "\nIn tags and forage sense (#{same.size}): #{same.inspect}"
+    respond "\nNot in forage sense (#{not_in_sense.size}): #{not_in_sense.sort.inspect}"
+    respond "\nNot in tags (#{not_in_tags.size}): #{not_in_tags.sort.inspect}"
+
+  end
+  
   case type
   when ADD
     Tags.add(*tags) && Tags.list()
@@ -296,6 +391,12 @@ module Tags
     Tags.planewalker()
   when TIME_OF_DAY
     Tags.log(Tags.time_of_day)
+  when DIFF
+    Tags.diff
+  when LIST_ROOMS
+    Tags.list_rooms(*tags.join(" "))
+  when API
+    # nothing
   else
     respond <<-HELP
   usage:
@@ -307,6 +408,7 @@ module Tags
     ;tags --crawl <location>             crawl an area using survival sense, pauses before moving more than 100 rooms
     ;tags --crawl <location> confirm     crawl an area and don't pause when moving more than 100 rooms away
     ;tags --crawl <location> all         crawl an area and don't skip recently sensed rooms
+    ;tags --list <location>              list rooms for a location, whether to skip or crawl
     
   single tag operations:
     ;tags + [tag]                        add a single tag, no need to use quotes
