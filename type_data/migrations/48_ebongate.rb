@@ -2,7 +2,7 @@ create_table "event:ebongate", keys: [:name]
 create_table "customization:death", keys: [:name]
 create_table "customization:misc", keys: [:name]
 create_table "customization:spellprep", keys: [:name]
-  
+
 migrate "event:ebongate", "customization:death" do
   insert(:name, %{bright orange circular tombstone})
   insert(:name, %{broken clover\-shaped tombstone})
@@ -179,7 +179,57 @@ migrate :ebongate, :valuable do
   insert(:name, %{wedge of polychromatic crowstone})
   insert(:name, %{wing\-shaped piece of silver crowstone})
 end
-  
+
+migrate :gem do
+  insert(:exclude, %{argent crystal\-studded scoria})
+  insert(:exclude, %{asymmetrical ink black crowstone})
+  insert(:exclude, %{berry pink lace agate})
+  insert(:exclude, %{blush\-hearted violet dusk opal})
+  insert(:exclude, %{chunk of abyssal onyx})
+  insert(:exclude, %{cobalt\-laced deep magenta everine})
+  insert(:exclude, %{columnar coral\-tinged auroraline})
+  insert(:exclude, %{crimson\-hazed silvery green everine})
+  insert(:exclude, %{crystal\-edged twilight blue everine})
+  insert(:exclude, %{crystal\-rife pitch black scoria})
+  insert(:exclude, %{crystallized dark grape amethyst})
+  insert(:exclude, %{ebon\-clouded crimson phantom sapphire})
+  insert(:exclude, %{ether\-warped lavender soulstone})
+  insert(:exclude, %{ether\-warped virid soulstone})
+  insert(:exclude, %{fiery\-veined cobalt fox agate})
+  insert(:exclude, %{full\-petaled azurite rosette})
+  insert(:exclude, %{hyacinth violet opal arcrose})
+  insert(:exclude, %{indigo\-cored ultramarine fluorite})
+  insert(:exclude, %{iridescent geode druzy stone})
+  insert(:exclude, %{iridescent peacock blue crowstone})
+  insert(:exclude, %{misshapen sunset crater agate})
+  insert(:exclude, %{oval of black lightning opal})
+  insert(:exclude, %{particolored astral sapphire})
+  insert(:exclude, %{piece of pitted grey scoria})
+  insert(:exclude, %{pillar of honeycomb jasper})
+  insert(:exclude, %{pink\-cored cerulean opal arcrose})
+  insert(:exclude, %{red\-blossomed tangerine everine})
+  insert(:exclude, %{rose\-hearted pale violet everine})
+  insert(:exclude, %{ruby crystal\-strewn scoria})
+  insert(:exclude, %{rutilated rainbow crystal})
+  insert(:exclude, %{shard of dark pink\-on\-violet alexandrite})
+  insert(:exclude, %{shard of gold\-webbed red obsidian})
+  insert(:exclude, %{slice of golden requiem sunstone})
+  insert(:exclude, %{slice of grey requiem dreamstone})
+  insert(:exclude, %{small azure\-banded auroraline})
+  insert(:exclude, %{some raw green velvet malachite})
+  insert(:exclude, %{spectral dark silver soulstone})
+  insert(:exclude, %{spectral ultramarine soulstone})
+  insert(:exclude, %{spherical fuchsia\-tinted auroraline})
+  insert(:exclude, %{spray of lustrous white scolecite})
+  insert(:exclude, %{sunrise\-hued white opal arcrose})
+  insert(:exclude, %{tumbled lilac\-striated auroraline})
+  insert(:exclude, %{umber\-orbed ebony fox agate})
+  insert(:exclude, %{virid\-webbed dark teal everine})
+  insert(:exclude, %{watery cyan\-hued opal arcrose})
+  insert(:exclude, %{wedge of polychromatic crowstone})
+  insert(:exclude, %{wing\-shaped piece of silver crowstone})
+end
+
 migrate "junk" do
   insert(:name, %{bits of blue yarn})
   insert(:name, %{broken algae-stained wand})
