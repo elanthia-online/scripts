@@ -26,6 +26,7 @@ describe GameObj do
     describe "junk specific to certain creatures" do
       [
         %{hollow smooth black glaes},
+        %{crude roa'ter-toothed necklace},
       ].each do |junk_name|
         it "recognizes critter dropped #{junk_name} as junk" do
           junk = GameObjFactory.item_from_name(junk_name)
