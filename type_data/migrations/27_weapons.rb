@@ -84,6 +84,7 @@ migrate :weapon, :pawnshop do
   insert(:noun, %{kunai})
   insert(:noun, %{langseax})
   insert(:noun, %{lisan})
+  insert(:noun, %{longbow})
   insert(:noun, %{longhammer})
   insert(:noun, %{machera})
   insert(:noun, %{magari-yari})
