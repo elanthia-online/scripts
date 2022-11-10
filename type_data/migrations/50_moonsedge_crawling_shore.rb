@@ -23,5 +23,8 @@ end
 
 #Crawling Shore Creatures
 migrate :aggressive_npc do
+  insert(:name, %{bony Tenthsworn occultist})
   insert(:name, %{desiccated half-krolvin strigoi})
+  insert(:name, %{gaunt feral selkie})
+  insert(:name, %{grisly corpse hulk})
 end
