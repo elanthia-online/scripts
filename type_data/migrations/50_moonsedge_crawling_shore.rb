@@ -1,0 +1,14 @@
+#Moonsedge Creatures
+migrate :undead, :aggressive_npc do
+  insert(:name, %{ashen patrician vampire})
+  insert(:name, %{cadaverous tatterdemalion ghast})
+  insert(:name, %{flickering mist-wreathed banshee})
+  insert(:name, %{horned basalt grotesque})
+  insert(:name, %{infernal death knight})
+  insert(:name, %{smouldering skeletal dreadsteed})
+end
+
+#Crawling Shore Creatures
+migrate :aggressive_npc do
+  insert(:name, %{desiccated half-krolvin strigoi})
+end
