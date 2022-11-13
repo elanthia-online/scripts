@@ -12,6 +12,10 @@ migrate :undead, :aggressive_npc,:noncorporeal do
   insert(:name, %{gaudy phantasmic conjurer})
 end
 
+migrate :boon do
+  insert(:exclude, %{flickering mist-wreathed banshee})
+end
+
 migrate :skin, :furrier do
   create_key(:exclude)
   
