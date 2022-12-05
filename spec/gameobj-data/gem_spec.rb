@@ -68,6 +68,7 @@ describe GameObj do
         %{piece of pink marble},
         %{piece of red jasper},
         %{piece of rose quartz},
+        %{piece of rosespar},
         %{piece of spiderweb obsidian},
         %{piece of white jade},
         %{piece of white marble},
@@ -121,7 +122,6 @@ describe GameObj do
     describe "valuables" do
       [
         %{piece of petrified haon},
-        %{piece of rosespar},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
           expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
