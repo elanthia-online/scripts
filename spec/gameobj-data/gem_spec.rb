@@ -491,6 +491,7 @@ describe GameObj do
         %{egg cowrie shell},
         %{fluted limpet shell},
         %{iridescent piece of mother-of-pearl},
+        %{piece of iridescent mother-of-pearl},
         %{king helmet shell},
         %{lavender nassa shell},
         %{lynx cowrie shell},
