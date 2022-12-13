@@ -10,6 +10,7 @@ migrate "event:duskruin" do
   insert(:name, %{silver raffle token})
   insert(:name, %{silvery white glass sphere})
   insert(:name, %{vibrant yellow glass sphere})
+  insert(:name, %{flat etched stone})
 end
 
 migrate :weapon do
@@ -24,4 +25,12 @@ end
 
 migrate :uncommon do
   insert(:exclude, %{strand of veniom thread})
+end
+
+migrate :gem do
+  insert(:exclude, %{flat etched stone})
+end
+
+migrate :gemshop do
+  insert(:exclude, %{flat etched stone})
 end
