@@ -396,7 +396,7 @@ if (RUBY_PLATFORM =~ /mingw|win/i) and (RUBY_PLATFORM !~ /darwin/i)
          if not caller.any? { |c| c =~ /eval|run/ }
             r = Win32.GetModuleFileName
             if r[:return] > 0
-               if File.exist?(r[:lpFilename])
+               if File.exists?(r[:lpFilename])
                   Win32.ShellExecuteEx(:lpVerb => 'runas', :lpFile => r[:lpFilename], :lpParameters => "#{File.expand_path($PROGRAM_NAME)} shellexecute #{[Marshal.dump(args)].pack('m').gsub("\n",'')}")
                end
             end
@@ -422,13 +422,13 @@ else
    else
       $wine_prefix = nil
    end
-   if $wine_bin and File.exist?($wine_bin) and File.file?($wine_bin) and $wine_prefix and File.exist?($wine_prefix) and File.directory?($wine_prefix)
+   if $wine_bin and File.exists?($wine_bin) and File.file?($wine_bin) and $wine_prefix and File.exists?($wine_prefix) and File.directory?($wine_prefix)
       module Wine
          BIN = $wine_bin
          PREFIX = $wine_prefix
          def Wine.registry_gets(key)
             hkey, subkey, thingie = /(HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)\\(.+)\\([^\\]*)/.match(key).captures # fixme: stupid highlights ]/
-            if File.exist?(PREFIX + '/system.reg')
+            if File.exists?(PREFIX + '/system.reg')
                if hkey == 'HKEY_LOCAL_MACHINE'
                   subkey = "[#{subkey.gsub('\\', '\\\\\\')}]"
                   if thingie.nil? or thingie.empty?
@@ -457,7 +457,7 @@ else
          end
          def Wine.registry_puts(key, value)
             hkey, subkey, thingie = /(HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)\\(.+)\\([^\\]*)/.match(key).captures # fixme ]/ 
-            if File.exist?(PREFIX)
+            if File.exists?(PREFIX)
                if thingie.nil? or thingie.empty?
                   thingie = '@'
                else
@@ -500,7 +500,7 @@ rescue LoadError
          r = Win32.GetModuleFileName
          if r[:return] > 0
             ruby_bin_dir = File.dirname(r[:lpFilename])
-            if File.exist?("#{ruby_bin_dir}\\gem.bat")
+            if File.exists?("#{ruby_bin_dir}\\gem.bat")
                verb = (Win32.isXP? ? 'open' : 'runas')
                # fixme: using --source http://rubygems.org to avoid https because it has been failing to validate the certificate on Windows
                r = Win32.ShellExecuteEx(:fMask => Win32::SEE_MASK_NOCLOSEPROCESS, :lpVerb => verb, :lpFile => "#{ruby_bin_dir}\\#{gem_file}", :lpParameters => 'install sqlite3 --source http://rubygems.org --no-ri --no-rdoc --version 1.3.13')
@@ -518,7 +518,7 @@ rescue LoadError
                   r = Win32.MessageBox(:lpText => "When the installer is finished, click OK to restart Lich.", :lpCaption => "Lich v#{LICH_VERSION}", :uType => Win32::MB_OKCANCEL)
                end
                if r == Win32::IDIOK
-                  if File.exist?("#{ruby_bin_dir}\\rubyw.exe")
+                  if File.exists?("#{ruby_bin_dir}\\rubyw.exe")
                      Win32.ShellExecute(:lpOperation => 'open', :lpFile => "#{ruby_bin_dir}\\rubyw.exe", :lpParameters => "\"#{File.expand_path($PROGRAM_NAME)}\"")
                   else
                      Win32.MessageBox(:lpText => "error: failed to find rubyw.exe; can't restart Lich for you", :lpCaption => "Lich v#{LICH_VERSION}", :uType => (Win32::MB_OK | Win32::MB_ICONERROR))
@@ -554,9 +554,9 @@ if ((RUBY_PLATFORM =~ /mingw|win/i) and (RUBY_PLATFORM !~ /darwin/i)) or ENV['DI
                r = Win32.GetModuleFileName
                if r[:return] > 0
                   ruby_bin_dir = File.dirname(r[:lpFilename])
-                  if File.exist?("#{ruby_bin_dir}\\gem.cmd")
+                  if File.exists?("#{ruby_bin_dir}\\gem.cmd")
                   gem_file = 'gem.cmd'
-                  elsif File.exist?("#{ruby_bin_dir}\\gem.bat")
+                  elsif File.exists?("#{ruby_bin_dir}\\gem.bat")
                      gem_file = 'gem.bat'
                   else
                      gem_file = nil
@@ -578,7 +578,7 @@ if ((RUBY_PLATFORM =~ /mingw|win/i) and (RUBY_PLATFORM !~ /darwin/i)) or ENV['DI
                         r = Win32.MessageBox(:lpText => "When the installer is finished, click OK to restart Lich.", :lpCaption => "Lich v#{LICH_VERSION}", :uType => Win32::MB_OKCANCEL)
                      end
                      if r == Win32::IDIOK
-                        if File.exist?("#{ruby_bin_dir}\\rubyw.exe")
+                        if File.exists?("#{ruby_bin_dir}\\rubyw.exe")
                            Win32.ShellExecute(:lpOperation => 'open', :lpFile => "#{ruby_bin_dir}\\rubyw.exe", :lpParameters => "\"#{File.expand_path($PROGRAM_NAME)}\"")
                         else
                            Win32.MessageBox(:lpText => "error: failed to find rubyw.exe; can't restart Lich for you", :lpCaption => "Lich v#{LICH_VERSION}", :uType => (Win32::MB_OK | Win32::MB_ICONERROR))
@@ -1020,41 +1020,41 @@ module Lich
             windir = (ENV['windir'] || ENV['SYSTEMROOT'] || 'c:\windows')
             hosts_path.gsub('%SystemRoot%', windir)
             hosts_file = "#{hosts_path}\\hosts"
-            if File.exist?(hosts_file)
+            if File.exists?(hosts_file)
                return (@@hosts_file = hosts_file)
             end
          end
-         if (windir = (ENV['windir'] || ENV['SYSTEMROOT'])) and File.exist?("#{windir}\\system32\\drivers\\etc\\hosts")
+         if (windir = (ENV['windir'] || ENV['SYSTEMROOT'])) and File.exists?("#{windir}\\system32\\drivers\\etc\\hosts")
             return (@@hosts_file = "#{windir}\\system32\\drivers\\etc\\hosts")
          end
          for drive in ['C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z']
             for windir in ['winnt','windows']
-               if File.exist?("#{drive}:\\#{windir}\\system32\\drivers\\etc\\hosts")
+               if File.exists?("#{drive}:\\#{windir}\\system32\\drivers\\etc\\hosts")
                   return (@@hosts_file = "#{drive}:\\#{windir}\\system32\\drivers\\etc\\hosts")
                end
             end
          end
       else # Linux/Mac
-         if File.exist?('/etc/hosts')
+         if File.exists?('/etc/hosts')
             return (@@hosts_file = '/etc/hosts')
-         elsif File.exist?('/private/etc/hosts')
+         elsif File.exists?('/private/etc/hosts')
             return (@@hosts_file = '/private/etc/hosts')
          end
       end
       return (@@hosts_file = false)
    end
    def Lich.modify_hosts(game_host)
-      if Lich.hosts_file and File.exist?(Lich.hosts_file)
+      if Lich.hosts_file and File.exists?(Lich.hosts_file)
          at_exit { Lich.restore_hosts }
          Lich.restore_hosts
-         if File.exist?("#{Lich.hosts_file}.bak")
+         if File.exists?("#{Lich.hosts_file}.bak")
             return false
          end
          begin
             # copy hosts to hosts.bak
             File.open("#{Lich.hosts_file}.bak", 'w') { |hb| File.open(Lich.hosts_file) { |h| hb.write(h.read) } }
          rescue
-            File.unlink("#{Lich.hosts_file}.bak") if File.exist?("#{Lich.hosts_file}.bak")
+            File.unlink("#{Lich.hosts_file}.bak") if File.exists?("#{Lich.hosts_file}.bak")
             return false
          end
          File.open(Lich.hosts_file, 'a') { |f| f.write "\r\n127.0.0.1\t\t#{game_host}" }
@@ -1064,10 +1064,10 @@ module Lich
       end
    end
    def Lich.restore_hosts
-      if Lich.hosts_file and File.exist?(Lich.hosts_file)      
+      if Lich.hosts_file and File.exists?(Lich.hosts_file)      
          begin
             # fixme: use rename instead?  test rename on windows
-            if File.exist?("#{Lich.hosts_file}.bak")
+            if File.exists?("#{Lich.hosts_file}.bak")
                File.open("#{Lich.hosts_file}.bak") { |infile|
                   File.open(Lich.hosts_file, 'w') { |outfile|
                      outfile.write(infile.read)
@@ -1700,10 +1700,10 @@ class XMLParser
             if @game.nil? or @game.empty?
                @game = 'unknown'
             end
-            unless File.exist?("#{DATA_DIR}/#{@game}")
+            unless File.exists?("#{DATA_DIR}/#{@game}")
                Dir.mkdir("#{DATA_DIR}/#{@game}")
             end
-            unless File.exist?("#{DATA_DIR}/#{@game}/#{@name}")
+            unless File.exists?("#{DATA_DIR}/#{@game}/#{@name}")
                Dir.mkdir("#{DATA_DIR}/#{@game}/#{@name}")
             end
             if $frontend =~ /^(?:wizard|avalon)$/
@@ -2625,9 +2625,9 @@ class Script
       if script_name =~ /\\|\//
          nil
       elsif script_name =~ /\.(?:lic|lich|rb|cmd|wiz)(?:\.gz)?$/i
-         File.exist?("#{SCRIPT_DIR}/#{script_name}")
+         File.exists?("#{SCRIPT_DIR}/#{script_name}")
       else
-         File.exist?("#{SCRIPT_DIR}/#{script_name}.lic") || File.exist?("#{SCRIPT_DIR}/#{script_name}.lich") || File.exist?("#{SCRIPT_DIR}/#{script_name}.rb") || File.exist?("#{SCRIPT_DIR}/#{script_name}.cmd") || File.exist?("#{SCRIPT_DIR}/#{script_name}.wiz") || File.exist?("#{SCRIPT_DIR}/#{script_name}.lic.gz") || File.exist?("#{SCRIPT_DIR}/#{script_name}.rb.gz") || File.exist?("#{SCRIPT_DIR}/#{script_name}.cmd.gz") || File.exist?("#{SCRIPT_DIR}/#{script_name}.wiz.gz")
+         File.exists?("#{SCRIPT_DIR}/#{script_name}.lic") || File.exists?("#{SCRIPT_DIR}/#{script_name}.lich") || File.exists?("#{SCRIPT_DIR}/#{script_name}.rb") || File.exists?("#{SCRIPT_DIR}/#{script_name}.cmd") || File.exists?("#{SCRIPT_DIR}/#{script_name}.wiz") || File.exists?("#{SCRIPT_DIR}/#{script_name}.lic.gz") || File.exists?("#{SCRIPT_DIR}/#{script_name}.rb.gz") || File.exists?("#{SCRIPT_DIR}/#{script_name}.cmd.gz") || File.exists?("#{SCRIPT_DIR}/#{script_name}.wiz.gz")
       end
    }
    @@elevated_log = proc { |data|
@@ -2636,7 +2636,7 @@ class Script
             nil
          else
             begin
-               Dir.mkdir("#{LICH_DIR}/logs") unless File.exist?("#{LICH_DIR}/logs")
+               Dir.mkdir("#{LICH_DIR}/logs") unless File.exists?("#{LICH_DIR}/logs")
                File.open("#{LICH_DIR}/logs/#{script.name}.log", 'a') { |f| f.puts data }
                true
             rescue
@@ -3911,7 +3911,7 @@ class Map
                end
                error = false
                while filename = file_list.shift
-                  if File.exist?(filename)
+                  if File.exists?(filename)
                      File.open(filename) { |f|
                        JSON.parse(f.read).each { |room|
                           room['wayto'].keys.each { |k|
@@ -3983,7 +3983,7 @@ class Map
             if @@loaded
                return true
             else
-               unless File.exist?(filename)
+               unless File.exists?(filename)
                   raise Exception.exception("MapDatabaseError"), "Fatal error: file `#{filename}' does not exist!"
                end
                missing_end = false
@@ -4096,7 +4096,7 @@ class Map
    end
    def Map.save(filename="#{DATA_DIR}/#{XMLData.game}/map-#{Time.now.to_i}.dat")
       if $SAFE == 0
-         if File.exist?(filename)
+         if File.exists?(filename)
             respond "--- Backing up map database"
             begin
                # fixme: does this work on all platforms? File.rename(filename, "#{filename}.bak")
@@ -4143,7 +4143,7 @@ class Map
       }).delete_if { |a,b| b.nil? or (b.class == Array and b.empty?) }.to_json(args)
    end
    def Map.save_json(filename="#{DATA_DIR}/#{XMLData.game}/map-#{Time.now.to_i}.json")
-      if File.exist?(filename)
+      if File.exists?(filename)
          respond "File exists!  Backing it up before proceeding..."
          begin
             File.open(filename, 'rb') { |infile|
@@ -4162,7 +4162,7 @@ class Map
    end
    def Map.save_xml(filename="#{DATA_DIR}/#{XMLData.game}/map-#{Time.now.to_i}.xml")
       if $SAFE == 0
-         if File.exist?(filename)
+         if File.exists?(filename)
             respond "File exists!  Backing it up before proceeding..."
             begin
                File.open(filename, 'rb') { |infile|
@@ -6733,7 +6733,7 @@ def do_client(client_string)
       elsif cmd =~ /^trust\s+(.*)/i
          script_name = $1
          if RUBY_VERSION =~ /^2\.[012]\./
-            if File.exist?("#{SCRIPT_DIR}/#{script_name}.lic")
+            if File.exists?("#{SCRIPT_DIR}/#{script_name}.lic")
                if Script.trust(script_name)
                   respond "--- Lich: '#{script_name}' is now a trusted script."
                else
@@ -7100,7 +7100,7 @@ class SpellRanks
    attr_accessor :minorspiritual, :majorspiritual, :cleric, :minorelemental, :majorelemental, :minormental, :ranger, :sorcerer, :wizard, :bard, :empath, :paladin, :arcanesymbols, :magicitemuse, :monk
    def SpellRanks.load
       if $SAFE == 0
-         if File.exist?("#{DATA_DIR}/#{XMLData.game}/spell-ranks.dat")
+         if File.exists?("#{DATA_DIR}/#{XMLData.game}/spell-ranks.dat")
             begin
                File.open("#{DATA_DIR}/#{XMLData.game}/spell-ranks.dat", 'rb') { |f|
                   @@timestamp, @@list = Marshal.load(f.read)
@@ -7976,9 +7976,9 @@ module Games
          def Spell.load(filename=nil)
             if $SAFE == 0
                if filename.nil?
-                  if File.exist?("#{DATA_DIR}/spell-list.xml")
+                  if File.exists?("#{DATA_DIR}/spell-list.xml")
                      filename = "#{DATA_DIR}/spell-list.xml"
-                  elsif File.exist?("#{SCRIPT_DIR}/spell-list.xml") # deprecated
+                  elsif File.exists?("#{SCRIPT_DIR}/spell-list.xml") # deprecated
                      filename = "#{SCRIPT_DIR}/spell-list.xml"
                   else
                      filename = "#{DATA_DIR}/spell-list.xml"
@@ -9370,15 +9370,15 @@ module Games
          def GameObj.load_data(filename=nil)
             if $SAFE == 0
                if filename.nil?
-                  if File.exist?("#{DATA_DIR}/gameobj-data.xml")
+                  if File.exists?("#{DATA_DIR}/gameobj-data.xml")
                      filename = "#{DATA_DIR}/gameobj-data.xml"
-                  elsif File.exist?("#{SCRIPT_DIR}/gameobj-data.xml") # deprecated
+                  elsif File.exists?("#{SCRIPT_DIR}/gameobj-data.xml") # deprecated
                      filename = "#{SCRIPT_DIR}/gameobj-data.xml"
                   else
                      filename = "#{DATA_DIR}/gameobj-data.xml"
                   end
                end
-               if File.exist?(filename)
+               if File.exists?(filename)
                   begin
                      @@type_data = Hash.new
                      @@sellable_data = Hash.new
@@ -10101,12 +10101,12 @@ for arg in ARGV
       nil # already used when defining the Wine module
    elsif arg =~ /\.sal$|Gse\.~xt$/i
       argv_options[:sal] = arg
-      unless File.exist?(argv_options[:sal])
+      unless File.exists?(argv_options[:sal])
          if ARGV.join(' ') =~ /([A-Z]:\\.+?\.(?:sal|~xt))/i
             argv_options[:sal] = $1
          end
       end
-      unless File.exist?(argv_options[:sal])
+      unless File.exists?(argv_options[:sal])
          if defined?(Wine)
             argv_options[:sal] = "#{Wine::PREFIX}/drive_c/#{argv_options[:sal][3..-1].split('\\').join('/')}"
          end
@@ -10125,12 +10125,12 @@ MAP_DIR    ||= "#{LICH_DIR}/maps"
 LOG_DIR    ||= "#{LICH_DIR}/logs"
 BACKUP_DIR ||= "#{LICH_DIR}/backup"
 
-unless File.exist?(LICH_DIR)
+unless File.exists?(LICH_DIR)
    begin
       Dir.mkdir(LICH_DIR)
    rescue
       message = "An error occured while attempting to create directory #{LICH_DIR}\n\n"
-      if not File.exist?(LICH_DIR.sub(/[\\\/]$/, '').slice(/^.+[\\\/]/).chop)
+      if not File.exists?(LICH_DIR.sub(/[\\\/]$/, '').slice(/^.+[\\\/]/).chop)
          message.concat "This was likely because the parent directory (#{LICH_DIR.sub(/[\\\/]$/, '').slice(/^.+[\\\/]/).chop}) doesn't exist."
       elsif defined?(Win32) and (Win32.GetVersionEx[:dwMajorVersion] >= 6) and (dir !~ /^[A-z]\:\\(Users|Documents and Settings)/)
          message.concat "This was likely because Lich doesn't have permission to create files and folders here.  It is recommended to put Lich in your Documents folder."
@@ -10144,12 +10144,12 @@ end
 
 Dir.chdir(LICH_DIR)
 
-unless File.exist?(TEMP_DIR)
+unless File.exists?(TEMP_DIR)
    begin
       Dir.mkdir(TEMP_DIR)
    rescue
       message = "An error occured while attempting to create directory #{TEMP_DIR}\n\n"
-      if not File.exist?(TEMP_DIR.sub(/[\\\/]$/, '').slice(/^.+[\\\/]/).chop)
+      if not File.exists?(TEMP_DIR.sub(/[\\\/]$/, '').slice(/^.+[\\\/]/).chop)
          message.concat "This was likely because the parent directory (#{TEMP_DIR.sub(/[\\\/]$/, '').slice(/^.+[\\\/]/).chop}) doesn't exist."
       elsif defined?(Win32) and (Win32.GetVersionEx[:dwMajorVersion] >= 6) and (dir !~ /^[A-z]\:\\(Users|Documents and Settings)/)
          message.concat "This was likely because Lich doesn't have permission to create files and folders here.  It is recommended to put Lich in your Documents folder."
@@ -10182,7 +10182,7 @@ Lich.log "info: #{RUBY_PLATFORM}"
 Lich.log early_gtk_error if early_gtk_error
 early_gtk_error = nil
 
-unless File.exist?(DATA_DIR)
+unless File.exists?(DATA_DIR)
    begin
       Dir.mkdir(DATA_DIR)   
    rescue
@@ -10191,7 +10191,7 @@ unless File.exist?(DATA_DIR)
       exit
    end
 end
-unless File.exist?(SCRIPT_DIR)
+unless File.exists?(SCRIPT_DIR)
    begin
       Dir.mkdir(SCRIPT_DIR)   
    rescue
@@ -10200,7 +10200,7 @@ unless File.exist?(SCRIPT_DIR)
       exit
    end
 end
-unless File.exist?(MAP_DIR)
+unless File.exists?(MAP_DIR)
    begin
       Dir.mkdir(MAP_DIR)   
    rescue
@@ -10209,7 +10209,7 @@ unless File.exist?(MAP_DIR)
       exit
    end
 end
-unless File.exist?(LOG_DIR)
+unless File.exists?(LOG_DIR)
    begin
       Dir.mkdir(LOG_DIR)   
    rescue
@@ -10218,7 +10218,7 @@ unless File.exist?(LOG_DIR)
       exit
    end
 end
-unless File.exist?(BACKUP_DIR)
+unless File.exists?(BACKUP_DIR)
    begin
       Dir.mkdir(BACKUP_DIR)   
    rescue
@@ -10318,7 +10318,7 @@ if arg = ARGV.find { |a| a == '--hosts-dir' }
    ARGV.delete_at(i)
    hosts_dir = ARGV[i]
    ARGV.delete_at(i)
-   if hosts_dir and File.exist?(hosts_dir)
+   if hosts_dir and File.exists?(hosts_dir)
       hosts_dir = hosts_dir.tr('\\', '/')
       hosts_dir += '/' unless hosts_dir[-1..-1] == '/'
    else
@@ -10359,7 +10359,7 @@ if did_import.nil?
       retry
    end
    backup_dir = 'data44/'
-   Dir.mkdir(backup_dir) unless File.exist?(backup_dir)
+   Dir.mkdir(backup_dir) unless File.exists?(backup_dir)
    Dir.entries(DATA_DIR).find_all { |fn| fn =~ /\.sav$/i }.each { |fn|
       next if fn == 'lich.sav'
       s = fn.match(/^(.+)\.sav$/i).captures.first
@@ -10372,10 +10372,10 @@ if did_import.nil?
          retry
       end
       File.rename("#{DATA_DIR}/#{fn}", "#{backup_dir}#{fn}")
-      File.rename("#{DATA_DIR}/#{fn}~", "#{backup_dir}#{fn}~") if File.exist?("#{DATA_DIR}/#{fn}~")
+      File.rename("#{DATA_DIR}/#{fn}~", "#{backup_dir}#{fn}~") if File.exists?("#{DATA_DIR}/#{fn}~")
    }
    Dir.entries(DATA_DIR).find_all { |fn| File.directory?("#{DATA_DIR}/#{fn}") and fn !~ /^\.\.?$/}.each { |game|
-      Dir.mkdir("#{backup_dir}#{game}") unless File.exist?("#{backup_dir}#{game}")
+      Dir.mkdir("#{backup_dir}#{game}") unless File.exists?("#{backup_dir}#{game}")
       Dir.entries("#{DATA_DIR}/#{game}").find_all { |fn| fn =~ /\.sav$/i }.each { |fn|
          s = fn.match(/^(.+)\.sav$/i).captures.first
          data = File.open("#{DATA_DIR}/#{game}/#{fn}", 'rb') { |f| f.read }
@@ -10387,10 +10387,10 @@ if did_import.nil?
             retry
          end
          File.rename("#{DATA_DIR}/#{game}/#{fn}", "#{backup_dir}#{game}/#{fn}")
-         File.rename("#{DATA_DIR}/#{game}/#{fn}~", "#{backup_dir}#{game}/#{fn}~") if File.exist?("#{DATA_DIR}/#{game}/#{fn}~")
+         File.rename("#{DATA_DIR}/#{game}/#{fn}~", "#{backup_dir}#{game}/#{fn}~") if File.exists?("#{DATA_DIR}/#{game}/#{fn}~")
       }
       Dir.entries("#{DATA_DIR}/#{game}").find_all { |fn| File.directory?("#{DATA_DIR}/#{game}/#{fn}") and fn !~ /^\.\.?$/ }.each { |char|
-         Dir.mkdir("#{backup_dir}#{game}/#{char}") unless File.exist?("#{backup_dir}#{game}/#{char}")
+         Dir.mkdir("#{backup_dir}#{game}/#{char}") unless File.exists?("#{backup_dir}#{game}/#{char}")
          Dir.entries("#{DATA_DIR}/#{game}/#{char}").find_all { |fn| fn =~ /\.sav$/i }.each { |fn|
             s = fn.match(/^(.+)\.sav$/i).captures.first
             data = File.open("#{DATA_DIR}/#{game}/#{char}/#{fn}", 'rb') { |f| f.read }
@@ -10402,9 +10402,9 @@ if did_import.nil?
                retry
             end
             File.rename("#{DATA_DIR}/#{game}/#{char}/#{fn}", "#{backup_dir}#{game}/#{char}/#{fn}")
-            File.rename("#{DATA_DIR}/#{game}/#{char}/#{fn}~", "#{backup_dir}#{game}/#{char}/#{fn}~") if File.exist?("#{DATA_DIR}/#{game}/#{char}/#{fn}~")
+            File.rename("#{DATA_DIR}/#{game}/#{char}/#{fn}~", "#{backup_dir}#{game}/#{char}/#{fn}~") if File.exists?("#{DATA_DIR}/#{game}/#{char}/#{fn}~")
          }
-         if File.exist?("#{DATA_DIR}/#{game}/#{char}/uservars.dat")
+         if File.exists?("#{DATA_DIR}/#{game}/#{char}/uservars.dat")
             blob = SQLite3::Blob.new(File.open("#{DATA_DIR}/#{game}/#{char}/uservars.dat", 'rb') { |f| f.read })
             begin
                Lich.db.execute('INSERT OR REPLACE INTO uservars(scope,hash) VALUES(?,?);', "#{game}:#{char}".encode('UTF-8'), blob)
@@ -10431,7 +10431,7 @@ if did_import.nil?
       sleep 0.1
       retry
    end
-   if File.exist?("#{DATA_DIR}/lich.sav")
+   if File.exists?("#{DATA_DIR}/lich.sav")
       data = File.open("#{DATA_DIR}/lich.sav", 'rb') { |f| Marshal.load(f.read) }
       favs = data['favorites']
       aliases = data['alias']
@@ -10552,7 +10552,7 @@ if did_import.nil?
 end
 
 if argv_options[:sal]
-   unless File.exist?(argv_options[:sal])
+   unless File.exists?(argv_options[:sal])
       Lich.log "error: launch file does not exist: #{argv_options[:sal]}"
       Lich.msgbox "error: launch file does not exist: #{argv_options[:sal]}"
       exit
@@ -10681,7 +10681,7 @@ else
 end
 
 if defined?(Gtk)
-   unless File.exist?('fly64.png')
+   unless File.exists?('fly64.png')
       File.open('fly64.png', 'wb') { |f| f.write '
          iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAChVBMVEUAAAAA
          AAABAQECAgIDAwMEBAQFBQUGBgYHBwcICAgKCgoLCwsMDAwNDQ0ODg4QEBAR
@@ -10744,7 +10744,7 @@ main_thread = Thread.new {
    launch_data = nil
 
    if ARGV.include?('--login')
-      if File.exist?("#{DATA_DIR}/entry.dat")
+      if File.exists?("#{DATA_DIR}/entry.dat")
          entry_data = File.open("#{DATA_DIR}/entry.dat", 'r') { |file|
             begin
                Marshal.load(file.read.unpack('m').first)
@@ -10887,7 +10887,7 @@ main_thread = Thread.new {
          Lich.log "error: failed to find login data for #{char_name}"
       end
    elsif defined?(Gtk) and (ARGV.empty? or argv_options[:gui])
-      if File.exist?("#{DATA_DIR}/entry.dat")
+      if File.exists?("#{DATA_DIR}/entry.dat")
          entry_data = File.open("#{DATA_DIR}/entry.dat", 'r') { |file|
             begin
                Marshal.load(file.read.unpack('m').first).sort { |a,b| [a[:user_id].downcase, a[:char_name]] <=> [b[:user_id].downcase, b[:char_name]] }
@@ -11795,12 +11795,12 @@ main_thread = Thread.new {
             if sge_launch_cmd =~ /lich/i
                link_to_sge_button.sensitive = false
                unlink_from_sge_button.sensitive = true
-               if real_sge_launch_cmd and (defined?(Wine) or File.exist?("#{real_sge_launch_cmd}\\launcher.exe"))
+               if real_sge_launch_cmd and (defined?(Wine) or File.exists?("#{real_sge_launch_cmd}\\launcher.exe"))
                   sge_order_label.text = "SGE => Lich => Simu Launcher => Frontend"
                else
                   sge_order_label.text = "SGE => Lich => Unknown"
                end
-            elsif sge_launch_cmd and (defined?(Wine) or File.exist?("#{sge_launch_cmd}\\launcher.exe"))
+            elsif sge_launch_cmd and (defined?(Wine) or File.exists?("#{sge_launch_cmd}\\launcher.exe"))
                sge_order_label.text = "SGE => Simu Launcher => Frontend"
                link_to_sge_button.sensitive = true
                unlink_from_sge_button.sensitive = false
@@ -11987,7 +11987,7 @@ main_thread = Thread.new {
 =begin
             elsif (page_num == 1) and not checked_frontends
                checked_frontends = true
-               found_profanity = File.exist?("#{LICH_DIR}/profanity.rb")
+               found_profanity = File.exists?("#{LICH_DIR}/profanity.rb")
                if defined?(Win32)
                   begin
                      key = Win32.RegOpenKeyEx(:hKey => Win32::HKEY_LOCAL_MACHINE, :lpSubKey => 'Software\\Simutronics\\STORM32', :samDesired => (Win32::KEY_ALL_ACCESS|Win32::KEY_WOW64_32KEY))[:phkResult]
@@ -12014,11 +12014,11 @@ main_thread = Thread.new {
                end
                Lich.log "wizard_dir: #{wizard_dir}"
                Lich.log "stormfront_dir: #{stormfront_dir}"
-               unless File.exist?("#{stormfront_dir}\\Stormfront.exe")
+               unless File.exists?("#{stormfront_dir}\\Stormfront.exe")
                   Lich.log "stormfront doesn't exist"
                   stormfront_dir = nil
                end
-               unless File.exist?("#{wizard_dir}\\Wizard.Exe")
+               unless File.exists?("#{wizard_dir}\\Wizard.Exe")
                   Lich.log "wizard doesn't exist"
                   wizard_dir = nil
                end
@@ -12182,7 +12182,7 @@ main_thread = Thread.new {
             end
             launch_data.collect! { |line| line.sub(/GAMEPORT=.+/, "GAMEPORT=#{localport}").sub(/GAMEHOST=.+/, "GAMEHOST=#{localhost}") }
             sal_filename = "#{TEMP_DIR}/lich#{rand(10000)}.sal"
-            while File.exist?(sal_filename)
+            while File.exists?(sal_filename)
                sal_filename = "#{TEMP_DIR}/lich#{rand(10000)}.sal"
             end
             File.open(sal_filename, 'w') { |f| f.puts launch_data }
