@@ -287,15 +287,15 @@ class GameObj
   def GameObj.load_data(filename=nil)
     if $SAFE == 0
       if filename.nil?
-        if File.exists?("#{DATA_DIR}/gameobj-data.xml")
+        if File.exist?("#{DATA_DIR}/gameobj-data.xml")
           filename = "#{DATA_DIR}/gameobj-data.xml"
-        elsif File.exists?("#{SCRIPT_DIR}/gameobj-data.xml") # deprecated
+        elsif File.exist?("#{SCRIPT_DIR}/gameobj-data.xml") # deprecated
           filename = "#{SCRIPT_DIR}/gameobj-data.xml"
         else
           filename = "#{DATA_DIR}/gameobj-data.xml"
         end
       end
-      if File.exists?(filename)
+      if File.exist?(filename)
         begin
           @@type_data = Hash.new
           @@sellable_data = Hash.new
