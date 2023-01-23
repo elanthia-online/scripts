@@ -68,6 +68,7 @@ describe GameObj do
         %{piece of pink marble},
         %{piece of red jasper},
         %{piece of rose quartz},
+        %{piece of rosespar},
         %{piece of spiderweb obsidian},
         %{piece of white jade},
         %{piece of white marble},
@@ -121,7 +122,6 @@ describe GameObj do
     describe "valuables" do
       [
         %{piece of petrified haon},
-        %{piece of rosespar},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
           expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
@@ -464,7 +464,6 @@ describe GameObj do
         %{brilliant fire pearl},
         %{deep blue mermaid's-tear sapphire},
         %{iridescent pearl},
-        %{iridescent piece of mother-of-pearl},
         %{kezmonihoney beryl},
         %{piece of cat's paw coral},
         %{piece of flower coral},
@@ -491,6 +490,8 @@ describe GameObj do
         %{dovesnail shell},
         %{egg cowrie shell},
         %{fluted limpet shell},
+        %{iridescent piece of mother-of-pearl},
+        %{piece of iridescent mother-of-pearl},
         %{king helmet shell},
         %{lavender nassa shell},
         %{lynx cowrie shell},
