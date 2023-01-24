@@ -27,3 +27,4 @@ end
 migrate :magic, :gemshop do
   insert(:exclude, %{petrified sprite figurine})
 end
+
