@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 4.14.5
+       version: 4.14.6
       required: Lich >= 5.5.0, infomon >= 1.18.11
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,6 +17,10 @@
 
   Version Control:
     Major_change.feature_addition.bugfix
+  v4.14.6 (2023-02-06)
+    - fix head/tail issues with claim
+    - cleaned up also here detection
+    - cleaned up cast_signs to not spam song status for bards
   v4.14.5 (2023-02-03)
     - regex fix for hunt monitor claim_room
     - fix in bs_wander method for 'approach lone target only'
@@ -184,7 +188,7 @@ require 'fileutils'
 FileUtils.mkdir_p(File.join($data_dir, XMLData.game, Char.name, "bigshot_profiles"))
 
 # Alphabetized Global Variables
-BIGSHOT_VERSION = '4.14.5'
+BIGSHOT_VERSION = '4.14.6'
 RALLY_TIME = 1
 REST_INTERVAL = 60
 $bigshot_1614_list = []
@@ -343,17 +347,6 @@ class Bigshot
         end
       }
     end
-	
-	def room_claimed_set(player_present)
-	  @members.each_pair { |k, v|
-	    begin
-		  v.set_room_claimed(player_present)
-		rescue
-		  @leader.message("yellow", "Error polling member(room_claimed_set). Removing #{k}!")
-		  @members.delete(k)
-		end
-	  }
-	end
 	
     def add_event(type)
       @members.each_pair do |k, v|
@@ -587,7 +580,9 @@ class Bigshot
           $ambusher_here = true
         end
       #Remove people from room claim if they walk out of the room.
-      elsif server_string =~ /^(?:You notice )?<a exist="-\d+" noun="(\w+)">[^<]+<\/a>(?:[^<]+<d cmd='[^']+'>[^<]+<\/d>|[^<]+<a exist="-\d+" noun="\w+">[^<]+<\/a>\.| moving stealthily \w+\.)/
+      elsif server_string =~ /^You notice <a exist="-\d+" noun="(\w+)">[^<]+<\/a> moving stealthily \w+\.$/
+        check_room_claimed($1)
+      elsif server_string =~ /<a exist="-\d+" noun="(\w+)">[^<]+<\/a>[^<]+<d cmd='[^']+'>[^<]+<\/d>/i
         check_room_claimed($1)
       elsif server_string =~ /^You could use this opportunity to <d cmd='WEAPON (\w+\s#\d+)'>.*<\/d>!/i
         $bigshot_reaction = $1
@@ -1371,6 +1366,7 @@ class Bigshot
     
     error_regex = Regexp.union(
       /Barrage can not be used with attack as the attack type/i,
+      /may not be activated within 60 seconds of a Multi-Strike\./i,
       /\.\.\.wait/i,      
     )
   
@@ -1402,6 +1398,8 @@ class Bigshot
         #Bow in the wrong hand
         fput "swap"
         next
+      elsif result =~ /may not be activated within 60 seconds of a Multi-Strike\./i
+	break
       elsif result =~ complete_regex || Time.now() > break_out
         break
       elsif result == false
@@ -3033,7 +3031,7 @@ class Bigshot
       @followers.add_event(:CAST_SIGNS)
       prepare_for_movement()
     end
-    set_room_claimed(claimed = [])
+    set_room_claimed(claimed = []) unless $bigshot_quick
     cast_signs()
    
   end
@@ -3383,7 +3381,7 @@ class Bigshot
         GameObj.npcs.each { |i| return true if i.type =~ /companion/ && i.name !~ /#{$companion}/i }
         GameObj.npcs.each { |i| return true if i.type =~ /familiar/ && i.name !~ /#{$familiar}/i }
       end
-      return true if get_room_claimed_status.length > 0
+      return true if $bigshot_room_claimed.length > 0
       return false
     else
       return false
@@ -3921,18 +3919,22 @@ class Bigshot
       @followers.add_event(:FOLLOWER_OVERKILL)
     end
   end
+  
+  def bard_renewal()
+    $bard_renewal_cost ||= 0
+    $bard_renewal_check ||= (Time.now - 61)
+    if Char.prof == "Bard" && (Time.now - $bard_renewal_check).to_i > 60
+      song_renewal_cost = Lich::Util.quiet_command_xml("song status", /currently singing:|not singing/, /<prompt time=/)
+      if song_renewal_cost.any?{ |line| line =~ /Your current renewal cost is (\d+) mana./i }
+        $bard_renewal_cost = $1.to_i
+      end
+      $bard_renewal_check = Time.now
+    end
+    return $bard_renewal_cost
+  end
 
   def cast_signs(single_cast = false)
     echo "cast_signs?" if $bigshot_debug
-    renewal_cost = 0
-    if Char.prof == "Bard"
-      silence_me unless undo_silence = silence_me
-      song_renewal_cost = Lich::Util.quiet_command_xml("song status", /currently singing:|not singing/, /<prompt time=/)
-      if song_renewal_cost.any?{ |line| line =~ /Your current renewal cost is (\d+) mana./i }
-        renewal_cost = $1.to_i
-      end
-      silence_me if undo_silence
-    end
 
     @SIGNS.each do |i|
       if i =~ /\b650\s?(\w+)?\s?(\w+)?\s?/ 
@@ -3988,11 +3990,11 @@ class Bigshot
       mana_cost = sign.mana_cost > 1 ? sign.mana_cost : 0 # Many erroneously return 1
       wrack() if !sign.affordable? and mana_cost > checkmana and @USE_WRACKING
 
-      if (!sign.active? && sign.affordable? && (renewal_cost == 0 || (checkmana >= (sign.mana_cost + renewal_cost))))
-          while (1)
-            result = sign.cast
-            break if (result !~ /Spell Hindrance/ || !sign.affordable? || (renewal_cost > 0 && (checkmana < (sign.mana_cost + renewal_cost))) || dead? || result =~ /You feel more courageous/)
-          end
+      if ( !sign.active? && sign.affordable? && checkmana(bard_renewal + sign.mana_cost) )
+        while (1)
+          result = sign.cast
+          break if (result !~ /Spell Hindrance/ || !sign.affordable? || !checkmana(bard_renewal + sign.mana_cost) || dead? || result =~ /You feel more courageous/)
+        end
         break if single_cast
       end
     end
@@ -4068,42 +4070,30 @@ class Bigshot
   end
 
   def set_room_claimed(claimed)
-    #set to [] if head or solo otherwise set to whatever head tells followers to set to.
     $bigshot_room_claimed = claimed
-    
-	#check our buffer to see if someone was "Also here"
-	buffer = reget(50,/^Also here:/,/^Obvious (?:exits|paths)/,/obvious signs of someone hiding/)
-	buffer.to_enum.with_index.reverse_each { |line, i|
-	  if line =~ /^Obvious (?:exits|paths):/
-	    if buffer[i - 1] =~ /^Also here: (.*)/
-		  $bigshot_room_claimed = $1.gsub("\r","").split(",")
-		elsif buffer[i - 1] =~ /obvious signs of someone hiding/
-		  $bigshot_room_claimed.push("hidden")
-		elsif buffer[i - 1] =~ /^Obvious (?:exits|paths):/
-		  buffer_two = reget(3,/^Also here:/,/^Obvious (?:exits|paths)/,/obvious signs of someone hiding/)
-		  if buffer_two[-2] =~ /^Also here: (.*)/
-		    $bigshot_room_claimed = $1.gsub("\r","").split(",")
-		  end
-		end
-	  break
-	  end
-	}
-    #backup check in case our buffer is over run with quiet commands
-    if $bigshot_room_claimed.length == 0
-      $bigshot_room_claimed = (checkpcs - $grouplist)
+  
+    #check our buffer to see if someone was "Also here"
+    buffer_one = reget(50,/^Also here:/,/^Obvious (?:exits|paths)/,/obvious signs of someone hiding/)
+    if buffer_one[-2] =~ /^Also here: (.*)/
+      $bigshot_room_claimed = $1.gsub("\r","").split(",")
+    elsif buffer_one[-2] =~ /obvious signs of someone hiding/
+      $bigshot_room_claimed.push("hidden")
+    else
+      sleep(0.1)
+      buffer_two = reget(20,/^Also here:/,/^Obvious (?:exits|paths)/,/obvious signs of someone hiding/)
+      if buffer_two[-2] =~ /^Also here: (.*)/
+        $bigshot_room_claimed = $1.gsub("\r","").split(",")
+      elsif buffer_two[-2] =~ /obvious signs of someone hiding/
+        $bigshot_room_claimed.push("hidden")
+      end
     end
-    
+
     #remove any group members that made it on the list. needed for bigshot quick
     $bigshot_room_claimed = ($bigshot_room_claimed - $grouplist)
     
-    #tell our followers the claim status
-    if !solo? && leading?
-      @followers.room_claimed_set($bigshot_room_claimed)
-    end
-    
     #echo room claim status
-    if get_room_claimed_status && UserVars.show_claim
-      Lich::Messaging.msg("info","Claimed: #{get_room_claimed_status.to_s.gsub(/\[|\]|\"/,"")}")
+    unless $bigshot_room_claimed.empty? || !UserVars.show_claim
+      Lich::Messaging.msg("info","Claimed: #{$bigshot_room_claimed.to_s.gsub(/\[|\]|\"/,"")}")
     end
   end
   
@@ -4116,10 +4106,6 @@ class Bigshot
 
   def get_obvious_hiding_player_status()
     return $obvious_hiding_player
-  end
-
-  def get_room_claimed_status
-    return $bigshot_room_claimed
   end
   
   def prepare_for_movement(move_signs=true)
@@ -4177,7 +4163,6 @@ class Bigshot
       exit if $bigshot_quick
       npcs = GameObj.targets
       npcs.delete_if { |npc| (npc.status =~ /dead|gone/) }
-
       sort_npcs.each { |i| return i if valid_target?(i, true) and no_players == true and (GameObjNpcCheck() > 0) }
       return if should_rest?
       
