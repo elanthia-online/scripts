@@ -1,0 +1,224 @@
+=begin
+  *** THIS IS AN ALPHA RELEASE ***
+
+  ;eboost
+  
+  This script provides a rough api for working with `boost info`
+
+  If you manually activate a boost you need to resync using the Boost.info api
+
+  API:
+    ;boost will register the api and run a single `boost info` command and parse the output
+
+  EBoost[:loot_major].remaining # => returns an int of the amount of `boost loot major` commands remaining
+  EBoost.use(:loot_major) # => uses a boost
+  EBoost.loot_major.use # => chainable api
+  EBoost.loot_major.remaining # => chainable api
+  EBoost.known # => returns an Array of all known boosts
+
+  author: Ondreian
+  tags: boosts, api
+  version: 0.0.1-rc.2
+    
+=end
+
+
+module EBoost
+  @known ||= []
+  
+  def self.dr?
+    XMLData.game.start_with?("DR") or Script.current.vars.include?("--dr")
+  end
+
+  module Outcomes
+    module Gemstone
+      None = %r{You do not have any (?:[\w\s]+) to redeem\.}
+      @messages = {
+        deathsting: {ok: %r{\[Your Death's Sting penalties have been reduced\.\]},
+                    err: %r{You are not suffering from Death's Sting\.}},
+
+        enhancive: {ok: %r{You have activated an Enhancive Stats Boost.  You will be boosted for 15 minutes\.},
+                   err: %r{You must specify either a RECOVERY, or STATS, or PAUSES enhancive boost\.}},
+        
+        absorb: {ok: %r{\[You have instantly absorbed \d+ experience points!\]},
+                err: None},
+        
+        experience: {ok: %r{You have activated a Doubled Experience Booster!},
+                    err: None},
+
+        loot_minor: {ok: %r{You have activated a Minor Loot Boost},
+                    err: None},
+        
+        loot_major: {ok: %r{You have activated a Major Loot Boost},
+                    err: None},
+        
+        longterm: {ok: /deducted/,
+                  err: None},
+        bounty: {ok: /You have activated a Bounty Boost/,
+                err: None}
+      }
+
+      def self.messages()
+        @messages
+      end
+    end
+
+    module Dragonrealms
+      @messages = {}
+
+      def self.messages()
+        @messages
+      end
+    end
+
+    def self.fetch()
+      return Dragonrealms.messages if EBoost.dr?
+      return Gemstone.messages
+    end
+  end
+  
+  module Patterns
+    module Dragonrealms
+      BoostParser = %r[^\s+(?<remaining>\d+)\s+<d>(?<cmd>[\w\s]+)<\/d>\.+(?<name>.*)$]
+      MenuStart = %r[Your Login Rewards information:]
+    end
+
+    module Gemstone
+      BoostParser = %r[^<d cmd='(?<cmd>[\w\s]+)'>(?<name>[\w\s'\-\.]+)<\/d>:\s+(?<remaining>\d+)$]
+      MenuStart   = %r[your Login Rewards information is as follows:]
+    end
+
+    def self.fetch(name)
+      return Dragonrealms.const_get(name) if EBoost.dr?
+      return Gemstone.const_get(name)
+    end
+  end
+
+  # BOOST BURDEN
+  def self.make_method_name(cmd)
+    return cmd.downcase[6..-1].to_sym if EBoost.dr?
+    cmd[6..-1].gsub(/\s+/, "_").to_sym
+  end
+
+  if Script.current.vars.include?("--test-method-names")
+    respond self.make_method_name("BOOST BURDEN")
+    exit
+  end
+
+  def self.to_method(api, cmd:, name:, remaining:)
+    method_name = self.make_method_name(cmd)
+    #respond "%s -> %s" % [cmd, remaining]
+    @known << method_name
+    boost = OpenStruct.new(cmd: cmd, name: name, remaining: remaining.to_i, to_sym: method_name)
+    api[method_name] = boost
+    boost.instance_eval do
+      def use(modifier=nil) # handle enhancive | gift commands where they have a sub-argument like boost enhancive stats
+        return :zero if self.remaining.eql?(0)
+        EBoost._use(boost: self, modifier: modifier)
+      end
+
+      def available?
+        self.remaining > 0
+      end
+
+      def available?
+        self.remaining > 0
+      end
+    end
+    boost
+  end
+
+  def self._use_naive(boost, compiled_cmd)
+    echo "warning: no messaging defined for %s" % boost.to_sym
+    fput compiled_cmd
+    boost.remaining = boost.remaining - 1
+    return :ok
+  end
+
+  def self._use_with_outcomes(boost, outcomes, compiled_cmd)
+    case dothistimeout(compiled_cmd, 5, Regexp.union(outcomes.values))
+    when outcomes[:ok]
+      boost.remaining = boost.remaining - 1
+      return :ok
+    when outcomes[:err]
+      return :err
+    else
+      echo "warning: no outcome matched for %s" % boost.to_sym
+    end
+  end
+
+  # todo: encode success/fail messages
+  def self._use(boost:, modifier:)
+    compiled_cmd = modifier.nil? ? boost.cmd : "%s %s" % [boost.cmd, modifier]
+    outcomes = Outcomes.fetch[boost.to_sym]
+    return self._use_naive(boost, compiled_cmd) if outcomes.nil?
+    return self._use_with_outcomes(boost, outcomes, compiled_cmd)
+  end
+
+  def self.to_kwargs(one,two,three)
+    # swap the position in DR
+    return {cmd: two, name: three, remaining: one} if EBoost.dr? # [two, three, one]
+    {cmd: one, name: two, remaining: three} #[one, two, three]
+  end
+
+  def self.parse(lines)
+    lines.scan(Patterns.fetch(:BoostParser))
+      .each_with_object(OpenStruct.new) {|match, api| 
+        self.to_method(api, **self.to_kwargs(*match))
+      }
+  end
+
+  if Script.current.vars.include?("--test-parse") && Script.current.vars.include?("--dr")
+    require "open-uri"
+    respond self.parse URI.open("https://gist.githubusercontent.com/ondreian/8862534c78f6ab058a8ae497dced160a/raw/77690e0c22593187875a81c975ae1a9626d538df/dr-boost-menu.txt").read
+  end
+  
+  def self.info()
+    @known.clear
+
+    output = Lich::Util.quiet_command_xml(EBoost.dr? ? "boost" : "boost info", 
+      Patterns.fetch(:MenuStart))
+      .join("\n")
+      
+    @state = self.parse(output)
+    
+    _respond "<b>parsed %s boost types</b>" % @known.size
+    return @state
+  end
+
+  def self.known
+    @known
+  end
+
+  def self.[](kind)
+    kind = kind.to_sym
+    fail "unknown boost %s" % kind unless @known.include?(kind)
+    @state.send(kind)
+  end
+
+  def self.use(kind)
+    boost = self[kind]
+    boost.use
+  end
+
+  def self.main()
+    self.info if Script.current.vars.include?("--flush")
+    @state ||= self.info
+  end
+
+  def self.method_missing(method, *args)
+    return super unless args.empty?
+    return super unless @state.respond_to?(method)
+    @state.send(method)
+  end
+
+  def self.respond_to?(method)
+    @state.respond_to?(method) || super
+  end
+
+  def self.methods(*args)
+    self.known + super(*args)
+  end
+
+  self.main()
+end

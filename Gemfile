@@ -6,4 +6,5 @@ group :development do
   gem "guard-rspec"
   gem "webmock"
   gem "rack"
+  gem 'rubocop'
 end

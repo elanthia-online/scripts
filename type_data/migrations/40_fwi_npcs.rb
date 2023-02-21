@@ -19,3 +19,12 @@ migrate :aggressive_npc do
   insert(:name, %{cloud sprite meddler})
   insert(:name, %{cloud sprite bully})
 end
+
+migrate :valuable, :pawnshop do
+  insert(:name, %{petrified sprite figurine})
+end
+
+migrate :magic, :gemshop do
+  insert(:exclude, %{petrified sprite figurine})
+end
+
