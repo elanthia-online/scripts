@@ -1,7 +1,7 @@
 migrate :aggressive_npc do
   insert(:name, "winged viper")
-  insert(:name, "Illvari pixie")
-  insert(:name, "Illvari sprite")
+  insert(:name, "Ilvari pixie")
+  insert(:name, "Ilvari sprite")
   insert(:name, "direbear")
   insert(:name, "monstrous direwolf")
   insert(:name, "treekin warrior")
