@@ -3,7 +3,7 @@ migrate :undead, :aggressive_npc do
   insert(:name, %{greater fetid corpse})
 end
 
-migrate :undead, :aggressive_npc,:noncorporeal do
+migrate :undead, :aggressive_npc, :noncorporeal do
   insert(:name, %{luminous spectre})
   insert(:name, %{spectral black warhorse})
 end
