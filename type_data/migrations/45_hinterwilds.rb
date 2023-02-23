@@ -11,6 +11,7 @@ migrate :aggressive_npc do
   insert(:name, %{immense gold-bristled hinterboar})
   insert(:name, %{niveous giant warg})
   insert(:name, %{quivering sanguine ooze})
+  insert(:name, %{quivering sanguine oozeling})
   insert(:name, %{savage fork-tongued wendigo})
   insert(:name, %{snowy warg packmother})
   insert(:name, %{squamous reptilian mutant})
