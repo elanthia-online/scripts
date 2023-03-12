@@ -27,4 +27,8 @@ migrate :skin, :furrier do
   insert(:name, %{acolyte ear})
   insert(:exclude, %{acolyte ear})
   insert(:exclude, %{bundle of hobgoblin acolyte ear})
+  
+  insert(:name, %{black eye})
+  insert(:exclude, %{black eye})
+  insert(:exclude, %{bundle of glistening black eye})
 end
