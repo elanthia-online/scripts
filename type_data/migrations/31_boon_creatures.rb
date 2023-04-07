@@ -91,7 +91,7 @@ migrate :boon do
   insert(:name, %{fenghai})
   insert(:name, %{fire mage})
   insert(:name, %{flesh golem})
-  insert(:name, %{forest trali shaman})
+  insert(:name, %{trali shaman})
   insert(:name, %{frenzied monk})
   insert(:name, %{frozen corpse})
   insert(:name, %{ghostly pooka})
