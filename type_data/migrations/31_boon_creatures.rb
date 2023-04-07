@@ -141,6 +141,7 @@ migrate :boon do
   insert(:name, %{vesperti})
   insert(:name, %{Vvrael warlock})
   insert(:name, %{vvrael warlock})
+  insert(:name, %{Vvrael witch})
   insert(:name, %{waern})
   insert(:name, %{warrior shade})
   insert(:name, %{wind wraith})
