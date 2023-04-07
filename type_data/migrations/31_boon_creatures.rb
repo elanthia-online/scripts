@@ -91,7 +91,6 @@ migrate :boon do
   insert(:name, %{fenghai})
   insert(:name, %{fire mage})
   insert(:name, %{flesh golem})
-  insert(:name, %{trali shaman})
   insert(:name, %{frenzied monk})
   insert(:name, %{frozen corpse})
   insert(:name, %{ghostly pooka})
@@ -137,6 +136,7 @@ migrate :boon do
   insert(:name, %{spiked cavern urchin})
   insert(:name, %{stone troll})
   insert(:name, %{tomb troll})
+  insert(:name, %{trali shaman})
   insert(:name, %{troll wraith})
   insert(:name, %{vesperti})
   insert(:name, %{Vvrael warlock})
@@ -150,6 +150,10 @@ migrate :boon do
 
   insert(:exclude, %{ethereal triton sentry})
   insert(:exclude, %{shadowy spectre})
+end
+
+migrate :aggresive_npc do
+  insert(:name, %{trali shaman})
 end
 
 migrate :aggressive_npc, :undead do
