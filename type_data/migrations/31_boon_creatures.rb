@@ -152,7 +152,7 @@ migrate :boon do
   insert(:exclude, %{shadowy spectre})
 end
 
-migrate :aggresive_npc do
+migrate :aggressive_npc do
   insert(:name, %{trali shaman})
 end
 
