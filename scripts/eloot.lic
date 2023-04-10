@@ -12,12 +12,18 @@
       contributors: SpiffyJr, Athias, Demandred, Tysong, Deysh, Ondreian
               game: Gemstone
               tags: loot
-           version: 1.5.27
+           version: 1.5.30
   Improvements:
-  v1.5.27 (2023-03-30)
-    - additional find_trash method changes to utilize meta:trashcan
+  v1.5.30 (2023-04-07)
+    - split drag method to wear and drag and added RT check for wearing containers after bulk sell.
 =end
 =begin
+  v1.5.29 (2023-04-04)
+    - added regex for pirate harnesses
+  v1.5.28 (2023-03-30)
+    - bugfix for trashcans
+  v1.5.27 (2023-03-30)
+    - additional find_trash method changes to utilize meta:trashcan
   v1.5.26 (2023-03-30)
     - added "wastebin" to list of trashcans
   v1.5.25 (2023-03-25)
@@ -204,7 +210,7 @@ end
 
 # eloot is a looter for Gemstone that focuses on performance
 module ELoot
-  ELoot_version = '1.5.27'
+  ELoot_version = '1.5.30'
 
   @@data ||= nil
 
@@ -513,32 +519,27 @@ module ELoot
     lines = []
     regex = Regexp.union(regex, /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./)
 
-    loop {
+    loop do
       lines = Lich::Util.quiet_command_xml(command, regex)
       ELoot.msg("debug", " get_lines: command: #{command} | lines - #{lines}")
-      if lines.any? { |l| l =~ /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i }
-        waitrt?
-        next
-      else
-        break
-      end
-    }
+      break unless lines.grep(/(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i).any?
+
+      ELoot.wait_rt
+    end
 
     return lines
   end
 
-  def self.get_res(command, regex)
-    regex = Regexp.union(regex, /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./)
+  def self.get_res(command, regex = nil)
+    rt_regex = /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./
+    regex = regex.nil? ? Regexp.union(/.*?/, rt_regex) : Regexp.union(regex, rt_regex)
     result = nil
-    loop {
+    loop do
       result = dothistimeout(command, 3, regex)
-      if result =~ /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i
-        waitrt?
-        next
-      else
-        break
-      end
-    }
+      break unless result =~ rt_regex
+
+      ELoot.wait_rt
+    end
 
     return result
   end
@@ -1039,12 +1040,11 @@ module ELoot
     return trashcan unless trashcan.nil?
 
     # Still here? Either the meta:can isn't defined or the room description isn't unavailable. Either way we have to use the noun.
-    can = ["barrel", "bin", "basket", "canister", "case", "casket", "crate", "hearth", "pit", "stump", "urn"]
-    trash = (XMLData.room_description + GameObj.loot.to_s).scan(Regexp.union(can)).uniq
+    can = ["barrel", "bin", "basket", "bucket", "canister", "case", "casket", "crate", "hearth", "pit", "stump", "urn", "wastebasket", "wastebin", "wastecan"]
+    trash = (Room.current.description.to_s + GameObj.loot.to_s).scan(Regexp.union(can)).uniq
 
     # Check to make sure it's actually a trashcan and not a custom disk/container
     trash.each { |item|
-      echo item
       lines = ELoot.get_lines("look in #{item}", /<container|I could not find what you were referring to.|The(.*?)is filled with a variety of garbage/)
 
       if lines.grep(/variety of garbage/).any?
@@ -1059,6 +1059,7 @@ module ELoot
 
   def self.find_worker
     worker = nil
+    lines = nil
     name = $1 if Room.current.tags.find { |w| w =~ /meta:boxpool:npc:(.*)/ }
 
     unless name
@@ -1069,12 +1070,15 @@ module ELoot
       worker = (GameObj.npcs).find { |obj| obj.name =~ Regexp.union(name) }
       break if worker
 
-      ELoot.get_lines("look", /<resource picture/)
+      lines = ELoot.get_lines("look", /<resource picture/)
       sleep 0.1
     }
 
     if worker.nil?
       ELoot.msg("info", " Failed to find the locksmith pool NPC")
+      ELoot.msg("info", " GameObj.npcs: #{GameObj.npcs}")
+      ELoot.msg("info", " Lines: #{lines}")
+
       ELoot.msg("info", " Update your map db; ;repository download-mapdb")
       ELoot.msg("info", " If the error persists then report this to Elanthia-Online")
       exit
@@ -1236,6 +1240,12 @@ module ELoot
     Inventory.open_single_container(ELoot.data.disk)
   end
 
+  def self.wait_rt
+    sleep 0.2
+    wait_while { checkrt > 0 }
+    sleep 0.2
+  end
+
   # Global data used by ELoot
   class Data
     attr_accessor :disk, :disk_full, :sacks_full, :ready_list, :ready_method, :sacks, :settings, :skinners, :skinsheath, :silent_open, :checked_bags,
@@ -1310,7 +1320,8 @@ module ELoot
         /^You (?:shield the opening of .*? from view as you |discreetly |carefully |deftly )?(?:remove|draw|grab|reach|slip|tuck|retrieve|already have|unsheathe|detach|swap)/,
         /^Get what\?$/,
         /^Why don't you leave some for others\?$/,
-        /^You need a free hand|^You already have that/
+        /^You need a free hand|^You already have that/,
+        /Reaching over your shoulder/
       )
 
       @look_regex = Regexp.union(
@@ -2023,18 +2034,17 @@ module ELoot
       }
     end
 
-    def self.drag(item, to = "hand") # drags things from inventory to a hand or wears containers
+    def self.drag(item, to = "hand") # drags things from inventory to a hand
       return if item.nil? || item.empty? || item.name == "Empty"
 
       if to == "hand"
         to = GameObj.right_hand.id.nil? ? 'right' : 'left'
       end
 
-      line = fput "_drag ##{item.id} #{to}"
+      line = ELoot.get_res("_drag ##{item.id} #{to}")
 
       20.times {
-        return true if ([GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)) && to != "wear"
-        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)) && to == "wear"
+        return true if ([GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id))
         break if line =~ /Get what|I could not find what you were referring to/
 
         sleep 0.1
@@ -2052,6 +2062,26 @@ module ELoot
       end
 
       return false
+    end
+
+    def self.wear(item)
+      return false if item.nil? || item.empty? || item.name == "Empty"
+
+      line = ELoot.get_res("_drag ##{item.id} wear")
+
+      # Give it time to update and confirm action
+      20.times {
+        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)) && (GameObj.inv.map(&:id).compact.include?(item.id))
+        break if line =~ /You can't wear that/
+        sleep 0.1
+      }
+
+      # Still here? Something is wrong, inform the player and exit.
+      if [GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
+        ELoot.msg("warn", " Something is wrong. Unable to wear the #{item}. Exiting to avoid losing items.")
+        ELoot.msg("warn", " Please grab a short log of what just happened and post it to the scripting discord for debugging")
+        exit
+      end
     end
 
     def self.free_hand
@@ -2075,8 +2105,6 @@ module ELoot
           end
         end
       end
-
-      # Fixme: Add toggle in UI to favor the left instead of the right
     end
 
     def self.free_hands(right: false, left: false, both: false)
@@ -2421,7 +2449,7 @@ module ELoot
         Inventory.open_single_container(ELoot.data.ready_list["2sheath"])
       end
 
-      ELoot.get_res("store #{ready_item}", /You|Spreading your wings|Draping the|Heedful of your surroundings/)
+      ELoot.get_res("store #{ready_item}", /You|Spreading your wings|Draping the|Heedful of your surroundings|Reaching over your shoulder/)
 
       20.times {
         return true if ![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
@@ -3060,7 +3088,7 @@ module ELoot
 
             # Fixme: add checks here
             dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
-            Inventory.drag(sack, "wear")
+            Inventory.wear(sack)
 
             bulk_note = ELoot.read_note.to_i
 
@@ -3134,7 +3162,7 @@ module ELoot
           if bulk_sell
             Inventory.drag(sack) if [checkleft, checkright].index(sack.noun).nil?
             dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
-            Inventory.drag(sack, "wear")
+            Inventory.wear(sack)
             sleep 0.5
             bulk_note = ELoot.read_note.to_i
             if bulk_note > 0
@@ -3667,7 +3695,7 @@ module ELoot
 
           # Fixme: add checks here
           dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
-          Inventory.drag(sack, "wear")
+          Inventory.wear(sack)
 
           bulk_note = ELoot.read_note.to_i
 
@@ -3750,7 +3778,7 @@ module ELoot
 
           dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
 
-          Inventory.drag(sack, "wear")
+          Inventory.wear(sack)
           sleep 0.5
 
           bulk_note = ELoot.read_note.to_i
