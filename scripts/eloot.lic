@@ -12,12 +12,28 @@
       contributors: SpiffyJr, Athias, Demandred, Tysong, Deysh, Ondreian
               game: Gemstone
               tags: loot
-           version: 1.5.24
+           version: 1.5.32
   Improvements:
-  v1.5.24 (2023-03-23)
-    - added additional trashcan identification if no room description available
+  v1.5.32 (2023-05-12)
+    - reworked method for cursed items to support eonake gauntlets
 =end
 =begin
+  v1.5.31 (2023-04-12)
+    - bugfix for never loot section not working correctly with regex
+  v1.5.30 (2023-04-07)
+    - split drag method to wear and drag and added RT check for wearing containers after bulk sell.
+  v1.5.29 (2023-04-04)
+    - added regex for pirate harnesses
+  v1.5.28 (2023-03-30)
+    - bugfix for trashcans
+  v1.5.27 (2023-03-30)
+    - additional find_trash method changes to utilize meta:trashcan
+  v1.5.26 (2023-03-30)
+    - added "wastebin" to list of trashcans
+  v1.5.25 (2023-03-25)
+    - another try at finding the trashcan
+  v1.5.24 (2023-03-23)
+    - added additional trashcan identification if no room description available
   v1.5.23 (2023-03-22)
     - added open regex for container
   v1.5.22 (2023-03-08)
@@ -198,7 +214,7 @@ end
 
 # eloot is a looter for Gemstone that focuses on performance
 module ELoot
-  ELoot_version = '1.5.24'
+  ELoot_version = '1.5.32'
 
   @@data ||= nil
 
@@ -507,32 +523,27 @@ module ELoot
     lines = []
     regex = Regexp.union(regex, /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./)
 
-    loop {
+    loop do
       lines = Lich::Util.quiet_command_xml(command, regex)
       ELoot.msg("debug", " get_lines: command: #{command} | lines - #{lines}")
-      if lines.any? { |l| l =~ /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i }
-        waitrt?
-        next
-      else
-        break
-      end
-    }
+      break unless lines.grep(/(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i).any?
+
+      ELoot.wait_rt
+    end
 
     return lines
   end
 
-  def self.get_res(command, regex)
-    regex = Regexp.union(regex, /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./)
+  def self.get_res(command, regex = nil)
+    rt_regex = /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./
+    regex = regex.nil? ? Regexp.union(/.*?/, rt_regex) : Regexp.union(regex, rt_regex)
     result = nil
-    loop {
+    loop do
       result = dothistimeout(command, 3, regex)
-      if result =~ /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i
-        waitrt?
-        next
-      else
-        break
-      end
-    }
+      break unless result =~ rt_regex
+
+      ELoot.wait_rt
+    end
 
     return result
   end
@@ -957,21 +968,28 @@ module ELoot
 
   def self.decurse(obj)
     return true unless obj.type =~ /cursed/
+    return false unless ELoot.data.settings[:loot_types].include?("cursed")
 
-    if !Spell[315].known?
-      ELoot.msg("info", "** #{obj.name} is cursed. And you don't know cleric spell 315. Can't touch that.")
-      return false
-    elsif Spell[315].known? && !Spell[315].affordable?
-      ELoot.msg("info", "** #{obj.name} is cursed and you don't have emough mana to cast 315.")
-      return false
-    elsif !ELoot.data.settings[:loot_types].include?("cursed")
-      ELoot.msg("info", "** #{obj.name} is cursed and you don't have the setting enabled for looting it.")
-      return false
-    elsif Spell[315].known? && Spell[315].affordable?
-      # Fixme: add hinderance check
-      Spell[315].cast("at ##{obj.id}")
-      return true
+    if Spell[315].known? && !Spell[315].affordable?
+      mana_regex = Regexp.union(
+        /An invigorating rush of mana pulses through you/i,
+        /You are too mentally fatigued to attempt this ability/i,
+        /You're already at full mana./i,
+        /Your mana control skills are not yet advanced/i,
+      )
+      dothistimeout "mana pulse", 2, mana_regex
     end
+
+    if Spell[315].known? && !Spell[315].affordable?
+      ELoot.msg("info", "** #{obj.name} is cursed and you don't have enough mana to cast 315.")
+      return false
+    end
+
+    if Spell[315].known? && Spell[315].affordable?
+      Spell[315].cast("at ##{obj.id}")
+    end
+
+    return true
   end
 
   def self.find_boxes
@@ -1024,31 +1042,35 @@ module ELoot
   end
 
   def self.find_trash
-    can = $1 if Room.current.tags.find { |t| t =~ /meta:trashcan:(.*)/ }
+    trashcan = nil
 
-    unless can
-      can = ["crate", "barrel", "wastebarrel", "wastebasket", "casket", "canister"]
-    end
+    can = Regexp.last_match(1) if Room.current.tags.find { |t| t =~ /meta:trashcan:(.*)/ }
 
-    trash = (GameObj.room_desc.to_a + GameObj.loot.to_a).find_all { |obj| (obj.name =~ Regexp.union(can) && obj.name !~ /\w+'s #{obj.noun}$/) && obj.type !~ /box/ }.last
+    # Most common scenario - meta:trashcan is defined and GameObj.room_desc is available or trashcan is in GameObj.loot
+    trashcan = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.name =~ Regexp.union(can.to_a) }
+    return trashcan unless trashcan.nil?
 
-    return trash unless trash.nil?
+    # Still here? Either the meta:can isn't defined or the room description isn't unavailable. Either way we have to use the noun.
+    can = ["barrel", "bin", "basket", "bucket", "canister", "case", "casket", "crate", "hearth", "pit", "stump", "urn", "wastebasket", "wastebin", "wastecan"]
+    trash = (Room.current.description.to_s + GameObj.loot.to_s).scan(Regexp.union(can)).uniq
 
-    lines = ELoot.get_lines("look", /<resource picture/)
+    # Check to make sure it's actually a trashcan and not a custom disk/container
+    trash.each { |item|
+      lines = ELoot.get_lines("look in #{item}", /<container|I could not find what you were referring to.|The(.*?)is filled with a variety of garbage/)
 
-    exist = %r{<a exist=(?:'|")(?<id>.*?)(?:'|") noun=(?:'|")(?<noun>.*?)(?:'|")>(?<name>.*?)</a>}
+      if lines.grep(/variety of garbage/).any?
+        trashcan = GameObj.new(Regexp.last_match(1), item, item) if lines.find { |l| l =~ /^<container id='(-?[0-9]+)' title/ }
+      end
 
-    items = []
+      break unless trashcan.nil?
+    }
 
-    lines.each do |line|
-      line.scan(exist).each do |matches| items << GameObj.new(*matches) end
-    end
-
-    return items.find_all { |obj| (obj.name =~ Regexp.union(can) && obj.name !~ /\w+'s #{obj.noun}$/) && obj.type !~ /box/ }.last
+    return trashcan
   end
 
   def self.find_worker
     worker = nil
+    lines = nil
     name = $1 if Room.current.tags.find { |w| w =~ /meta:boxpool:npc:(.*)/ }
 
     unless name
@@ -1059,12 +1081,15 @@ module ELoot
       worker = (GameObj.npcs).find { |obj| obj.name =~ Regexp.union(name) }
       break if worker
 
-      ELoot.get_lines("look", /<resource picture/)
+      lines = ELoot.get_lines("look", /<resource picture/)
       sleep 0.1
     }
 
     if worker.nil?
       ELoot.msg("info", " Failed to find the locksmith pool NPC")
+      ELoot.msg("info", " GameObj.npcs: #{GameObj.npcs}")
+      ELoot.msg("info", " Lines: #{lines}")
+
       ELoot.msg("info", " Update your map db; ;repository download-mapdb")
       ELoot.msg("info", " If the error persists then report this to Elanthia-Online")
       exit
@@ -1226,11 +1251,17 @@ module ELoot
     Inventory.open_single_container(ELoot.data.disk)
   end
 
+  def self.wait_rt
+    sleep 0.2
+    wait_while { checkrt > 0 }
+    sleep 0.2
+  end
+
   # Global data used by ELoot
   class Data
     attr_accessor :disk, :disk_full, :sacks_full, :ready_list, :ready_method, :sacks, :settings, :skinners, :skinsheath, :silent_open, :checked_bags,
                   :close_regex, :look_regex, :sacks_closed, :all_loot_categories, :regex_gold_rings, :right_hand, :left_hand, :skin_edged, :skin_blunt,
-                  :coin_hand, :coin_container, :silver_breakdown, :get_regex, :alchemy_mode, :sell_containers, :local_gemshop, :local_furrier, :log_unlootables
+                  :coin_hand, :coin_container, :silver_breakdown, :get_regex, :alchemy_mode, :sell_containers, :local_gemshop, :local_furrier, :log_unlootables, :exclude
 
     def initialize(settings)
       @disk = nil
@@ -1296,11 +1327,15 @@ module ELoot
 
       @settings[:sell_container] ||= ["default", "overflow", "box", "collectible", "forageable", "gem", "herb", "lockpick", "potion", "reagent", "scroll", "skin", "treasure", "trinket", "wand"]
 
+      @exclude = @settings[:loot_exclude].map { |r| r.is_a?(String) ? Regexp.new(r) : r }
+      @exclude = '' if @exclude.nil?
+
       @get_regex = Regexp.union(
         /^You (?:shield the opening of .*? from view as you |discreetly |carefully |deftly )?(?:remove|draw|grab|reach|slip|tuck|retrieve|already have|unsheathe|detach|swap)/,
         /^Get what\?$/,
         /^Why don't you leave some for others\?$/,
-        /^You need a free hand|^You already have that/
+        /^You need a free hand|^You already have that/,
+        /Reaching over your shoulder/
       )
 
       @look_regex = Regexp.union(
@@ -2013,18 +2048,17 @@ module ELoot
       }
     end
 
-    def self.drag(item, to = "hand") # drags things from inventory to a hand or wears containers
+    def self.drag(item, to = "hand") # drags things from inventory to a hand
       return if item.nil? || item.empty? || item.name == "Empty"
 
       if to == "hand"
         to = GameObj.right_hand.id.nil? ? 'right' : 'left'
       end
 
-      line = fput "_drag ##{item.id} #{to}"
+      line = ELoot.get_res("_drag ##{item.id} #{to}")
 
       20.times {
-        return true if ([GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)) && to != "wear"
-        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)) && to == "wear"
+        return true if ([GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id))
         break if line =~ /Get what|I could not find what you were referring to/
 
         sleep 0.1
@@ -2042,6 +2076,26 @@ module ELoot
       end
 
       return false
+    end
+
+    def self.wear(item)
+      return false if item.nil? || item.empty? || item.name == "Empty"
+
+      line = ELoot.get_res("_drag ##{item.id} wear")
+
+      # Give it time to update and confirm action
+      20.times {
+        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)) && (GameObj.inv.map(&:id).compact.include?(item.id))
+        break if line =~ /You can't wear that/
+        sleep 0.1
+      }
+
+      # Still here? Something is wrong, inform the player and exit.
+      if [GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
+        ELoot.msg("warn", " Something is wrong. Unable to wear the #{item}. Exiting to avoid losing items.")
+        ELoot.msg("warn", " Please grab a short log of what just happened and post it to the scripting discord for debugging")
+        exit
+      end
     end
 
     def self.free_hand
@@ -2065,8 +2119,6 @@ module ELoot
           end
         end
       end
-
-      # Fixme: Add toggle in UI to favor the left instead of the right
     end
 
     def self.free_hands(right: false, left: false, both: false)
@@ -2411,7 +2463,7 @@ module ELoot
         Inventory.open_single_container(ELoot.data.ready_list["2sheath"])
       end
 
-      ELoot.get_res("store #{ready_item}", /You|Spreading your wings|Draping the|Heedful of your surroundings/)
+      ELoot.get_res("store #{ready_item}", /You|Spreading your wings|Draping the|Heedful of your surroundings|Reaching over your shoulder/)
 
       20.times {
         return true if ![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
@@ -2650,8 +2702,9 @@ module ELoot
 
       objs = objs.reject do |thing|
         result = Loot.bag_loot(thing) if thing.type =~ /clothing/
+
         next true if result == "crumbly"
-        next false if ELoot.data.settings[:loot_exclude].length.positive? && thing.name =~ Regexp.union(ELoot.data.settings[:loot_exclude])
+        next false if ELoot.data.settings[:loot_exclude].length.positive? && thing.name.match(Regexp.union(ELoot.data.exclude))
         next false if (thing.name.eql?("shard of oblivion quartz") and Char.level.eql?(100) && ELoot.data.settings[:loot_types].include?("gem"))
         next false if (thing.name =~ /doomstone|urglaes fang/ && !ELoot.data.settings[:loot_types].include?("cursed"))
 
@@ -2710,7 +2763,7 @@ module ELoot
 
     def self.should_grab_item?(thing)
       # If its on the exclude list return
-      return false if !ELoot.data.settings[:loot_exclude].empty? && thing.name =~ Regexp.union(ELoot.data.settings[:loot_exclude])
+      return false if !ELoot.data.settings[:loot_exclude].empty? && thing.name.match(Regexp.union(ELoot.data.exclude))
 
       # oblivion quartz isn't cursed if you are level 100
       return true  if thing.name.eql?("shard of oblivion quartz") and Char.level.eql?(100) && ELoot.data.settings[:loot_types].include?("gem")
@@ -3050,7 +3103,7 @@ module ELoot
 
             # Fixme: add checks here
             dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
-            Inventory.drag(sack, "wear")
+            Inventory.wear(sack)
 
             bulk_note = ELoot.read_note.to_i
 
@@ -3124,7 +3177,7 @@ module ELoot
           if bulk_sell
             Inventory.drag(sack) if [checkleft, checkright].index(sack.noun).nil?
             dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
-            Inventory.drag(sack, "wear")
+            Inventory.wear(sack)
             sleep 0.5
             bulk_note = ELoot.read_note.to_i
             if bulk_note > 0
@@ -3657,7 +3710,7 @@ module ELoot
 
           # Fixme: add checks here
           dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
-          Inventory.drag(sack, "wear")
+          Inventory.wear(sack)
 
           bulk_note = ELoot.read_note.to_i
 
@@ -3740,7 +3793,7 @@ module ELoot
 
           dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
 
-          Inventory.drag(sack, "wear")
+          Inventory.wear(sack)
           sleep 0.5
 
           bulk_note = ELoot.read_note.to_i
@@ -3764,7 +3817,7 @@ module ELoot
             next if item.name =~ /#{Vars.needed_reagents}/ && Vars.needed_reagents.length.to_i > 0
           end
           $sell_ignore.push(item.id)
-          if item.type =~ /cursed/ && (!Spell[315].known? || !ELoot.data.settings[:sell_loot_types].include?("cursed"))
+          if item.type =~ /cursed/ && !ELoot.data.settings[:sell_loot_types].include?("cursed")
             ELoot.msg("info", "** #{item.name} is cursed. Can't touch that. You'll need to take a look")
             next
           elsif item.type =~ /cursed/ && Spell[315].known? && Spell[315].affordable? && ELoot.data.settings[:sell_loot_types].include?("cursed")
@@ -3866,7 +3919,7 @@ module ELoot
         end
         next unless ELoot.decurse(thing)
 
-        if thing.type =~ /cursed/ && (!Spell[315].known? || !ELoot.data.settings[:sell_loot_types].include?("cursed"))
+        if thing.type =~ /cursed/ && !ELoot.data.settings[:sell_loot_types].include?("cursed")
           ELoot.msg("info", "** #{thing.name} is cursed. Can't touch that. You'll need to take a look")
           next
         elsif thing.type =~ /cursed/ && Spell[315].known? && Spell[315].affordable? && ELoot.data.settings[:sell_loot_types].include?("cursed")
@@ -3883,7 +3936,7 @@ module ELoot
             thing.contents.each { |box_item|
               if box_item.type =~ /cursed/ && Spell[315].known? && Spell[315].affordable? && ELoot.data.settings[:sell_loot_types].include?("cursed")
                 Spell[315].cast("at ##{box_item.id}")
-              elsif box_item.type =~ /cursed/ && !Spell[315].known?
+              elsif box_item.type =~ /cursed/ && !ELoot.data.settings[:sell_loot_types].include?("cursed")
                 ELoot.msg("info", "** #{box_item.name} is cursed. Stowing box. You'll need to take a look")
                 Inventory.single_drag(thing, false)
               else

@@ -313,19 +313,42 @@ describe GameObj do
 
           expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "boon"
         end
+      end
 
-        boon_name_collisions = [
-          %{shadowy spectre},
-          %{wispy phantasma},
-        ]
+      describe "Undead Boons" do
+        [
+          "bog wight",
+          "crazed zombie",
+          "dybbuk",
+          "flesh golem",
+          "frozen corpse",
+          "ghostly pooka",
+          "lesser moor wight",
+          "night mare",
+          "rock troll zombie",
+          "rotting woodsman",
+          "skeletal lord",
+          "skeletal warhorse",
+          "spectral miner",
+          "troll wraith",
+          "waern",
+          "warrior shade",
+          "wind wraith",
+          "zombie",
+        ].each do |undead|
+          boon_name_collisions = [
+            %{shadowy spectre},
+            %{wispy phantasma},
+          ]
 
-        all_boon_prefixes.each do |boon_prefix|
-          boon_creature = "#{boon_prefix} #{undead}"
-          unless boon_name_collisions.include?(boon_creature)
-            it "recognizes #{boon_creature} as an undead aggressive NPC with a boon" do
-              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "aggressive npc"
-              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "undead"
-              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "boon"
+          all_boon_prefixes.each do |boon_prefix|
+            boon_creature = "#{boon_prefix} #{undead}"
+            unless boon_name_collisions.include?(boon_creature)
+              it "recognizes #{boon_creature} as an undead aggressive NPC with a boon" do
+                expect(GameObjFactory.npc_from_name(boon_creature).type).to include "aggressive npc"
+                expect(GameObjFactory.npc_from_name(boon_creature).type).to include "undead"
+                expect(GameObjFactory.npc_from_name(boon_creature).type).to include "boon"
+              end
             end
           end
         end
@@ -821,13 +844,71 @@ describe GameObj do
             expect(GameObjFactory.npc_from_name(grizzled_name).type).to_not include "boon"
           end
         end
+      end
 
-        all_boon_prefixes.each do |boon_prefix|
-          boon_creature = "#{boon_prefix} #{creature}"
-          it "recognizes #{boon_creature} as an aggressive NPC with a boon" do
-            expect(GameObjFactory.npc_from_name(boon_creature).type).to include "aggressive npc"
-            expect(GameObjFactory.npc_from_name(boon_creature).type).to include "boon"
-            expect(GameObjFactory.npc_from_name(boon_creature).type).to_not include "undead"
+      describe "Living Boons" do
+        [
+          "aivren",
+          "Arachne priest",
+          "Arachne priestess",
+          "ash hag",
+          "black forest ogre",
+          "centaur",
+          "cougar",
+          "crested basilisk",
+          "dark vortece",
+          "dhu goleras",
+          "dobrem",
+          "dreadnought raptor",
+          "fenghai",
+          "fire mage",
+          "giant albino scorpion",
+          "giant fog beetle",
+          "greater bog troll",
+          "greater construct",
+          "greater faeroth",
+          "hisskra chieftain",
+          "hisskra shaman",
+          "hunch-backed dogmatist",
+          "ice troll",
+          "Illoke elder",
+          "kiramon defender",
+          "kiramon worker",
+          "krolvin corsair",
+          "krolvin warfarer",
+          "krolvin warrior",
+          "lava troll",
+          "lesser faeroth",
+          "lesser griffin",
+          "massive grahnk",
+          "massive pyrothag",
+          "mastodonic leopard",
+          "moor hound",
+          "moor witch",
+          "moulis",
+          "muscular supplicant",
+          "raving lunatic",
+          "red tsark",
+          "roa'ter",
+          "sabre-tooth tiger",
+          "siren",
+          "skayl",
+          "spiked cavern urchin",
+          "stone troll",
+          "trali shaman",
+          "tomb troll",
+          "vesperti",
+          "Vvrael warlock",
+          "Vvrael witch",
+          "yeti",
+        ].each do |creature|
+          all_boon_prefixes.each do |boon_prefix|
+            boon_creature = "#{boon_prefix} #{creature}"
+            it "recognizes #{boon_creature} as an aggressive NPC with a boon" do
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "aggressive npc"
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to include "boon"
+              expect(GameObjFactory.npc_from_name(boon_creature).type).to_not include "undead"
+            end
           end
         end
       end
@@ -856,6 +937,8 @@ describe GameObj do
             end
           end
 
+=begin
+SOS creatures don't have boons.
           all_boon_prefixes.each do |boon_prefix|
             boon_creature = "#{boon_prefix} #{creature}"
             it "recognizes #{boon_creature} as an aggressive NPC with a boon" do
@@ -864,6 +947,7 @@ describe GameObj do
               expect(GameObjFactory.npc_from_name(boon_creature).type).to_not include "undead"
             end
           end
+=end
         end
       end
 
