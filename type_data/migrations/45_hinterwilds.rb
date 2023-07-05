@@ -91,7 +91,7 @@ migrate :skin, :furrier do
   insert(:name, %{warg pelt})
   insert(:exclude, %{warg pelt})
   insert(:exclude, %{bundle of niveous warg pelt})
-  
+
   insert(:name, %{golden hinterboar mane})
   insert(:name, %{hinterboar mane})
   insert(:exclude, %{hinterboar mane})
@@ -106,7 +106,7 @@ migrate :skin, :furrier do
   insert(:name, %{undansormr scales})
   insert(:exclude, %{undansormr scales})
   insert(:exclude, %{bundle of handful of undansormr scales})
-  
+
   insert(:name, %{woolly mastodon trunk})
   insert(:name, %{mastodon trunk})
   insert(:exclude, %{mastodon trunk})
