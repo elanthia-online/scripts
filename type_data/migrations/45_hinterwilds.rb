@@ -66,6 +66,7 @@ migrate :gem, :gemshop do
   insert(:name, %{piece of dusky blue sapphire})
   insert(:name, %{piece of polished ivory})
   insert(:name, %{rainbowed ammolite shard})
+  insert(:name, %{rough cinnabar shard})
   insert(:name, %{royal blue boreal topaz})
   insert(:name, %{rutilated twilight tourmaline})
   insert(:name, %{saffron-hued danburite stone})
