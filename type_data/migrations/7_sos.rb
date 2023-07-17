@@ -3,6 +3,7 @@ migrate :aggressive_npc do
   insert(:name, %[pale scaled shaper])
   insert(:name, %[deathsworn fanatic])
   insert(:name, %[white sidewinder])
+  insert(:name, %{sand-hued desert sidewinder})
 end
 
 migrate :aggressive_npc, :undead do
