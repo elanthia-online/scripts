@@ -16,6 +16,10 @@ migrate :aggressive_npc do
   insert(:name, "necrotic snake")
   insert(:name, "spectre")
   insert(:name, "wild dog")
+  insert(:name, %{brindle wild hound}) # Orcswold, Yegharren Plains
+  insert(:name, %{(?:black|mangy|spotted|mongrel) wild dog}) # Orcswold, Yegharren Plains
+  insert(:name, %{red centaur}) # Locksmehr Trail
+  insert(:name, %{soldier ant}) # WL
 end
 
 migrate :undead do
