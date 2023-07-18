@@ -1,4 +1,4 @@
-#OSA Mobs
+# OSA Mobs
 migrate :aggressive_npc do
   insert(:name, %{battle-scarred fierce krolvin huntmaster})
   insert(:name, %{battle-scarred fierce krolvin watcher})
@@ -325,9 +325,10 @@ migrate :undead, :aggressive_npc do
   insert(:name, %{unworldly pirate})
 end
 
-#Kraken Falls mobs
+# Kraken Falls mobs
 migrate :aggressive_npc do
   insert(:name, %{barbed cavern urchin})
+  insert(:name, %{coconut crab})
   insert(:name, %{crazed canine})
   insert(:name, %{ebon swine})
   insert(:name, %{hobgoblin acolyte})
@@ -335,8 +336,10 @@ migrate :aggressive_npc do
   insert(:name, %{luminous worm})
   insert(:name, %{muddy hog})
   insert(:name, %{muscular brindlecat})
+  insert(:name, %{ogre sentry})
   insert(:name, %{shelfae assailant})
   insert(:name, %{shelfae guard})
   insert(:name, %{speckled cave lizard})
   insert(:name, %{spectacled bear})
+  insert(:name, %{wharf rat})
 end
