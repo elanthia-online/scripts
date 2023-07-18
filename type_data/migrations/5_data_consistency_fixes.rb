@@ -19,10 +19,7 @@ migrate :aggressive_npc do
   insert(:name, %{brindle wild hound}) # Orcswold, Yegharren Plains
   insert(:name, %{(?:black|mangy|spotted|mongrel) wild dog}) # Orcswold, Yegharren Plains
   insert(:name, %{red centaur}) # Locksmehr Trail
-  insert(:name, %{solider ant}) # WL
-  insert(:name, %{coconut crab}) # KF
-  insert(:name, %{ogre sentry}) # KF
-  insert(:name, %{wharf rat}) # KF
+  insert(:name, %{soldier ant}) # WL
 end
 
 migrate :undead do
