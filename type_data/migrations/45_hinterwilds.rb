@@ -66,6 +66,7 @@ migrate :gem, :gemshop do
   insert(:name, %{piece of dusky blue sapphire})
   insert(:name, %{piece of polished ivory})
   insert(:name, %{rainbowed ammolite shard})
+  insert(:name, %{rough cinnabar shard})
   insert(:name, %{royal blue boreal topaz})
   insert(:name, %{rutilated twilight tourmaline})
   insert(:name, %{saffron-hued danburite stone})
@@ -90,7 +91,7 @@ migrate :skin, :furrier do
   insert(:name, %{warg pelt})
   insert(:exclude, %{warg pelt})
   insert(:exclude, %{bundle of niveous warg pelt})
-  
+
   insert(:name, %{golden hinterboar mane})
   insert(:name, %{hinterboar mane})
   insert(:exclude, %{hinterboar mane})
@@ -105,7 +106,7 @@ migrate :skin, :furrier do
   insert(:name, %{undansormr scales})
   insert(:exclude, %{undansormr scales})
   insert(:exclude, %{bundle of handful of undansormr scales})
-  
+
   insert(:name, %{woolly mastodon trunk})
   insert(:name, %{mastodon trunk})
   insert(:exclude, %{mastodon trunk})
