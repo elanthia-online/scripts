@@ -1,4 +1,4 @@
-#Moonsedge Creatures
+# Moonsedge Creatures
 migrate :undead, :aggressive_npc do
   insert(:name, %{ashen patrician vampire})
   insert(:name, %{cadaverous tatterdemalion ghast})
@@ -7,7 +7,7 @@ migrate :undead, :aggressive_npc do
   insert(:name, %{smouldering skeletal dreadsteed})
 end
 
-migrate :undead, :aggressive_npc,:noncorporeal do
+migrate :undead, :aggressive_npc, :noncorporeal do
   insert(:name, %{flickering mist-wreathed banshee})
   insert(:name, %{gaudy phantasmic conjurer})
 end
@@ -20,7 +20,7 @@ migrate :skin, :furrier do
   insert(:name, %{(?:flame-scarred )?dreadsteed skull})
 end
 
-#Crawling Shore Creatures
+# Crawling Shore Creatures
 migrate :aggressive_npc do
   insert(:name, %{bony Tenthsworn occultist})
   insert(:name, %{desiccated half-krolvin strigoi})
