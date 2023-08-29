@@ -17,12 +17,7 @@ migrate :boon do
 end
 
 migrate :skin, :furrier do
-  create_key(:exclude)
-  
-  insert(:name, %{flame-scarred dreadsteed skull})
-  insert(:name, %{dreadsteed skull})
-  insert(:exclude, %{dreadsteed skull})
-  insert(:exclude, %{bundle of flame-scarred dreadsteed skull})
+  insert(:name, %{(?:flame-scarred )?dreadsteed skull})
 end
 
 #Crawling Shore Creatures
