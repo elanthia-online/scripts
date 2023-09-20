@@ -11,7 +11,7 @@
    contributors: Ondreian, Tysong
            game: Gemstone
            tags: silver, bounty, ledger, bank
-        version: 1.2.0
+        version: 1.3.3
    requirements:
     - sequel gem
     - ascii_charts gem
@@ -30,7 +30,17 @@
       - fix for mono output
     v1.2.0 - 2023-07-01
       - add lootcap estimator for --report-character flag
-
+    v1.3.0 - 2023-08-01
+      - fix for lootcap estimate SQL statement
+      - add ability to pass year, month, character, game to Ledger::Character.estimate_loot_cap
+    v1.3.1 - 2023-09-01
+      - fix to prevent other peoples debts from triggering withdrawels
+      - fix to prevent partial debt repayment from triggering withdrawl of entire debt
+      - fix to match depts in mist harbor.
+    v1.3.2 - 2023-09-06
+      - Code cleanup, no functional changes
+    v1.3.3 - 2023-09-17
+      - Fix to bounty point tracking (broken in 1.3.2)
 =end
 
 gems_to_load = ["sequel", "ascii_charts", "terminal-table"]
@@ -47,6 +57,9 @@ unless failed_to_load.empty?
   echo "Please install the above gem(s) to run ;ledger"
   exit
 end
+
+
+
 
 module Ledger
   def self.record_transaction(amount:, type:)
@@ -78,10 +91,11 @@ module Ledger
         .sum(:amount) || 0
     end
 
-    def self.estimate_loot_cap()
+    def self.estimate_loot_cap(year: Time.now.year, month: Time.now.month, character: Char.name, game: XMLData.game)
       Ledger::History::Transactions
-        .where(year: Time.now.year, month: Time.now.month, type: "silver", character: Char.name, game: XMLData.game)
-        .where { amount < 1000000 and amount > 0 }
+        .where(year: year, month: month, type: "silver", character: character, game: game)
+        .where { amount < 1_000_000 }
+        .where { amount > 0 }
         .sum(:amount) || 0
     end
   end
@@ -89,6 +103,23 @@ module Ledger
   module History
     @file = File.join($data_dir, "ledger.db")
     Self = Sequel.sqlite(@file)
+    @withdraw_silver_regex = Regexp.union(
+      /I have a (?<debt>bill) of (?<silver>[\d,]+) silvers? (?:presented by your creditors|that I suggest you pay immediately)/,
+      /Very well, a withdrawal of (?<silver>[\d,]+) silver/,
+      /teller scribbles the transaction into a book and hands you (?<silver>[\d,]+) silver/,
+      /teller carefully records the transaction, (?:and then )?hands you (?<silver>[\d,]+) silver/,
+      /scrip for (?<silver>[\d,]+) silvers?, with a 0 silver fee for the scrip/, # Terras note withdraw, will be moved to notes regex next release
+    )
+    @withdraw_notes_regex = Regexp.union( # Unused till next release
+      /scrip for (?<silver>[\d,]+) silvers?, with a (?<fee>[\d,]+) silvers? fee for the scrip/, # Terras
+    )
+    @deposit_regex = Regexp.union(
+      /You deposit (?<silver>[\d,]+) silvers? into your account/,
+      /That's a total of (?<silver>[\d,]+) silver/,
+      /That's (?<silver>[\d,]+) silver|silvers? to your account/,
+      /You deposit your note worth (?<silver>[\d,]+) into your account/,
+      /You hand your notes to the teller, who glances over each one and scribbles the amounts in a book.  She says, "They add up to (?<silver>[\d,]+) (?:silver|silvers)/,
+    )
 
     Self.create_table?(:transactions) do
       primary_key :id
@@ -223,14 +254,25 @@ module Ledger
     def self.main()
       while (line = get)
         # todo: bloodscrip tracking deposit/withdraw
-        if line =~ /Very well, a withdrawal of ([\d,]+) silver|That's a total of ([\d,]+) silver|That's ([\d,]+) (?:silver|silvers) to your account|scrip for ([\d,]+) silvers, with a ([\d,]+) silver fee for the scrip|I have a bill of ([\d,]+) silvers presented by your creditors|teller carefully records the transaction, (?:and then )?hands you ([\d,]+) silver|You deposit ([\d,]+) (?:silver|silvers) into your account|You deposit your note worth ([\d,]+) into your account|teller scribbles the transaction into a book and hands you ([\d,]+) (?:silver|silvers)|You hand your notes to the teller, who glances over each one and scribbles the amounts in a book.  She says, "They add up to ([\d,]+) (?:silver|silvers)/
-          withdraws = $1.delete(',').to_i + $4.delete(',').to_i + $5.delete(',').to_i + $6.delete(',').to_i + $7.delete(',').to_i + $10.delete(',').to_i
-          deposits = $2.delete(',').to_i + $3.delete(',').to_i + $8.delete(',').to_i + $9.delete(',').to_i + $11.delete(',').to_i
-          echo "recorded.withdraw : #{withdraws}" if withdraws > 0
-          echo "recorded.deposit : #{deposits}" if deposits > 0
-          self.record_transaction(amount: deposits - withdraws, type: "silver")
-        elsif line =~ /\[You have earned ([\d,]+) bounty points/
-          self.record_transaction(amount: $1.delete(',').to_i, type: "bounty")
+        if (match = line.match(@withdraw_silver_regex))
+          silver = match[:silver].delete(',').to_i
+          if match[:debt]
+            # 5 lines is the min, using 10 for safety. Very unlikely of a false positive
+            next unless reget 10, "The local debt collector suddenly enters and walks toward you purposely."
+
+            if /owe (?<debtsilver>[\d,]+) silver/ =~ reget(10, "The debt collector reminds you that you still owe").last
+              # If you deposit but do not have enough to cover dept will take what it can, without this was recording the full fine silver as withdrawn
+              silver -= debtsilver.delete(',').to_i
+            end
+          end
+          echo "recorded.withdraw : #{silver}"
+          self.record_transaction(amount: -silver, type: "silver")
+        elsif (match = line.match(@deposit_regex))
+          silver = match[:silver].delete(',').to_i
+          echo "recorded.deposit : #{silver}"
+          self.record_transaction(amount: silver, type: "silver")
+        elsif line =~ /\[You have earned (?<amount>[\d,]+) bounty points/
+          self.record_transaction(amount: $~[:amount].delete(',').to_i, type: "bounty")
         elsif line =~ /inter-town bank transfer options? available/
           self.print()
         end
