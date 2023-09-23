@@ -4,7 +4,7 @@ migrate :aggressive_npc do
   insert(:name, %{bloody halfling cannibal})
   insert(:name, %{brawny gigas shield-maiden})
   insert(:name, %{cinereous chthonian sybil})
-  insert(:name, %{colossal boreal undansormr})
+  insert(:name, %{(?:colossal )?boreal undansormr})
   insert(:name, %{flayed gigas disciple})
   insert(:name, %{grim gigas skald})
   insert(:name, %{heavily armored battle mastodon})
