@@ -4,7 +4,7 @@ migrate :aggressive_npc do
   insert(:name, %{bloody halfling cannibal})
   insert(:name, %{brawny gigas shield-maiden})
   insert(:name, %{cinereous chthonian sybil})
-  insert(:name, %{colossal boreal undansormr})
+  insert(:name, %{(?:colossal )?boreal undansormr})
   insert(:name, %{flayed gigas disciple})
   insert(:name, %{grim gigas skald})
   insert(:name, %{heavily armored battle mastodon})
@@ -24,13 +24,13 @@ migrate :boon do
 end
 
 migrate :undead, :aggressive_npc do
-  insert(:name, %{eyeless black valravn})
-  insert(:name, %{shining winged disir})
-  insert(:name, %{withered shadow-cloaked draugr})
+  insert(:name, %{(?:eyeless )?black valravn})
+  insert(:name, %{(?:shining )?winged disir})
+  insert(:name, %{(?:withered )?shadow-cloaked draugr})
 end
 
 migrate :undead, :aggressive_npc, :noncorporeal do
-  insert(:name, %{roiling crimson angargeist})
+  insert(:name, %{(?:roiling )?crimson angargeist})
 end
 
 migrate :gem, :gemshop do
@@ -86,31 +86,11 @@ migrate :gem, :gemshop do
 end
 
 migrate :skin, :furrier do
-  create_key(:exclude)
-  insert(:name, %{niveous warg pelt})
-  insert(:name, %{warg pelt})
-  insert(:exclude, %{warg pelt})
-  insert(:exclude, %{bundle of niveous warg pelt})
-
-  insert(:name, %{golden hinterboar mane})
-  insert(:name, %{hinterboar mane})
-  insert(:exclude, %{hinterboar mane})
-  insert(:exclude, %{bundle of golden hinterboar mane})
-
-  insert(:name, %{inky black valravn plume})
-  insert(:name, %{valravn plume})
-  insert(:exclude, %{valravn plume})
-  insert(:exclude, %{bundle of inky black valravn plume})
-
-  insert(:name, %{handful of undansormr scales})
-  insert(:name, %{undansormr scales})
-  insert(:exclude, %{undansormr scales})
-  insert(:exclude, %{bundle of handful of undansormr scales})
-
-  insert(:name, %{woolly mastodon trunk})
-  insert(:name, %{mastodon trunk})
-  insert(:exclude, %{mastodon trunk})
-  insert(:exclude, %{bundle of woolly mastodon trunk})
+  insert(:name, %{(?:niveous )?warg pelt})
+  insert(:name, %{(?:golden )?hinterboar mane})
+  insert(:name, %{(?:inky black )?valravn plume})
+  insert(:name, %{(?:handful of )?undansormr scales})
+  insert(:name, %{(?:woolly )?mastodon trunk})
 end
 
 migrate :uncommon do
