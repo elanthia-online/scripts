@@ -259,7 +259,8 @@ class Bigshot
     @@RECOGNIZED = [:HUNTING_PREP_COMMANDS, :HUNTING_SCRIPTS_START, :CAST_SIGNS, :ATTACK, :PREP_REST,
                     :HUNTING_SCRIPTS_STOP, :RESTING_SCRIPTS_START, :RESTING_PREP_COMMANDS, :DISPLAY_WATCH, :START_WATCH, :STOP_WATCH, :SINGLE_STOP,
                     :FOLLOWER_OVERKILL, :STAY_QUIET, :FOLLOW_NOW, :LOOT, :CUSTOM_PUT, :CUSTOM_CMD, :CUSTOM_DO_CLIENT,
-                    :PUBLIC_SEND, :GO2_WAYPOINTS, :GO2_RESTING_ROOM, :GO2_RALLY_ROOM, :GO2_HUNTING_ROOM, :CHECK_MIND, :JOIN_LEADER, :FOG_RETURN]
+                    :PUBLIC_SEND, :GO2_WAYPOINTS, :GO2_RESTING_ROOM, :GO2_RALLY_ROOM, :GO2_HUNTING_ROOM, :CHECK_MIND, :JOIN_LEADER, :FOG_RETURN, :CHECK_SNEAKY,
+                    :LEAVE_GROUP]
 
     def initialize(type, time_stamp, room_id, c_in = nil)
       raise "Event type not recognized" unless @@RECOGNIZED.include?(type)
@@ -303,7 +304,7 @@ class Bigshot
     end
 
     def size()
-      return @members.size
+      return @members.size + 1
     end
 
     def get_names
@@ -556,6 +557,19 @@ class Bigshot
       end
 
       return group_weight
+    end
+
+    def need_sneaky?
+      @members.each_pair { |k, v|
+        begin
+          return true if v.sneaky_hunt? && !v.player_hidden?
+        rescue
+          @leader.message("yellow", "Error polling member(need_sneaky?). Removing #{k}!")
+          @members.delete(k)
+        end
+      }
+
+      return false
     end
 
     def all_present?
@@ -2100,8 +2114,9 @@ class Bigshot
   end
 
   def check_for_deaders_prone
+    return unless @PULL
     return if GameObj.pcs.nil?
-    GameObj.pcs.each { |s| if s.status =~ /sitting|^lying|prone/ && s.status !~ /dead/; fput "pull #{s.noun}"; end; } if GameObj.targets.any? { |s| s.type =~ /aggressive npc/ } && @PULL
+    GameObj.pcs.each { |s| if s.status =~ /sitting|^lying|prone/ && s.status !~ /dead/; fput "pull #{s.noun}"; end; } if GameObj.targets.any? { |s| s.type =~ /aggressive npc/ }
 
     if GameObj.pcs.any? { |s| s.status =~ /dead/ } && @DEADER
       puts "#{monsterbold_start} Found a deader! #{monsterbold_end}"
@@ -4189,9 +4204,11 @@ class Bigshot
       else
         @RALLYPOINT_ROOM_IDS.each { |room|
           go2(room.to_i)
-          @followers.add_event(:FOLLOW_NOW) # trigger rubber band
-          message("yellow", "Waiting for followers....") if !@followers.all_present?
-          sleep(0.5) while (!@followers.all_present?)
+          if !@followers.all_present?
+            @followers.add_event(:FOLLOW_NOW) # trigger rubber band
+            message("yellow", "Waiting for followers....")
+            sleep(0.5) while (!@followers.all_present?)
+          end
         }
       end
     end
@@ -4229,11 +4246,23 @@ class Bigshot
         message("yellow", "Waiting for followers....") if !@followers.all_present?
         sleep 0.5 while (!@followers.all_present?)
       end
+      sleep 0.5
 
       check_for_deaders_prone
 
       @followers.add_event(:JOIN_LEADER)
       @followers.add_event(:CAST_SIGNS)
+
+      # make sure we're hiding if we're sneaking
+      if @followers.need_sneaky?
+        message("yellow", "Waiting for followers to hide.")
+        @followers.add_event(:CHECK_SNEAKY)
+        wait_while { @followers.need_sneaky? }
+        sleep 0.5
+        wait_while { @followers.roundtime? }
+        sleep 0.5
+      end
+
       prepare_for_movement()
     end
 
@@ -4253,6 +4282,7 @@ class Bigshot
     last_attack = 0
     reset_variables()
     target = bs_wander() if !$bigshot_quick
+    return if should_rest?
 
     while true
       while ((target = find_target(target, just_arrived)) && !should_rest? && no_players_hunt && !$bigshot_flee)
@@ -4275,7 +4305,7 @@ class Bigshot
         end
       end
 
-      return if (should_rest?)
+      return if should_rest?
 
       target = bs_wander()
       just_arrived = true
@@ -4333,13 +4363,23 @@ class Bigshot
 
     wait_while { @followers.roundtime? }
 
+    @followers.clear_group_events
     @followers.add_event(:HUNTING_SCRIPTS_STOP)
     croak_scripts(@HUNTING_SCRIPTS)
 
     if @INDEPENDENT_RETURN
-      @followers.add_event(:FOG_RETURN)
-      @followers.add_event(:GO2_WAYPOINTS)
-      @followers.add_event(:GO2_RESTING_ROOM)
+      if $grouplist.length.positive?
+        @followers.add_event(:PREP_REST)
+        @followers.add_event(:LEAVE_GROUP)
+        @followers.add_event(:FOG_RETURN)
+        @followers.add_event(:GO2_WAYPOINTS)
+        @followers.add_event(:GO2_RESTING_ROOM)
+
+        Lich::Util.quiet_command_xml("disband group", /You have no group to disband|You disband your group/)
+        until $grouplist.empty?
+          groupcheck()
+        end
+      end
 
       @RETURN_WAYPOINT_IDS.each { |room| go2(room.to_i) }
       go2(@RESTING_ROOM_ID)
@@ -4358,22 +4398,17 @@ class Bigshot
       }
 
       go2(@RESTING_ROOM_ID)
+    end
+
+    if (@QUIET_FOLLOWERS) && !any_wounded
       @followers.add_event(:FOLLOW_NOW)
       while (!@followers.all_present?)
         break if any_wounded
         message("yellow", "Waiting for followers....")
-        sleep(1)
+        sleep(0.5)
       end
-    end
+      sleep 2
 
-    @followers.add_event(:FOLLOW_NOW)
-    while (!@followers.all_present?)
-      break if any_wounded
-      message("yellow", "Waiting for followers....")
-      sleep(0.5)
-    end
-
-    if (@QUIET_FOLLOWERS) && !any_wounded
       @RESTING_COMMANDS.each { |i|
         fput(i)
         sleep(0.3)
@@ -4384,11 +4419,6 @@ class Bigshot
       @followers.add_event(:RESTING_PREP_COMMANDS)
       @followers.add_event(:RESTING_SCRIPTS_START)
     else
-      # dismiss the group so each character can do it's own thing
-      if $grouplist.length.positive?
-        multifput "disband group", "group open"
-      end
-
       @followers.add_event(:RESTING_PREP_COMMANDS)
       @followers.add_event(:RESTING_SCRIPTS_START)
 
@@ -4406,15 +4436,8 @@ class Bigshot
       single_stop()
     end
 
-    $bigshot_group_status.each { |member, reason|
-      if reason =~ /No blessing on weapon|Ammo had no effect \(need blessed or magical\)/i
-        message("yellow", "Need a blessing or magical weapon/ammo to continue hunting for #{member}")
-        @followers.add_event(:SINGLE_STOP)
-        single_stop()
-      end
-    }
-
     # join everyone back to the leader
+    Lich::Util.quiet_command_xml("group open", /Your group status/)
     @followers.add_event(:JOIN_LEADER)
     while (!@followers.all_present?)
       message("yellow", "Waiting for followers....")
@@ -4436,7 +4459,6 @@ class Bigshot
       fput 'exp'
       sleep 0.2
       display_watch()
-      display_items_for_blessing()
       message("yellow", "Bigshot last rested because: #{$rest_reason}") unless $rest_reason.nil?
 
       $bigshot_group_status[Char.name] = $not_hunting_reason
@@ -4872,6 +4894,14 @@ class Bigshot
     end
   end
 
+  def player_hidden?
+    return hidden?
+  end
+
+  def sneaky_hunt?
+    return @SNEAKY_SNEAKY
+  end
+
   def encumbrance?
     return [percentencumbrance, @ENCUMBERED]
   end
@@ -5171,6 +5201,8 @@ class Bigshot
   def should_rest?()
     echo "should_rest?" if $bigshot_debug
 
+    # echo "Method should_rest?() was called by #{caller[0]}"
+
     group_rest = @followers.group_should_rest?
     leader_rest = ready_to_rest?
 
@@ -5431,6 +5463,8 @@ class Bigshot
 
   def bs_wander()
     echo "bs_wander" if $bigshot_debug
+    return if should_rest?
+
     $wander_rooms    ||= Array.new
     @COMMANDS_REGISTRY = {}
 
@@ -5465,8 +5499,8 @@ class Bigshot
       npcs = GameObj.targets
       npcs.delete_if { |npc| (npc.status =~ /dead|gone/) }
       sort_npcs.each { |i| return i if valid_target?(i, true) and no_players == true and (gameobj_npc_check() > 0) }
-      return if should_rest?
 
+      return if should_rest?
       pause @WANDER_WAIT unless should_flee?(true)
 
       unless should_flee?(true) || !$bigshot_room_claimed.empty?
@@ -5475,7 +5509,21 @@ class Bigshot
         sort_npcs.each { |i| return i if valid_target?(i, false) and no_players_hunt == true and (gameobj_npc_check() > 0) }
       end
 
+      if !@followers.all_present?
+        @followers.add_event(:FOLLOW_NOW) # trigger rubber band
+        message("yellow", "Waiting for followers....")
+        sleep(0.5) while (!@followers.all_present?)
+      end
+
       # make sure we're hiding if we're sneaking
+      while @followers.need_sneaky?
+        message("yellow", "Waiting for followers to hide.")
+        @followers.add_event(:CHECK_SNEAKY)
+        sleep 0.5
+        wait_while { @followers.roundtime? }
+        sleep 0.5
+      end
+
       if $bigshot_sneaky_hunt
         cmd_hide(1) unless hidden
         waitrt?
@@ -5873,7 +5921,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
       end
 
       # process event
-      events_to_skip = [:FOLLOWER_OVERKILL, :PREP_REST, :DISPLAY_WATCH, :START_WATCH, :STOP_WATCH, :CHECK_MIND, :FOLLOW_NOW, :GO2_RALLY_ROOM, :GO2_HUNTING_ROOM]
+      events_to_skip = [:FOLLOWER_OVERKILL, :PREP_REST, :DISPLAY_WATCH, :START_WATCH, :STOP_WATCH, :CHECK_MIND, :FOLLOW_NOW, :GO2_RALLY_ROOM, :GO2_HUNTING_ROOM, :CHECK_SNEAKY]
       bs.message("yellow", " Event: " + event.type.to_s) unless events_to_skip.include?(event.type)
       if (event.type == :HUNTING_PREP_COMMANDS)
         bs.HUNTING_PREP_COMMANDS.each { |i|
@@ -5885,20 +5933,19 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
         }
       elsif (event.type == :JOIN_LEADER)
         next if Char.name == leader
-        is_joined = false
-        until (checkpcs.include?(leader)) && is_joined
-          break if Char.name == leader
 
-          bs.go2(group.room_id)
+        bs.go2(group.room_id) until checkpcs.include?(leader)
+        bs.groupcheck()
+
+        until $grouplist.include?(leader)
+          dothistimeout("join #{leader}", 3, /You are already a member|You join/)
           bs.groupcheck()
-
-          if $grouplist.include?(leader) && checkpcs.include?(leader)
-            is_joined = true
-          else
-            fput "join #{leader}"
-            sleep 2
-          end
         end
+      elsif (event.type == :LEAVE_GROUP)
+        dothistimeout('leave group', 1, /You leave|But you are not in a group/)
+      elsif (event.type == :CHECK_SNEAKY)
+        next if Char.name == leader
+        bs.cmd_hide(1) if bs.sneaky_hunt? && !hidden
       elsif (event.type == :GO2_RALLY_ROOM)
         rally_rooms = group.rally_ids
         rally_rooms.each { |place|
@@ -5967,6 +6014,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
       elsif (event.type == :FOG_RETURN)
         bs.fog_return
       elsif (event.type == :GO2_WAYPOINTS)
+        fput('unhide') if (hidden? || invisible?)
         waypoint_rooms = group.return_waypoints_ids
         waypoint_rooms.each { |place|
           bs.go2(place) until (Room.current.id == place.to_i)
@@ -6012,6 +6060,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
         bs.display_watch()
         bs.message("yellow", "Bigshot last rested because: #{$rest_reason}") if $rest_reason
         bs.message("yellow", "Bigshot isn't hunting because: #{$not_hunting_reason}") if $not_hunting_reason
+        _respond
       elsif (event.type == :CUSTOM_PUT)
         bs.group_put(event.cmd_input)
       elsif (event.type == :CUSTOM_CMD)
