@@ -1,6 +1,7 @@
 # The Hive, a post-cap hunting area in Zul Logoth, gameobj-data.xml additions.
 
 migrate :aggressive_npc do
+  insert(:name, %{bloated kiramon broodtender})
   insert(:name, %{chitinous kiramon myrmidon})
   insert(:name, %{corpulent kresh ravager})
   insert(:name, %{disfigured hive thrall})
