@@ -18,14 +18,7 @@ migrate :skin, :furrier do
   insert(:name, %{(?:thin )?broodtender tendril})  # from bloated kiramon broodtender
 end
 
-=begin
-Additional migrations to be added.
 migrate :gem, :gemshop do
-  insert(:name, %{virescent nephrite shard})
+  insert(:name, %{fragment of pale green-blue aquamarine})
+  insert(:name, %{lilac-crested molten gold ametrine})
 end
-
-migrate :uncommon do
-  insert(:name, %{stygian valravn quill})
-  insert(:name, %{nacreous disir feather})
-end
-=end
