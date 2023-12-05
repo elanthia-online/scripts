@@ -11,10 +11,11 @@ migrate :aggressive_npc do
 end
 
 migrate :skin, :furrier do
-  insert(:name, %{glossy kiramon chitin})    # from chitinous kiramon myrmidon
-  insert(:name, %{kiramon poison gland})     # from sleek black kiramon stalker
-  insert(:name, %{strandweaver spinneret})   # from translucent kiramon strandweaver
-  insert(:name, %{thin broodtender tendril}) # from bloated kiramon broodtender
+  insert(:name, %{(?:glittering )?kresh foreclaw}) # from corpulent kresh ravager
+  insert(:name, %{(?:glossy )?kiramon chitin})     # from chitinous kiramon myrmidon
+  insert(:name, %{kiramon poison gland})           # from sleek black kiramon stalker
+  insert(:name, %{strandweaver spinneret})         # from translucent kiramon strandweaver
+  insert(:name, %{(?:thin )?broodtender tendril})  # from bloated kiramon broodtender
 end
 
 =begin
