@@ -9,18 +9,16 @@ migrate :aggressive_npc do
   insert(:name, %{translucent kiramon strandweaver})
 end
 
+migrate :skin, :furrier do
+  insert(:name, %{strandweaver spinneret}) # from translucent kiramon strandweaver
+  insert(:name, %{glossy kiramon chitin})  # from chitinous kiramon myrmidon
+  insert(:name, %{kiramon poison gland})   # from sleek black kiramon stalker
+end
+
 =begin
 Additional migrations to be added.
 migrate :gem, :gemshop do
   insert(:name, %{virescent nephrite shard})
-end
-
-migrate :skin, :furrier do
-  insert(:name, %{(?:niveous )?warg pelt})
-  insert(:name, %{(?:golden )?hinterboar mane})
-  insert(:name, %{(?:inky black )?valravn plume})
-  insert(:name, %{(?:handful of )?undansormr scales})
-  insert(:name, %{(?:woolly )?mastodon trunk})
 end
 
 migrate :uncommon do
