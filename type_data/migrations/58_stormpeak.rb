@@ -8,6 +8,6 @@ migrate :aggressive_npc do
   insert(:name, %{Veiki herald})
 end
 
-migrate :undead, :aggressive_npc do
+migrate :undead, :aggressive_npc, :noncorporeal do
   insert(:name, %{swirling spectre})
 end
