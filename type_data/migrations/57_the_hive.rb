@@ -24,6 +24,6 @@ migrate :gem, :gemshop do
   insert(:name, %{pear-shaped greenish-yellow citrine})
 end
 
-migrate :breakable do
+migrate :breakable, :valuable do
   insert(:name, %{porous chunk of rock})
 end
