@@ -46,6 +46,7 @@ migrate :gem, :gemshop do
   insert(:name, %{dull griseous mournstone})
   insert(:name, %{faceted wyrm's-heart sapphire})
   insert(:name, %{fossilized undandsormr egg})
+  insert(:name, %{fossilized undansormr egg})
   insert(:name, %{frosted pale violet amethyst})
   insert(:name, %{gold-banded onyx})
   insert(:name, %{gold-green auroral emerald})
