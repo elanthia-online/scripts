@@ -6,5 +6,5 @@ migrate :aggressive_npc do
   insert(:name, %{lightning fiend})
   insert(:name, %{titan stormcaller})
   insert(:name, %{tempest tyrant})
-  insert(:name, %{veiki herald})
+  insert(:name, %{Veiki herald})
 end
