@@ -96,6 +96,10 @@ migrate :skin, :furrier do
   insert(:name, %{(?:woolly )?mastodon trunk})
 end
 
+migrate :gemshop, :valuable do
+  insert(:name, %{fossilized rolton tooth})
+end
+
 migrate :uncommon do
   insert(:name, %{stygian valravn quill})
   insert(:name, %{nacreous disir feather})
