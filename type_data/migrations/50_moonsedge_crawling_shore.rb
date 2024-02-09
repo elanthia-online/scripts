@@ -27,3 +27,18 @@ migrate :aggressive_npc do
   insert(:name, %{gaunt feral selkie})
   insert(:name, %{grisly corpse hulk})
 end
+
+migrate :gem, :gemshop do
+  insert(:name, %{cabochon torchlight carnelian})
+  insert(:name, %{chatoyant cerulean chrysoberyl})
+  insert(:name, %{copper-chased azurite chunk})
+  insert(:name, %{blue-green glacial core})
+  insert(:name, %{pinch of electrum dust})
+  insert(:name, %{fragment of pale blue glacialite})
+  insert(:name, %{swirling quicksilver globe})
+  insert(:name, %{clear azure hoarstone})
+  insert(:name, %{stygian lichstone})
+  insert(:name, %{jagged nephrite shard})
+  insert(:name, %{niveous snowdrop})
+  insert(:name, %{disk of petrified spruce})
+end

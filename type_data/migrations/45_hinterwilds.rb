@@ -44,8 +44,10 @@ migrate :gem, :gemshop do
   insert(:name, %{deep red-violet garnet})
   insert(:name, %{deep violet duskjewel})
   insert(:name, %{dull griseous mournstone})
+  insert(:name, %{faceted stormcloud alexandrite})
   insert(:name, %{faceted wyrm's-heart sapphire})
   insert(:name, %{fossilized undandsormr egg})
+  insert(:name, %{fossilized undansormr egg})
   insert(:name, %{frosted pale violet amethyst})
   insert(:name, %{gold-banded onyx})
   insert(:name, %{gold-green auroral emerald})
@@ -75,6 +77,7 @@ migrate :gem, :gemshop do
   insert(:name, %{silver-hite palladium nugget})
   insert(:name, %{silvery nimbus opal})
   insert(:name, %{small flaxen citrine})
+  insert(:name, %{smooth blue-green labradorite})
   insert(:name, %{some dark ivory aranthium-bloom})
   insert(:name, %{stark white snowstone})
   insert(:name, %{teal chrome diopside})
@@ -91,6 +94,10 @@ migrate :skin, :furrier do
   insert(:name, %{(?:inky black )?valravn plume})
   insert(:name, %{(?:handful of )?undansormr scales})
   insert(:name, %{(?:woolly )?mastodon trunk})
+end
+
+migrate :gemshop, :valuable do
+  insert(:name, %{fossilized rolton tooth})
 end
 
 migrate :uncommon do
