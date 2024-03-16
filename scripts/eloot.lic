@@ -13,8 +13,13 @@
       contributors: SpiffyJr, Athias, Demandred, Tysong, Deysh, Ondreian
               game: Gemstone
               tags: loot
-           version: 1.6.19
+           version: 1.6.20
   Improvements:
+  v1.6.20 (2024-03-16)
+    - added use of trash verb
+    - (F2P) withdraw a note when the max bank account balance is reached
+    - fix to not "Share silvers" from the allotment of "Keep Silvers"
+    - fix to locksmith rooms without trashcans
   v1.6.19 (2024-03-13)
     - fix to not sell bounty items in FWI when selling disabled for that type
   v1.6.18 (2024-03-08)
@@ -1175,6 +1180,14 @@ module ELoot
     return false
   end
 
+  def self.f2p?
+    if ELoot.data.f2p.nil?
+      lines = ELoot.get_lines('account', /Game Instance/)
+      ELoot.data.f2p = $1 if lines.any?(/Account Type: (\w+)/)
+    end
+    ELoot.data.f2p == "F2P"
+  end
+
   def self.find_boxes
     box_sacks = Array.new
     box_sacks.push(ELoot.data.sacks["box"]) if ELoot.data.settings[:sell_container].include?("box")
@@ -1228,13 +1241,25 @@ module ELoot
   def self.find_trash
     trashcan = nil
 
+    # Use new trash verb first
+    lines = ELoot.get_lines('trash', /You could discard items|You do not notice/)
+
+    if lines.any?(/You could discard items in an? <a exist="(-?\d+)" noun=".*?">.*?<\/a>/)
+      trash_id = $1
+    end
+
+    trashcan = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.id == trash_id }
+
+    return trashcan unless trashcan.nil?
+
+    # Stil here see if the meta tag is present
     can = Regexp.last_match(1) if Room.current.tags.find { |t| t =~ /meta:trashcan:(.*)/ }
 
     # Most common scenario - meta:trashcan is defined and GameObj.room_desc is available or trashcan is in GameObj.loot
     trashcan = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.name =~ Regexp.union(can.to_a) }
     return trashcan unless trashcan.nil?
 
-    # Still here? Either the meta:can isn't defined or the room description isn't unavailable. Either way we have to use the noun.
+    # Still here? Either the meta:can isn't defined or the room description isn't available. Either way we have to use the noun.
     can = ["barrel", "bin", "basket", "bucket", "canister", "case", "casket", "crate", "hearth", "pit", "stump", "urn", "wastebasket", "wastebin", "wastecan"]
     trash = (Room.current.description.to_s + GameObj.room_desc.to_s + GameObj.loot.to_s).scan(Regexp.union(can)).uniq
 
@@ -1291,6 +1316,7 @@ module ELoot
   end
 
   def self.go2(place)
+    ELoot.msg "debug", " go2 called by #{caller[0]} place: #{place}"
     fput('unhide') if (hidden? || invisible?)
 
     # If we're going to a place we do it based on the sell_fwi settings
@@ -1430,16 +1456,67 @@ module ELoot
       end
     end
 
-    ending_silver = ELoot.silver_check
-    keep_silvers = ELoot.data.settings[:sell_keep_silver].to_i
+    current_silvers = ELoot.silver_check
+    keep_silvers = [ELoot.data.settings[:sell_keep_silver].to_i, 0].max
+    share_silvers = current_silvers - keep_silvers
+
+    # Share silvers
+    if ELoot.data.settings[:sell_share_silvers] && share_silvers.positive?
+      fput("share #{share_silvers}")
+      current_silvers = ELoot.silver_check
+    end
+
+    # Any notes on us?
     note = ELoot.data.sacks["default"].contents.find { |obj| obj.noun =~ /^(?:note|scrip|chit)$/ }
 
-    unless ending_silver - keep_silvers == 0
-      ELoot.go2('bank')
-      fput('share all') if ELoot.data.settings[:sell_share_silvers] && ending_silver > 1
-      fput('deposit all') if ending_silver > 0 || note
-      fput("withdraw #{keep_silvers}") if keep_silvers.positive?
+    # Head over to the bank if something to do.
+    return unless (current_silvers != keep_silvers) || (note && !ELoot.f2p?)
+
+    ELoot.go2('bank')
+
+    unless ELoot.f2p?
+      result = dothistimeout "deposit all", 2, ELoot.data.deposit_regex
+    else
+      # F2P accounts have to be handled a little different due to bank capacity
+      loop do
+        lines = ELoot.get_lines("bank account", /You currently have an account/)
+
+        if lines.find { |line| line.match(/in the amount of (?<silver>[\d,]+) silver/) }
+          silver_balance = Regexp.last_match[:silver].gsub(',', '').to_i
+        end
+
+        if lines.find { |line| line.match(/a maximum of (?<silver>[\d,]+) silvers/) }
+          silver_max = Regexp.last_match[:silver].gsub(',', '').to_i
+        end
+
+        # Make sure we have the correct current silvers
+        current_silvers = ELoot.silver_check
+
+        # Do we have enough to deposit without taking out a note?
+        if (silver_balance + current_silvers) < silver_max
+          result = dothistimeout("deposit #{current_silvers}", 2, Regexp.union(ELoot.data.deposit_regex, /you don't have access/i)) if current_silvers.positive?
+          if result =~ /you don't have access/i
+            ELoot.msg("info", " You don't have a bank in this town. Exiting...")
+            exit
+          end
+          break
+        else
+          deposit_size = silver_max - silver_balance
+          dothistimeout("deposit #{deposit_size}", 2, ELoot.data.deposit_regex)
+
+          # Do we have enough to pull a full note and still have 10,000 buffer to deposit?
+          current_silvers = ELoot.silver_check
+
+          note_size = current_silvers >= 10000 ? silver_max : (silver_max - (10000 - current_silvers))
+          dothistimeout("withdraw #{note_size}", 2, /The teller/)
+          note = [GameObj.right_hand, GameObj.left_hand].find { |obj| obj.noun =~ /^(?:note|scrip|chit)$/ }
+          Inventory.single_drag(note)
+        end
+      end
     end
+
+    # Finally withdraw any keeper silvers
+    dothistimeout("withdraw #{keep_silvers}", 2, ELoot.data.withdraw_regex) if keep_silvers.positive?
   end
 
   def self.silver_withdraw(amount)
@@ -1492,7 +1569,7 @@ module ELoot
     attr_accessor :disk, :disk_full, :sacks_full, :ready_list, :ready_method, :sacks, :settings, :skinners, :skinsheath, :silent_open, :checked_bags,
                   :close_regex, :look_regex, :sacks_closed, :all_loot_categories, :regex_gold_rings, :right_hand, :left_hand, :skin_edged, :skin_blunt,
                   :coin_hand, :coin_container, :silver_breakdown, :get_regex, :alchemy_mode, :sell_containers, :local_gemshop, :local_furrier, :log_unlootables, :exclude,
-                  :charm, :gauntlet, :coin_bag
+                  :charm, :gauntlet, :coin_bag, :f2p, :deposit_regex, :withdraw_regex
 
     def initialize(settings)
       @disk = nil
@@ -1520,6 +1597,7 @@ module ELoot
       @charm = nil
       @gauntlet = nil
       @coin_bag = nil
+      @f2p = nil
 
       $sell_ignore = Array.new
 
@@ -1563,6 +1641,22 @@ module ELoot
       @settings[:sell_container] ||= ["default", "overflow", "box", "collectible", "forageable", "gem", "herb", "lockpick", "potion", "reagent", "scroll", "skin", "treasure", "trinket", "wand"]
 
       @exclude = @settings[:loot_exclude].map { |r| r.is_a?(String) ? Regexp.new(r) : r }
+
+      @deposit_regex = Regexp.union(
+        /You deposit (?<silver>[\d,]+) silvers? into your account/,
+        /That's a total of (?<silver>[\d,]+) silver/,
+        /That's (?<silver>[\d,]+) silver|silvers? to your account/,
+        /You deposit your note worth (?<silver>[\d,]+) into your account/,
+        /You hand your notes to the teller, who glances over each one and scribbles the amounts in a book.  She says, "They add up to (?<silver>[\d,]+) (?:silver|silvers)/,
+        /You have no coins to deposit/
+      )
+
+      @withdraw_regex = Regexp.union(
+        /I have a (?<debt>bill) of (?<silver>[\d,]+) silvers? (?:presented by your creditors|that I suggest you pay immediately)/,
+        /Very well, a withdrawal of (?<silver>[\d,]+) silver/,
+        /teller scribbles the transaction into a book and hands you (?<silver>[\d,]+) silver/,
+        /teller carefully records the transaction, (?:and then )?hands you (?<silver>[\d,]+) silver/,
+      )
 
       @get_regex = Regexp.union(
         /^You (?:shield the opening of .*? from view as you |discreetly |carefully |deftly |slowly )?(?:remove|draw|grab|reach|slip|tuck|retrieve|already have|unsheathe|detach|swap|sling)/,
@@ -3567,12 +3661,21 @@ module ELoot
         return
       end
 
+      return_room = Room.current.id
+
       ELoot.msg("debug", " save_trash_box(box): looking for a trashcan")
       trash = ELoot.find_trash
 
       unless trash
         # going here because they have trash cans. Don't want to litter
-        ELoot.go2('locksmith pool')
+        if XMLData.game == 'GSF' && Room[Room.current.find_nearest_by_tag("town")].location == 'the tunnels and caverns of Zul Logoth'
+          trash_spot = 1005
+        else
+          trash_spot = 'locksmith pool'
+        end
+
+        ELoot.go2(trash_spot)
+
         trash = ELoot.find_trash
       end
 
@@ -3608,6 +3711,7 @@ module ELoot
       end
 
       fput("drop ##{box.id}") if [GameObj.right_hand.id, GameObj.left_hand.id].include?(box.id)
+      ELoot.go2(return_room)
     end
 
     def self.dump_herbs_junk
@@ -3648,7 +3752,13 @@ module ELoot
 
       unless trash
         # going here because they have trash cans. Don't want to litter
-        ELoot.go2('locksmith pool')
+        if XMLData.game == 'GSF' && Room[Room.current.find_nearest_by_tag("town")].location == 'the tunnels and caverns of Zul Logoth'
+          trash_spot = 1005
+        else
+          trash_spot = 'locksmith pool'
+        end
+
+        ELoot.go2(trash_spot)
         trash = ELoot.find_trash
       end
 
