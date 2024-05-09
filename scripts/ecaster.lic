@@ -1,0 +1,425 @@
+=begin
+  ecaster - make spellcasting great again, based on 'voodoo'
+
+        author: elanthia-online
+  contributors: Selandriel
+          tags: magic, spell, casting
+          game: gs
+      required: Lich > 5.7.0
+       version: 1.0.1
+
+  Version Control:
+    Major_change.feature_addition.bugfix
+      1.0.1: change checkmana to Char.mana calls
+      1.0.0: forked and renamed as ecaster
+             Rubocop cleanup
+             upstream hook name fix
+      0.9.6: fix CAST_RX to catch more roundtimes more correctly
+      0.9.5: fix verb handling to better support all options
+      0.9.4: add support for configuring verb and stance for aliases
+      0.9.3: add timeout to cast procedure to prevent lockups
+      0.9.2: fix 'other' target handling; complete multicast support
+      0.9.1: fix channel rt handling to be less bad
+      0.9.0: initial release
+=end
+
+if running? 'voodoo'
+  echo "You already have 'voodoo' running, which will conflict with this script."
+  echo "Please ;kill voodoo and try again."
+  exit
+end
+
+module ECaster
+  @@options = CharSettings[:options] || {
+    channel: false, conserve: false, safety: false, stance: false
+  }
+
+  @@mantle = CharSettings[:mantle] || {}
+
+  @@stance = CharSettings[:stance] || {}
+
+  @@alias = CharSettings[:alias] || {}
+  @@verbs = CharSettings[:verbs] || {}
+
+  UPSTREAM_HOOK_ID = "#{Script.current.name}_upstream_hook"
+
+  ORDINALS = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth', 'eleventh']
+  STANCES = ['offensive', 'advance', 'forward', 'neutral', 'guarded', 'defensive']
+
+  VALID_VERBS = ['cast', 'channel', 'evoke']
+
+  STANCE_RX = /You are now in an? \w+ stance\.|Cast Roundtime in effect:  Setting stance to \w+\./
+  WAIT_RX = /(?:Cast Roundtime|Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\.|You are now in an? \w+ stance\.|Cast Roundtime in effect:  Setting stance to \w+\./
+  CAST_RX = /(?:Cast|Channel|Evoke) at what\?|You do not currently have a target\.|You (?:gesture|cast|channel|evoke)|(?:\.\.\.)?[Ww]ait \d+ [Ss]ec(?:onds)?\.|You are unable to do that right now\.|You can't make that dextrous of a move!/
+
+  SCCMD_RX = /^(?:<c>)?;(?:#{Script.current.name}|ec)(?:\s(.*))?$/
+  SPELL_RX = /^(?:<c>)?(\d{3,4})\s?(.+?)?\s?(\d+)?$/
+  ALIAS_RX = /^(?:<c>)?(\w+)\s?(.+?)?\s?(\d+)?$/
+
+  SPELL_QUEUE = Queue.new
+  SCCMD_QUEUE = Queue.new
+
+  UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command|
+    begin
+      if command =~ SPELL_RX
+        spell_number = $1
+        spell_target = $2
+        cast_counter = $3
+        input_alias = nil
+      elsif command =~ ALIAS_RX
+        input_alias = $1.downcase
+        spell_number = @@alias[input_alias]
+        spell_target = $2
+        cast_counter = $3
+      end
+    rescue StandardError => e
+      respond e.message
+      respond e.backtrace.join("\r\n")
+    end
+    if spell_number
+      SPELL_QUEUE.push({ number: spell_number, target: spell_target, alias: input_alias, count: cast_counter })
+      nil
+    elsif command =~ SCCMD_RX
+      SCCMD_QUEUE.push($1)
+      nil
+    else
+      command
+    end
+  end)
+
+  before_dying do
+    UpstreamHook.remove(UPSTREAM_HOOK_ID)
+  end
+
+  def self.send(message)
+    message.gsub!('&', '&amp;').gsub!('<', '&lt;').gsub!('>', '&gt;') if ($frontend == 'stormfront')
+    _respond "#{message}\r\n"
+  end
+
+  def self.prompt
+    _respond "<prompt time=\"#{XMLData.server_time}\">#{XMLData.prompt}</prompt>\r\n"
+  end
+
+  def self.command(args)
+    action, first, second = args.split(' ')
+    unless action
+      ECaster.help
+    else
+      if action == 'help'
+        ECaster.help
+      elsif action == 'mantle'
+        ECaster.mantle(first, second)
+      elsif action == 'stance'
+        ECaster.stance(first, second)
+      elsif action == 'alias'
+        ECaster.alias(first, second)
+      elsif action == 'verb'
+        ECaster.verb(first, second)
+      elsif action == 'set'
+        ECaster.option(first, second)
+      else
+        ECaster.help
+      end
+    end
+    ECaster.prompt
+  end
+
+  def self.help
+    ECaster.send "<output class=\"mono\"/>"
+    ECaster.send ""
+    ECaster.send " ECaster helps you cast your spells!"
+    ECaster.send ""
+    ECaster.send " Usage:"
+    ECaster.send "  ;ec alias {spell} {name}"
+    ECaster.send "  ;ec alias clear {name}"
+    ECaster.send "    -- set an alias for a spell number"
+    ECaster.send ""
+    ECaster.send "  ;ec verb {spell} {verb}"
+    ECaster.send "  ;ec verb {spell} clear"
+    ECaster.send "    -- force ecaster to use a specific verb for a given spell"
+    ECaster.send ""
+    ECaster.send "  ;ec stance {spell} {stance}"
+    ECaster.send "    -- change stance to {stance} (default 'offensive') before casting {spell}"
+    ECaster.send "        will stance back to guarded after cast"
+    ECaster.send ""
+    ECaster.send "  ;ec mantle {spell} [remove]"
+    ECaster.send "    -- add [or remove] a given spell to your mantle list"
+    ECaster.send "        ecaster will attempt to keep these spells active"
+    ECaster.send ""
+    ECaster.send "  ;ec set {option} on|off"
+    ECaster.send "    channel -- attempt to use channel verb for supported spells"
+    ECaster.send "    safety -- prevent casting offensive spells without valid target in room"
+    ECaster.send "    stance -- attempt to change stance for aimed spells only"
+    ECaster.send ""
+    ECaster.send "    conserve -- do not cast spell if insufficient mana or if specific target is not valid"
+    ECaster.send ""
+    ECaster.send " Options: #{@@options}"
+    ECaster.send ""
+    ECaster.send " Stances: #{@@stance}"
+    ECaster.send ""
+    ECaster.send " Alias: #{@@alias}"
+    ECaster.send ""
+    ECaster.send " Verbs: #{@@verbs}"
+    ECaster.send ""
+    ECaster.send "<output class=\"\"/>"
+  end
+
+  def self.mantle(*args)
+    spell_number, remove = args
+    spell_number = spell_number.to_i
+    unless spell_number
+      ECaster.send "You must specify a valid spell number."
+    else
+      unless remove
+        unless @@mantle.include?(spell)
+          @@mantle.push(spell)
+          ECaster.send "#{spell} has been added to your mantle list."
+        else
+          ECaster.send "Your"
+        end
+      else
+        # if remove ~= /^remove$/
+        # @@mantle.
+      end
+    end
+  end
+
+  def self.verb(*args)
+    valid_verbs_message = "Valid verbs include: incant, channel, evoke"
+    spell, verb = args
+    unless spell && verb
+      ECaster.send "You must specify a valid spell number and verb.  #{valid_verbs_message}"
+    else
+      if verb == 'clear'
+        @@verbs.delete spell
+        ECaster.send "Removed verb for spell #{spell}."
+      else
+        unless VALID_VERBS.include?(verb)
+          ECaster.send "The specified verb '#{verb}' is invalid.  #{valid_verbs_message}"
+        else
+          old_verb = @@verbs[spell]
+          if old_verb
+            ECaster.send "Spell #{spell} was set to use the '#{old_verb}' verb, changing to '#{verb}'."
+          else
+            ECaster.send "Spell #{spell} will now use #{verb} verb."
+          end
+          @@verbs[spell] = verb
+          CharSettings[:verbs] = @@verbs
+          CharSettings.save
+        end
+      end
+    end
+  end
+
+  def self.alias(*args)
+    spell, command = args
+    unless spell && command
+      ECaster.send "You must specify a valid spell number and alias name."
+    else
+      if spell == 'clear'
+        @@alias.delete command
+        ECaster.send "Removed alias '#{command}'."
+      else
+        old_spell = @@alias[command]
+        if old_spell
+          ECaster.send "Alias '#{command}' was set to spell #{old_spell}, changing to #{spell}."
+        else
+          ECaster.send "Created alias '#{command}' for spell #{spell}."
+        end
+        @@alias[command] = spell
+      end
+      CharSettings[:alias] = @@alias
+      CharSettings.save
+    end
+  end
+
+  def self.stance(*args)
+    spell, stance = args
+    unless spell && stance
+      ECaster.send "You must specify a valid spell number and stance."
+    else
+      if stance == 'clear'
+        @@stance.delete spell
+        ECaster.send "Removed stance for spell #{spell}."
+      else
+        unless STANCES.include?(stance)
+          ECaster.send "Specified stance '#{stance}' is not recognized."
+          ECaster.send "Valid options include: #{STANCES.join(', ')}"
+        else
+          old_stance = @@stance[spell]
+          if old_stance
+            ECaster.send "Stance for spell #{spell} was '#{old_stance}, changing to '#{stance}'."
+          else
+            ECaster.send "Set spell #{spell} to use stance '#{stance}'."
+          end
+          @@stance[spell] = stance
+        end
+      end
+      CharSettings[:stance] = @@stance
+      CharSettings.save
+    end
+  end
+
+  def self.option(*args)
+    option, value = args
+    unless option && value
+      ECaster.send "You must specify a valid option and value."
+      ECaster.send "Valid options include: #{@@option.keys.join(' ')}"
+    else
+      option = option.to_sym
+      unless @@options.keys.include?(option)
+        ECaster.send "Specified option '#{option}' is not valid."
+        ECaster.send "Current options are: #{@@option}"
+      else
+        value = (value == 'on')
+        @@options[option] = value
+        CharSettings[:options] = @@options
+        CharSettings.save
+        ECaster.send "Set option '#{option}' to #{value}."
+      end
+    end
+  end
+
+  def self.affordable?(spell, count)
+    if spell.num == 516 && Char.mana >= 1
+      true
+    elsif count
+      Char.mana >= (spell.mana_cost * count.to_i)
+    else
+      Char.mana >= spell.mana_cost
+    end
+  end
+
+  def self.valid_targets?
+    GameObj.npcs.count { |npc| npc.type =~ /aggressive/ && npc.status !~ /dead|gone/ } || 0
+  end
+
+  def self.valid_target?(target)
+    s1, s2, s3 = target.downcase.split(' ')
+    s1 = 'second' if s1 == 'other'
+    n = ORDINALS.index(s1) || -1
+    if n > -1
+      if s3
+        pattern = /#{s2}(?:.+?)#{s3}/
+      else
+        pattern = /#{s2}/
+      end
+    else
+      if s2
+        pattern = /#{s1}(?:.+?)#{s2}/
+      else
+        pattern = /#{s1}/
+      end
+    end
+    # candidate = GameObj.pcs.select {|pc| pc.noun =~ pattern }
+    candidate = GameObj.npcs.select { |npc| npc.name =~ pattern }.at(n)
+    candidate && candidate.status !~ /dead|gone/ && candidate.type =~ /aggressive/
+  end
+
+  def self.cast(input)
+    spell_number, spell_target, spell_alias, count = input.values_at(:number, :target, :alias, :count)
+    spell = Spell[spell_number]
+
+    if spell_target.to_i.to_s == spell_target
+      count = spell_target
+      spell_target = nil
+    end
+
+    unless spell
+      ECaster.send "Spell number #{spell_number} is not a known spell."
+      ECaster.prompt
+      return
+    end
+
+    unless spell.known?
+      ECaster.send "You do not known the #{spell.name} spell!"
+      ECaster.prompt
+      return
+    end
+
+    if @@options[:conserve]
+      unless ECaster.affordable?(spell, count)
+        ECaster.send "Insufficient mana to cast #{spell.name}."
+        ECaster.prompt
+        return
+      end
+      if spell.type == 'attack' && spell_target && !ECaster.valid_target?(spell_target)
+        ECaster.send "Could not find valid target matching '#{spell_target}'."
+        ECaster.prompt
+        return
+      end
+    end
+
+    if @@options[:safety] && spell.type == 'attack' && ECaster.valid_targets? == 0
+      ECaster.send "No valid targets available to safely cast #{spell.name}."
+      ECaster.prompt
+      return
+    end
+
+    if checkcastrt > 0
+      echo "Waiting for cast roundtime..."
+      waitcastrt? while checkcastrt > 0
+    end
+
+    if @@stance[spell_alias] || @@stance[spell_number] || @@options[:stance] && spell.stance
+      stance = @@stance[spell_alias] || @@stance[spell_number] || 'offensive'
+      unless checkstance == stance || dead?
+        result = dothistimeout "stance #{stance}", 2, STANCE_RX until result =~ STANCE_RX
+      end
+      result = nil
+    end
+
+    should_channel = spell.channel && @@options[:channel]
+
+    verb = @@verbs[spell_alias] || @@verbs[spell_number] || 'cast'
+    verb = 'channel evoke' if should_channel && verb == 'evoke'
+
+    if spell_target
+      if verb == 'channel evoke'
+        put "target #{spell_target}"
+        put "incant #{spell_number} #{verb} #{count}"
+      else
+        put "prepare #{spell_number}"
+        put "#{verb} #{spell_target} #{count}"
+      end
+    else
+      unless verb == 'cast'
+        put "incant #{spell_number} #{verb} #{count}"
+      else
+        put "incant #{spell_number} #{count}"
+      end
+    end
+
+    if @@stance[spell_alias] || @@stance[spell_number] || @@options[:stance] && spell.stance
+      stance = 'guarded'
+      # if verb == 'channel' || spell.channel
+      timeout = (Time.now.to_f + 3.0)
+      line = get until (line =~ CAST_RX || (Time.now.to_f) > timeout)
+      waitrt if line =~ /You channel/
+      # end
+      result = dothistimeout "stance #{stance}", 2, STANCE_RX until result =~ STANCE_RX
+    end
+  end
+
+  ECaster.prompt
+  echo "Type ;ec for options."
+  ECaster.prompt
+
+  loop do
+    unless SPELL_QUEUE.empty?
+      spell = SPELL_QUEUE.pop
+      SPELL_QUEUE.clear
+      ECaster.cast spell
+    end
+    # unless MANTLE_QUEUE.empty?
+    # 	spell = MANTLE_QUEUE.pop
+    # 	ECaster.cast spell
+    # end
+    unless SCCMD_QUEUE.empty?
+      command = SCCMD_QUEUE.pop
+      SCCMD_QUEUE.clear
+      ECaster.command command
+    end
+    sleep 0.1
+  end
+end

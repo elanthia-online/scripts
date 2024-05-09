@@ -25,6 +25,11 @@ end
 migrate :undead do
   insert(:name, "spectre")
   insert(:name, "darken")
+  insert(:name, %{bog spectre})
+end
+
+migrate "noncorporeal" do
+  insert(:name, %{bog spectre})
 end
 
 migrate :gem do

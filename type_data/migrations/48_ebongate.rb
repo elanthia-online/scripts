@@ -202,6 +202,7 @@ migrate :ebongate, :valuable do
   insert(:name, %{rutilated rainbow crystal})
   insert(:name, %{shard of dark pink\-on\-violet alexandrite})
   insert(:name, %{shard of gold\-webbed red obsidian})
+  insert(:name, %{slice of ebony requiem starstone})
   insert(:name, %{slice of golden requiem sunstone})
   insert(:name, %{slice of grey requiem dreamstone})
   insert(:name, %{small azure\-banded auroraline})
