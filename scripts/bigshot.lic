@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.3.12
+       version: 5.3.13
       required: Lich >= 5.5.0, infomon >= 1.18.11
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,6 +17,9 @@
 
   Version Control:
     Major_change.feature_addition.bugfix
+  v5.3.13 (2024-07-19)
+    - bugfix for head/tail random looting
+    - bugfix for smite tracking in a group
   v5.3.12 (2024-07-13)
     - update profile_current and save_profile_name when using CLI profile load/save
     - bugfix ready_to_rest? should_rest lambda logic
@@ -403,11 +406,11 @@ class Bigshot
     end
 
     def set_group_looting_active
-      @members[@leader.ma_looter].set_looting_active
+      @members[@leader.designated_looter].set_looting_active
     end
 
     def looter
-      return @leader.DESIGNATED_LOOTER
+      return @leader.designated_looter
     end
 
     def looter_present?
@@ -3187,7 +3190,12 @@ class Bigshot
   def cmd_volnsmite(npc)
     echo "cmd_volnsmite" if $bigshot_debug
     while !$bigshot_smite_list.any? { |a| a.to_i == npc.id.to_i } && npc.status !~ /dead|gone/ && GameObj.targets.any? { |s| s.id == npc.id } && !should_flee? && (npc.type.split(',').any? { |a| a == "undead" } || npc.type.split(',').any? { |a| a == "noncorporeal" })
-      res = dothistimeout "smite ##{npc.id}", 1, /^Roundtime|^What were you referring to\?$/
+      res = dothistimeout "smite ##{npc.id}", 1, /^Roundtime|^What were you referring to\?$|^It looks like somebody already did the job for you\.$/
+      if res =~ /^It looks like somebody already did the job for you\.$/i
+        $bigshot_smite_list.push(npc.id.to_i)
+        break
+      end
+
       if res =~ /^What were you referring to\?$/i
         break
       end
@@ -4295,6 +4303,9 @@ class Bigshot
       encumbrance_hash[Char.name] = (@ENCUMBERED - percentencumbrance) # Add the leader
       encumbrance_hash.reject! { |key, _value| @NEVER_LOOT.include?(key) } # Remove any character in the no-loot list
 
+      # Remove or handle nil values
+      encumbrance_hash.compact!
+
       # Find the max
       max_value = encumbrance_hash.values.max
 
@@ -4318,6 +4329,10 @@ class Bigshot
     end
 
     return looter
+  end
+
+  def designated_looter
+    @DESIGNATED_LOOTER
   end
 
   def lead(my_group = nil)
@@ -4588,7 +4603,7 @@ class Bigshot
       end
 
       # if its dead lets loot it!
-      need_to_loot?(target, true)
+      need_to_loot?
 
       return if should_rest?
 
@@ -4646,6 +4661,13 @@ class Bigshot
 
     set_obvious_hiding_player(false)
     prepare_for_movement
+
+    # Wait for follower to finish looting if needed
+    while !@followers.looting_done
+      $looting_inactive = @followers.looting_done
+      echo "rest - $looting_inactive: #{$looting_inactive}" if $bigshot_debug
+      sleep 0.5
+    end
 
     wait_while { @followers.roundtime? }
 
@@ -4892,30 +4914,68 @@ class Bigshot
     escape_rooms
 
     # if its dead lets loot it!
-    need_to_loot?(target)
+    need_to_loot?
 
     echo "commands.size = #{commands.size}" if $bigshot_debug
   end
 
-  def need_to_loot?(target, after_attack_loop = false)
-    if (target.status =~ /dead|gone/ || after_attack_loop) && !$ambusher_here
-      @DESIGNATED_LOOTER = ma_looter
-      if Char.name == @DESIGNATED_LOOTER && (Char.name == @followers.leader_name || @followers.leader_name.nil?)
-        loot()
-      else
-        if Char.name == @followers.leader_name
-          $looting_inactive = false
-          @followers.set_group_looting_active
-          @followers.add_event(:PREP_REST)
-          @followers.add_event(:LOOT)
-        end
-      end
-      check_mind
+  def need_to_loot?(final_loot = false)
+    return unless leading?
+    return unless checkroom("Duskruin Arena, Dueling Sands").nil?
+    return if should_flee?
+    return if $ambusher_here
+    return unless @followers.looting_done
 
-      if @BOUNTY_MODE && (bounty_check?)
-        $bigshot_should_rest = true
-      end
+    $last_loot ||= Time.now + 15
+    if @DELAY_LOOT && sort_npcs.any? { |s| valid_target?(s) } && !final_loot
+      return unless $last_loot <= Time.now
     end
+
+    dead_npcs = GameObj.npcs.find_all { |i| i.status == 'dead' && i.type !~ /escort/i }
+    if dead_npcs.length.zero?
+      reset_variables()
+      return
+    end
+
+    @DESIGNATED_LOOTER = ma_looter
+    echo "need_to_loot? | @DESIGNATED_LOOTER: #{@DESIGNATED_LOOTER} | called by #{caller[0]}" if $bigshot_debug
+
+    $looting_inactive = false
+    if Char.name == @DESIGNATED_LOOTER
+      loot()
+      $looting_inactive = true
+    else
+      @followers.set_group_looting_active
+      @followers.add_event(:PREP_REST)
+      @followers.add_event(:LOOT)
+    end
+
+    $last_loot = nil
+
+    check_mind
+
+    if @BOUNTY_MODE && (bounty_check?)
+      $bigshot_should_rest = true
+    end
+  end
+
+  def loot()
+    dead_npcs = GameObj.npcs.find_all { |i| i.status == 'dead' && i.type !~ /escort/i }
+    dead_npcs.each { |i|
+      next if i.status =~ /gone/
+      use_lte_boost()
+      add_overkill()
+      change_stance('defensive') if gameobj_npc_check() > 0 && @LOOT_STANCE
+
+      if (@LOOT_SCRIPT)
+        run_script(@LOOT_SCRIPT, true)
+      else
+        bs_put "loot ##{i.id}"
+        bs_put "loot room"
+      end
+
+      break unless GameObj.npcs.any? { |npc| npc.status == 'dead' && npc.type !~ /escort/i }
+    }
   end
 
   def go2(place)
@@ -5354,7 +5414,8 @@ class Bigshot
   end
 
   def reset_variables()
-    echo "reset_variables" if $bigshot_debug
+    echo "reset_variables called by #{caller[0]}" if $bigshot_debug
+
     $ambusher_here = false
     $bigshot_smite_list = []
     $bigshot_aim = 0
@@ -5546,7 +5607,7 @@ class Bigshot
     # Otherwise we need to rest for some reason
     # call loot for certain situations but not if wounded
     if rest_reasons.any? { |reason| reason.match?(/dread limit|bounty complete|fried|out of mana|encumbered/) } && !$ambusher_here && $bigshot_room_claim.length.to_i.zero? && !rest_reasons.include?('wounded.')
-      final_loot()
+      need_to_loot?(true)
     end
     # Fixme: wounded group members need to be mobile before leaving
     $bigshot_status = :resting
@@ -5703,60 +5764,6 @@ class Bigshot
 
   def set_looting_active
     $looting_inactive = false
-  end
-
-  def final_loot
-    @DESIGNATED_LOOTER = ma_looter
-    if Char.name == @DESIGNATED_LOOTER && (Char.name == @followers.leader_name || @followers.leader_name.nil?)
-      loot_dead
-    else
-      if Char.name == @followers.leader_name
-        @followers.add_event(:PREP_REST)
-        @followers.add_event(:FINAL_LOOT)
-      end
-    end
-  end
-
-  def loot
-    echo "loot" if $bigshot_debug
-    return unless checkroom("Duskruin Arena, Dueling Sands").nil?
-
-    waitrt?
-
-    $last_loot ||= Time.now + 15
-    if @DELAY_LOOT && sort_npcs.any? { |s| valid_target?(s) }
-      loot_dead if $last_loot <= Time.now
-    else
-      loot_dead
-    end
-  end
-
-  def loot_dead
-    dead_npcs = GameObj.npcs.find_all { |i| i.status == 'dead' && i.type !~ /escort/i }
-    if dead_npcs.length.zero?
-      reset_variables()
-      return
-    end
-    return if should_flee?
-
-    $looting_inactive = false
-    dead_npcs.each { |i|
-      next if i.status =~ /gone/
-      $last_loot = nil
-      use_lte_boost()
-      add_overkill()
-      change_stance('defensive') if gameobj_npc_check() > 0 && @LOOT_STANCE
-
-      if (@LOOT_SCRIPT)
-        run_script(@LOOT_SCRIPT, true)
-      else
-        bs_put "loot ##{i.id}"
-        bs_put "loot room"
-      end
-
-      break unless GameObj.npcs.any? { |npc| npc.status == 'dead' && npc.type !~ /escort/i }
-    }
-    $looting_inactive = true
   end
 
   def check_room_claimed(player_present)
@@ -6358,12 +6365,6 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
       event = bs.event_stack.size == 0 ? nil : bs.grab_event
       next if event.nil?
 
-      if bs.event_stack.any? { |a| [:LOOT, :FINAL_LOOT].include?(a.type) }
-        if group.looter == Char.name
-          $looting_inactive = false
-        end
-      end
-
       # kertwang!
       if [:FOLLOW_NOW, :ATTACK].include?(event.type)
         unless checkpcs.include?(leader)
@@ -6444,10 +6445,9 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
               stop_attack = true
               break
             end
-            if bs.event_stack.any? { |a| [:LOOT, :FINAL_LOOT].include?(a.type) }
-              if group.looter == Char.name
-                $looting_inactive = false
-              end
+            if (bs.event_stack.any? { |a| a.type == :LOOT }) && group.looter == Char.name
+              stop_attack = true
+              break
             end
 
             target = bs.find_target(nil) if !$bigshot_bandits && @PRIORITY && !bs.priority(target)
@@ -6492,20 +6492,11 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
         until (Room.current.id == group.resting_id)
           bs.go2(group.resting_id)
         end
-      elsif (event.type == :LOOT)
-        if group.looter == Char.name
-          $looting_inactive = false
-          bs.loot
-          sleep 0.5
-          $looting_inactive = true
-        end
-      elsif (event.type == :FINAL_LOOT)
-        if group.looter == Char.name
-          $looting_inactive = false
-          bs.loot_dead
-          sleep 0.5
-          $looting_inactive = true
-        end
+      elsif (event.type == :LOOT) && group.looter == Char.name
+        $looting_inactive = false
+        bs.loot
+        sleep 0.5
+        $looting_inactive = true
       elsif (event.type == :HUNTING_SCRIPTS_STOP)
         bs.croak_scripts(bs.HUNTING_SCRIPTS)
       elsif (event.type == :RESTING_PREP_COMMANDS)
