@@ -1,3 +1,5 @@
+return true if ENV['NETLIFY']
+
 source 'https://rubygems.org'
 
 group :development do
