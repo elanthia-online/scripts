@@ -103,4 +103,5 @@ end
 migrate :uncommon do
   insert(:name, %{stygian valravn quill})
   insert(:name, %{nacreous disir feather})
+  insert(:name, %{silver-veined black draconic idol})
 end
