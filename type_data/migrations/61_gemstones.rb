@@ -1,4 +1,4 @@
-create_table "ascension:jewel", keys: [:noun, :exclude]
+create_table "ascension:jewel", keys: [:noun]
 
 migrate "ascension:jewel" do
   insert(:noun, %[jewel])
