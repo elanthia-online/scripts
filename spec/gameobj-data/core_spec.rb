@@ -17,6 +17,7 @@ describe GameObj do
         "alchemy product",
         "ammo",
         "armor",
+        "ascension:jewel",
         "bandit",
         "boon",
         "box",
