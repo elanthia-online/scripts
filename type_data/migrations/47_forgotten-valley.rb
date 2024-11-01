@@ -7,3 +7,7 @@ migrate :aggressive_npc do
   insert(:name, %{shan sorcerer})
   insert(:name, %{shan sorceress})
 end
+
+migrate :valuable, :gemshop do
+  insert(:name, %{scintillating fishscale})
+end
