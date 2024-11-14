@@ -1,0 +1,309 @@
+=begin
+   A script that tracks enhancive charge loss. Will check charge level in the background when enhancives are active.
+   
+   ;ECTracker alert
+      - Toggle alert message when charge loss recorded
+   ;ECTracker verbose
+      - Toggle alert message when charge level is checked (mainly for troubleshooting)
+
+   ;ECTracker 300
+      - Start tracking, # determins time between checks in seconds. Defaults to 60 if left blank.
+   ;eq ECTracker.generate_item_summary("item_name")
+      - Lists a summary of the item selected. Accepts partial name.
+   ;eq ECTracker.find_simultaneous_charge_loss
+      - Lists events when more than one item lost a charge.
+
+        author: Nisugi
+  contributors: Nisugi
+          game: Gemstone
+          tags: enhancives, charge, tracking, data
+       version: 1.0.0
+
+  v1.0.0
+    - Initial Release
+=end
+
+module ECTracker
+require 'yaml'; require 'time'
+UserVars.ectracker ||= Hash.new
+UserVars.ectracker[:alert] ||= false
+UserVars.ectracker[:verbose] ||= false
+
+  ENHANCIVE_ON_MSGS = Regexp.union(
+    /You are now accepting the benefits of your enhancive inventory items./,
+    /You are already accepting the benefits of any and all enhancive items in your inventory./,
+    /You cannot turn off enhancives while in combat./,
+    /You are currently accepting the benefits of any and all enhancive items in your inventory./,
+    /You concentrate, but nothing seems to happen./
+  )
+  ENHANCIVE_OFF_MSGS = Regexp.union(
+    /You are no longer accepting the benefits of your enhancive inventory items./,
+    /You already are not accepting the benefits of any enhancive items in your inventory./,
+    /You are(?:<pushBold\/>)? not(?:<popBold\/>)? currently accepting the benefit of any enhancive items in your inventory./
+  )
+  ENHANCIVE_MSGS = Regexp.union(ENHANCIVE_ON_MSGS, ENHANCIVE_OFF_MSGS)
+
+  def self.help
+    msg = "\n"
+    msg += ";ECTracker alert\n"
+    msg += "  - Toggle alert message when charge loss recorded\n\n"
+    msg += ";ECTracker verbose\n"
+    msg += "  - Toggle alert message when charge level is checked (mainly for troubleshooting)\n\n"
+    msg += ";ECTracker 300\n"
+    msg += "  - Start tracking, # determins time between checks in seconds. Defaults to 60 if left blank.\n\n"
+    msg += ';eq ECTracker.generate_item_summary("item_name")'
+    msg += "\n  - Lists a summary of the item selected. Accepts partial name. No name defaults to all items.\n\n"
+    msg += ";eq ECTracker.find_simultaneous_charge_loss\n"
+    msg += "  - Lists events when more than one item lost a charge.\n"
+    Lich::Messaging.mono(msg)
+  end
+
+  # load our data, or create our data structure if first run
+  def self.load
+    @@filename = File.join(DATA_DIR, XMLData.game, Char.name, "ECTracker.yaml")
+    game_dir = File.join(DATA_DIR, XMLData.game)
+    char_dir = File.join(game_dir, Char.name)
+    Dir.mkdir(game_dir) unless File.exist?(game_dir)
+    Dir.mkdir(char_dir) unless File.exist?(char_dir)
+
+    if File.exist?(@@filename)
+      @@items = YAML.load_file(@@filename, permitted_classes: [Symbol, Time]) || {}
+      @@items.each_value do |entries|
+        entries.each { |entry| entry[:time_checked] = Time.parse(entry[:time_checked]) if entry[:time_checked].is_a?(String) }
+      end
+      Lich::Messaging.msg("info", "Enhancive Charge Tracking file loaded. #{@@filename}")
+    else
+      @@items = {}
+      File.write(@@filename, @@items.to_yaml)
+      Lich::Messaging.msg("info", "Creating Enhancive Charge Tracking file. #{@@filename}")
+    end
+  end
+  
+  # meat and potatoes
+  # determine if enhancives are active or not.
+  def self.check_enhancive_state
+    result = Lich::Util.issue_command( "invento enh", ENHANCIVE_MSGS, /You currently have \d+ enhancive pauses? available./, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true )
+    if result.include?(ENHANCIVE_ON_MSGS)
+      UserVars.enhancives_active = true
+    elsif result.include?(ENHANCIVE_OFF_MSGS)
+      UserVars.enhancives_active = false
+    end
+  end
+
+  # check charges of all worn enhancives 
+  def self.check_charges
+    Lich::Messaging.msg("info", "Nom Nom Nom (Checking charges)") if UserVars.ectracker[:verbose]
+    timestamp = Time.now.iso8601
+    result = Lich::Util.issue_command("invento enh list", /Your worn items are:/, /For more information, see/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
+
+    result.each do |line|
+      case line
+      when /[^<]+<a exist="\d+" noun="\w+">([^<]+)<\/a>[^(]+\((?:<pushBold\/>)?(\d+)(?:<popBold\/>)?\/\d+ charges\)/
+        item_name = $1.strip
+        charges = $2.to_i
+
+        @@items[item_name] ||= []
+        last_entry = @@items[item_name].last
+        charge_lost = last_entry && last_entry[:charges] > charges
+        Lich::Messaging.msg("info", "CHARGE LOST - #{item_name}") if charge_lost && UserVars.ectracker[:alert]
+        if last_entry.nil? || charge_lost || last_entry[:active] != UserVars.enhancives_active
+          @@items[item_name] << { charges: charges, time_checked: timestamp, active: UserVars.enhancives_active }
+        end
+      
+      when /[^<]+<a exist="\d+" noun="\w+">([^<]+)<\/a>[^(]+\(charged until (.*?)\)/
+        item_name = $1.strip
+        expiration = $2.strip
+        @@items[item_name] ||= []
+        last_entry = @@items[item_name].last
+        if last_entry.nil? || last_entry[:expiration] != expiration
+          @@items[item_name] << { expiration: expiration, time_checked: timestamp, active: UserVars.enhancives_active }
+        end
+        
+      end
+    end
+  end
+
+  # utilities
+  # Helper to format time in DD:HH:MM:SS format
+  def self.format_time(total_seconds)
+    days = (total_seconds / 86400).to_i
+    hours = (total_seconds % 86400 / 3600).to_i
+    minutes = (total_seconds % 3600 / 60).to_i
+    seconds = (total_seconds % 60).to_i
+
+    format("%02d:%02d:%02d:%02d", days, hours, minutes, seconds)
+  end
+
+  # is it a string or is it a time object??
+  def self.parse_time(time_checked)
+    time_checked.is_a?(String) ? Time.parse(time_checked) : time_checked
+  end
+
+  # Calculate the total active time for an item
+  def self.calculate_total_active_time(entries)
+    total_time = 0
+    active_start_time = nil
+    entries.each do |entry|
+      if entry[:active]
+        active_start_time ||= parse_time(entry[:time_checked])
+      else
+        if active_start_time
+          time_checked = parse_time(entry[:time_checked])
+          total_time += time_checked - active_start_time
+          active_start_time = nil
+        end
+      end
+    end
+
+    total_time += Time.now - active_start_time if active_start_time
+    return ECTracker.format_time(total_time.to_i)
+  end
+
+  # Calculate the total charges lost for an item
+  def self.calculate_total_charges_lost(entries)
+    charges_lost = 0
+    entries.each_cons(2) do |prev_entry, next_entry|
+      next unless prev_entry[:charges] && next_entry[:charges]
+      lost = prev_entry[:charges] - next_entry[:charges]
+      charges_lost += lost if lost > 0
+    end
+    charges_lost
+  end
+
+  # Find times when a charge was depleted for an item
+  def self.find_charge_depletion_times(entries)
+    depletion_times = []
+    entries.each_cons(2) do |prev_entry, next_entry|
+      if prev_entry[:charges] && next_entry[:charges] && prev_entry[:charges] > next_entry[:charges]
+        depletion_times << next_entry[:time_checked]
+      end
+    end
+    depletion_times
+  end
+
+  # Generate summary of selected item, or all items if none selected. Partially matches.
+  def self.generate_item_summary(name = "all")
+    msg = "Item Summary Report:\n"
+
+    @@items.each do |item_name, entries|
+      next unless name.downcase == "all" || item_name.downcase.include?(name.downcase)
+
+      total_time_active = calculate_total_active_time(entries)
+      charges_lost = calculate_total_charges_lost(entries)
+      charge_depletion_times = find_charge_depletion_times(entries)
+
+      msg += "Item Name: #{item_name}\n"
+      msg += "Total Time Active: #{total_time_active}\n"
+      msg += "Total Charges Lost: #{charges_lost}\n"
+      msg += "Charge Depletion Times:\n"
+
+      if charge_depletion_times.empty?
+        msg += " - No charge depletion events recorded.\n"
+      else
+        charge_depletion_times.each_with_index do |time, index|
+          if index == 0
+            interval = 0
+          else
+            interval = ((time - charge_depletion_times[index - 1]) / 60).to_i
+          end
+        msg += " - #{time.strftime('%Y-%m-%d %H:%M:%S %z')}     #{interval} minutes\n"
+        end
+      end
+      msg += "\n"
+      Lich::Messaging.mono(msg)
+      msg = ""
+    end
+  end
+
+  # Generate summary of multi charge loss events.
+  def self.find_simultaneous_charge_loss
+    msg = "Simultaneous Charge Loss Events:\n"
+    charge_times = Hash.new { |hash, key| hash[key] = [] }
+
+    @@items.each do |item_name, entries|
+      entries.each_cons(2) do |prev_entry, next_entry|
+        next unless prev_entry[:charges] && next_entry[:charges] && prev_entry[:charges] > next_entry[:charges]
+          charge_times[next_entry[:time_checked]] << { name: item_name, loss_time: next_entry[:time_checked] }
+      end
+    end
+
+    # Filter and sort events where multiple items lost charges simultaneously
+    simultaneous_events = charge_times.select { |_, items| items.size > 1 }.sort.to_h
+    if simultaneous_events.empty?
+      msg += "No simultaneous charge loss events found."
+    else
+      simultaneous_events.each do |time, items|
+        msg += "#{items.count} charges lost on #{time.strftime('%Y-%m-%d at %H:%M:%S')}\n"
+        # msg += "Event Time: #{time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+        # msg += "Number of Items Affected: #{items.count}"
+        items.each do |item|
+          msg += "  - #{item[:name]}\n"
+        end
+        msg += "\n"
+      end
+    end
+      Lich::Messaging.mono(msg)
+      msg = ""
+  end
+
+  # Do the damn thang.
+  # Watch for enhancive activation/deactivation
+  Thread.new do
+    status_tags
+    while line = get
+      if line =~ ECTracker::ENHANCIVE_ON_MSGS
+        UserVars.enhancives_active = true
+      elsif line =~ ECTracker::ENHANCIVE_OFF_MSGS
+        UserVars.enhancives_active = false
+      end
+    end
+  end
+
+ 
+  if Script.current.vars[0] =~ /^verbose/
+    UserVars.ectracker[:verbose] = !UserVars.ectracker[:verbose]
+    Lich::Messaging.msg("info", "Verbose messaging active") if UserVars.ectracker[:verbose]
+    Lich::Messaging.msg("info", "Verbose messaging inactive") if !UserVars.ectracker[:verbose]
+    exit
+  elsif Script.current.vars[0] =~ /^alert/
+    UserVars.ectracker[:alert] = !UserVars.ectracker[:alert]
+    Lich::Messaging.msg("info", "Verbose messaging active") if UserVars.ectracker[:alert]
+    Lich::Messaging.msg("info", "Verbose messaging inactive") if !UserVars.ectracker[:alert]
+    exit
+  elsif Script.current.vars[0] =~ /^help/
+    ECTracker.help
+    exit
+    # Set our check interval in seconds 
+  elsif Script.current.vars[0] =~ /^(\d+)$/
+    @@time_between_checks = $1.to_i
+    Lich::Messaging.msg("info", "Setting check interval to #{$1} seconds.")
+  else
+    @@time_between_checks = 60
+    Lich::Messaging.msg("info", "Using default check interval of 60 seconds.")
+  end
+  
+  # load our data up
+  ECTracker.load
+  before_dying { File.write(@@filename, @@items.to_yaml) }
+
+  # Do an initial check then start our loop. Checking when enhancinves are activated/deactived or the check interval has elapsed.
+  ECTracker.check_enhancive_state
+  ECTracker.check_charges
+  File.write(@@filename, @@items.to_yaml)
+  time_of_last_check = Time.now
+  previous_enhancives_state = UserVars.enhancives_active
+  loop do
+    if ((Time.now - time_of_last_check) >= @@time_between_checks && UserVars.enhancives_active ) || UserVars.enhancives_active != previous_enhancives_state
+      ECTracker.check_charges
+      File.write(@@filename, @@items.to_yaml)
+      time_of_last_check = Time.now
+      previous_enhancives_state = UserVars.enhancives_active
+    end
+    sleep(1)
+  end
+
+end
+
+
+# need to make writing to file a lot less frequent.
+# does it work for held items?
