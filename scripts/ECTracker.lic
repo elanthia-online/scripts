@@ -1,6 +1,8 @@
 =begin
    A script that tracks enhancive charge loss. Will check charge level in the background when enhancives are active.
 
+   ;ECTreacker help
+      - list out the commands
    ;ECTracker alert
       - Toggle alert message when charge loss recorded
    ;ECTracker verbose
@@ -17,18 +19,20 @@
   contributors: Nisugi
           game: Gemstone
           tags: enhancives, charge, tracking, data
-       version: 1.0.0
+       version: 1.1.0
 
+  v1.1.0
+    - added some more data to the display.
+    - cleaned up time formatting in data
   v1.0.0
     - Initial Release
 =end
 
+require 'yaml'
+require 'time'
+
 module ECTracker
-  require 'yaml'
-  require 'time'
-  UserVars.ectracker ||= Hash.new
-  UserVars.ectracker[:alert] ||= false
-  UserVars.ectracker[:verbose] ||= false
+  UserVars.ectracker ||= { alert: false, verbose: false }
 
   ENHANCIVE_ON_MSGS = Regexp.union(
     /You are now accepting the benefits of your enhancive inventory items./,
@@ -45,17 +49,23 @@ module ECTracker
   ENHANCIVE_MSGS = Regexp.union(ENHANCIVE_ON_MSGS, ENHANCIVE_OFF_MSGS)
 
   def self.help
-    msg = "\n"
-    msg += ";ECTracker alert\n"
-    msg += "  - Toggle alert message when charge loss recorded\n\n"
-    msg += ";ECTracker verbose\n"
-    msg += "  - Toggle alert message when charge level is checked (mainly for troubleshooting)\n\n"
-    msg += ";ECTracker 300\n"
-    msg += "  - Start tracking, # determins time between checks in seconds. Defaults to 60 if left blank.\n\n"
-    msg += ';eq ECTracker.generate_item_summary("item_name")'
-    msg += "\n  - Lists a summary of the item selected. Accepts partial name. No name defaults to all items.\n\n"
-    msg += ";eq ECTracker.find_simultaneous_charge_loss\n"
-    msg += "  - Lists events when more than one item lost a charge.\n"
+    msg = <<~HELP
+
+      ;ECTracker alert
+        - Toggle alert message when charge loss recorded
+
+      ;ECTracker verbose
+        - Toggle alert message when charge level is checked (mainly for troubleshooting)
+
+      ;ECTracker 300
+        - Start tracking, # determines time between checks in seconds. Defaults to 60 if left blank.
+
+      ;eq ECTracker.generate_item_summary("item_name")
+        - Lists a summary of the item selected. Accepts partial name. No name defaults to all items.
+
+      ;eq ECTracker.find_simultaneous_charge_loss
+        - Lists events when more than one item lost a charge.
+    HELP
     Lich::Messaging.mono(msg)
   end
 
@@ -69,13 +79,18 @@ module ECTracker
 
     if File.exist?(@@filename)
       @@items = YAML.load_file(@@filename, permitted_classes: [Symbol, Time]) || {}
+
+      # Ensure `time_checked` and `expiration` fields are uniform strings
       @@items.each_value do |entries|
-        entries.each { |entry| entry[:time_checked] = Time.parse(entry[:time_checked]) if entry[:time_checked].is_a?(String) }
+        entries.each do |entry|
+          entry[:time_checked] = entry[:time_checked].strftime("%Y-%m-%d %H:%M:%S") if entry[:time_checked].is_a?(Time)
+          entry[:expiration] = entry[:expiration].strftime("%Y-%m-%d %H:%M:%S") if entry[:expiration].is_a?(Time)
+        end
       end
+
       Lich::Messaging.msg("info", "Enhancive Charge Tracking file loaded. #{@@filename}")
     else
       @@items = {}
-      File.write(@@filename, @@items.to_yaml)
       Lich::Messaging.msg("info", "Creating Enhancive Charge Tracking file. #{@@filename}")
     end
   end
@@ -84,17 +99,12 @@ module ECTracker
   # determine if enhancives are active or not.
   def self.check_enhancive_state
     result = Lich::Util.issue_command("invento enh", ENHANCIVE_MSGS, /You currently have \d+ enhancive pauses? available./, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
-    if result.include?(ENHANCIVE_ON_MSGS)
-      UserVars.enhancives_active = true
-    elsif result.include?(ENHANCIVE_OFF_MSGS)
-      UserVars.enhancives_active = false
-    end
+    UserVars.enhancives_active = result.include?(ENHANCIVE_ON_MSGS)
   end
 
-  # check charges of all worn enhancives
   def self.check_charges
     Lich::Messaging.msg("info", "Nom Nom Nom (Checking charges)") if UserVars.ectracker[:verbose]
-    timestamp = Time.now.iso8601
+    timestamp = Time.now.strftime("%Y-%m-%d %H:%M:%S") # Timestamp without time zone
     result = Lich::Util.issue_command("invento enh list", /Your worn items are:/, /For more information, see/, include_end: false, timeout: 3, silent: true, usexml: true, quiet: true)
 
     result.each do |line|
@@ -106,20 +116,27 @@ module ECTracker
         @@items[item_name] ||= []
         last_entry = @@items[item_name].last
         charge_lost = last_entry && last_entry[:charges] > charges
-        Lich::Messaging.msg("info", "CHARGE LOST - #{item_name}") if charge_lost && UserVars.ectracker[:alert]
         if last_entry.nil? || charge_lost || last_entry[:active] != UserVars.enhancives_active
           @@items[item_name] << { charges: charges, time_checked: timestamp, active: UserVars.enhancives_active }
         end
+        Lich::Messaging.msg("info", "CHARGE LOST - #{item_name} has #{charges} remaining.") if charge_lost && UserVars.ectracker[:alert]
 
       when /[^<]+<a exist="\d+" noun="\w+">([^<]+)<\/a>[^(]+\(charged until (.*?)\)/
         item_name = $1.strip
         expiration = $2.strip
         @@items[item_name] ||= []
         last_entry = @@items[item_name].last
-        if last_entry.nil? || last_entry[:expiration] != expiration
-          @@items[item_name] << { expiration: expiration, time_checked: timestamp, active: UserVars.enhancives_active }
-        end
 
+        begin
+          # Attempt to parse the expiration date using the specific format
+          expiration_time = Time.strptime(expiration, "%m/%d/%Y %H:%M:%S %Z").strftime("%Y-%m-%d %H:%M:%S")
+          # Add a new entry with expiration if it’s different from the last recorded expiration
+          if last_entry.nil? || last_entry[:expiration] != expiration_time
+            @@items[item_name] << { expiration: expiration_time, time_checked: timestamp, active: UserVars.enhancives_active }
+          end
+        rescue ArgumentError
+          Lich::Messaging.msg("error", "Failed to parse expiration time for #{item_name}: #{expiration}")
+        end
       end
     end
   end
@@ -135,29 +152,21 @@ module ECTracker
     format("%02d:%02d:%02d:%02d", days, hours, minutes, seconds)
   end
 
-  # is it a string or is it a time object??
-  def self.parse_time(time_checked)
-    time_checked.is_a?(String) ? Time.parse(time_checked) : time_checked
-  end
-
   # Calculate the total active time for an item
   def self.calculate_total_active_time(entries)
     total_time = 0
     active_start_time = nil
     entries.each do |entry|
+      time_checked = Time.strptime(entry[:time_checked], "%Y-%m-%d %H:%M:%S")
       if entry[:active]
-        active_start_time ||= parse_time(entry[:time_checked])
-      else
-        if active_start_time
-          time_checked = parse_time(entry[:time_checked])
-          total_time += time_checked - active_start_time
-          active_start_time = nil
-        end
+        active_start_time ||= time_checked
+      elsif active_start_time
+        total_time += time_checked - active_start_time
+        active_start_time = nil
       end
     end
-
     total_time += Time.now - active_start_time if active_start_time
-    return ECTracker.format_time(total_time.to_i)
+    total_time.to_i
   end
 
   # Calculate the total charges lost for an item
@@ -176,47 +185,66 @@ module ECTracker
     depletion_times = []
     entries.each_cons(2) do |prev_entry, next_entry|
       if prev_entry[:charges] && next_entry[:charges] && prev_entry[:charges] > next_entry[:charges]
-        depletion_times << next_entry[:time_checked]
+        depletion_times << Time.strptime(next_entry[:time_checked], "%Y-%m-%d %H:%M:%S")
       end
     end
     depletion_times
   end
 
-  # Generate summary of selected item, or all items if none selected. Partially matches.
   def self.generate_item_summary(name = "all")
-    msg = "Item Summary Report:\n"
+    msg = "Item Summary Report:\n\n"
 
     @@items.each do |item_name, entries|
       next unless name.downcase == "all" || item_name.downcase.include?(name.downcase)
 
-      total_time_active = calculate_total_active_time(entries)
+      # Find the first recorded time for the item
+      first_recorded_time = entries.first[:time_checked].is_a?(String) ? Time.parse(entries.first[:time_checked]) : entries.first[:time_checked]
+      total_time_active_seconds = calculate_total_active_time(entries)
+      total_time_active = format_time(total_time_active_seconds)
       charges_lost = calculate_total_charges_lost(entries)
       charge_depletion_times = find_charge_depletion_times(entries)
 
-      msg += "      Item Name: #{item_name}\n"
-      msg += "    Time Active: #{total_time_active}\n"
-      msg += "   Charges Lost: #{charges_lost}\n"
-      msg += "Depletion Times:\n"
+      # Calculate the average time between charge losses
+      if charges_lost > 0
+        average_time_between_losses = format_time((total_time_active_seconds / charges_lost.to_i).to_i)
+      else
+        average_time_between_losses = "N/A"
+      end
+
+      # Ensure the first entry is the initial time the item was recorded
+      if charge_depletion_times.empty? || charge_depletion_times.first != first_recorded_time
+        charge_depletion_times.unshift(first_recorded_time)
+      end
+
+      msg += "    Item Name: #{item_name}\n"
+      msg += "  Time Active: #{total_time_active}\n"
+      msg += " Charges Lost: #{charges_lost}\n"
+      msg += "Avg Loss Time: #{average_time_between_losses}\n"
+      msg += " ----------------------------------------------\n"
+      msg += "   Charge Depletion Time  |  Time Since Last Loss\n"
 
       if charge_depletion_times.empty?
         msg += " - No charge depletion events recorded.\n"
       else
-        charge_depletion_times.each_with_index do |time, index|
-          if index == 0
-            interval = 0
-          else
-            interval = ((time - charge_depletion_times[index - 1]) / 60).to_i
+        previous_time = nil
+        entries.each do |entry|
+          next unless entry[:charges] # Skip entries without charge data
+
+          time_checked = entry[:time_checked].is_a?(String) ? Time.parse(entry[:time_checked]) : entry[:time_checked]
+          if charge_depletion_times.include?(time_checked)
+            interval = previous_time.nil? ? 0 : (time_checked - previous_time).to_i
+            msg += "#{entry[:charges].to_s.rjust(3)}) #{time_checked.strftime('%Y-%m-%d %H:%M:%S')}  |  #{format_time(interval)}\n"
+            previous_time = time_checked
           end
-          msg += " - #{time.strftime('%Y-%m-%d %H:%M:%S %z')}     #{interval} minutes\n"
         end
       end
       msg += "\n"
       Lich::Messaging.mono(msg)
       msg = ""
     end
+    ECTracker.calculate_average_charge_loss
   end
 
-  # Generate summary of multi charge loss events.
   def self.find_simultaneous_charge_loss
     msg = "Simultaneous Charge Loss Events:\n"
     charge_times = Hash.new { |hash, key| hash[key] = [] }
@@ -224,7 +252,10 @@ module ECTracker
     @@items.each do |item_name, entries|
       entries.each_cons(2) do |prev_entry, next_entry|
         next unless prev_entry[:charges] && next_entry[:charges] && prev_entry[:charges] > next_entry[:charges]
-        charge_times[next_entry[:time_checked]] << { name: item_name, loss_time: next_entry[:time_checked] }
+
+        # Ensure time_checked is a Time object
+        time_checked = next_entry[:time_checked].is_a?(String) ? Time.parse(next_entry[:time_checked]) : next_entry[:time_checked]
+        charge_times[time_checked] << { name: item_name, loss_time: time_checked }
       end
     end
 
@@ -234,9 +265,9 @@ module ECTracker
       msg += "No simultaneous charge loss events found."
     else
       simultaneous_events.each do |time, items|
+        # Ensure `time` is a Time object and format it
+        time = time.is_a?(Time) ? time : Time.parse(time)
         msg += "#{items.count} charges lost on #{time.strftime('%Y-%m-%d at %H:%M:%S')}\n"
-        # msg += "Event Time: #{time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
-        # msg += "Number of Items Affected: #{items.count}"
         items.each do |item|
           msg += "  - #{item[:name]}\n"
         end
@@ -245,6 +276,35 @@ module ECTracker
     end
     Lich::Messaging.mono(msg)
     msg = ""
+  end
+
+  def self.calculate_average_charge_loss
+    total_time_between_losses = 0
+    total_loss_events = 0
+    item_averages = {}
+
+    @@items.each do |item_name, entries|
+      # Get charge depletion times for each item
+      charge_depletion_times = find_charge_depletion_times(entries)
+
+      # Calculate the time intervals for each charge depletion event for this item
+      time_intervals = charge_depletion_times.each_cons(2).map { |a, b| (b - a) / 3600.0 } # Hours
+
+      # Skip if there are no intervals
+      next if time_intervals.empty?
+
+      # Calculate the average time interval for this item
+      item_average = time_intervals.sum / time_intervals.size
+      item_averages[item_name] = item_average
+
+      # Accumulate for overall average
+      total_time_between_losses += time_intervals.sum
+      total_loss_events += time_intervals.size
+    end
+
+    # Calculate the overall average time between charge losses
+    overall_average = total_loss_events > 0 ? (total_time_between_losses / total_loss_events) : 0
+    Lich::Messaging.msg("info", "There is an average of #{overall_average.round(2)} hours between charge loss across all items.")
   end
 
   # Do the damn thang.
