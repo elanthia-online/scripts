@@ -14,9 +14,11 @@
               wiki: https://gswiki.play.net/Lich:Script_Eloot
               game: Gemstone
               tags: loot
-           version: 2.0.1
+           version: 2.0.2
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.0.2  (2024-11-20)
+    - bugfix in single_loot method
   v2.0.1  (2024-11-12)
     - bugfix to only buff for selling if something to sell
     - bugfix to exit if insufficient funds at bank
@@ -697,6 +699,19 @@ module ELoot
     Inventory.close_sell_containers
 
     ELoot.validate_setup
+  end
+
+  def self.time_between(method_name, gap)
+    current_time = Time.now
+
+    # Check if the method was previously called and if the time gap is satisfied
+    if ELoot.data.last_called[method_name]
+      time_diff = current_time - ELoot.data.last_called[method_name]
+      return false if time_diff < gap
+    end
+
+    ELoot.data.last_called[method_name] = current_time
+    return true # Return true if either it's the first call or enough time has passed
   end
 
   def self.manage_sorter
@@ -1533,11 +1548,12 @@ module ELoot
                   :coin_hand, :coin_container, :silver_breakdown, :get_regex, :put_regex, :alchemy_mode, :sell_containers, :local_gemshop, :local_furrier, :log_unlootables, :exclude,
                   :charm, :gauntlet, :coin_bag, :reagent_horde_inv, :account_type, :gem_regex, :locker, :container_settings, :everything_list, :everything,
                   :only_list, :only, :inventory, :gem_inventory, :alchemy_inventory, :horde_type, :cache, :locker_city, :use_hording, :stash,
-                  :items_to_horde, :horde_deposit, :inv_save, :deposit_regex, :withdraw_regex, :disk_nouns_regex, :sigil_determination_on_fail, :start_room
+                  :items_to_horde, :horde_deposit, :inv_save, :deposit_regex, :withdraw_regex, :disk_nouns_regex, :sigil_determination_on_fail, :start_room, :last_called
 
     def initialize(settings)
       @settings = settings
       @start_room = nil
+      @last_called = {}
 
       # inventory type
       @sacks = {}
@@ -2757,16 +2773,11 @@ module ELoot
     def self.check_auto_closer
       return if ELoot.data.settings[:auto_close].empty?
 
-      items_opened = []
-      ELoot.data.sacks.keys.each { |bag|
-        bag_obj = ELoot.data.sacks[bag]
-        next if items_opened.include?(bag_obj.name)
-
-        items_opened.push(bag_obj.name)
-        next unless ELoot.data.settings[:auto_close].include?(bag_obj.name)
-
-        ELoot.get_lines("open ##{bag_obj.id}", ELoot.data.silent_open)
-      }
+      ELoot.data.sacks.each_value do |bag_obj|
+        if ELoot.data.settings[:auto_close].include?(bag_obj.name)
+          ELoot.get_lines("open ##{bag_obj.id}", ELoot.data.silent_open)
+        end
+      end
     end
 
     def self.clear_hands
@@ -2895,6 +2906,12 @@ module ELoot
     def self.open_loot_containers(item)
       # Method intended for opening containers that will receive loot from the loot room or loot item command
       ELoot.msg(type: "debug", text: " Start of open_loot_containers(item)")
+
+      # makes sure any auto-closers are open before looting
+      if ELoot.time_between(:autoclosers, 30)
+        Inventory.check_auto_closer
+      end
+
       return unless ELoot.data.settings[:keep_closed]
 
       Inventory.open_single_container(ELoot.data.sacks["default"])
@@ -3042,27 +3059,30 @@ module ELoot
     def self.single_loot(item) # loots a single item
       return if item.nil?
 
-      if ELoot.data.sacks[item.type] && !ELoot.data.sacks_full.include?(ELoot.data.sacks[item.type])
-        bag = ELoot.data.sacks[item.type]
-      else
-        bag = ELoot.data.sacks["default"]
+      # loot item will fallback to the default sack but if both are full we need to loot manually
+      bag = ELoot.data.sacks[item.type]
+      bag = nil if bag.nil? || ELoot.data.sacks_full.include?(bag)
+      bag ||= ELoot.data.sacks["default"]
+      bag = nil if bag.nil? || ELoot.data.sacks_full.include?(bag)
+
+      unless bag
+        Inventory.single_drag(item)
+        return
       end
 
-      Inventory.check_auto_closer
+      lines = ELoot.get_command("loot ##{item.id}", ELoot.data.put_regex)
 
-      loop {
-        lines = fput "loot ##{item.id}"
-        if lines =~ /You can't.*?It's closed!/ && GameObj.containers.keys.include?(container.id) && container.contents.is_a?(Array)
-          # Must be an auto closer. Their ID and contents don't drop from GameObj.container when closed
+      if lines.any? { |line| line =~ /<\/inv>You can't put your <a exist=".*?" noun=".*?">.*?<\/a> in the <a exist="(\d+)" noun=".*?">.*?<\/a>.  It's closed!/ }
+        bag_id = $1
+        bag = GameObj.inv.find { |i| i.id == bag_id }
+        # Must be an auto closer. Their ID and contents don't drop from GameObj.container when closed
+        if GameObj.containers.keys.include?(bag.id) && bag.contents.is_a?(Array)
           ELoot.data.settings[:auto_close].push(bag.name)
           Inventory.open_single_container(bag)
           ELoot.msg(type: "info", text: " #{bag.name} must be an autocloser, adding to list.")
           ELoot.save_profile()
-          next
-        else
-          break
         end
-      }
+      end
 
       20.times {
         return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id) and ELoot.data.sacks[item.type].contents.to_a.map(&:id).include?(item.id))
@@ -3072,61 +3092,16 @@ module ELoot
         sleep 0.1
       }
 
-      ELoot.msg(text: "debug", type: "Inventory.single_loot: opening bag")
-      # Still here? Bag must be closed
-      Inventory.open_single_container(bag)
+      # edge case of treasure system mismatch
+      return true if Sell.check_inventory.any? { |obj| obj.id == item.id }
 
-      # Now that the bags open lets try again
-      fput "loot ##{item.id}"
-
-      10.times {
-        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id) and ELoot.data.sacks[item.type].contents.to_a.map(&:id).include?(item.id))
-        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id) and ELoot.data.sacks["default"].contents.to_a.map(&:id).include?(item.id))
-
-        sleep 0.1
-      }
-
-      # Still here? inform user it didn't fit
-      ELoot.msg(type: "info", text: " The #{item} wasn't looted. Trying overflow container.")
-
-      # still here so try overflow
-      if ELoot.data.settings[:overflow_container].empty?
-        ELoot.msg(type: "info", text: " You have not set an OVERFLOW container.")
-        ELoot.msg(type: "info", text: " You're carrying too much stuff. Unload a bit! Exiting...")
-        exit
-      else
-        result = Inventory.store_item(ELoot.data.sacks[ELoot.data.settings[:overflow_container]], item)
-        if result
-          ELoot.box_phase(item)
-          return
-        end
-      end
-
-      # inform user it didn't fit
-      ELoot.msg(type: "info", text: " The #{item} won't fit in the #{ELoot.data.sacks[ELoot.data.settings[:overflow_container]]}. Trying secondary overflow container.")
-
-      # try secondary overflow
-      if ELoot.data.settings[:secondary_overflow].empty?
-        ELoot.msg(type: "info", text: " You have not set a Secondary OVERFLOW container.")
-        ELoot.msg(type: "info", text: " You're carrying too much stuff. Unload a bit! Exiting...")
-        exit
-      else
-        result = Inventory.store_item(ELoot.data.sacks[ELoot.data.settings[:secondary_overflow]], item)
-        if result
-          ELoot.box_phase(item)
-          return
-        end
-        ELoot.msg(type: "info", text: " Your Secondary OVERFLOW container cannot hold this item.")
-        ELoot.msg(type: "info", text: " You're carrying too much stuff. Unload a bit! Exiting...")
-        exit
-      end
+      # still here so just loot it manually
+      Inventory.single_drag(item)
     end
 
     def self.store_item(bag, item, is_skinner = false)
       # Fixme - cleanup
       return unless item&.name != "Empty"
-
-      Inventory.check_auto_closer
 
       lines = ELoot.get_command("_drag ##{item.id} ##{bag.id}", ELoot.data.put_regex)
 
@@ -3177,7 +3152,7 @@ module ELoot
       }
 
       # Still here? Assume bag is closed
-      ELoot.msg(type: "debug", text: " Inventory.single_loot: opening bag")
+      ELoot.msg(type: "debug", text: " Inventory.store_item: opening #{bag.noun}")
       Inventory.open_single_container(bag)
 
       # Try it again
@@ -4038,8 +4013,6 @@ module ELoot
     def self.loot_all(items) # loots entire room
       waitrt?
 
-      Inventory.check_auto_closer
-
       Inventory.free_hand
 
       res = ELoot.get_command('loot room', /<dialogData|There is no loot|You need a free hand to do that|With a discerning eye|You note some treasure of interest|You can't.*?It's closed!/)
@@ -4148,10 +4121,8 @@ module ELoot
         # Make sure we have a hand free
         Inventory.free_hand
         if from_where == "Room"
-
           valid.each do |obj|
             if obj.type !~ /clothing|jewelry|gem|herb|skin|wand|scroll|potion|reagent|trinket|lockpick|treasure|forageable|magic|collectible/
-
               Inventory.single_drag(obj)
             else
               Inventory.single_loot(obj)
@@ -4896,7 +4867,9 @@ module ELoot
       Inventory.free_hands(both: true)
 
       # Lousy autoclosers
-      Inventory.check_auto_closer
+      if ELoot.time_between(:autoclosers, 30)
+        Inventory.check_auto_closer
+      end
 
       ELoot.data.sacks.keys.each { |item|
         next unless ELoot.data.settings[:sell_container].include?(item)
@@ -4937,7 +4910,9 @@ module ELoot
       end
 
       # Lousy autoclosers
-      Inventory.check_auto_closer
+      if ELoot.time_between(:autoclosers, 30)
+        Inventory.check_auto_closer
+      end
 
       consignment_sacks.each { |sack|
         next if sack.nil?
@@ -5210,7 +5185,9 @@ module ELoot
       end
 
       # Lousy autoclosers
-      Inventory.check_auto_closer
+      if ELoot.time_between(:autoclosers, 30)
+        Inventory.check_auto_closer
+      end
 
       ELoot.msg(type: "debug", text: " skin_sacks: #{skin_sacks}")
       skin_sacks.each do |sack|
@@ -5311,7 +5288,9 @@ module ELoot
       end
 
       # Lousy autoclosers
-      Inventory.check_auto_closer
+      if ELoot.time_between(:autoclosers, 30)
+        Inventory.check_auto_closer
+      end
 
       gem_sacks.each { |sack|
         next if sack.nil?
@@ -5818,7 +5797,9 @@ module ELoot
       end
 
       # Lousy autoclosers
-      Inventory.check_auto_closer
+      if ELoot.time_between(:autoclosers, 30)
+        Inventory.check_auto_closer
+      end
 
       all_contents.each { |thing|
         next if $sell_ignore.include?(thing.id)
