@@ -98,6 +98,7 @@ end
 
 migrate :gemshop, :valuable do
   insert(:name, %{fossilized rolton tooth})
+  insert(:name, %{swirling silver globe})
 end
 
 migrate :uncommon do
