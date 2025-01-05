@@ -1,0 +1,1760 @@
+=begin
+
+  Script for escorting travellers
+
+  If the script is started before you wait for the traveller, it will go to the
+  pickup room and get him.  If you already have a traveller, he must be in the
+  room when the script is started.
+
+  Destination is determined automatically.
+
+  The script will check for targetable npcs and bandit ambushes, and either pause
+  to let you handle them, or start an attack script to disable/kill them.
+
+  The attack script will be given the ids of targetable npcs in the command line
+  arguments, so that it doesn't have to duplicate that work.  It should do one
+  attack, handle any looting, and exit.  This script will then evaluate the room
+  and start the attack script again if needed.
+
+  The global variable $ego2_travel_cost is used to tell how much silver should be
+  taken for the trip.  If the defaults aren't working out for you, you can change
+  them with a separate script.
+
+  ;ego2 help
+
+   author: elanthia-online
+     game: Gemstone
+     tags: bounty
+  version: 1.0.0
+
+  changelog:
+    1.0.0 (2020-10-10):
+      * initial fork of ego2
+      * remove Zul rope bridge pathing as no longer needed
+      * rubocop cleanup
+
+=end
+=begin
+  changelog:
+    0.6 (2020-10-10):
+      fix commas in silver check
+    0.5 (2015-04-07):
+      ignore disabled people's disabled bandits
+      don't use "a tiny shard of jet black crystal" as an indicator of who owns the bandits
+      pay attention to disks
+    0.4 (2014-11-04):
+      fixed poaching issue where escort id wasn't being checked when he exclaims, "It's an ambush!"
+    0.3 (2014-09-29):
+      reworked ambush detection to prevent false positives (poaching other peoples bandits)
+      removed code to download gameobj-data.xml
+
+=end
+
+fix_setting = { 'on' => true, 'off' => false, 'true' => true, 'false' => false, 'yes' => true, 'no' => false }
+
+script.vars.shift
+
+if script.vars[0] == 'set'
+  if (script.vars[1] == 'attack-script') and script.vars[2]
+    if script.vars[2].downcase == 'none'
+      CharSettings['attack-script'] = nil
+    else
+      CharSettings['attack-script'] = script.vars[2]
+    end
+    echo "setting saved (attack-script = #{CharSettings['attack-script'] || 'none'})"
+  elsif (script.vars[1] == 'poach') and (script.vars[2].downcase =~ /^(on|off|true|false|yes|no)$/)
+    CharSettings['poach'] = fix_setting[$1]
+    echo "setting saved (poach = #{CharSettings['poach']})"
+  elsif (script.vars[1] == 'hide') and (script.vars[2].downcase =~ /^(on|off|true|false|yes|no)$/)
+    CharSettings['hide'] = fix_setting[$1]
+    echo "setting saved (hide = #{CharSettings['hide']})"
+  elsif (script.vars[1] == 'haste') and (script.vars[2].downcase =~ /^(on|off|true|false|yes|no)$/)
+    CharSettings['haste'] = fix_setting[$1]
+    echo "setting saved (haste = #{CharSettings['haste']})"
+  elsif (script.vars[1] == 'useherbs') and (script.vars[2].downcase =~ /^(on|off|true|false|yes|no)$/)
+    CharSettings['useherbs'] = fix_setting[$1]
+    echo "setting saved (useherbs = #{CharSettings['useherbs']})"
+  else
+    echo "You're doing it wrong.  (#{$clean_lich_char}#{script.name} help)"
+  end
+  exit
+elsif script.vars[0].downcase == 'list'
+  output = "\n"
+  output.concat "   attack-script: #{CharSettings['attack-script'] || 'none'}\n"
+  output.concat "           poach: #{CharSettings['poach'] || 'false'}\n"
+  output.concat "           haste: #{CharSettings['haste'] || 'false'}\n"
+  output.concat "            hide: #{CharSettings['hide'] || 'false'}\n"
+  output.concat "        useherbs: #{CharSettings['useherbs'] || 'false'}\n"
+  output.concat "\n"
+  respond output
+  exit
+end
+
+travel_cost   = nil
+poach         = CharSettings['poach']
+attack_script = CharSettings['attack-script']
+hide          = CharSettings['hide']
+haste         = CharSettings['haste']
+useherbs      = CharSettings['useherbs']
+justice       = true
+justice_count = 0
+fell_off_rope = false
+lost_escort   = 0
+sanct_count   = -1
+wait_num      = 45
+
+options = script.vars.find_all { |var| var =~ /^\-\-/ }
+script.vars.delete_if { |var| var =~ /^\-\-/ }
+options.each { |opt|
+  if opt =~ /^\-\-poach=(on|off|true|false|yes|no)$/i
+    poach = fix_setting[$1.downcase]
+  elsif opt =~ /^\-\-hide=(on|off|true|false|yes|no)$/i
+    hide = fix_setting[$1.downcase]
+  elsif opt =~ /^\-\-haste=(on|off|true|false|yes|no)$/i
+    haste = fix_setting[$1.downcase]
+  elsif opt =~ /^\-\-useherbs=(on|off|true|false|yes|no)$/i
+    useherbs = fix_setting[$1.downcase]
+  elsif opt =~ /^\-\-attack\-script=(.+)$/i
+    if $1.downcase == 'none'
+      attack_script = nil
+    else
+      attack_script = $1
+    end
+  elsif opt =~ /^\-\-travel\-cost=([0-9]+)$/i
+    travel_cost = $1.to_i
+  else
+    echo "ignoring unrecognized option: #{opt}"
+  end
+}
+
+unless script.vars.empty?
+  output = "\n"
+  output.concat "   #{$clean_lich_char}#{script.name}                                   start an escort\n"
+  output.concat "   #{$clean_lich_char}#{script.name} list                              show saved options\n"
+  output.concat "\n"
+  output.concat "These commands will save an option and exit:\n"
+  output.concat "\n"
+  output.concat "   #{$clean_lich_char}#{script.name} set attack-script <script name>   set what script will be started when bandits or creatures\n"
+  output.concat "   #{''.ljust($clean_lich_char.length)}#{''.ljust(script.name.length)}                                   are in the room\n"
+  output.concat "   #{$clean_lich_char}#{script.name} set attack-script none            pause for bandits and creatures instead of starting a script\n"
+  output.concat "   #{$clean_lich_char}#{script.name} set poach <yes/no>                start the attack script (or pause) even if other characters\n"
+  output.concat "   #{''.ljust($clean_lich_char.length)}#{''.ljust(script.name.length)}                                   are in the room\n"
+  output.concat "   #{$clean_lich_char}#{script.name} set haste <yes/no>                cast haste before moving\n"
+  output.concat "   #{$clean_lich_char}#{script.name} set hide <yes/no>                 hide before moving\n"
+  output.concat "   #{$clean_lich_char}#{script.name} set useherbs <yes/no>             use herbs when injured and no npcs present\n"
+  output.concat "\n"
+  output.concat "These commands will set an option for one run, without saving:\n"
+  output.concat "\n"
+  output.concat "   #{$clean_lich_char}#{script.name} --attack-script=<script name>\n"
+  output.concat "   #{$clean_lich_char}#{script.name} --attack-script=none\n"
+  output.concat "   #{$clean_lich_char}#{script.name} --poach=<yes/no>\n"
+  output.concat "   #{$clean_lich_char}#{script.name} --travel-cost=<number>\n"
+  output.concat "   #{$clean_lich_char}#{script.name} --haste=<yes/no>\n"
+  output.concat "   #{$clean_lich_char}#{script.name} --hide=<yes/no>\n"
+  output.concat "   #{$clean_lich_char}#{script.name} --useherbs=<yes/no>\n"
+  output.concat "\n"
+  respond output
+  exit
+end
+
+CharSettings['targetable']   ||= Array.new
+CharSettings['untargetable'] ||= Array.new
+
+destination_room  = nil
+path              = nil
+escort_id         = nil
+XMLData.room_count
+no_hide_rooms     = [1192, 1191, 1190, 1156, 1155, 1154, 1153]
+no_haste_rooms    = [1191]
+disabled          = /dead|sleeping|calm|stunned|lying down|prone|sitting|frozen/ # entangled|rooted
+escort_noun       = /^(?:traveller|magistrate|merchant|scribe|dignitary|official)$/
+ignorable_npcs    = /^(?:kobold|rolton|urgh|ridge orc|hobgoblin|velnalin|fire ant)$/
+
+escort_pickup = {
+  "area just inside the Sapphire Gate"                   => ["Ta'Illistim", 34],
+  "area just inside the North Gate"                      => ["Wehnimer's Landing", 223],
+  "south end of North Market"                            => ["Solhaven",           1472],
+  "area just north of the South Gate, past the barbican" => ["Icemule Trace",      2412],
+  "Kresh'ar Deep monument"                               => ["Zul Logoth",         1005],
+  "area just inside the Amaranth Gate"                   => ["Ta'Vaalor",          3483],
+}
+
+escort_dropoff = {
+  "Wehnimer's Landing" => [223],
+  "Icemule Trace"      => [2486],
+  "Zul Logoth"         => [992, 1266],
+  "Solhaven"           => [3902],
+  "Ta'Vaalor"          => [5907],
+  "Ta'Illistim"        => [37],
+}
+
+# Travel costs defined here are for returning to your starting room.
+# It's a global variable so that a controlling script that knows where
+# you'll be going after the escort can override the travel cost.
+
+$ego2_travel_cost ||= {
+  "Wehnimer's Landing" => {
+    "Icemule Trace" => 0,
+    "Zul Logoth"    => 20,
+    "Solhaven"      => 0,
+    "Ta'Vaalor"     => 4020,
+    "Ta'Illistim"   => 4020,
+  },
+  "Icemule Trace"      => {
+    "Wehnimer's Landing" => 0,
+    "Zul Logoth"         => 20,
+    "Solhaven"           => 0,
+    "Ta'Vaalor"          => 4020,
+    "Ta'Illistim"        => 4020,
+  },
+  "Zul Logoth"         => {
+    "Wehnimer's Landing" => 2020,
+    "Icemule Trace"      => 2020,
+    "Solhaven"           => 2020,
+    "Ta'Vaalor"          => 2000,
+    "Ta'Illistim"        => 2000,
+  },
+  "Solhaven"           => {
+    "Wehnimer's Landing" => 0,
+    "Icemule Trace"      => 0,
+    "Zul Logoth"         => 20,
+    "Ta'Vaalor"          => 4020,
+    "Ta'Illistim"        => 4020,
+  },
+  "Ta'Vaalor"          => {
+    "Wehnimer's Landing" => 4020,
+    "Icemule Trace"      => 4020,
+    "Zul Logoth"         => 2000,
+    "Solhaven"           => 4020,
+    "Ta'Illistim"        => 0,
+  },
+  "Ta'Illistim"        => {
+    "Wehnimer's Landing" => 4020,
+    "Icemule Trace"      => 4020,
+    "Zul Logoth"         => 2000,
+    "Solhaven"           => 4020,
+    "Ta'Vaalor"          => 0,
+  },
+}
+
+check_silvers = proc {
+  silvers = nil
+  action = proc { |server_string|
+    if server_string =~ /^\s*Name\:|^\s*Gender\:|^\s*Normal \(Bonus\)|^\s*Strength \(STR\)\:|^\s*Constitution \(CON\)\:|^\s*Dexterity \(DEX\)\:|^\s*Agility \(AGI\)\:|^\s*Discipline \(DIS\)\:|^\s*Aura \(AUR\)\:|^\s*Logic \(LOG\)\:|^\s*Intuition \(INT\)\:|^\s*Wisdom \(WIS\)\:|^\s*Influence \(INF\)\:/
+      nil
+    elsif server_string =~ /^\s*Mana\:\s+\-?[0-9]+\s+Silver\:\s+([0-9,]+)/
+      silvers = $1.gsub(',', '').to_i
+      DownstreamHook.remove("#{script.name}_check_silvers")
+      nil
+    else
+      server_string
+    end
+  }
+  DownstreamHook.add("#{script.name}_check_silvers", action)
+  $_SERVER_.puts "#{$cmd_prefix}info\n"
+  wait_until { silvers }
+  silvers
+}
+
+hide_me = proc {
+  if hide
+    Spell.lock_cast
+    unless hidden? or invisible? or no_hide_rooms.include?(Room.current.id)
+      waitrt?
+      fput 'hide'
+      sleep 0.5
+      waitrt?
+    end
+  end
+}
+
+haste_me = proc {
+  if haste
+    spell = Spell[506]
+    if not spell.active? and spell.known? and spell.affordable? and not no_haste_rooms.include?(Room.current.id)
+      spell.cast
+    end
+  end
+}
+
+protect_me = proc {
+  # this proc is called for moves that knock you out of hiding, so it's pointless if hiding isn't enabled
+  if hide
+    wizard_shield = Spell[919]
+    if wizard_shield.known? and not wizard_shield.active? and (mana > 150)
+      wizard_shield.cast
+    end
+  end
+}
+
+check_escort = proc {
+  GameObj.npcs.any? { |npc| npc.id == escort_id }
+}
+
+$ego2_my_ambush = false
+$ego2_staggered_ambush = false
+exec_string = "
+  hide_me
+  status_tags
+  before_dying { kill_script(#{script.name.inspect}) if running?(#{script.name.inspect}) }
+  Thread.new { wait_while { running?(#{Script.self.name.inspect}) }; Script.self.kill }
+  while (line = get)
+    if line =~ /<pushStream id='room'/
+      $ego2_my_ambush = false
+      $ego2_staggered_ambush = false
+      echo 'not my ambush' if $ego2_debug
+    elsif line =~ /An? .*?\#{$ego2_escort_id}.*? fearfully exclaims, \"It's an ambush!\"|<compass>.*?(?:quickly approaches|suddenly leaps from|leaps out of|suddenly jumps out of the shadows)|carefully concealed metal jaws|nearly invisible length of razor wire|length of nearly invisible razor wire|carefully concealed inflated pouch|carefully concealed looped rope|a carefully concealed net|carefully concealed pit|Suddenly, the ground gives out from under you as you fall into a shallow pit filled with tiny spikes!/
+      # removed cause it caused a poach: tiny shard of jet black crystal
+      $ego2_my_ambush = true
+      echo 'my ambush' if $ego2_debug
+      if line =~ /<compass>.*?(?:quickly approaches|suddenly leaps from|leaps out of|suddenly jumps out of the shadows)/
+        $ego2_staggered_ambush = true
+        echo 'staggered ambush' if $ego2_debug
+      end
+    end
+  end
+"
+start_exec_script(exec_string, { :quiet => true })
+
+check_room = proc {
+  if hide
+    Spell.unlock_cast
+  end
+  loop {
+    while (unknown_npc = GameObj.npcs.find { |npc| not CharSettings['targetable'].include?(npc.name) and not CharSettings['untargetable'].include?(npc.name) })
+      target_result = dothistimeout "target ##{unknown_npc.id}", 10, /^You are now targeting|^You can't target|^Usage:  TARGET/
+      if target_result =~ /^You are now targeting/
+        CharSettings['targetable'].push(unknown_npc.name)
+      elsif target_result =~ /^You can't target/
+        CharSettings['untargetable'].push(unknown_npc.name)
+      end
+    end
+    npcs = GameObj.npcs.to_a.find_all { |npc| CharSettings['targetable'].include?(npc.name) and not (npc.name =~ ignorable_npcs) and (npc.noun !~ escort_noun) and (($ego2_my_ambush and npc.type =~ /bandit/) or npc.status !~ disabled) and (npc.status !~ /dead/) }
+    all_pcs = GameObj.pcs.to_a
+    pcs = all_pcs.find_all { |pc| pc.status.nil? or pc.status =~ /hiding|hidden/ }
+    disks = GameObj.loot.to_a.find_all { |loot| (loot.noun == 'disk') and (loot.name !~ /#{Char.name}/) and (all_pcs.empty? or (loot.name !~ /#{all_pcs.collect { |pc| pc.noun }.join('|')}/)) }
+    jerks = GameObj.pcs.to_a.find_all { |pc| UserVars.attacked_me.to_a.include?(pc.noun) and (pc.status !~ /dead/) }
+    unless jerks.empty?
+      unless justice_count == XMLData.room_count
+        result = dothistimeout 'justice status', 1, /^There is no justice other than your own out here\.$|^You sense that your surroundings are calm enough/
+        if result =~ /^There is no justice other than your own out here\.$/
+          justice = false
+        else
+          justice = true
+        end
+        justice_count = XMLData.room_count
+      end
+      if justice
+        jerks.clear
+      end
+    end
+    break if sanct_count == XMLData.room_count
+    if (poach and npcs.length > 0) or (npcs.length > 0 and ($ego2_my_ambush or (pcs.empty? and disks.empty?))) or (attack_script and jerks.length > 0)
+      if attack_script
+        if (checkrt > 0)
+          waitrt?
+          next
+        elsif (checkcastrt > 0)
+          waitcastrt?
+          next
+        end
+        start_script(attack_script, (jerks + npcs).collect { |n| n.id }, { :quiet=>true })
+        wait_while { running?(attack_script) }
+        if clear.any? { |line| line =~ /^Be at peace my child|^Spells of War cannot be cast/ }
+          sanct_count = XMLData.room_count
+        end
+      else
+        puts "\n#{monsterbold_start}Kill!#{monsterbold_end} \n\n"
+        pause_script
+      end
+    else
+      break
+    end
+    sleep 0.1
+  }
+}
+
+use_herbs = proc {
+  if useherbs
+    if XMLData.name == 'Tillmen' and XMLData.game == 'GSIV'
+      if ([Wounds.head, Wounds.neck, Wounds.torso, Wounds.limbs, Wounds.nerves, Scars.head, Scars.neck, Scars.torso, Scars.nerves].max > 0) or (Scars.limbs > 1) or ((checkhealth + 50) < maxhealth)
+        start_script 'useherbs', ['--buy-missing=off']
+        wait_while { running?('useherbs') }
+        if ([Wounds.head, Wounds.neck, Wounds.torso, Wounds.limbs, Wounds.nerves, Scars.head, Scars.neck, Scars.torso, Scars.nerves].max > 0) or (Scars.limbs > 1) or ((checkhealth + 50) < maxhealth)
+          useherbs = false
+        end
+      end
+    else
+      if ([Wounds.head, Wounds.neck, Wounds.torso, Wounds.limbs, Wounds.nerves, Scars.head, Scars.neck, Scars.torso, Scars.limbs, Scars.nerves].max > 0) or ((checkhealth + 50) < maxhealth)
+        start_script 'useherbs', ['--buy-missing=off']
+        wait_while { running?('useherbs') }
+        if ([Wounds.head, Wounds.neck, Wounds.torso, Wounds.limbs, Wounds.nerves, Scars.head, Scars.neck, Scars.torso, Scars.limbs, Scars.nerves].max > 0) or ((checkhealth + 50) < maxhealth)
+          useherbs = false
+        end
+      end
+    end
+  end
+}
+
+find_nearest = proc { |target_list|
+  start_room = Room.current
+  if target_list.include?(start_room.id)
+    nearest_id = start_room.id
+  else
+    _, shortest_distances = Map.dijkstra(start_room.id, target_list)
+    nearest_id = least_time = nil
+    for target in target_list
+      est_time = shortest_distances[target]
+      if !est_time.nil? and (least_time.nil? or least_time > est_time)
+        nearest_id = target
+        least_time = est_time
+      end
+    end
+  end
+  nearest_id
+}
+
+old_disable_portal_method = proc {
+  if XMLData.game =~ /^GSPlat/ and not Map.list.any? { |room| room.timeto.any? { |_adj_id, time| time.class == Proc and time._dump =~ /$go2_use_portals/ } }
+    for start_room in ['7561', '9318', '3479', '2696', '17691', '12584', '9664', '20453', '16746']
+      for end_room in ['7561', '9318', '3479', '2696', '17691', '12584', '9664', '20453', '16746']
+        if start_room != end_room
+          Map[start_room.to_i].wayto.delete(end_room)
+          Map[start_room.to_i].timeto.delete(end_room)
+        end
+      end
+    end
+    for start_room in ['7561', '5052', '9095', '2696', '11128', '12387', '648', '5766', '5940']
+      for end_room in ['7561', '5052', '9095', '2696', '11128', '12387', '648', '5766', '5940']
+        if start_room != end_room
+          Map[start_room.to_i].wayto.delete(end_room)
+          Map[start_room.to_i].timeto.delete(end_room)
+        end
+      end
+    end
+    for start_room in ['19706', '19709', '19745', '19752', '19778', '19723', '19721', '19719']
+      Map[start_room.to_i].wayto.delete('19707')
+      Map[start_room.to_i].timeto.delete('19707')
+    end
+  end
+}
+
+find_path = proc {
+  unless (current_room = Room.current)
+    echo 'Current room is not in the map database.'
+    fput 'unhide' if hidden?
+    exit
+  end
+  # disable vaalor shortcut
+  $go2_use_vaalor_shortcut = false
+  unless Map.list.any? { |room| room.timeto.any? { |_adj_id, time| time.class == Proc and time._dump =~ /$go2_use_vaalor_shortcut/ } }
+    Room[16745].timeto['16746'] = 15000
+    Room[16746].timeto['16745'] = 15000
+  end
+  # disable seeking
+  $go2_use_seeking = false
+  # disable portals
+  $go2_use_portals = false
+  old_disable_portal_method.call
+  previous, shortest_distances = Map.dijkstra(current_room.id, destination_room.id)
+  unless previous[destination_room.id]
+    echo "You can't get there from here."
+    fput 'unhide' if hidden?
+    exit
+  end
+  path = [destination_room.id]
+  path.push(previous[path[-1]]) until previous[path[-1]] == nil
+  path.reverse!
+  est_time = ((shortest_distances[destination_room.id] + (1.8 * path.length)) / 60.0).as_time
+  respond "ETA: #{est_time} (#{path.length} rooms to move through)."
+  _, _ = nil, nil
+}
+
+better_miniscript = {
+  '2524,2523'   => proc {
+    move 'climb rockslide'
+    hide_me.call
+  },
+  '2510,2509'   => proc {
+    move 'climb bank'
+    hide_me.call
+  },
+  '2509,2510'   => proc {
+    move 'climb bank'
+    hide_me.call
+  },
+  '2502,2503'   => proc {
+    move 'climb branch'
+    hide_me.call
+  },
+  '2505,2504'   => proc {
+    move 'climb tree'
+    hide_me.call
+  },
+  '75,74'       => proc {
+    move 'climb wall'
+    hide_me.call
+  },
+  '74,75'       => proc {
+    move 'climb wall'
+    hide_me.call
+  },
+  '884,883'     => proc {
+    move 'climb boulders'
+    hide_me.call
+  },
+  '883,884'     => proc {
+    move 'climb boulders'
+    hide_me.call
+  },
+  '991,990'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    empty_hands
+    move 'climb trail'
+    waitrt?
+    fill_hands
+  },
+  '990,991'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    empty_hands
+    move 'climb trail'
+    waitrt?
+    fill_hands
+  },
+  '990,989'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    empty_hands
+    move 'climb path'
+    waitrt?
+    fill_hands
+  },
+  '989,990'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    empty_hands
+    move 'climb path'
+    waitrt?
+    fill_hands
+  },
+  '989,988'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    empty_hands
+    move 'climb mountainside'
+    waitrt?
+    fill_hands
+  },
+  '988,989'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    empty_hands
+    move 'climb mountainside'
+    waitrt?
+    fill_hands
+  },
+  '971,970'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'go fissure'
+    waitrt?
+    hide_me.call
+  },
+  '970,971'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'go fissure'
+    waitrt?
+    hide_me.call
+  },
+  '964,963'     => proc {
+    move 'climb boulders'
+    hide_me.call
+  },
+  '963,964'     => proc {
+    move 'climb boulders'
+    hide_me.call
+  },
+  '902,901'     => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'go crevasse'
+    hide_me.call
+  },
+  '1018,1017'   => proc {
+    move 'climb precipice'
+    hide_me.call
+  },
+  '1017,1018'   => proc {
+    move 'climb cliff'
+    hide_me.call
+  },
+  '1024,1025'   => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'climb ledge'
+    waitrt?
+  },
+  '1025,1024'   => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'climb cliff'
+    waitrt?
+  },
+  '1156,1155'   => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'north'
+    waitrt?
+  },
+  '1153,1154'   => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'south'
+    waitrt?
+  },
+  '1236,1237'   => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'go stream'
+  },
+  '1239,1238'   => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    move 'go stream'
+  },
+  '1224,1223'   => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    empty_hands
+    move 'climb boulder'
+    waitrt?
+    fill_hands
+  },
+  '1223,1224'   => proc {
+    protect_me.call
+    check_room.call
+    haste_me.call
+    empty_hands
+    move 'climb boulder'
+    waitrt?
+    fill_hands
+  },
+  '1219,1220'   => proc {
+    haste_me.call
+    3.times {
+      result = dothistimeout 'search', 3, /^don't find anything|discover a northwest path|Round\s?time/
+      waitrt?
+      check_room.call
+      break if result =~ /discover a northwest path/
+    }
+    haste_me.call
+    hide_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    move 'go path'
+  },
+  '1030,1029'   => proc {
+    move 'climb cliff'
+    hide_me.call
+  },
+  '1029,1030'   => proc {
+    move 'climb cliff'
+    hide_me.call
+  },
+  '1020,1019'   => proc {
+    move 'climb crevice'
+    hide_me.call
+  },
+  '1019,1020'   => proc {
+    move 'climb crevice'
+    hide_me.call
+  },
+  '1242,1241'   => proc {
+    haste_me.call
+    5.times {
+      search_result = dothistimeout 'search', 5, /discover a|don't find anything|Round\s?time/
+      waitrt?
+      check_room.call
+      break if search_result =~ /discover a/
+    }
+    check_room.call
+    haste_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    move 'go path'
+  },
+  '10117,10119' => proc {
+    move 'go gangplank'
+    if Room.current.id == 10117
+      echo 'Waiting for ferry... '
+      loop {
+        break if clear.include?('An elven crewmember scrambles back onto the boat and lowers the gangplank.')
+        check_room.call
+        sleep 0.1
+      }
+      move 'go gangplank'
+    end
+    loop {
+      break if clear.include?('An elven crewmember scrambles back onto the boat and lowers the gangplank.')
+      check_room.call
+      sleep 0.1
+    }
+    haste_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    move 'out'
+  },
+  '10119,10117' => proc {
+    move 'go gangplank'
+    if Room.current.id == 10119
+      echo 'Waiting for ferry... '
+      loop {
+        break if clear.include?('An elven crewmember scrambles back onto the boat and lowers the gangplank.')
+        check_room.call
+        sleep 0.1
+      }
+      move 'go gangplank'
+    end
+    loop {
+      break if clear.include?('An elven crewmember scrambles back onto the boat and lowers the gangplank.')
+      check_room.call
+      sleep 0.1
+    }
+    haste_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    move 'out'
+  },
+  '1216,1217'   => proc {
+    5.times {
+      search_result = dothistimeout 'search', 5, /don't find anything|discover a small footpath|^Round\s?time/
+      fput 'search'
+      waitrt?
+      check_room.call
+      break if search_result =~ /discover a small footpath/
+    }
+    check_room.call
+    haste_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    hide_me.call
+    check_room.call
+    move 'go footpath'
+  },
+  '1190,1189'   => proc {
+    move 'out'
+    hide_me.call
+  },
+  '1192,1193'   => proc {
+    move 'out'
+    hide_me.call
+  },
+  '1190,1191'   => proc {
+    result = nil
+    if checknpcs.include?('ferryman')
+      fput 'unhide' if invisible? or hidden?
+      result = dothistimeout 'give ferryman 10', 5, /What is it you're trying to give|Thank you, friend\.  Go ahead and board\.|Sorry, friend, break time for me\.  Not taking tolls\./
+    end
+    until result =~ /Thank you, friend\.  Go ahead and board\./
+      echo 'Waiting for the ferryman...'
+      loop {
+        break if clear.any? { |line| line =~ /nimbly walks up the gangplank|He sets the gangplank down between the dock and the ferry and takes his place next to it\.|The ferryboat bumps up against the dock.  Immediately the ferryman ropes the boat securely to the dock, then picks up the gangplank and lays it down between the ferry and the dock, providing a safe, firm exit\./ }
+        sleep 0.1
+        check_room.call
+      }
+      fput 'unhide' if invisible? or hidden?
+      result = dothistimeout 'give ferryman 10', 5, /What is it you're trying to give|Thank you, friend\.  Go ahead and board\.|Sorry, friend, break time for me\.  Not taking tolls\./
+    end
+    move 'go gang'
+  },
+  '1192,1191'   => proc {
+    result = nil
+    if checknpcs.include?('ferryman')
+      fput 'unhide' if invisible? or hidden?
+      result = dothistimeout 'give ferryman 10', 5, /What is it you're trying to give|Thank you, friend\.  Go ahead and board\.|Sorry, friend, break time for me\.  Not taking tolls\./
+    end
+    until result =~ /Thank you, friend\.  Go ahead and board\./
+      echo 'Waiting for the ferryman...'
+      loop {
+        break if clear.any? { |line| line =~ /nimbly walks up the gangplank|He sets the gangplank down between the dock and the ferry and takes his place next to it\.|The ferryboat bumps up against the dock.  Immediately the ferryman ropes the boat securely to the dock, then picks up the gangplank and lays it down between the ferry and the dock, providing a safe, firm exit\./ }
+        sleep 0.1
+        check_room.call
+      }
+      fput 'unhide' if invisible? or hidden?
+      result = dothistimeout 'give ferryman 10', 5, /What is it you're trying to give|Thank you, friend\.  Go ahead and board\.|Sorry, friend, break time for me\.  Not taking tolls\./
+    end
+    move 'go gang'
+  },
+  '1191,1190'   => proc {
+    loop {
+      break if clear.any? { |line| line =~ /^The ferryman.*Everybody out/i }
+      check_room.call
+      sleep 0.1
+    }
+    protect_me.call
+    move 'go gang'
+    10.times {
+      check_room.call
+      sleep 0.2
+      break if check_escort.call
+    }
+  },
+  '1191,1192'   => proc {
+    loop {
+      break if clear.any? { |line| line =~ /^The ferryman.*Everybody out/i }
+      check_room.call
+      sleep 0.1
+    }
+    protect_me.call
+    move 'go gang'
+    10.times {
+      check_room.call
+      sleep 0.2
+      break if check_escort.call
+    }
+  },
+  '2547,2546'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      check_room.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'northeast', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2547,2548'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      check_room.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'southwest', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2545,2544'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      check_room.call
+      hide_me.call
+      dothistimeout 'north', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2545,2546'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'southwest', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2536,2535'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'east', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2536,2537'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'west', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2535,2534'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'southeast', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2535,2536'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'west', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2534,2533'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'southeast', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2534,2535'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'northwest', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2526,2525'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'east', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2526,2527'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'west', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2525,2524'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'northeast', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2525,2526'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'west', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2524,2525'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'southwest', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2522,2521'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'northeast', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2522,2523'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'west', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2521,2520'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'northeast', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2521,2522'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'southwest', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2518,2519'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'west', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2518,2517'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'northeast', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2516,2515'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'north', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2516,2517'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'south', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2513,2512'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'northwest', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2513,2514'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'south', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2507,2508'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'southwest', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2506,2505'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'north', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2502,2501'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'north', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2500,2499'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'northeast', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2500,2501'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'south', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2497,2498'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'southwest', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '2497,2496'   => proc {
+    room_count = XMLData.room_count
+    while room_count == XMLData.room_count
+      check_room.call
+      haste_me.call
+      fput 'stand' unless standing?
+      hide_me.call
+      dothistimeout 'west', 3, /^Trying to sneak over|^Obvious|^Running heedlessly/
+    end
+  },
+  '1012,1013'   => proc {
+    dothistimeout 'buy ticket', 10, /^You already bought a ticket.$|^The dwarf .*You now have passage/
+    bug = true
+    300.times {
+      sleep 0.1
+      if clear.any? { |line| line =~ /^You hastily enter the mining cart./ }
+        bug = false
+        break
+      end
+    }
+    unless bug
+      3600.times {
+        sleep 0.1
+        break if clear.any? { |line| line =~ /^You hastily exit the cart/ }
+        check_room.call
+      }
+    end
+    100.times {
+      check_room.call
+      sleep 0.2
+      break if check_escort.call
+    }
+  },
+  '1260,1261'   => proc {
+    dothistimeout 'buy ticket', 10, /^You already bought a ticket.$|^The dwarf .*You now have passage/
+    bug = true
+    300.times {
+      sleep 0.1
+      if clear.any? { |line| line =~ /^You hastily enter the mining cart./ }
+        bug = false
+        break
+      end
+    }
+    unless bug
+      3600.times {
+        sleep 0.1
+        break if clear.any? { |line| line =~ /^You hastily exit the cart/ }
+        check_room.call
+      }
+    end
+    100.times {
+      check_room.call
+      sleep 0.2
+      break if check_escort.call
+    }
+  },
+  '1266,1267'   => proc {
+    dothistimeout 'buy ticket', 10, /^You already bought a ticket.$|^The dwarf .*You now have passage/
+    bug = true
+    300.times {
+      sleep 0.1
+      if clear.any? { |line| line =~ /^You hastily enter the mining cart./ }
+        bug = false
+        break
+      end
+    }
+    unless bug
+      3600.times {
+        sleep 0.1
+        break if clear.any? { |line| line =~ /^You hastily exit the cart/ }
+        check_room.call
+      }
+    end
+    100.times {
+      check_room.call
+      sleep 0.2
+      break if check_escort.call
+    }
+  },
+  '992,993'     => proc {
+    dothistimeout 'buy ticket', 10, /^You already bought a ticket.$|^The dwarf .*You now have passage/
+    bug = true
+    300.times {
+      sleep 0.1
+      if clear.any? { |line| line =~ /^You hastily enter the mining cart./ }
+        bug = false
+        break
+      end
+    }
+    unless bug
+      3600.times {
+        sleep 0.1
+        break if clear.any? { |line| line =~ /^You hastily exit the cart/ }
+        check_room.call
+      }
+    end
+    100.times {
+      check_room.call
+      sleep 0.2
+      break if check_escort.call
+    }
+  },
+  '1230,1231'   => proc {
+    haste_me.call
+    dothistimeout 'search', 5, /You search/
+    waitrt?
+    check_room.call
+    haste_me.call
+    check_room.call
+    hide_me.call
+    move 'go crack'
+    haste_me.call
+    dothistimeout 'search', 5, /You search/
+    waitrt?
+    15.times { sleep 0.1; break if check_escort.call }
+    haste_me.call
+    hide_me.call
+    move 'go opening'
+  },
+  '1232,1231'   => proc {
+    haste_me.call
+    dothistimeout 'search', 5, /You search/
+    waitrt?
+    check_room.call
+    haste_me.call
+    check_room.call
+    hide_me.call
+    move 'go crack'
+    haste_me.call
+    dothistimeout 'search', 5, /You search/
+    waitrt?
+    15.times { sleep 0.1; break if check_escort.call }
+    haste_me.call
+    hide_me.call
+    move 'go opening'
+  },
+  '784,786'     => proc {
+    haste_me.call
+    hide_me.call
+    move 'south'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'south'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'west'
+  },
+  '786,784'     => proc {
+    haste_me.call
+    hide_me.call
+    move 'east'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'east'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'north'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'east'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'north'
+  },
+  '1042,1041'   => proc {
+    move 'climb boulder'
+    check_room.call
+    hide_me.call
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    look_result = dothistimeout 'look trail', 5, /^You peer into the mist and see that the trail heads off to the/
+    dir = /^You peer into the mist and see that the trail heads off to the (\w+)/.match(look_result).captures.first
+    haste_me.call
+    hide_me.call
+    move 'down'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move dir
+  },
+  '1808,1811'   => proc {
+    haste_me.call
+    hide_me.call
+    move 'southwest'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'southwest'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'southwest'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'northwest'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'northwest'
+  },
+  '1811,1808'   => proc {
+    haste_me.call
+    hide_me.call
+    move 'southeast'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'southeast'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'northeast'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'northeast'
+    10.times { check_room.call; sleep 0.2; break if check_escort.call }
+    10.times { check_room.call; sleep 0.1 }
+    haste_me.call
+    hide_me.call
+    move 'northeast'
+  },
+  '1074,1075'   => proc {
+    move 'southeast'
+    hide_me.call
+  },
+  '1074,1073'   => proc {
+    empty_hands
+    start_pcs = checkpcs
+    look_result = dothistimeout 'look ladder', 8, /The rope ladder is not being used by anyone at the moment\.|is climbing the rope ladder/
+    unless look_result =~ /The rope ladder is not being used by anyone at the moment\./
+      line = get until line =~ /climbs down the rest of the ladder slowly|climbs the remaining few rungs of the ladder/
+    end
+    if start_pcs
+      loop {
+        break unless checkpcs
+        waiting_pcs = start_pcs & checkpcs
+        break if waiting_pcs.empty?
+        sleep_time = 20 + rand(11)
+        echo "Giving the people here before you #{sleep_time} seconds..."
+        sleep sleep_time
+        look_result = dothistimeout 'look ladder', 8, /The rope ladder is not being used by anyone at the moment\.|is climbing the rope ladder/
+        if look_result =~ /The rope ladder is not being used by anyone at the moment\./
+          break
+        else
+          line = get until line =~ /climbs down the rest of the ladder slowly|climbs the remaining few rungs of the ladder/
+        end
+      }
+    end
+    haste_me.call
+    move 'climb ladder'
+    waitrt?
+    move 'climb down'
+    waitrt?
+    move 'climb down'
+    waitrt?
+    move 'climb down'
+    waitrt?
+    fill_hands
+  },
+  '1070,1071'   => proc {
+    empty_hands
+    start_pcs = checkpcs
+    look_result = dothistimeout 'look ladder', 8, /The rope ladder is not being used by anyone at the moment\.|is climbing the rope ladder/
+    unless look_result =~ /The rope ladder is not being used by anyone at the moment\./
+      line = get until line =~ /climbs down the rest of the ladder slowly|climbs the remaining few rungs of the ladder/
+    end
+    if start_pcs
+      loop {
+        break unless checkpcs
+        waiting_pcs = start_pcs & checkpcs
+        break if waiting_pcs.empty?
+        sleep_time = 20 + rand(11)
+        echo "Giving the people here before you #{sleep_time} seconds..."
+        sleep sleep_time
+        look_result = dothistimeout 'look ladder', 8, /The rope ladder is not being used by anyone at the moment\.|is climbing the rope ladder/
+        if look_result =~ /The rope ladder is not being used by anyone at the moment\./
+          break
+        else
+          line = get until line =~ /climbs down the rest of the ladder slowly|climbs the remaining few rungs of the ladder/
+        end
+      }
+    end
+    haste_me.call
+    move 'climb ladder'
+    waitrt?
+    move 'climb up'
+    waitrt?
+    move 'climb up'
+    waitrt?
+    move 'climb up'
+    waitrt?
+    fill_hands
+  },
+  '785,786'     => proc {
+    while checkpaths.include?('s')
+      move 'south'
+      10.times { check_room.call; sleep 0.2; break if check_escort.call }
+      10.times { check_room.call; sleep 0.1 }
+      haste_me.call
+      hide_me.call
+      move 'west'
+      10.times { check_room.call; sleep 0.2; break if check_escort.call }
+      10.times { check_room.call; sleep 0.1 }
+      haste_me.call
+      hide_me.call
+    end
+  },
+  '785,784'     => proc {
+    while checkpaths.include?('n')
+      move 'east'
+      10.times { check_room.call; sleep 0.2; break if check_escort.call }
+      10.times { check_room.call; sleep 0.1 }
+      haste_me.call
+      hide_me.call
+      move 'north'
+      10.times { check_room.call; sleep 0.2; break if check_escort.call }
+      10.times { check_room.call; sleep 0.1 }
+      haste_me.call
+      hide_me.call
+    end
+  },
+}
+
+go_next_room = proc {
+  unless (current_room = Room.current)
+    echo 'Current room is not in the map database.'
+    fput 'unhide' if hidden?
+    exit
+  end
+  find_path.call unless path.include?(current_room.id)
+  next_id = path[path.index(current_room.id) + 1].to_s
+  if (miniscript = better_miniscript["#{current_room.id},#{next_id}"])
+    miniscript.call
+  else
+    way = current_room.wayto[next_id]
+    if way.class == Proc
+      way.call
+    elsif way.class == String
+      count = 0
+      loop {
+        if (move(way) == false) and not muckled?
+          unless Room.current.id == current_room.id
+            break
+          end
+          if (count += 1) > 5
+            echo 'fixing map database...'
+            echo "deleting: #{current_room.id} -> #{way} -> #{next_id} "
+            current_room.wayto.delete(next_id)
+            break
+          else
+            sleep 0.2
+          end
+        else
+          break
+        end
+      }
+    else
+      path = Array.new
+    end
+  end
+  sleep 0.1
+}
+
+backtrack = proc {
+  unless (current_room = Room.current)
+    echo 'Current room is not in the map database.'
+    fput 'unhide' if hidden?
+    exit
+  end
+  begin
+    next_id = path[path.index(current_room.id) - 1].to_s
+    way = current_room.wayto[next_id]
+  rescue
+    echo 'error: unable to backtack'
+    echo $!
+    way = proc { sleep 3 }
+  end
+  if way.class == Proc
+    way.call
+  elsif way.class == String
+    if (move(way) == false) and not muckled?
+      echo 'fixing map database...'
+      echo "deleting: #{current_room.id} -> #{way} -> #{next_id}"
+      current_room.wayto.delete(next_id)
+      current_room.timeto.delete(next_id)
+    end
+  else
+    start_script 'go2', [next_id.to_s, 'typeahead=0', 'shortcut=off']
+    wait_while { running?('go2') }
+  end
+  sleep 0.1
+}
+
+if bounty? =~ /client has hired us to provide a protective escort .* Go to the (.*?) and WAIT .* guarantee .*? safety to (.*?) as soon as you can/
+  pickup_string = $1
+  destination_town = $2
+  start_town, pickup_room = escort_pickup[pickup_string]
+  unless pickup_room and start_town
+    echo "error: unmatched pickup location: #{pickup_string}"
+    fput 'unhide' if hidden?
+    exit
+  end
+  unless escort_dropoff[destination_town]
+    echo "error: unmatched destination town: #{destination_town}"
+    fput 'unhide' if hidden?
+    exit
+  end
+else
+  echo "You don't have an escort task."
+  fput 'unhide' if hidden?
+  exit
+end
+
+unless Room.current
+  echo 'error: current room was not found in the map database'
+  fput 'unhide' if hidden?
+  exit
+end
+
+Thread.new { wait_until { dead? }; Script.self.kill }
+
+#
+# see if our escort is already in the room
+#
+for npc in GameObj.npcs.find_all { |n| n.noun =~ escort_noun }
+  fput 'unhide' if hidden? or invisible?
+  result =  dothistimeout "tell ##{npc.id} to follow", 8, /#{npc.noun} nods and says to you|#{npc.noun} says to you, "But I already am!"|#{npc.noun} says to you, "The guild didn't hire you to guide me\."|^The merchant gives you a strange look\.$/
+  if result =~ /#{npc.noun} nods and says to you|#{npc.noun} says to you, "But I already am!"/
+    escort_id = npc.id
+    before_dying { $ego2_escort_id = nil }
+    $ego2_escort_id = escort_id
+    break
+  end
+end
+
+unless escort_id
+  #
+  # get monies for ferry and carts
+  #
+  travel_cost ||= $ego2_travel_cost[start_town][destination_town].to_i
+  silvers = check_silvers.call
+  if silvers < travel_cost
+    bank_id = Room[pickup_room].find_nearest_by_tag('bank')
+    start_script 'go2', [bank_id.to_s]
+    wait_while { running?('go2') }
+    fput 'unhide' if hidden? or invisible?
+    fput "withdraw #{travel_cost - silvers}"
+  end
+  #
+  # pick up escort
+  #
+  start_script 'go2', [pickup_room.to_s]
+  wait_while { running?('go2') }
+  dothistimeout 'wait', 20, /^Time drags on by\.\.\.$/
+  checked_npc_ids = Array.new
+  130.times {
+    sleep 0.1
+    if (npc = GameObj.npcs.find { |obj| (obj.noun =~ escort_noun) and not checked_npc_ids.include?(obj.id) })
+      checked_npc_ids.push(npc.id)
+      fput 'unhide' if hidden? or invisible?
+      result =  dothistimeout "tell ##{npc.id} to follow", 8, /#{npc.noun} nods and says to you|#{npc.noun} says to you, "But I already am!"|#{npc.noun} says to you, "The guild didn't hire you to guide me\."|^The merchant gives you a strange look\.$/
+      if result =~ /#{npc.noun} nods and says to you|#{npc.noun} says to you, "But I already am!"/
+        escort_id = npc.id
+        before_dying { $ego2_escort_id = nil }
+        $ego2_escort_id = escort_id
+        break
+      end
+    end
+  }
+  checked_npc_ids = nil
+end
+
+unless escort_id
+  echo 'error: failed to find escort'
+  fput 'unhide' if hidden?
+  exit
+end
+
+unless (destination_room = Room[find_nearest.call(escort_dropoff[destination_town])])
+  echo 'error: failed to find destination room'
+  fput 'unhide' if hidden?
+  exit
+end
+
+Thread.new {
+  loop {
+    wait_while { standing? or stunned? or (checkrt > 0) }
+    put 'stand'
+    sleep 0.5
+  }
+}
+
+start_time = Time.now
+
+loop {
+  haste_me.call
+
+  check_room.call
+
+  use_herbs.call
+
+  check_room.call
+
+  hide_me.call
+
+  check_room.call
+
+  use_herbs.call
+
+  check_room.call
+
+  hide_me.call
+
+  go_next_room.call
+
+  10.times {
+    sleep 0.1
+    check_room.call
+    sleep 0.1
+    check_room.call
+    break if check_escort.call
+  }
+
+  if bounty? !~ /client has hired us to provide a protective escort/
+    break
+  elsif check_escort.call
+    lost_escort = 0
+    fell_off_rope = false
+    end_time = Time.now.to_f + 1.0
+    until (Time.now.to_f > end_time)
+      sleep 0.1
+      check_room.call
+    end
+    wait_num = 45
+  elsif (lost_escort += 1) > 10
+    echo 'error: lost escort'
+    break
+  elsif fell_off_rope
+    end_time = Time.now.to_f + 1.0
+    until (Time.now.to_f > end_time)
+      check_room.call
+      sleep 0.1
+    end
+    wait_num = 45
+  elsif checkpcs
+    backtrack.call
+    if check_escort.call
+      lost_escort = 0
+    end
+    (wait_num += 5).times { check_room.call; sleep 0.2 }
+  else
+    backtrack.call
+    if check_escort.call
+      lost_escort = 0
+    end
+    check_room.call
+  end
+}
+
+echo "travel time: #{((Time.now - start_time) / 60.0).as_time}"
+
+fput 'unhide' if hidden?
+
+=begin
+
+  You manage to avoid being hit by the crystal as it shatters harmlessly nearby!
+
+  You finally reach the shore and you pull yourself to safety.  Your body aches all over and you can't seem to move again just yet.
+
+  A giantman traveller looks faint.
+  A giantman traveller mumbles, "I'm bleeding."
+  A half-elven rogue turns to a giantman traveller and exclaims, "I've got ya now!"
+  A half-elven rogue swings a backsword at a giantman traveller!
+  AS: +414 vs DS: +204 with AvD: +38 + d100 roll: +49 = +297
+  ... and hits for 117 points of damage!
+  The giantman traveller twists away but is caught with a hard slash!
+  The giantman traveller is knocked to the ground!
+  The giantman traveller is stunned!
+
+=end
