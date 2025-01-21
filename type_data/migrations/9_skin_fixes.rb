@@ -7,6 +7,8 @@ migrate :skin, :furrier do
   insert(:name, %{brown boar hide})
   insert(:name, %{moor eagle talon})
   insert(:name, %{mountain snowcat pelt})
+  delete(:name, %{crooked witch nose})      # fix for crooked witch nose bundles
+  insert(:name, %{(?:crooked )?witch nose}) # fix for crooked witch nose bundles
 end
 
 migrate :skin, :furrier do
