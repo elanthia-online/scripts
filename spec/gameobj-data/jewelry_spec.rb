@@ -116,7 +116,6 @@ describe GameObj do
             %{elegant},
             %{emerald-set},
             %{engraved},
-            %{enruned},
             %{etched},
             %{filigreed},
             %{fine},
@@ -142,7 +141,6 @@ describe GameObj do
 
           metal_jewelry = jewelry_metal_modifiers.product(jewelry_metals, jewelry_nouns).each do |combo|
             jewelry_name = combo.join(" ")
-            next if jewelry_name == "enruned gold ring"
 
             jewelry = GameObjFactory.item_from_name(jewelry_name)
             expect(jewelry.type).to include "jewelry"
