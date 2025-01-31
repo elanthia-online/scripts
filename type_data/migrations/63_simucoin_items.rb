@@ -134,6 +134,8 @@ migrate "simucoin:f2p" do
 end
 
 migrate :scroll do
+  create_key(:exclude)
+
   insert(:exclude, %{birth certificate parchment})
   insert(:exclude, %{amnesty parchment})
 end
