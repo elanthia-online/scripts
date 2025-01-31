@@ -132,3 +132,33 @@ migrate "simucoin:f2p" do
   insert(:name, %{large coin-shaped token})       # Treasure Boost (30 days)
   insert(:name, %{tiny coin-shaped token})        # Treasure Cap Reset
 end
+
+migrate :scroll do
+  insert(:exclude, %{birth certificate parchment})
+  insert(:exclude, %{amnesty parchment})
+end
+
+migrate :jewelry do
+  insert(:exclude, %{sun-etched gold ring})
+  insert(:exclude, %{enruned gold ring})
+end
+
+migrate :jar do
+  insert(:exclude, %{squat pale grey crystal bottle})
+  insert(:exclude, %{squat pale blue crystal bottle})
+end
+
+migrate :magic do
+  insert(:exclude, %{Briarmoon Cove entry orb})
+  insert(:exclude, %{small glowing orb})
+  insert(:exclude, %{glowing orb})
+  insert(:exclude, %{large glowing orb})
+end
+
+migrate :uncommon do
+  insert(:exclude, %{bronze stamped voucher booklet})
+  insert(:exclude, %{circular bronze sunburst marker})
+  insert(:exclude, %{circular laje sunburst marker})
+  insert(:exclude, %{circular vaalin sunburst marker})
+  insert(:exclude, %{bronze sword token})
+end
