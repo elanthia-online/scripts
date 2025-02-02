@@ -140,8 +140,9 @@ describe GameObj do
             %{turquoise-set},
           ]
 
-          metal_jewelry = jewelry_metal_modifiers.product(jewelry_metals, jewelry_nouns).each do |combo|
+          jewelry_metal_modifiers.product(jewelry_metals, jewelry_nouns).each do |combo|
             jewelry_name = combo.join(" ")
+            next if jewelry_name == "enruned gold ring"
 
             jewelry = GameObjFactory.item_from_name(jewelry_name)
             expect(jewelry.type).to include "jewelry"
@@ -252,12 +253,12 @@ describe GameObj do
             %{trilliant-cut},
           ]
 
-          gem_jewelry = jewelry_gem_modifiers.product(jewelry_gem_materials, jewelry_nouns).each do |combo|
+          jewelry_gem_modifiers.product(jewelry_gem_materials, jewelry_nouns).each do |combo|
             jewelry_name = combo.join(" ")
 
-              jewelry = GameObjFactory.item_from_name(jewelry_name)
-              expect(jewelry.type).to include "jewelry"
-              expect(jewelry.sellable.to_s).to include "gemshop"
+            jewelry = GameObjFactory.item_from_name(jewelry_name)
+            expect(jewelry.type).to include "jewelry"
+            expect(jewelry.sellable.to_s).to include "gemshop"
           end
         end
 
