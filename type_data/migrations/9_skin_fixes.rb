@@ -9,6 +9,8 @@ migrate :skin, :furrier do
   insert(:name, %{mountain snowcat pelt})
   delete(:name, %{crooked witch nose})      # fix for crooked witch nose bundles
   insert(:name, %{(?:crooked )?witch nose}) # fix for crooked witch nose bundles
+  delete(:name, %{polar bear skin})         # fix for polar bear skin bundles
+  insert(:name, %{(?:polar )?bear skin})    # fix for polar bear skin bundles
 end
 
 migrate :skin, :furrier do
