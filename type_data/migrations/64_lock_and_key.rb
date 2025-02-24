@@ -3,7 +3,7 @@ create_table "lockandkey", keys: [:name]
 migrate "lockandkey", "uncommon" do
   insert(:name, %{radiant golden bauble})
   insert(:name, %{vibrant golden bauble})
-  
+
   insert(:name, %{radiant blood red key})
   insert(:name, %{radiant forest green key})
   insert(:name, %{radiant frosty white key})
