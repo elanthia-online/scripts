@@ -42,6 +42,7 @@ describe GameObj do
         "junk",
         "lm tool",
         "lm trap",
+        "lockandkey",
         "lockpick",
         "manna bread",
         "magic",
