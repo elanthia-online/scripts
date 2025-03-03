@@ -4,12 +4,12 @@ create_table "lockandkey:lock", keys: [:name]
 create_table "lockandkey:rune", keys: [:name]
 create_table "lockandkey:misc", keys: [:name]
 
-migrate "lockandkey:bauble", "uncommon" do
+migrate "lockandkey:bauble" do
   insert(:name, %{radiant golden bauble})
   insert(:name, %{vibrant golden bauble})
 end
 
-migrate "lockandkey:key", "uncommon" do
+migrate "lockandkey:key" do
   insert(:name, %{radiant blood red key})
   insert(:name, %{radiant forest green key})
   insert(:name, %{radiant frosty white key})
@@ -23,7 +23,7 @@ migrate "lockandkey:key", "uncommon" do
   insert(:name, %{vibrant royal blue key})
 end
 
-migrate "lockandkey:lock", "uncommon" do
+migrate "lockandkey:lock" do
   insert(:name, %{radiant blood red lock})
   insert(:name, %{radiant forest green lock})
   insert(:name, %{radiant frosty white lock})
