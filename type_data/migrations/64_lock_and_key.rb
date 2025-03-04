@@ -36,3 +36,7 @@ migrate "lockandkey:lock" do
   insert(:name, %{vibrant rainbow-hued lock})
   insert(:name, %{vibrant royal blue lock})
 end
+
+migrate ""lockandkey:misc"" do
+  insert(:name, %{glowing torn page})
+end
