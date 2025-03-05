@@ -41,6 +41,10 @@ migrate "lockandkey:rune" do
   insert(:name, %{glowing rune-incised stone})
 end
 
+migrate "gem", "gemshop" do
+  insert(:exclude, %{glowing rune-incised stone})
+end
+
 migrate "lockandkey:misc" do
   insert(:name, %{glowing torn page})
   insert(:name, %{tiny orange vial})
