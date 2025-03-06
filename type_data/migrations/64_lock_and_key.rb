@@ -48,5 +48,7 @@ end
 migrate "lockandkey:misc" do
   insert(:name, %{glowing torn page})
   insert(:name, %{silvery crimson vial})
+  insert(:name, %{silvery indigo vial})
   insert(:name, %{tiny orange vial})
+  insert(:name, %{tiny pink vial})
 end
