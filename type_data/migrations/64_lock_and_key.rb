@@ -51,4 +51,5 @@ migrate "lockandkey:misc" do
   insert(:name, %{silvery indigo vial})
   insert(:name, %{tiny orange vial})
   insert(:name, %{tiny pink vial})
+  insert(:name, %{vial of iridescent oil})
 end
