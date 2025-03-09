@@ -36,3 +36,22 @@ migrate "lockandkey:lock" do
   insert(:name, %{vibrant rainbow-hued lock})
   insert(:name, %{vibrant royal blue lock})
 end
+
+migrate "lockandkey:rune" do
+  insert(:name, %{glowing rune-incised stone})
+end
+
+migrate "gem", "gemshop" do
+  insert(:exclude, %{glowing rune-incised stone})
+end
+
+migrate "lockandkey:misc" do
+  insert(:name, %{glowing torn page})
+  insert(:name, %{silvery crimson vial})
+  insert(:name, %{silvery indigo vial})
+  insert(:name, %{tiny blue vial})
+  insert(:name, %{tiny orange vial})
+  insert(:name, %{tiny pink vial})
+  insert(:name, %{tiny red vial})
+  insert(:name, %{vial of iridescent oil})
+end
