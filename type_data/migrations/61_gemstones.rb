@@ -5,6 +5,6 @@ migrate "ascension:jewel" do
   insert(:noun, %[jewel])
 end
 
-migrate "ascension:quest", "uncommon" do
+migrate "ascension:quest", :uncommon do
   insert(:name, %{silver-veined black draconic idol})
 end
