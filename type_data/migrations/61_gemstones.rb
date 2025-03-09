@@ -1,9 +1,14 @@
 create_table "ascension:jewel", keys: [:noun, :exclude]
+create_table "ascension:misc", keys: [:name]
 create_table "ascension:quest", keys: [:name]
 
 migrate "ascension:jewel" do
   insert(:noun, %[jewel])
   insert(:exclude, %{iron black jewel})
+end
+
+migrate "ascension:misc" do
+  insert(:name, %{scintillating mote of gemstone dust})
 end
 
 migrate "ascension:quest", :uncommon do
