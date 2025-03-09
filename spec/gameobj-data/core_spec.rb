@@ -18,6 +18,7 @@ describe GameObj do
         "ammo",
         "armor",
         "ascension:jewel",
+        "ascension:quest",
         "bandit",
         "boon",
         "box",
