@@ -104,4 +104,16 @@ end
 migrate :uncommon do
   insert(:name, %{stygian valravn quill})
   insert(:name, %{nacreous disir feather})
+  insert(:exclude, %{bluish black razern-bloom})
+  insert(:exclude, %{faceted stormcloud alexandrite})
+  insert(:exclude, %{shard of glossy black obsidian})
+  insert(:exclude, %{shard of raven's wing obsidian})
+end
+
+migrate :valuable do
+  insert(:exclude, %{silver-hite palladium nugget})
+end
+
+migrate :magic, :pawnshop do
+  insert(:exclude, %{twilight blue azurite crystal})
 end
