@@ -104,7 +104,6 @@ end
 migrate :uncommon do
   insert(:name, %{stygian valravn quill})
   insert(:name, %{nacreous disir feather})
-  insert(:name, %{silver-veined black draconic idol})
   insert(:exclude, %{bluish black razern-bloom})
   insert(:exclude, %{faceted stormcloud alexandrite})
   insert(:exclude, %{shard of glossy black obsidian})
