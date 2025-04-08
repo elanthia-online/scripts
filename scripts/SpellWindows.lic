@@ -9,8 +9,10 @@
 
   Now it also incorporates buff_tracker and targetwindow!
 
-  NOTE ** If you use the combat window in order to click to attack, be sure to toggle that feed with:
+  NOTE ** If you use the combat window, room window, or inventory window, be sure to toggle those feeds with:
       ;spellwindow combat
+      ;spellwindow room
+      ;spellwindow inventory
 
   ;spellwindow       - starts the script
   ;spellwindow help  - for the details
@@ -20,150 +22,128 @@
   contributors: Nisugi
           game: Gemstone
           tags: hunting, combat, tracking, spells, buffs, debuffs, cooldowns
-       version: 1.5
+       version: 1.7
       required: Wrayth
 
   Change Log:
+  v1.7 (2025-04-06)
+    - fixed progress bar on bard songs and armor adjustments.
+  v1.6 (2025-03-18)
+    - added room window and inventory feeds to optional blocking
   v1.5 (2025-03-13)
     - added adderall and removeall commands for missing spell window
     - corrected Indef time left display
   v1.4 (2024-12-31)
     - fixed syntax error
-  v1.3 (2024-12-14)
-    - target_window back in
-    - dynamic window updating
-  v1.2 (2024-12-13)
-    - removed target_window
-  v1.1 (2024-12-13)
-    - incorporated buff_tracker
-    - incorporated target_window
-  v1.0 (2024-12-12)
-    - Initial Release
 =end
 
 module SpellWindow
-  class Pattern
-    UPSTREAM_HOOK_ID = "#{Script.current.name.downcase}::upstream"
-    DOWNSTREAM_HOOK_ID = "#{Script.current.name.downcase}::downstream"
-    HOOK_CMD_RX = %r{^(?:<c>)?;(?:#{Script.current.name}?|buff)(?: (.*))?$}i
-    ACTIVE_SPELLS = %r{^<dialogData id='Active Spells' clear='t'></dialogData>}
-    BUFFS = %r{<dialogData id='Buffs' clear='t'></dialogData>}
-    DEBUFFS = %r{<dialogData id='Debuffs' clear='t'></dialogData>}
-    COOLDOWNS = %r{<dialogData id='Cooldowns' clear='t'></dialogData>}
-    COMBAT = %r{<dialogData id='combat'>/}
-    QUICKBAR = %r{<openDialog id="quick" location="quickBar"}
-    QUICKBAR_SWITCH = %r{<switchQuickBar id="quick"/>}
-    GRASP_ARMS = %r{(?:arm|appendage|claw|limb|pincer|tentacle|palpus|palpi)s?}
-  end
+  require 'yaml'
+  $spellwindow_blackout = false
+
+  @filename = File.join(DATA_DIR, XMLData.game, Char.name, "SpellWindow.yaml")
+  game_dir = File.join(DATA_DIR, XMLData.game)
+  char_dir = File.join(game_dir, Char.name)
+  Dir.mkdir(game_dir) unless File.exist?(game_dir)
+  Dir.mkdir(char_dir) unless File.exist?(char_dir)
 
   CMD_QUEUE = Queue.new
+  UPSTREAM_HOOK_ID = "#{Script.current.name.downcase}::upstream"
+  DOWNSTREAM_HOOK_ID = "#{Script.current.name.downcase}::downstream"
+  HOOK_CMD_RX = %r{^(?:<c>)?;(?:#{Script.current.name}?|buff)(?: (.*))?$}i
+  ACTIVE_SPELLS = %r{^<dialogData id='Active Spells' clear='t'></dialogData>}
+  BUFFS = %r{^<dialogData id='Buffs' clear='t'></dialogData>}
+  DEBUFFS = %r{^<dialogData id='Debuffs' clear='t'></dialogData>}
+  COOLDOWNS = %r{^<dialogData id='Cooldowns' clear='t'></dialogData>}
+  COMBAT = %r{^<dialogData id='combat'>}
+  QUICKBAR = %r{^<openDialog id=[^\s]+ location=(?:'|")quickBar(?:'|")}
+  QUICKBAR_SWITCH = %r{^<switchQuickBar id="quick"/>}
+  QUICKBAR_DIALOG = %r{^<dialogData id="quick">}
+  GRASP_ARMS = %r{(?:arm|appendage|claw|limb|pincer|tentacle|palpus|palpi)s?}
+  MAP_WINDOW = %r{^<dialogData id='mapViewMain'}
+  INVENTORY_WINDOW = Regexp.union(
+    %r{^<streamWindow id='inv'},
+    %r{^<clearStream id='inv'}
+  )
+  END_INVENTORY_STREAM = %r{^<popStream/>}
+  ROOM_WINDOW = Regexp.union(
+    %r{^<nav rm=},
+    %r{^<component id='room desc'>},
+    %r{^<component id='room players'>},
+    %r{^<component id='room objs'>},
+    %r{^<component id='room exits'>},
+    %r{^<compDef id='room desc'>},
+    %r{^<compDef id='room objs'>},
+    %r{^<compDef id='room players'>},
+    %r{^<compDef id='room exits'>},
+    %r{^<compDef id='sprite'>}
+  )
+  SWMIN_PATTERNS = Regexp.union(ACTIVE_SPELLS, BUFFS, DEBUFFS, COOLDOWNS, QUICKBAR, QUICKBAR_SWITCH, QUICKBAR_DIALOG, MAP_WINDOW)
 
-  def self.save_settings
-    CharSettings['show_spells'] = @show_spells
-    CharSettings['show_buffs'] = @show_buffs
-    CharSettings['show_debuffs'] = @show_debuffs
-    CharSettings['show_cooldowns'] = @show_cooldowns
-    CharSettings['block_combat'] = @block_combat
-    CharSettings['show_missing'] = @show_missing
-    CharSettings['show_targets'] = @show_targets
-    CharSettings['show_arms'] = @show_arms
-    CharSettings['my_buffs'] = @my_buffs
+  if File.exist?(@filename)
+    @settings = YAML.load_file(@filename)
+    respond("Loaded settings from #{@filename}")
+  else
+    @settings = {}
+    @settings[:show_spells]     = true
+    @settings[:show_buffs]      = true
+    @settings[:show_debuffs]    = true
+    @settings[:show_cooldowns]  = true
+    @settings[:block_combat]    = true
+    @settings[:block_room]      = true
+    @settings[:block_inventory] = true
+    @settings[:show_missing]    = false
+    @settings[:show_targets]    = false
+    @settings[:show_arms]       = false
+    @settings[:debug]           = false
+    @settings[:my_buffs]        = []
+    File.write(@filename, @settings.to_yaml)
+    respond("Default settings initialized.")
   end
 
-  def self.initialize_script
-    # set up default settings
-    @debug = false
-    defaults = {
-      'show_spells'    => true,
-      'show_buffs'     => true,
-      'show_debuffs'   => true,
-      'show_cooldowns' => true,
-      'block_combat'   => true,
-      'show_missing'   => false,
-      'show_targets'   => false,
-      'show_arms'      => false,
-      'my_buffs'       => []
-    }
-    defaults.each do |key, value|
-      CharSettings[key] ||= value
+  def self.flextape(server_string)
+    if server_string =~ INVENTORY_WINDOW && @settings[:block_inventory]
+      $spellwindow_blackout = true
+      return nil
+    elsif server_string =~ END_INVENTORY_STREAM && $spellwindow_blackout
+      $spellwindow_blackout = false
+      return nil
     end
-
-    # retrieve settings
-    @show_spells = CharSettings['show_spells']
-    @show_buffs = CharSettings['show_buffs']
-    @show_debuffs = CharSettings['show_debuffs']
-    @show_cooldowns = CharSettings['show_cooldowns']
-    @block_combat = CharSettings['block_combat']
-    @show_missing = CharSettings['show_missing']
-    @show_targets = CharSettings['show_targets']
-    @show_arms = CharSettings['show_arms']
-    @my_buffs = CharSettings['my_buffs']
-
-    @@thread = nil
-
-    # create our pattern for Flextape
-    patterns = [
-      Pattern::ACTIVE_SPELLS,
-      Pattern::BUFFS,
-      Pattern::DEBUFFS,
-      Pattern::COOLDOWNS,
-      Pattern::QUICKBAR,
-      Pattern::QUICKBAR_SWITCH
-    ]
-    patterns << Pattern::COMBAT if @block_combat
-    @@MAX_CHECK = Regexp.union(patterns)
-
-    # set up our hooks.
-    DownstreamHook.add(Pattern::DOWNSTREAM_HOOK_ID, proc do |server_string| SpellWindow.flextape(server_string) end)
-    UpstreamHook.add(Pattern::UPSTREAM_HOOK_ID, proc do |command|
-      if command =~ Pattern::HOOK_CMD_RX
-        CMD_QUEUE.push($1)
-        nil
-      else
-        command
-      end
-    end)
-
-    # clean up
-    before_dying {
-      UpstreamHook.remove(Pattern::UPSTREAM_HOOK_ID)
-      DownstreamHook.remove(Pattern::DOWNSTREAM_HOOK_ID)
-      @@thread.kill if @@thread.alive?
-      SpellWindow.save_settings
-    }
-
-    # create our missing spells and target windows. The other 4 windows are auto opened by wrayth if you use them.
-    puts("<closeDialog id='Missing Spells'/><openDialog type='dynamic' id='Missing Spells' title='Missing Spells' target='Missing Spells' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Missing Spells'></dialogData></openDialog>") if @show_missing
-    puts("<closeDialog id='Target Window'/><openDialog type='dynamic' id='Target Window' title='Targets' target='Target Window' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Targets'></dialogData></openDialog>") if @show_targets
+    return nil if $spellwindow_blackout
+    return nil if SWMIN_PATTERNS.match?(server_string)
+    return nil if COMBAT.match?(server_string) && @settings[:block_combat]
+    return nil if ROOM_WINDOW.match?(server_string) && @settings[:block_room]
+    return server_string
   end
 
-  def self.flextape(xml_line)
-    return nil if @@MAX_CHECK.match?(xml_line)
-    return xml_line
-  end
+  DownstreamHook.add(DOWNSTREAM_HOOK_ID, proc do |server_string| SpellWindow.flextape(server_string) end)
+  UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command| if command =~ HOOK_CMD_RX; CMD_QUEUE.push($1); nil; else; command; end; end)
+  before_dying { UpstreamHook.remove(UPSTREAM_HOOK_ID); DownstreamHook.remove(DOWNSTREAM_HOOK_ID); File.write(@filename, @settings.to_yaml) }
 
-  # missing spells stuff .. formerly buff_tracker
+  _respond("<closeDialog id='Missing Spells'/><openDialog type='dynamic' id='Missing Spells' title='Missing Spells' target='Missing Spells' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Missing Spells'></dialogData></openDialog>") if @settings[:show_missing]
+  _respond("<closeDialog id='Target Window'/><openDialog type='dynamic' id='Target Window' title='Targets' target='Target Window' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Targets'></dialogData></openDialog>") if @settings[:show_targets]
+
   def self.add_buff(var)
-    @my_buffs << var unless @my_buffs.include?(var)
-    puts("#{Spell[var].name} added.")
+    @settings[:my_buffs] << var unless @settings[:my_buffs].include?(var)
+    respond("#{Spell[var].name} added.")
   end
 
   def self.remove_buff(var)
-    @my_buffs.delete(var)
-    puts("#{Spell[var].name} removed.")
+    @settings[:my_buffs].delete(var)
+    respond("#{Spell[var].name} removed.")
   end
 
   def self.my_buffs
-    puts("    You have chosen to monitor:")
-    puts('<output class="mono"/>')
-    @my_buffs.sort_by { |b| Spell[b].num }.each { |b|
-      puts("%8s  %s" % [Spell[b].num, Spell[b].name])
+    _respond('<output class="mono"/>')
+    respond(@settings[:my_buffs].empty? ? 'No spells monitored.' : ' Monitoring:')
+    @settings[:my_buffs].sort_by { |b| Spell[b].num }.each { |b|
+      respond("%5s %s" % [Spell[b].num, Spell[b].name])
     }
-    puts('<output class=""/>')
+    _respond('<output class=""/>')
   end
 
   def self.missing_spells
-    missing = @my_buffs - Spell.active.map { |s| s.name }
+    missing = @settings[:my_buffs] - Spell.active.map { |s| s.name }
     output = "<dialogData id='Missing Spells' clear='t'></dialogData><dialogData id='Missing Spells'>"
     top_value = 0
     if missing.length > 0
@@ -181,11 +161,11 @@ module SpellWindow
 
   def self.status_fix(status)
     status_mapping = {
-      /rather calm/                    => 'calmed',
-      /to be frozen in place/          => 'frozen',
-      /held in place/                  => 'held',
-      /lying down/                     => 'prone',
-      /entangled by a lashing \w+ \w+/ => 'entangled'
+      /rather calm/           => 'calmed',
+      /to be frozen in place/ => 'frozen',
+      /held in place/         => 'held',
+      /lying down/            => 'prone',
+      /entangled by/          => 'entangled'
     }
 
     fix_status = status_mapping.find { |pattern, _| pattern.match?(status) }&.last || status
@@ -206,12 +186,11 @@ module SpellWindow
   end
 
   def self.target_window
-    targets = GameObj.targets.reject { |t| t.noun =~ Pattern::GRASP_ARMS || (t.name =~ /^animated / && t.name != "animated slush") }
-    group_members = Group.members
-    non_group_members = GameObj.pcs.reject { |player| group_members.any? { |member| member.id == player.id } }
+    targets = GameObj.targets.reject { |t| t.noun =~ GRASP_ARMS || (t.name =~ /^animated / && t.name != "animated slush") }
+    group_members = Lich::Gemstone::Group.members
+    non_group_members = Lich::Gemstone::Group.nonmembers
 
     output = "<dialogData id='Target Window' clear='t'></dialogData><dialogData id='Target Window'>"
-
     # Targets Section
     if targets.any?
       output += "<link id='total' value='Total Targets: #{targets.size}' cmd='target next' echo='target next' justify='3' top='3' left='0' height='15' width='195'/>"
@@ -220,18 +199,7 @@ module SpellWindow
       output += "<label id='noTargets' value='-= No Targets =-' justify='3' left='0' width='187'/>"
     end
 
-    output += "<label id='space1' value=' ' justify='3' left='0' width='187'/>"
-
-    # Players Section
-    if non_group_members.any?
-      output += "<label id='pcs' value='Total Players: #{non_group_members.size}' justify='3' left='0' height='15' width='195'/>"
-      output += build_target_links(non_group_members, include_titles: false)
-    else
-      output += "<label id='noPcs' value='-= No Players =-' justify='3' left='0' width='187'/>"
-    end
-
-    output += "<label id='space2' value=' ' justify='3' left='0' width='187'/>"
-
+    output += "<label id='space1' value='---------------------------' justify='3' left='0' width='187'/>"
     # Group Members Section
     if group_members.any?
       output += "<label id='group' value='Group Size: #{group_members.size}' justify='3' left='0' height='15' width='195'/>"
@@ -240,12 +208,19 @@ module SpellWindow
       output += "<label id='noGroup' value='-= No Group =-' justify='3' left='0' width='187'/>"
     end
 
+    output += "<label id='space2' value='---------------------------' justify='3' left='0' width='187'/>"
+    # Players Section
+    if non_group_members.any?
+      output += "<label id='pcs' value='Total Players: #{non_group_members.size}' justify='3' left='0' height='20' width='195'/>"
+      output += build_target_links(non_group_members, include_titles: false)
+    else
+      output += "<label id='noPcs' value='-= No Players =-' justify='3' left='0' width='187'/>"
+    end
+
     output += "</dialogData>"
     output
   end
 
-  # spell windows .. active spells, buffs, debuffs, cooldowns
-  # format simu uses for the progress bar time value
   def self.format_time(timeleft)
     seconds = timeleft * 60
     hours = (seconds / 3600).to_i
@@ -254,7 +229,6 @@ module SpellWindow
     format("%02d:%02d:%02d", hours, minutes, seconds)
   end
 
-  # format simu uses for the label time value
   def self.display_time(timeleft)
     return "Indef" if timeleft > 300
     seconds = timeleft * 60
@@ -265,6 +239,21 @@ module SpellWindow
       minutes = (seconds % 3600 / 60).to_i
       format("%d:%02d", hours, minutes)
     end
+  end
+
+  def self.calc_bard_song_duration()
+    duration = 120 + Stats.logic[:bonus] + (Stats.influence[:bonus] * 3) + (Char.mental_lore_telepathy * 2)
+    case Stats.level
+    when 76..100
+      duration += 225 + (Stats.level - 75)
+    when 51..75
+      duration += 175 + ((Stats.level - 50) * 2)
+    when 26..50
+      duration += 100 + ((Stats.level - 25) * 3)
+    else
+      duration += (Stats.level * 4)
+    end
+    return duration
   end
 
   def self.get_spell_max_duration(sn, stext)
@@ -279,10 +268,11 @@ module SpellWindow
       'Evasiveness'                => 0.05,
       'Wall of Force'              => 1.5
     }
+    return 250 if stext.start_with?("Armor")
+    return @spellsong_duration if stext.start_with?("Song of")
     custom_durations[stext] || Spell[sn].max_duration || 5
   end
 
-  # build outputs for our Effects windows
   def self.build_output(effect_type, title)
     effects = effect_type.to_h
     id_effects = effects.select { |k, _v| k.is_a?(Integer) }
@@ -311,15 +301,15 @@ module SpellWindow
   end
 
   def self.update_windows
-    @@thread.kill if @@thread&.alive? # Terminate the old thread
-    @@thread = Thread.new do
+    @thread.kill if @thread&.alive? # Terminate the old thread
+    @thread = Thread.new do
       begin
         window_to_effects = {
           'active_spells'  => Effects::Spells,
           'buffs'          => Effects::Buffs,
           'debuffs'        => Effects::Debuffs,
           'cooldowns'      => Effects::Cooldowns,
-          'missing_spells' => @my_buffs
+          'missing_spells' => @settings[:my_buffs]
         }
         update_intervals = {
           'active_spells' => 60,
@@ -360,7 +350,7 @@ module SpellWindow
           output = ''
 
           # target window, update asap on any change.
-          new_target_output = SpellWindow.target_window if @show_targets
+          new_target_output = SpellWindow.target_window if @settings[:show_targets]
           if new_target_output == old_target_output
             output += ''
           else
@@ -372,7 +362,7 @@ module SpellWindow
           current_state = {}
           window_to_effects.each do |window, effect_type|
             if window == 'missing_spells'
-              current_state[window] = @my_buffs - Spell.active.map { |s| s.name }
+              current_state[window] = @settings[:my_buffs] - Spell.active.map { |s| s.name }
             else
               # Use durations for other windows
               current_state[window] = effect_type.to_h.transform_values { |end_time| (end_time - Time.now).to_i }
@@ -385,7 +375,7 @@ module SpellWindow
               # Handle "missing_spells" specifically as an array comparison
               missing_changed = current_state[window].sort != last_state[window]&.sort
               if missing_changed
-                output += SpellWindow.missing_spells if @show_missing
+                output += SpellWindow.missing_spells if @settings[:show_missing]
                 last_state[window] = current_state[window].dup
               end
             else
@@ -397,13 +387,13 @@ module SpellWindow
               if current_state[window].keys.map(&:to_s).sort != last_state[window].keys.map(&:to_s).sort || status != last_state['status'][window] || duration_increased
                 case window
                 when 'active_spells'
-                  output += SpellWindow.build_output(Effects::Spells, 'Active Spells') if @show_spells
+                  output += SpellWindow.build_output(Effects::Spells, 'Active Spells') if @settings[:show_spells]
                 when 'buffs'
-                  output += SpellWindow.build_output(Effects::Buffs, 'Buffs') if @show_buffs
+                  output += SpellWindow.build_output(Effects::Buffs, 'Buffs') if @settings[:show_buffs]
                 when 'debuffs'
-                  output += SpellWindow.build_output(Effects::Debuffs, 'Debuffs') if @show_debuffs
+                  output += SpellWindow.build_output(Effects::Debuffs, 'Debuffs') if @settings[:show_debuffs]
                 when 'cooldowns'
-                  output += SpellWindow.build_output(Effects::Cooldowns, 'Cooldowns') if @show_cooldowns
+                  output += SpellWindow.build_output(Effects::Cooldowns, 'Cooldowns') if @settings[:show_cooldowns]
                 when 'missing_spells'
                   output += SpellWindow.missing_spells
                 end
@@ -426,13 +416,13 @@ module SpellWindow
 
             case window
             when 'active_spells'
-              window_outputs[window] = SpellWindow.build_output(Effects::Spells, 'Active Spells') if @show_spells
+              window_outputs[window] = SpellWindow.build_output(Effects::Spells, 'Active Spells') if @settings[:show_spells]
             when 'buffs'
-              window_outputs[window] = SpellWindow.build_output(Effects::Buffs, 'Buffs') if @show_buffs
+              window_outputs[window] = SpellWindow.build_output(Effects::Buffs, 'Buffs') if @settings[:show_buffs]
             when 'debuffs'
-              window_outputs[window] = SpellWindow.build_output(Effects::Debuffs, 'Debuffs') if @show_debuffs
+              window_outputs[window] = SpellWindow.build_output(Effects::Debuffs, 'Debuffs') if @settings[:show_debuffs]
             when 'cooldowns'
-              window_outputs[window] = SpellWindow.build_output(Effects::Cooldowns, 'Cooldowns') if @show_cooldowns
+              window_outputs[window] = SpellWindow.build_output(Effects::Cooldowns, 'Cooldowns') if @settings[:show_cooldowns]
             end
 
             if window_outputs[window] != old_outputs[window]
@@ -443,8 +433,8 @@ module SpellWindow
 
           if output != last_sent_output
             wait_while { Script.running?("go2") }
-            puts(output) unless output.empty?
-            echo(output) unless output.empty? if @debug
+            _respond(output) unless output.empty?
+            respond(output) unless output.empty? if @settings[:debug]
             last_sent_output = output
           else
           end
@@ -457,7 +447,6 @@ module SpellWindow
     end
   end
 
-  # processing commands from upstream
   def self.command(args)
     action, arg = args.split(' ')
     action = action.downcase
@@ -465,7 +454,7 @@ module SpellWindow
       SpellWindow.update_windows
     else
       if action == 'help'
-        puts('<output class="mono"/>')
+        _respond('<output class="mono"/>')
         [
           ['',               'Start the script.'],
           ['spells',         'Toggle the Active Spells window.'],
@@ -480,46 +469,49 @@ module SpellWindow
           ['adderall',       'Adds all currently worn spells to the list.'],
           ['removeall',      'Removes all spells from tracking whether they\'re active or not'],
           ['combat',         'Toggle combat window feed. Enable if you use the combat window to click.'],
+          ['room',           'Toggle room window feed.'],
+          ['inventory',      'Toggle inventory window feed.'],
           ['targets',        'Toggle targets window.'],
           ['arms',           'Show Grasp of the Grave arm count in the target window.'],
           ['settings',       'Lists current settings.'],
         ].each { |cmd_pair|
-          puts(
+          respond(
             ("%8s %-15s %s" % ([';spellwindows'] + cmd_pair))
               .gsub('<', '&lt;')
               .gsub('>', '&gt;')
           )
         }
-        puts('<output class=""/>')
-        exit
+        _respond('<output class=""/>')
       elsif action == 'settings'
-        puts("  You're current SpellWindow settings are:")
-        puts('<output class="mono"/>')
-        puts("  Active Spells   #{@show_spells}")
-        puts("          Buffs   #{@show_buffs}")
-        puts("        Debuffs   #{@show_debuffs}")
-        puts("      Cooldowns   #{@show_cooldowns}")
-        puts(" Missing Spells   #{@show_missing}")
-        puts("         Combat   #{!@block_combat}")
-        puts("        Targets   #{@show_targets}")
-        puts("      Arm Count   #{@show_arms}")
-        puts("")
-        puts('<output class=""/>')
+        _respond('<output class="mono"/>')
+        respond(" Current Settings:")
+        respond("     Spells: #{@settings[:show_spells]}")
+        respond("      Buffs: #{@settings[:show_buffs]}")
+        respond("    Debuffs: #{@settings[:show_debuffs]}")
+        respond("  Cooldowns: #{@settings[:show_cooldowns]}")
+        respond("    Missing: #{@settings[:show_missing]}")
+        respond("     Combat: #{!@settings[:block_combat]}")
+        respond("       Room: #{!@settings[:block_room]}")
+        respond("  Inventory: #{!@settings[:block_room]}")
+        respond("    Targets: #{@settings[:show_targets]}")
+        respond("  Arm Count: #{@settings[:show_arms]}")
+        respond("")
+        _respond('<output class=""/>')
         SpellWindow.my_buffs
       elsif action == 'add'
         if Spell[arg].num.nil?
-          puts("#{arg} is not a valid buff or spell. Please try again.")
+          respond("#{arg} is not a valid buff or spell. Please try again.")
         else
           SpellWindow.add_buff(Spell[arg].name)
         end
       elsif action == 'adderall'
         Spell.active.each { |s| SpellWindow.add_buff(Spell[s].name) }
       elsif action == 'removeall'
-        @my_buffs = []
-        _respond("All spells removed from watch list.")
+        @settings[:my_buffs] = []
+        respond("All spells removed from watch list.")
       elsif action =~ /rem(?:ove)?/
         if Spell[arg].num.nil?
-          _respond("#{arg} is not a valid buff or spell. Please try again.")
+          respond("#{arg} is not a valid buff or spell. Please try again.")
         else
           SpellWindow.remove_buff(Spell[arg].name)
         end
@@ -528,36 +520,46 @@ module SpellWindow
       elsif action == 'quickload'
         Spell.active.filter { |s| s.known? }.each { |s| SpellWindow.add_buff(Spell[s].name) }
       elsif action == 'combat'
-        @block_combat = !@block_combat
-        respond(@block_combat ? 'Combat window feed enabled' : 'Combat window feed disabled')
+        @settings[:block_combat] = !@settings[:block_combat]
+        respond(@settings[:block_combat] ? 'Combat window feed disabled.' : 'Combat window feed enabled.')
+      elsif action == 'room'
+        @settings[:block_room] = !@settings[:block_room]
+        respond(@settings[:block_room] ? 'Room window disabled.' : 'Room window enabled.')
+      elsif action == 'inventory'
+        @settings[:block_inventory] = !@settings[:block_inventory]
+        respond(@settings[:block_inventory] ? 'Inventory window disabled.' : 'Inventory window enabled.')
       elsif action == 'spells'
-        @show_spells = !@show_spells
-        _respond(@show_spells ? 'Active Spells window enabled' : 'Active Spells window disabled')
+        @settings[:show_spells] = !@settings[:show_spells]
+        _respond(@settings[:show_spells] ? 'Active Spells window enabled' : 'Active Spells window disabled')
       elsif action == 'buffs'
-        @show_buffs = !@show_buffs
-        _respond(@show_buffs ? 'Buffs window enabled' : 'Buffs window disabled')
+        @settings[:show_buffs] = !@settings[:show_buffs]
+        _respond(@show_buffs ? 'Buffs window enabled.' : 'Buffs window disabled.')
       elsif action == 'debuffs'
-        @show_debuffs = !@show_debuffs
-        _respond(@show_debuffs ? 'Debuffs window enabled' : 'Debuffs window disabled')
+        @settings[:show_debuffs] = !@settings[:show_debuffs]
+        _respond(@settings[:show_debuffs] ? 'Debuffs window enabled.' : 'Debuffs window disabled.')
       elsif action == 'cooldowns'
-        @show_cooldowns = !@show_cooldowns
-        puts(@show_spells ? 'Cooldowns window enabled' : 'Cooldowns window disabled')
+        @settings[:show_cooldowns] = !@settings[:show_cooldowns]
+        respond(@settings[:show_spells] ? 'Cooldowns window enabled.' : 'Cooldowns window disabled.')
       elsif action == 'missing'
-        @show_missing = !@show_missing
-        puts(@show_missing ? 'Missing spells window enabled' : 'Missing spells window disabled')
-        puts("<closeDialog id='Missing Spells'/><openDialog type='dynamic' id='Missing Spells' title='Missing Spells' target='Missing Spells' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Missing Spells'></dialogData></openDialog>") if @show_missing
-        puts("<closeDialog id='Missing Spells'/>") if !@show_missing
+        @settings[:show_missing] = !@settings[:show_missing]
+        respond(@settings[:show_missing] ? 'Missing spells window enabled.' : 'Missing spells window disabled.')
+        _respond("<closeDialog id='Missing Spells'/><openDialog type='dynamic' id='Missing Spells' title='Missing Spells' target='Missing Spells' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Missing Spells'></dialogData></openDialog>") if @settings[:show_missing]
+        _respond("<closeDialog id='Missing Spells'/>") if !@settings[:show_missing]
       elsif action == 'targets'
-        @show_targets = !@show_targets
-        puts(@show_targets ? 'Targets window enabled' : 'Targets window disabled')
-        puts("<closeDialog id='Target Window'/><openDialog type='dynamic' id='Target Window' title='Target Window' target='Target Window' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Target Window'></dialogData></openDialog>") if @show_targets
-        puts("<closeDialog id='Target Window'/>") if !@show_targets
+        @settings[:show_targets] = !@settings[:show_targets]
+        respond(@settings[:show_targets] ? 'Targets window enabled.' : 'Targets window disabled.')
+        _respond("<closeDialog id='Target Window'/><openDialog type='dynamic' id='Target Window' title='Target Window' target='Target Window' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Target Window'></dialogData></openDialog>") if @settings[:show_targets]
+        _respond("<closeDialog id='Target Window'/>") if !@settings[:show_targets]
       elsif action == 'arms'
-        @show_arms = !@show_arms
-        puts(@show_arms ? 'Grasp of the Grave arms will display in target window' : 'Grasp of the Grave arms will not display in target window')
+        @settings[:show_arms] = !@settings[:show_arms]
+        respond(@settings[:show_arms] ? 'Grasp of the Grave arms will display in target window.' : 'Grasp of the Grave arms will not display in target window.')
       elsif action == 'debug'
-        @debug = !@debug
-        puts(@show_targets ? 'Debug enabled' : 'Debug disabled')
+        @settings[:debug] = !@settings[:debug]
+        respond(@settings[:show_targets] ? 'Debug enabled.' : 'Debug disabled.')
+      elsif action == 'abort'
+        $spellwindow_blackout = false
+        @settings[:block_inventory] = false
+        respond("Inventory stream enabled.")
       else
         SpellWindow.update_windows
       end
@@ -572,7 +574,13 @@ module SpellWindow
     end
   end
 
-  SpellWindow.initialize_script
+  if Stats.prof == "Bard"
+    @spellsong_duration = calc_bard_song_duration()
+  else
+    @spellsonog_duration = 10
+  end
+
+  Group.maybe_check
   update_windows
   CMD_QUEUE.push(Script.current.vars[0])
 
