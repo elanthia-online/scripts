@@ -6,9 +6,12 @@
           game: Gemstone
           tags: dispel, unpoison, undisease, disarmed, effects
       required: Lich >= 5.9.0
-       version: 2.1.1
+       version: 2.2.0
 
   Improvements:
+  v2.2.0  (2025-04-23)
+    - determine whether web/globe/cloud is targetable to avoid dispelling player versions
+    - track web/globe/cloud ids to not retry casting again via CappedCollection
   v2.1.1  (2025-04-18)
     - fix for Moonsedge bind not triggering properly in XML
     - add Paladin 1635 beseech support in remove_stun and remove_web_bound
@@ -130,16 +133,40 @@ end
 require 'yaml'
 require 'terminal-table'
 
+module Ecleanse
+  class CappedCollection
+    MAX_SIZE = 200
+    attr_accessor :list, :max_size
+
+    def initialize(max_size = MAX_SIZE)
+      @list = []
+      @max_size = max_size
+    end
+
+    def <<(id)
+      @list << id
+      while @list.size > @max_size
+        @list.shift
+      end
+    end
+
+    def include?(id)
+      @list.include?(id)
+    end
+  end
+end
+
 # Data Class
 module Ecleanse
   class Data
     attr_accessor :settings, :did_something, :event_stack, :disease, :dispel, :poison, :webs, :injury_locations, :cloud, :globe, :web, :debuffs, :magic_globes,
-                  :recover_item, :recover_room, :creature
+                  :recover_item, :recover_room, :creature, :target_regex, :bad_targets
 
     def initialize(settings)
       @settings = settings
       @did_something = false
       @event_stack = []
+      @bad_targets = Ecleanse::CappedCollection.new
 
       @disease = [113].map { |s| Spell[s] }.find { |s| s.known? }
       @dispel = [417, 1218, 119].map { |s| Spell[s] }.find { |s| s.known? }
@@ -153,6 +180,14 @@ module Ecleanse
 
       @debuffs = /Confusion|Vertigo|Sounds|Thought Lash|Mindwipe|Pious Trial|Powersink/
       @magic_globes = /silvery blue globe|spiraling ghostly rift|chaotic spatial anomaly/i
+      @target_regex = Regexp.union(
+        /^You can only target creatures, players, and creature-created hazards\.$/,
+        /^Usage:  TARGET {player\|creature\|hazard}$/,
+        /^You are now targeting .+\.$/,
+        /^You are unable to discern the origin of .+\.$/,
+        /^You discern that you are the origin of .+ and decide against targeting yourself\.$/,
+        /^Suspecting that .+ is the origin of .+, you turn your attention towards \w+!$/,
+      )
 
       # action variables
       @cloud = nil
@@ -591,11 +626,18 @@ module Ecleanse
       # Return if we don't know how to do cast those
       return if Ecleanse.data.webs.nil?
 
+      # Return unless able to target object
+      result = dothistimeout("target ##{Ecleanse.data.web.id}", 2, Ecleanse.data.target_regex)
+      unless result.is_a?(String) && result =~ /^Suspecting that .+ is the origin of .+, you turn your attention towards \w+!$/
+        Ecleanse.data.bad_targets << Ecleanse.data.web.id
+        return
+      end
+
       System.scripts_pause
 
       Action.mana_pulse(Ecleanse.data.webs.num)
 
-      Ecleanse.data.webs.cast("at #{Ecleanse.data.web}") if Ecleanse.data.webs.affordable?
+      Ecleanse.data.webs.cast("at ##{Ecleanse.data.web.id}") if Ecleanse.data.webs.affordable?
       Ecleanse.data.web = nil
     end
 
@@ -606,10 +648,17 @@ module Ecleanse
       # Return if we don't know how to do cast those
       return if Ecleanse.data.dispel.nil?
 
+      # Return unless able to target object
+      result = dothistimeout("target ##{Ecleanse.data.globe.id}", 2, Ecleanse.data.target_regex)
+      unless result.is_a?(String) && result =~ /^Suspecting that .+ is the origin of .+, you turn your attention towards \w+!$/
+        Ecleanse.data.bad_targets << Ecleanse.data.globe.id
+        return
+      end
+
       Action.mana_pulse(Ecleanse.data.dispel.num)
 
       System.scripts_pause
-      Ecleanse.data.dispel.cast("at #{Ecleanse.data.globe}") if Ecleanse.data.dispel.affordable?
+      Ecleanse.data.dispel.cast("at ##{Ecleanse.data.globe.id}") if Ecleanse.data.dispel.affordable?
       Ecleanse.data.globe = nil
     end
 
@@ -663,10 +712,20 @@ module Ecleanse
       return unless Ecleanse.data.settings[:dispel_clouds]
       return unless Util.able_to_cast
 
+      # Return if we don't know how to do cast those
+      return if Ecleanse.data.dispel.nil?
+
+      # Return unless able to target object
+      result = dothistimeout("target ##{Ecleanse.data.cloud.id}", 2, Ecleanse.data.target_regex)
+      unless result.is_a?(String) && result =~ /^Suspecting that .+ is the origin of .+, you turn your attention towards \w+!$/
+        Ecleanse.data.bad_targets << Ecleanse.data.cloud.id
+        return
+      end
+
       Action.mana_pulse(Ecleanse.data.dispel)
 
       System.scripts_pause
-      Ecleanse.data.dispel.cast("at #{Ecleanse.data.cloud}") if Ecleanse.data.dispel.affordable?
+      Ecleanse.data.dispel.cast("at ##{Ecleanse.data.cloud.id}") if Ecleanse.data.dispel.affordable?
       Ecleanse.data.cloud = nil
     end
 
@@ -1474,9 +1533,9 @@ module Ecleanse
       rooted_pressed = debuffs.any? { |k| k =~ /Rooted|Pressed/ }
       dispell_debuffs = debuffs.any? { |k| k =~ Ecleanse.data.debuffs }
       webbed_bound = checkwebbed || checkbound
-      Ecleanse.data.cloud = GameObj.loot.find { |l| l.name =~ /cloud/i && l.name != 'cloud of acidic mist' && l.type !~ /\bgem\b/i }
-      Ecleanse.data.globe = GameObj.loot.find { |l| l.name =~ Ecleanse.data.magic_globes }
-      Ecleanse.data.web = GameObj.loot.find { |l| l.noun =~ /web/i }
+      Ecleanse.data.cloud = GameObj.loot.find { |l| l.name =~ /cloud/i && l.name != 'cloud of acidic mist' && l.type !~ /\bgem\b/i && !Ecleanse.data.bad_targets.include?(l.id) }
+      Ecleanse.data.globe = GameObj.loot.find { |l| l.name =~ Ecleanse.data.magic_globes && !Ecleanse.data.bad_targets.include?(l.id) }
+      Ecleanse.data.web = GameObj.loot.find { |l| l.noun =~ /web/i && !Ecleanse.data.bad_targets.include?(l.id) }
       determination_injury = Ecleanse.data.settings[:determination] && Ecleanse.data.injury_locations.any? { |limb| XMLData.injuries[limb]["wound"] > 1 }
 
       conditions = {
