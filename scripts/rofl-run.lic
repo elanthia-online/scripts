@@ -17,6 +17,9 @@
   v1.0.3 - 2025-04-23
     - improved hand handling
     - allowed alternate versions of commands (planes/planar, spirits/spiritual, elements/elemental)
+    - some internal optimizations and restructuring
+    - reworked info display/messaging
+    - fixed typo in planar ring room range
   v1.0.2 - 2025-04-22
     - bugfix in header keyword usage
   v1.0.1 - 2025-04-21
@@ -34,21 +37,23 @@ module RofLRun
   UserVars.ringing_stop_resting  ||= 90
 
   @rofl_debug = UserVars.rofl_debug
+  @left_hand
+  @right_hand
 
   def self.ringing_loop(balcony_location, resting_location, ring_rooms)
     # check if the supporting scripts are available
     unless Script.exists?("rofl-puzzles") && Script.exists?("rofl-questions")
       unless Script.exists?("rofl-puzzles")
-        respond("")
-        respond("** You need to download the rofl-puzzles script:")
-        respond("     ;repo download rofl-puzzles **")
-        respond("")
+        Lich::Messaging::msg(error, " ")
+        Lich::Messaging::msg(error, "** You need to download the rofl-puzzles script:")
+        Lich::Messaging::msg(error, "     ;repo download rofl-puzzles **")
+        Lich::Messaging::msg(error, " ")
       end
       unless Script.exists?("rofl-questions")
-        respond("")
-        respond("** You need to download the rofl-questions script:")
-        respond("     ;repo download rofl-questions **")
-        respond("")
+        Lich::Messaging::msg(error, " ")
+        Lich::Messaging::msg(error, "** You need to download the rofl-questions script:")
+        Lich::Messaging::msg(error, "     ;repo download rofl-questions **")
+        Lich::Messaging::msg(error, " ")
       end
 
       exit
@@ -65,25 +70,22 @@ module RofLRun
     }
 
     loop do
+      # let's start with empty hands, unless it's a card to run
+      deal_with_hands(:card)
+
       # First thing we should do is see if we have more runs left, because if we don't the rest doesn't matter!
-      echo("Checking for runs left...") if @rofl_debug
-      if dothistimeout("look at scholar's card", 2, /This card grants travel to the trials on Liabo\./).nil?
-        respond("You are out of runs!") unless Room.current.uid.include?(resting_location)
-        Script.run("go2", "u#{resting_location}") unless Room.current.uid.include?(resting_location)
-        deal_with_hands(:empty)
-        respond("You are out of runs!")
-        exit
-      end
+      handle_card(:check)
 
       # Waiting to absorb XP
       echo("Checking mind state...") if @rofl_debug
       if UserVars.ignore_ringing_xp != "yes" && percentmind > UserVars.ringing_start_resting.to_i
-        echo("******* Mind #{percentmind}%; over #{UserVars.ringing_start_resting}%.  Going to closest node to wait in 3 seconds.") unless Room.current.uid.include?(resting_location)
+        Lich::Messaging::msg("info","******* Mind #{percentmind}%; over #{UserVars.ringing_start_resting}%.  Going to node to rest in 3 seconds.") unless Room.current.uid.include?(resting_location)
         sleep(3) unless Room.current.uid.include?(resting_location)
         Script.run("go2", "u#{resting_location}") unless Room.current.uid.include?(resting_location)
-        deal_with_hands(:empty)
-        echo("******* Mind #{percentmind}%; over #{UserVars.ringing_start_resting}%.  Waiting until mind is #{UserVars.ringing_stop_resting}% or under.")
+        deal_with_hands(:fill)
+        Lich::Messaging::msg("info","******* Mind #{percentmind}%; over #{UserVars.ringing_start_resting}%.  Waiting until mind is #{UserVars.ringing_stop_resting}% or under.")
         sleep(1) while percentmind > UserVars.ringing_stop_resting.to_i
+        deal_with_hands(:empty)
       end
 
       # if we're already in one of the appropriate ring rooms, then we don't need to move
@@ -98,7 +100,7 @@ module RofLRun
           travel_retry += 1
 
           if travel_retry > 5
-            respond("Unable to get to the starting location (u#{balcony_location}) room, exiting.")
+            Lich::Messaging::msg("error", "Unable to get to the starting location (u#{balcony_location}) room, exiting.")
             exit
           end
         end
@@ -110,19 +112,10 @@ module RofLRun
       end
 
       # Clear any non-card items from our hands
-      deal_with_hands(:empty)
+      deal_with_hands(:card)
 
       # Check if we have a card and get it if we do
-      echo("Checking/getting scholar's card...") if @rofl_debug
-      unless dothistimeout("get scholar's card", 2, /You remove a|You already have that/) =~ /You remove a|You already have that/
-        if checkright != "card" && checkleft != "card"
-          respond("** Out of runs!") unless Room.current.uid.include?(resting_location)
-          Script.run("go2", "u#{resting_location}") unless Room.current.uid.include?(resting_location)
-          deal_with_hands(:empty)
-          respond("** You are out of runs! **")
-          exit
-        end
-      end
+      handle_card(:get)
 
       # Double Check the supporting scripts are running and not paused
       check_support_scripts
@@ -145,14 +138,48 @@ module RofLRun
       # Check if we're going to keep going or if we're told to stop
       if UserVars.stop_ringing == "yes"
         Script.run("go2", "u#{resting_location}") unless Room.current.uid.include?(resting_location)
-        deal_with_hands(:empty)
-        echo("Var stop_ringing set to yes, resetting to no and exiting.")
+        deal_with_hands(:empty) # put away prizes
+        deal_with_hands(:fill) # get original items out
+        Lich::Messaging::msg("info", "Var stop_ringing set to yes, resetting to no and exiting.")
         UserVars.stop_ringing = "no"
         exit
       end
     end
   end
 
+  # Manages checking or getting the scholar's card for runs
+  # actions:
+  #   :none - Doesn't try to get or check the card
+  #   :get - Tries to get the card, and makes sure it ends up in hands
+  #   :check - Just looks for the card to see if there are actions
+  #
+  # To Do:  We can do this better, we should try to find the card in inventory and _drag to get it into hands,
+  #         and make sure we have at least one empty hand to put it into.  For the future.
+  def self.handle_card(action = :none)
+    echo("Checking for runs/card.") if @rofl_debug
+    out_of_runs = false # Assume we are starting with runs, unless we find that we don't have any later
+
+    case action
+    when :none
+      raise("handle_card action = none: Uh, this shouldn't happen, report to EO!! #{caller[0]}")
+    when :check
+      echo("Checking for runs left...") if @rofl_debug
+      out_of_runs = dothistimeout("look at scholar's card", 2, /This card grants travel to the trials on Liabo\./).nil?
+      echo("Checked for runs #{out_of_runs}")
+    when :get
+      echo("Getting scholar's card...") if @rofl_debug
+      out_of_runs = dothistimeout("get scholar's card", 2, /You remove a|You already have that/).nil? && checkright != "card" && checkleft != "card"
+      echo("Getting card #{out_of_runs}")
+    end
+
+    if out_of_runs
+      deal_with_hands(:fill)
+      Lich::Messaging::msg("warn", "** You are out of runs! **")
+      exit
+    end
+  end
+
+  # Make sure the required support scripts are running before we need them
   def self.check_support_scripts
     # start the support scripts, if needed
     echo("Checking/Starting support scripts...") if @rofl_debug
@@ -161,15 +188,15 @@ module RofLRun
 
     # make sure they are running, if not, exit
     unless Script.running?("rofl-puzzles") && Script.running?("rofl-questions")
-      respond("Support Scripts Issues, waiting 10 seconds in case of a slow startup.")
+      Lich::Messaging::msg("warn", "Support Scripts Issues, waiting 10 seconds in case of a slow startup.")
       sleep(10) # give it another chance to finish starting
       unless Script.running?("rofl-puzzles") && Script.running?("rofl-questions")
-        respond(" ** Failed to Start Support Scripts! **")
-        respond(" rofl-puzzles: #{Script.running?("rofl-puzzles")}")
-        respond(" rofl-questions: #{Script.running?("rofl-questions")}")
+        Lich::Messaging::msg("error", " ** Failed to Start Support Scripts! **")
+        Lich::Messaging::msg("error", " rofl-puzzles: #{Script.running?("rofl-puzzles")}")
+        Lich::Messaging::msg("error", " rofl-questions: #{Script.running?("rofl-questions")}")
         exit
       else
-        respond("Scripts Running, continuing.")
+        Lich::Messaging::msg("info", "Scripts Running, continuing.")
       end
     end
 
@@ -178,71 +205,87 @@ module RofLRun
     Script.unpause("rofl-questions") if Script.paused?("rofl-questions")
   end
 
-  def self.deal_with_hands(fill_or_empty = :none)
-    echo("Checking hands...") if @rofl_debug
-    case fill_or_empty
+  # Manages hand contents
+  # actions:
+  #   :none - Default, but should not be used
+  #   :empty - Empty hands completely.  Does not track cards/notes as being in hands, will track other items
+  #   :fill - Put away whatever isbeing held and retrieve items that were previously stored, if any
+  #   :card - Empty hand, but keep a cards.  Will track stored items, unless it's a card or note.
+  def self.deal_with_hands(action = :none)
+    echo("Dealing with hands...") if @rofl_debug
+    #echo("Left Hand: #{@left_hand} and Right Hand: #{@right_hand}")
+    case action
     when :none
-      raise("fill_or_empty: Uh, this shouldn't happen, report to EO!! #{caller[0]}")
-    when :empty
-      unless GameObj.left_hand.noun == 'card'
-        @left_hand = GameObj.left_hand
-        Lich::Stash::stash_hands(left: true)
-      end
-      unless GameObj.right_hand.noun == 'card'
-        @right_hand = GameObj.right_hand
-        Lich::Stash::stash_hands(right: true)
-      end
-    when :fill
-      if @left_hand && @left_hand.id
-        fput("_drag ##{@left_hand.id} left")
-        @left_hand = nil
-      end
-      if @right_hand && @right_hand.id
-        fput("_drag ##{@right_hand.id} right")
-        @right_hand = nil
-      end
+      raise("deal_with_hands action = none: Uh, this shouldn't happen, report to EO!! #{caller[0]}")
+    when :empty # empty hands entirely, do not track if it was a card or note
+      echo("Dealing with hands... :empty command") if @rofl_debug
+      echo("Hands:empty:before - L: #{@left_hand} R: #{@right_hand}") if @rofl_debug
+      @left_hand = GameObj.left_hand if GameObj.left_hand.noun != "card" && GameObj.left_hand.noun != "note" && !(GameObj.left_hand.noun.nil?)
+      @right_hand = GameObj.right_hand if GameObj.right_hand.noun != "card" && GameObj.right_hand.noun != "note" && !(GameObj.right_hand.noun.nil?)
+      echo("Hands:empty:after - L: #{@left_hand} R: #{@right_hand}") if @rofl_debug
+
+      Lich::Stash::stash_hands(both: true)
+    when :fill # store whatever we're holding and get items back out
+      echo("Dealing with hands... :fill command") if @rofl_debug
+      echo("Hands:fill:before - L: #{@left_hand} R: #{@right_hand}") if @rofl_debug
+      Lich::Stash::stash_hands(left: true) unless GameObj.left_hand.id != @left_hand.id
+      Lich::Stash::stash_hands(right: true) unless GameObj.right_hand.id != @right_hand.id
+
+      fput("_drag ##{@right_hand.id} right") if @right_hand && @right_hand.id && GameObj.right_hand.id != @right_hand.id
+      fput("_drag ##{@left_hand.id} left") if @left_hand && @left_hand.id && GameObj.left_hand.id != @left_hand.id
+      
+      @left_hand = @right_hand = nil 
+    when :card # set hands so that we only have a card out
+      echo("Dealing with hands... :card command") if @rofl_debug
+      echo("Hands:card:before - L: #{@left_hand} R: #{@right_hand}") if @rofl_debug
+      @left_hand = GameObj.left_hand if GameObj.left_hand.noun != "card" && GameObj.left_hand.noun != "note" && !(GameObj.left_hand.noun.nil?)
+      @right_hand = GameObj.right_hand if GameObj.right_hand.noun != "card" && GameObj.right_hand.noun != "note" && !(GameObj.right_hand.noun.nil?)
+      echo("Hands:card:after - L: #{@left_hand} R: #{@right_hand}") if @rofl_debug
+      
+      Lich::Stash::stash_hands(left: true) unless GameObj.left_hand.noun == 'card'
+      Lich::Stash::stash_hands(right: true) unless GameObj.right_hand.noun == 'card'
     end
   end
 
   def self.show_help
-    respond("** ** **  Ringing  ** ** **")
-    respond("** ** Version: #{(Script.list.find { |x| x.name == Script.current.name }.inspect)[/version: (\d+\.\d+\.\d+)/i, 1]}  ** **")
-    respond("**")
-    respond("** USAGE: '#{$lich_char}#{Script.current.name} <planes/spirit/elements/chaos/order>'")
-    respond("** ")
-    respond("** This script requires both rofl-puzzles and rofl-questions to be downloaded to work.")
-    respond("**     rofl-puzzles is #{Script.exists?("rofl-puzzles") ? "present" : "missing"} and rofl-questions is #{Script.exists?("rofl-questions") ? "present" : "missing"}")
-    respond("** ")
-    respond("** To stop the script from doing another run after this one:  ")
-    respond("**   #{$lich_char}vars set stop_ringing=yes")
-    respond("**   #{$lich_char}#{Script.current.name} stop")
-    respond("** this gets auto-reset to no after the run finishes as the script exits.")
-    respond("** ")
-    respond("** The script will run endlessly until you are over #{UserVars.ringing_start_resting}% then rest")
-    respond("** until you are under #{UserVars.ringing_stop_resting}%.")
-    respond("** > You can set the preferred resting threshold % by:")
-    respond("**     #{$lich_char}#{Script.current.name} mind_stop=<number> (no percent sign)")
-    respond("** > You can set the preferred re-starting threshold % by:")
-    respond("**     #{$lich_char}#{Script.current.name} mind_start=<number> (no percent sign)")
-    respond("** > You can enable experience management by:")
-    respond("**     #{$lich_char}#{Script.current.name} absorb_xp")
-    respond("** > You can disable experience management by:")
-    respond("**     #{$lich_char}#{Script.current.name} ignore_xp")
-    respond("**")
-    respond("** Prizes will be placed in #{UserVars.lootsack.nil? ? "stowed" : "your " + UserVars.lootsack}.")
-    respond("** If you want to change that, then: ")
-    respond("**    #{$lich_char}vars set lootsack=<container>")
-    respond("**")
-    respond("** Debugging can be toggled (currently: #{@rofl_debug}) by:")
-    respond("**    #{$lich_char}#{Script.current.name} debug")
-    respond("**")
-    respond("** **  Happy Ringing  ** **")
+    Lich::Messaging::mono("** ** **  Ringing  ** ** **")
+    Lich::Messaging::mono("** ** Version: #{(Script.list.find { |x| x.name == Script.current.name }.inspect)[/version: (\d+\.\d+\.\d+)/i, 1]}  ** **")
+    Lich::Messaging::mono("**")
+    Lich::Messaging::mono("** USAGE: '#{$lich_char}#{Script.current.name} <planes/spirit/elements/chaos/order>'")
+    Lich::Messaging::mono("** ")
+    Lich::Messaging::mono("** This script requires both rofl-puzzles and rofl-questions to be downloaded to work.")
+    Lich::Messaging::mono("**     rofl-puzzles is #{Script.exists?("rofl-puzzles") ? "present" : "missing"} and rofl-questions is #{Script.exists?("rofl-questions") ? "present" : "missing"}")
+    Lich::Messaging::mono("** ")
+    Lich::Messaging::mono("** To stop the script from doing another run after this one:  ")
+    Lich::Messaging::mono("**   #{$lich_char}vars set stop_ringing=yes")
+    Lich::Messaging::mono("**   #{$lich_char}#{Script.current.name} stop")
+    Lich::Messaging::mono("** this gets auto-reset to no after the run finishes as the script exits.")
+    Lich::Messaging::mono("** ")
+    Lich::Messaging::mono("** The script will run endlessly until you are over #{UserVars.ringing_start_resting}% then rest")
+    Lich::Messaging::mono("** until you are under #{UserVars.ringing_stop_resting}%.")
+    Lich::Messaging::mono("** > You can set the preferred resting threshold % by:")
+    Lich::Messaging::mono("**     #{$lich_char}#{Script.current.name} mind_stop=<number> (no percent sign)")
+    Lich::Messaging::mono("** > You can set the preferred re-starting threshold % by:")
+    Lich::Messaging::mono("**     #{$lich_char}#{Script.current.name} mind_start=<number> (no percent sign)")
+    Lich::Messaging::mono("** > You can enable experience management by:")
+    Lich::Messaging::mono("**     #{$lich_char}#{Script.current.name} absorb_xp")
+    Lich::Messaging::mono("** > You can disable experience management by:")
+    Lich::Messaging::mono("**     #{$lich_char}#{Script.current.name} ignore_xp")
+    Lich::Messaging::mono("**")
+    Lich::Messaging::mono("** Prizes will be placed in #{UserVars.lootsack.nil? ? "stowed" : "your " + UserVars.lootsack}.")
+    Lich::Messaging::mono("** If you want to change that, then: ")
+    Lich::Messaging::mono("**    #{$lich_char}vars set lootsack=<container>")
+    Lich::Messaging::mono("**")
+    Lich::Messaging::mono("** Debugging can be toggled (currently: #{@rofl_debug}) by:")
+    Lich::Messaging::mono("**    #{$lich_char}#{Script.current.name} debug")
+    Lich::Messaging::mono("**")
+    Lich::Messaging::mono("** **  Happy Ringing  ** **")
   end
 
   echo(Script.current.vars[1].downcase) if @rofl_debug
 
   if Script.current.vars[1].downcase =~ /planes|planar/
-    self.ringing_loop(7111001, 7110206, [*7111001..7111005])
+    self.ringing_loop(7111001, 7110206, [*7111002..7111005])
   elsif Script.current.vars[1].downcase =~ /spirit|spiritual/
     self.ringing_loop(7112001, 7110215, [*7112002..7112005])
   elsif Script.current.vars[1].downcase =~ /elements|elemental/
@@ -255,22 +298,22 @@ module RofLRun
     self.show_help
   elsif Script.current.vars[1].downcase =~ /ignore_xp/
     UserVars.ignore_ringing_xp = "yes"
-    respond("XP status will be ignored.")
+    Lich::Messaging::msg("info", "XP status will be ignored.")
   elsif Script.current.vars[1].downcase =~ /absorb_xp/
     UserVars.ignore_ringing_xp = "no"
-    respond("XP will be absorbed before continuing.")
+    Lich::Messaging::msg("info", "XP will be absorbed before continuing.")
   elsif Script.current.vars[1].downcase =~ /mind_start/
     UserVars.ringing_start_resting = Script.current.vars[1].downcase[/\d+/] || 90
-    respond("Start Resting at #{UserVars.ringing_start_resting}%.")
+    Lich::Messaging::msg("info", "Start Resting at #{UserVars.ringing_start_resting}%.")
   elsif Script.current.vars[1].downcase =~ /mind_stop/
     UserVars.ringing_stop_resting = Script.current.vars[1].downcase[/\d+/] || 90
-    respond("Stop Resting at #{UserVars.ringing_stop_resting}%.")
+    Lich::Messaging::msg("info", "Stop Resting at #{UserVars.ringing_stop_resting}%.")
   elsif Script.current.vars[1].downcase =~ /debug/
     UserVars.rofl_debug = @rofl_debug = !@rofl_debug
-    respond("Debugging #{@rofl_debug}.")
+    Lich::Messaging::msg("info", "Debugging #{@rofl_debug}.")
   elsif Script.current.vars[1].downcase =~ /stop/
     UserVars.stop_ringing = "yes"
-    respond("Stopping after this run.")
+    Lich::Messaging::msg("info", "Stopping after this run.")
   else
     self.show_help
   end
