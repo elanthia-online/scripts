@@ -1,0 +1,289 @@
+module DyeTied
+
+  require 'json'
+  require 'terminal-table'
+  require 'net/http'
+
+ 
+  @dyes = []
+
+  ##TODO: Add to Settings
+  @debug = false # Set to true for debugging messages
+  
+  def self.get_dyes_command_dye_n_ator(item_name)
+    Lich::Messaging.msg("info", "get_dyes_command_dye_n_ator(#{item_name}).") if @debug
+    results = Lich::Util.issue_command(
+      "gaze #{item_name}",
+      /Several cylinders are filled with dye, the glass displaying each hue in turn and reminding you that you have the following colors stored within:/,
+      :silent => true, :quiet => true
+    )
+  end
+
+  def self.get_dyes_list_dye_a_nator(item_name)
+    Lich::Messaging.msg("info", "get_dyes_list_dye_a_nator(#{item_name}).") if @debug
+
+    @dyes.clear # Clear previous results if any
+
+    results = get_dyes_command_dye_n_ator(item_name)
+
+    results.each do |result|
+      # Extract the full item name from the <a> tag contents
+      if result =~ /You gaze at (?:an|a) <a [^>]*>([^<]+)<\/a>/
+        item_name = $1.strip
+      end
+
+      # Match dye lines and extract amount and dye name
+      if result =~ /\d+\.\s+(infinite doses|[0-9]+ doses) of (cobbling|alchemy) (.+?) dye/i
+        amount = $1.strip
+        type = $2.strip
+        color = $3.strip
+        @dyes << {
+          name: "#{color} dye",
+          amount: amount,
+          type: type,
+          item: item_name,
+          character: Char.name
+        }
+      end
+    end
+  end
+
+  def self.generate_json
+    Lich::Messaging.msg("info", "generate_json") if @debug
+    unless @dyes.empty?
+      JSON.pretty_generate(@dyes)
+    else
+      Lich::Messaging.msg("error", "No dyes found.")
+      return nil
+    end
+  end
+
+  def self.get_dyes_list_single(hand)
+    Lich::Messaging.msg("info", "get_dyes_list_single(#{hand}).") if @debug
+
+    @dyes.clear # Clear previous results if any
+    
+    dye_id = nil
+    dye_name = nil
+
+    if hand == "left" 
+      if GameObj.left_hand.name =~ /dye$/i
+        dye_id = GameObj.left_hand.id 
+      end
+    elsif hand == "right"
+      if GameObj.right_hand.name =~ /dye$/i
+        dye_id = GameObj.right_hand.id 
+      end
+    else
+      Lich::Messaging.msg("error", "Invalid hand specified. Use 'left' or 'right'.")
+      exit
+    end
+
+    if dye_id.nil?
+      Lich::Messaging.msg("error", "No dye found in the specified hand.")
+      exit
+    end
+
+    type_amount = determine_type_and_amount({:id => dye_id, :name => dye_name}, nil, get_item = false)
+    
+    @dyes << {
+      name: type_amount[:name] + " dye",
+      amount: type_amount[:uses],
+      type: type_amount[:type],
+      item: "n/a",
+      character: Char.name
+    }
+  end
+
+  def self.get_dyes_list_container(item_name)
+    Lich::Messaging.msg("info", "get_dyes_list_container(#{item_name}).") if @debug
+
+    @dyes.clear
+
+    container_id = nil
+
+    # Try left and right hands
+    if GameObj.left_hand && GameObj.left_hand.name =~ /#{Regexp.escape(item_name)}/i
+      container_id = GameObj.left_hand.id
+    elsif GameObj.right_hand && GameObj.right_hand.name =~ /#{Regexp.escape(item_name)}/i
+      container_id = GameObj.right_hand.id
+    else
+      # Look in inventory
+      GameObj.inv.each do |inv|
+        if inv.name =~ /#{Regexp.escape(item_name)}/i
+          container_id = inv.id
+          break # Stop looking after we find the first match
+        end
+      end
+    end
+
+    if container_id
+      found_dyes = process_container(container_id)
+      echo found_dyes if @debug
+    else
+      Lich::Messaging.msg("error", "Could not find a container matching '#{item_name}'.")
+      exit
+    end
+
+    # finish processing now
+    found_dyes.each do |result|
+      name = result[:name]
+      type_amount = determine_type_and_amount(result, container_id)
+
+      @dyes << {
+        name: name,
+        amount: type_amount[:uses],
+        type: type_amount[:type],
+        item: item_name,
+        character: Char.name
+      }
+    end
+  end
+
+  def self.get_analyze_result(result, container_id, get_item = true)
+    Lich::Messaging.msg("info", "get_analyze_result(#{result}).") if @debug
+
+    fput("get ##{result[:id]}") if get_item
+    analyze_result = Lich::Util.issue_command("analyze ##{result[:id]}", /You analyze .*? and sense that the creator has provided the following information:/)
+    fput("_drag ##{result[:id]} ##{container_id}") if get_item
+    return analyze_result
+  end
+
+  def self.determine_type_and_amount(result, container_id, get_item = true)
+      dye_type = nil
+      uses = nil
+      name = nil
+
+      analyze_result = get_analyze_result(result, container_id, get_item)
+      echo analyze_result if @debug
+
+      analyze_result.each do |line|
+        # Look for the line containing the dye info
+        if line =~ /This is Dyer's Tent dye that will dye/
+          Lich::Messaging.msg("error", "This is Dyer's Tent dye, which we are not tracking.")
+        elsif line =~ /is (\w+) dye.*? It has (one|\d+) uses/i
+          dye_type = $1.downcase
+          if($2 == "one")
+            uses = 1
+          else
+            uses = $2.to_i
+          end
+        elsif line =~ /will dye items (.+)./
+          name = $1.strip
+        end
+      end
+
+      if dye_type && uses
+        return { type: dye_type, uses: uses, name: name }
+      else
+        Lich::Messaging.msg("error", "Could not determine dye type or number of uses.")
+        exit
+      end
+  end
+
+  def self.process_container(container_id)
+    found = []
+    if (valid_container = GameObj.containers[container_id])
+      valid_container.each do |item|
+        if item.name =~ /dye$/i
+          found << {
+            name: item.name,
+            id: item.id.to_i
+          }
+        end
+      end
+    end
+    return found
+  end
+
+
+  def self.display_results_table
+    Lich::Messaging.msg("info", "display_results_table") if @debug
+    
+    i = 1 # counter for the table row numbers
+    
+    table = Terminal::Table.new do |t|
+      t.title = "Dyes Found"
+      t.headings = ['No', 'Item', 'Dye Name', 'Amount', 'Type', 'Character']
+      @dyes.each do |dye|
+        t.add_row [i, dye[:item], dye[:name], dye[:amount], dye[:type], dye[:character]]
+        i += 1
+      end
+    end
+    
+    respond(table)
+  end
+
+  def self.display_help
+    Lich::Messaging.mono(Lich::Messaging.xml_encode("#{Script.current.name} Help:"))
+    Lich::Messaging.mono(Lich::Messaging.xml_encode("Usage: #{$lich_char}#{Script.current.name} --dye-n-ator <item_name>    - Search for dyes in a dye-n-ator"))
+    Lich::Messaging.mono(Lich::Messaging.xml_encode("       #{$lich_char}#{Script.current.name} --dye <hand>                - Record dye in <right/left> hand") ) 
+    Lich::Messaging.mono(Lich::Messaging.xml_encode("       #{$lich_char}#{Script.current.name} --container <item_name>     - Record dye in <container>"))
+    Lich::Messaging.mono(Lich::Messaging.xml_encode("       #{$lich_char}#{Script.current.name} --help                      - Display this help message"))
+    Lich::Messaging.mono(Lich::Messaging.xml_encode("       #{$lich_char}#{Script.current.name} --debug                     - Toggle debug messages")) 
+  end
+
+  def self.send_to_sheet
+    Lich::Messaging.msg("info", "send_to_sheet") if @debug
+    Lich::Messaging.msg("info", "Sending data to Google Sheets.  This could take a minute or two for a full dye-n-ator, please be patient.")
+
+    uri = URI("https://script.google.com/macros/s/AKfycbzFQFAW5h4uXMrGOd5IrhY7OZCA49UsZlk4ce1j6nDPvL2ClrQAXRA2A2v2Myv5noxs/exec")
+
+    req = Net::HTTP::Post.new(uri.request_uri, 'Content-Type' => 'application/json')
+    req.body = generate_json
+
+    res = Net::HTTP.start(uri.host, uri.port, use_ssl: true) do |http|
+      http.request(req)
+    end
+
+    Lich::Messaging.msg("info", " GoogleSheets responded #{res.code}: #{res.body}") if @debug
+    Lich::Messaging.msg("info", "Sending to Sheet completed.  You can visit the sheet, here:")
+    Lich::Messaging.msg("info", "https://docs.google.com/spreadsheets/d/10n664FdTAocGDjPloWpyVXdDMAFUm87qkBqhVSn9ak8/edit?usp=sharing")
+    res.code.to_i
+  rescue => e
+    # catch network / JSON errors
+    echo "!! send_to_sheet error: #{e.class}: #{e.message}"
+  end
+end
+
+unless Script.current.vars[0].nil?
+  case Script.current.vars[0].downcase
+  when /--help/
+    DyeTied.display_help
+  when /--debug/
+    @debug = !@debug
+    Lich::Messaging.msg("info", "Debug mode toggled to #{@debug}")
+  when /--dye/
+    Lich::Messaging.msg("info", "#{Script.current.name} processing a single dye: #{Script.current.vars[2..-1].join(" ")}.")
+    DyeTied.get_dyes_list_single(Script.current.vars[2])
+
+    #echo DyeTied.generate_json
+    DyeTied.display_results_table
+
+    #DyeTied.send_to_sheet
+  when /--dye-n-ator/
+    Lich::Messaging.msg("info", "#{Script.current.name} is looking for dyes in your #{Script.current.vars[2..-1].join(" ")}.")
+    
+    item_name = Script.current.vars[2..-1].join(" ")
+    DyeTied.get_dyes_list_dye_a_nator(item_name)
+    
+    #echo DyeTied.generate_json
+    DyeTied.display_results_table
+
+    DyeTied.send_to_sheet
+  when /--container/
+    Lich::Messaging.msg("info", "#{Script.current.name} is looking for dyes in your #{Script.current.vars[2..-1].join(" ")}.")
+      
+    item_name = Script.current.vars[2..-1].join(" ")
+    DyeTied.get_dyes_list_container(item_name)
+    
+    #echo DyeTied.generate_json
+    DyeTied.display_results_table
+
+    #DyeTied.send_to_sheet
+  else
+    Lich::Messaging.msg("info", "Unknown command. Use --help for usage information.")
+  end
+else
+  DyeTied.display_help
+end
