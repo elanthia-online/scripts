@@ -1,0 +1,489 @@
+=begin
+
+  BlueTracker  https://blue-tracker.fly.dev/
+
+  A script to fetch and display recent GM posts from the Gemstone Discord server.
+
+        author: Nisugi
+  contributors: Nisugi
+          game: Gemstone
+          tags: discord, gamemaster, announcements, information
+       version: 1.0.0
+
+  Version Control:
+  v1.0.0
+  - Initial release
+=end
+
+require 'open-uri'
+require 'json'
+require 'time'
+
+module BlueTracker
+  API_URL   = 'https://blue-tracker.fly.dev'
+  # API_URL   = 'http://127.0.0.1:8080' # For local testing
+  WIDTH     = 78
+
+  # Channel mapping organized by category
+  CHANNEL_GROUPS = {
+    'Announcements' => {
+      general: '796618391262986241',
+      development: '796619793934319643',
+      merchant: '1331041053309931591',
+      event: '832466682291027998',
+      endnotes: '1121832778791665716',
+    },
+    'Game Channels' => {
+      gamechatter: '387270949499830273',
+      help: '387271714012135425',
+      prime: '387271313695309824',
+      premium: '387271364572086272',
+      platinum: '387271396218241024',
+      shattered: '387271438081720331',
+      festivals: '387271681539833858',
+      roleplaying: '541653031691747329',
+      mechanics: '532373273816858636',
+      gemstones: '1271943281613340775',
+    },
+    'Pay Events'    => {
+      events: '594010837732294735',
+      duskruin: '594009933763051549',
+      ebongate: '594009960166457344',
+      ringsoflumnis: '701166110204231733',
+      rumorwoods: '594009994953883648'
+    }
+  }.freeze
+
+  CHANNELS = CHANNEL_GROUPS.values.reduce(&:merge).freeze
+
+  class API
+    class << self
+      def get(path)
+        begin
+          URI.open("#{API_URL}#{path}", 'User-Agent' => 'LichBlue/1.0') do |io|
+            return JSON.parse(io.read, symbolize_names: true)
+          end
+        rescue StandardError => e
+          respond "BlueTracker error: #{e}" unless e.message.include?('404 NOT FOUND')
+          nil
+        end
+      end
+    end
+  end
+
+  class Formatter
+    class << self
+      def clean(text)
+        text ||= '(no content)'
+
+        # First preserve line breaks before other processing
+        text = text.gsub(/\r\n/, "\n").gsub(/\r/, "\n")
+
+        # Remove Discord reply quotes
+        text = text.sub(/^>\s*\*\*[^*]+?\*\*:\s*/m, '@')
+
+        # Handle Discord lists (*, -, •)
+        text = text.gsub(/^[\*\-•]\s+/m, '• ')
+
+        # Remove bold but preserve the text
+        text = text.gsub(/\*\*(.*?)\*\*/, '\1')
+
+        # Remove italics but preserve the text
+        text = text.gsub(/\*(.*?)\*/, '\1')
+
+        # Remove code blocks but preserve the text
+        text = text.gsub(/```[^\n]*\n(.*?)```/m, '\1')
+        text = text.gsub(/`([^`]+)`/, '\1')
+
+        # Remove non-ASCII but preserve newlines
+        text.gsub(/[^\x20-\x7E\n]/, '')
+      end
+
+      def wrap(text, max)
+        lines = []
+        text.split("\n").each do |paragraph|
+          if paragraph.strip.empty?
+            lines << '' # Preserve blank lines
+          elsif paragraph.length <= max
+            lines << paragraph
+          else
+            # Wrap long lines
+            words, line = paragraph.split(/\s+/), ''
+            words.each do |w|
+              if (line.size + w.size + 1) > max
+                lines << line.strip
+                line = ''
+              end
+              line << ' ' unless line.empty?
+              line << w
+            end
+            lines << line.strip unless line.empty?
+          end
+        end
+        lines
+      end
+
+      def truncate(str, max)
+        str.length > max ? str[0, max - 1] : str
+      end
+
+      def horiz(ch = '-')
+        '+' + (ch * (WIDTH - 2)) + '+'
+      end
+
+      def card(post, replied_post = nil)
+        ts = Time.at(post[:ts] / 1000.0).strftime('%Y-%m-%d %H:%M')
+        body = clean(post[:content]).strip
+        author = post[:author_name] || 'Unknown'
+        channel = post[:channel_name] || post[:chan_id]
+
+        lines = []
+        lines << horiz
+        lines << "| Author: %-22s Date: %-37s |" % [truncate(author, 22), ts]
+        lines << "| PostID: %-22s Channel: %-34s |" % [post[:id], truncate(channel, 35)]
+
+        # If this is a reply, show the replied-to content
+        if replied_post
+          lines << horiz('=')
+          replied_author = truncate(replied_post[:author_name] || 'Unknown', 30)
+          replied_id = replied_post[:id] || replied_post[:reply_to_id]
+          lines << "| Replying to: %-30s (ID: %-19s)      |" % [replied_author, replied_id]
+          lines << horiz('-')
+          reply_body = clean(replied_post[:content] || '(no content)').strip
+          wrap(reply_body, WIDTH - 4).take(3).each { |ln| lines << "| #{ln.ljust(WIDTH - 4)} |" }
+          if reply_body.length > 200
+            lines << "| #{'[...]'.ljust(WIDTH - 4)} |"
+          end
+        end
+
+        lines << horiz('=')
+        wrap(body, WIDTH - 4).each { |ln| lines << "| #{ln.ljust(WIDTH - 4)} |" }
+        lines << horiz
+        lines.join("\n")
+      end
+
+      def brief(post)
+        body = clean(post[:content]).strip
+        ts = Time.at(post[:timestamp] / 1000.0).strftime('%m-%d %H:%M')
+        author = post[:author_name] || 'Unknown'
+        # Truncate body to fit in one line
+        max_body_len = WIDTH - ts.length - author.length - 10
+        body = truncate(body, max_body_len)
+        "[%s] %s: %s" % [ts, truncate(author, 15), body]
+      end
+    end
+  end
+
+  class Watcher
+    def self.start(channels_to_watch)
+      # Build the watcher code as a string to execute in ExecScript
+      watcher_code = build_watcher_code(channels_to_watch)
+
+      # Start the watcher as an ExecScript
+      exec_script = ExecScript.start(watcher_code, { :name => 'blue-watcher', :quiet => false })
+
+      if exec_script
+        respond "BlueTracker watcher started as background script"
+        respond "Type ;k blue-watcher to stop watching"
+      else
+        respond "Failed to start BlueTracker watcher"
+      end
+    end
+
+    def self.build_watcher_code(channels_to_watch)
+      # Special case for "all"
+      if channels_to_watch.length == 1 && channels_to_watch[0].downcase == 'all'
+        channels_config = ':all'
+        echo_msg = "Watching ALL channels for GM posts"
+      else
+        resolved_channels = channels_to_watch.map { |c| CLI.resolve_channel(c) }.compact
+
+        if resolved_channels.empty?
+          respond "No valid channels specified to watch"
+          return nil
+        end
+
+        channels_config = resolved_channels.inspect
+        channel_names = channels_to_watch.map { |c| CLI.get_channel_display_name(c) }.compact
+        echo_msg = "Watching channels: #{channel_names.join(', ')}"
+      end
+
+      respond echo_msg
+
+      # Return the Ruby code as a string that will run in the ExecScript
+      <<~RUBY
+        require 'net/http'
+        require 'uri'
+        require 'json'
+
+        watching = true
+        channels = #{channels_config}
+
+        respond "[BlueTracker] Watcher started"
+
+        begin
+          uri = URI.parse("#{API_URL}/stream")
+        #{'  '}
+          Net::HTTP.start(uri.host, uri.port) do |http|
+            http.read_timeout = nil  # Disable timeout for SSE
+            request = Net::HTTP::Get.new(uri.request_uri)
+            request['Accept'] = 'text/event-stream'
+            request['Cache-Control'] = 'no-cache'
+        #{'    '}
+            http.request(request) do |response|
+              response.read_body do |chunk|
+                break unless watching
+        #{'        '}
+                # Parse SSE format
+                chunk.each_line do |line|
+                  if line.start_with?('data: ')
+                    begin
+                      data = JSON.parse(line[6..-1], symbolize_names: true)
+        #{'              '}
+                      # Check if we should show this post
+                      should_show = channels == :all || channels.include?(data[:channel_id])
+        #{'              '}
+                      if should_show
+                        respond ""
+                        respond " New GM post in #\#{data[:channel_name]}!"
+                        respond "\#{data[:author_name]}: \#{data[:content]}"
+                        respond "Use ;blue \#{data[:id]} to see full post"
+                        respond ""
+                      end
+                    rescue JSON::ParseError
+                      # Ignore malformed data
+                    end
+                  end
+                end
+              end
+            end
+          end
+        rescue => e
+          respond "[BlueTracker] Watch connection lost: \#{e.message}"
+          respond "[BlueTracker] Use ;blue watch <channels> to reconnect"
+        end
+
+        respond "[BlueTracker] Watcher stopped"
+      RUBY
+    end
+
+    def self.stop
+      # This method is no longer needed since we kill the script with ;k blue-watcher
+      respond "To stop watching, use: ;k blue-watcher"
+    end
+
+    def self.resolve_channel(channel_arg)
+      # Reuse the existing resolve_channel logic
+      CLI.resolve_channel(channel_arg)
+    end
+  end
+
+  class CLI
+    def self.run(argv)
+      cmd = argv.shift || 'help'
+
+      case cmd
+      when 'latest'
+        handle_latest(argv)
+      when 'history'
+        handle_history(argv)
+      when 'watch'
+        handle_watch(argv)
+      when 'channels'
+        show_channels
+      when 'help'
+        show_help
+      when /^\d+$/
+        handle_post_id(cmd)
+      else
+        show_help
+      end
+    end
+
+    def self.handle_latest(args)
+      channel_arg = args.first
+      channel_id = resolve_channel(channel_arg) if channel_arg
+
+      if channel_arg && !channel_id
+        respond "Unknown channel: #{channel_arg}"
+        respond "Available channels: #{CHANNELS.keys.join(', ')}"
+        return
+      end
+
+      if channel_id
+        # Get latest from specific channel
+        response = API.get("/api/search?channels=#{channel_id}&per_page=1")
+
+        if response && response[:results] && !response[:results].empty?
+          post_data = response[:results].first
+          display_from_search(post_data)
+        else
+          respond "No GM posts found in channel"
+        end
+      else
+        # Get latest across all channels
+        posts = API.get("/api/v1/posts?limit=1&order=desc")
+        if posts && posts.is_a?(Array) && !posts.empty?
+          display_from_v1(posts.first)
+        else
+          respond 'No posts found.'
+        end
+      end
+    end
+
+    def self.handle_history(args)
+      channel_arg = args[0]
+      count = (args[1] || '1').to_i
+      count = 50 if count > 50
+      count = 1 if count < 1
+
+      channel_id = resolve_channel(channel_arg)
+
+      if !channel_id
+        respond "Usage: ;blue history <channel> [count]"
+        respond "Available channels: #{CHANNELS.keys.join(', ')}"
+        return
+      end
+
+      response = API.get("/api/search?channels=#{channel_id}&per_page=#{count}")
+
+      if response && response[:results] && !response[:results].empty?
+        respond "=== Showing #{response[:results].size} GM post(s) from #{channel_arg} ==="
+
+        # Display each post with full formatting
+        response[:results].reverse.each_with_index do |post_data, index|
+          display_from_search(post_data)
+          # Add a separator between posts if showing multiple
+          if index < response[:results].size - 1
+            respond "" # Blank line between posts
+          end
+        end
+      else
+        respond "No GM posts found"
+      end
+    end
+
+    def self.handle_post_id(post_id)
+      # Use the full posts table endpoint
+      post = API.get("/api/posts/#{post_id}")
+      if post
+        display_from_v1(post)
+      else
+        respond 'Post not found.'
+      end
+    end
+
+    def self.handle_watch(args)
+      if args.empty?
+        respond "Usage: ;blue watch <channel1> [channel2] ..."
+        show_available_channels
+        return
+      end
+
+      Watcher.start(args)
+    end
+
+    def self.show_channels
+      respond "Available channels by category:"
+      respond ""
+
+      CHANNEL_GROUPS.each do |category, channels|
+        respond "#{category}:"
+        channels.each do |name, _|
+          respond "  #{name}"
+        end
+        respond ""
+      end
+    end
+
+    def self.show_available_channels
+      respond ""
+      respond "Available channels:"
+      CHANNEL_GROUPS.each do |category, channels|
+        channel_list = channels.keys.join(', ')
+        respond "  #{category}: #{channel_list}"
+      end
+      respond ""
+    end
+
+    def self.display_from_search(post_data)
+      # Convert search format to display format
+      post = {
+        id: post_data[:id],
+        chan_id: post_data[:channel_id],
+        ts: post_data[:timestamp],
+        content: post_data[:content],
+        author_name: post_data[:author_name],
+        channel_name: post_data[:channel]
+      }
+
+      replied_post = post_data[:replied_to]
+      msg = Formatter.card(post, replied_post)
+      respond Lich::Messaging.mono(msg)
+    end
+
+    def self.display_from_v1(post)
+      # Fetch reply if needed - use the full posts endpoint
+      replied_post = nil
+      if post[:reply_to_id]
+        # Try to get the replied-to post from the full posts table
+        replied_data = API.get("/api/posts/#{post[:reply_to_id]}")
+        replied_post = replied_data if replied_data
+      end
+
+      msg = Formatter.card(post, replied_post)
+      respond Lich::Messaging.mono(msg)
+    end
+
+    def self.resolve_channel(channel_arg)
+      # Check if it's a known channel name
+      if CHANNELS.key?(channel_arg.to_sym)
+        return CHANNELS[channel_arg.to_sym]
+      end
+
+      # Check if it's already a channel ID
+      if channel_arg =~ /^\d+$/
+        return channel_arg
+      end
+
+      nil
+    end
+
+    def self.get_channel_display_name(channel_arg)
+      # Return the channel name with its category for better display
+      CHANNEL_GROUPS.each do |category, channels|
+        if channels.key?(channel_arg.to_sym)
+          return "#{channel_arg} (#{category})"
+        end
+      end
+      channel_arg
+    end
+
+    def self.show_help
+      respond <<~HELP
+        BlueTracker Commands:
+        ;blue latest [channel]          - Show the most recent GM post (optionally from specific channel)
+        ;blue <post_id>                 - Show specific post by ID
+        ;blue history <channel> [count] - Show recent GM posts from channel (default: 1, max: 50)
+        ;blue watch <channel1> [...]    - Watch channels for new GM posts
+        ;blue channels                  - Show all available channels organized by category
+        ;blue help                      - Show this help
+
+        Examples:
+        ;blue latest
+        ;blue latest general
+        ;blue 1234567890
+        ;blue history development 5
+        ;blue watch all
+        ;blue watch general development event
+      HELP
+
+      respond ""
+      show_available_channels
+    end
+  end
+end
+
+BlueTracker::CLI.run(Script.current.vars[1..-1])
+
+# ExecScript.start(Watcher.start(args), { :name => 'blue-watch' })
