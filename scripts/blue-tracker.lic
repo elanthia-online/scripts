@@ -1,3 +1,4 @@
+# QUIET
 =begin
 
   BlueTracker  https://blue-tracker.fly.dev/
@@ -8,20 +9,24 @@
   contributors: Nisugi
           game: Gemstone
           tags: discord, gamemaster, announcements, information
-       version: 1.0.0
+       version: 1.0.1
 
   Version Control:
-  v1.0.0
-  - Initial release
+  v1.0.1
+  - Fixed nil watcher code handling
+  - Improved channel name matching (case-insensitive)
+  - Fixed timestamp consistency between formatters
+  - Improved error handling and truncation
 =end
 
-require 'open-uri'
+require 'net/http'
 require 'json'
 require 'time'
+require 'uri'
+require 'timeout'
 
 module BlueTracker
   API_URL   = 'https://blue-tracker.fly.dev'
-  # API_URL   = 'http://127.0.0.1:8080' # For local testing
   WIDTH     = 78
 
   # Channel mapping organized by category
@@ -34,7 +39,7 @@ module BlueTracker
       endnotes: '1121832778791665716',
     },
     'Game Channels' => {
-      gamechatter: '387270949499830273',
+      game_chatter: '387270949499830273',
       help: '387271714012135425',
       prime: '387271313695309824',
       premium: '387271364572086272',
@@ -54,6 +59,7 @@ module BlueTracker
     }
   }.freeze
 
+  # Flattened channel list for backward compatibility
   CHANNELS = CHANNEL_GROUPS.values.reduce(&:merge).freeze
 
   class API
@@ -80,17 +86,26 @@ module BlueTracker
             # Don't show error for 404s
             return nil
           else
-            respond "BlueTracker error: HTTP #{response.code} #{response.message}"
+            respond "BlueTracker error: HTTP #{response.code}"
             return nil
           end
-        rescue JSON::ParserError
-          respond "BlueTracker error: Invalid JSON response"
-          nil
-        rescue Net::TimeoutError, Net::OpenTimeout, Net::ReadTimeout
-          respond "BlueTracker error: Request timeout"
-          nil
-        rescue StandardError => e
-          respond "BlueTracker error: #{e.message}"
+        rescue => e
+          # Handle all errors with specific checks
+          case e
+          when Net::OpenTimeout, Net::ReadTimeout, Timeout::Error
+            respond "BlueTracker error: Request timeout"
+          when JSON::ParserError
+            respond "BlueTracker error: Invalid response from server"
+          when SocketError, Errno::ECONNREFUSED
+            respond "BlueTracker error: Unable to connect to server"
+          else
+            # Only show specific error types to avoid exposing internals
+            if e.message.include?('404 NOT FOUND')
+              return nil
+            else
+              respond "BlueTracker error: Unexpected error occurred"
+            end
+          end
           nil
         end
       end
@@ -150,7 +165,8 @@ module BlueTracker
       end
 
       def truncate(str, max)
-        str.length > max ? str[0, max - 1] : str
+        # Fixed: truncate to exactly max length, not max-1
+        str.length > max ? str[0, max] : str
       end
 
       def horiz(ch = '-')
@@ -158,7 +174,9 @@ module BlueTracker
       end
 
       def card(post, replied_post = nil)
-        ts = Time.at(post[:ts] / 1000.0).strftime('%Y-%m-%d %H:%M')
+        # Fixed: handle both :ts and :timestamp for consistency
+        timestamp = post[:ts] || post[:timestamp]
+        ts = Time.at(timestamp / 1000.0).strftime('%Y-%m-%d %H:%M')
         body = clean(post[:content]).strip
         author = post[:author_name] || 'Unknown'
         channel = post[:channel_name] || post[:chan_id]
@@ -166,7 +184,7 @@ module BlueTracker
         lines = []
         lines << horiz
         lines << "| Author: %-22s Date: %-37s |" % [truncate(author, 22), ts]
-        lines << "| PostID: %-22s Channel: %-34s |" % [post[:id], truncate(channel, 35)]
+        lines << "| PostID: %-22s Channel: %-34s |" % [post[:id], truncate(channel, 34)]
 
         # If this is a reply, show the replied-to content
         if replied_post
@@ -190,7 +208,9 @@ module BlueTracker
 
       def brief(post)
         body = clean(post[:content]).strip
-        ts = Time.at(post[:timestamp] / 1000.0).strftime('%m-%d %H:%M')
+        # Fixed: handle both timestamp formats
+        timestamp = post[:timestamp] || post[:ts]
+        ts = Time.at(timestamp / 1000.0).strftime('%m-%d %H:%M')
         author = post[:author_name] || 'Unknown'
         # Truncate body to fit in one line
         max_body_len = WIDTH - ts.length - author.length - 10
@@ -204,6 +224,12 @@ module BlueTracker
     def self.start(channels_to_watch)
       # Build the watcher code as a string to execute in ExecScript
       watcher_code = build_watcher_code(channels_to_watch)
+
+      # Fixed: Check if watcher_code is nil before starting
+      unless watcher_code
+        respond "Failed to build watcher - invalid channel configuration"
+        return
+      end
 
       # Start the watcher as an ExecScript
       exec_script = ExecScript.start(watcher_code, { :name => 'blue-watcher', :quiet => false })
@@ -226,7 +252,7 @@ module BlueTracker
 
         if resolved_channels.empty?
           respond "No valid channels specified to watch"
-          return nil
+          return nil # Explicitly return nil for error case
         end
 
         channels_config = resolved_channels.inspect
@@ -238,89 +264,89 @@ module BlueTracker
 
       # Return the Ruby code as a string that will run in the ExecScript
       <<~RUBY
-    require 'net/http'
-    require 'uri'
-    require 'json'
+        require 'net/http'
+        require 'uri'
+        require 'json'
 
-    watching = true
-    channels = #{channels_config}
-    retry_count = 0
-    max_retries = 5
+        watching = true
+        channels = #{channels_config}
+        retry_count = 0
+        max_retries = 5
 
-    respond "[BlueTracker] Watcher started"
+        respond "[BlueTracker] Watcher started"
 
-    while watching && retry_count < max_retries
-      begin
-        uri = URI.parse("#{API_URL}/stream")
-    #{'    '}
-        # Use HTTPS for Fly.io
-        Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') do |http|
-          http.read_timeout = nil  # Disable timeout for SSE
-          http.open_timeout = 30
-          http.keep_alive_timeout = 30
-    #{'      '}
-          request = Net::HTTP::Get.new(uri.request_uri)
-          request['Accept'] = 'text/event-stream'
-          request['Cache-Control'] = 'no-cache'
-          request['Connection'] = 'keep-alive'
-          request['User-Agent'] = 'LichBlue/1.0'
-    #{'      '}
-          http.request(request) do |response|
-            if response.code == '200'
-              retry_count = 0  # Reset retry count on successful connection
-    #{'          '}
-              response.read_body do |chunk|
-                break unless watching
-    #{'            '}
-                # Parse SSE format
-                chunk.each_line do |line|
-                  if line.start_with?('data: ')
-                    begin
-                      data = JSON.parse(line[6..-1], symbolize_names: true)
-    #{'                  '}
-                      # Skip keepalive messages
-                      next if data[:type] == 'keepalive'
-    #{'                  '}
-                      # Check if we should show this post
-                      should_show = channels == :all || channels.include?(data[:channel_id])
-    #{'                  '}
-                      if should_show
-                        respond ""
-                        respond " New GM post in #\#{data[:channel_name]}!"
-                        respond "\#{data[:author_name]}: \#{data[:content]}"
-                        respond "Use ;blue \#{data[:id]} to see full post"
-                        respond ""
+        while watching && retry_count < max_retries
+          begin
+            uri = URI.parse("#{API_URL}/stream")
+        #{'    '}
+            # Use HTTPS for Fly.io
+            Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https') do |http|
+              http.read_timeout = nil  # Disable timeout for SSE
+              http.open_timeout = 30
+              http.keep_alive_timeout = 30
+        #{'      '}
+              request = Net::HTTP::Get.new(uri.request_uri)
+              request['Accept'] = 'text/event-stream'
+              request['Cache-Control'] = 'no-cache'
+              request['Connection'] = 'keep-alive'
+              request['User-Agent'] = 'LichBlue/1.0'
+        #{'      '}
+              http.request(request) do |response|
+                if response.code == '200'
+                  retry_count = 0  # Reset retry count on successful connection
+        #{'          '}
+                  response.read_body do |chunk|
+                    break unless watching
+        #{'            '}
+                    # Parse SSE format
+                    chunk.each_line do |line|
+                      if line.start_with?('data: ')
+                        begin
+                          data = JSON.parse(line[6..-1], symbolize_names: true)
+        #{'                  '}
+                          # Skip keepalive messages
+                          next if data[:type] == 'keepalive'
+        #{'                  '}
+                          # Check if we should show this post
+                          should_show = channels == :all || channels.include?(data[:channel_id])
+        #{'                  '}
+                          if should_show
+                            respond ""
+                            respond " New GM post in #\#{data[:channel_name]}!"
+                            respond "\#{data[:author_name]}: \#{data[:content]}"
+                            respond "Use ;blue \#{data[:id]} to see full post"
+                            respond ""
+                          end
+                        rescue JSON::ParseError
+                          # Ignore malformed data
+                        end
                       end
-                    rescue JSON::ParseError
-                      # Ignore malformed data
                     end
                   end
+                else
+                  raise "HTTP \#{response.code}: \#{response.message}"
                 end
               end
-            else
-              raise "HTTP \#{response.code}: \#{response.message}"
+            end
+        #{'    '}
+          rescue => e
+            retry_count += 1
+            respond "[BlueTracker] Connection lost: Connection error"
+        #{'    '}
+            if retry_count < max_retries && watching
+              wait_time = [2 ** retry_count, 60].min  # Exponential backoff, max 60s
+              respond "[BlueTracker] Retrying in \#{wait_time} seconds... (attempt \#{retry_count}/\#{max_retries})"
+              sleep(wait_time)
             end
           end
         end
-    #{'    '}
-      rescue => e
-        retry_count += 1
-        respond "[BlueTracker] Connection lost: \#{e.message}"
-    #{'    '}
-        if retry_count < max_retries && watching
-          wait_time = [2 ** retry_count, 60].min  # Exponential backoff, max 60s
-          respond "[BlueTracker] Retrying in \#{wait_time} seconds... (attempt \#{retry_count}/\#{max_retries})"
-          sleep(wait_time)
+
+        if retry_count >= max_retries
+          respond "[BlueTracker] Max retries exceeded. Use ;blue watch <channels> to reconnect"
         end
-      end
-    end
 
-    if retry_count >= max_retries
-      respond "[BlueTracker] Max retries exceeded. Use ;blue watch <channels> to reconnect"
-    end
-
-    respond "[BlueTracker] Watcher stopped"
-  RUBY
+        respond "[BlueTracker] Watcher stopped"
+      RUBY
     end
 
     def self.stop
@@ -362,7 +388,7 @@ module BlueTracker
 
       if channel_arg && !channel_id
         respond "Unknown channel: #{channel_arg}"
-        respond "Available channels: #{CHANNELS.keys.join(', ')}"
+        show_available_channels
         return
       end
 
@@ -397,14 +423,15 @@ module BlueTracker
 
       if !channel_id
         respond "Usage: ;blue history <channel> [count]"
-        respond "Available channels: #{CHANNELS.keys.join(', ')}"
+        show_available_channels
         return
       end
 
       response = API.get("/api/search?channels=#{channel_id}&per_page=#{count}")
 
       if response && response[:results] && !response[:results].empty?
-        respond "=== Showing #{response[:results].size} GM post(s) from #{channel_arg} ==="
+        channel_display = get_channel_display_name(channel_arg)
+        respond "=== Showing #{response[:results].size} GM post(s) from #{channel_display} ==="
 
         # Display each post with full formatting
         response[:results].reverse.each_with_index do |post_data, index|
@@ -467,7 +494,7 @@ module BlueTracker
       post = {
         id: post_data[:id],
         chan_id: post_data[:channel_id],
-        ts: post_data[:timestamp],
+        ts: post_data[:timestamp], # Use :ts for consistency
         content: post_data[:content],
         author_name: post_data[:author_name],
         channel_name: post_data[:channel]
@@ -492,9 +519,12 @@ module BlueTracker
     end
 
     def self.resolve_channel(channel_arg)
-      # Check if it's a known channel name
-      if CHANNELS.key?(channel_arg.to_sym)
-        return CHANNELS[channel_arg.to_sym]
+      # Fixed: Case-insensitive channel matching
+      normalized_arg = channel_arg.to_s.downcase.to_sym
+
+      # Check if it's a known channel name (case-insensitive)
+      CHANNELS.each do |name, id|
+        return id if name.to_s.downcase == normalized_arg.to_s
       end
 
       # Check if it's already a channel ID
@@ -507,9 +537,13 @@ module BlueTracker
 
     def self.get_channel_display_name(channel_arg)
       # Return the channel name with its category for better display
+      normalized_arg = channel_arg.to_s.downcase.to_sym
+
       CHANNEL_GROUPS.each do |category, channels|
-        if channels.key?(channel_arg.to_sym)
-          return "#{channel_arg} (#{category})"
+        channels.each do |name, _|
+          if name.to_s.downcase == normalized_arg.to_s
+            return "#{channel_arg} (#{category})"
+          end
         end
       end
       channel_arg
@@ -541,5 +575,3 @@ module BlueTracker
 end
 
 BlueTracker::CLI.run(Script.current.vars[1..-1])
-
-# ExecScript.start(Watcher.start(args), { :name => 'blue-watch' })
