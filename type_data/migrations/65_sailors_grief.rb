@@ -1,4 +1,5 @@
 migrate :aggressive_npc do
+  insert(:name, %{amaranthine kraken tentacle})
   insert(:name, %{brackish bilge mass})
   insert(:name, %{fulminating stormborn primordial})
   insert(:name, %{gigantic lightning whelk})
