@@ -138,6 +138,107 @@ def frontend_pid
   defined?($frontend_pid) && $frontend_pid.to_i.positive? ? $frontend_pid.to_i : nil
 end
 
+# ------------------------------------------------------------
+#  Auto-detect frontend PID when Lich was launched by another
+#  GUI client (e.g. Warlock) and $frontend_pid is nil.
+# ------------------------------------------------------------
+if !defined?($frontend_pid) || $frontend_pid.to_i <= 0
+  case RUBY_PLATFORM
+  when /mingw|mswin/ # ---------- Windows ----------
+    require 'win32ole'
+    require 'fiddle'
+    require 'fiddle/import'
+
+    module Win32Tool
+      extend Fiddle::Importer
+      dlload 'user32.dll'
+      extern 'int EnumWindows(void*, long)'
+      extern 'int IsWindowVisible(void*)'
+      extern 'int GetWindowThreadProcessId(void*, void*)'
+    end
+
+    WMI = WIN32OLE.connect('winmgmts://')
+
+    def parent_pid(pid)
+      q  = WMI.ExecQuery("SELECT ParentProcessId FROM Win32_Process WHERE ProcessId=#{pid}")
+      p  = nil; q.each { |row| p = row.ParentProcessId.to_i; break } # take first row
+      p || 0
+    end
+
+    def gui_process?(pid)
+      found = false
+      enum_cb = Fiddle::Closure::BlockCaller.new(Fiddle::TYPE_INT, [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG]) do |hwnd, _|
+        next 1 if Win32Tool.IsWindowVisible(hwnd).zero?
+        buf = [0].pack('L')
+        Win32Tool.GetWindowThreadProcessId(hwnd, buf)
+        this_pid = buf.unpack1('L')
+        if this_pid == pid
+          found = true
+          0 # stop
+        else
+          1
+        end
+      end
+      Win32Tool.EnumWindows(enum_cb, 0)
+      found
+    end
+
+    pid = Process.pid
+    seen = []
+    until pid.zero? || seen.include?(pid)
+      if gui_process?(pid)
+        $frontend_pid = pid
+        break
+      end
+      seen << pid
+      pid = parent_pid(pid)
+    end
+
+  when /linux/ # ---------- Linux ----------
+    def parent_pid(pid)
+      File.read("/proc/#{pid}/status")[/PPid:\s+(\d+)/, 1].to_i rescue 0
+    end
+
+    def gui_process?(pid)
+      return false unless system('which xdotool > /dev/null 2>&1')
+      system("xdotool search --pid #{pid} > /dev/null 2>&1")
+    end
+
+    pid = Process.pid
+    seen = []
+    until pid.zero? || seen.include?(pid)
+      if gui_process?(pid)
+        $frontend_pid = pid
+        break
+      end
+      seen << pid
+      pid = parent_pid(pid)
+    end
+
+  when /darwin/ # ---------- macOS ----------
+    def parent_pid(pid)
+      `ps -o ppid= -p #{pid}`.to_i
+    end
+
+    def gui_process?(pid)
+      `osascript -e 'tell application "System Events" to count (windows of (processes whose unix id is #{pid}))'`.to_i.positive?
+    rescue
+      false
+    end
+
+    pid = Process.pid
+    seen = []
+    until pid.zero? || seen.include?(pid)
+      if gui_process?(pid)
+        $frontend_pid = pid
+        break
+      end
+      seen << pid
+      pid = parent_pid(pid)
+    end
+  end
+end
+
 def detect_platform
   case RUBY_PLATFORM
   when /mingw|mswin/ then :windows
