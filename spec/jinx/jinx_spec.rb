@@ -19,6 +19,7 @@ end
 module Jinx
   describe Setup do
     it "bails when $data_dir doesn't exist" do
+      $data_dir = nil
       expect {Setup.apply}.to raise_error(Jinx::Error, "$data_dir is not String")
     end
 
