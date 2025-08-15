@@ -4,7 +4,11 @@
 
    author: elanthia-online
      tags: utility, util, repository, repo, update, upgrade, meta, ruby, development
-  version: 1.0.0
+  version: 1.0.1
+
+  Changelog:
+  1.0.1 - Fixed double refresh issue and missing repositories in asset lists
+  1.0.0 - Initial release with caching and performance improvements
 =end
 
 require 'gtk3'
@@ -171,7 +175,7 @@ module JinxGUI
       Thread.new do
         begin
           Jinx::CLI.repo_add(name, url)
-          clear_cache! # Clear cache when repos change
+          clear_all_caches! # Clear cache when repos change
         rescue => e
           append_log("[repo add] #{e.message}")
         ensure
@@ -186,7 +190,7 @@ module JinxGUI
       Thread.new do
         begin
           Jinx::CLI.repo_rm(repo)
-          clear_cache! # Clear cache when repos change
+          clear_all_caches! # Clear cache when repos change
         rescue => e
           append_log("[repo rm] #{e.message}")
         ensure
@@ -202,7 +206,7 @@ module JinxGUI
       Thread.new do
         begin
           Jinx::CLI.repo_change(repo, new_url)
-          clear_cache! # Clear cache when repos change
+          clear_all_caches! # Clear cache when repos change
         rescue => e
           append_log("[repo change] #{e.message}")
         ensure
@@ -213,7 +217,7 @@ module JinxGUI
 
     refresh_btn.signal_connect('clicked') do
       Thread.new do
-        clear_cache!
+        clear_all_caches!
         refresh_repos(cache_only: false)
       end
     end
@@ -255,6 +259,7 @@ module JinxGUI
           end
         rescue => e
           status = "error: #{e.message}"
+          append_log("[WARN] Failed to fetch manifest for #{name}: #{e.message}")
         end
         rows << [name, url, status]
       end
@@ -272,8 +277,9 @@ module JinxGUI
       append_log("[jinx_gui] Repositories refreshed")
 
       # If not caching, also refresh the asset lists
+      # BUT only clear the asset cache, not the manifest cache!
       unless cache_only
-        clear_cache!
+        clear_asset_cache! # Only clear asset lists, keep manifests
         refresh_assets(:script, filter: nil, use_cache: false)
         refresh_assets(:data, filter: nil, use_cache: false)
       end
@@ -546,26 +552,47 @@ module JinxGUI
         end
       else
         # Full refresh - fetch from repos
-        append_log("[jinx_gui] Fetching fresh #{kind} data from repositories...")
+        append_log("[jinx_gui] Building #{kind} list from repositories...")
         pattern = filter && !filter.empty? ? Regexp.new(Regexp.escape(filter), Regexp::IGNORECASE) : nil
 
         repos = begin Jinx::Repo.to_a rescue [] end
+        successful_repos = 0
+
         repos.each do |repo|
           break unless @alive # Check if still alive
           # Use cached manifest if available
           m = @manifest_cache_mutex.synchronize { @manifest_cache[repo[:name].to_s] }
           if m.nil?
             begin
+              append_log("[jinx_gui] Fetching manifest for #{repo[:name]}...")
               m = manifest_with_retries(repo)
               @manifest_cache_mutex.synchronize { @manifest_cache[repo[:name].to_s] = m }
             rescue => e
-              append_log("[WARN] #{repo[:name]} manifest failed: #{e.message}")
+              append_log("[ERROR] Failed to load #{repo[:name]}: #{e.message}")
               m = (repo || {}).dup
               m[:available] = []
             end
           end
 
+          # Check if manifest has an error
+          if m[:err]
+            append_log("[WARN] #{repo[:name]} has error: #{m[:err]}")
+          end
+
           assets = (kind == :script) ? safe_repo_scripts(m) : safe_repo_data(m)
+          if assets.any?
+            successful_repos += 1
+            append_log("[jinx_gui] Found #{assets.size} #{kind}(s) in #{repo[:name]}")
+          elsif m[:available].is_a?(Array) && m[:available].empty?
+            append_log("[INFO] #{repo[:name]} has no #{kind}s available")
+          elsif !m[:available].is_a?(Array)
+            append_log("[WARN] #{repo[:name]} has invalid manifest structure")
+          else
+            # Repository has items but none of this type
+            other_count = m[:available].size
+            append_log("[INFO] #{repo[:name]} has #{other_count} total assets but no #{kind}s")
+          end
+
           assets.each do |asset|
             fname = File.basename(CGI.unescape(asset[:file].to_s))
             next if fname.empty?
@@ -579,6 +606,8 @@ module JinxGUI
           end
         end
 
+        append_log("[jinx_gui] Successfully loaded #{kind}s from #{successful_repos}/#{repos.size} repositories")
+
         # Cache the full list
         @full_asset_lists[kind] = rows
 
@@ -587,7 +616,7 @@ module JinxGUI
           rows = rows.select { |r| r[0] =~ pattern }
           append_log("[jinx_gui] Found #{rows.size} #{kind}(s) matching '#{filter}'")
         else
-          append_log("[jinx_gui] Loaded #{rows.size} total #{kind}(s)")
+          append_log("[jinx_gui] Total: #{rows.size} #{kind}(s)")
         end
       end
 
@@ -633,31 +662,52 @@ module JinxGUI
     end
   end
 
-  # Clear cache helper
-  def clear_cache!
+  # Clear only asset cache (keep manifests)
+  def clear_asset_cache!
+    @full_asset_lists = { script: [], data: [] }
+    append_log("[jinx_gui] Asset cache cleared")
+  end
+
+  # Clear all caches (manifests and assets)
+  def clear_all_caches!
     @manifest_cache_mutex.synchronize { @manifest_cache.clear }
     @full_asset_lists = { script: [], data: [] }
-    append_log("[jinx_gui] Cache cleared")
+    append_log("[jinx_gui] All caches cleared")
   end
 
   # Retry wrapper for manifest fetches
-  def manifest_with_retries(repo, attempts: 2, delay: 0.25)
+  def manifest_with_retries(repo, attempts: 3, delay: 1.0)
     last_e = nil
     attempts.times do |i|
       begin
+        append_log("[DEBUG] Attempt #{i + 1}/#{attempts} to fetch manifest for #{repo[:name]}...")
         m = Jinx::Repo.manifest(repo)
-        # Only accept proper manifests (Hash with :available Array)
-        if m.is_a?(Hash) && m[:available].is_a?(Array)
-          return m
+
+        # Check if it's actually a valid manifest
+        if m.is_a?(Hash)
+          if m[:err]
+            # Repo.manifest returns error in :err field
+            append_log("[DEBUG] #{repo[:name]} returned error: #{m[:err]}")
+            return m # Return it anyway so we can handle it properly
+          elsif m[:available].is_a?(Array)
+            append_log("[DEBUG] #{repo[:name]} manifest loaded successfully with #{m[:available].size} assets")
+            return m
+          else
+            append_log("[DEBUG] #{repo[:name]} manifest missing :available array")
+            raise "invalid manifest structure - no :available array"
+          end
         else
-          raise "invalid manifest structure"
+          append_log("[DEBUG] #{repo[:name]} returned non-Hash: #{m.class}")
+          raise "manifest is not a Hash: #{m.class}"
         end
       rescue => e
         last_e = e
+        append_log("[DEBUG] Attempt #{i + 1} failed: #{e.message}")
         sleep(delay) if i < attempts - 1
       end
     end
-    raise(last_e || "manifest failed")
+    append_log("[ERROR] All #{attempts} attempts failed for #{repo[:name]}")
+    raise(last_e || "manifest failed after #{attempts} attempts")
   end
 
   def installed_status(kind, filename)
