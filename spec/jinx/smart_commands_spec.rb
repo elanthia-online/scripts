@@ -34,7 +34,7 @@ module Jinx
           'mirror'  => 'ffnglichrepoarchive.netlify.app',
         }.each do |(dir, domain)|
           WebMock.stub_request(:any, %r{https://#{domain}})
-            .to_rack(Rack::Directory.new(File.join(__dir__, 'repos', dir)))
+                 .to_rack(Rack::Directory.new(File.join(__dir__, 'repos', dir)))
         end
       end
 
@@ -44,7 +44,7 @@ module Jinx
     end
 
     before(:each) do
-      $data_dir =  Dir.mktmpdir("data")
+      $data_dir = Dir.mktmpdir("data")
       $script_dir = Dir.mktmpdir("scripts")
       $lich_dir = Dir.mktmpdir("lich")
       Setup.apply
@@ -134,7 +134,7 @@ module Jinx
           Service.run("install go2")
           game_output
           File.write(File.join($script_dir, "go2.lic"), "modified")
-          
+
           expect { Service.run("update go2") }
             .to raise_error(Jinx::Error, /has been modified/)
         end
@@ -144,7 +144,7 @@ module Jinx
           game_output
           original_content = File.read(File.join($script_dir, "go2.lic"))
           File.write(File.join($script_dir, "go2.lic"), "modified")
-          
+
           Service.run("update go2 --force")
           restored_content = File.read(File.join($script_dir, "go2.lic"))
           expect(restored_content).to eq(original_content)
@@ -224,7 +224,7 @@ module Jinx
         end
 
         it "groups results by type" do
-          Service.run("search .")  # Match everything
+          Service.run("search .") # Match everything
           output = game_output
           expect(output).to include("Scripts:")
           expect(output).to include("Datas:")
@@ -271,7 +271,7 @@ module Jinx
       it "prevents cross-type installation" do
         expect { Service.run("script install spell-list.xml") }
           .to raise_error(Jinx::Error, /Attempted to download/)
-        
+
         expect { Service.run("data install go2") }
           .to raise_error(Jinx::Error, /Attempted to download/)
       end
