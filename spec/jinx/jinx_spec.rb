@@ -297,14 +297,15 @@ module Jinx
     describe "data" do
       let(:local_asset_path) { File.join($data_dir, "spell-list.xml") }
 
-      describe "install" do
-        class Spell
+      before do
+        stub_const("Spell", Class.new do
           def self.load
           end
-        end
+        end)
+      end
 
+      describe "install" do
         it "will install the first time cleanly on 1-to-1" do
-          allow(Spell).to receive(:load)
           Service.run("data install spell-list.xml")
 
           _first_attempt = game_output
