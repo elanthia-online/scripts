@@ -28,7 +28,6 @@ module Jinx
       before(:all) do
         WebMock.enable!
         {
-          'core'    => 'repo.elanthia.online',
           'extras'  => 'extras.repo.elanthia.online',
           'archive' => 'archive.lich.elanthia.online',
           'mirror'  => 'ffnglichrepoarchive.netlify.app',
@@ -84,7 +83,7 @@ module Jinx
           Service.run("install go2")
           expect(File.exist?(File.join($script_dir, "go2.lic"))).to be true
           output = game_output
-          expect(output).to include("installing go2.lic from repo:core")
+          expect(output).to include("installing go2.lic from repo:elanthia-online")
         end
 
         it "installs data files automatically" do
@@ -92,7 +91,7 @@ module Jinx
           Service.run("install spell-list.xml")
           expect(File.exist?(File.join($data_dir, "spell-list.xml"))).to be true
           output = game_output
-          expect(output).to include("installing spell-list.xml from repo:core")
+          expect(output).to include("installing spell-list.xml from repo:elanthia-online")
         end
 
         it "provides helpful error for non-existent assets" do
@@ -107,7 +106,7 @@ module Jinx
         end
 
         it "respects --repo flag for specific repository" do
-          Service.run("install go2 --repo=core")
+          Service.run("install go2 --repo=elanthia-online")
           expect(File.exist?(File.join($script_dir, "go2.lic"))).to be true
         end
       end
@@ -118,7 +117,7 @@ module Jinx
           game_output
           Service.run("update go2")
           output = game_output
-          expect(output).to include("go2.lic from repo:core already installed")
+          expect(output).to include("go2.lic from repo:elanthia-online already installed")
         end
 
         it "updates installed data files automatically" do
@@ -127,7 +126,7 @@ module Jinx
           game_output
           Service.run("update spell-list.xml")
           output = game_output
-          expect(output).to include("spell-list.xml from repo:core already installed")
+          expect(output).to include("spell-list.xml from repo:elanthia-online already installed")
         end
 
         it "handles modified files appropriately" do
@@ -166,9 +165,9 @@ module Jinx
         end
 
         it "filters by repository with --repo" do
-          Service.run("list --repo=core")
+          Service.run("list --repo=elanthia-online")
           output = game_output
-          expect(output).to include("core:")
+          expect(output).to include("elanthia-online:")
           expect(output).not_to include("elanthia-online:")
         end
       end
@@ -179,7 +178,7 @@ module Jinx
           output = game_output
           expect(output).to include("go2")
           expect(output).to include("type: script")
-          expect(output).to include("repo: core")
+          expect(output).to include("repo: elanthia-online")
         end
 
         it "shows info for data files" do
@@ -187,7 +186,7 @@ module Jinx
           output = game_output
           expect(output).to include("spell-list.xml")
           expect(output).to include("type: data")
-          expect(output).to include("repo: core")
+          expect(output).to include("repo: elanthia-online")
         end
 
         it "shows info for engines" do
@@ -195,7 +194,7 @@ module Jinx
           output = game_output
           expect(output).to include("lich.rb")
           expect(output).to include("type: engine")
-          expect(output).to include("repo: core")
+          expect(output).to include("repo: elanthia-online")
         end
 
         it "handles non-existent assets gracefully" do

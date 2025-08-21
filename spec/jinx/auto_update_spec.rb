@@ -28,7 +28,6 @@ module Jinx
       before(:all) do
         WebMock.enable!
         {
-          'core'    => 'repo.elanthia.online',
           'extras'  => 'extras.repo.elanthia.online',
           'archive' => 'archive.lich.elanthia.online',
           'mirror'  => 'ffnglichrepoarchive.netlify.app',
@@ -64,7 +63,7 @@ module Jinx
         expect(installed.size).to eq(1)
         expect(installed.first[:name]).to eq("go2.lic")
         expect(installed.first[:type]).to eq("script")
-        expect(installed.first[:metadata][:repo]).to eq(:core)
+        expect(installed.first[:metadata][:repo]).to eq(:"elanthia-online")
       end
 
       it "tracks installed data files" do
@@ -75,7 +74,7 @@ module Jinx
         expect(installed.size).to eq(1)
         expect(installed.first[:name]).to eq("spell-list.xml")
         expect(installed.first[:type]).to eq("data")
-        expect(installed.first[:metadata][:repo]).to eq(:core)
+        expect(installed.first[:metadata][:repo]).to eq(:"elanthia-online")
       end
 
       it "tracks multiple installed assets" do
