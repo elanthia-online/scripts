@@ -168,7 +168,7 @@ module Jinx
           Service.run("list --repo=elanthia-online")
           output = game_output
           expect(output).to include("elanthia-online:")
-          expect(output).not_to include("elanthia-online:")
+          expect(output).not_to include("extras:")
         end
       end
 

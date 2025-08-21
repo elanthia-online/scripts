@@ -256,9 +256,9 @@ module Jinx
           .to raise_error(Jinx::Error,
                           %r[more than one repo has asset\(noop.lic\)])
 
-        expect { Service.run("script info noop --repo=elanthia-online") }
+        expect { Service.run("script info noop --repo=mirror") }
           .to raise_error(Jinx::Error,
-                          %r[repo\(elanthia-online\) does not advertise asset\(noop.lic\)])
+                          %r[repo\(mirror\) does not advertise asset\(noop.lic\)])
         game_output # clear
         # make sure it checks the elanthia-online repo
         Service.run("script info noop --repo=elanthia-online")
