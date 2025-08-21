@@ -141,6 +141,37 @@ module Jinx
         expect(output).to include("go2.lic(script)")
       end
 
+      it "handles deleted local files and removes them from tracking" do
+        # Install some scripts first
+        Service.run("script install go2")
+        Service.run("script install infomon")
+        game_output
+
+        # Delete one of the scripts (simulate user manually deleting)
+        go2_path = File.join($script_dir, "go2.lic")
+        File.delete(go2_path) if File.exist?(go2_path)
+
+        # Check for updates - should clean up metadata for deleted file
+        updates = AutoUpdater.check_for_updates
+        output = game_output
+
+        expect(output).to include("Checked 2 assets")
+        expect(output).to include("1 removed from tracking: go2.lic")
+        expect(updates).to be_empty
+
+        # Verify metadata was removed
+        metadata = []
+        Jinx::ScriptMetadata.each { |name, _meta| metadata << name }
+        expect(metadata).not_to include("go2.lic")
+        expect(metadata).to include("infomon.lic")
+
+        # Run check again - should not mention go2.lic anymore
+        AutoUpdater.check_for_updates
+        output = game_output
+        expect(output).to include("Checked 1 assets")
+        expect(output).not_to include("go2.lic")
+      end
+
       it "handles missing assets in repository" do
         # Install an asset
         Service.run("script install go2")
@@ -246,6 +277,34 @@ module Jinx
         expect(output).not_to include("\\n")
         # Individual error lines should include specific update command
         expect(output).to include(";jinx update go2.lic --force")
+      end
+
+      it "handles deleted files during update_all" do
+        Service.run("script install go2")
+        Service.run("script install infomon")
+        Service.run("data install spell-list.xml")
+        game_output
+
+        # Delete go2.lic (simulate user deletion)
+        File.delete(File.join($script_dir, "go2.lic"))
+
+        # Make infomon outdated
+        File.write(File.join($script_dir, "infomon.lic"), "modified")
+
+        # Run update_all
+        AutoUpdater.update_all(force: true)
+        output = game_output
+
+        # Should update infomon and clean up go2
+        expect(output).to include("Checked 3 assets")
+        expect(output).to include("1 updates: infomon.lic(script)")
+        expect(output).to include("1 removed from tracking: go2.lic")
+        expect(output).to include("+ Updated all 1 assets: infomon.lic")
+
+        # Verify metadata was cleaned up
+        metadata = []
+        Jinx::ScriptMetadata.each { |name, _meta| metadata << name }
+        expect(metadata).not_to include("go2.lic")
       end
 
       it "reports multiple updates with progress" do
