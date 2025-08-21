@@ -201,7 +201,7 @@ module Jinx
         output = game_output
 
         expect(output).to include("1 updates: go2.lic(script)")
-        expect(output).to include("✓ Updated all 1 assets: go2.lic")
+        expect(output).to include("+ Updated all 1 assets: go2.lic")
       end
 
       it "respects dry-run flag" do
@@ -241,7 +241,7 @@ module Jinx
         output = game_output
 
         # At least one should succeed (infomon), and errors should be clean
-        expect(output).to match(/✓ Updated.*✗ Failed/)
+        expect(output).to match(/\+ Updated.*- Failed/)
         # Error messages should be cleaned up (no escaped newlines)
         expect(output).not_to include("\\n")
         # Individual error lines should include specific update command
@@ -263,7 +263,7 @@ module Jinx
         output = game_output
 
         expect(output).to include("3 updates: go2.lic(script), infomon.lic(script), spell-list.xml(data)")
-        expect(output).to include("✓ Updated all 3 assets: go2.lic, infomon.lic, spell-list.xml")
+        expect(output).to include("+ Updated all 3 assets: go2.lic, infomon.lic, spell-list.xml")
       end
     end
 
@@ -304,7 +304,7 @@ module Jinx
         Service.run("auto-update --force")
         output = game_output
 
-        expect(output).to include("✓ Updated all 1 assets: go2.lic")
+        expect(output).to include("+ Updated all 1 assets: go2.lic")
       end
     end
   end
