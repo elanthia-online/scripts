@@ -17,15 +17,23 @@
   ;spellwindow       - starts the script
   ;spellwindow help  - for the details
 
-
         author: Nisugi
   contributors: Nisugi
           game: Gemstone
           tags: hunting, combat, tracking, spells, buffs, debuffs, cooldowns
-       version: 1.8
+       version: 1.9
       required: Wrayth
 
   Change Log:
+  v1.9 (2025-08-23)
+    - Major performance optimizations for multi-boxing
+    - Added configurable target window section ordering (players/targets/group)
+    - Added configurable timer update speed (default 0.25s)
+    - Optimized go2 handling: blocks target updates during travel, allows spell updates
+    - Added betrayer panel and bank dialog feed blocking options
+    - Improved state comparison logic to reduce CPU usage
+    - Fixed command argument parsing for multi-word commands
+    - Added toggles for showing/hiding players and group in target window
   v1.8 (2025-04-08)
     - set room and inventory feed to enabled as default instead of disabled.
     - use Spellsong module for song max duration calculation.
@@ -63,6 +71,8 @@ module SpellWindow
   QUICKBAR = %r{^<openDialog id=[^\s]+ location=(?:'|")quickBar(?:'|")}
   QUICKBAR_SWITCH = %r{^<switchQuickBar id="quick"/>}
   QUICKBAR_DIALOG = %r{^<dialogData id="quick">}
+  BETRAYER_PANEL = %r{^<dialogData id='BetrayerPanel'}
+  BANK_DIALOG = %r{^<dialogData id='bank'>|^<openDialog type='dynamic' id='bank'}
   GRASP_ARMS = %r{(?:arm|appendage|claw|limb|pincer|tentacle|palpus|palpi)s?}
   MAP_WINDOW = %r{^<dialogData id='mapViewMain'}
   INVENTORY_WINDOW = Regexp.union(
@@ -82,7 +92,7 @@ module SpellWindow
     %r{^<compDef id='room exits'>},
     %r{^<compDef id='sprite'>}
   )
-  SWMIN_PATTERNS = Regexp.union(ACTIVE_SPELLS, BUFFS, DEBUFFS, COOLDOWNS, QUICKBAR, QUICKBAR_SWITCH, QUICKBAR_DIALOG, MAP_WINDOW)
+  SWMIN_PATTERNS = Regexp.union(ACTIVE_SPELLS, BUFFS, DEBUFFS, COOLDOWNS, QUICKBAR, QUICKBAR_SWITCH, QUICKBAR_DIALOG, MAP_WINDOW).freeze
 
   if File.exist?(@filename)
     @settings = YAML.load_file(@filename)
@@ -96,29 +106,43 @@ module SpellWindow
     @settings[:block_combat]    = true
     @settings[:block_room]      = false
     @settings[:block_inventory] = false
+    @settings[:block_betrayer]  = false
+    @settings[:block_bank]      = false
     @settings[:show_missing]    = false
     @settings[:show_targets]    = false
+    @settings[:show_players]    = true
+    @settings[:show_group]      = true
     @settings[:show_arms]       = false
     @settings[:debug]           = false
     @settings[:my_buffs]        = []
+    @settings[:target_order]    = ['players', 'targets', 'group'] # Default order
+    @settings[:update_interval] = 0.25 # Update loop interval in seconds
     File.write(@filename, @settings.to_yaml)
     respond("Default settings initialized.")
   end
   @spellsong_duration = Spellsong.duration / 60
 
   def self.flextape(server_string)
+    # Fast path: check blackout state first (most common case)
+    return nil if $spellwindow_blackout
+
+    # Handle inventory window start/end
     if server_string =~ INVENTORY_WINDOW && @settings[:block_inventory]
       $spellwindow_blackout = true
       return nil
-    elsif server_string =~ END_INVENTORY_STREAM && $spellwindow_blackout
+    elsif server_string =~ END_INVENTORY_STREAM
       $spellwindow_blackout = false
       return nil
     end
-    return nil if $spellwindow_blackout
+
+    # Batch all the expensive regex checks
     return nil if SWMIN_PATTERNS.match?(server_string)
-    return nil if COMBAT.match?(server_string) && @settings[:block_combat]
-    return nil if ROOM_WINDOW.match?(server_string) && @settings[:block_room]
-    return server_string
+    return nil if @settings[:block_combat] && COMBAT.match?(server_string)
+    return nil if @settings[:block_room] && ROOM_WINDOW.match?(server_string)
+    return nil if @settings[:block_betrayer] && BETRAYER_PANEL.match?(server_string)
+    return nil if @settings[:block_bank] && BANK_DIALOG.match?(server_string)
+
+    server_string
   end
 
   DownstreamHook.add(DOWNSTREAM_HOOK_ID, proc do |server_string| SpellWindow.flextape(server_string) end)
@@ -186,8 +210,43 @@ module SpellWindow
         name = entity.name.split.last.capitalize
       end
       status = SpellWindow.status_fix(entity.status) unless entity.status.nil?
-      "<link id='#{entity.id}' value='#{status} #{name}' cmd='target ##{entity.id}' echo='target ##{entity.id}' justify='3' left='0' height='15' width='195'/>"
+      "<link id='#{entity.id}' value='#{status} #{name}' cmd='target ##{entity.id}' echo='target ##{entity.id}' justify='3' left='0' align='center' height='15' width='187'/>"
     end.join
+  end
+
+  def self.build_section(section_name, targets, group_members, non_group_members)
+    case section_name
+    when 'players'
+      return '' unless @settings[:show_players]
+      if non_group_members.any?
+        output = "<label id='pcs' value='Total Players: #{non_group_members.size}' justify='3' left='0' align='center' height='15' width='187'/>"
+        output += build_target_links(non_group_members, include_titles: false)
+      else
+        output = "<label id='noPcs' value='-= No Players =-' justify='3' left='0' align='center' width='187'/>"
+      end
+      output
+
+    when 'targets'
+      if targets.any?
+        output = "<link id='total' value='Total Targets: #{targets.size}' cmd='target next' echo='target next' justify='3' left='0' align='center' height='15' width='187'/>"
+        output += build_target_links(targets, include_titles: true)
+      else
+        output = "<label id='noTargets' value='-= No Targets =-' justify='3' left='0' align='center' width='187'/>"
+      end
+      output
+
+    when 'group'
+      return '' unless @settings[:show_group]
+      if group_members.any?
+        output = "<label id='group' value='Group Size: #{group_members.size}' justify='3' left='0' align='center' height='15' width='187'/>"
+        output += build_target_links(group_members, include_titles: false)
+      else
+        output = "<label id='noGroup' value='-= No Group =-' justify='3' align='center' width='187'/>"
+      end
+      output
+    else
+      ''
+    end
   end
 
   def self.target_window
@@ -196,30 +255,24 @@ module SpellWindow
     non_group_members = Lich::Gemstone::Group.nonmembers
 
     output = "<dialogData id='Target Window' clear='t'></dialogData><dialogData id='Target Window'>"
-    # Targets Section
-    if targets.any?
-      output += "<link id='total' value='Total Targets: #{targets.size}' cmd='target next' echo='target next' justify='3' top='3' left='0' height='15' width='195'/>"
-      output += build_target_links(targets, include_titles: true)
-    else
-      output += "<label id='noTargets' value='-= No Targets =-' justify='3' left='0' width='187'/>"
+
+    # Ensure we have a valid target_order setting
+    @settings[:target_order] ||= ['players', 'targets', 'group']
+
+    # Build sections in configured order
+    sections_output = []
+    @settings[:target_order].each do |section|
+      section_content = build_section(section, targets, group_members, non_group_members)
+      sections_output << section_content unless section_content.empty?
     end
 
-    output += "<label id='space1' value='---------------------------' justify='3' left='0' width='187'/>"
-    # Group Members Section
-    if group_members.any?
-      output += "<label id='group' value='Group Size: #{group_members.size}' justify='3' left='0' height='15' width='195'/>"
-      output += build_target_links(group_members, include_titles: false)
-    else
-      output += "<label id='noGroup' value='-= No Group =-' justify='3' left='0' width='187'/>"
-    end
-
-    output += "<label id='space2' value='---------------------------' justify='3' left='0' width='187'/>"
-    # Players Section
-    if non_group_members.any?
-      output += "<label id='pcs' value='Total Players: #{non_group_members.size}' justify='3' left='0' height='20' width='195'/>"
-      output += build_target_links(non_group_members, include_titles: false)
-    else
-      output += "<label id='noPcs' value='-= No Players =-' justify='3' left='0' width='187'/>"
+    # Join sections with spacers between them
+    sections_output.each_with_index do |section, index|
+      output += section
+      # Add spacer between sections (but not after the last one)
+      if index < sections_output.length - 1
+        output += "<label id='space#{index}' value='---------------------------' justify='3' left='0' align='center' width='187'/>"
+      end
     end
 
     output += "</dialogData>"
@@ -291,7 +344,7 @@ module SpellWindow
   end
 
   def self.update_windows
-    @thread.kill if @thread&.alive? # Terminate the old thread
+    return if @thread&.alive? # Don't create multiple threads
     @thread = Thread.new do
       begin
         window_to_effects = {
@@ -339,23 +392,27 @@ module SpellWindow
           now = Time.now
           output = ''
 
-          # target window, update asap on any change.
-          new_target_output = SpellWindow.target_window if @settings[:show_targets]
-          if new_target_output == old_target_output
-            output += ''
-          else
-            output += new_target_output if new_target_output
-            old_target_output = new_target_output
+          # target window, update asap on any change (but skip during go2 to reduce spam)
+          if @settings[:show_targets] && !Script.running?('go2')
+            new_target_output = SpellWindow.target_window
+            if new_target_output != old_target_output
+              output += new_target_output
+              old_target_output = new_target_output
+            end
           end
 
           # determine our current state
           current_state = {}
+          # Cache active spell names for this iteration
+          active_spell_names = nil
+
           window_to_effects.each do |window, effect_type|
             if window == 'missing_spells'
-              current_state[window] = @settings[:my_buffs] - Spell.active.map { |s| s.name }
+              active_spell_names ||= Spell.active.map(&:name)
+              current_state[window] = @settings[:my_buffs] - active_spell_names
             else
               # Use durations for other windows
-              current_state[window] = effect_type.to_h.transform_values { |end_time| (end_time - Time.now).to_i }
+              current_state[window] = effect_type.to_h.transform_values { |end_time| (end_time - now).to_i }
             end
           end
 
@@ -370,11 +427,18 @@ module SpellWindow
               end
             else
               status = current_state[window].empty? ? 'no spells' : 'active spells'
-              duration_increased = current_state[window].any? do |spell, duration|
-                duration > (last_state[window][spell] || 0)
+              # Only check duration increases if status and keys haven't changed
+              keys_changed = current_state[window].keys.sort != (last_state[window]&.keys&.sort || [])
+              status_changed = status != last_state['status'][window]
+
+              duration_increased = false
+              unless keys_changed || status_changed
+                duration_increased = current_state[window].any? do |spell, duration|
+                  duration > (last_state[window][spell] || 0)
+                end
               end
 
-              if current_state[window].keys.map(&:to_s).sort != last_state[window].keys.map(&:to_s).sort || status != last_state['status'][window] || duration_increased
+              if keys_changed || status_changed || duration_increased
                 case window
                 when 'active_spells'
                   output += SpellWindow.build_output(Effects::Spells, 'Active Spells') if @settings[:show_spells]
@@ -421,14 +485,14 @@ module SpellWindow
             end
           end
 
-          if output != last_sent_output
-            wait_while { Script.running?("go2") }
-            puts(output) unless output.empty?
-            respond(output) unless output.empty? if @settings[:debug]
-            last_sent_output = output
-          else
+          unless output.empty?
+            if output != last_sent_output
+              puts(output)
+              respond(output) if @settings[:debug]
+              last_sent_output = output
+            end
           end
-          sleep(0.1)
+          sleep(@settings[:update_interval] || 0.25)
         end
       rescue StandardError => e
         puts("[ERROR] Exception in update_window: #{e.message}")
@@ -438,8 +502,8 @@ module SpellWindow
   end
 
   def self.command(args)
-    action, arg = args.split(' ')
-    action = action.downcase
+    action, arg = args.split(' ', 2)
+    action = action.downcase if action
     unless action
       SpellWindow.update_windows
     else
@@ -461,8 +525,14 @@ module SpellWindow
           ['combat',         'Toggle combat window feed. Enable if you use the combat window to click.'],
           ['room',           'Toggle room window feed.'],
           ['inventory',      'Toggle inventory window feed.'],
+          ['betrayer',       'Toggle betrayer panel feed.'],
+          ['bank',           'Toggle bank dialog feed.'],
           ['targets',        'Toggle targets window.'],
+          ['players',        'Toggle players display in target window.'],
+          ['group',          'Toggle group members display in target window.'],
           ['arms',           'Show Grasp of the Grave arm count in the target window.'],
+          ['order <layout>', 'Set target window order. Ex: "targets players group" or "default"'],
+          ['speed <value>',  'Set timer update speed (0.1-1.0 sec). Only affects countdown timers, not spell/target changes.'],
           ['settings',       'Lists current settings.'],
         ].each { |cmd_pair|
           respond(
@@ -482,9 +552,15 @@ module SpellWindow
         respond("    Missing: #{@settings[:show_missing]}")
         respond("     Combat: #{!@settings[:block_combat]}")
         respond("       Room: #{!@settings[:block_room]}")
-        respond("  Inventory: #{!@settings[:block_room]}")
+        respond("  Inventory: #{!@settings[:block_inventory]}")
+        respond("   Betrayer: #{!@settings[:block_betrayer]}")
+        respond("       Bank: #{!@settings[:block_bank]}")
         respond("    Targets: #{@settings[:show_targets]}")
+        respond("    Players: #{@settings[:show_players]}")
+        respond("      Group: #{@settings[:show_group]}")
         respond("  Arm Count: #{@settings[:show_arms]}")
+        respond("      Order: #{(@settings[:target_order] || ['players', 'targets', 'group']).map(&:capitalize).join(' -> ')}")
+        respond("      Speed: #{@settings[:update_interval] || 0.25} seconds")
         respond("")
         puts('<output class=""/>')
         SpellWindow.my_buffs
@@ -518,6 +594,12 @@ module SpellWindow
       elsif action == 'inventory'
         @settings[:block_inventory] = !@settings[:block_inventory]
         respond(@settings[:block_inventory] ? 'Inventory window disabled.' : 'Inventory window enabled.')
+      elsif action == 'betrayer'
+        @settings[:block_betrayer] = !@settings[:block_betrayer]
+        respond(@settings[:block_betrayer] ? 'Betrayer panel disabled.' : 'Betrayer panel enabled.')
+      elsif action == 'bank'
+        @settings[:block_bank] = !@settings[:block_bank]
+        respond(@settings[:block_bank] ? 'Bank dialog disabled.' : 'Bank dialog enabled.')
       elsif action == 'spells'
         @settings[:show_spells] = !@settings[:show_spells]
         puts(@settings[:show_spells] ? 'Active Spells window enabled' : 'Active Spells window disabled')
@@ -540,9 +622,52 @@ module SpellWindow
         respond(@settings[:show_targets] ? 'Targets window enabled.' : 'Targets window disabled.')
         puts("<closeDialog id='Target Window'/><openDialog type='dynamic' id='Target Window' title='Target Window' target='Target Window' scroll='manual' location='main' justify='3' height='68' resident='true'><dialogData id='Target Window'></dialogData></openDialog>") if @settings[:show_targets]
         puts("<closeDialog id='Target Window'/>") if !@settings[:show_targets]
+      elsif action == 'players'
+        @settings[:show_players] = !@settings[:show_players]
+        respond(@settings[:show_players] ? 'Players display in target window enabled.' : 'Players display in target window disabled.')
+      elsif action == 'group'
+        @settings[:show_group] = !@settings[:show_group]
+        respond(@settings[:show_group] ? 'Group members display in target window enabled.' : 'Group members display in target window disabled.')
       elsif action == 'arms'
         @settings[:show_arms] = !@settings[:show_arms]
         respond(@settings[:show_arms] ? 'Grasp of the Grave arms will display in target window.' : 'Grasp of the Grave arms will not display in target window.')
+      elsif action == 'order'
+        if arg == 'default'
+          @settings[:target_order] = ['players', 'targets', 'group']
+          respond("Target window order set to: Players -> Targets -> Group")
+        elsif arg
+          # Parse the order string (e.g., "targets players group" or "targets, players, group")
+          parts = arg.downcase.split(/[\s,]+/).reject(&:empty?)
+          valid_sections = ['targets', 'players', 'group']
+
+          # Validate that we have exactly 3 parts and they're all valid sections
+          if parts.length == 3 && parts.all? { |p| valid_sections.include?(p) } && parts.uniq.length == 3
+            @settings[:target_order] = parts
+            respond("Target window order set to: #{parts.map(&:capitalize).join(' -> ')}")
+          else
+            respond("Invalid order. Please specify all three sections: targets, players, group")
+            respond("Example: ;spellwindows order targets players group")
+            respond("Current order: #{@settings[:target_order].map(&:capitalize).join(' -> ')}")
+          end
+        else
+          respond("Current order: #{@settings[:target_order].map(&:capitalize).join(' -> ')}")
+          respond("To change: ;spellwindows order <targets players group>")
+        end
+      elsif action == 'speed'
+        if arg
+          speed = arg.to_f
+          if speed >= 0.1 && speed <= 1.0
+            @settings[:update_interval] = speed
+            respond("Timer update interval set to: #{speed} seconds")
+            respond("Note: This only affects countdown timers. Spell changes and targets update immediately.")
+          else
+            respond("Invalid speed. Please use a value between 0.1 and 1.0 seconds.")
+            respond("Current speed: #{@settings[:update_interval] || 0.25} seconds")
+          end
+        else
+          respond("Current update speed: #{@settings[:update_interval] || 0.25} seconds")
+          respond("To change: ;spellwindows speed <0.1-1.0>")
+        end
       elsif action == 'debug'
         @settings[:debug] = !@settings[:debug]
         respond(@settings[:show_targets] ? 'Debug enabled.' : 'Debug disabled.')
