@@ -1,0 +1,859 @@
+=begin
+
+  A GUI for Jinx!
+
+   author: elanthia-online
+     tags: utility, util, repository, repo, update, upgrade, meta, ruby, development
+  version: 1.0.0
+
+  Changelog:
+  1.0.0 - Initial release with caching and performance improvements
+=end
+
+require 'gtk3'
+require 'digest/sha1'
+require 'cgi'
+
+Script.run("Jinx") unless defined?(Jinx)
+
+module JinxGUI
+  extend self
+
+  # =====================
+  # Cache for performance
+  # =====================
+  @manifest_cache = {}
+  @manifest_cache_mutex = Mutex.new
+  @full_asset_lists = { script: [], data: [] }
+  @is_loading = false
+  @alive = false
+
+  # =====================
+  # Thread/UI helper
+  # =====================
+  def ui(&blk)
+    if Gtk.respond_to?(:queue)
+      Gtk.queue { blk.call }
+    else
+      GLib::Idle.add { blk.call; false }
+    end
+  end
+
+  # =====================
+  # Time helper
+  # =====================
+  def safe_ago(ts)
+    return '—' if ts.nil?
+    Jinx::Util.ago(ts) rescue '—'
+  end
+
+  # =====================
+  # Log bridge
+  # =====================
+  def install_log_bridge!
+    return unless defined?(Jinx) && defined?(Jinx::Log)
+    log_class = Jinx::Log.singleton_class
+
+    # Hook Jinx::Log.out once
+    if log_class.method_defined?(:out) && !log_class.method_defined?(:out__orig)
+      log_class.send(:alias_method, :out__orig, :out)
+      log_class.send(:define_method, :out) do |msg, label: :debug|
+        if defined?(JinxGUI)
+          if msg.is_a?(StandardError)
+            JinxGUI.append_log("[#{label}] #{msg.message}")
+            msg.backtrace.to_a.slice(0..5).each { |frame| JinxGUI.append_log(frame) }
+          else
+            JinxGUI.append_log("[#{label}] #{msg}")
+          end
+        end
+        out__orig(msg, label: label)
+      end
+    end
+
+    # DO NOT hook mono globally — Info panel captures mono locally.
+  end
+
+  # =====================
+  # App bootstrap
+  # =====================
+  def start!
+    @alive = true
+    install_log_bridge!
+
+    ui do
+      @win = Gtk::Window.new(Gtk::Window::TOPLEVEL)
+      @win.title = 'Jinx - Package Manager'
+      @win.set_default_size(1100, 700)
+      @win.signal_connect('destroy') {
+        @alive = false
+      }
+
+      notebook = Gtk::Notebook.new
+      notebook.tab_pos = Gtk::PositionType::TOP
+
+      # Build tabs
+      log_tab = build_log_tab
+      @repos_model,   repos_tab   = build_repos_tab
+      @scripts_model, scripts_tab = build_assets_tab(:script)
+      @data_model,    data_tab    = build_assets_tab(:data)
+
+      # Add Log tab first for better initial UX
+      notebook.append_page(log_tab,     Gtk::Label.new('Log'))
+      notebook.append_page(repos_tab,   Gtk::Label.new('Repos'))
+      notebook.append_page(scripts_tab, Gtk::Label.new('Scripts'))
+      notebook.append_page(data_tab,    Gtk::Label.new('Data'))
+
+      @win.add(notebook)
+      @win.show_all
+
+      # Show loading message immediately
+      append_log("[jinx_gui] Starting up...")
+      append_log("[jinx_gui] Loading repository data, this may take 20-30 seconds...")
+
+      # Set loading indicators
+      ui do
+        @repos_model.clear
+        iter = @repos_model.append
+        iter[0] = "Loading repositories..."
+        iter[1] = "Please wait..."
+        iter[2] = "Fetching manifests..."
+
+        [@scripts_model, @data_model].each do |model|
+          model.clear
+          iter = model.append
+          iter[0] = "Loading..."
+          iter[1] = "Please wait..."
+        end
+      end
+
+      # Start initial refresh
+      initial_refresh
+    end
+  end
+
+  # =====================
+  # Initial refresh with caching
+  # =====================
+  def initial_refresh
+    Thread.new do
+      return unless @alive
+      @is_loading = true
+      append_log("[jinx_gui] Fetching repository manifests...")
+      refresh_repos(cache_only: false) do
+        if @alive
+          append_log("[jinx_gui] Initial load complete!")
+          @is_loading = false
+        end
+      end
+    end
+  end
+
+  # =====================
+  # Repos Tab (name, url, status)
+  # =====================
+  def build_repos_tab
+    model = Gtk::ListStore.new(String, String, String)
+    view  = Gtk::TreeView.new(model)
+    view.enable_grid_lines = :both
+    add_text_column(view, 'Name',   0, sortable: true)
+    add_text_column(view, 'URL',    1, sortable: true)
+    add_text_column(view, 'Status', 2, sortable: true)
+
+    name_entry = Gtk::Entry.new; name_entry.placeholder_text = 'repo name'
+    url_entry  = Gtk::Entry.new; url_entry.placeholder_text  = 'https://...'
+
+    add_btn     = Gtk::Button.new(label: 'Add')
+    rm_btn      = Gtk::Button.new(label: 'Remove')
+    chg_btn     = Gtk::Button.new(label: 'Change URL')
+    refresh_btn = Gtk::Button.new(label: 'Refresh Manifests')
+
+    add_btn.signal_connect('clicked') do
+      name = name_entry.text.to_s.strip
+      url  = url_entry.text.to_s.strip
+      next if name.empty? || url.empty?
+      Thread.new do
+        begin
+          Jinx::CLI.repo_add(name, url)
+          clear_all_caches! # Clear cache when repos change
+        rescue => e
+          append_log("[repo add] #{e.message}")
+        ensure
+          refresh_repos(cache_only: false)
+        end
+      end
+    end
+
+    rm_btn.signal_connect('clicked') do
+      iter = selected_iter(view); next unless iter
+      repo = iter[0]
+      Thread.new do
+        begin
+          Jinx::CLI.repo_rm(repo)
+          clear_all_caches! # Clear cache when repos change
+        rescue => e
+          append_log("[repo rm] #{e.message}")
+        ensure
+          refresh_repos(cache_only: false)
+        end
+      end
+    end
+
+    chg_btn.signal_connect('clicked') do
+      iter = selected_iter(view); next unless iter
+      repo = iter[0]
+      new_url = url_entry.text.to_s.strip; next if new_url.empty?
+      Thread.new do
+        begin
+          Jinx::CLI.repo_change(repo, new_url)
+          clear_all_caches! # Clear cache when repos change
+        rescue => e
+          append_log("[repo change] #{e.message}")
+        ensure
+          refresh_repos(cache_only: false)
+        end
+      end
+    end
+
+    refresh_btn.signal_connect('clicked') do
+      Thread.new do
+        clear_all_caches!
+        refresh_repos(cache_only: false)
+      end
+    end
+
+    scroller = Gtk::ScrolledWindow.new; scroller.add(view)
+    ctrls = Gtk::Box.new(:horizontal, 6)
+    ctrls.pack_start(name_entry,  expand: true,  fill: true,  padding: 0)
+    ctrls.pack_start(url_entry,   expand: true,  fill: true,  padding: 0)
+    ctrls.pack_start(add_btn,     expand: false, fill: false, padding: 0)
+    ctrls.pack_start(chg_btn,     expand: false, fill: false, padding: 0)
+    ctrls.pack_start(rm_btn,      expand: false, fill: false, padding: 0)
+    ctrls.pack_start(refresh_btn, expand: false, fill: false, padding: 0)
+
+    box = Gtk::Box.new(:vertical, 8); box.margin = 8
+    box.pack_start(ctrls, expand: false, fill: false, padding: 0)
+    box.pack_start(scroller, expand: true, fill: true, padding: 0)
+
+    @repos_view = view
+    [model, box]
+  end
+
+  def refresh_repos(cache_only: false, &callback)
+    Thread.new do
+      return unless @alive # Exit early if shutting down
+      append_log("[jinx_gui] Refreshing repositories#{cache_only ? ' (from cache)' : ''}...")
+      repos = begin Jinx::Repo.to_a rescue [] end
+      rows  = []
+      repos.each do |r|
+        break unless @alive # Check if still alive
+        name, url, status = r[:name].to_s, r[:url].to_s, 'ok'
+        begin
+          if cache_only
+            @manifest_cache_mutex.synchronize do
+              @manifest_cache[name] ||= manifest_with_retries(r)
+            end
+          else
+            m = manifest_with_retries(r)
+            @manifest_cache_mutex.synchronize { @manifest_cache[name] = m }
+          end
+        rescue => e
+          status = "error: #{e.message}"
+          append_log("[WARN] Failed to fetch manifest for #{name}: #{e.message}")
+        end
+        rows << [name, url, status]
+      end
+
+      return unless @alive # Don't update UI if shutting down
+      ui do
+        return unless @repos_model && @alive
+        @repos_model.clear
+        rows.sort_by! { |row| row[0].to_s }
+        rows.each do |r|
+          it = @repos_model.append
+          (0..2).each { |i| it[i] = r[i] }
+        end
+      end
+      append_log("[jinx_gui] Repositories refreshed")
+
+      # If not caching, also refresh the asset lists
+      # BUT only clear the asset cache, not the manifest cache!
+      unless cache_only
+        clear_asset_cache! # Only clear asset lists, keep manifests
+        refresh_assets(:script, filter: nil, use_cache: false)
+        refresh_assets(:data, filter: nil, use_cache: false)
+      end
+
+      callback.call if callback
+    end
+  end
+
+  # =====================
+  # Scripts/Data Tabs (name, repo, installed, modified, updated)
+  # =====================
+  def build_assets_tab(kind)
+    model = Gtk::ListStore.new(String, String, String, String, String)
+    view  = Gtk::TreeView.new(model)
+
+    view.selection.mode = :browse
+    view.activate_on_single_click = true rescue nil
+    view.signal_connect('button-press-event') do |w, event|
+      begin
+        if event.button == 1
+          path, col, _cx, _cy = w.get_path_at_pos(event.x.to_i, event.y.to_i)
+          if path
+            w.selection.select_path(path)
+            w.set_cursor(path, col, false)
+          end
+        end
+      rescue => e
+        append_log("[DEBUG] click-select failed: #{e.message}")
+      end
+      false
+    end
+    view.signal_connect('row-activated') { |w, path, _| w.selection.select_path(path) }
+    view.enable_grid_lines = :both
+
+    add_text_column(view, 'Name',         0, sortable: true)
+    add_text_column(view, 'Repo',         1, sortable: true)
+    add_text_column(view, 'Installed',    2, sortable: true)
+    add_text_column(view, 'Modified',     3, sortable: true)
+    add_text_column(view, 'Updated (ago)', 4, sortable: true)
+
+    # --- Controls (button-driven search; no auto-run) ---
+    search = Gtk::SearchEntry.new
+    search.placeholder_text = 'search by name… (empty = show all)'
+
+    search_btn  = Gtk::Button.new(label: 'Search')
+    clear_btn   = Gtk::Button.new(label: 'Clear')
+    info_btn    = Gtk::Button.new(label: 'Info')
+    install_btn = Gtk::Button.new(label: 'Install')
+    update_btn  = Gtk::Button.new(label: 'Update')
+
+    force_toggle = Gtk::CheckButton.new
+    force_toggle.label = 'Force overwrite'
+
+    # Search with caching - much faster!
+    search_btn.signal_connect('clicked') do
+      search_text = search.text.to_s.strip
+
+      # Update info panel
+      ui do
+        t = (kind == :script) ? @script_info_text : @data_info_text
+        if search_text.empty?
+          t.buffer.text = "Showing all #{kind}s..."
+        else
+          t.buffer.text = "Searching for '#{search_text}'..."
+        end
+      end
+
+      # Empty search = show all
+      filter = search_text.empty? ? nil : search_text
+      refresh_assets(kind, filter: filter, use_cache: true)
+    end
+
+    # Clear button
+    clear_btn.signal_connect('clicked') do
+      search.text = ''
+      ui do
+        t = (kind == :script) ? @script_info_text : @data_info_text
+        t.buffer.text = "Showing all #{kind}s..."
+      end
+      refresh_assets(kind, filter: nil, use_cache: true)
+    end
+
+    # Info button — capture-only (no Log bleed), preserve selection
+    local_view = view
+    info_btn.signal_connect('clicked') do
+      iter = selected_iter(local_view)
+      unless iter
+        append_log("[jinx_gui] No item selected ..."); next
+      end
+
+      keep_name = iter[0].to_s
+      keep_repo = iter[1].to_s
+      name      = keep_name
+      repo      = keep_repo
+
+      ui do
+        t = (kind == :script) ? @script_info_text : @data_info_text
+        t.buffer.text = "Fetching info for #{name}..."
+      end
+
+      Thread.new do
+        captured = []
+        begin
+          old_mono = (defined?(Jinx::Log) && Jinx::Log.respond_to?(:mono)) ? Jinx::Log.method(:mono) : nil
+
+          # Override mono: capture only; do NOT forward to original
+          Jinx::Log.singleton_class.send(:define_method, :mono) do |text|
+            clean = text.to_s.gsub(/<[^>]+>/, '')
+            captured << clean
+            nil
+          end
+
+          if kind == :script
+            Jinx::CLI.script_info(name, repo)
+          else
+            Jinx::CLI.data_info(name, repo)
+          end
+        rescue => e
+          captured << "Error: #{e.message}"
+        ensure
+          # Restore original mono
+          Jinx::Log.singleton_class.send(:define_method, :mono, &old_mono) if old_mono
+        end
+
+        ui do
+          # Update side panel
+          t = (kind == :script) ? @script_info_text : @data_info_text
+          t.buffer.text = (captured.any? ? captured.join("\n") : "No info available")
+
+          # Restore selection to the same (name, repo) row if still present
+          model = (kind == :script) ? @scripts_model : @data_model
+          view  = (kind == :script) ? @scripts_view  : @data_view
+          it = model.iter_first
+          while it
+            if it[0].to_s == keep_name && it[1].to_s == keep_repo
+              path = it.path
+              view.selection.select_path(path)
+              view.set_cursor(path, view.columns.first, false)
+              break
+            end
+            it.next!
+          end
+        end
+      end
+    end
+
+    # Install button
+    install_btn.signal_connect('clicked') do
+      iter = selected_iter(local_view)
+      unless iter
+        append_log("[jinx_gui] No item selected for install"); next
+      end
+
+      name = iter[0].to_s
+      repo = iter[1].to_s
+      force = force_toggle.active?
+
+      Thread.new do
+        begin
+          if kind == :script
+            Jinx::CLI.script_install(name, repo, force: force)
+          else
+            Jinx::CLI.data_install(name, repo, force: force)
+          end
+          # Refresh just this asset type after install
+          refresh_assets(kind, filter: nil, use_cache: true)
+        rescue => e
+          append_log("[install] #{e.message}")
+        end
+      end
+    end
+
+    # Update button
+    update_btn.signal_connect('clicked') do
+      iter = selected_iter(local_view)
+      unless iter
+        append_log("[jinx_gui] No item selected for update"); next
+      end
+
+      name = iter[0].to_s
+      repo = iter[1].to_s
+      force = force_toggle.active?
+
+      Thread.new do
+        begin
+          if kind == :script
+            Jinx::CLI.script_update(name, repo, force: force)
+          else
+            Jinx::CLI.data_update(name, repo, force: force)
+          end
+          # Refresh just this asset type after update
+          refresh_assets(kind, filter: nil, use_cache: true)
+        rescue => e
+          append_log("[update] #{e.message}")
+        end
+      end
+    end
+
+    # Layout
+    paned = Gtk::Paned.new(:horizontal)
+    scroller = Gtk::ScrolledWindow.new; scroller.add(view)
+
+    info_frame = Gtk::Frame.new("Information")
+    info_text = Gtk::TextView.new
+    info_text.editable = false
+    info_text.wrap_mode = :word
+    info_text.buffer.text = "Select an item and click Info to see details"
+    info_scroller = Gtk::ScrolledWindow.new; info_scroller.add(info_text)
+    info_frame.add(info_scroller)
+
+    if kind == :script
+      @script_info_text = info_text
+      @scripts_view     = view
+    else
+      @data_info_text   = info_text
+      @data_view        = view
+    end
+
+    paned.pack1(scroller, true, false)
+    paned.pack2(info_frame, false, true)
+    paned.position = 700
+
+    ctrls = Gtk::Box.new(:horizontal, 6)
+    ctrls.pack_start(search,       expand: true,  fill: true,  padding: 0)
+    ctrls.pack_start(search_btn,   expand: false, fill: false, padding: 0)
+    ctrls.pack_start(clear_btn,    expand: false, fill: false, padding: 0)
+    ctrls.pack_start(info_btn,     expand: false, fill: false, padding: 0)
+    ctrls.pack_start(install_btn,  expand: false, fill: false, padding: 0)
+    ctrls.pack_start(update_btn,   expand: false, fill: false, padding: 0)
+    ctrls.pack_start(force_toggle, expand: false, fill: false, padding: 0)
+
+    box = Gtk::Box.new(:vertical, 8)
+    box.margin = 8
+    box.pack_start(ctrls,  expand: false, fill: false, padding: 0)
+    box.pack_start(paned,  expand: true,  fill: true,  padding: 0)
+
+    [model, box]
+  end
+
+  def refresh_assets(kind, filter: nil, use_cache: true)
+    Thread.new do
+      return unless @alive # Exit early if shutting down
+
+      # Remember current selection to restore after repopulating
+      view   = (kind == :script) ? @scripts_view : @data_view
+      model  = (kind == :script) ? @scripts_model : @data_model
+      prev_name = prev_repo = nil
+      ui do
+        return unless view && @alive
+        if (it = selected_iter(view))
+          prev_name = it[0].to_s
+          prev_repo = it[1].to_s
+        end
+      end
+
+      rows = []
+
+      if use_cache && @full_asset_lists[kind].any?
+        # Use cached data and just filter it
+        append_log("[jinx_gui] Using cached #{kind} data for search...")
+        rows = @full_asset_lists[kind]
+
+        # Apply filter if present
+        if filter && !filter.empty?
+          pattern = Regexp.new(Regexp.escape(filter), Regexp::IGNORECASE)
+          rows = rows.select { |r| r[0] =~ pattern }
+          append_log("[jinx_gui] Found #{rows.size} #{kind}(s) matching '#{filter}'")
+        else
+          append_log("[jinx_gui] Showing all #{rows.size} #{kind}(s)")
+        end
+      else
+        # Full refresh - fetch from repos
+        append_log("[jinx_gui] Building #{kind} list from repositories...")
+        pattern = filter && !filter.empty? ? Regexp.new(Regexp.escape(filter), Regexp::IGNORECASE) : nil
+
+        repos = begin Jinx::Repo.to_a rescue [] end
+        successful_repos = 0
+
+        repos.each do |repo|
+          break unless @alive # Check if still alive
+          # Use cached manifest if available
+          m = @manifest_cache_mutex.synchronize { @manifest_cache[repo[:name].to_s] }
+          if m.nil?
+            begin
+              append_log("[jinx_gui] Fetching manifest for #{repo[:name]}...")
+              m = manifest_with_retries(repo)
+              @manifest_cache_mutex.synchronize { @manifest_cache[repo[:name].to_s] = m }
+            rescue => e
+              append_log("[ERROR] Failed to load #{repo[:name]}: #{e.message}")
+              m = (repo || {}).dup
+              m[:available] = []
+            end
+          end
+
+          # Check if manifest has an error
+          if m[:err]
+            append_log("[WARN] #{repo[:name]} has error: #{m[:err]}")
+          end
+
+          assets = (kind == :script) ? safe_repo_scripts(m) : safe_repo_data(m)
+          if assets.any?
+            successful_repos += 1
+            append_log("[jinx_gui] Found #{assets.size} #{kind}(s) in #{repo[:name]}")
+          elsif m[:available].is_a?(Array) && m[:available].empty?
+            append_log("[INFO] #{repo[:name]} has no #{kind}s available")
+          elsif !m[:available].is_a?(Array)
+            append_log("[WARN] #{repo[:name]} has invalid manifest structure")
+          else
+            # Repository has items but none of this type
+            other_count = m[:available].size
+            append_log("[INFO] #{repo[:name]} has #{other_count} total assets but no #{kind}s")
+          end
+
+          assets.each do |asset|
+            fname = File.basename(CGI.unescape(asset[:file].to_s))
+            next if fname.empty?
+
+            installed = installed_status(kind, fname)
+            modified  = modified_status(kind, fname, asset)
+            updated   = safe_ago(asset[:last_commit])
+
+            row = [fname, m[:name].to_s, installed, modified, updated]
+            rows << row
+          end
+        end
+
+        append_log("[jinx_gui] Successfully loaded #{kind}s from #{successful_repos}/#{repos.size} repositories")
+
+        # Cache the full list
+        @full_asset_lists[kind] = rows
+
+        # Apply filter if present
+        if pattern
+          rows = rows.select { |r| r[0] =~ pattern }
+          append_log("[jinx_gui] Found #{rows.size} #{kind}(s) matching '#{filter}'")
+        else
+          append_log("[jinx_gui] Total: #{rows.size} #{kind}(s)")
+        end
+      end
+
+      return unless @alive # Don't update UI if shutting down
+      ui do
+        return unless model && view && @alive
+        begin
+          model.clear
+          # Sort by Name, then Repo (keeps identical names adjacent but separate by repo)
+          rows.sort_by! { |r| [r[0].to_s, r[1].to_s] }
+          rows.each { |r| it = model.append; (0..4).each { |i| it[i] = r[i] } }
+
+          # Update info panel if search completed
+          if filter
+            t = (kind == :script) ? @script_info_text : @data_info_text
+            if t && !t.destroyed?
+              if rows.empty?
+                t.buffer.text = "No #{kind}s found matching '#{filter}'"
+              else
+                t.buffer.text = "Found #{rows.size} #{kind}(s) matching '#{filter}'\n\nSelect an item and click Info to see details"
+              end
+            end
+          end
+
+          # Restore previous selection if possible
+          if prev_name && prev_repo && view && !view.destroyed?
+            it = model.iter_first
+            while it
+              if it[0].to_s == prev_name && it[1].to_s == prev_repo
+                path = it.path
+                view.selection.select_path(path)
+                view.set_cursor(path, view.columns.first, false)
+                break
+              end
+              it.next!
+            end
+            # If not found, leave selection as-is (no auto-jump to row 0)
+          end
+        rescue
+          # Silently ignore errors during shutdown
+        end
+      end
+    end
+  end
+
+  # Clear only asset cache (keep manifests)
+  def clear_asset_cache!
+    @full_asset_lists = { script: [], data: [] }
+    append_log("[jinx_gui] Asset cache cleared")
+  end
+
+  # Clear all caches (manifests and assets)
+  def clear_all_caches!
+    @manifest_cache_mutex.synchronize { @manifest_cache.clear }
+    @full_asset_lists = { script: [], data: [] }
+    append_log("[jinx_gui] All caches cleared")
+  end
+
+  # Retry wrapper for manifest fetches
+  def manifest_with_retries(repo, attempts: 3, delay: 1.0)
+    last_e = nil
+    attempts.times do |i|
+      begin
+        append_log("[DEBUG] Attempt #{i + 1}/#{attempts} to fetch manifest for #{repo[:name]}...")
+        m = Jinx::Repo.manifest(repo)
+
+        # Check if it's actually a valid manifest
+        if m.is_a?(Hash)
+          if m[:err]
+            # Repo.manifest returns error in :err field
+            append_log("[DEBUG] #{repo[:name]} returned error: #{m[:err]}")
+            return m # Return it anyway so we can handle it properly
+          elsif m[:available].is_a?(Array)
+            append_log("[DEBUG] #{repo[:name]} manifest loaded successfully with #{m[:available].size} assets")
+            return m
+          else
+            append_log("[DEBUG] #{repo[:name]} manifest missing :available array")
+            raise "invalid manifest structure - no :available array"
+          end
+        else
+          append_log("[DEBUG] #{repo[:name]} returned non-Hash: #{m.class}")
+          raise "manifest is not a Hash: #{m.class}"
+        end
+      rescue => e
+        last_e = e
+        append_log("[DEBUG] Attempt #{i + 1} failed: #{e.message}")
+        sleep(delay) if i < attempts - 1
+      end
+    end
+    append_log("[ERROR] All #{attempts} attempts failed for #{repo[:name]}")
+    raise(last_e || "manifest failed after #{attempts} attempts")
+  end
+
+  def installed_status(kind, filename)
+    dir =
+      if kind == :script
+        Jinx::Folder.script_dir rescue nil
+      else
+        Jinx::Folder.data_dir rescue nil
+      end
+    return 'unknown' unless dir.is_a?(String) && !dir.empty?
+    File.exist?(File.join(dir, filename)) ? 'yes' : 'no'
+  end
+
+  def modified_status(kind, filename, asset)
+    dir =
+      if kind == :script
+        Jinx::Folder.script_dir rescue nil
+      else
+        Jinx::Folder.data_dir rescue nil
+      end
+    return '—' unless dir.is_a?(String) && !dir.empty?
+    path = File.join(dir, filename)
+    return '—' unless File.exist?(path)
+    begin
+      remote_b64 = asset[:md5].to_s # upstream digest field is :md5 (base64 SHA1)
+      return 'unknown' if remote_b64.empty?
+      local_b64 = Digest::SHA1.base64digest(File.binread(path))
+      (local_b64 == remote_b64) ? 'clean' : 'modified'
+    rescue
+      'unknown'
+    end
+  end
+
+  # =====================
+  # Log Tab
+  # =====================
+  def build_log_tab
+    @log_view = Gtk::TextView.new
+    @log_view.editable = false
+    @log_view.wrap_mode = :word_char
+    @log_buffer = @log_view.buffer
+    @log_buffer.text = "Jinx GUI initialized at #{Time.now}\n"
+
+    clear_btn = Gtk::Button.new(label: 'Clear Log')
+    clear_btn.signal_connect('clicked') do
+      ui { @log_buffer.text = "Log cleared at #{Time.now}\n" }
+    end
+
+    scroller = Gtk::ScrolledWindow.new; scroller.add(@log_view)
+    box = Gtk::Box.new(:vertical, 8); box.margin = 8
+    box.pack_start(clear_btn, expand: false, fill: false, padding: 0)
+    box.pack_start(scroller, expand: true, fill: true, padding: 0)
+    box
+  end
+
+  def append_log(line)
+    # Filter out noisy non-Jinx output
+    return if line.to_s =~ /uberbar|dialogData|progressBar|anchor_left|Target Window|label id=/i
+    return if line.to_s.strip.empty?
+    return unless @alive # Don't try to update if shutting down
+    ui do
+      return unless @log_buffer && @log_view && @alive
+      begin
+        it = @log_buffer.end_iter
+        @log_buffer.insert(it, line.to_s + "\n")
+        # Auto-scroll
+        mark = @log_buffer.create_mark(nil, it, false)
+        @log_view.scroll_mark_onscreen(mark) if @log_view && !@log_view.destroyed?
+        @log_buffer.delete_mark(mark) if mark
+      rescue
+        # Silently ignore errors during shutdown
+      end
+    end
+  end
+
+  # =====================
+  # Shared widget helpers
+  # =====================
+  def add_text_column(view, title, idx, sortable: false)
+    renderer = Gtk::CellRendererText.new
+    col = Gtk::TreeViewColumn.new(title, renderer, text: idx)
+    col.resizable = true
+    col.sort_column_id = idx if sortable
+    view.append_column(col)
+  end
+
+  def selected_iter(view)
+    return nil unless view
+    sel  = view.selection
+    res  = sel.selected
+    iter = res.is_a?(Array) ? res[1] : res
+    if iter.nil?
+      begin
+        path, _col = view.cursor
+        iter = view.model.get_iter(path) if path
+      rescue => e
+        append_log("[DEBUG] selected_iter: cursor fallback err: #{e.message}")
+      end
+    end
+    iter
+  end
+
+  # =====================
+  # Safe wrappers (tolerate older Jinx)
+  # =====================
+  def safe_repo_scripts(repo)
+    Jinx::Repo.respond_to?(:scripts) ? Jinx::Repo.scripts(repo) : (repo[:scripts] || [])
+  end
+
+  def safe_repo_data(repo)
+    Jinx::Repo.respond_to?(:data) ? Jinx::Repo.data(repo) : (repo[:data] || [])
+  end
+
+  # =====================
+  # Keep-alive check
+  # =====================
+  def alive?
+    @alive
+  end
+
+  # =====================
+  # Cleanup method
+  # =====================
+  def cleanup!
+    @alive = false
+    ui { @win.destroy if @win && !@win.destroyed? } rescue nil
+  end
+end
+
+# Entrypoint
+if __FILE__ == $0 || defined?(Script)
+  if defined?(Jinx::Setup)
+    Jinx::Setup.apply
+  end
+
+  # Handle script exit cleanup
+  before_dying do
+    JinxGUI.cleanup! if defined?(JinxGUI)
+  end if defined?(before_dying)
+
+  JinxGUI.start!
+
+  # Keep the main script thread alive while GUI is running
+  while JinxGUI.alive?
+    sleep 0.1
+  end
+
+  # Clean exit
+  puts "[jinx_gui] GUI closed, exiting cleanly"
+end
