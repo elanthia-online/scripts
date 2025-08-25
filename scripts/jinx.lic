@@ -13,9 +13,27 @@
 
    author: elanthia-online
      tags: utility, util, repository, repo, update, upgrade, meta, ruby, development
-  version: 0.6.4
+  version: 0.7.1
 
   Changelog:
+  0.7.1 (2025-08-15)
+    Add auto-update command for bulk updates:
+    - New ;jinx auto-update command to check and update all installed assets
+    - Tracks installed assets via metadata files
+    - Shows progress during bulk updates
+    - Add --dry-run flag to preview updates without installing
+    - Excludes engine assets from auto-update for safety
+    - Detailed reporting of successful and failed updates
+
+  0.7.0 (2025-08-14)
+    Major ergonomic improvements:
+    - Add smart asset type detection - no need to specify script/data/engine
+    - New unified commands: ;jinx install/update/info/search/list <asset>
+    - Automatic routing based on asset type from manifest
+    - Better error messages with helpful suggestions
+    - Backward compatibility maintained for all existing commands
+    - Add --type flag to force specific asset type when needed
+
   0.6.4 (2024-05-05)
     Fix helper text if file exists to append --force to command
   0.6.3 (2023-05-17)
@@ -117,6 +135,8 @@ module Jinx
 
     def self.parse_flag(h, f)
       (name, val) = f[2..-1].split("=")
+      # Convert hyphens to underscores for consistent access
+      name = name.gsub("-", "_")
       if val.nil?
         h[name.to_sym] = true
       else
@@ -189,6 +209,7 @@ end
 
 module Jinx
   module Seed
+    # deprecated - replaced by elanthia-online extras repo
     ElanthiaOnlineCore = {
       name: "core",
       url: %[https://repo.elanthia.online]
@@ -415,6 +436,35 @@ module Jinx
           CGI.unescape(File.basename(asset[:file])).eql?(name)
         end
       end
+
+      def find_asset_across_repos(name, repos)
+        normalized_name = Installer.normalize_filename(name)
+        results = []
+
+        repos.each do |repo|
+          Repo.manifest(repo) unless repo[:available].is_a?(Array)
+          next unless repo[:available].is_a?(Array)
+
+          asset = find_asset_in(repo, normalized_name)
+          results << { repo: repo, asset: asset } if asset
+        end
+
+        results
+      end
+
+      def detect_asset_type(name, repos)
+        matches = find_asset_across_repos(name, repos)
+
+        return nil if matches.empty?
+        return matches.first[:asset][:type] if matches.size == 1
+
+        # Check if all matches have the same type
+        types = matches.map { |m| m[:asset][:type] }.uniq
+        return types.first if types.size == 1
+
+        # Multiple types found
+        :ambiguous
+      end
     end
   end
 end
@@ -461,6 +511,14 @@ module Jinx
           entries
         }
       end
+
+      def remove(name)
+        name = name.to_s
+        self.atomic { |entries|
+          entries.delete(name)
+          entries
+        }
+      end
     end
 
     class << self
@@ -483,6 +541,24 @@ module Jinx
 
       def for(asset)
         class_for(asset).find_for_asset(asset)
+      end
+
+      def all_installed
+        installed = []
+
+        # Gather all installed scripts
+        ScriptMetadata.each do |name, metadata|
+          installed << { name: name, type: "script", metadata: metadata }
+        end
+
+        # Gather all installed data files
+        DatafileMetadata.each do |name, metadata|
+          installed << { name: name, type: "data", metadata: metadata }
+        end
+
+        # Explicitly exclude engines from auto-update for safety
+
+        installed
       end
     end
   end
@@ -568,6 +644,237 @@ module Jinx
       }
       Log.out("file downloaded to %s" % local_location,
               label: %i(install download))
+    end
+  end
+end
+
+module Jinx
+  module AutoUpdater
+    def self.check_for_updates
+      installed = Metadata.all_installed
+
+      if installed.empty?
+        _respond "No jinx-installed assets found to update."
+        return []
+      end
+
+      updates_available = []
+      errors = []
+      cleaned_up = []
+
+      installed.each do |item|
+        begin
+          # Find the asset in its original repo
+          repo = Repo.lookup(item[:metadata][:repo])
+          Repo.manifest(repo) unless repo[:available].is_a?(Array)
+
+          asset = Lookup.find_asset_in(repo, item[:name])
+
+          if asset.nil?
+            errors << "#{item[:name]} (no longer available in repo:#{item[:metadata][:repo]})"
+            next
+          end
+
+          # Check if update is needed by comparing the current local file digest
+          # with the remote digest, not just the stored metadata
+          local_file_path = case item[:type]
+                            when "script"
+                              File.join(Folder.script_dir, item[:name])
+                            when "data"
+                              File.join(Folder.data_dir, item[:name])
+                            end
+
+          if local_file_path && File.exist?(local_file_path)
+            # Calculate current file digest
+            source = File.read(local_file_path)
+            digest = Digest::SHA1.new
+            digest.update(source)
+            current_digest = digest.base64digest
+
+            # Only consider it an update if the remote differs from current local file
+            if asset[:md5] != current_digest
+              updates_available << {
+                name: item[:name],
+                type: item[:type],
+                repo: repo,
+                asset: asset,
+                old_digest: current_digest,
+                new_digest: asset[:md5]
+              }
+            end
+          else
+            # File doesn't exist locally - user must have deleted it
+            # Remove the metadata so we don't keep trying to update it
+            case item[:type]
+            when "script"
+              ScriptMetadata.remove(item[:name])
+            when "data"
+              DatafileMetadata.remove(item[:name])
+            end
+            cleaned_up << item[:name]
+          end
+        rescue => e
+          errors << "#{item[:name]} (error: #{e.message})"
+        end
+      end
+
+      # Report findings
+      if updates_available.empty? && errors.empty? && cleaned_up.empty?
+        _respond "Checked #{installed.size} assets - all up to date!"
+      else
+        parts = []
+        parts << "Checked #{installed.size} assets"
+        if updates_available.any?
+          update_list = updates_available.map { |u| "#{u[:name]}(#{u[:type]})" }.join(", ")
+          parts << "#{updates_available.size} updates: #{update_list}"
+        end
+        if cleaned_up.any?
+          parts << "#{cleaned_up.size} removed from tracking: #{cleaned_up.join(", ")}"
+        end
+        _respond parts.join(" - ")
+
+        if errors.any?
+          _respond "#{errors.size} errors: #{errors.join(", ")}"
+        end
+      end
+
+      updates_available
+    end
+
+    def self.update_all(force: false, dry_run: false)
+      updates = check_for_updates
+
+      return if updates.empty?
+
+      if dry_run
+        _respond "Dry run - no changes will be made"
+        return
+      end
+
+      successful = []
+      failed = []
+      progress_parts = []
+
+      updates.each_with_index do |update, idx|
+        progress_parts << "[#{idx + 1}/#{updates.size}] #{update[:name]}"
+
+        begin
+          case update[:type]
+          when "script"
+            env = defined?(Urnon) ? Jinx::UrnonScript : Jinx::LichScript
+            env.install(update[:name], [update[:repo]], overwrite: true, force: force)
+          when "data"
+            env = defined?(Urnon) ? Jinx::UrnonData : Jinx::LichData
+            env.install(update[:name], [update[:repo]], overwrite: true, force: force)
+          end
+          successful << update[:name]
+          progress_parts[-1] += "+"
+        rescue => e
+          # Clean up the error message - remove escaped newlines and excessive detail
+          clean_error = e.message.gsub("\\n", " ").gsub("\n", " ").strip
+          # Simplify common error messages
+          if clean_error.include?("has been modified since last download")
+            clean_error = "locally modified"
+          elsif clean_error.include?("already exists")
+            clean_error = "file exists"
+          end
+
+          failed << { name: update[:name], error: clean_error }
+          progress_parts[-1] += "-"
+        end
+      end
+
+      # Final consolidated report
+      if successful.any? && failed.empty?
+        _respond "+ Updated all #{successful.size} assets: #{successful.join(", ")}"
+      elsif failed.any? && successful.empty?
+        _respond "- Failed to update all #{failed.size} assets"
+        failed.each do |f|
+          _respond "- <b>#{f[:name]}</b>: #{f[:error]} - try `;jinx update #{f[:name]} --force`"
+        end
+      elsif successful.any? || failed.any?
+        parts = []
+        if successful.any?
+          parts << "+ Updated: #{successful.join(", ")}"
+        end
+        if failed.any?
+          parts << "- Failed: #{failed.map { |f| f[:name] }.join(", ")}"
+        end
+        _respond parts.join(" | ")
+
+        if failed.any?
+          failed.each do |f|
+            _respond "- <b>#{f[:name]}</b>: #{f[:error]} - try `;jinx update #{f[:name]} --force`"
+          end
+        end
+      end
+    end
+  end
+end
+
+module Jinx
+  module SmartInstaller
+    def self.install(asset_name, sources, overwrite: false, force: false, type: nil)
+      # If type is explicitly provided, use the traditional installers
+      if type
+        case type.to_s
+        when "script"
+          env = defined?(Urnon) ? Jinx::UrnonScript : Jinx::LichScript
+          return env.install(asset_name, sources, overwrite: overwrite, force: force)
+        when "data"
+          env = defined?(Urnon) ? Jinx::UrnonData : Jinx::LichData
+          return env.install(asset_name, sources, overwrite: overwrite, force: force)
+        when "engine"
+          return LichEngine.install(asset_name, sources, overwrite: overwrite, force: force)
+        else
+          fail Jinx::Error, "Unknown asset type: #{type}"
+        end
+      end
+
+      # Auto-detect type from manifests
+      detected_type = Lookup.detect_asset_type(asset_name, sources)
+
+      if detected_type.nil?
+        fail Jinx::Error, <<~ERROR
+          No asset named '#{asset_name}' found in any repository.
+
+          Try one of:
+          - ;jinx list              to see all available assets
+          - ;jinx search #{asset_name}    to search for similar names
+        ERROR
+      end
+
+      if detected_type == :ambiguous
+        matches = Lookup.find_asset_across_repos(asset_name, sources)
+        types_by_repo = matches.map { |m| "#{m[:repo][:name]}: #{m[:asset][:type] || 'script'}" }
+
+        fail Jinx::Error, <<~ERROR
+          Asset '#{asset_name}' exists with different types in multiple repositories:
+          #{types_by_repo.map { |t| "  - #{t}" }.join("\n")}
+
+          Please specify the type explicitly:
+          - ;jinx install #{asset_name} --type=script
+          - ;jinx install #{asset_name} --type=data
+          - ;jinx install #{asset_name} --type=engine
+
+          Or specify the repository:
+          - ;jinx install #{asset_name} --repo=<repo_name>
+        ERROR
+      end
+
+      # Route to appropriate installer based on detected type
+      case detected_type
+      when "script", nil # nil type defaults to script for backward compatibility
+        env = defined?(Urnon) ? Jinx::UrnonScript : Jinx::LichScript
+        env.install(asset_name, sources, overwrite: overwrite, force: force)
+      when "data"
+        env = defined?(Urnon) ? Jinx::UrnonData : Jinx::LichData
+        env.install(asset_name, sources, overwrite: overwrite, force: force)
+      when "engine"
+        LichEngine.install(asset_name, sources, overwrite: overwrite, force: force)
+      else
+        fail Jinx::Error, "Unknown asset type: #{detected_type}"
+      end
     end
   end
 end
@@ -807,17 +1114,17 @@ module Jinx
         FileUtils.touch Folder.path("repos.yaml")
       end
       # seed core repos
-      repos_to_seed = [Seed::ElanthiaOnlineCore, Seed::ElanthiaOnlineExtras, Seed::FFNGLichRepoArchiveMirror]
+      repos_to_seed = [Seed::ElanthiaOnlineExtras, Seed::FFNGLichRepoArchiveMirror]
 
       repos_to_seed.each { |repo|
         Repo.create(**repo) unless Repo.exists?(repo[:name])
       }
 
       # prune deprecated repos
-      repos_to_prune = [Seed::Gtk3ScriptUpdates]
+      repos_to_prune = [Seed::Gtk3ScriptUpdates, Seed::ElanthiaOnlineCore]
 
       repos_to_prune.each { |repo|
-        Repo.remove(repo) if Repo.exists?(repo[:name])
+        Repo.remove(**repo) if Repo.exists?(repo[:name])
       }
       # setup script metadata
       unless File.exist? Folder.path("scripts.yaml")
@@ -861,10 +1168,15 @@ module Jinx
       argv = Opts.parse(args)
       # prune flags
       args = args.reject { |arg| arg.start_with?("--") }
+
       # help
-      if argv.help.eql?(true) && args.length.eql?(1)
+      if (argv.help.eql?(true) && args.length.eql?(1)) || args.empty?
         return CLI.help()
       end
+
+      # === ORIGINAL NAMESPACED COMMANDS (backward compatibility) ===
+      # Check these FIRST to maintain backward compatibility
+
       # repo list
       if argv.repo.eql?(true) && argv.list.eql?(true)
         return CLI.repo_list()
@@ -945,6 +1257,39 @@ module Jinx
         return CLI.engine_update(args[2], argv.repo, force: argv.force)
       end
 
+      # === NEW UNIFIED COMMANDS (no namespace required) ===
+      # These only trigger if no namespaced command matched
+
+      # jinx list - show all assets
+      if argv.list.eql?(true) && args.length.eql?(1)
+        return CLI.list_all(argv.repo)
+      end
+
+      # jinx info <asset_name> - smart info detection
+      if argv.info.eql?(true) && args.length.eql?(2)
+        return CLI.smart_info(args.last, argv.repo)
+      end
+
+      # jinx install <asset_name> - smart install
+      if argv.install.eql?(true) && args.length.eql?(2)
+        return CLI.smart_install(args.last, argv.repo, force: argv.force, type: argv.type)
+      end
+
+      # jinx update <asset_name> - smart update
+      if argv.update.eql?(true) && args.length.eql?(2)
+        return CLI.smart_update(args.last, argv.repo, force: argv.force, type: argv.type)
+      end
+
+      # jinx search <pattern> - search all asset types
+      if argv.search.eql?(true) && args.length.eql?(2)
+        return CLI.search_all(args.last, argv.repo)
+      end
+
+      # jinx auto-update - check and update all installed assets
+      if argv.auto_update.eql?(true) || (argv.auto.eql?(true) && argv.update.eql?(true)) || args.include?("auto-update")
+        return CLI.auto_update(force: argv.force, dry_run: argv.dry_run || argv.dry)
+      end
+
       Log.out("unknown command", label: %i(cli))
       CLI.help()
     end
@@ -960,36 +1305,42 @@ module Jinx
 
         A federated script repository manager
 
-        Usage: ;jinx help or ;jinx &lt;subcommand&gt; [&lt;arg1&gt;, ...]
+        Usage: ;jinx &lt;subcommand&gt; [&lt;args&gt;...] [options]
 
-        Repo commands:
-          repo list                                        list all currently known repositories
-          repo add    {repo:name} {repo:url}               add a repository from an http url
-          repo info   {repo:name}                          show detailed info about a specific repo
-          repo rm     {repo:name}                          remove a repository by name
-          repo change {repo:name} {repo:url}               changes the url for a given repo
+        Asset Commands:
+          list                                             list all available assets
+          info    &lt;name&gt;                                  show details about an asset
+          install &lt;name&gt;                                  install an asset
+          update  &lt;name&gt;                                  update an installed asset
+          search  &lt;pattern&gt;                               search for assets by name pattern
+          auto-update                                      check and update all installed assets
 
-        Script commands:
-          script list                                      list all currently known scripts
-          script info    {script:name}                     shows known info about a remote script
-          script install {script:name}                     attempt to install a script
-          script update  {script:name}                     attempts to update an installed script
-          script search  {pattern}                         searches for any script matching the pattern
+        Repository Commands:
+          repo list                                        list all configured repositories
+          repo add    &lt;name&gt; &lt;url&gt;                        add a new repository
+          repo info   &lt;name&gt;                              show repository details
+          repo rm     &lt;name&gt;                              remove a repository
+          repo change &lt;name&gt; &lt;url&gt;                        change repository URL
 
-        Data commands:
-          data list                                        list all currently known data files
-          data info    {datafile:name}                     shows known info about a remote data file
-          data install {datafile:name}                     attempt to install a data file
-          data update  {datafile:name}                     attempts to update an installed data file
-          data search  {pattern}                           searches for data files matching the pattern
+        Options:
+          --repo=&lt;name&gt;                                   target a specific repository
+          --type={script|data|engine}                      override auto-detected asset type
+          --force                                           overwrite without confirmation
+          --dry-run                                         check for updates without installing
 
-        Engine commands:
-          engine list                                      list all currently known scripting engines
-          engine update {engine:name}                      attempts to update your scripting engine
+        Examples:
+          ;jinx install go2                                install the go2 script
+          ;jinx update spell-list.xml                      update spell data file
+          ;jinx search map                                 find all assets with "map" in the name
+          ;jinx install go2 --repo=core                    install from specific repository
+          ;jinx auto-update                                check and update all installed assets
+          ;jinx auto-update --dry-run                      preview available updates without installing
 
-        Script, data, and engine commands all take an optional --repo={repo:name} argument to perform
-        the action on a specified repo. Without the argument, the action will be attempted on all
-        repos that have been added.
+        Notes:
+          - Asset type (script/data/engine) is automatically detected from repository metadata
+          - Use --type flag only when you need to override the auto-detection
+          - Use --repo flag when the same asset exists in multiple repositories
+          - Legacy namespaced commands (script/data/engine) are still supported for compatibility
 
       HELP
     end
@@ -1135,6 +1486,117 @@ module Jinx
       sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
       env = defined?(Urnon) ? Jinx::UrnonEngine : Jinx::LichEngine
       env.install(engine, sources, overwrite: true, force: force)
+    end
+
+    # === NEW UNIFIED COMMAND IMPLEMENTATIONS ===
+
+    def self.list_all(repo_name = nil)
+      Repo
+        .select { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+        .map    { |repo| repo.merge(Repo.manifest(repo)) }
+        .each   { |repo|
+          Repo.dump(repo, scripts: true, data: true, engines: true)
+        }
+    end
+
+    def self.smart_info(asset_name, repo_name = nil)
+      repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      matches = Lookup.find_asset_across_repos(asset_name, repos)
+
+      if matches.empty?
+        Log.mono <<~ERROR
+          No asset named '#{asset_name}' found.
+
+          Try:
+          - ;jinx search #{asset_name}    to find similar names
+          - ;jinx list                    to see all available assets
+        ERROR
+        return
+      end
+
+      if matches.size > 1 && repo_name.nil?
+        Log.mono "<b>Asset '#{asset_name}' found in multiple repositories:</b>"
+        matches.each do |match|
+          type_str = match[:asset][:type] || "script"
+          Log.mono "  #{match[:repo][:name]} (type: #{type_str})"
+        end
+        Log.mono "\nSpecify a repository with --repo=<name> to see specific info"
+        return
+      end
+
+      match = matches.first
+      asset = match[:asset]
+      repo = match[:repo]
+      type_str = asset[:type] || "script"
+
+      Log.mono("<b>%s (repo: %s, type: %s, modified: %s)</b>" %
+        [asset_name, repo[:name], type_str,
+         Util.ago(asset[:last_commit]) + " ago"])
+
+      if asset[:header]
+        Log.mono Repo.header(repo, asset)
+      else
+        Log.mono "no documentation"
+      end
+    end
+
+    def self.smart_install(asset_name, repo_name = nil, force: false, type: nil)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      SmartInstaller.install(asset_name, sources, overwrite: false, force: force, type: type)
+    end
+
+    def self.smart_update(asset_name, repo_name = nil, force: false, type: nil)
+      sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+      SmartInstaller.install(asset_name, sources, overwrite: true, force: force, type: type)
+    end
+
+    def self.search_all(pattern, repo_name = nil)
+      pattern = Regexp.compile(pattern)
+      candidate_repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+
+      all_matches = []
+
+      candidate_repos.each do |repo|
+        Repo.manifest(repo)
+        next unless repo[:available].is_a?(Array)
+
+        repo[:available].each do |asset|
+          if File.basename(asset[:file]) =~ pattern
+            type_str = asset[:type] || "script"
+            all_matches << {
+              repo: repo[:name],
+              file: File.basename(asset[:file]),
+              type: type_str,
+              last_commit: asset[:last_commit]
+            }
+          end
+        end
+      end
+
+      if all_matches.empty?
+        Log.mono "<b>No matches found for pattern: #{pattern.source}</b>"
+        return
+      end
+
+      # Group by type
+      by_type = all_matches.group_by { |m| m[:type] }
+
+      Log.mono "<b>Found #{all_matches.size} #{all_matches.size == 1 ? "match" : "matches"}:</b>"
+
+      by_type.each do |type, matches|
+        Log.mono "\n<b>#{type.capitalize}s:</b>"
+        matches.sort_by { |m| m[:file] }.each do |match|
+          Log.mono "%s> %s (updated: %s ago)" % [
+            match[:repo].to_s.rjust(15),
+            match[:file].ljust(25),
+            Util.ago(match[:last_commit])
+          ]
+        end
+      end
+    end
+
+    def self.auto_update(force: false, dry_run: false)
+      AutoUpdater.update_all(force: force, dry_run: dry_run)
     end
   end
 end
