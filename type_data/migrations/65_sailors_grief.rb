@@ -21,10 +21,12 @@ end
 
 migrate :gem, :gemshop do
   insert(:name, %{asymmetrical rough grey pearl})
+  insert(:name, %{banana yellow citrine})
   insert(:name, %{banded mauve sugar stone})
   insert(:name, %{blue-veined volcanic obsidian})
   insert(:name, %{blue-whorled greenish ocean jasper})
   insert(:name, %{cabochon of striated grape jade})
+  insert(:name, %{chunk of indigo seaglass})
   insert(:name, %{clouded cream orange pearl})
   insert(:name, %{copper-veined royal azel})
   insert(:name, %{cracked shell-infused geode})
@@ -46,6 +48,7 @@ migrate :gem, :gemshop do
   insert(:name, %{smooth dolphin stone disc})
   insert(:name, %{tiny cut ametrine})
   insert(:name, %{uncut sanguine pyrope})
+  insert(:name, %{vibrant ocean jasper cabochon})
   insert(:name, %{volcanic blue larimar stone})
   insert(:name, %{whorled jungle malachite})
 end
