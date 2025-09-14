@@ -13,36 +13,41 @@
   contributors: Nisugi
           game: Gemstone
           tags: hunting, combat, tracking, gemstones, jewels, dust, klocks, data
-       version: 2.5
+       version: 2.6
 
 Change Log:
-  v2.5
-    - change non-ascii compatible character to ascii
-  v2.4
-    - comment out server response from google sheets on send
-  v2.3
-    - convert old string to int on load
-    - added way to backdate weekly reset
-  v2.2
-    - cross character eligibilty tracking ;kt eligible
-    - save data every 5 min (people crash a lot?)
-  v2.1
-    - added way to correct weekly/montly found count
-    - added commas to large numbers
-    - migrate old dust search count to new format
-    - indicate how many weeks to show with gemstone report ;kt gemstone report 4
-  v2.0
-    - added monthly/weekly gemstone tracking
-    - added weekly dust tracking
-    - corrected report outputs
-    - option to submit finds to external spreadsheet
+  v2.7 (2025-09-14)
+    - Sailor's Grief creatures added.
+  v2.6 (2025-08-23)
+    - Major performance optimizations: adaptive sleep (5x faster when idle)
+    - Fixed eligibility system: only count searches when truly eligible for gems
+    - Simplified timezone handling: all displays now in Eastern Time with "(ET)" labels
+    - Improved cross-character eligibility: fixed logic, added stale data cleanup
+    - Enhanced reports: removed redundant calculations, clearer column headers
+    - Optimized backup system: reduced unnecessary backup creation
+    - Added robust reset validation: prevents invalid reset times, handles multi-week gaps
+    - Fixed eligibility debugging: added debug mode for troubleshooting reset issues
+    - Code cleanup: removed unused none_found field and related tracking
+    - Removed dead code: unused jewel cost calculations, gem target methods
+    - Removed dangerous back_date_reset functionality
+    - Simplified weekly reset logic after removing non-eligible tracking
+    - Enhanced weekly status to show "Eligible (1st/2nd/3rd)" or just "Ineligible"
+    - Eligible Since now only shows date when eligible, otherwise shows "Ineligible"
+    - Removed unused last_weekly_event_searches field
+    - Kept migration code for backwards compatibility
+    - Added data backup/restore functionality
+    - Fixed missing calculate_monthly_eligible_searches method
+    - Added comprehensive error handling
+    - Standardized all timestamps as integers
+    - Added data validation before saves
+    - Made weekly resets atomic to prevent data loss
 =end
 
 no_kill_all
 no_pause_all
 
 module Killtracker
-  ['yaml', 'terminal-table', 'time', 'rubygems', 'rubygems/dependency_installer', 'net/http', 'json', 'digest'].each(&method(:require))
+  ['yaml', 'terminal-table', 'time', 'rubygems', 'rubygems/dependency_installer', 'net/http', 'json', 'digest', 'fileutils'].each(&method(:require))
 
   installer = Gem::DependencyInstaller.new({ :user_install => true, :document => nil })
   installed_gems = Gem::Specification.map { |gem| gem.name }.sort.uniq
@@ -65,56 +70,381 @@ module Killtracker
     exit
   end
 
+  # Initialize paths immediately
   @filename = File.join(DATA_DIR, XMLData.game, Char.name, "Killtracker.yaml")
-  if File.exist?(@filename)
-    $killtracker = YAML.load_file(@filename)
-  end
-  $killtracker                              ||= {}
-  $killtracker[:creature]                   ||= "none"
-  $killtracker[:ascension_searches]         ||= 0
-  $killtracker[:weekly_ascension_searches]  ||= 0
-  $killtracker[:searches_since_jewel]       ||= 0
-  $killtracker[:searches_since_dust]        ||= 0
-  $killtracker[:jewel_found]                ||= {}
-  $killtracker[:dust_found]                 ||= {}
-  $killtracker[:none_found]                 ||= {}
-  $killtracker[:silent]                       = true if $killtracker[:silent].nil?
-  $killtracker[:monthly_gemstones]          ||= 0
-  $killtracker[:weekly_gemstone]            ||= 0
-  $killtracker[:weekly_dust]                ||= 0
-  $killtracker[:last_month_reset]           ||= TZInfo::Timezone.get("America/New_York").now.month
-  $killtracker[:last_week_reset]            ||= 0
-  $killtracker[:cached_reset_time]          ||= 0
+  @backup_dir = File.join(DATA_DIR, XMLData.game, Char.name, "Killtracker_backups")
 
-  # migrate legacy dust count to newer format
-  if $killtracker[:dust_found]
-    $killtracker[:dust_found].each do |_, ev|
-      if ev.key?(:searches)
-        ev[:searches_since] = ev.delete(:searches)
+  # Initialize data
+  def self.initialize_data
+    FileUtils.mkdir_p(@backup_dir) unless File.directory?(@backup_dir)
+
+    if File.exist?(@filename)
+      begin
+        $killtracker = YAML.load_file(@filename)
+
+        # Only create initial_load backup if it doesn't exist
+        initial_backup = File.join(@backup_dir, "initial_load.yaml")
+        unless File.exist?(initial_backup)
+          File.write(initial_backup, $killtracker.to_yaml)
+        end
+      rescue => e
+        echo "Error loading Killtracker data: #{e.message}"
+        echo "Attempting to restore from latest backup..."
+        restore_latest_backup
       end
     end
+
+    # Initialize all data structures
+    $killtracker                              ||= {}
+    $killtracker[:creature]                   ||= "none"
+    $killtracker[:weekly_ascension_searches]  ||= 0
+    $killtracker[:monthly_ascension_searches] ||= 0
+    $killtracker[:searches_since_jewel]       ||= 0
+    $killtracker[:searches_since_dust]        ||= 0
+    $killtracker[:jewel_found]                ||= {}
+    $killtracker[:dust_found]                 ||= {}
+    $killtracker[:silent]                       = true if $killtracker[:silent].nil?
+    $killtracker[:monthly_gemstones]          ||= 0
+    $killtracker[:weekly_gemstone]            ||= 0
+    $killtracker[:weekly_dust]                ||= 0
+    $killtracker[:last_month_reset]           ||= TZInfo::Timezone.get("America/New_York").now.month
+    $killtracker[:last_week_reset]            ||= 0
+    $killtracker[:cached_reset_time]          ||= 0
+    $killtracker[:weekly_counts]              ||= {}
+    $killtracker[:jewel_found_this_week]      ||= false
+    $killtracker[:debug_eligibility]          ||= false
   end
-  # fix my other mistake of saving to string .. can pull these out in a week or two.
-  if $killtracker[:jewel_found]
-    $killtracker[:jewel_found].each do |_, ev|
-      if ev.key?(:searches_week)
-        ev[:searches_week] = ev[:searches_week].to_i
+
+  def self.create_backup(reason = "manual")
+    timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
+    backup_file = File.join(@backup_dir, "Killtracker_#{timestamp}_#{reason}.yaml")
+
+    begin
+      File.write(backup_file, $killtracker.to_yaml)
+
+      backups = Dir.glob(File.join(@backup_dir, "Killtracker_*.yaml")).sort
+      if backups.length > 10
+        backups[0...-10].each { |f| File.delete(f) rescue nil }
       end
+
+      return backup_file
+    rescue => e
+      echo "Warning: Failed to create backup: #{e.message}"
+      return nil
+    end
+  end
+
+  def self.restore_latest_backup
+    backups = Dir.glob(File.join(@backup_dir, "Killtracker_*.yaml")).sort
+    if backups.empty?
+      echo "No backups found to restore from."
+      return false
+    end
+
+    latest_backup = backups.last
+    begin
+      $killtracker = YAML.load_file(latest_backup)
+      echo "Successfully restored from backup: #{File.basename(latest_backup)}"
+      save(true)
+      return true
+    rescue => e
+      echo "Failed to restore from backup: #{e.message}"
+      return false
     end
   end
 
   def self.save(force = false)
-    @old_data       ||= Marshal.load(Marshal.dump($killtracker))
+    @last_save_hash ||= 0
     @next_save_time ||= 0
 
     unless force
-      return if @old_data == $killtracker
+      current_hash = $killtracker.hash
+      return if @last_save_hash == current_hash
       return if Time.now.to_i <= @next_save_time
     end
 
-    File.write(@filename, $killtracker.to_yaml)
-    @next_save_time = Time.now.to_i + 300
-    @old_data = Marshal.load(Marshal.dump($killtracker))
+    errors = validate_data
+    if errors.any?
+      echo "WARNING: Data validation errors found:"
+      errors.each { |e| echo "  - #{e}" }
+      echo "Creating backup before save..."
+      create_backup("validation_errors")
+    end
+
+    begin
+      File.write(@filename, $killtracker.to_yaml)
+      @next_save_time = Time.now.to_i + 300
+      @last_save_hash = $killtracker.hash
+    rescue => e
+      echo "Error saving data: #{e.message}"
+      echo "Data remains in memory but was not saved to disk."
+    end
+  end
+
+  def self.migrate_legacy_data
+    # Check if migration is actually needed
+    needs_migration = false
+
+    # Check for string keys that need to be converted to integers
+    [$killtracker[:jewel_found], $killtracker[:dust_found]].each do |events|
+      next unless events
+      if events.keys.any? { |k| k.is_a?(String) }
+        needs_migration = true
+        break
+      end
+    end
+
+    # Check for old :searches key that needs to be renamed
+    if $killtracker[:dust_found]
+      $killtracker[:dust_found].each do |_, ev|
+        if ev.key?(:searches)
+          needs_migration = true
+          break
+        end
+      end
+    end
+
+    # Check for deprecated :ascension_searches key
+    if $killtracker.key?(:ascension_searches)
+      needs_migration = true
+    end
+
+    return unless needs_migration
+
+    echo "Legacy data detected, performing migration..."
+    create_backup("pre_migration")
+
+    begin
+      if $killtracker[:dust_found]
+        dust_string_keys = $killtracker[:dust_found].keys.select { |k| k.is_a?(String) }
+        dust_string_keys.each do |str_key|
+          $killtracker[:dust_found][str_key.to_i] = $killtracker[:dust_found][str_key]
+          $killtracker[:dust_found].delete(str_key)
+        end
+
+        $killtracker[:dust_found].each do |_key, ev|
+          if ev.key?(:searches)
+            ev[:searches_since] = ev.delete(:searches)
+          end
+        end
+      end
+
+      [$killtracker[:jewel_found], $killtracker[:dust_found]].each do |events|
+        next unless events
+
+        string_keys = events.keys.select { |k| k.is_a?(String) }
+        string_keys.each do |str_key|
+          events[str_key.to_i] = events[str_key]
+          events.delete(str_key)
+        end
+
+        events.each do |_, ev|
+          ev[:searches_week] = ev[:searches_week].to_i if ev[:searches_week]
+          ev[:searches_since] = ev[:searches_since].to_i if ev[:searches_since]
+          ev[:room] = ev[:room].to_s if ev[:room]
+        end
+      end
+
+      [:weekly_ascension_searches, :monthly_ascension_searches, :searches_since_jewel,
+       :searches_since_dust, :monthly_gemstones, :weekly_gemstone, :weekly_dust].each do |key|
+        $killtracker[key] = $killtracker[key].to_i if $killtracker[key]
+      end
+
+      $killtracker.delete(:ascension_searches)
+
+      echo "Data migration completed successfully."
+    rescue => e
+      echo "Error during migration: #{e.message}"
+      echo "Restoring from pre-migration backup..."
+      restore_latest_backup
+    end
+  end
+
+  # Time utilities
+  def self.get_eastern_tz
+    TZInfo::Timezone.get("America/New_York")
+  end
+
+  def self.format_time_eastern(timestamp)
+    eastern_tz = get_eastern_tz
+    time_et = eastern_tz.to_local(Time.at(timestamp))
+    time_et.strftime("%m/%d %H:%M ET")
+  end
+
+  def self.get_next_reset_time
+    eastern = get_eastern_tz
+    now_est = eastern.now
+
+    days_since_sunday = now_est.wday
+    last_sunday_midnight_est = eastern.local_time(now_est.year, now_est.month, now_est.day, 0, 0, 0) - (days_since_sunday * 86400)
+    next_reset_est = last_sunday_midnight_est + (7 * 86400)
+    next_reset_est.to_i
+  end
+
+  def self.calculate_week_end_timestamp(week_num)
+    tz = get_eastern_tz
+    current_year = tz.now.year
+
+    jan_1 = tz.local_time(current_year, 1, 1)
+    week_start = jan_1 + (week_num * 7 - jan_1.wday) * 86400
+    week_end = week_start + (6 * 86400) + (23 * 3600) + (59 * 60) + 59
+
+    week_end.to_i
+  end
+
+  def self.get_next_reset_local_time
+    $killtracker[:cached_reset_time] = get_next_reset_time
+  end
+
+  def self.maybe_reset_weekly_counter
+    get_next_reset_local_time if $killtracker[:cached_reset_time] == 0
+    eastern = get_eastern_tz
+    $killtracker[:weekly_counts] ||= {}
+
+    current_time = Time.now.to_i
+    reset_time = $killtracker[:cached_reset_time]
+
+    # Validate reset time is reasonable (not too far in future/past)
+    if reset_time > 0 && (reset_time - current_time).abs > (14 * 86400) # More than 2 weeks off
+      echo "Warning: Reset time seems invalid (#{Time.at(reset_time)}), recalculating..."
+      get_next_reset_local_time
+      reset_time = $killtracker[:cached_reset_time]
+    end
+
+    # Process all missed resets (in case system was offline for multiple weeks)
+    while current_time >= reset_time && ($killtracker[:last_week_reset] == 0 || $killtracker[:last_week_reset] < reset_time)
+      create_backup("weekly_reset")
+
+      begin
+        finished_week = eastern.to_local(Time.at($killtracker[:cached_reset_time] - 7 * 86400)).strftime("%U").to_i
+
+        total_this_week = $killtracker[:weekly_ascension_searches].to_i
+        weekly_dust = $killtracker[:weekly_dust].to_i
+        weekly_gemstone = $killtracker[:weekly_gemstone].to_i
+
+        $killtracker[:weekly_counts][:"week_#{finished_week}_ascension_searches"] = total_this_week
+        $killtracker[:weekly_counts][:"week_#{finished_week}_dust"] = weekly_dust
+        $killtracker[:weekly_counts][:"week_#{finished_week}_gemstone"] = weekly_gemstone
+
+        $killtracker[:monthly_ascension_searches] += total_this_week
+
+        $killtracker[:weekly_ascension_searches] = 0
+        $killtracker[:weekly_gemstone] = 0
+        $killtracker[:weekly_dust] = 0
+        $killtracker[:jewel_found_this_week] = false
+        $killtracker[:last_week_reset] = $killtracker[:cached_reset_time]
+
+        get_next_reset_local_time
+
+        # Validate eligibility state after reset
+        if $killtracker[:debug_eligibility]
+          echo "Post-reset eligibility check:"
+          currently_eligible?
+        end
+
+        echo "Weekly reset completed successfully for week #{finished_week}"
+        save(true)
+      rescue => e
+        echo "Error during weekly reset: #{e.message}"
+        echo "Restoring from backup..."
+        restore_latest_backup
+        break
+      end
+    end
+  end
+
+  def self.maybe_reset_monthly_counter
+    est = get_eastern_tz
+    current_month = est.now.month
+    current_year = est.now.year
+
+    if current_month != $killtracker[:last_month_reset]
+      create_backup("monthly_reset")
+
+      $killtracker[:monthly_gemstones] = 0
+      $killtracker[:monthly_ascension_searches] = 0
+      $killtracker[:last_month_reset] = current_month
+
+      echo "Monthly reset completed for month #{current_month}"
+      save(true)
+    end
+
+    gems_this_month = 0
+    $killtracker[:jewel_found].each do |timestamp, _|
+      next unless timestamp.is_a?(Integer)
+      jewel_time = est.to_local(Time.at(timestamp))
+      if jewel_time.month == current_month && jewel_time.year == current_year
+        gems_this_month += 1
+      end
+    end
+
+    if gems_this_month != $killtracker[:monthly_gemstones]
+      echo "Correcting monthly gemstone count: #{$killtracker[:monthly_gemstones]} -> #{gems_this_month}"
+      $killtracker[:monthly_gemstones] = gems_this_month
+    end
+  end
+
+  def self.backfill_counters
+    tz = get_eastern_tz
+    now = tz.now
+    current_week  = now.strftime("%U").to_i
+    current_month = now.month
+    current_year = now.year
+
+    create_backup("pre_backfill")
+
+    begin
+      $killtracker[:weekly_gemstone]   = 0
+      $killtracker[:monthly_gemstones] = 0
+      $killtracker[:weekly_dust]       = 0
+      $killtracker[:monthly_ascension_searches] = 0
+      $killtracker[:jewel_found_this_week] = false
+
+      $killtracker[:jewel_found].each do |key, _|
+        next unless key.is_a?(Integer)
+        local = tz.to_local(Time.at(key))
+
+        if local.strftime("%U").to_i == current_week && local.year == current_year
+          $killtracker[:weekly_gemstone] += 1
+          $killtracker[:jewel_found_this_week] = true
+          echo "  Found jewel in current week at #{local.strftime('%m/%d %H:%M')}"
+        end
+
+        if local.year == current_year && local.month == current_month
+          $killtracker[:monthly_gemstones] += 1
+        end
+      end
+
+      $killtracker[:dust_found].each do |key, _|
+        next unless key.is_a?(Integer)
+        local = tz.to_local(Time.at(key))
+        if local.strftime("%U").to_i == current_week && local.year == current_year
+          $killtracker[:weekly_dust] += 1
+        end
+      end
+
+      $killtracker[:weekly_counts].each do |week_key, searches|
+        next unless week_key.to_s.include?('ascension_searches')
+        next unless searches.is_a?(Integer)
+
+        week_num = week_key.to_s.match(/week_(\d+)_/)[1].to_i
+        week_start_time = calculate_week_end_timestamp(week_num) - (6 * 86400)
+        week_start_local = tz.to_local(Time.at(week_start_time))
+
+        if week_start_local.year == current_year && week_start_local.month == current_month
+          $killtracker[:monthly_ascension_searches] += searches
+        end
+      end
+
+      update_eligibility
+      respond("Counters successfully recalculated.")
+      respond("  Weekly gems: #{$killtracker[:weekly_gemstone]}, Monthly gems: #{$killtracker[:monthly_gemstones]}")
+      respond("  Jewel found this week: #{$killtracker[:jewel_found_this_week]}")
+    rescue => e
+      respond("Error during backfill: #{e.message}")
+      respond("Restoring from backup...")
+      restore_latest_backup
+    end
   end
 
   def self.help
@@ -128,221 +458,511 @@ module Killtracker
     respond(";kt dust report        - find report of all dust")
     respond(";kt fix find count     - fixes monthly/weekly gemstone count in summary")
     respond(";kt save               - force search data to be saved to file")
+    respond(";kt backup             - create a manual backup of current data")
+    respond(";kt restore backup     - restore from the latest backup")
+    respond(";kt validate           - check data integrity")
     respond("")
     respond(";kt submit finds       - Pushes jewel and dust find to google sheets.")
     respond("   https://docs.google.com/spreadsheets/d/1IOLs8AGRR45Kr6Y9nz6CXlMVBKYR7cHLaz0jjAbjMv0")
   end
 
-  def self.dust_report
-    tz     = TZInfo::Timezone.get("America/New_York")
-    events = $killtracker[:dust_found].sort_by { |key, _| key.to_i }
+  # Report methods
+  def self.summary_report
+    begin
+      gems_total      = $killtracker[:jewel_found].size
+      dust_total      = $killtracker[:dust_found].size
 
-    rows = events.map do |key, ev|
-      time_str = tz.to_local(Time.at(key.to_i)).strftime("%m/%d %H:%M:%S")
-      searches = (ev[:searches_week] || 0).with_commas
-      creature = ev[:creature] || ""
-      room     = ev[:room] || ""
-      name     = ev[:name] || ""
-      [time_str, searches, creature, room, name]
+      weekly_searches = $killtracker[:weekly_ascension_searches].to_i
+      monthly_searches = calculate_monthly_eligible_searches
+      gems_this_week  = $killtracker[:weekly_gemstone].to_i
+      dust_this_week  = $killtracker[:weekly_dust].to_i
+      gems_this_month = $killtracker[:monthly_gemstones].to_i
+
+      since_last_gem   = $killtracker[:searches_since_jewel].to_i
+      since_last_dust  = $killtracker[:searches_since_dust].to_i
+
+      total_searches_for_gems = $killtracker[:jewel_found].values
+                                                          .map { |ev| ev[:searches_week].to_i }
+                                                          .sum
+
+      total_searches_for_dust = $killtracker[:dust_found].values
+                                                         .map { |ev| ev[:searches_week].to_i }
+                                                         .sum
+
+      avg_per_gem  = gems_total > 0 ? (total_searches_for_gems.to_f  / gems_total).round : 0
+      avg_per_dust = dust_total > 0 ? (total_searches_for_dust.to_f  / dust_total).round : 0
+
+      remaining_gems = [0, 3 - gems_this_month].max
+
+      # Determine weekly status with gem number
+      if currently_eligible?
+        gem_number = gems_this_month + 1
+        ordinal = case gem_number
+                  when 1 then "1st"
+                  when 2 then "2nd"
+                  when 3 then "3rd"
+                  end
+        weekly_status = "Eligible (#{ordinal})"
+        eligible_since = get_eligible_since_time
+      else
+        weekly_status = "Ineligible"
+        eligible_since = "Ineligible"
+      end
+
+      rows = [
+        ["Searches This Week", weekly_searches.with_commas],
+        ["Eligible This Month", monthly_searches.with_commas],
+        [],
+        ["Weekly Status", weekly_status],
+        ["Eligible Since", eligible_since],
+        [],
+        ["Gemstones Found (all)", gems_total.with_commas],
+        [" This Week", gems_this_week],
+        [" This Month", gems_this_month],
+        [" Remaining This Month", remaining_gems],
+        [" Avg Searches/Gem", avg_per_gem.with_commas],
+        [],
+        ["Dust Found (all)", dust_total.with_commas],
+        [" This Week", dust_this_week],
+        [" Avg Searches/Dust", avg_per_dust.with_commas],
+        [],
+        ["Since Last Gem", since_last_gem.with_commas],
+        ["Since Last Dust", since_last_dust.with_commas],
+      ]
+
+      table = Terminal::Table.new(
+        title: "Killtracker Summary",
+        headings: ["Metric", "Count"],
+        rows: rows
+      )
+
+      respond table.to_s
+    rescue => e
+      respond "Error generating summary report: #{e.message}"
+      respond "Run ;kt validate to check data integrity"
     end
+  end
 
-    title = "Detailed Dust Report: #{$killtracker[:dust_found].size} Dust over #{$killtracker[:ascension_searches]} Searches"
-    table = Terminal::Table.new(
-      title: title,
-      headings: ["Time", "Searches", "Creature", "Room", "Name"],
-      rows: rows
-    )
+  def self.dust_report
+    begin
+      events = $killtracker[:dust_found].sort_by { |key, _| key.to_i }
 
-    respond table.to_s
+      rows = events.map do |key, ev|
+        time_str = format_time_eastern(key.to_i)
+        searches = (ev[:searches_week] || 0).with_commas
+        creature = ev[:creature] || ""
+        room     = ev[:room] || ""
+        name     = ev[:name] || ""
+        [time_str, searches, creature, room, name]
+      end
+
+      title = "Detailed Dust Report: #{$killtracker[:dust_found].size} Dust over #{calculate_total_searches.with_commas} Searches"
+      table = Terminal::Table.new(
+        title: title,
+        headings: ["Time", "Searches", "Creature", "Room", "Name"],
+        rows: rows
+      )
+
+      respond table.to_s
+    rescue => e
+      respond "Error generating dust report: #{e.message}"
+    end
   end
 
   def self.jewel_report
-    tz     = TZInfo::Timezone.get("America/New_York")
-    events = $killtracker[:jewel_found].sort_by { |key, _| key.to_i }
+    begin
+      events = $killtracker[:jewel_found].sort_by { |key, _| key.to_i }
 
-    total_searches_for_gems = events.map { |_, ev| ev[:searches_week].to_i }
-                                    .sum
+      total_searches_for_gems = events.map { |_, ev| ev[:searches_week].to_i }.sum
 
-    rows = events.map do |key, ev|
-      time_str = tz.to_local(Time.at(key.to_i)).strftime("%m/%d %H:%M:%S")
-      searches = (ev[:searches_week] || 0).with_commas
-      creature = ev[:creature] || ""
-      room     = ev[:room] || ""
-      name     = ev[:name] || ""
-      [time_str, searches, creature, room, name]
+      rows = events.map do |key, ev|
+        time_str = format_time_eastern(key.to_i)
+        since_last_jewel = (ev[:searches_since] || 0).with_commas
+        jewel_num = determine_jewel_number(key.to_i)
+        creature = ev[:creature] || ""
+        room     = ev[:room] || ""
+        name     = ev[:name] || ""
+        [time_str, jewel_num, since_last_jewel, creature, room, name]
+      end
+
+      title = "Detailed Jewel Report: #{$killtracker[:jewel_found].size} Jewels over #{total_searches_for_gems.with_commas} Eligible Searches"
+      table = Terminal::Table.new(
+        title: title,
+        headings: ["Time", "Jewel#", "Since Last Jewel", "Creature", "Room", "Name"],
+        rows: rows
+      )
+
+      respond table.to_s
+    rescue => e
+      respond "Error generating jewel report: #{e.message}"
     end
-
-    title = "Detailed Jewel Report: #{$killtracker[:jewel_found].size} Jewels over #{total_searches_for_gems} Searches"
-    table = Terminal::Table.new(
-      title: title,
-      headings: ["Time", "Searches", "Creature", "Room", "Name"],
-      rows: rows
-    )
-
-    respond table.to_s
-  end
-
-  def self.summary_report
-    # overall counts
-    gems_total      = $killtracker[:jewel_found].size
-    dust_total      = $killtracker[:dust_found].size
-
-    # weekly/monthly buckets
-    weekly_searches = $killtracker[:weekly_ascension_searches]
-    gems_this_week  = $killtracker[:weekly_gemstone] || 0
-    dust_this_week  = $killtracker[:weekly_dust]     || 0
-    gems_this_month = $killtracker[:monthly_gemstones] || 0
-
-    # since-last counters
-    since_last_gem  = $killtracker[:searches_since_jewel]
-    since_last_dust = $killtracker[:searches_since_dust]
-
-    # compute sum of searches_week across all gem events
-    total_searches_for_gems = $killtracker[:jewel_found].values
-                                                        .map { |ev| ev[:searches_week].to_i }
-                                                        .sum
-
-    # compute sum of searches_week across all dust events
-    total_searches_for_dust = $killtracker[:dust_found].values
-                                                       .map { |ev| ev[:searches_week].to_i }
-                                                       .sum
-
-    # averages
-    avg_per_gem  = gems_total > 0 ? (total_searches_for_gems.to_f  / gems_total).round : 0
-    avg_per_dust = dust_total > 0 ? (total_searches_for_dust.to_f  / dust_total).round : 0
-
-    # remaining gems this month (max 3)
-    remaining_gems = [0, 3 - gems_this_month].max
-
-    rows = [
-      ["Searches This Week", weekly_searches.with_commas],
-      [],
-      ["Gemstones Found (all)", gems_total.with_commas],
-      [" This Week", gems_this_week],
-      [" This Month", gems_this_month],
-      [" Avg Searches/Gem", avg_per_gem.with_commas],
-      [" Remaining Gems", remaining_gems],
-      [],
-      ["Dust Found (all)", dust_total.with_commas],
-      [" This Week", dust_this_week],
-      [" Avg Searches/Dust", avg_per_dust.with_commas],
-      [],
-      ["Since Last Gem", since_last_gem.with_commas],
-      ["Since Last Dust", since_last_dust.with_commas],
-    ]
-
-    table = Terminal::Table.new(
-      title: "Killtracker Summary",
-      headings: ["Metric", "Count"],
-      rows: rows
-    )
-
-    respond table.to_s
   end
 
   def self.gemstones_report(weeks_back = nil)
-    tz = TZInfo::Timezone.get("America/New_York")
+    begin
+      tz = get_eastern_tz
 
-    combined = []
-    $killtracker[:jewel_found].each do |key, ev|
-      combined << ev.merge(
-        timestamp: key.to_i,
-        type: "Gemstone",
-        since: ev[:searches_since]
-      )
-    end
-    $killtracker[:dust_found].each do |key, ev|
-      combined << ev.merge(
-        timestamp: key.to_i,
-        type: "Dust",
-        since: ev[:searches_since]
-      )
-    end
-    $killtracker[:none_found].each do |key, ev|
-      combined << ev.merge(
-        timestamp: key.to_i,
-        type: "None",
-        since: ev[:searches_since]
-      )
-    end
+      combined = []
+      $killtracker[:jewel_found].each do |key, ev|
+        next unless key.is_a?(Integer) && ev.is_a?(Hash)
+        combined << ev.merge(
+          timestamp: key,
+          type: "Gemstone",
+          since: ev[:searches_since],
+          jewel_number: determine_jewel_number(key)
+        )
+      end
+      $killtracker[:dust_found].each do |key, ev|
+        next unless key.is_a?(Integer) && ev.is_a?(Hash)
+        combined << ev.merge(
+          timestamp: key,
+          type: "Dust",
+          since: ev[:searches_since]
+        )
+      end
 
-    events_by_week = combined.group_by do |ev|
-      tz.to_local(Time.at(ev[:timestamp])).strftime("%U").to_i
-    end
-    current_week = tz.to_local(Time.now).strftime("%U").to_i
+      events_by_week = combined.group_by do |ev|
+        tz.to_local(Time.at(ev[:timestamp])).strftime("%U").to_i
+      end
+      current_week = tz.to_local(Time.now).strftime("%U").to_i
 
-    if weeks_back
-      start_week = [0, current_week - (weeks_back - 1)].max
-      allowed_weeks = (start_week..current_week).to_a
-    else
-      allowed_weeks = events_by_week.keys
-    end
-
-    events_by_week.select { |wk, _| allowed_weeks.include?(wk) }
-                  .sort
-                  .each do |week_number, events|
-      if week_number == current_week
-        weekly_count = $killtracker[:weekly_ascension_searches]
+      if weeks_back
+        start_week = [0, current_week - (weeks_back - 1)].max
+        allowed_weeks = (start_week..current_week).to_a
       else
-        weekly_count = ($killtracker[:weekly_counts] && $killtracker[:weekly_counts][:"week_#{week_number}_ascension_searches"]) || 0
-      end
-      next if weekly_count == 0
-
-      title = "Week #{week_number} Gemstone Search Report: #{weekly_count.with_commas} Searches"
-      rows = events.sort_by { |ev| ev[:timestamp] }.map do |ev|
-        time_str = tz.to_local(Time.at(ev[:timestamp])).strftime("%m/%d %H:%M:%S")
-        [
-          time_str, # Time
-          ev[:type], # Type
-          (ev[:searches_week] || 0).with_commas, # Searches so far that week at event
-          (ev[:since] || 0).with_commas, # Searches since last find
-          ev[:creature], # Creature
-          ev[:name] # Name
-        ]
+        allowed_weeks = events_by_week.keys
       end
 
-      table = Terminal::Table.new(
-        title: title,
-        headings: ["Time", "Type", "Week", "Since", "Creature", "Name"],
-        rows: rows
-      )
-      respond table.to_s
+      events_by_week.select { |wk, _| allowed_weeks.include?(wk) }
+                    .sort
+                    .each do |week_number, events|
+        if week_number == current_week
+          weekly_count = $killtracker[:weekly_ascension_searches].to_i
+        else
+          weekly_count = ($killtracker[:weekly_counts] && $killtracker[:weekly_counts][:"week_#{week_number}_ascension_searches"]).to_i
+        end
+        next if weekly_count == 0
+
+        title = "Week #{week_number} Gemstone Search Report: #{weekly_count.with_commas} Searches"
+        rows = events.sort_by { |ev| ev[:timestamp] }.map do |ev|
+          time_str = format_time_eastern(ev[:timestamp])
+          type_display = ev[:type]
+          if ev[:type] == "Gemstone"
+            type_display = "Gem##{ev[:jewel_number]}"
+          end
+
+          [
+            time_str,
+            type_display,
+            (ev[:searches_week] || 0).with_commas,
+            (ev[:since] || 0).with_commas,
+            ev[:creature],
+            ev[:name]
+          ]
+        end
+
+        table = Terminal::Table.new(
+          title: title,
+          headings: ["Time", "Type", "Week Searches", "Since Last", "Creature", "Name"],
+          rows: rows
+        )
+        respond table.to_s
+      end
+    rescue => e
+      respond "Error generating gemstones report: #{e.message}"
     end
   end
 
   def self.eligibility_report(sort_key = nil)
-    update_eligibility
-    prof_mode = sort_key&.match?(/^(?:prof|profession)$/i)
-    if prof_mode
-      groups = @jewel_eligibility.values.group_by { |stats| stats[:profession] }
-      rows = groups.map do |prof, stats_list|
-        wk = stats_list.sum { |s| s[:weekly_gemstone].to_i }
-        mo = stats_list.sum { |s| s[:monthly_gemstones].to_i }
-        eligible = !(mo == 3 || wk == 1) ? "Yes" : "No"
-        [prof, eligible, wk, mo]
-      end
-      title    = "Jewel Eligibility Across Characters (by profession)"
-      headings = ["Prof", "Eligible", "Week", "Month"]
-    else
-      rows = @jewel_eligibility.map do |char, stats|
-        wk = stats[:weekly_gemstone].to_i
-        mo = stats[:monthly_gemstones].to_i
-        eligible = !(mo == 3 || wk == 1) ? "Yes" : "No"
-        [char, stats[:profession], eligible, wk, mo]
-      end
-      title    = "Jewel Eligibility Across Characters"
-      headings = ["Name", "Prof", "Eligible", "Week", "Month"]
-    end
-    rows.sort_by! { |r| r[0].downcase }
+    begin
+      update_eligibility
 
-    table = Terminal::Table.new(
-      title: title,
-      headings: headings,
-      rows: rows
-    )
-    respond table.to_s
+      eligibility_file = File.join(DATA_DIR, XMLData.game, "jewel_eligibility.yaml")
+      if File.exist?(eligibility_file)
+        @jewel_eligibility = YAML.load_file(eligibility_file) || {}
+      else
+        @jewel_eligibility = {}
+      end
+
+      prof_mode = sort_key&.match?(/^(?:prof|profession)$/i)
+      if prof_mode
+        groups = @jewel_eligibility.values.group_by { |stats| stats[:profession] }
+        rows = groups.map do |prof, stats_list|
+          wk = stats_list.sum { |s| s[:weekly_gemstone].to_i }
+          mo = stats_list.sum { |s| s[:monthly_gemstones].to_i }
+          eligible = (mo < 3 && wk == 0) ? "Yes" : "No"
+          [prof, eligible, wk, mo]
+        end
+        title    = "Jewel Eligibility Across Characters (by profession)"
+        headings = ["Prof", "Eligible", "Week", "Month"]
+      else
+        current_time = Time.now.to_i
+        rows = @jewel_eligibility.map do |char, stats|
+          wk = stats[:weekly_gemstone].to_i
+          mo = stats[:monthly_gemstones].to_i
+          eligible = (mo < 3 && wk == 0) ? "Yes" : "No"
+
+          # Add indicator for stale data (older than 24 hours)
+          last_updated = stats[:last_updated] || 0
+          stale_hours = (current_time - last_updated) / 3600.0
+          if stale_hours > 24
+            char_display = "#{char} (#{stale_hours.to_i}h old)"
+            eligible = "#{eligible}?" if eligible != "No" # Add ? for uncertainty
+          else
+            char_display = char
+          end
+
+          [char_display, stats[:profession], eligible, wk, mo]
+        end
+        title    = "Jewel Eligibility Across Characters"
+        headings = ["Name", "Prof", "Eligible", "Week", "Month"]
+      end
+      rows.sort_by! { |r| r[0].downcase }
+
+      table = Terminal::Table.new(
+        title: title,
+        headings: headings,
+        rows: rows
+      )
+      respond table.to_s
+    rescue => e
+      respond "Error generating eligibility report: #{e.message}"
+    end
   end
 
+  def self.send_to_sheet(ev_type, key)
+    begin
+      case ev_type
+      when "dust"
+        ev = $killtracker[:dust_found][key]
+      when "jewel"
+        ev = $killtracker[:jewel_found][key]
+      end
+      return unless ev
+
+      uri = URI("https://script.google.com/macros/s/AKfycbyltG_Eax1-CY4n1isy9U_ZRlKxD93Ai5XQqbF78Wq-4tIqtFirLjbVcgrd13T59e6z/exec")
+
+      user_id = Digest::SHA256.hexdigest([Char.name, Stats.race, Stats.prof].join('|'))
+
+      req = Net::HTTP::Post.new(uri.request_uri, 'Content-Type' => 'application/json')
+      req.body = {
+        timestamp: key,
+        type: ev_type,
+        searches_week: ev[:searches_week],
+        searches_since: ev[:searches_since],
+        creature: ev[:creature],
+        room: ev[:room],
+        name: ev[:name],
+        user: user_id
+      }.to_json
+
+      res = Net::HTTP.start(uri.host, uri.port, use_ssl: true) do |http|
+        http.request(req)
+      end
+
+      res.code.to_i
+    rescue => e
+      echo "!! send_to_sheet error: #{e.class}: #{e.message}"
+    end
+  end
+
+  def self.send_all_finds
+    respond("Sending found jewels...")
+    sent_jewels = 0
+    $killtracker[:jewel_found].each do |timestamp, _|
+      next unless timestamp.is_a?(Integer)
+      if send_to_sheet("jewel", timestamp)
+        sent_jewels += 1
+      end
+    end
+    respond("  Sent #{sent_jewels} jewel records")
+
+    respond("Sending found dust...")
+    sent_dust = 0
+    $killtracker[:dust_found].each do |timestamp, _|
+      next unless timestamp.is_a?(Integer)
+      if send_to_sheet("dust", timestamp)
+        sent_dust += 1
+      end
+    end
+    respond("  Sent #{sent_dust} dust records")
+
+    respond("Sending complete.")
+    respond("View the data at: https://docs.google.com/spreadsheets/d/1IOLs8AGRR45Kr6Y9nz6CXlMVBKYR7cHLaz0jjAbjMv0")
+    respond("")
+    respond("Please note, this is a special command and should only be ran once.")
+    respond("To continue submitting finds going forward please enable the feature: ;kt submit finds")
+  end
+
+  def self.calculate_total_searches
+    total = $killtracker[:weekly_counts].values.select { |v| v.is_a?(Integer) }.sum
+    total + $killtracker[:weekly_ascension_searches].to_i
+  end
+
+  def self.determine_jewel_number(jewel_timestamp)
+    begin
+      tz = get_eastern_tz
+      jewel_time = tz.to_local(Time.at(jewel_timestamp))
+      jewel_month = jewel_time.month
+      jewel_year = jewel_time.year
+
+      jewels_before = 0
+      $killtracker[:jewel_found].each do |timestamp, _|
+        next unless timestamp.is_a?(Integer)
+        ts_time = tz.to_local(Time.at(timestamp))
+        if ts_time.year == jewel_year && ts_time.month == jewel_month && timestamp < jewel_timestamp
+          jewels_before += 1
+        end
+      end
+
+      jewels_before + 1
+    rescue => e
+      echo "Error determining jewel number: #{e.message}"
+      return 0
+    end
+  end
+
+  def self.calculate_monthly_eligible_searches
+    # monthly_ascension_searches includes completed weeks from this month
+    # weekly_ascension_searches is the current incomplete week
+    monthly_total = $killtracker[:monthly_ascension_searches].to_i + $killtracker[:weekly_ascension_searches].to_i
+
+    if monthly_total < 0
+      echo "Warning: Monthly search total is negative (#{monthly_total}), resetting to current week"
+      monthly_total = $killtracker[:weekly_ascension_searches].to_i
+    end
+
+    monthly_total
+  end
+
+  def self.get_eligible_since_time
+    if $killtracker[:jewel_found_this_week]
+      # Will be eligible at next weekly reset
+      next_reset = get_next_reset_time
+      return format_time_eastern(next_reset)
+    end
+
+    # Find the most recent jewel
+    last_jewel_time = nil
+    $killtracker[:jewel_found].each do |timestamp, _|
+      next unless timestamp.is_a?(Integer)
+      if last_jewel_time.nil? || timestamp > last_jewel_time
+        last_jewel_time = timestamp
+      end
+    end
+
+    if last_jewel_time
+      tz = get_eastern_tz
+      current_week = tz.now.strftime("%U").to_i
+      jewel_week = tz.to_local(Time.at(last_jewel_time)).strftime("%U").to_i
+
+      if jewel_week < current_week
+        # Eligible since start of this week
+        days_since_sunday = tz.now.wday
+        last_reset = tz.local_time(tz.now.year, tz.now.month, tz.now.day, 0, 0, 0) - (days_since_sunday * 86400)
+        return format_time_eastern(last_reset.to_i)
+      else
+        # Eligible since the jewel was found
+        return format_time_eastern(last_jewel_time)
+      end
+    else
+      return "Start of tracking"
+    end
+  end
+
+  def self.currently_eligible?
+    # Must satisfy BOTH weekly and monthly conditions
+    weekly_eligible = !$killtracker[:jewel_found_this_week]
+    monthly_eligible = $killtracker[:monthly_gemstones].to_i < 3
+
+    eligible = weekly_eligible && monthly_eligible
+
+    # Debug logging for troubleshooting
+    if $killtracker[:debug_eligibility]
+      echo "Eligibility Check:"
+      echo "  Weekly eligible: #{weekly_eligible} (found this week: #{$killtracker[:jewel_found_this_week]})"
+      echo "  Monthly eligible: #{monthly_eligible} (monthly gems: #{$killtracker[:monthly_gemstones]})"
+      echo "  Overall eligible: #{eligible}"
+    end
+
+    eligible
+  end
+
+  def self.update_eligibility
+    begin
+      @eligibility_file = File.join(DATA_DIR, XMLData.game, "jewel_eligibility.yaml")
+
+      File.open(@eligibility_file, File::RDWR | File::CREAT, 0644) do |f|
+        f.flock(File::LOCK_EX)
+        content = f.read
+        @jewel_eligibility = content.empty? ? {} : YAML.load(content) || {}
+
+        # Clean up stale entries (older than 7 days)
+        current_time = Time.now.to_i
+        @jewel_eligibility.delete_if do |char, data|
+          last_updated = data[:last_updated] || 0
+          stale = (current_time - last_updated) > (7 * 86400)
+          if stale && char != Char.name
+            echo "Removing stale eligibility data for #{char} (#{Time.at(last_updated)})" if $killtracker[:debug_eligibility]
+            true
+          else
+            false
+          end
+        end
+
+        @jewel_eligibility[Char.name] = {
+          profession: Stats.prof,
+          weekly_gemstone: $killtracker[:weekly_gemstone].to_i,
+          monthly_gemstones: $killtracker[:monthly_gemstones].to_i,
+          currently_eligible: currently_eligible?,
+          last_updated: current_time
+        }
+
+        f.rewind
+        f.write(@jewel_eligibility.to_yaml)
+        f.truncate(f.pos)
+      end
+    rescue => e
+      echo "Warning: Could not update eligibility file: #{e.message}"
+    end
+  end
+
+  def self.validate_data
+    errors = []
+
+    [:weekly_ascension_searches, :monthly_ascension_searches, :searches_since_jewel,
+     :searches_since_dust, :monthly_gemstones, :weekly_gemstone, :weekly_dust].each do |key|
+      if $killtracker[key] && $killtracker[key] < 0
+        errors << "#{key} is negative: #{$killtracker[key]}"
+      end
+    end
+
+    [$killtracker[:jewel_found], $killtracker[:dust_found]].each do |events|
+      next unless events
+      events.each do |timestamp, _data|
+        unless timestamp.is_a?(Integer)
+          errors << "Timestamp is not integer: #{timestamp.inspect} (#{timestamp.class})"
+          next
+        end
+
+        if timestamp < 1000000000 || timestamp > Time.now.to_i + 86400
+          errors << "Timestamp out of reasonable range: #{timestamp}"
+        end
+      end
+    end
+
+    if $killtracker[:monthly_gemstones] > 3
+      errors << "Monthly gemstones exceeds maximum: #{$killtracker[:monthly_gemstones]}"
+    end
+
+    if $killtracker[:weekly_gemstone] > 1
+      errors << "Weekly gemstone exceeds maximum: #{$killtracker[:weekly_gemstone]}"
+    end
+
+    errors
+  end
+
+  # Hook and command handling
   CMD_QUEUE = Queue.new
   REPORT_QUEUE = Queue.new
   DOWNSTREAM_HOOK_ID = "#{Script.current.name.downcase}::downstream"
@@ -354,7 +974,7 @@ module Killtracker
   EVIL_EYE_FLEE = %r{The <pushBold/><a exist="\d+" noun="[^"]+">(?<creature>[^<]+)</a><popBold/> turns and runs screaming into the distance, never to be seen again.}
 
   FOUND_DUST = %r{<pushBold/>You notice a scintillating mote of gemstone dust on the ground and gather it quickly.}
-  FOUND_GEMSTONE = %r{<pushBold/> \*\* A glint of light catches your eye, and you notice an? <a exist="\d+" noun="\w+">(?<name>[^<]+)</a> at your feet! \*\*}
+  FOUND_GEMSTONE = %r{<pushBold/> \*\* A glint of light catches your eye, and you notice an? <a exist="\d+" noun="\w+">(?<n>[^<]+)</a> at your feet! \*\*}
   ASCENSION_CREATURES = Regexp.union(
     %r{armored battle mastodon},
     %r{black valravn},
@@ -386,157 +1006,36 @@ module Killtracker
     %r{kiramon myrmidon},
     %r{kiramon stalker},
     %r{kiramon strandweaver},
-    %r{kresh ravager}
+    %r{kresh ravager},
+    %r{lightning whelk},
+    %r{needle-toothed trenchling},
+    %r{coral golem},
+    %r{stormborn primordial},
+    %r{charmed corsair},
+    %r{steelwing harpy},
+    %r{bilge mass},
+    %r{drowned mariner},
+    %r{revenant bucaneer},
+    %r{wraith shark},
+    %r{humpbacked merrow},
+    %r{fog-cloaked kelpie},
+    %r{kraken tentacle},
+    %r{needle-toothed trenchling},
+    %r{merrow oracle}
   )
-
-  def self.update_eligibility
-    # need to load from file each time to prevent over writing data
-    @eligibility_file = File.join(DATA_DIR, XMLData.game, "jewel_eligibility.yaml")
-    if File.exist?(@eligibility_file)
-      @jewel_eligibility = YAML.load_file(@eligibility_file) || {}
-    else
-      @jewel_eligibility = {}
-    end
-    @jewel_eligibility[Char.name] = {
-      profession: Stats.prof,
-      weekly_gemstone: $killtracker[:weekly_gemstone] || 0,
-      monthly_gemstones: $killtracker[:monthly_gemstones] || 0,
-    }
-    File.write(@eligibility_file, @jewel_eligibility.to_yaml)
-  end
-
-  def self.backfill_counters
-    tz = TZInfo::Timezone.get("America/New_York")
-    now = tz.now
-    current_week  = now.strftime("%U").to_i
-    current_month = now.month
-
-    $killtracker[:weekly_gemstone]   = 0
-    $killtracker[:monthly_gemstones] = 0
-    $killtracker[:weekly_dust]       = 0
-
-    $killtracker[:jewel_found].each_key do |key|
-      ts    = key.to_i
-      local = tz.to_local(Time.at(ts))
-
-      $killtracker[:weekly_gemstone]   += 1 if local.strftime("%U").to_i == current_week
-      $killtracker[:monthly_gemstones] += 1 if local.month == current_month
-    end
-
-    $killtracker[:dust_found].each_key do |key|
-      ts    = key.to_i
-      local = tz.to_local(Time.at(ts))
-      $killtracker[:weekly_dust] += 1 if local.strftime("%U").to_i == current_week
-    end
-    update_eligibility
-  end
-
-  def self.send_to_sheet(ev_type, key)
-    case ev_type
-    when "dust"
-      ev = $killtracker[:dust_found][key]
-    when "jewel"
-      ev = $killtracker[:jewel_found][key]
-    end
-    return unless ev
-
-    uri = URI("https://script.google.com/macros/s/AKfycbyltG_Eax1-CY4n1isy9U_ZRlKxD93Ai5XQqbF78Wq-4tIqtFirLjbVcgrd13T59e6z/exec")
-
-    user_id = Digest::SHA256.hexdigest([Char.name, Stats.race, Stats.prof].join('|'))
-
-    req = Net::HTTP::Post.new(uri.request_uri, 'Content-Type' => 'application/json')
-    req.body = {
-      timestamp: key.to_i,
-      type: ev_type,
-      searches_week: ev[:searches_week],
-      searches_since: ev[:searches_since],
-      creature: ev[:creature],
-      room: ev[:room],
-      name: ev[:name],
-      user: user_id
-    }.to_json
-
-    res = Net::HTTP.start(uri.host, uri.port, use_ssl: true) do |http|
-      http.request(req)
-    end
-    # echo "→ GoogleSheets responded #{res.code}: #{res.body}"
-    res.code.to_i
-  rescue => e
-    # catch network / JSON errors
-    echo "!! send_to_sheet error: #{e.class}: #{e.message}"
-  end
-
-  def self.send_all_finds
-    respond("Sending found jewels...")
-    $killtracker[:jewel_found].each { |j| send_to_sheet("jewel", j.first) }
-    respond("Sending found dust...")
-    $killtracker[:dust_found].each { |d| send_to_sheet("dust", d.first) }
-    respond("Sending complete.")
-    respond("View the data at: https://docs.google.com/spreadsheets/d/1IOLs8AGRR45Kr6Y9nz6CXlMVBKYR7cHLaz0jjAbjMv0")
-    respond("")
-    respond("Please note, this is a special command and should only be ran once.")
-    respond("To continue submitting finds going forward please enable the feature: ;kt submit finds")
-  end
-
-  def self.get_next_reset_local_time
-    eastern = TZInfo::Timezone.get('America/New_York')
-    now_est = eastern.now
-    last_sunday_midnight_est = eastern.local_time(now_est.year, now_est.month, now_est.day, 0, 0, 0) - (now_est.wday * 86400)
-    next_reset_est = last_sunday_midnight_est + (7 * 86400)
-    $killtracker[:cached_reset_time] = next_reset_est.to_i
-  end
-
-  def self.maybe_reset_weekly_counter
-    get_next_reset_local_time if $killtracker[:cached_reset_time] == 0
-    eastern = TZInfo::Timezone.get("America/New_York")
-    $killtracker[:weekly_counts] ||= {}
-    while Time.now.to_i >= $killtracker[:cached_reset_time] && ($killtracker[:last_week_reset] == 0 || $killtracker[:last_week_reset] < $killtracker[:cached_reset_time])
-      finished_week = eastern.to_local(Time.at($killtracker[:cached_reset_time] - 7 * 86400)).strftime("%U").to_i
-      # determine remaing searches on week since last find
-      total_this_week = $killtracker[:weekly_ascension_searches]
-      gap = total_this_week - ($killtracker[:last_weekly_event_searches] || 0)
-      key = $killtracker[:cached_reset_time].to_s
-      $killtracker[:found_none][key] = {
-        searches_since: gap,
-        searches_week: total_this_week,
-        creature: "none",
-        room: "none",
-        name: "Final searches of the week with no find"
-      }
-      $killtracker[:weekly_counts][:"week_#{finished_week}_ascension_searches"] = $killtracker[:weekly_ascension_searches]
-      $killtracker[:weekly_counts][:"week_#{finished_week}_dust"] = $killtracker[:weekly_dust]
-      $killtracker[:weekly_counts][:"week_#{finished_week}_gemstone"] = $killtracker[:weekly_gemstone]
-      $killtracker[:weekly_ascension_searches] = 0
-      $killtracker[:weekly_gemstone] = 0
-      $killtracker[:weekly_dust] = 0
-      $killtracker[:last_week_reset] = $killtracker[:cached_reset_time]
-      get_next_reset_local_time
-    end
-  end
-
-  def self.maybe_reset_monthly_counter
-    est = TZInfo::Timezone.get("America/New_York")
-    current_month = est.now.month
-    if current_month != $killtracker[:last_month_reset]
-      $killtracker[:monthly_gemstones] = 0
-      $killtracker[:last_month_reset] = current_month
-    end
-  end
-
-  def self.back_date_reset
-    $killtracker[:cached_reset_time] = $killtracker[:cached_reset_time] - 7 * 86400
-    $killtracker[:last_week_reset] = 0
-    maybe_reset_weekly_counter
-  end
 
   def self.parse_downstream(line)
     case line
     when FOUND_GEMSTONE
-      key = Time.now.to_i.to_s
-      name = Regexp.last_match[:name]
-      room = Room.current.id
+      key = Time.now.to_i
+      name = Regexp.last_match[:n]
+      room = Room.current.id.to_s
+
+      create_backup("pre_jewel_find")
+
       $killtracker[:monthly_gemstones] += 1
       $killtracker[:weekly_gemstone] += 1
+      $killtracker[:jewel_found_this_week] = true
       $killtracker[:jewel_found][key] = {
         searches_since: $killtracker[:searches_since_jewel],
         searches_week: $killtracker[:weekly_ascension_searches],
@@ -547,13 +1046,12 @@ module Killtracker
       }
       report = ['found gemstone', $killtracker[:creature], $killtracker[:weekly_ascension_searches], $killtracker[:searches_since_jewel]]
       $killtracker[:searches_since_jewel] = 0
-      $killtracker[:last_weekly_event_searches] = $killtracker[:weekly_ascension_searches]
       REPORT_QUEUE.push(report)
       REPORT_QUEUE.push(["send jewel report", key]) if $killtracker[:submit_finds]
 
     when FOUND_DUST
-      key = Time.now.to_i.to_s
-      room = Room.current.id
+      key = Time.now.to_i
+      room = Room.current.id.to_s
       $killtracker[:weekly_dust] += 1
       $killtracker[:dust_found][key] = {
         searches_since: $killtracker[:searches_since_dust],
@@ -564,7 +1062,6 @@ module Killtracker
       }
       report = ['found dust', $killtracker[:creature], $killtracker[:weekly_ascension_searches], $killtracker[:searches_since_dust]]
       $killtracker[:searches_since_dust] = 0
-      $killtracker[:last_weekly_event_searches] = $killtracker[:weekly_ascension_searches]
       REPORT_QUEUE.push(report)
       REPORT_QUEUE.push(["send dust report", key]) if $killtracker[:submit_finds]
 
@@ -574,11 +1071,17 @@ module Killtracker
       name = Regexp.last_match[:creature]
       $killtracker[:creature] = name
       if ASCENSION_CREATURES.match?(name)
-        $killtracker[:weekly_ascension_searches] += 1
-        $killtracker[:searches_since_jewel] += 1
-        $killtracker[:searches_since_dust] += 1
-        report = ["search report", name, $killtracker[:weekly_ascension_searches], $killtracker[:searches_since_dust], $killtracker[:searches_since_jewel]]
-        REPORT_QUEUE.push(report) unless $killtracker[:silent]
+        # Only count searches when we're eligible for gems
+        if currently_eligible?
+          $killtracker[:weekly_ascension_searches] += 1
+          $killtracker[:searches_since_jewel] += 1
+          $killtracker[:searches_since_dust] += 1
+
+          report = ["search report", name, $killtracker[:weekly_ascension_searches], $killtracker[:searches_since_dust], $killtracker[:searches_since_jewel]]
+          REPORT_QUEUE.push(report) unless $killtracker[:silent]
+        elsif $killtracker[:debug_eligibility]
+          echo "Search not counted - currently ineligible (#{name})"
+        end
       end
     end
     line
@@ -596,8 +1099,11 @@ module Killtracker
 
   DownstreamHook.add(DOWNSTREAM_HOOK_ID, proc do |server_string| parse_downstream(server_string) end)
   UpstreamHook.add(UPSTREAM_HOOK_ID, proc do |command| parse_upstream(command) end)
-  before_dying { File.write(@filename, $killtracker.to_yaml); DownstreamHook.remove(DOWNSTREAM_HOOK_ID); UpstreamHook.remove(UPSTREAM_HOOK_ID) }
+  before_dying { save(true); DownstreamHook.remove(DOWNSTREAM_HOOK_ID); UpstreamHook.remove(UPSTREAM_HOOK_ID) }
 
+  # Initialize everything after all methods are defined
+  initialize_data
+  migrate_legacy_data
   save(true)
   maybe_reset_weekly_counter
   maybe_reset_monthly_counter
@@ -605,6 +1111,7 @@ module Killtracker
 
   CMD_QUEUE.push(Script.current.vars[0]) unless Script.current.vars[0].nil?
 
+  # Main command processing loop
   loop do
     unless REPORT_QUEUE.empty?
       report = REPORT_QUEUE.pop
@@ -640,6 +1147,23 @@ module Killtracker
       when /save/
         Killtracker.save(true)
         respond("Killtracker data saved to file.")
+      when /backup/
+        backup_file = Killtracker.create_backup("manual")
+        respond("Backup created: #{File.basename(backup_file)}") if backup_file
+      when /restore backup/
+        if Killtracker.restore_latest_backup
+          respond("Data restored from latest backup.")
+        else
+          respond("Failed to restore from backup.")
+        end
+      when /validate/
+        errors = Killtracker.validate_data
+        if errors.empty?
+          respond("Data validation passed - no errors found.")
+        else
+          respond("Data validation found #{errors.length} error(s):")
+          errors.each { |e| respond("  - #{e}") }
+        end
       when /jewel report/
         Killtracker.jewel_report
       when /dust report/
@@ -653,13 +1177,12 @@ module Killtracker
         Killtracker.send_all_finds
       when /fix find count/
         Killtracker.backfill_counters
-      when /back date reset/
-        Killtracker.back_date_reset
+        respond("Monthly and weekly find counts have been recalculated.")
       when /(?:eligible|eligibility)(?:\s+(\w+))?/
         sort_key = $1&.downcase
         Killtracker.eligibility_report(sort_key)
       when /announce$/
-        $killtracker[:silent] = !$killtracker[:silent] # toggle setting
+        $killtracker[:silent] = !$killtracker[:silent]
         msg = $killtracker[:silent] ? 'Reporting only upon a find.' : 'Reporting after each kill.'
         respond(msg)
       when /announce msg/
@@ -674,6 +1197,11 @@ module Killtracker
         respond(msg)
       end
     end
-    sleep(0.25)
+    # Adaptive sleep - longer when idle, shorter when active
+    if CMD_QUEUE.empty? && REPORT_QUEUE.empty?
+      sleep(1.0)
+    else
+      sleep(0.1)
+    end
   end
 end
