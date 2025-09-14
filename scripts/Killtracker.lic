@@ -679,7 +679,12 @@ module Killtracker
 
       eligibility_file = File.join(DATA_DIR, XMLData.game, "jewel_eligibility.yaml")
       if File.exist?(eligibility_file)
-        @jewel_eligibility = YAML.load_file(eligibility_file) || {}
+        # Use shared lock for reading to prevent reading during write
+        File.open(eligibility_file, File::RDONLY) do |f|
+          f.flock(File::LOCK_SH)
+          content = f.read
+          @jewel_eligibility = content.empty? ? {} : YAML.load(content) || {}
+        end
       else
         @jewel_eligibility = {}
       end
@@ -891,39 +896,61 @@ module Killtracker
   def self.update_eligibility
     begin
       @eligibility_file = File.join(DATA_DIR, XMLData.game, "jewel_eligibility.yaml")
+      temp_file = "#{@eligibility_file}.tmp.#{Process.pid}.#{Time.now.to_i}"
 
-      File.open(@eligibility_file, File::RDWR | File::CREAT, 0644) do |f|
-        f.flock(File::LOCK_EX)
-        content = f.read
-        @jewel_eligibility = content.empty? ? {} : YAML.load(content) || {}
-
-        # Clean up stale entries (older than 7 days)
-        current_time = Time.now.to_i
-        @jewel_eligibility.delete_if do |char, data|
-          last_updated = data[:last_updated] || 0
-          stale = (current_time - last_updated) > (7 * 86400)
-          if stale && char != Char.name
-            echo "Removing stale eligibility data for #{char} (#{Time.at(last_updated)})" if $killtracker[:debug_eligibility]
-            true
-          else
-            false
-          end
+      # Read existing data with file locking
+      @jewel_eligibility = {}
+      if File.exist?(@eligibility_file)
+        File.open(@eligibility_file, File::RDONLY) do |f|
+          f.flock(File::LOCK_SH)
+          content = f.read
+          @jewel_eligibility = content.empty? ? {} : YAML.load(content) || {}
         end
+      end
 
-        @jewel_eligibility[Char.name] = {
-          profession: Stats.prof,
-          weekly_gemstone: $killtracker[:weekly_gemstone].to_i,
-          monthly_gemstones: $killtracker[:monthly_gemstones].to_i,
-          currently_eligible: currently_eligible?,
-          last_updated: current_time
-        }
+      # Clean up stale entries (older than 7 days)
+      current_time = Time.now.to_i
+      @jewel_eligibility.delete_if do |char, data|
+        last_updated = data[:last_updated] || 0
+        stale = (current_time - last_updated) > (7 * 86400)
+        if stale && char != Char.name
+          echo "Removing stale eligibility data for #{char} (#{Time.at(last_updated)})" if $killtracker[:debug_eligibility]
+          true
+        else
+          false
+        end
+      end
 
-        f.rewind
-        f.write(@jewel_eligibility.to_yaml)
-        f.truncate(f.pos)
+      # Update current character's data
+      @jewel_eligibility[Char.name] = {
+        profession: Stats.prof,
+        weekly_gemstone: $killtracker[:weekly_gemstone].to_i,
+        monthly_gemstones: $killtracker[:monthly_gemstones].to_i,
+        currently_eligible: currently_eligible?,
+        last_updated: current_time
+      }
+
+      # Write to temporary file first
+      File.write(temp_file, @jewel_eligibility.to_yaml)
+
+      # Atomic rename (replace original file)
+      if RUBY_PLATFORM =~ /mswin|mingw|cygwin/
+        # Windows doesn't support atomic rename with existing files
+        # Use exclusive lock and quick replace
+        File.open(@eligibility_file, File::RDWR | File::CREAT, 0644) do |f|
+          f.flock(File::LOCK_EX)
+          # Move temp file over existing file
+          require 'fileutils'
+          FileUtils.mv(temp_file, @eligibility_file, force: true)
+        end
+      else
+        # Unix/Linux supports atomic rename
+        File.rename(temp_file, @eligibility_file)
       end
     rescue => e
       echo "Warning: Could not update eligibility file: #{e.message}"
+      # Clean up temp file if it exists
+      File.delete(temp_file) if File.exist?(temp_file) rescue nil
     end
   end
 
@@ -1204,5 +1231,3 @@ module Killtracker
     end
   end
 end
-
-
