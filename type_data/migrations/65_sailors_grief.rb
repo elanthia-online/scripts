@@ -1,5 +1,7 @@
 migrate :aggressive_npc do
+  insert(:name, %{algae-draped merrow oracle})
   insert(:name, %{amaranthine kraken tentacle})
+  insert(:name, %{blubbery humpbacked merrow})
   insert(:name, %{brackish bilge mass})
   insert(:name, %{fulminating stormborn primordial})
   insert(:name, %{gigantic lightning whelk})
