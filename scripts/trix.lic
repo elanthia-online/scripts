@@ -1,0 +1,526 @@
+=begin
+
+  trix.lic: A utility script for using magic items from a container
+
+  Accepts a container parameter to specify which container to operate on.
+  Will inventory magic items in the container (they must have loresong unlocked) and allow you
+  to cast the spells from them using a menu interface.
+
+            author: elanthia-online
+      contributors: Scribs, Claude
+              game: gs
+              tags: utility, containers, magic items, spells, miu
+           version: 1.0.1
+          required: Lich >= 5.0.0
+
+  Usage:
+    ;trix scan <container>      -scan a container for magic items
+    ;trix                       -displays menu of saved magic items
+    ;trix <menu number>         -will attempt to activate that magic item
+    ;trix <menu number> -f      -will force activating that magic item even if it has 1 charge remaining
+    ;trix clear                 -delete all saved trix magic item data from character settings
+
+  Examples:
+    ;trix scan backpack
+    ;trix scan "leather bag"
+    ;trix 1 -f
+    ;trix clear
+
+  changelog:
+    1.0.1 (2025-09-10)
+      Refactored into module/class architecture to avoid namespace conflicts
+    1.0.0 (2025-09-09)
+      Initial release with basic functionality for one container and few safeguards
+
+=end
+
+module Trix
+  class SpellInfo
+    def self.get_spell_info(spell_name)
+      return { num: nil, bonuses: [] } if spell_name.nil? || spell_name == "Unknown"
+      spell = Spell[spell_name]
+      return { num: nil, bonuses: [] } if spell.nil?
+      spell_num = spell.num
+      bonuses = []
+      begin
+        bonuses << "#{spell.bolt_as} bAS" if spell.bolt_as != 0
+        bonuses << "#{spell.physical_as} pAS" if spell.physical_as != 0
+        bonuses << "#{spell.bolt_ds} bDS" if spell.bolt_ds != 0
+        bonuses << "#{spell.physical_ds} pDS" if spell.physical_ds != 0
+        bonuses << "#{spell.elemental_cs} elemCS" if spell.elemental_cs != 0
+        bonuses << "#{spell.mental_cs} mentCS" if spell.mental_cs != 0
+        bonuses << "#{spell.spirit_cs} spirCS" if spell.spirit_cs != 0
+        bonuses << "#{spell.sorcerer_cs} sorcCS" if spell.sorcerer_cs != 0
+        bonuses << "#{spell.elemental_td} elemTD" if spell.elemental_td != 0
+        bonuses << "#{spell.mental_td} mentTD" if spell.mental_td != 0
+        bonuses << "#{spell.spirit_td} spirTD" if spell.spirit_td != 0
+        bonuses << "#{spell.sorcerer_td} sorcTD" if spell.sorcerer_td != 0
+        bonuses << "#{spell.strength} str" if spell.strength.to_i != 0
+        bonuses << "#{spell.constitution} con" if spell.constitution.to_i != 0
+        bonuses << "#{spell.health} health" if spell.health.to_i != 0
+        bonuses << "#{spell.dodging} dodge" if spell.dodging.to_i != 0
+        bonuses << "#{spell.combatmaneuvers} CM" if spell.combatmaneuvers.to_i != 0
+        bonuses << "#{spell.damagefactor}% DF" if spell.damagefactor.to_i != 0
+        bonuses << "#{spell.block}% block" if spell.block.to_i != 0
+        bonuses << "#{spell.unarmed_af} UAF" if spell.unarmed_af.to_i != 0
+        bonuses << "#{spell.asg} AsG" if spell.asg.to_i != 0
+      rescue StandardError => e
+        echo "Warning: Error accessing spell bonus data for spell #{spell_num}: #{e.message}" if $trix_debug
+      end
+      { num: spell_num, bonuses: bonuses }
+    end
+  end
+
+  class ItemScanner
+    EXCLUDED_ITEMS = [
+      "small statue",
+      "blue wand",
+      "flask",
+      "quartz orb",
+      "golden wand",
+      "twisted wand",
+      "cube",
+      "coin",
+      "gold ring",
+      "crystal amulet"
+    ].freeze
+
+    def self.scan_container(container_name)
+      container_obj = GameObj.inv.find { |obj| obj.name =~ /#{container_name}/i || obj.noun =~ /#{container_name}/i }
+
+      if container_obj.nil?
+        echo "Error: Container '#{container_name}' not found in your inventory"
+        return
+      end
+
+      echo "Operating on container: #{container_obj.name}"
+
+      container_items = container_obj.contents
+
+      if container_items.nil? || container_items.empty?
+        echo "The #{container_obj.name} appears to be empty or closed, attempting to open..."
+
+        # Try to open the container
+        result = dothistimeout "open ##{container_obj.id}", 2, /You open|already open|can't be opened|What were you/i
+
+        if result =~ /You open|already open/i
+          echo "Successfully opened #{container_obj.name}, checking contents again..."
+          # Look in the container to refresh contents
+          dothistimeout "look in ##{container_obj.id}", 2, /In the .* you see|There is nothing|The .* is empty/i
+          sleep 0.5 # Brief pause to let game update
+
+          # Retry getting contents
+          container_items = container_obj.contents
+
+          if container_items.nil? || container_items.empty?
+            echo "The #{container_obj.name} is empty"
+            return
+          else
+            echo "Found items in #{container_obj.name} after opening"
+          end
+        else
+          echo "Could not open #{container_obj.name} - it may not be openable or you may not have access"
+          return
+        end
+      end
+
+      magic_items = container_items.select do |item|
+        item_types = item.type
+
+        if item_types
+          types_array = item_types.split(',').map(&:strip)
+          types_array.any? { |type| type == 'magic' || type == 'jewelry' }
+        else
+          false
+        end
+      end
+
+      if magic_items.empty?
+        echo "No magic or jewelry items detected in #{container_obj.name}"
+        return
+      end
+
+      echo "Analyzing magic and jewelry items with loresong..."
+
+      silence_me
+
+      detailed_items = []
+
+      magic_items.each_with_index do |item, index|
+        echo "Analyzing #{item.name}... (#{index + 1}/#{magic_items.length})"
+
+        if EXCLUDED_ITEMS.any? { |excluded| item.name.downcase.include?(excluded.downcase) }
+          next
+        end
+
+        lines = Lich::Util.issue_command("recall ##{item.id}", /^(?:As you recall|You are unable to recall)|^It is estimated to be worth/i, timeout: 1, usexml: false, silent: true, quiet: true)
+
+        loresong_data = ""
+        unable_to_recall = false
+
+        lines.each { |line|
+          if line
+            loresong_data += line + "\n"
+            if line =~ /^You are unable to recall the/i
+              unable_to_recall = true
+              break
+            end
+            break if line =~ /^You recall/i || line =~ /^The .* contains no/i
+          end
+        }
+
+        if unable_to_recall
+          next
+        end
+
+        spell_name = nil
+        activation = nil
+        charges = nil
+        empowered_charges = nil
+
+        if loresong_data =~ /imbedded with the (.+?) spell/i
+          spell_name = $1
+        elsif loresong_data =~ /spell of (.+?)(?:\.|$)/i
+          spell_name = $1
+        elsif loresong_data =~ /(.+?) spell/i
+          spell_name = $1
+        end
+
+        if loresong_data =~ /activated by (\w+)ing it/i
+          verb = $1.downcase
+          case verb
+          when 'wav'
+            activation = 'WAVE'
+          when 'tap', 'tapp'
+            activation = 'TAP'
+          when 'rais'
+            activation = 'RAISE'
+          when 'rubb'
+            activation = 'RUB'
+          else
+            activation = verb.upcase
+          end
+        elsif loresong_data =~ /(WAVE|INVOKE|RUB|RAISE|TOUCH|TURN|TAP)/i
+          activation = $1.upcase
+        end
+
+        if loresong_data =~ /(\d+) charges?/i
+          charges = $1.to_i
+        elsif loresong_data =~ /(\d+) uses?/i
+          charges = $1.to_i
+        end
+
+        if loresong_data =~ /It is empowered and can be charged for an additional (\d+)/i
+          empowered_charges = $1.to_i
+        end
+
+        detailed_items << {
+          item: item,
+          id: item.id,
+          name: item.name,
+          spell: spell_name || "Unknown",
+          activation: activation || "Unknown",
+          charges: charges || "Unknown",
+          empowered_charges: empowered_charges || "not",
+          container_id: container_obj.id,
+          container_name: container_obj.name
+        }
+      end
+
+      silence_me
+
+      echo ""
+      echo "Magic & Jewelry Items Menu:"
+      echo "==========================="
+
+      # Pre-calculate column widths for alignment
+      max_num_width = detailed_items.length.to_s.length + 1 # +1 for the period
+      max_name_width = detailed_items.map { |d| d[:name].length }.max
+      max_spell_width = detailed_items.map do |d|
+        spell_info = SpellInfo.get_spell_info(d[:spell])
+        spell_display = spell_info[:num] ? "[#{spell_info[:num]}] #{d[:spell]}" : d[:spell]
+        spell_display.length
+      end.max
+      max_activation_width = detailed_items.map { |d| d[:activation].length }.max
+
+      detailed_items.each_with_index do |details, index|
+        spell_info = SpellInfo.get_spell_info(details[:spell])
+
+        spell_display = spell_info[:num] ? "[#{spell_info[:num]}] #{details[:spell]}" : details[:spell]
+
+        # Format with aligned columns
+        num_part = "#{index + 1}.".ljust(max_num_width)
+        name_part = details[:name].ljust(max_name_width)
+        spell_part = spell_display.ljust(max_spell_width)
+        activation_part = "(#{details[:activation]})".ljust(max_activation_width + 2)
+        charges_part = "[#{details[:charges]} charges, #{details[:empowered_charges]} empowered]"
+
+        echo "#{num_part} #{name_part} - #{spell_part} #{activation_part} #{charges_part}"
+
+        unless spell_info[:bonuses].empty?
+          echo "#{' ' * (max_num_width + 1)}#{' ' * max_name_width}   Bonuses: #{spell_info[:bonuses].join(', ')}"
+        end
+      end
+
+      cache_key = "trix_#{container_obj.name.downcase.gsub(' ', '_')}_items"
+      CharSettings[cache_key] = detailed_items
+      echo "Scan results saved for #{container_obj.name}"
+    end
+  end
+
+  class MagicItemManager
+    def self.display_saved_items
+      saved_containers = []
+
+      begin
+        settings_hash = CharSettings.to_hash
+        settings_hash.keys.each do |key|
+          if key.to_s.start_with?('trix_') && key.to_s.end_with?('_items')
+            container_name = key.to_s.gsub('trix_', '').gsub('_items', '').gsub('_', ' ')
+            saved_containers << { name: container_name, key: key }
+          end
+        end
+      rescue => e
+        echo "Error accessing CharSettings: #{e.message}"
+        echo "No saved scan results found. Use 'scan <container>' to analyze items first."
+        return []
+      end
+
+      if saved_containers.empty?
+        echo "No saved scan results found. Use 'scan <container>' to analyze items first."
+        return []
+      end
+
+      echo "Saved Magic & Jewelry Items:"
+      echo "============================"
+      echo ""
+
+      all_items = []
+      item_counter = 1
+
+      saved_containers.each_with_index do |container_info, _container_index|
+        echo "#{container_info[:name].upcase}:"
+        echo "-" * (container_info[:name].length + 1)
+
+        detailed_items = CharSettings[container_info[:key]]
+        if detailed_items && !detailed_items.empty?
+          # Pre-calculate column widths for alignment
+          max_num_width = detailed_items.length.to_s.length + 1 # +1 for the period
+          max_name_width = detailed_items.map { |d| d[:name].length }.max
+          max_spell_width = detailed_items.map do |d|
+            spell_info = SpellInfo.get_spell_info(d[:spell])
+            spell_display = spell_info[:num] ? "[#{spell_info[:num]}] #{d[:spell]}" : d[:spell]
+            spell_display.length
+          end.max
+          max_activation_width = detailed_items.map { |d| d[:activation].length }.max
+
+          detailed_items.each_with_index do |details, _index|
+            spell_info = SpellInfo.get_spell_info(details[:spell])
+
+            spell_display = spell_info[:num] ? "[#{spell_info[:num]}] #{details[:spell]}" : details[:spell]
+
+            # Format with aligned columns
+            num_part = "#{item_counter}.".ljust(max_num_width)
+            name_part = details[:name].ljust(max_name_width)
+            spell_part = spell_display.ljust(max_spell_width)
+            activation_part = "(#{details[:activation]})".ljust(max_activation_width + 2)
+            charges_part = "[#{details[:charges]} charges, #{details[:empowered_charges]} empowered]"
+
+            echo "#{num_part} #{name_part} - #{spell_part} #{activation_part} #{charges_part}"
+
+            unless spell_info[:bonuses].empty?
+              echo "#{' ' * (max_num_width + 1)}#{' ' * max_name_width}   Bonuses: #{spell_info[:bonuses].join(', ')}"
+            end
+
+            all_items << details
+            item_counter += 1
+          end
+        else
+          echo "No items saved for this container."
+        end
+        echo ""
+      end
+
+      return all_items
+    end
+
+    def self.get_all_saved_items
+      saved_containers = []
+
+      begin
+        settings_hash = CharSettings.to_hash
+        settings_hash.keys.each do |key|
+          if key.to_s.start_with?('trix_') && key.to_s.end_with?('_items')
+            container_name = key.to_s.gsub('trix_', '').gsub('_items', '').gsub('_', ' ')
+            saved_containers << { name: container_name, key: key }
+          end
+        end
+      rescue
+        return []
+      end
+
+      all_items = []
+      saved_containers.each do |container_info|
+        detailed_items = CharSettings[container_info[:key]]
+        if detailed_items && !detailed_items.empty?
+          detailed_items.each do |details|
+            all_items << details
+          end
+        end
+      end
+
+      return all_items
+    end
+
+    def self.clear_all_saved_data
+      deleted_containers = []
+
+      begin
+        settings_hash = CharSettings.to_hash
+        keys_to_delete = []
+
+        settings_hash.keys.each do |key|
+          if key.to_s.start_with?('trix_') && key.to_s.end_with?('_items')
+            container_name = key.to_s.gsub('trix_', '').gsub('_items', '').gsub('_', ' ')
+            keys_to_delete << key
+            deleted_containers << container_name
+          end
+        end
+
+        keys_to_delete.each do |key|
+          CharSettings[key] = nil
+        end
+
+        if deleted_containers.empty?
+          echo "No trix data found to clear."
+        else
+          echo "Cleared trix data for containers: #{deleted_containers.join(', ')}"
+          echo "Total containers cleared: #{deleted_containers.length}"
+        end
+      rescue => e
+        echo "Error clearing trix data: #{e.message}"
+      end
+    end
+
+    def self.activate_item(menu_number, force = false)
+      all_items = get_all_saved_items
+
+      if all_items.empty?
+        echo "No saved scan results found. Use 'scan <container>' to analyze items first."
+        return
+      end
+
+      if menu_number < 1 || menu_number > all_items.length
+        echo "Error: Invalid menu number. Please choose between 1 and #{all_items.length}"
+        return
+      end
+
+      selected_item = all_items[menu_number - 1]
+      activation_verb = selected_item[:activation].downcase
+      item_id = selected_item[:id]
+      container_id = selected_item[:container_id]
+
+      if selected_item[:charges].is_a?(Integer) && selected_item[:charges] < 2 && !force
+        echo "Error: Low charges, use with -f if you really want to use the charge"
+        return
+      end
+
+      echo "Activating #{selected_item[:name]} with #{activation_verb}..."
+
+      fput "get ##{item_id} from ##{container_id}"
+
+      verb = activation_verb
+      case verb
+      when 'tap', 'rub'
+        fput "wear ##{item_id}"
+        pre_rt = checkcastrt
+        dothistimeout "#{activation_verb} ##{item_id}", 3, /./
+        post_rt = checkcastrt
+        fput "remove ##{item_id}"
+      when 'raise', 'wave'
+        pre_rt = checkcastrt
+        dothistimeout "#{activation_verb} ##{item_id}", 3, /./
+        post_rt = checkcastrt
+      else
+        echo "Error: invalid activation type"
+        fput "put ##{item_id} in ##{container_id}"
+        return
+      end
+
+      activation_successful = post_rt > pre_rt
+      fput "put ##{item_id} in ##{container_id}"
+
+      if activation_successful && selected_item[:charges].is_a?(Integer)
+        new_charge_count = selected_item[:charges] - 1
+
+        begin
+          settings_hash = CharSettings.to_hash
+          settings_hash.keys.each do |key|
+            if key.to_s.start_with?('trix_') && key.to_s.end_with?('_items')
+              detailed_items = CharSettings[key]
+              if detailed_items && detailed_items.is_a?(Array)
+                item_index = detailed_items.find_index { |item| item && item[:id] == selected_item[:id] }
+                if item_index
+                  updated_item = detailed_items[item_index].dup
+                  updated_item[:charges] = new_charge_count
+                  detailed_items[item_index] = updated_item
+                  CharSettings[key] = detailed_items
+                  echo "Updated charges for #{selected_item[:name]} to #{new_charge_count}"
+                  break
+                end
+              end
+            end
+          end
+        rescue => e
+          echo "Warning: Could not update charge count - #{e.message}"
+        end
+      end
+    end
+  end
+end
+
+if script.vars.empty?
+  Trix::MagicItemManager.display_saved_items
+  exit
+end
+
+if script.vars[1] && script.vars[1].match?(/^\d+$/)
+  menu_number = script.vars[1].to_i
+  force_flag = script.vars[2..-1]&.any? { |arg| arg == '-f' || arg == '-force' } || false
+  Trix::MagicItemManager.activate_item(menu_number, force_flag)
+  exit
+end
+
+command = script.vars[1]
+container = script.vars[2]
+
+if command == "clear"
+  Trix::MagicItemManager.clear_all_saved_data
+  exit
+elsif command == "scan"
+  if script.vars.length < 3
+    echo "Usage: #{$lich_char}#{script.name} scan <container>"
+    echo "Example: #{$lich_char}#{script.name} scan backpack"
+    exit
+  end
+
+  if container.nil? || container.empty?
+    echo "Error: No container specified"
+    echo "Usage: #{$lich_char}#{script.name} scan <container>"
+    exit
+  end
+
+  Trix::ItemScanner.scan_container(container)
+else
+  echo "Usage:"
+  echo "  #{$lich_char}#{script.name}              - Display saved magic items"
+  echo "  #{$lich_char}#{script.name} scan <container> - Scan container for magic items"
+  echo "  #{$lich_char}#{script.name} <number>        - Activate item by menu number"
+  echo "  #{$lich_char}#{script.name} clear           - Delete all saved trix magic item data"
+  echo ""
+  echo "Examples:"
+  echo "  #{$lich_char}#{script.name} scan backpack"
+  echo "  #{$lich_char}#{script.name} 1"
+  echo "  #{$lich_char}#{script.name} clear"
+  exit
+end
