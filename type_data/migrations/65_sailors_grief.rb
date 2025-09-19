@@ -56,8 +56,8 @@ migrate :gem, :gemshop do
 end
 
 migrate :skin, :furrier do
-  insert(:name, %{(?:iridescent) ?whelk shell fragment})
+  insert(:name, %{(?:iridescent )?whelk shell fragment})
   insert(:name, %{needle-thin trenchling tooth})
   insert(:name, %{trenchling teeth})
-  insert(:name, %{(?:metallic) ?harpy feather})
+  insert(:name, %{(?:metallic )?harpy feather})
 end
