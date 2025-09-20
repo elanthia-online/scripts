@@ -12,13 +12,13 @@ migrate :aggressive_npc do
 end
 
 migrate :undead, :aggressive_npc do
-  insert(:name, %{garish revenant buccaneer})
-  insert(:name, %{milky-eyed drowned mariner})
-  insert(:name, %{pallid fog-cloaked kelpie})
+  insert(:name, %{(?:garish )?revenant buccaneer})
+  insert(:name, %{(?:milky-eyed )?drowned mariner})
+  insert(:name, %{(?:pallid )?fog-cloaked kelpie})
 end
 
 migrate :undead, :aggressive_npc, :noncorporeal do
-  insert(:name, %{tenebrific wraith shark})
+  insert(:name, %{(?:tenebrific )?wraith shark})
 end
 
 migrate :gem, :gemshop do
