@@ -1,14 +1,14 @@
 migrate :aggressive_npc do
-  insert(:name, %{algae-draped merrow oracle})
+  insert(:name, %{(?:algae-draped )?merrow oracle})
   insert(:name, %{(?:amaranthine )?kraken tentacle})
-  insert(:name, %{blubbery humpbacked merrow})
-  insert(:name, %{brackish bilge mass})
-  insert(:name, %{fulminating stormborn primordial})
-  insert(:name, %{gigantic lightning whelk})
-  insert(:name, %{grey-plumed steelwing harpy})
-  insert(:name, %{hapless charmed corsair})
-  insert(:name, %{kelp-tangled coral golem})
-  insert(:name, %{scaly needle-toothed trenchling})
+  insert(:name, %{(?:blubbery )?humpbacked merrow})
+  insert(:name, %{(?:brackish )?bilge mass})
+  insert(:name, %{(?:fulminating )?stormborn primordial})
+  insert(:name, %{(?:gigantic )?lightning whelk})
+  insert(:name, %{(?:grey-plumed )?steelwing harpy})
+  insert(:name, %{(?:hapless )?charmed corsair})
+  insert(:name, %{(?:kelp-tangled )?coral golem})
+  insert(:name, %{(?:scaly )?needle-toothed trenchling})
 end
 
 migrate :undead, :aggressive_npc do
