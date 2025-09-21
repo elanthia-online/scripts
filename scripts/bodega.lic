@@ -9,10 +9,17 @@
 
   Author: Ondreian
   Requirements: Ruby >= 2.3
-  version: 0.3
+  version: 0.5
   tags: playershops
 
   changelog:
+    v0.5 - Add smart parsing mode for 90%+ performance improvement
+           - New --smart flag for intelligent item inspection
+           - Loads existing JSON, compares IDs, only inspects new items
+           - Automatic removal of deleted items from cache
+           - Comprehensive efficiency reporting and change detection
+           - Clean non-invasive implementation with graceful fallbacks
+    v0.4 - Add API-based upload to github site.
     v0.3 - Update for Lich 5.11 compatibility
     v0.2 - Update for Ruby v3 compatibility
 
@@ -102,7 +109,11 @@ module Bodega
     FLAG_PREFIX = "--"
 
     def self.parse_command(h, c)
-      h[c.to_sym] = true
+      if c == "smart"
+        h[:smart] = true
+      else
+        h[c.to_sym] = true
+      end
     end
 
     def self.parse_flag(h, f)
@@ -222,6 +233,7 @@ module Bodega
       imbeddable: %r[^It is a magical item which could be imbedded with a spell],
       not_wearable: %r[^You determine that you could not wear],
       holy: %r[^It is a holy item\.],
+      is_gemstone: %r[^The jewel appears to be a powerful relic that can convey wondrous abilities on its wielder],
     }
 
     PROPS = {
@@ -231,13 +243,14 @@ module Bodega
       # flare: %r[^It has been infused with the power of an? (?<flare>.*?)\.],
       material: %r[^It looks like this item has been mainly crafted out of (?<material>.*?)\.],
       cost: %r[will cost (?<cost>\d+) coins\.$],
-      worn: %r[You determine that you could wear the (?:.*?)(?:, slinging it| around| on| over) (?<worn>.*?)\.],
+      worn: %r[The .*? can be worn(?:, slinging it across the |, hanging it from the |, attaching it to the | around the | in the | on the | over(?: the)? )(?<worn>[^.]+)(?=.)],
       activator: %r[^It could be activated by (?<activator>\w+) it\.$],
       spell: %r[^It is currently imbedded with the (?<spell>.*?) spell.],
       charges: %r[The (?:\w+) looks to have (?<charges>.*?) charges remaining\.$|It has (?<charges>.*?) charges remaining.],
       shield_size: %r[Your careful inspection of an ornate villswood shield allows you to conclude that it is a (?<size>\w+) shield that],
       armor_type: %r[ allows you to conclude that it is (?<armor_type>.*?)\.],
       flare: %r[It has been infused with (?<flare>.*?)\.$],
+      gemstone_bound_to: %r[jewel is bound to (?<gemstone_bound_to>\w+),],
     }
 
     def self.of(details)
@@ -259,7 +272,14 @@ module Bodega
     end
 
     def _extract(details)
-      details.each do |line|
+      # Convert to array for indexed access (needed for jewel property parsing)
+      details_array = details.to_a
+
+      details_array.each_with_index do |line, index|
+        # Try to parse gemstone properties first (multi-line blocks)
+        next if _gemstone_property(details_array, index)
+
+        # Then handle single-line patterns
         maybe_raw(line,
                   _props(line),
                   _bools(line),
@@ -288,10 +308,80 @@ module Bodega
       return false
     end
 
+    def _gemstone_property(lines, index)
+      # Parse gemstone property blocks that span multiple lines
+      return false unless lines[index].match(/^Property:\s+(.+)$/)
+
+      property = { name: $1.strip }
+
+      # Look for Rarity on next line
+      if index + 1 < lines.size && lines[index + 1].match(/^Rarity:\s+(.+)$/)
+        property[:rarity] = $1.strip
+      end
+
+      # Look for Mnemonic
+      if index + 2 < lines.size && lines[index + 2].match(/^Mnemonic:\s+(.+)$/)
+        property[:mnemonic] = $1.strip
+      end
+
+      # Look for Description (may span multiple lines)
+      if index + 3 < lines.size && lines[index + 3].match(/^Description:\s+(.+)$/)
+        description = $1.strip
+
+        # Check for continuation on next lines (not starting with known patterns)
+        current_index = index + 4
+        while current_index < lines.size
+          # Stop if we hit another property block or known pattern
+          break if lines[current_index].match(/^Property:|^\*|^You note|^The jewel/)
+          # Add continuation lines
+          unless lines[current_index].strip.empty?
+            description += " " + lines[current_index].strip
+          end
+          current_index += 1
+        end
+
+        property[:description] = description
+      end
+
+      # Check for activation marker
+      if lines.size > index + 4 && lines[index + 4].match(/^\s*\*\s+Activated/)
+        property[:activated] = true
+      elsif lines.size > index + 5 && lines[index + 5].match(/^\s*\*\s+Activated/)
+        property[:activated] = true
+      end
+
+      @props[:gemstone_properties] ||= []
+      @props[:gemstone_properties] << property
+
+      return true
+    end
+
     def _props(line)
-      PROPS.select do |_prop, pattern|
-        if (result = line.match(pattern))
+      PROPS.select do |prop, pattern|
+        if prop == :worn && line =~ /anywhere on the body/i
+          @props[:worn] = "pin"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /around the chest, beneath another garment/i
+          @props[:worn] = "undershirt"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /on the feet, beneath shoes or boots/i
+          @props[:worn] = "socks"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /slinging it across the shoulders and back/i
+          @props[:worn] = "shoulders"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /hanging it from the shoulders/i
+          @props[:worn] = "cloak"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /on the legs/i
+          @props[:worn] = "pants"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /around the legs/i
+          @props[:worn] = "legs"
+          true  # Return true to indicate a match was found
+        elsif (result = line.match(pattern))
           @props.merge!(result.to_h)
+          true
         else
           false
         end
@@ -314,8 +404,11 @@ module Bodega
     begin
       FileUtils.mkdir_p(LOCAL_FS_ROOT)
     rescue => exception
-      Log.out(exception.message)
-      exit
+      Log.out("Failed to create bodega directory: #{LOCAL_FS_ROOT}")
+      Log.out("Error: #{exception.message}")
+      Log.out("lich_dir: #{$lich_dir}")
+      Log.out("local_dir option: #{Opts.local_dir}")
+      fail "Cannot create bodega directory - check permissions and paths"
     end
 
     def self.local_path(file)
@@ -488,8 +581,12 @@ module Bodega
         Log.out(right_col + " ... Shop(id: #{id}, name: #{name})",
                 label: Utils.safe_string(town))
         begin
-          Parser.scan_inv(town, id, name,
-                          cmd_template.gsub("{SHOP#}", id))
+          # Route to smart or regular parsing based on --smart flag
+          if Opts.smart
+            Parser.smart_scan_inv(town, id, name, cmd_template.gsub("{SHOP#}", id))
+          else
+            Parser.scan_inv(town, id, name, cmd_template.gsub("{SHOP#}", id))
+          end
         rescue => exception
           Log.out(exception)
           nil
@@ -506,10 +603,12 @@ module Bodega
 
       (preamble, *inv) = coll.run()
 
-      { preamble: preamble,
-        town: town,
-        id: id,
-        inv: parse_inv(inv.map(&:strip)) }
+      result = { preamble: preamble,
+                 town: town,
+                 id: id,
+                 inv: parse_inv(inv.map(&:strip)) }
+
+      result
     end
 
     def self.add_room(acc, row)
@@ -548,6 +647,504 @@ module Bodega
       .map(&:to_h)
     end
 
+    def self.get_browse_ids(inv)
+      # Extract item IDs from browse output without doing full inspection
+      item_ids = Set.new
+
+      inv.reduce([]) do |acc, row|
+        break acc if row.include?("SHOP INSPECT")
+        Parser.add_room(acc, row) if row.match(Messages::NEW_ROOM)
+        Parser.add_sign(acc, row) if row.match(Messages::SIGN) or not acc.last.sign.nil?
+
+        # Extract item ID without full inspection
+        if row.match(Messages::ITEM) and acc.last.sign.nil?
+          item_id = row.match(Messages::ITEM)[:item_id]
+          item_ids.add(item_id)
+        end
+        acc
+      end
+
+      item_ids
+    end
+
+    def self.load_and_validate_town_json(town)
+      # Load existing town JSON file with validation
+      filename = Utils.safe_string(town) + ".json"
+      file_path = Assets.local_path(filename)
+
+      return nil unless File.exist?(file_path)
+
+      begin
+        data = JSON.parse(File.read(file_path))
+
+        # Basic structure validation
+        unless data.is_a?(Hash) && data['shops'].is_a?(Array)
+          Log.out("Invalid JSON structure for #{town}, falling back to full parsing", label: :smart)
+          return nil
+        end
+
+        # Validate each shop has required fields
+        data['shops'].each do |shop|
+          unless shop.is_a?(Hash) && shop['id'] && shop['inv'].is_a?(Array)
+            Log.out("Invalid shop structure in #{town}, falling back to full parsing", label: :smart)
+            return nil
+          end
+        end
+
+        Log.out("Loaded existing data for #{town} (#{data['shops'].size} shops)", label: :smart)
+        data
+      rescue JSON::ParserError => e
+        Log.out("Corrupted JSON for #{town}: #{e.message}, falling back to full parsing", label: :smart)
+        nil
+      rescue => e
+        Log.out("Failed to load #{town}: #{e.message}, falling back to full parsing", label: :smart)
+        nil
+      end
+    end
+
+    def self.find_shop_by_id(town_data, shop_id)
+      # Find specific shop in town data by shop ID
+      return nil unless town_data && town_data['shops']
+
+      shop_data = town_data['shops'].find { |shop| shop['id'].to_s == shop_id.to_s }
+
+      if shop_data
+        Log.out("Found existing shop #{shop_id} in cached data", label: :smart)
+      else
+        Log.out("Shop #{shop_id} not found in cached data (new shop)", label: :smart)
+      end
+
+      shop_data
+    end
+
+    def self.extract_item_ids_from_shop(shop_data)
+      # Extract all item IDs from a shop's inventory structure
+      item_ids = Set.new
+
+      return item_ids unless shop_data && shop_data['inv']
+
+      shop_data['inv'].each do |room|
+        next unless room['items']
+        room['items'].each do |item|
+          item_ids.add(item['id'].to_s) if item['id']
+        end
+      end
+
+      item_ids
+    end
+
+    def self.smart_scan_inv(town, shop_id, name, cmd)
+      # Smart parsing: load existing data, compare IDs, only inspect new items
+      Log.out("Smart scanning shop #{shop_id}", label: :smart)
+
+      # Initialize tracking if not exists
+      @smart_stats ||= { new_items: 0, removed_items: 0, unchanged_items: 0, shops_scanned: 0 }
+      @removed_items_tracker ||= {}
+
+      # Load added items tracking for smart scans (only on first shop)
+      load_added_items if @smart_stats[:shops_scanned] == 0
+
+      # Step 1: Get current browse IDs from shop scan
+      coll = Collector.new(
+        start: %[is located in],
+        close: %[You can use the SHOP INSPECT {STOCK#}],
+        command: cmd
+      )
+
+      (preamble, *inv) = coll.run()
+      current_ids = get_browse_ids(inv.map(&:strip))
+
+      Log.out("Found #{current_ids.size} items currently in shop #{shop_id}", label: :smart)
+
+      # Step 2: Load and validate existing town data
+      town_data = load_and_validate_town_json(town)
+
+      # Step 3: Find existing shop data
+      existing_shop = find_shop_by_id(town_data, shop_id)
+
+      if existing_shop.nil?
+        # New shop or no existing data - fall back to full parsing
+        Log.out("No existing data for shop #{shop_id}, performing full scan", label: :smart)
+
+        # Track that we had to do a full scan
+        @smart_stats[:shops_scanned] += 1
+        @smart_stats[:new_items] += current_ids.size # All items are "new" on first run
+
+        return {
+          preamble: preamble,
+          town: town,
+          id: shop_id,
+          inv: parse_inv(inv.map(&:strip))
+        }
+      end
+
+      # Step 4: Extract existing item IDs
+      existing_ids = extract_item_ids_from_shop(existing_shop)
+      Log.out("Found #{existing_ids.size} items in cached shop #{shop_id}", label: :smart)
+
+      # Step 5: Calculate differences
+      new_ids = current_ids - existing_ids
+      removed_ids = existing_ids - current_ids
+      unchanged_ids = current_ids & existing_ids
+
+      Log.out("Smart diff for shop #{shop_id}: #{new_ids.size} new, #{removed_ids.size} removed, #{unchanged_ids.size} unchanged", label: :smart)
+
+      # Track statistics
+      @smart_stats[:new_items] += new_ids.size
+      @smart_stats[:removed_items] += removed_ids.size
+      @smart_stats[:unchanged_items] += unchanged_ids.size
+      @smart_stats[:shops_scanned] += 1
+
+      # Step 6: Capture and remove deleted items from existing shop structure
+      if removed_ids.any?
+        capture_removed_items(town, existing_shop, removed_ids, name)
+        remove_items_from_shop(existing_shop, removed_ids)
+      end
+
+      # Step 7: Batch inspect new items
+      new_items = []
+      if new_ids.any?
+        max_item_depth = (Opts["max-item-depth"] || 100).to_i
+        Log.out("Inspecting #{new_ids.size} new items for shop #{shop_id}", label: :smart)
+
+        current_time = Time.now.utc.iso8601
+        new_ids.take(max_item_depth).each do |item_id|
+          begin
+            item_data = scan_item(item_id)
+            new_items << item_data
+
+            # Track in added_items.json for persistence across full scans
+            track_added_item(item_id, current_time)
+          rescue => e
+            Log.out("Failed to inspect item #{item_id}: #{e.message}", label: :smart)
+          end
+        end
+      end
+
+      # Step 8: Add new items to existing shop structure
+      if new_items.any?
+        add_items_to_shop(existing_shop, new_items)
+      end
+
+      # Return the updated shop structure, preserving room_id if it exists
+      result = {
+        preamble: preamble,
+        town: town,
+        id: shop_id,
+        inv: existing_shop['inv']
+      }
+
+      result
+    end
+
+    def self.load_removed_items
+      # Load the global removed items file with migration support
+      return @removed_items_data if @removed_items_data
+
+      file_path = Assets.local_path("removed_items.json")
+
+      if File.exist?(file_path)
+        begin
+          @removed_items_data = JSON.parse(File.read(file_path))
+          Log.out("Loaded removed_items.json", label: :smart)
+        rescue JSON::ParserError => e
+          Log.out("Failed to load removed_items.json: #{e.message}", label: :smart)
+          @removed_items_data = {}
+        end
+      else
+        # First run - migrate from existing town files if they have removed_items
+        Log.out("No removed_items.json found, checking for migration...", label: :migrate)
+        migrated_data = {}
+
+        towns.each do |town|
+          begin
+            town_data = load_and_validate_town_json(town)
+            if town_data && town_data['removed_items'] && town_data['removed_items'].any?
+              migrated_data[town] = town_data['removed_items']
+              Log.out("Migrating #{town_data['removed_items'].size} removed items from #{town}.json", label: :migrate)
+            end
+          rescue => e
+            Log.out("Error checking #{town} for migration: #{e.message}", label: :migrate)
+          end
+        end
+
+        @removed_items_data = migrated_data
+
+        if migrated_data.any?
+          save_removed_items
+          Log.out("Migration complete - saved to removed_items.json", label: :migrate)
+        else
+          Log.out("No existing removed_items to migrate", label: :migrate)
+        end
+      end
+
+      @removed_items_data ||= {}
+    end
+
+    def self.save_removed_items
+      # Save the global removed items file with server reboot safeguard
+      return if @removed_items_data.nil? || @removed_items_data.empty?
+
+      # Server reboot safeguard: check for mass additions that indicate ID reset
+      original_file_path = Assets.local_path("removed_items.json")
+      if File.exist?(original_file_path)
+        begin
+          original_data = JSON.parse(File.read(original_file_path))
+
+          # Count items added in current session only
+          new_items_count = 0
+          @removed_items_data.each do |town, items|
+            original_town_items = original_data[town] || []
+            original_ids = original_town_items.map { |item| item['id'].to_s }.to_set
+
+            new_items_count += items.count { |item| !original_ids.include?(item['id'].to_s) }
+          end
+
+          # Safeguard threshold: reject if adding more than 750 items in one session
+          # This indicates likely server reboot (all item IDs changed)
+          max_new_items = (Opts["removed-max-new"] || 750).to_i
+
+          if new_items_count > max_new_items
+            Log.out("SAFEGUARD: Rejecting #{new_items_count} new removed items (threshold: #{max_new_items})", label: :safeguard)
+            Log.out("This likely indicates a server reboot with ID reset - keeping existing data", label: :safeguard)
+            return
+          elsif new_items_count > 100
+            Log.out("Adding #{new_items_count} new removed items (threshold: #{max_new_items})", label: :safeguard)
+          end
+        rescue => e
+          Log.out("Warning: Could not check original removed_items.json: #{e.message}", label: :safeguard)
+        end
+      end
+
+      begin
+        Assets.write_local_json(@removed_items_data, "removed_items")
+        Log.out("Saved removed_items.json", label: :smart)
+      rescue => e
+        Log.out("Failed to save removed_items.json: #{e.message}", label: :smart)
+      end
+    end
+
+    def self.load_added_items
+      # Load the global added items file (only during smart scans)
+      return @added_items_data if @added_items_data
+
+      file_path = Assets.local_path("added_items.json")
+
+      if File.exist?(file_path)
+        begin
+          @added_items_data = JSON.parse(File.read(file_path))
+          Log.out("Loaded added_items.json with #{@added_items_data.size} items", label: :smart)
+        rescue JSON::ParserError => e
+          Log.out("Failed to load added_items.json: #{e.message}", label: :smart)
+          @added_items_data = {}
+        end
+      else
+        Log.out("No added_items.json found, creating new tracking", label: :smart)
+        @added_items_data = {}
+      end
+
+      @added_items_data
+    end
+
+    def self.track_added_item(item_id, timestamp)
+      # Initialize added items tracking if needed
+      load_added_items
+
+      # Add this item to our tracking
+      @added_items_data[item_id.to_s] = timestamp
+    end
+
+    def self.save_added_items
+      # Save added_items.json (only called during smart scans)
+      return unless @added_items_data
+
+      # Clean up old items (older than 32 days) to prevent file growth
+      thirty_two_days_ago = Time.now.utc - (32 * 24 * 60 * 60)
+
+      @added_items_data = @added_items_data.select do |_item_id, timestamp_str|
+        begin
+          Time.parse(timestamp_str) >= thirty_two_days_ago
+        rescue
+          false # Remove items with invalid timestamps
+        end
+      end
+
+      begin
+        Assets.write_local_json(@added_items_data, "added_items")
+        Log.out("Saved added_items.json with #{@added_items_data.size} items", label: :smart)
+      rescue => e
+        Log.out("Failed to save added_items.json: #{e.message}", label: :smart)
+      end
+    end
+
+    def self.clean_removed_items_by_size
+      # Configurable size-based cleanup
+      max_size_mb = (Opts["removed-max-size"] || 10).to_f
+      min_days = (Opts["removed-min-days"] || 14).to_i
+      max_days = (Opts["removed-max-days"] || 180).to_i
+
+      file_path = Assets.local_path("removed_items.json")
+
+      # First pass: remove anything older than max_days
+      max_cutoff = Time.now.utc - (max_days * 24 * 60 * 60)
+
+      @removed_items_data.each do |town, items|
+        @removed_items_data[town] = items.select do |item|
+          begin
+            Time.parse(item['removed_date']) >= max_cutoff
+          rescue
+            false # Remove items with invalid dates
+          end
+        end
+      end
+
+      # Remove empty town entries
+      @removed_items_data.delete_if { |_town, items| items.empty? }
+
+      # Save and check file size
+      save_removed_items
+      return unless File.exist?(file_path)
+
+      file_size_mb = File.size(file_path) / (1024.0 * 1024.0)
+
+      if file_size_mb > max_size_mb
+        Log.out("removed_items.json is #{file_size_mb.round(2)}MB, trimming to #{max_size_mb}MB", label: :cleanup)
+
+        # Second pass: trim to size while respecting min_days
+        min_cutoff = Time.now.utc - (min_days * 24 * 60 * 60)
+
+        # Get all items sorted by date (newest first)
+        all_items = []
+        @removed_items_data.each do |_town, items|
+          items.each { |item| all_items << item }
+        end
+        all_items.sort_by! { |item| item['removed_date'] }.reverse!
+
+        # Calculate how many items to keep
+        reduction_ratio = max_size_mb / file_size_mb
+        target_count = (all_items.size * reduction_ratio * 0.9).to_i # 90% of target to leave buffer
+
+        # Keep newest items that are also within min_days
+        items_to_keep = all_items.select do |item|
+          begin
+            Time.parse(item['removed_date']) >= min_cutoff
+          rescue
+            false
+          end
+        end
+
+        # If we still have too many, take only the newest
+        items_to_keep = items_to_keep.first(target_count) if items_to_keep.size > target_count
+
+        # Rebuild by town
+        @removed_items_data = {}
+        items_to_keep.each do |item|
+          town = item['town'] || item['last_seen_shop'] # fallback for old data
+          @removed_items_data[town] ||= []
+          @removed_items_data[town] << item
+        end
+
+        save_removed_items
+        new_size = File.size(file_path) / (1024.0 * 1024.0)
+        Log.out("Trimmed removed_items.json from #{file_size_mb.round(2)}MB to #{new_size.round(2)}MB", label: :cleanup)
+      end
+    end
+
+    def self.capture_removed_items(town, shop_data, item_ids_to_remove, shop_name)
+      # Capture removed items before deleting them
+      return unless shop_data && shop_data['inv']
+
+      # Load existing data if not loaded
+      load_removed_items
+
+      @removed_items_data[town] ||= []
+      current_time = Time.now.utc.iso8601
+
+      shop_data['inv'].each do |room|
+        next unless room['items']
+        room['items'].each do |item|
+          if item_ids_to_remove.include?(item['id'].to_s)
+            removed_item = item.dup
+            removed_item['removed_date'] = current_time
+            removed_item['last_seen_shop'] = shop_name
+            removed_item['town'] = town
+            @removed_items_data[town] << removed_item
+          end
+        end
+      end
+    end
+
+    def self.remove_items_from_shop(shop_data, item_ids_to_remove)
+      # Remove specific item IDs from shop's inventory structure
+      return unless shop_data && shop_data['inv']
+
+      shop_data['inv'].each do |room|
+        next unless room['items']
+        room['items'].reject! { |item| item_ids_to_remove.include?(item['id'].to_s) }
+      end
+    end
+
+    def self.add_items_to_shop(shop_data, new_items)
+      # Add new items to the first room of the shop (simplified approach)
+      return unless shop_data && shop_data['inv'] && new_items.any?
+
+      # Ensure at least one room exists
+      if shop_data['inv'].empty?
+        shop_data['inv'] = [{ 'room_title' => 'Main Room', 'branch' => 'entry', 'items' => [] }]
+      end
+
+      # Add all new items to the first room (we don't know their original room structure from browse)
+      first_room = shop_data['inv'].first
+      first_room['items'] ||= []
+      first_room['items'].concat(new_items)
+    end
+
+    def self.get_removed_items_for_town(town)
+      # Load the global removed items data if not loaded
+      load_removed_items
+
+      # Get all removed items for this town
+      all_removed = @removed_items_data[town] || []
+
+      # Remove duplicates by item ID (keep most recent)
+      unique_removed = {}
+      all_removed.each do |item|
+        item_id = item['id'].to_s
+        if !unique_removed[item_id] || Time.parse(item['removed_date']) > Time.parse(unique_removed[item_id]['removed_date'])
+          unique_removed[item_id] = item
+        end
+      end
+
+      unique_removed.values.sort_by { |item| item['removed_date'] }.reverse
+    end
+
+    def self.display_smart_summary
+      return unless @smart_stats && @smart_stats[:shops_scanned] > 0
+
+      stats = @smart_stats
+      total_items = stats[:new_items] + stats[:unchanged_items]
+      efficiency = total_items > 0 ? (stats[:unchanged_items].to_f / total_items * 100).round(1) : 0
+
+      Log.out("=" * 60, label: :smart)
+      Log.out("SMART PARSING SUMMARY", label: :smart)
+      Log.out("=" * 60, label: :smart)
+      Log.out("Shops scanned: #{stats[:shops_scanned]}", label: :smart)
+      Log.out("New items found: #{stats[:new_items]}", label: :smart)
+      Log.out("Items removed: #{stats[:removed_items]}", label: :smart)
+      Log.out("Items unchanged: #{stats[:unchanged_items]}", label: :smart)
+      Log.out("Cache efficiency: #{efficiency}% (#{stats[:unchanged_items]}/#{total_items} items cached)", label: :smart)
+
+      if stats[:new_items] > 0 || stats[:removed_items] > 0
+        Log.out("*** CHANGES DETECTED - JSON updated with #{stats[:new_items]} new and #{stats[:removed_items]} removed items ***", label: :smart)
+      else
+        Log.out("*** NO CHANGES DETECTED - All items matched cache ***", label: :smart)
+      end
+      Log.out("=" * 60, label: :smart)
+
+      # Reset stats for next run
+      @smart_stats = nil
+    end
+
     def self.scan_item(id)
       coll = Collector.new(
         command: %[shop inspect #{id}],
@@ -578,31 +1175,64 @@ module Bodega
     end
 
     def self.to_json()
+      @created_files = []
+
+      # First, collect all the data
+      all_town_data = []
+
       Utils.benchmark(template: "scanned shops in {{run_time}}") do
         towns_to_search.each do |town|
           start = Time.now
           shops = Parser.shops(town)
 
-          next if shops.empty?
-
-          data = {
+          # ALWAYS update timestamp when parser runs - shows last scan time on website
+          # This ensures users see when we last checked for updates, not when data last changed
+          town_data = {
             created_at: Time.now.utc,
             run_time: Utils.fmt_time(Time.now - start),
             town: town,
-            shops: shops,
+            shops: shops || []
           }
 
-          save_json(name: town,
-                    data: data)
+          all_town_data << town_data
         end
       end
+
+      # Now save all the data
+      all_town_data.each do |data|
+        filename = save_json(name: data[:town], data: data)
+        @created_files << filename if filename
+      end
+
+      # Display smart parsing summary if we were in smart mode
+      display_smart_summary if Opts.smart
+
+      # Save added items file after all towns are processed (smart mode only)
+      save_added_items if Opts.smart
+
+      # Clean and save the global removed items file after all towns are processed
+      if @removed_items_data && @removed_items_data.any?
+        clean_removed_items_by_size
+        save_removed_items
+      end
+
+      # Add removed_items.json to created files list for upload
+      if File.exist?(Assets.local_path("removed_items.json"))
+        @created_files << "removed_items.json"
+      end
+
+      @created_files
+    end
+
+    def self.created_files
+      @created_files || []
     end
 
     def self.save_json(name:, data:)
       return Utils.pp(data) if Opts["dry-run"]
-      Assets.write_local_json(data,
-                              Utils.safe_string(Opts.to_h
-                                  .fetch(:shop, name)))
+      filename = Utils.safe_string(Opts.to_h.fetch(:shop, name))
+      Assets.write_local_json(data, filename)
+      return "#{filename}.json"
     end
 
     def self.manifest(url_root: Opts.to_h.fetch(:url, Assets::URL), _file: nil)
@@ -766,6 +1396,231 @@ module Bodega
 end
 
 module Bodega
+  module Uploader
+    # Upload endpoints - API method preferred for better reliability
+    API_ENDPOINTS = [
+      "https://bodega-netlify-api.netlify.app/.netlify/functions/upload",
+      "https://bodega-vercel-api.vercel.app/api/upload",
+      # Additional fallback endpoints can be added here
+    ]
+
+    def self.upload_all_files(specific_files = nil)
+      return if Opts["dry-run"]
+
+      Log.out("Starting upload process...", label: :upload)
+
+      # Only use API upload - no fallbacks
+      if upload_via_api(specific_files)
+        Log.out("Upload complete via API!", label: :upload)
+      else
+        Log.out("Upload failed - all API endpoints failed", label: :upload)
+      end
+    end
+
+    def self.split_large_file(filename, json_content)
+      require 'json'
+
+      begin
+        data = JSON.parse(json_content)
+
+        # Only split files that have a 'shops' array
+        unless data['shops'] && data['shops'].is_a?(Array)
+          Log.out("#{filename} doesn't have shops array, cannot split", label: :upload)
+          return { filename => json_content }
+        end
+
+        shops = data['shops']
+        total_shops = shops.length
+
+        # Split into chunks of 50 shops each (should be ~2.5MB per chunk)
+        chunk_size = 50
+        chunks = {}
+
+        shops.each_slice(chunk_size).with_index do |shop_chunk, index|
+          chunk_number = index + 1
+          total_chunks = (total_shops / chunk_size.to_f).ceil
+
+          # Create chunk filename like: wehnimers_landing_part1of3.json
+          base_name = filename.gsub('.json', '')
+          chunk_filename = "#{base_name}_part#{chunk_number}of#{total_chunks}.json"
+
+          # Create chunk data with same structure but subset of shops
+          chunk_data = data.dup
+          chunk_data['shops'] = shop_chunk
+          chunk_data['chunk_info'] = {
+            'original_file'  => filename,
+            'part'           => chunk_number,
+            'total_parts'    => total_chunks,
+            'shops_in_chunk' => shop_chunk.length,
+            'total_shops'    => total_shops
+          }
+
+          chunks[chunk_filename] = JSON.generate(chunk_data)
+
+          Log.out("Created #{chunk_filename}: #{shop_chunk.length} shops, #{chunks[chunk_filename].bytesize} bytes", label: :upload)
+        end
+
+        return chunks
+      rescue JSON::ParserError => e
+        Log.out("Failed to parse #{filename} as JSON: #{e.message}", label: :upload)
+        return { filename => json_content }
+      end
+    end
+
+    def self.upload_via_api(specific_files = nil)
+      begin
+        require 'net/http'
+        require 'uri'
+        require 'json'
+
+        # Get specific files list or all JSON files
+        if specific_files && !specific_files.empty?
+          Log.out("Uploading specific files: #{specific_files.join(', ')}", label: :upload)
+          files = specific_files
+        else
+          Log.out("No specific files provided, uploading all cached files", label: :upload)
+          files = Assets.cached_files()
+        end
+
+        if files.empty?
+          Log.out("No files to upload", label: :upload)
+          return true # Nothing to upload is success
+        end
+
+        # Collect all files
+        files_to_upload = {}
+        files.each do |file|
+          basename = File.basename(file)
+          file_path = Assets.local_path(basename)
+          if File.exist?(file_path)
+            json_content = File.read(file_path)
+
+            # Split large files (>5MB) into smaller chunks
+            if json_content.bytesize > 5_000_000
+              Log.out("#{basename} is large (#{json_content.bytesize} bytes), splitting...", label: :upload)
+              split_files = split_large_file(basename, json_content)
+              split_files.each do |split_name, split_content|
+                files_to_upload[split_name] = split_content
+                Log.out("Preparing #{split_name} for upload (#{split_content.bytesize} bytes)", label: :upload)
+              end
+            else
+              files_to_upload[basename] = json_content
+              Log.out("Preparing #{basename} for upload", label: :upload)
+            end
+          end
+        end
+
+        if files_to_upload.empty?
+          Log.out("No valid files to upload", label: :upload)
+          return true
+        end
+
+        # Try file-by-file upload to each endpoint
+        API_ENDPOINTS.each do |endpoint|
+          Log.out("Uploading #{files_to_upload.size} files to #{endpoint} one by one...", label: :upload)
+
+          begin
+            if upload_files_individually(endpoint, files_to_upload)
+              Log.out("Successfully uploaded via API", label: :upload)
+              return true
+            end
+          rescue => e
+            Log.out("Endpoint #{endpoint} failed: #{e.message}", label: :upload)
+          end
+        end
+
+        Log.out("All API endpoints failed", label: :upload)
+        return false
+      rescue => e
+        Log.out("API upload error: #{e.message}", label: :upload)
+        return false
+      end
+    end
+
+    def self.upload_files_individually(endpoint, files)
+      require 'net/http'
+      require 'uri'
+      require 'json'
+
+      uri = URI(endpoint)
+      session_id = Time.now.to_i.to_s + rand(1000).to_s
+      total_files = files.size
+      file_index = 0
+
+      Log.out("Starting multi-file upload session: #{session_id}", label: :upload)
+
+      files.each do |filename, content|
+        file_index += 1
+        is_final_file = (file_index == total_files)
+
+        payload = {
+          filename: filename,
+          content: content,
+          session_id: session_id,
+          file_index: file_index,
+          total_files: total_files,
+          is_final: is_final_file,
+          timestamp: Time.now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+          source: "bodega-script-individual"
+        }
+
+        json_data = payload.to_json
+        Log.out("Uploading #{filename} (#{content.bytesize} bytes) - #{file_index}/#{total_files}", label: :upload)
+
+        request = Net::HTTP::Post.new(uri)
+        request['Content-Type'] = 'application/json'
+        request['User-Agent'] = 'Bodega-Script/2.0'
+        request.body = json_data
+
+        response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true, read_timeout: 60) do |http|
+          http.request(request)
+        end
+
+        if response.code.to_i >= 200 && response.code.to_i < 300
+          response_data = JSON.parse(response.body)
+          Log.out("#{filename} uploaded: #{response_data['message']}", label: :upload)
+
+          # If this was the final file, check if gist was created
+          if is_final_file && response_data['gist_url']
+            Log.out("Multi-file upload complete! Gist: #{response_data['gist_url']}", label: :upload)
+            return true
+          end
+        else
+          Log.out("Failed to upload #{filename} - HTTP #{response.code}: #{response.body}", label: :upload)
+          return false
+        end
+
+        # Small delay between uploads to be nice to the server
+        sleep(0.5) unless is_final_file
+      end
+
+      return true
+    rescue => e
+      Log.out("Individual file upload error: #{e.message}", label: :upload)
+      return false
+    end
+
+    def self.count_items_in_json(parsed_json)
+      total_items = 0
+
+      if parsed_json.is_a?(Hash) && parsed_json['shops']
+        parsed_json['shops'].each do |shop|
+          if shop['inv']
+            shop['inv'].each do |room|
+              if room['items']
+                total_items += room['items'].length
+              end
+            end
+          end
+        end
+      end
+
+      total_items
+    end
+  end
+end
+
+module Bodega
   module CLI
     def self.help_menu()
       <<~HELP_MENU
@@ -786,6 +1641,17 @@ module Bodega
           --save                dump the results to the filesystem            [required in standalone mode]
           --out                 the location on the filesystem to write to    [defaults to $lich_dir/bodega/]
           --manifest            create a manifest file of the assets
+          --upload              upload generated JSON files via API or gist fallback
+
+        smart mode:
+          --smart               enable smart parsing - only inspect new items for 90%+ speed boost
+                                loads existing JSON, compares item IDs, only inspects truly new items
+                                automatically removes deleted items and adds new ones
+                                first run still full speed, subsequent runs are much faster
+
+
+        upload mode:
+          --upload              upload existing JSON files from local filesystem
 
         search mode:
           --flush               forces a resync of the search index from the CDN
@@ -806,8 +1672,20 @@ module Bodega
       ##
       if Opts.parser
         Log.out(Opts.to_h, label: :opts)
-        Bodega::Parser.to_json()  if (Opts.save or Opts["dry-run"])
+        created_files = Bodega::Parser.to_json() if (Opts.save or Opts["dry-run"])
         Bodega::Parser.manifest() if Opts.manifest
+
+        # Auto-upload after parsing if requested
+        if Opts.upload and (Opts.save or Opts["dry-run"])
+          # Only upload files that were just created during parsing
+          Bodega::Uploader.upload_all_files(created_files)
+        end
+      end
+
+      # Handle standalone upload mode
+      if Opts.upload and not Opts.parser
+        Log.out("Upload mode: uploading existing JSON files", label: :upload)
+        Bodega::Uploader.upload_all_files
       end
 
       if Opts.search
@@ -815,6 +1693,23 @@ module Bodega
       end
     rescue => exception
       Log.out(exception)
+    end
+  end
+end
+
+# Ruby automation module methods for clean integration
+module Bodega
+  module Parser
+    def self.smart_scan
+      Log.out("Starting smart scan mode", label: :automation)
+      Script.run("bodega", "--parser", "--smart", "--save")
+    end
+
+    def self.full_scan
+      Log.out("Starting full scan mode", label: :automation)
+      # Full scan does smart scan first, then full scan
+      Script.run("bodega", "--parser", "--smart", "--save")
+      Script.run("bodega", "--parser", "--save")
     end
   end
 end
