@@ -8,8 +8,8 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.9.5
-      required: Lich >= 5.12.1
+       version: 5.9.6
+      required: Lich >= 5.12.6
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
       Full Changelog: https://gswiki.play.net/Script_Bigshot/Changelog
@@ -17,6 +17,11 @@
 
   Version Control:
     Major_change.feature_addition.bugfix
+  v5.9.6  (2025-09-09)
+    - add support for 902 and 411 (doesn't work with UAC)
+    - remove custom issue_command for Lich method
+    - added cast_spell method
+    - updated Society Abilities/Spells/CMan section to ignore rapidfire cool down: 515 (ignore) or rapidfire (ignore)
   v5.9.5  (2025-07-22)
     - remove companion_check calls as no longer needed with migration to GameObj.targets for valid creatures
     - add check_disks param to bigclaim? method
@@ -369,6 +374,8 @@ $bigshot_archery_location = nil
 $bigshot_bandits = false
 $bigshot_bless = []
 $bigshot_bond_return = false
+$bigshot_cast902 = false
+$bigshot_cast411 = false
 $bigshot_dislodge_target = nil
 $bigshot_dislodge_location = []
 $bigshot_debug = false
@@ -2025,6 +2032,10 @@ class Bigshot
         $bigshot_rooted = true
       elsif server_string =~ /You're finally able to break free of <pushBold\/>the <a exist="(\d+)" noun="snake">snake's<\/a><popBold\/> coils!/
         $bigshot_rooted = false
+      elsif server_string =~ /Your <a exist="(.*?)" noun=".*?">.*?<\/a> stops glowing\./i
+        $bigshot_cast902 = true
+      elsif server_string =~ /The scintillating.*?light surrounding the <a exist=".*?" noun=".*?">.*?<\/a> fades away./i
+        $bigshot_cast411 = true
       end
       server_string
     }
@@ -2681,7 +2692,7 @@ class Bigshot
     regex = Regexp.union(regex, /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./)
 
     loop do
-      lines = issue_command(command, regex, silent: true, quiet: true)
+      lines = Lich::Util.issue_command(command, regex, usexml: true, silent: nil, quiet: true)
       debug_msg(@DEBUG_SYSTEM, "get_lines | lines: #{lines} | called by #{caller[0]}")
       break unless lines.grep(/(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./i).any?
 
@@ -2702,71 +2713,6 @@ class Bigshot
       wait_rt
     end
 
-    return result
-  end
-
-  def issue_command(command, start_pattern, end_pattern = /<prompt/, include_end: true, timeout: 5, silent: nil, usexml: true, quiet: false)
-    result = []
-    name = "Bigshot:: -#{Time.now.tv_sec}.#{Time.now.tv_usec}-#{Random.rand(10000)}"
-    filter = false
-
-    save_script_silent = Script.current.silent
-    save_want_downstream = Script.current.want_downstream
-    save_want_downstream_xml = Script.current.want_downstream_xml
-
-    Script.current.silent = silent if !silent.nil?
-    Script.current.want_downstream = !usexml
-    Script.current.want_downstream_xml = usexml
-
-    begin
-      Timeout::timeout(timeout, Interrupt) {
-        DownstreamHook.add(name, proc { |line|
-          if filter
-            if line =~ end_pattern
-              DownstreamHook.remove(name)
-              filter = false
-              if quiet
-                next(nil)
-              else
-                line
-              end
-            else
-              if quiet
-                next(nil)
-              else
-                line
-              end
-            end
-          elsif line =~ start_pattern
-            filter = true
-            if quiet
-              next(nil)
-            else
-              line
-            end
-          else
-            line
-          end
-        })
-        fput command
-
-        until (line = get) =~ start_pattern; end
-        result << line.rstrip
-        until (line = get) =~ end_pattern
-          result << line.rstrip
-        end
-        if include_end
-          result << line.rstrip
-        end
-      }
-    rescue Interrupt
-      nil
-    ensure
-      DownstreamHook.remove(name)
-      Script.current.silent = save_script_silent if !silent.nil?
-      Script.current.want_downstream = save_want_downstream
-      Script.current.want_downstream_xml = save_want_downstream_xml
-    end
     return result
   end
 
@@ -2850,10 +2796,12 @@ class Bigshot
     # Celerity (506) routine
     if (command =~ /^(celerity|haste|506)\s+(.*)/i)
       command = $2
-      if Spell[506].known? and Spell[506].affordable?
-        if (Spell[506].active? and Spell[506].timeleft <= 0.05) || (!Spell[506].active?)
-          Spell[506].cast
-        end
+
+      spell = Spell[506]
+      if !spell.active? || spell.timeleft <= 0.05
+        waitrt?
+        cmd_spell(id: 506, target: npc)
+        waitcastrt?
       end
     end
 
@@ -2892,7 +2840,7 @@ class Bigshot
 
     # Perform the command
     if (command =~ /^(incant)?\s?(\d+)\s?((?:open|closed)?\s?(?:cast|channel|evoke)?\s?(?:cast|channel|evoke)?\s?(?:open|closed)?\s?(?:acid|air|cold|earth|fire|lightning|steam|water)?)?.*$/i)
-      cmd_spell($1, $2.to_i, $3, npc)
+      cmd_spell(incant: $1, id: $2.to_i, extra: $3, target: npc)
     elsif (command =~ /^barrage|^flurry|^fury|^gthrusts|^pummel|^thrash/i)
       cmd_assault(npc, command)
     elsif (command =~ /^pindown|^cripple|^charge|^twinhammer|^dizzyingswing|^clash|^volley|^pulverize|^cyclone|^whirlwind|^wblade/i)
@@ -4189,24 +4137,58 @@ class Bigshot
     ].include?(spell_id)
   end
 
-  def cmd_spell(incant = nil, id, extra, target)
+  def cast_spell(spell_id: nil, target: nil, extra: nil, force: false, max_attempts: 3)
+    attempts = 0
+
+    loop do
+      cast_result =
+        if target
+          Spell[spell_id].cast(target)
+        elsif force
+          Spell[spell_id].force_incant(extra)
+        else
+          Spell[spell_id].cast
+        end
+
+      case cast_result.to_s
+      when /^Be at peace my child, there is no need for spells of war in here\.$/,
+           /Spells of War cannot be cast/,
+           /Cast at what/
+        return :blocked
+      when /^\[Spell Hindrance for/
+        attempts += 1
+        return :hindrance if attempts >= max_attempts
+        # otherwise loop again
+      else
+        return :success
+      end
+    end
+  end
+
+  def cmd_spell(incant: nil, id: nil, extra: nil, target: nil)
     debug_msg(@DEBUG_COMMANDS, "cmd_spell | incant: #{incant} | id: #{id} | extra: #{extra} | target: #{target} | called by #{caller[0]}")
 
     selfcast = spell_is_selfcast?(id)
 
-    if (checkprep != "None" and checkprep != Spell[id].name)
+    if (checkprep != "None" && checkprep != Spell[id].name)
       fput 'release'
     end
 
-    return if id == 506 and Spell[506].active?
-    return if id == 9605 and Effects::Cooldowns.active?("Surge of Strength") # surge cooldown
-    return if id == 9625 and Effects::Cooldowns.active?("Burst of Swiftness") # burst cooldown
-    return if id == 335 and Effects::Cooldowns.active?(335) # Divine Wrath cooldown
-    return if id == 608 and hiding?
-    return if id == 703 and $bigshot_703_list.any? { |s| s == target.id }
-    return if id == 1614 and $bigshot_1614_list.any? { |s| s == target.id }
-    return if target.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == target.id }
-    return if id == 720 and Effects::Cooldowns.active?("Implosion") # implosion cooldown
+    # There is a 5 mana penality if you ignore the 515 cooldown
+    if Spell[597].active? && Spell[id].mana_cost.positive? && Spell[id].mana_cost + 5 > Char.mana
+      return
+    end
+
+    return unless Spell[id].known?
+    return if id == 506 && Spell[506].active?
+    return if id == 9605 && Effects::Cooldowns.active?("Surge of Strength") # surge cooldown
+    return if id == 9625 && Effects::Cooldowns.active?("Burst of Swiftness") # burst cooldown
+    return if id == 335 && Effects::Cooldowns.active?(335) # Divine Wrath cooldown
+    return if id == 608 && hiding?
+    return if id == 703 && $bigshot_703_list.any? { |s| s == target.id }
+    return if id == 1614 && $bigshot_1614_list.any? { |s| s == target.id }
+    return if id.to_s !~ /902|411/ && (target.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == target.id })
+    return if id == 720 && Effects::Cooldowns.active?("Implosion") # implosion cooldown
     # short duration buff cooldown check
     return if [140, 211, 215, 219, 919, 1619, 1650].include?(Spell[id].num) && Effects::Cooldowns.active?(Spell[id].name)
 
@@ -4219,7 +4201,7 @@ class Bigshot
       end
     end
 
-    if (!Spell[id].affordable? and id != 9605 and id != 506)
+    if !Spell[id].affordable? && ![9605, 506, 902, 411].include?(id)
       $bigshot_should_rest = true
       $rest_reason = "out of mana"
     end
@@ -4229,10 +4211,12 @@ class Bigshot
     waitcastrt?
 
     if incant.nil?
-      if selfcast
-        Spell[id].cast(Char.name)
+      if id.to_s =~ /506|902/
+        cast_spell(spell_id: id)
+      elsif selfcast
+        cast_spell(spell_id: id, target: Char.name)
       else
-        Spell[id].cast("##{target.id}")
+        cast_spell(spell_id: id, target: target.id)
       end
     else
       if selfcast
@@ -4242,7 +4226,7 @@ class Bigshot
       after_stance = Spell.class_variable_get(:@@after_stance)
       Spell.after_stance = Char.stance
       change_stance('offensive') if Spell[id].stance || (id.to_s =~ /1700/i && extra =~ /evoke/i)
-      Spell[id].force_incant(extra) # bs_put "incant #{id} #{extra}"
+      cast_spell(spell_id: id, extra: extra, force: true)
       change_stance(@HUNTING_STANCE)
       Spell.after_stance = after_stance
 
@@ -4348,7 +4332,7 @@ class Bigshot
     return unless Spell[515].known?
     return unless Spell[515].affordable?
     return if Effects::Buffs.active?("Rapid Fire") && Effects::Buffs.time_left("Rapid Fire") > 0.05
-    return if Effects::Cooldowns.active?("Rapid Fire Recovery") && (ignore.empty? || ignore.nil?)
+    return if Spell[597].active? && ignore.to_s.empty?
 
     waitrt?
     waitcastrt?
@@ -5376,6 +5360,11 @@ class Bigshot
     end
 
     wait_rt
+
+    if @SIGNS.any? { |s| ['902', '411'].include?(s) }
+      check_902_411()
+    end
+
     cast_signs()
   end
 
@@ -6555,6 +6544,33 @@ class Bigshot
     return current_favor
   end
 
+  def cast902()
+    if Spell[902].known? && Spell[902].affordable?
+      waitrt?
+      change_stance(@WANDER_STANCE) unless Effects::Buffs.active?("Rapid Fire")
+      cmd_spell(id: 902)
+      check_902_411()
+      waitcastrt?
+    end
+  end
+
+  def cast411()
+    if Spell[411].known? && Spell[411].affordable?
+      waitrt?
+      change_stance(@WANDER_STANCE) unless Effects::Buffs.active?("Rapid Fire")
+      cmd_spell(id: 411, target: GameObj.right_hand)
+      check_902_411()
+      waitcastrt?
+    end
+  end
+
+  def check_902_411()
+    lines = Lich::Util.quiet_command_xml("look at ##{GameObj.right_hand.id}", /You see nothing unusual.|I could not find|The <a exist="(.*?)" noun=".*?">.*?<\/a>/).join(" ")
+
+    $bigshot_cast902 = !lines&.match?(/gleams faintly with inner light/)
+    $bigshot_cast411 = !lines&.match?(/is surrounded by a scintillating/)
+  end
+
   def cast_signs(single_cast = false)
     debug_msg(@DEBUG_COMMANDS, "cast_signs | single_cast: #{single_cast} | called by #{caller[0]}")
 
@@ -6563,15 +6579,28 @@ class Bigshot
         cmd_assume($1.to_s, $2.to_s)
         next
       end
+
+      if i =~ /\b(?:515|rapid|rapidfire)(?:\s?\(?(\w+)\)?)?/
+        ignore = $1
+        cmd_rapid(ignore)
+        next
+      end
+
+      # There is a 5 mana penality if you ignore the 515 cooldown
+      if Spell[597].active? && Spell[id].mana_cost.positive? && Spell[id].mana_cost + 5 > Char.mana
+        next
+      end
+
       i = i.to_i
       next if [9903, 9904, 9905, 9906, 9907, 9908, 9909, 9910, 9912, 9913, 9914, 9918].include?(i) and Spell[9012].active?
       next if i == 9918
       next if (i == 9605 && Effects::Cooldowns.active?("Surge of Strength"))
-      next if (i == 515 && Effects::Cooldowns.active?("Rapid Fire Recovery"))
       next if (i == 320 && Effects::Cooldowns.active?("Ethereal Censer"))
       next if (i == 605 && Effects::Cooldowns.active?("Barkskin"))
       next if (i == 9625 && Effects::Cooldowns.active?("Burst of Swiftness"))
       next if (i == 1035 && Effects::Buffs.active?("Song of Tonis"))
+      next if (i == 902 && !$bigshot_cast902)
+      next if (i == 411 && !$bigshot_cast411)
 
       if i == 122420
         next unless Warcry.available?("Seanette's Shout")
@@ -6628,8 +6657,24 @@ class Bigshot
         end
         next
       end
+
       if i == 909
-        Spell[909].force_channel if (Spell[909].known? && Spell[909].affordable? && !Spell[909].active?)
+        if (Spell[909].known? && Spell[909].affordable? && !Spell[909].active?)
+          waitrt?
+
+          Spell[909].force_channel
+          waitcastrt?
+        end
+        next
+      end
+
+      if i == 902
+        cast902()
+        next
+      end
+
+      if i == 411
+        cast411()
         next
       end
 
