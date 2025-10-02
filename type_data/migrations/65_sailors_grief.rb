@@ -2,7 +2,6 @@ migrate :aggressive_npc do
   insert(:name, %{(?:algae-draped )?merrow oracle})
   insert(:name, %{(?:amaranthine )?kraken tentacle})
   insert(:name, %{(?:blubbery )?humpbacked merrow})
-  insert(:name, %{(?:brackish )?bilge mass})
   insert(:name, %{(?:fulminating )?stormborn primordial})
   insert(:name, %{(?:gigantic )?lightning whelk})
   insert(:name, %{(?:grey-plumed )?steelwing harpy})
@@ -18,6 +17,7 @@ migrate :undead, :aggressive_npc do
 end
 
 migrate :undead, :aggressive_npc, :noncorporeal do
+  insert(:name, %{(?:brackish )?bilge mass})
   insert(:name, %{(?:tenebrific )?wraith shark})
 end
 
