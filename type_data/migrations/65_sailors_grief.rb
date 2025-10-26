@@ -65,3 +65,7 @@ migrate :skin, :furrier do
   insert(:name, %{trenchling teeth})
   insert(:name, %{(?:metallic )?harpy feather})
 end
+
+migrate :uncommon do
+  insert(:name, %{mummified shark heart})
+end
