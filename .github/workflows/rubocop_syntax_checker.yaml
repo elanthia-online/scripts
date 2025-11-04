@@ -11,33 +11,112 @@ on:
       - 'scripts/**'
       - 'type_data/migrations/**'
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   rubocop:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         ruby: ['3.3']
+
     name: Run Rubocop on Ruby ${{ matrix.ruby }}
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
-
-      - name: Get changed files
-        id: changed-files
-        uses: step-security/changed-files@95b56dadb92a30ca9036f16423fd3c088a71ee94 # v46.0.5
-        with:
-          files: |
-            **/*.lic
-            **/*.rb
-        
-      - uses: ruby/setup-ruby@d5126b9b3579e429dd52e51e68624dda2e05be25 # v1.267.0
+      
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@d5126b9b3579e429dd52e51e68624dda2e05be25 # v1.267.0
         with:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
-
-      - name: Rubocop
+      
+      - name: Determine base reference and fetch
+        id: base_ref
         run: |
-          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
-            bundle exec rubocop $file
-          done
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "base=${{ github.base_ref }}" >> $GITHUB_OUTPUT
+            echo "compare_ref=origin/${{ github.base_ref }}" >> $GITHUB_OUTPUT
+            git fetch origin ${{ github.base_ref }}
+          else
+            # For push events, check if it's a new branch
+            if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+              echo "New branch detected, comparing with default branch"
+              DEFAULT_BRANCH=$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5)
+              echo "base=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+              echo "compare_ref=origin/$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+              git fetch origin $DEFAULT_BRANCH
+            else
+              echo "base=${{ github.event.before }}" >> $GITHUB_OUTPUT
+              echo "compare_ref=${{ github.event.before }}" >> $GITHUB_OUTPUT
+            fi
+          fi
+      
+      - name: Get changed files
+        id: changed_files
+        run: |
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM -z ${{ steps.base_ref.outputs.compare_ref }} HEAD | grep -zE '\.(rb|rbw|lic)$' || true)
+          
+          if [ -n "$CHANGED_FILES" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "$CHANGED_FILES" > /tmp/changed_files.txt
+            echo "Changed files:"
+            cat /tmp/changed_files.txt | tr '\0' '\n'
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No Ruby, .rbw, or .lic files changed"
+          fi
+      
+      - name: Run Rubocop autocorrect on changed files
+        if: steps.changed_files.outputs.has_changes == 'true'
+        run: |
+          echo "Running rubocop -a on changed files..."
+          cat /tmp/changed_files.txt | xargs -0 -I {} bundle exec rubocop -a {} || {
+            echo "Warning: Rubocop autocorrect encountered issues but continuing..."
+            exit 0
+          }
+      
+      - name: Check for changes and commit
+        if: steps.changed_files.outputs.has_changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          if git diff --quiet; then
+            echo "No changes made by rubocop autocorrect"
+          else
+            # Check if we can push (not a protected branch issue)
+            if git add -u && git commit -m "Auto-fix: Apply rubocop autocorrections [skip ci]"; then
+              if git push 2>&1 | tee /tmp/push_output.txt; then
+                echo "Successfully pushed autocorrect changes"
+              else
+                if grep -q "protected branch" /tmp/push_output.txt || grep -q "permission" /tmp/push_output.txt; then
+                  echo "::warning::Cannot push to protected branch. Rubocop fixes were not committed."
+                  echo "Please apply rubocop fixes manually or adjust branch protection rules."
+                else
+                  echo "::error::Failed to push changes"
+                  exit 1
+                fi
+              fi
+            else
+              echo "::error::Failed to commit changes"
+              exit 1
+            fi
+          fi
+      
+      - name: Run Rubocop check on changed files
+        if: steps.changed_files.outputs.has_changes == 'true'
+        run: |
+          echo "Running rubocop check on changed files..."
+          cat /tmp/changed_files.txt | xargs -0 -I {} bundle exec rubocop {}
+      
+      - name: Summary
+        if: always() && steps.changed_files.outputs.has_changes == 'false'
+        run: |
+          echo "✅ No Ruby, .rbw, or .lic files were changed in this ${{ github.event_name }}"
