@@ -89,7 +89,7 @@ module Migration
     def migrate(*table_names, &migration)
       table_names.each do |table_name|
         table = assert_table_exists(table_name)
-        @changesets << ChangeSet.run(table, @file, @tables, &migration)  # Add @tables here
+        @changesets << ChangeSet.run(table, @file, @tables, &migration) # Add @tables here
       end
       self
     end
