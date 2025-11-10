@@ -43,6 +43,12 @@ module Migration
       key.to_s.downcase.to_sym
     end
     #
+    # get all rules for a key:
+    #
+    def get_rules(key)
+      @rules[Table.normalize_key(key)] || []
+    end
+    #
     # validate that a ruleset only contains
     # whitelisted keys
     #
