@@ -21,33 +21,37 @@ module Migration
     # Empty Ruleset Error
     #
     def self.raise_empty_ruleset(table)
-      fail Exception, <<~ERROR
+      fail StandardError, <<~ERROR
        Table[#{table.name}] exported an empty RuleSet and that is not allowed
       ERROR
     end
+
     #
     # Error for bad key validation
     #
     def self.raise_bad_rule_kind(table, key)
-      fail Exception, <<~ERROR
+      fail StandardError, <<~ERROR
         Key[#{key}] in Table[#{table.name}] not a valid Key
 
             allowed metadata keys: #{METADATA_KEYS}
         allowed game-obj.xml keys: #{GAMEOBJ_DATA_KEYS}
       ERROR
     end
+
     ##
     ## normalizes a key to what gameobj-data format expects
     ##
     def self.normalize_key(key)
       key.to_s.downcase.to_sym
     end
+
     #
     # get all rules for a key:
     #
     def get_rules(key)
       @rules[Table.normalize_key(key)] || []
     end
+
     #
     # validate that a ruleset only contains
     # whitelisted keys
@@ -61,17 +65,17 @@ module Migration
     #
     # Table Attributes
     #
-    attr_reader :name,     # the name of the table in gameob-data.xml
-                           #
-                :rules,    # the set of rules that will be applied
-                           # on encoding the table to gameobj-data.xml
-                           #
-                :pending,  # you can mark a table pending 
-                           # and it will not compile
-                           # 
+    attr_reader :name, # the name of the table in gameob-data.xml
+                :rules, # the set of rules that will be applied
+                # on encoding the table to gameobj-data.xml
+                #
+                :pending, # you can mark a table pending
+                # and it will not compile
+                #
                 :kind,     # sellable | type
                 :basename, # the basename of the table
                 :log_name  # name to appear in logs
+
     ##
     ## reads a .yaml definition into memory
     ## so that migrations may be layered ontop
@@ -90,10 +94,10 @@ module Migration
       # output something useful
       # about how we are loading this data
       Migration.log(%{decoding #{log_name} from #{file}},
-        label: %i[table],
-        color: :blue)
+                    label: %i[table],
+                    color: :blue)
 
-      rules = Hash[YAML.load_file(file).map do |(k,v)|
+      rules = Hash[YAML.load_file(file).map do |(k, v)|
         [Table.normalize_key(k), v]
       end]
       kind = rules.fetch(:kind, "type")
@@ -106,25 +110,29 @@ module Migration
         rules: rules
       )
     end
+
     #
     # check for existance of a key
     #
     def has_key?(key)
       !@rules[Table.normalize_key(key)].nil?
     end
+
     #
     # check if a given key has a rule
     #
     def has_rule?(key, rule)
       @rules[Table.normalize_key(key)].include?(rule)
     end
+
     #
-    # fetches the current matcher expression 
+    # fetches the current matcher expression
     # from  the table by key
     #
     def get(key, default = nil)
       @rules.fetch(Table.normalize_key(key), default)
     end
+
     #
     # inserts a new rule into a table on
     # the appropriate key
@@ -132,6 +140,7 @@ module Migration
     def insert(key, *rules)
       @rules[Table.normalize_key(key)] = [*@rules[Table.normalize_key(key)], *rules]
     end
+
     #
     # deletes a rule from a table on a key
     # since we are doing migrations over time
@@ -142,14 +151,16 @@ module Migration
         @rules[Table.normalize_key(key)].delete(rule)
       end
     end
+
     #
     # creates a new key with an empty ruleset
     #
     def create_key(key)
       insert(key)
     end
+
     #
-    # dumps the table key/ruleset pairs to 
+    # dumps the table key/ruleset pairs to
     # a Map(Key, Regexp) that can be used
     #
     def to_regex()
@@ -168,10 +179,11 @@ module Migration
       @rules.select do |kind| (%i[name prefix prefix_required] & [kind]).empty? end.each do |kind, ruleset|
         next if ruleset.empty?
         regex_map[kind] = Validate.regexp(self, kind,
-          Convert.ruleset_to_regex(ruleset))
+                                          Convert.ruleset_to_regex(ruleset))
       end
       regex_map
     end
+
     #
     # compiles the table key/ruleset pairs to
     # an XML document
@@ -186,7 +198,8 @@ module Migration
         element = Migration.raw_element(kind.to_s)
         xml.add_element(element)
         element.add_text(
-          Convert.to_safe_xml(pattern))
+          Convert.to_safe_xml(pattern)
+        )
       end
       ## return the created document
       return xml
