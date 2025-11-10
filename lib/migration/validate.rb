@@ -1,5 +1,5 @@
 module Migration
-  class ValidationError < Exception; end
+  class ValidationError < StandardError; end
 
   module Validate
     def self.regexp(table, key, body)
@@ -7,7 +7,7 @@ module Migration
         Regexp.new(body)
       rescue => err
         fail ValidationError, <<~ERROR
-          
+
           Table[#{table.name}:#{key}] -> Error
             #{err.message}
 
