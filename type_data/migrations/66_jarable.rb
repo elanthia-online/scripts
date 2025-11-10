@@ -61,11 +61,11 @@ migrate "jarable" do
     insert(:name, gem_name)
   end
 
-  gem_names.each do |gem_name|
+  get_nouns.each do |gem_name|
     insert(:noun, gem_name)
-  end  
+  end
 
-  gem_names.each do |gem_name|
+  get_excludes.each do |gem_name|
     insert(:exclude, gem_name)
-  end  
+  end
 end
