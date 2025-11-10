@@ -55,6 +55,10 @@ module Migration
       end
     end
 
+    def get_table(table_name)
+      @tables[Table.normalize_key(table_name)]
+    end
+
     def apply_deletions()
       @changesets.each do |changeset| 
         changeset.deletes.each do |key, rules|
