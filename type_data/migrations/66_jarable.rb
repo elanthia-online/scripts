@@ -52,20 +52,13 @@ migrate "jarable" do
   insert(:name, %{white clam shell})
   insert(:name, %{white gryphon's wing shell})
 
-  gem_table = get_table("gem")
-  gem_names = gem_table.get_rules(:name)
-  get_nouns = gem_table.get_rules(:noun)
-  get_excludes = gem_table.get_rules(:exclude)
-
-  gem_names.each do |gem_name|
+  copy_rules_from("gem", :name).each do |gem_name|
     insert(:name, gem_name)
   end
-
-  get_nouns.each do |gem_name|
+  copy_rules_from("gem", :noun).each do |gem_name|
     insert(:noun, gem_name)
   end
-
-  get_excludes.each do |gem_name|
+  copy_rules_from("gem", :exclude).each do |gem_name|
     insert(:exclude, gem_name)
   end
 end
