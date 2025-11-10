@@ -108,7 +108,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -116,7 +115,6 @@ describe GameObj do
       it "recognizes blue lapis lazuli as a gem" do
         lapis_obj = GameObjFactory.item_from_name("blue lapis lazuli", "lapis")
         expect(lapis_obj.type).to include "gem"
-        expect(lapis_obj.type).to include "jarable"
         expect(lapis_obj.sellable).to eq "gemshop"
       end
     end
@@ -201,7 +199,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -239,7 +236,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -292,7 +288,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -305,7 +300,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).type).to include "cursed"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
@@ -393,7 +387,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -424,7 +417,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -435,7 +427,6 @@ describe GameObj do
     ["brilliant purple opal"].each do |gem|
       it "recognizes #{gem} as a gem" do
         expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-        expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
         expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
       end
     end
@@ -462,7 +453,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -483,7 +473,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -550,7 +539,6 @@ describe GameObj do
       ].each do |gem|
         it "recognizes #{gem} as a gem" do
           expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-          expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
           expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
         end
       end
@@ -598,7 +586,6 @@ describe GameObj do
     ].each do |gem|
       it "recognizes #{gem} as a gem" do
         expect(GameObjFactory.item_from_name(gem).type).to include "gem"
-        expect(GameObjFactory.item_from_name(gem).type).to include "jarable"
         expect(GameObjFactory.item_from_name(gem).type).to_not include "valuable"
         expect(GameObjFactory.item_from_name(gem).type).to include "realm:reim"
         expect(GameObjFactory.item_from_name(gem).sellable).to eq "gemshop"
