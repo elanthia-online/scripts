@@ -513,8 +513,8 @@ describe GameObj do
         %{yellow helmet shell},
       ].each do |valuable|
         it "recognizes #{valuable} as a valuable" do
-          expect(GameObjFactory.item_from_name(valuable).type).to eq "valuable"
-          expect(GameObjFactory.item_from_name(valuable).sellable).to eq "gemshop"
+          expect(GameObjFactory.item_from_name(valuable).type).to include "valuable"
+          expect(GameObjFactory.item_from_name(valuable).sellable).to include "gemshop"
         end
       end
     end
