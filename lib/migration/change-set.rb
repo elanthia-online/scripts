@@ -1,15 +1,17 @@
 require "pathname"
 
 module Migration
-  class PrettyError < Exception 
+  class PrettyError < StandardError
     def initialize(changeset, msg)
       super <<~ERROR
         \n\t#{changeset.file.split("../").last} >> #{changeset.table.log_name} #{msg}
         ERROR
     end
   end
+
   class KeyError < PrettyError; end
   class RuleError < PrettyError; end
+
   ##
   ## this is execution instance for
   ## evaluating a new set of changes
@@ -27,7 +29,7 @@ module Migration
     def initialize(table, file, tables)
       @table   = table
       @file    = file
-      @tables  = tables  # Add this line
+      @tables  = tables # Add this line
       @inserts = {}
       @deletes = {}
       @creates = []
