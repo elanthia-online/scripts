@@ -1,4 +1,4 @@
-create_table "jarable", keys: [:name, :exclude]
+create_table "jarable", keys: [:name, :noun, :exclude]
 
 migrate "jarable" do
   insert(:name, %{amethyst clam shell})
@@ -51,4 +51,21 @@ migrate "jarable" do
   insert(:name, %{yellow-banded coquina shell})
   insert(:name, %{white clam shell})
   insert(:name, %{white gryphon's wing shell})
+
+  gem_table = get_table("gem")
+  gem_names = gem_table.get_rules(:name)
+  get_nouns = gem_table.get_rules(:noun)
+  get_excludes = gem_table.get_rules(:exclude)
+
+  gem_names.each do |gem_name|
+    insert(:name, gem_name)
+  end
+
+  gem_names.each do |gem_name|
+    insert(:noun, gem_name)
+  end  
+
+  gem_names.each do |gem_name|
+    insert(:exclude, gem_name)
+  end  
 end
