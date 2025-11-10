@@ -1,7 +1,6 @@
 create_table "jarable", keys: [:name, :exclude]
 
 migrate "jarable" do
-  insert(:name, %{brass and teak casket miniature})
   insert(:name, %{amethyst clam shell})
   insert(:name, %{angulate wentletrap shell})
   insert(:name, %{beige clam shell})
