@@ -1,6 +1,7 @@
 module Migration
-  class TableNotFound < Exception; end
-  class DuplicateTable < Exception; end
+  class TableNotFound < StandardError; end
+  class DuplicateTable < StandardError; end
+
   ##
   ## loads a migration Ruby instance and executes it
   ## within a ChangeSet context, storing the result
@@ -9,12 +10,14 @@ module Migration
   ##
   class Migrator
     attr_reader :file, :tables, :basename
+
     def initialize(file, tables)
       @file       = file
       @tables     = tables
       @basename   = File.basename(@file)
       @changesets = []
     end
+
     ##
     ## read the file into this binding
     ##
@@ -35,20 +38,20 @@ module Migration
       @changesets.each do |changeset|
         changeset.creates.each do |key|
           Migration.log(%[#{changeset.table.log_name} CREATE key "#{key}"],
-            label: %i[changeset],
-            color: :light_blue)
+                        label: %i[changeset],
+                        color: :light_blue)
           changeset.table.create_key(key)
         end
       end
     end
 
     def apply_insertions()
-      @changesets.each do |changeset| 
+      @changesets.each do |changeset|
         changeset.inserts.each do |key, rules|
           rules.each do |rule|
             Migration.log(%[#{changeset.table.log_name} INSERT #{key} "#{rule}"],
-              label: %i[changeset],
-              color: :green)
+                          label: %i[changeset],
+                          color: :green)
           end
           changeset.table.insert(key, *rules)
         end
@@ -60,12 +63,12 @@ module Migration
     end
 
     def apply_deletions()
-      @changesets.each do |changeset| 
+      @changesets.each do |changeset|
         changeset.deletes.each do |key, rules|
           rules.each do |rule|
             Migration.log(%[#{changeset.table.log_name} DELETE #{key} "#{rule}"],
-              label: %i[changeset],
-              color: :yellow)
+                          label: %i[changeset],
+                          color: :yellow)
           end
 
           changeset.table.delete(key, *rules)
@@ -74,12 +77,12 @@ module Migration
     end
 
     def assert_table_exists(table_name)
-      table = @tables[Table.normalize_key(table_name)] or
+      @tables[Table.normalize_key(table_name)] or
         fail TableNotFound, Color.red("Table[:#{table_name}] does not exist")
     end
 
     def assert_table_does_not_exist(table_name)
-      table = @tables[Table.normalize_key(table_name)] and
+      @tables[Table.normalize_key(table_name)] and
         fail DuplicateTable, Color.red("Table[:#{table_name}] already exists")
     end
 
@@ -91,7 +94,7 @@ module Migration
       self
     end
 
-    def create_table(table_name, kind: 'type', keys:[])
+    def create_table(table_name, kind: 'type', keys: [])
       assert_table_does_not_exist(table_name)
       normalized_name = Table.normalize_key(table_name)
       @tables[normalized_name] = Table.new(
