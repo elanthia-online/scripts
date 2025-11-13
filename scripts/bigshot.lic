@@ -23,6 +23,9 @@
     - tighten follower loop
     - MA lead can identify expected group number at startup eg ;bigshot head 3
     - head/tail can now be started in any order
+    - removed old companion_check method
+    - bugfix when using negative mana value in cmd_spell
+    - refactor group class
   v5.9.13  (2025-10-27)
     - fix for dhurl command to respect ambush settings and additional messaging
   v5.9.12  (2025-10-24)
@@ -316,7 +319,7 @@
       Celerity (506) support from grouped wizards for MStrikes
 =end
 # Check version of Lich for compatibility
-lich_gem_requires = '5.12.1'
+lich_gem_requires = Script.list.find { |x| x.name == Script.current.name }.inspect[/required: Lich >= (\d+\.\d+\.\d+)/i, 1]
 
 if Gem::Version.new(LICH_VERSION) < Gem::Version.new(lich_gem_requires)
   if $frontend == 'stormfront' || $frontend == 'profanity'
@@ -341,9 +344,7 @@ end
 
 if UserVars
   # Create UserVars.op on first run
-  if UserVars.op.nil?
-    UserVars.op = {}
-  end
+  UserVars.op ||= {}
 
   # First time running a version with monitor strings that can be specified, set up default values
   if UserVars.op["monitor_strings"].nil? || UserVars.op["monitor_strings"].empty?
@@ -373,7 +374,6 @@ FileUtils.mkdir_p(File.join($data_dir, XMLData.game, Char.name, "bigshot_profile
 
 # Global Variables
 $bigshot_version = get_script_version
-$bigshot_rally_time = 1
 $bigshot_rest_interval = 60
 $bigshot_1614_list = []
 $bigshot_703_list = []
@@ -407,10 +407,8 @@ $bigshot_unarmed_followup_attack = ""
 $bigshot_unarmed_tier = 1
 $bigshot_rooted = false
 $bigshot_wand = 0
-$companion ||= nil
 $current_script_name = Script.current.name
 $current_room_npcs = GameObj.npcs
-$familiar = ""
 $last_loot = nil
 $looting_inactive = true
 $not_hunting_reason = nil
@@ -528,11 +526,7 @@ class Bigshot
     end
 
     def stale?
-      if (Room.current.id != @room_id || Time.now.to_i - @created_at > 15)
-        return true
-      else
-        return false
-      end
+      Room.current.id != @room_id || (Time.now.to_i - @created_at) > 15
     end
   end
 end
@@ -631,8 +625,22 @@ class Bigshot
     include DRbUndumped
     attr_accessor :leader, :members
 
-    def initialize()
+    def initialize
       @members = Hash.new
+    end
+
+    # Helper method to check for offline members
+    def member_online
+      @members.each do |name, member|
+        begin
+          yield(name, member)
+        rescue
+          helper_name = __method__.to_s
+          caller_method = caller_locations(1, 20).map(&:label).find { |lbl| lbl !~ /^(block in|each|#{helper_name})/ }
+          @leader.message("yellow", "Error in #{caller_method}. Removing #{name}!")
+          @members.delete(name)
+        end
+      end
     end
 
     def set_leader(leader)
@@ -644,14 +652,14 @@ class Bigshot
     end
 
     def add_member(member)
-      @members[member.name()] = member
+      @members[member.name] = member
     end
 
-    def size()
+    def size
       return @members.size + 1
     end
 
-    def group_size()
+    def group_size
       return @members.size
     end
 
@@ -659,23 +667,14 @@ class Bigshot
       return @members.keys + [@leader.name]
     end
 
-    def room_id()
-      return @leader.room_id()
-    end
-
-    def first_member
-      @members[@leader.ma_looter].add_event(:LOOT, Time.now.to_i, Room.current.id)
+    def room_id
+      return @leader.room_id
     end
 
     def looting_done
-      @members.each_pair { |k, v|
-        begin
-          return false if !v.looting_inactive?
-        rescue
-          @leader.message("yellow", "Error polling member(need_sneaky?). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        return false if !member.looting_inactive?
+      end
 
       return true
     end
@@ -688,265 +687,185 @@ class Bigshot
       return @leader.designated_looter
     end
 
-    def looter_present?
-      return true if checkpcs.include?(@leader.ma_looter)
-
-      if !checkpcs.include?(@leader.ma_looter)
-        @members.delete(@leader.ma_looter)
-        return false
-      end
-    end
-
     def add_event(type, room = Room.current.id)
-      @members.each_pair do |_k, v|
-        begin
-          v.add_event(type, Time.now.to_i, room)
-        rescue
-          @leader.message("yellow", "Error adding #{type} event to members stack(add_event): #{$!}")
-          @leader.message("yellow", $!.backtrace.join("\n"))
-        end
+      member_online do |_, member|
+        member.add_event(type, Time.now.to_i, room)
       end
     end
 
+    # Fixme: this won't work. bounty? returns a string. See def cur_bounty
     def has_bounty?(bounty_regex)
       if !bounty_regex.is_a? Regexp
         @leader.message("yellow", "That's not a Regexp.  Killing Bigshot")
         client_do(";k bigshot")
       end
-      @members.each_pair do |k, v|
+
+      @members.each do |name, member|
         begin
-          return true if v.cur_bounty =~ bounty_regex
+          return true if member.cur_bounty =~ bounty_regex
         rescue
-          @leader.message("yellow", "Error polling member(has_bounty?). Removing #{k}!")
-          @members.delete(k)
+          @leader.message("yellow", "Error polling member (has_bounty?). Removing #{name}!")
+          @members.delete(name)
         end
       end
+
       return false
     end
 
     def group_assist(should_attack)
-      @members.each_pair { |k, v|
-        begin
-          v.set_help_group(should_attack)
-        rescue
-          @leader.message("yellow", "Error polling member(group_assist). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        member.set_help_group(should_attack)
+      end
     end
 
     def add_leader_event(event)
       @leader.add_event(Event.new(event)) unless @leader.event_stack.size > 5
     end
 
-    def return_waypoints_ids()
+    def return_waypoints_ids
       return @leader.RETURN_WAYPOINT_IDS
     end
 
-    def resting_id()
+    def resting_id
       return @leader.RESTING_ROOM_ID
     end
 
-    def hunting_id()
+    def hunting_id
       return @leader.HUNTING_ROOM_ID
     end
 
-    def rally_ids()
+    def rally_ids
       return @leader.RALLYPOINT_ROOM_IDS
     end
 
-    def roundtime?()
-      @members.each_pair { |k, v|
-        begin
-          return true if v.rt? > 0
-        rescue
-          @leader.message("yellow", "Error polling member(roundtime?). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+    def roundtime?
+      member_online do |_, member|
+        return true if member.rt? > 0
+      end
+
       return false
     end
 
     # Use this to perform combat actions
     def do_command(command_input)
-      @members.each_pair { |k, v|
-        begin
-          v.add_event(:CUSTOM_CMD, Time.now.to_i, Room.current.id, command_input)
-        rescue
-          @leader.message("yellow", "Error polling member(do_command). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        member.add_event(:CUSTOM_CMD, Time.now.to_i, Room.current.id, command_input)
+      end
     end
 
     # Use this to perform non-combat actions
     def do_put(command_input)
-      @members.each_pair { |k, v|
-        begin
-          v.add_event(:CUSTOM_PUT, Time.now.to_i, Room.current.id, command_input)
-        rescue
-          @leader.message("yellow", "Error polling member(do_put). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        member.add_event(:CUSTOM_PUT, Time.now.to_i, Room.current.id, command_input)
+      end
     end
 
     # Use this to perform actions as if they were typed through the client
     def client_do(command_input)
-      @members.each_pair { |k, v|
-        begin
-          v.add_event(:CUSTOM_DO_CLIENT, Time.now.to_i, Room.current.id, command_input)
-        rescue
-          @leader.message("yellow", "Error polling member(client_do). Removing! #{k}")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        member.add_event(:CUSTOM_DO_CLIENT, Time.now.to_i, Room.current.id, command_input)
+      end
     end
 
     # Use this to perform actions as if they were typed through the client
     def pub_send(command_input)
-      @members.each_pair { |k, v|
-        begin
-          v.add_event(:PUBLIC_SEND, Time.now.to_i, Room.current.id, command_input)
-        rescue
-          @leader.message("yellow", "Error polling member. Removing!")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        member.add_event(:PUBLIC_SEND, Time.now.to_i, Room.current.id, command_input)
+      end
     end
 
     def clear_group_events()
-      @members.each_pair { |k, v|
-        begin
-          v.clear_events()
-        rescue
-          @leader.message("yellow", "Error polling member(clear_group_events). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        member.clear_events()
+      end
     end
 
-    def group_should_hunt?()
-      emergency = @leader.event_stack.size == 0 ? nil : @leader.event_stack.shift
-      if (emergency)
+    def group_should_hunt?
+      if (emergency = @leader.event_stack.shift)
         @leader.clear_events()
         return false
       end
 
       $bigshot_group_status = {}
-      @members.each_pair { |k, v|
-        begin
-          reason = v.ready_to_hunt?
-          if reason != "ready"
-            $bigshot_group_status[k] = reason
-          end
-        rescue
-          @leader.message("yellow", "Error polling member(group_should_hunt?). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
-      if $bigshot_group_status.empty?
-        $bigshot_status = :ready
-        return true
-      else
-        return false
+      member_online do |name, member|
+        reason = member.ready_to_hunt?
+        $bigshot_group_status[name] = reason unless reason == "ready"
       end
+
+      $bigshot_group_status.empty? ? ( $bigshot_status = :ready; true ) : false
     end
 
     def group_bandit_hunting(kill_bandits)
-      @members.each_pair { |k, v|
-        begin
-          v.set_bandit_hunting(kill_bandits)
-        rescue
-          @leader.message("yellow", "Error polling member(group_bandit_hunting). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        member.set_bandit_hunting(kill_bandits)
+      end
     end
 
-    def group_should_rest?()
+    def group_should_rest?
       $bigshot_group_status = {}
 
-      @members.each_pair { |k, v|
-        begin
-          reason = v.ready_to_rest?
-
-          if !!reason
-            $bigshot_group_status[k] = reason
-          end
-        rescue
-          @leader.message("yellow", "Error polling member(should_rest?). Removing #{k}!")
-          @members.delete(k)
+      member_online do |name, member|
+        if (reason = member.ready_to_rest?)
+          $bigshot_group_status[name] = reason
         end
-      }
-
-      if $bigshot_group_status.empty?
-        return false
-      else
-        return true
       end
+
+      return !$bigshot_group_status.empty?
     end
 
     def any_saturated?
-      @members.each_pair do |k, v|
-        begin
-          return true if v.saturated?
-        rescue StandardError
-          @leader.message("yellow", "Error polling member(any_saturated?). Removing #{k}!")
-          @members.delete(k)
-        end
+      member_online do |_, member|
+        return true if member.saturated?
       end
-      false
+
+      return false
     end
 
+    # Fixme
     def group_encumbrance
       group_weight = {}
-      @members.each_pair do |k, v|
-        current, setting = v.encumbrance?
-        group_weight[k] = (setting - current)
+
+      member_online do |name, member|
+        current, setting = member.encumbrance?
+        group_weight[name] = (setting - current)
       end
 
       return group_weight
     end
 
     def need_sneaky?
-      @members.each_pair { |k, v|
-        begin
-          return true if v.sneaky_hunt? && !v.player_hidden?
-        rescue
-          @leader.message("yellow", "Error polling member(need_sneaky?). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+      member_online do |_, member|
+        return true if member.sneaky_hunt? && !member.player_hidden?
+      end
 
       return false
     end
 
     def all_present?
       sleep(0.1) while Lich::Gemstone::Claim::Lock.locked?
-      @members.each_pair { |k, _v|
-        return false unless checkpcs.include?(k)
-        return false unless Lich::Gemstone::Group.members.map(&:noun).include?(k)
-      }
+
+      member_online do |name, member|
+        member.ping
+        return false unless checkpcs.include?(name)
+        return false unless Lich::Gemstone::Group.members.map(&:noun).include?(name)
+      end
+
       return true
     end
 
     def rest_prep_complete?
-      @members.each_pair { |_k, v|
-        return false if !v.rest_prep_done?
-      }
+      member_online do |_, member|
+        return false if !member.rest_prep_done?
+      end
+
       return true
     end
 
-    def emergency_rest?()
-      @members.each_pair { |k, v|
-        begin
-          return true if v.wounded?
-        rescue
-          @leader.message("yellow", "Error polling member(emergency_rest). Removing #{k}!")
-          @members.delete(k)
-        end
-      }
+    def emergency_rest?
+      member_online do |_, member|
+        return true if member.wounded?
+      end
+
       return false
     end
   end
@@ -2128,6 +2047,25 @@ class Bigshot
     end
   end
 
+  def clear_events()
+    debug_msg(@DEBUG_SYSTEM, "clear_events | called by #{caller[0]}")
+    @event_stack.clear
+  end
+
+  def grab_event()
+    debug_msg(@DEBUG_SYSTEM, "grab_event | called by #{caller[0]}")
+    @event_stack.shift()
+  end
+
+  def ping
+    # checks if follower got disconnected
+    return true
+  end
+
+  def remove_event(item)
+    @event_stack.reject! { |event| event.type == item }
+  end
+
   def self.debug_help
     if defined?(Terminal)
       rows = []
@@ -2241,16 +2179,6 @@ class Bigshot
     end
   end
 
-  def grab_event()
-    debug_msg(@DEBUG_SYSTEM, "grab_event | called by #{caller[0]}")
-    @event_stack.shift()
-  end
-
-  def clear_events()
-    debug_msg(@DEBUG_SYSTEM, "clear_events | called by #{caller[0]}")
-    @event_stack.clear
-  end
-
   def initialize(options = nil)
     $bigshot = self
 
@@ -2318,8 +2246,10 @@ class Bigshot
       @HUNTING_SCRIPTS.each { |hs|
         # check for scripts with args passed
         hs_name = hs.split(/\s+/).first
-        echo "Cleaning up hunting scripts: #{hs_name}."
-        stop_script(hs_name) if running?(hs_name)
+        if running?(hs_name)
+          echo "Cleaning up hunting scripts: #{hs_name}."
+          stop_script(hs_name)
+        end
       }
       fput("movement autosneak off") if $bigshot_sneaky_hunt
       echo "debug active for bigshot version #{$bigshot_version}" if $bigshot_debug
@@ -4278,7 +4208,7 @@ class Bigshot
       end
     end
 
-    if !Spell[id].affordable? && ![9605, 506, 902, 411].include?(id)
+    if !Spell[id].affordable? && ![9605, 506, 902, 411].include?(id) && !@OOM.negative?
       $bigshot_should_rest = true
       $rest_reason = "out of mana"
     end
@@ -5315,19 +5245,12 @@ class Bigshot
     debug_msg(@DEBUG_STATUS, "lead | called by #{caller[0]}")
 
     monitor_interaction()
-    # companion_check() # commented out 7/22/2025, no longer needed with move to GameObj.targets for valid creatures
     npc_room_check()
     @followers = my_group || Group.new()
 
-    if !checkpcs.nil?
-      groupcheck()
-    end
+    groupcheck() if !checkpcs.nil?
 
-    if (should_rest? && !$bigshot_quick)
-      rest()
-    else
-      hunt()
-    end
+    should_rest? && !$bigshot_quick ? rest : hunt
   end
 
   def find_routine(target)
@@ -5429,6 +5352,12 @@ class Bigshot
       end
     end
 
+    Lich::Util.quiet_command_xml("group open", /Your group status/)
+    @followers.add_event(:FOLLOW_NOW) # trigger rubber band
+    message("yellow", "Waiting for followers....") if !@followers.all_present?
+    sleep 0.5 while (!@followers.all_present?)
+    groupcheck
+
     prepare_for_movement()
 
     @followers.add_event(:HUNTING_SCRIPTS_START)
@@ -5508,6 +5437,9 @@ class Bigshot
     target = bs_wander() if !$bigshot_quick
 
     while true
+      # Remove stale events to avoid stale ATTACK commands when entering a room
+      @event_stack.reject!(&:stale?)
+
       while ((target = find_target(target, just_arrived)) && !should_rest? && no_players_hunt && !should_flee?)
         debug_msg(@DEBUG_COMBAT, "inside do_hunt loop | target: #{target}")
 
@@ -5689,7 +5621,9 @@ class Bigshot
 
     if $bigshot_single || (@BOUNTY_MODE && ($rest_reason =~ /bounty complete/i || Script.running?('ebounty')))
       msg = $bigshot_single ? " Exiting Bigshot: Single loop complete" : " Exiting Bigshot: Bounty mode - #{$rest_reason}"
+      respond
       message("yellow", msg)
+      respond
       @followers.add_event(:SINGLE_STOP)
       single_stop()
     end
@@ -5862,12 +5796,10 @@ class Bigshot
       # Rest variables and retarget if target changed
       reset_variables(false)
       bs_put "target ##{target.id}" if target.status !~ /dead|gone/
-
-      # Tell follower to attack if target changed
-      if time_between(:last_attack, 10)
-        @followers.add_event(:ATTACK)
-      end
     end
+
+    # Make sure followers are attacking
+    @followers.add_event(:ATTACK)
 
     commands.each do |i|
       break if attack_break(target)
@@ -6853,7 +6785,7 @@ class Bigshot
   def bs_move
     room = Room.current
     next_room_options = room.wayto.keys - @HUNTING_BOUNDARIES
-    next_room_options.delete_if { |room_id| (room.timeto[room_id].is_a?(StringProc)) and room.timeto[room_id].call.nil? }
+    next_room_options.delete_if { |room_id| (room.timeto[room_id].is_a?(StringProc)) && room.timeto[room_id].call.nil? }
     next_room = next_room_options.find_all { |r| not $wander_rooms.include?(r) }
     if next_room.empty?
       next_room = $wander_rooms.find { |r| next_room_options.include?(r) }
@@ -6880,6 +6812,7 @@ class Bigshot
     @COMMANDS_REGISTRY = {}
     prepare_for_movement()
     check_for_deaders_prone
+    fleeing = true
 
     while true # wander, check for players
       return if should_rest?
@@ -6894,6 +6827,7 @@ class Bigshot
 
         # check for creatures again after waiting
         unless should_flee?(true)
+          fleeing = false
           sort_npcs.each { |i| return i if valid_target?(i, false) }
         end
 
@@ -6907,6 +6841,7 @@ class Bigshot
       end
 
       # If still here the rest is preping to move to the next room
+      cast_signs unless fleeing
       new_room = true
 
       if !@followers.all_present? || Lich::Gemstone::Group.broken?
@@ -7031,36 +6966,6 @@ class Bigshot
     end
     waitcastrt?
     return
-  end
-
-  def companion_check()
-    debug_msg(@DEBUG_STATUS, "companion_check | called by #{caller[0]}")
-
-    if (Stats.prof =~ /Ranger/i && Spell[630].known? && GameObj.npcs.any? { |i| i.type =~ /companion/ } && $companion == nil)
-      npcs = GameObj.npcs.find_all { |i| i.type =~ /companion/i }
-      npcs.each { |i|
-        res = dothistimeout "lean ##{i.id}", 1, /your direction in acknowledgement|rubbing.*gently|while it is flying|You lean toward/i
-        if res =~ /rubbing.*gently/i
-          $companion = i.name
-          echo "Ranger Companion set to #{i.name}"
-          break
-        end
-      }
-    end
-    if (Stats.prof =~ /Wizard/i && Spell[920].known? && GameObj.npcs.any? { |i| i.type =~ /familiar/ })
-      res = dothistimeout "tell familiar to enter fakeportal", 1, /You sense confusion from your .*\.|You have no familiar at this time\./i
-      if res =~ /You sense confusion from your/i
-        res.sub!('You sense confusion from your ', '')
-        res.gsub!('.', '')
-        GameObj.npcs.each { |s|
-          if s.name =~ /#{res}/i
-            $familiar = s.name
-            break
-          end
-        }
-        echo "Familiar set as #{$familiar}"
-      end
-    end
   end
 
   def escape_rooms
@@ -7362,10 +7267,10 @@ elsif (Script.current.vars[1] =~ /reset/i)
   CharSettings['targetable'] = nil
   CharSettings['untargetable'] = nil
   echo "Character Settings for Targetable and Untargetable are now reset"
-elsif (Script.current.vars[1] =~ /ranger|companion/i)
-  $companion = nil
-  echo "Ranger Companion has been reset"
 elsif (Script.current.vars[1] =~ /head|lead/i)
+  # Make sure group is open
+  Lich::Util.quiet_command_xml("group open", /Your group status/)
+
   # launch DRb server
   DRb.start_service(nil, Bigshot::Group.new)
 
@@ -7378,77 +7283,161 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
 
   bs = Bigshot.new(Script.current.vars)
 
-  group_count = Script.current.vars[1..].find { |el| el.to_s.match?(/\A-?\d+\z/) }&.to_i || 1
+  group_count = Script.current.vars[1..].find { |el| el.to_s.match?(/\A-?\d+\z/) }
 
   start_time = Time.now
+  group_started = false
+  timeout = 60
+  pause_time = 10
+  short_pause = 3
+  current_count = 0
+  respond
 
   loop do
     Lich::Util.quiet_command_xml("group", /You are/)
-
     current_count = Lich::Gemstone::Group.length
-    break if current_count == group_count
+    elapsed = Time.now - start_time
 
-    if Time.now - start_time > 30
-      echo "Timeout: Only #{current_count} member(s) joined after 30 seconds. Exiting."
+    case
+    when group_count && current_count == group_count.to_i
+      Lich::Messaging.msg("text", "Starting group #{current_count}/#{group_count.to_i} joined.")
+      break
+    when group_count && current_count > group_count.to_i # More group members than expected.
+      Lich::Messaging.msg("text", "A group of #{current_count} found but only #{group_count.to_i} expected. Pausing #{pause_time} seconds before moving on.")
+      sleep pause_time
+      break
+    when current_count.positive? && group_count.nil? # if there is a group assume everyone is joined if no count passed?
+      if group_started
+        Lich::Messaging.msg("text", "Group started up. Pausing #{pause_time} seconds for stragglers")
+        Lich::Messaging.msg("text", "You can set expected followers with: ;bigshot head <number of followers>")
+        sleep pause_time
+      else
+        Lich::Messaging.msg("text", "A group of #{current_count} found and no expected number of followers.")
+        Lich::Messaging.msg("text", "You can set expected followers with: ;bigshot head <number of followers>")
+      end
+      respond
+
+      break
+    when elapsed > timeout
+      msg = if group_count
+              "Timeout: Only #{current_count}/#{group_count.to_i} joined after #{timeout} seconds. Exiting."
+            else
+              "Timeout: No group established after #{timeout} seconds. Exiting."
+            end
+
+      Lich::Messaging.msg("text", msg)
       exit
-    end
+    when current_count.zero? # No group yet, sleeping a bit
+      Lich::Messaging.msg("text", "No group currently. Pausing #{pause_time} seconds for characters to join.")
+      respond
+      sleep pause_time
 
-    echo "Waiting on group members to join. Expecting #{group_count} member(s). Currently: #{current_count}"
-    sleep 2
+      # Check if a group was started
+      Lich::Util.quiet_command_xml("group", /You are/)
+      current_count = Lich::Gemstone::Group.length
+      group_started = current_count.positive?
+    when group_count && current_count < group_count.to_i # user gave a group count and not everyone is joined yet
+      respond
+      Lich::Messaging.msg("text", "Waiting on group members: #{current_count}/#{group_count.to_i} joined.")
+      sleep short_pause
+    end
   end
 
   # set leader
   my_group = DRbObject.new(nil, uri)
   my_group.set_leader(bs)
 
-  until my_group.size() > group_count
+  until my_group.size() > current_count
     # announce/go
-    (1..$bigshot_rally_time).each { |_i| fput "whisper ooc group Bigshot rallying at #{uri}"; sleep(1); }
-    echo "Waiting for members to join Bigshot rally..."
-    sleep 2
+    respond
+    Lich::Util.issue_command("whisper ooc group Bigshot members (#{my_group.size - 1}/#{current_count}) rallying at #{uri}", /<pushStream id="speech"/, silent: true, quiet: false)
+    respond
+    sleep short_pause
   end
+
+  Lich::Messaging.msg("text", " Group Members:")
+  my_group.get_names.sort.each { |character| Lich::Messaging.msg("text", "  #{character}") }
+  respond
+  Lich::Messaging.msg("text", " Leaving in...")
+  3.downto(1) { |num| Lich::Messaging.msg("text", "     #{num}"); sleep 1 }
+  respond
 
   bs.lead(my_group)
 elsif (Script.current.vars[1] =~ /tail|follow|link/i)
-  # Watch for rally
   group = nil
   bs = nil
   uri = nil
 
-  while (group.nil? && bs.nil?)
-    if Script.current.vars[1] =~ /link/i && Script.current.vars[2].nil?
-      echo "Must supply target URI when using LINK option"
+  max_attempts = 60
+  retry_interval = 0.5
+  attempts = 0
+
+  # Watch for rally
+  uri_status = proc { |server|
+    if server.to_s =~ /rallying at (.*)\."/
+      uri = Regexp.last_match(1)
+    end
+    server
+  }
+  DownstreamHook.add('uri_status', uri_status)
+
+  if Script.current.vars[1] =~ /link/i
+    if Script.current.vars[2].nil?
+      Lich::Messaging.msg("text", "Must supply target URI when using LINK option")
       exit
-    end
-
-    if Script.current.vars[1] =~ /link/i
+    else
       uri = Script.current.vars[2]
-    end
-
-    if (!uri.nil? || get =~ /rallying at (.*)\."$/)
-      uri = uri.nil? ? Regexp.last_match(1) : uri
-      fput "whisper ooc group Bigshot rallying at #{uri}" unless Script.current.vars[1] =~ /link/i
-      # create group
-      DRb.start_service()
-
-      group = DRbObject.new(nil, uri)
-
-      # create Bigshot
-      bs = Bigshot.new(Script.current.vars)
-      group.add_member(bs)
-
-      # bs.companion_check() # commented out 7/22/2025, no longer needed with move to GameObj.targets for valid creatures
-      bs.npc_room_check()
     end
   end
 
+  while group.nil? || bs.nil? || !(group.members&.keys&.include?(Char.name))
+    # Resolve URI
+    loop do
+      if uri
+        DownstreamHook.remove('uri_status')
+        break
+      end
+
+      sleep retry_interval
+    end
+
+    Lich::Util.issue_command("whisper ooc group Joining group at #{uri}", /<pushStream id="speech"/, silent: true, quiet: false)
+
+    begin
+      DRb.start_service()
+
+      group ||= DRbObject.new(nil, uri)
+      bs ||= Bigshot.new(Script.current.vars)
+
+      # Add member if not already included
+      unless group.members&.keys.any? { |name| name == Char.name }
+        begin
+          group.add_member(bs)
+        rescue => e
+          Lich::Messaging.msg("yellow", "Failed to add character to group: #{e.message}")
+        end
+      end
+    rescue DRb::DRbConnError => e
+      Lich::Messaging.msg("yellow", "DRb connection failed: #{e.message}")
+    rescue => e
+      Lich::Messaging.msg("yellow", "Unexpected error: #{e.class} - #{e.message}")
+    end
+
+    attempts += 1
+    if attempts >= max_attempts
+      Lich::Messaging.msg("yellow", "Maximum join attempts reached. Exiting.")
+      exit
+    end
+
+    sleep retry_interval
+  end
+
   # Participate
-  bs.message("yellow", " Joined group")
+  bs.message("yellow", " Successfully joined group")
+  bs.npc_room_check()
   leader = group.leader.name
 
-  $bigshot_overkill_counter = 0
-
-  bs.groupcheck if !checkpcs.nil?
+  bs.groupcheck unless checkpcs.nil?
 
   while (!dead?)
     begin
@@ -7465,6 +7454,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
           bs.go2(group.room_id) until checkpcs.include?(leader)
           result = dothistimeout("join #{leader}", 3, /You are already a member|You join|What were you referring to/)
           bs.groupcheck unless result =~ /What were you referring to/
+          sleep 0.1
         end
       end
 
@@ -7479,6 +7469,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
           bs.go2(group.room_id) until checkpcs.include?(leader)
           result = dothistimeout("join #{leader}", 3, /You are already a member|You join|What were you referring to/)
           bs.groupcheck unless result =~ /What were you referring to/
+          sleep 0.1
         end
       elsif (event.type == :LEAVE_GROUP)
         dothistimeout('leave group', 1, /You leave|But you are not in a group/)
@@ -7542,6 +7533,9 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
           stop_attack = bs.event_stack.any? { |a| a.type == :PREP_REST }
           sleep(0.1)
         end
+
+        # remove extra attacks in stack
+        bs.remove_event(:ATTACK)
       elsif (event.type == :CHECK_MIND)
         bs.check_mind
       elsif (event.type == :PREP_REST)
