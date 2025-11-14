@@ -40,6 +40,7 @@ describe GameObj do
         "herb",
         "instrument",
         "jar",
+        "jarable",
         "jewelry",
         "junk",
         "lm tool",
