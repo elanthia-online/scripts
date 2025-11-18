@@ -31,15 +31,31 @@
     end
 
   Author: Ondreian
-  Requirements: Ruby >= 2.3, redis
-  version: 0.1
+  Requirements: Ruby >= 2.3, redis, connection_pool
+  required: Lich >= 5.12.0
+  version: 1.0.0
+
+  Setup Instructions: https://github.com/elanthia-online/scripts/wiki/cluster.lic-Documentation
+     Help Contribute: https://github.com/elanthia-online/scripts
+
+  Version Control:
+    Major_change.feature_addition.bugfix
+  v1.0.0  (2025-10-27)
+    - update version to semantic versioning
+    - include link to setup instructions in header
+    - switch to using connection_pool
+  v0.1.0  (2019-06-22)
+    - add contract system
+  v0.0.0  (2019-01-14)
+    - initial release
 =end
 
-require 'redis'
 require 'json'
 require 'ostruct'
 require 'securerandom'
 require 'benchmark'
+
+install_gem_requirements({ "connection_pool" => true, "redis" => true })
 
 class Cluster
   ##
@@ -128,11 +144,13 @@ class Cluster
   NOOP               = -> channel, message {}
   UNSUPPORTED_METHOD = -> channel, message { return {error: "#{channel} is not implemented on #{Char.name}"} }
   TTL                = 5
+  POOL_SIZE          = 5
+  POOL_TIMEOUT       = 5
 
   attr_reader :cb_map, :pending_requests, 
               :connected, :last_publish,
               :keep_alive, :event_loop,
-              :pub, :sub
+              :pool, :sub
 
   def initialize()
     @cb_map           ||= {}
@@ -146,13 +164,17 @@ class Cluster
 
   def _connect_local()
     #Log.out("...connecting to local redis instance...")
-    @pub = Redis.new()
+    @pool = ConnectionPool.new(size: POOL_SIZE, timeout: POOL_TIMEOUT) do
+      Redis.new()
+    end
     @sub = Redis.new()
   end
 
   def _connect_remote(url)
     #Log.out("...connecting to remote redis instance at\n\n\t#{url}\n")
-    @pub = Redis.new(url: url)
+    @pool = ConnectionPool.new(size: POOL_SIZE, timeout: POOL_TIMEOUT) do
+      Redis.new(url: url)
+    end
     @sub = Redis.new(url: url)
   end
 
@@ -180,7 +202,9 @@ class Cluster
 
   def publish(*args)
     @last_publish = Time.now
-    @pub.publish(*args)
+    @pool.with do |conn|
+      conn.publish(*args)
+    end
   end
   
   def emit(channel, **payload)
@@ -249,7 +273,7 @@ class Cluster
       _handle_leave(channel, incoming) if kind_of_channel.eql?(:leave)
       return _handle_cast(channel, incoming)
     rescue Exception => err
-      Log.out(err, label: %i[dispatch error] + channel.split(".")) and defined?(Log)
+      Log.out(err, label: %i[dispatch error] + channel.split(".")) if defined?(Log)
     end
   end
 
@@ -269,7 +293,7 @@ class Cluster
       _callback = @cb_map.fetch(channel, NOOP).call(channel, 
         OpenStruct.new(incoming))
     rescue Exception => err
-      Log.out(err, label: %i[dispatch error] + channel.split(".")) and defined?(Log)
+      Log.out(err, label: %i[dispatch error] + channel.split(".")) if defined?(Log)
     end
   end
 
@@ -335,7 +359,7 @@ class Cluster
           on.pmessage do |pattern, channel, message| _route_incoming(channel, message) end
         end
       rescue Redis::BaseConnectionError => error
-        Log.out(error, label: %i[err conn]) and defined?(Log)
+        Log.out(error, label: %i[err conn]) if defined?(Log)
         sleep 1
         retry
       end
@@ -352,9 +376,11 @@ class Cluster
   end
 
   def destroy()
-    Log.out("cleaning up", label: %i[destroy]) and defined?(Log)
+    Log.out("cleaning up", label: %i[destroy]) if defined?(Log)
     broadcast(:leave)
     [@event_loop, @keepalive].map(&:kill).each(&:join)
+    @pool.shutdown { |conn| conn.quit }
+    @sub.quit
   end
 
   def self.of()
@@ -406,18 +432,37 @@ class Cluster
     end
     
     def put(key, val)
-      Cluster.pub.set(_key(key), val.to_json)
+      Cluster.pool.with do |conn|
+        conn.set(_key(key), val.to_json)
+      end
     end
 
     def get(key)
-      Cluster.parse(
-        Cluster.pub.get(
-          _key(key)))
+      result = Cluster.pool.with do |conn|
+        conn.get(_key(key))
+      end
+      Cluster.parse(result) if result
+    end
+
+    def delete(key)
+      Cluster.pool.with do |conn|
+        conn.del(_key(key))
+      end
+    end
+
+    def exists?(key)
+      Cluster.pool.with do |conn|
+        conn.exists?(_key(key))
+      end
     end
   end
 
   def self.registry(namespace = nil)
     Registry.new(namespace)
+  end
+
+  def self.pool
+    @cluster&.pool
   end
 end
 
@@ -553,4 +598,4 @@ end
 
 
 # keepalive
-loop do sleep(1) end 
+loop do sleep(1) end
