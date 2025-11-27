@@ -33,7 +33,7 @@
   game: any
   tags: core
   required: Lich >= 4.3.12
-  version: 0.0.9
+  version: 0.0.10
 
   changelog:
     0.0.1 initial release
@@ -48,19 +48,9 @@
     0.0.7 rotate in new cert from that nutty Tillmen
     0.0.8 put in prevention to not run on newer REXML gem versions (3.3.2+) due to compatibility issue
     0.0.9 change class checks to is_a? checks
+    0.0.10 add safeguards to REXML streams for non-valid XML, allows newer REXML ruby gem usage
 
 =end
-
-if (Gem::Version.new(REXML::Version) > Gem::Version.new("3.3.1"))
-  respond("")
-  Lich::Messaging.msg("bold", "Your version of the Ruby Gem REXML is currently #{REXML::Version}.")
-  Lich::Messaging.msg("bold", "Unfortunately, Tillmen's LNet server does not work with this version of the gem.")
-  Lich::Messaging.msg("bold", "You need to manually downgrade your REXML gem to version 3.3.1 or older.")
-  Lich::Messaging.msg("bold", "Warning: Downgrading the gem could lead to security risks.")
-  respond("")
-  Lich::Messaging.msg("bold", "Exiting #{Script.current.name}!")
-  exit
-end
 
 # fixme: option to separate private messages to familiar window
 # fixme: scrub
@@ -69,6 +59,153 @@ require 'openssl'
 toggle_unique
 clear
 hide_me
+
+# Add this new SafeXMLParser class before the main LNet class
+
+class SafeXMLParser
+  def initialize(handler)
+    @handler = handler
+    @buffer = ''
+    @in_root = false
+  end
+
+  def parse_chunk(chunk)
+    @buffer += chunk
+
+    # Process complete XML documents from the buffer
+    while @buffer.length > 0
+      # Look for complete XML elements
+      if (match = @buffer.match(/^(<[^>]*>.*?<\/[^>]*>)/m))
+        xml_fragment = match[1]
+        @buffer = @buffer[match.end(0)..-1] || ''
+
+        process_xml_fragment(xml_fragment)
+      elsif (match = @buffer.match(/^(<[^>]*\/>)/m))
+        # Self-closing tags
+        xml_fragment = match[1]
+        @buffer = @buffer[match.end(0)..-1] || ''
+
+        process_xml_fragment(xml_fragment)
+      else
+        # Wait for more data if we don't have a complete element
+        break
+      end
+    end
+  end
+
+  private
+
+  def process_xml_fragment(fragment)
+    begin
+      # Try to parse the fragment as-is first
+      REXML::Document.new(fragment)
+      REXML::Document.parse_stream(fragment, @handler)
+    rescue REXML::ParseException, ArgumentError => e
+      echo "XML parse error: #{e.message}" if $lnet_debug
+
+      # Attempt to fix common XML issues
+      fixed_fragment = sanitize_xml(fragment)
+
+      begin
+        # Wrap in root element if it's not well-formed
+        if !fixed_fragment.match(/^<\?xml/) && !is_complete_document(fixed_fragment)
+          wrapped_fragment = "<root>#{fixed_fragment}</root>"
+          REXML::Document.parse_stream(wrapped_fragment, WrapperHandler.new(@handler))
+        else
+          REXML::Document.parse_stream(fixed_fragment, @handler)
+        end
+      rescue REXML::ParseException, ArgumentError => e2
+        echo "Failed to parse XML even after sanitization: #{e2.message}" if $lnet_debug
+        # Log the problematic XML for debugging
+        echo "Problematic XML: #{fragment[0..200]}" if $lnet_debug
+      end
+    end
+  end
+
+  def sanitize_xml(xml)
+    # Remove control characters except tab, newline, carriage return
+    xml = xml.gsub(/[\x00-\x08\x0B\x0C\x0E-\x1F]/, '')
+
+    # Fix common encoding issues
+    xml = xml.encode('UTF-8', invalid: :replace, undef: :replace, replace: '?')
+
+    # Escape unescaped ampersands (but not already escaped ones)
+    xml = xml.gsub(/&(?!(?:amp|lt|gt|quot|apos);)/, '&amp;')
+
+    # Fix unclosed tags by attempting basic repairs
+    xml = fix_unclosed_tags(xml)
+
+    xml
+  end
+
+  def fix_unclosed_tags(xml)
+    # This is a basic implementation - you might need to enhance based on actual issues
+    # Stack to track open tags
+    tag_stack = []
+    result = ''
+
+    # Simple regex to find tags - this is basic and may need refinement
+    xml.scan(/<\/?[^>]*>|[^<]+/) do |token|
+      if token.start_with?('<')
+        if token.start_with?('</')
+          # Closing tag
+          tag_name = token.match(/<\/([^>\s]+)/)[1] rescue nil
+          if tag_name && tag_stack.last == tag_name
+            tag_stack.pop
+          end
+        elsif !token.end_with?('/>')
+          # Opening tag (not self-closing)
+          tag_name = token.match(/<([^>\s]+)/)[1] rescue nil
+          tag_stack.push(tag_name) if tag_name
+        end
+      end
+      result += token
+    end
+
+    # Close any remaining open tags
+    while !tag_stack.empty?
+      result += "</#{tag_stack.pop}>"
+    end
+
+    result
+  end
+
+  def is_complete_document(xml)
+    xml.strip.start_with?('<') && xml.strip.end_with?('>')
+  end
+end
+
+# Wrapper handler to skip the artificial root element
+class WrapperHandler
+  def initialize(real_handler)
+    @real_handler = real_handler
+    @in_root = false
+  end
+
+  def tag_start(name, attrs)
+    if name == 'root' && !@in_root
+      @in_root = true
+      return
+    end
+    @real_handler.tag_start(name, attrs)
+  end
+
+  def tag_end(name)
+    if name == 'root' && @in_root
+      @in_root = false
+      return
+    end
+    @real_handler.tag_end(name)
+  end
+
+  def text(text)
+    @real_handler.text(text) if @in_root
+  end
+
+  def method_missing(method, *args)
+    @real_handler.send(method, *args) if @real_handler.respond_to?(method)
+  end
+end
 
 class Callbacks
   attr_accessor :registered
@@ -268,12 +405,18 @@ class LNet
     @@last_send = Time.now
   end
 
-  def LNet.send_data(attributes, _data)
+  def LNet.send_data(attributes, data)
     return false if @@server.closed?
     xml = REXML::Document.new
     element = xml.add_element('data')
     attributes.each_pair { |name, val| element.add_attribute(name, val) }
-    element.text = nil
+
+    if data.nil?
+      element.text = nil
+    else
+      element.text = [Marshal.dump(data)].pack('m').strip
+    end
+
     @@server.puts(xml)
     @@last_send = Time.now
   end
@@ -432,23 +575,35 @@ class LNet
 
   def LNet.dispatch_callback(type, data)
     from = data["from"]
-    type, _params = type.split(":")
-    params = []
+    type_base, _params = type.split(":")
 
-    if !callbacks.keys.include?(type)
-      echo "rejecting unknown request (#{type}) from #{from}..."
-      LNet.send_data({ 'type' => type, 'to' => from }, :error)
-    elsif (@@options["permission"][type] && LNet.allow?(type, from)) || @@options["permission"][type].nil?
-      callbacks[type].run(from, params, data)
-      if (@@options["permission"][type])
-        echo "sending #{type} info to #{from}..."
+    if !callbacks.keys.include?(type_base)
+      echo "rejecting unknown request (#{type_base}) from #{from}..."
+      LNet.send_data({ 'type' => type_base, 'to' => from }, nil)
+    elsif (@@options["permission"][type_base] && LNet.allow?(type_base, from)) || @@options["permission"][type_base].nil?
+      if (@@options["permission"][type_base])
+        echo "sending #{type_base} info to #{from}..."
       end
-      LNet.send_data({ 'type' => type, 'to' => from },
-                     # prefer default callbacks
-                     nil)
+
+      # Fix: Actually execute callbacks and use their results
+      if callbacks[type_base] && callbacks[type_base].registered.any?
+        # Execute the first registered callback for this type
+        callback = callbacks[type_base].registered.values.first
+        begin
+          result = callback.call(data)
+          LNet.send_data({ 'type' => type_base, 'to' => from }, result)
+        rescue StandardError => e
+          echo "error in callback for #{type_base}: #{e}"
+          respond e.backtrace
+          LNet.send_data({ 'type' => type_base, 'to' => from }, nil)
+        end
+      else
+        # No callback registered, send nil
+        LNet.send_data({ 'type' => type_base, 'to' => from }, nil)
+      end
     else
-      echo "rejecting request from #{from} for #{type} info..."
-      LNet.send_data({ 'type' => type, 'to' => from }, nil)
+      echo "rejecting request from #{from} for #{type_base} info..."
+      LNet.send_data({ 'type' => type_base, 'to' => from }, nil)
     end
   end
 
@@ -543,7 +698,7 @@ class LNet
         end
       elsif (@active_tags.last == 'data')
         begin
-          data = nil
+          data = Marshal.load(text.unpack('m').first)
         rescue
           return
         end
@@ -1068,15 +1223,32 @@ Thread.new {
   }
 }
 
-#
-# connect and listen to the server
-#
+# Modified connection thread - replace the existing connection thread with this:
 Thread.new {
   loop {
     last_connect_attempt = Time.now
     begin
       LNet.connect
-      REXML::Document.parse_stream(LNet.server, LNet.new)
+
+      # Create the safe XML parser
+      safe_parser = SafeXMLParser.new(LNet.new)
+
+      # Read from server in chunks and parse safely
+      while !LNet.server.closed?
+        begin
+          chunk = LNet.server.readpartial(4096)
+          safe_parser.parse_chunk(chunk)
+        rescue EOFError
+          echo "Server closed connection" if $lnet_debug
+          break
+        rescue Errno::ECONNRESET
+          echo "Connection reset by server" if $lnet_debug
+          break
+        rescue => e
+          echo "Error reading from server: #{e.message}" if $lnet_debug
+          break
+        end
+      end
     rescue
       echo $!
       respond $!.backtrace[0..1]
