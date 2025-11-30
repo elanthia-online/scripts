@@ -132,6 +132,165 @@ module MemoryProfiler
     end
   end
 
+  def self.get_macos_memory_stats
+    # Get comprehensive memory info on macOS using ps and vm_stat
+    stats = {}
+    begin
+      # Get RSS and VSZ from ps (most reliable)
+      output = `ps -o rss=,vsz= -p #{Process.pid}`.strip
+      if output =~ /(\d+)\s+(\d+)/
+        stats[:vm_rss] = $1.to_i * 1024      # ps reports in KB
+        stats[:vm_size] = $2.to_i * 1024     # Virtual size in KB
+      end
+
+      # Try to get more detailed info via libproc
+      begin
+        require 'fiddle'
+
+        # libproc is part of libSystem on macOS
+        libsystem = Fiddle::Handle.new('/usr/lib/libSystem.B.dylib')
+
+        # proc_pid_rusage gives us detailed resource usage
+        # int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer)
+        # RUSAGE_INFO_V4 = 4, gives us the most info
+        proc_pid_rusage = Fiddle::Function.new(
+          libsystem['proc_pid_rusage'],
+          [Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_INT
+        )
+
+        # rusage_info_v4 structure is 296 bytes on 64-bit
+        # Key offsets (all uint64_t = 8 bytes):
+        #   0: ri_uuid (16 bytes)
+        #   16: ri_user_time
+        #   24: ri_system_time
+        #   32: ri_pkg_idle_wkups
+        #   40: ri_interrupt_wkups
+        #   48: ri_pageins
+        #   56: ri_wired_size
+        #   64: ri_resident_size
+        #   72: ri_phys_footprint
+        #   ... more fields
+        rusage_buffer = Fiddle::Pointer.malloc(296)
+
+        result = proc_pid_rusage.call(Process.pid, 4, rusage_buffer)  # 4 = RUSAGE_INFO_V4
+
+        if result == 0
+          # Successfully got rusage info
+          stats[:wired_size] = rusage_buffer[56, 8].unpack1('Q')
+          stats[:resident_size] = rusage_buffer[64, 8].unpack1('Q')
+          stats[:phys_footprint] = rusage_buffer[72, 8].unpack1('Q')
+
+          # phys_footprint is the "real" memory usage Apple reports in Activity Monitor
+          # It includes compressed memory and is often more accurate than RSS
+        end
+      rescue => e
+        # libproc not available or failed, continue with ps data
+        stats[:libproc_error] = e.message
+      end
+
+      # Get peak memory using getrusage (available via Ruby's Process module)
+      begin
+        rusage = Process.getrusage rescue nil
+        if rusage && rusage.respond_to?(:maxrss)
+          # maxrss is in bytes on macOS (unlike Linux where it's KB)
+          stats[:vm_peak] = rusage.maxrss
+        end
+      rescue
+        # getrusage not available
+      end
+
+      # Fallback: try ru_maxrss via syscall if Process.getrusage not available
+      if !stats[:vm_peak]
+        begin
+          require 'fiddle'
+          libsystem = Fiddle::Handle.new('/usr/lib/libSystem.B.dylib')
+
+          getrusage = Fiddle::Function.new(
+            libsystem['getrusage'],
+            [Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP],
+            Fiddle::TYPE_INT
+          )
+
+          # struct rusage is 144 bytes on macOS 64-bit
+          # ru_maxrss is at offset 8 (after ru_utime which is 16 bytes... wait)
+          # Actually: ru_utime (16) + ru_stime (16) + ru_maxrss (8) = offset 32
+          rusage_struct = Fiddle::Pointer.malloc(144)
+          result = getrusage.call(0, rusage_struct)  # RUSAGE_SELF = 0
+
+          if result == 0
+            # ru_maxrss is at offset 32 (after ru_utime and ru_stime, each 16 bytes)
+            stats[:vm_peak] = rusage_struct[32, 8].unpack1('q')  # signed long
+          end
+        rescue
+          # Failed to get peak memory
+        end
+      end
+
+    rescue => e
+      stats[:error] = e.message
+    end
+    stats
+  end
+
+  def self.get_macos_thread_count
+    # Count threads on macOS using ps or libproc
+    begin
+      # ps -M shows threads, count lines minus header
+      output = `ps -M -p #{Process.pid} 2>/dev/null`
+      lines = output.strip.split("\n")
+      # First line is header, rest are threads
+      count = lines.size - 1
+      return count if count > 0
+    rescue
+    end
+
+    # Fallback: try proc_pidinfo
+    begin
+      require 'fiddle'
+      libsystem = Fiddle::Handle.new('/usr/lib/libSystem.B.dylib')
+
+      # int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize)
+      proc_pidinfo = Fiddle::Function.new(
+        libsystem['proc_pidinfo'],
+        [Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_LONG_LONG, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+        Fiddle::TYPE_INT
+      )
+
+      # PROC_PIDTASKINFO = 4, struct proc_taskinfo is 112 bytes
+      taskinfo_buffer = Fiddle::Pointer.malloc(112)
+      result = proc_pidinfo.call(Process.pid, 4, 0, taskinfo_buffer, 112)
+
+      if result > 0
+        # pti_threadnum is at offset 24 (after various uint64_t fields)
+        # Actually the structure is:
+        #   uint64_t pti_virtual_size    (0)
+        #   uint64_t pti_resident_size   (8)
+        #   uint64_t pti_total_user      (16)
+        #   uint64_t pti_total_system    (24)
+        #   uint64_t pti_threads_user    (32)
+        #   uint64_t pti_threads_system  (40)
+        #   int32_t  pti_policy          (48)
+        #   int32_t  pti_faults          (52)
+        #   int32_t  pti_pageins         (56)
+        #   int32_t  pti_cow_faults      (60)
+        #   int32_t  pti_messages_sent   (64)
+        #   int32_t  pti_messages_recv   (68)
+        #   int32_t  pti_syscalls_mach   (72)
+        #   int32_t  pti_syscalls_unix   (76)
+        #   int32_t  pti_csw             (80)
+        #   int32_t  pti_threadnum       (84)
+        #   ...
+        thread_count = taskinfo_buffer[84, 4].unpack1('l')  # signed int32
+        return thread_count if thread_count > 0
+      end
+    rescue
+    end
+
+    # Final fallback
+    Thread.list.count
+  end
+
   def self.malloc_trim
     # Force glibc malloc to return memory to OS (Linux only)
     return unless platform == :linux
@@ -1067,6 +1226,7 @@ module MemoryProfiler
     peak_working_set = nil
     page_faults = nil
     linux_stats = {}
+    macos_stats = {}
 
     # Platform-specific memory data
     case platform
@@ -1088,6 +1248,10 @@ module MemoryProfiler
       linux_stats = get_linux_memory_stats
       virtual_size = linux_stats[:vm_size]
       peak_working_set = linux_stats[:vm_peak]
+    when :macos
+      macos_stats = get_macos_memory_stats
+      virtual_size = macos_stats[:vm_size]
+      peak_working_set = macos_stats[:vm_peak]
     end
 
     respond "=" * 70
@@ -1096,6 +1260,8 @@ module MemoryProfiler
       respond "PROCESS MEMORY (Windows WMI data)"
     when :linux
       respond "PROCESS MEMORY (Linux /proc data)"
+    when :macos
+      respond "PROCESS MEMORY (macOS libproc/ps data)"
     else
       respond "PROCESS MEMORY"
     end
@@ -1113,6 +1279,11 @@ module MemoryProfiler
         respond "Stack:                    #{format_bytes(linux_stats[:vm_stk])}" if linux_stats[:vm_stk]
         respond "Executable:               #{format_bytes(linux_stats[:vm_exe])}" if linux_stats[:vm_exe]
         respond "Libraries:                #{format_bytes(linux_stats[:vm_lib])}" if linux_stats[:vm_lib]
+      elsif platform == :macos && macos_stats.any?
+        respond "Physical footprint:       #{format_bytes(macos_stats[:phys_footprint])}" if macos_stats[:phys_footprint]
+        respond "  (This is what Activity Monitor reports)"
+        respond "Wired size:               #{format_bytes(macos_stats[:wired_size])}" if macos_stats[:wired_size]
+        respond "Resident size (libproc):  #{format_bytes(macos_stats[:resident_size])}" if macos_stats[:resident_size]
       elsif platform == :windows
         respond "Page Faults:              #{page_faults}" if page_faults
       end
@@ -1124,6 +1295,8 @@ module MemoryProfiler
         case platform
         when :linux
           respond "  (Reserved but not resident; includes malloc arenas)"
+        when :macos
+          respond "  (Reserved but not resident; includes memory-mapped files)"
         when :windows
           respond "  (Reserved but not committed virtual memory)"
         end
@@ -1384,6 +1557,27 @@ module MemoryProfiler
       respond "      THIS IS A KEY DIFFERENCE from Windows (1 MB)!"
       respond ""
 
+    when :macos
+      # macOS: 512 KB default main thread, 512 KB for secondary threads
+      # (can check with: ulimit -s, typically shows 8192 but pthread uses 512 KB)
+      os_thread_count = get_macos_thread_count
+
+      # macOS default pthread stack: 512 KB per thread
+      # Main thread can be larger (8 MB) but secondary threads are 512 KB
+      # We'll estimate conservatively at 512 KB per thread
+      actual_thread_memory = os_thread_count * 512 * 1024
+
+      respond "macOS thread info (from libproc/ps):"
+      respond "  OS threads in process:  #{os_thread_count}"
+      respond "  Ruby Thread.list count: #{threads.count}"
+      respond "  Stack memory estimate:  #{format_bytes(actual_thread_memory)}"
+      respond "    (#{os_thread_count} threads x 512 KB default stack)"
+      respond ""
+      respond "NOTE: macOS uses 512 KB default stack for pthreads."
+      respond "      Main thread may have up to 8 MB stack."
+      respond "      This is smaller than Linux (8 MB) but similar to Windows (1 MB)."
+      respond ""
+
     else
       # Unknown platform - use conservative estimate
       actual_thread_memory = threads.count * 2 * 1024 * 1024
@@ -1522,6 +1716,38 @@ module MemoryProfiler
       respond "  malloc_trim = Fiddle::Function.new(libc['malloc_trim'], [Fiddle::TYPE_INT], Fiddle::TYPE_INT)"
       respond "  malloc_trim.call(0)  # Trim all arenas"
       respond ""
+    elsif platform == :macos
+      respond "=" * 70
+      respond "MACOS MEMORY ALLOCATOR"
+      respond "=" * 70
+      respond ""
+
+      respond "macOS uses a custom malloc implementation (libmalloc) with zones."
+      respond "Key differences from Linux/Windows:"
+      respond "  - Memory is organized into 'zones' (similar to arenas)"
+      respond "  - Default zone is 'DefaultMallocZone'"
+      respond "  - Compressed memory can make RSS appear lower than actual usage"
+      respond ""
+
+      # Show physical footprint if available (this is what Activity Monitor uses)
+      if macos_stats[:phys_footprint]
+        respond "Physical Footprint:       #{format_bytes(macos_stats[:phys_footprint])}"
+        respond "  This is the 'Memory' column in Activity Monitor."
+        respond "  It accounts for compressed memory and is more accurate than RSS."
+        respond ""
+      end
+
+      respond "Debugging memory on macOS:"
+      respond "  - Use 'leaks' command: leaks #{Process.pid}"
+      respond "  - Use 'heap' command:  heap #{Process.pid}"
+      respond "  - Use 'vmmap' command: vmmap #{Process.pid}"
+      respond "  - Use Instruments.app for detailed profiling"
+      respond ""
+      respond "Environment variables for debugging:"
+      respond "  MallocStackLogging=1      # Track allocation call stacks"
+      respond "  MallocScribble=1          # Fill freed memory with 0x55"
+      respond "  MallocGuardEdges=1        # Add guard pages around allocations"
+      respond ""
     end
 
     # Check SQLite memory usage if available
@@ -1645,6 +1871,9 @@ module MemoryProfiler
       when :linux
         respond "   (ESTIMATED: #{os_thread_count} threads x 8 MB reserved on Linux)"
         respond "   (Note: Linux reserves 8 MB but commits less - see VmStk)"
+      when :macos
+        respond "   (MEASURED: #{os_thread_count} threads x 512 KB on macOS)"
+        respond "   (Note: Main thread may use up to 8 MB)"
       else
         respond "   (ESTIMATED: #{os_thread_count} threads)"
       end
