@@ -20,7 +20,8 @@
   v5.11.0  (2025-11-29)
     - add support for boon creatures
     - add toggle to stop for dead group members
-    - refactor find_routine, ma_looter
+    - refactor find_routine, ma_looter, check_mind, ready_to_hunt?, and ready_to_rest?
+    - removed gather_ammo (no longer used since archery update)
   v5.10.0  (2025-10-31)
     - update BSAreaRooms
     - fix MA so leader has group open
@@ -2216,7 +2217,7 @@ class Bigshot
                 :MONITOR_INTERACTION, :FLEE_CLOUDS, :FLEE_VINES, :FLEE_WEBS, :FLEE_VOIDS, :WRACKING_SPIRIT,
                 :REST_TILL_SPIRIT, :REST_TILL_PERCENTSTAMINA, :BOUNTY_MODE, :AMBUSH, :ARCHERY_AIM,
                 :event_stack, :inbounds, :followers, :group, :leader, :BLESS, :AIM, :TIER3, :QUIET_FOLLOWERS, :IGNORE_DISKS,
-                :MSTRIKE_COOLDOWN, :MSTRIKE_STAMINA_COOLDOWN, :MSTRIKE_MOB, :BOON_ABILITIES, :BOONS_IGNORE, :BOONS_FLEE,
+                :MSTRIKE_COOLDOWN, :MSTRIKE_STAMINA_COOLDOWN, :MSTRIKE_MOB, :BOON_ABILITIES, :BOONS_IGNORE, :BOONS_FLEE, :BOON_CACHE,
                 :MSTRIKE_QUICKSTRIKE, :MSTRIKE_STAMINA_QUICKSTRIKE, :UAC_MSTRIKE,
                 :WANDER_WAIT, :QUICK_COMMANDS, :PRIORITY, :TROUBADOURS_RALLY, :SNEAKY_SNEAKY,
                 :QUICKHUNT_TARGETS, :UAC_SMITE, :FOG_RETURN, :FOG_OPTIONAL, :LOOT_STANCE,
@@ -2573,6 +2574,7 @@ class Bigshot
     initialize_boon_data
     @BOONS_IGNORE = UserVars.op["boons_ignore"] || []
     @BOONS_FLEE = UserVars.op["boons_flee"] || []
+    @BOON_CACHE = {}
 
     convert_from_uid
 
@@ -3564,6 +3566,7 @@ class Bigshot
       /\.\.\.wait/i,
       /(?:Barrage|Flurry|Fury|Guardant Thrusts|Pummel|Thrash) is still in cooldown\./,
       /Your mind clouds with confusion and you glance around uncertainly\./i,
+      /You can't reach/,
     )
 
     result_regex = Regexp.union(complete_regex, error_regex)
@@ -5077,9 +5080,7 @@ class Bigshot
     waitcastrt?
 
     result = dothistimeout("fire ##{npc.id}", 2, /round(time)?|You cannot|Could not find|seconds|Get what?/i)
-    if (result =~ /^Could not find/)
-      # gather_ammo()#Not used since archery updates.
-    elsif (result =~ /You cannot fire/)
+    if (result =~ /You cannot fire/)
       unless GameObj.right_hand.id.nil?
         line = dothistimeout "stow ##{GameObj.right_hand.id}", 3, /put|closed/
         if line =~ /closed/
@@ -5858,8 +5859,6 @@ class Bigshot
     if @SIGNS.any? { |s| ['902', '411'].include?(s) }
       check_902_411()
     end
-
-    cast_signs()
   end
 
   def do_hunt() # Finds target and calls attack block
@@ -5977,6 +5976,7 @@ class Bigshot
     $bigshot_should_rest = false
     $bigshot_overkill_counter = 0
     $bigshot_lte_boost_counter = 0
+    @BOON_CACHE = {}
 
     # Wait for follower to finish looting if needed
     while !@followers.looting_done
@@ -6484,24 +6484,40 @@ class Bigshot
 
     return nil unless creature.type.include?("boon")
 
-    lines = Lich::Util.quiet_command_xml("assess ##{creature.id}", /The <pushBold\/><a exist=".*" noun=".*">.*<\/a><popBold\/>/)
+    # Return cached result if it exists
+    return @BOON_CACHE[creature.id] if @BOON_CACHE.key?(creature.id)
+
+    # Otherwise, do the assessment
+    lines = Lich::Util.quiet_command_xml(
+      "assess ##{creature.id}",
+      /The <pushBold\/><a exist=".*" noun=".*">.*<\/a><popBold\/>|You do not currently have a target./
+    )
+
     text = lines.find { |l| l.include?("appears to be") }
-    return nil unless text
+    unless text
+      @BOON_CACHE[creature.id] = nil
+      return nil
+    end
 
     # Clean out XML tags
     cleaned = text.gsub(/<[^>]+>/, '')
 
-    # Capture the descriptors after "appears to be"
+    # Capture descriptors after "appears to be"
     match = cleaned.match(/appears to be (.+?)(?:\.|$)/i)
-    return nil unless match
+    unless match
+      @BOON_CACHE[creature.id] = nil
+      return nil
+    end
 
     phrase = match[1].downcase.strip
 
-    # Split by commas or "and", BUT preserve multi-word adjectives
+    # Split by commas or "and" (preserve multi-word adjectives)
     boons = phrase.split(/\s*(?:,|and)\s*/i).map(&:strip)
 
-    abilities = boons.map { |b| @BOON_ABILITIES[b] }.compact
-    abilities.empty? ? nil : abilities.uniq
+    abilities = boons.map { |b| @BOON_ABILITIES[b] }.compact.uniq
+
+    # Cache the result
+    @BOON_CACHE[creature.id] = abilities.empty? ? nil : abilities
   end
 
   def invalid_target_with_boons(creature)
@@ -6512,11 +6528,13 @@ class Bigshot
 
     abilities = check_boons(creature)
     return false unless abilities
+
     return true if (abilities & @BOONS_IGNORE).any?
   end
 
   def should_flee_from_boons?
     debug_msg(@DEBUG_COMBAT, "should_flee_from_boons? | called by #{caller[0]}")
+
     return false if @BOONS_FLEE.empty?
 
     GameObj.targets.each do |creature|
@@ -6552,7 +6570,7 @@ class Bigshot
 
     return false if $bigshot_bandits
 
-    return true if should_flee_from_boons?
+    return true if @BOONS_FLEE.any? && GameObj.targets.any? { |c| c.type.include?("boon") } && should_flee_from_boons?
     return true if !leading? && checkpcs.empty?
 
     npcs = GameObj.targets.reject! do |npc|
@@ -6581,7 +6599,7 @@ class Bigshot
       'target.status =~ /dead|gone/'                             => target.status =~ /dead|gone/,
       'target gone from GameObj.targets collection'              => GameObj.targets.none? { |n| n.id == target.id },
       'target.name contains animated but not an animated slush/' => target.name =~ /animated/ && target.name !~ /animated slush/,
-      'targets with boons are being ignored'                     => invalid_target_with_boons(target)
+      'targets with boons are being ignored'                     => (target.type.include?("boon") && invalid_target_with_boons(target))
     }
 
     invalid_conditions.each do |condition, result|
@@ -6783,87 +6801,27 @@ class Bigshot
 
   def check_mind
     @followers.add_event(:CHECK_MIND)
-    if percentmind() < 100
-      @CORRECT_PERCENT_MIND = percentmind()
-      debug_msg(@DEBUG_STATUS, "check_mind | percentmind(): #{percentmind()} | called by #{caller[0]}")
+
+    current_percent = percentmind()
+    if current_percent < 100
+      @CORRECT_PERCENT_MIND = current_percent
+      debug_msg(@DEBUG_STATUS, "check_mind | percentmind(): #{current_percent} | called by #{caller[0]}")
     else
       lines = Lich::Util.quiet_command_xml("experience", /<output class="mono"\/>/)
 
-      if lines.any? { |l| l =~ /Field Exp\:\s*([0-9,]+)\/([0-9,]+)/i }
-        in_bucket = $1.delete(",").to_f
-        max_bucket = $2.delete(",").to_f
-      end
-
-      actual_percent = (in_bucket / max_bucket) * 100
-      if actual_percent.nil?
-        @CORRECT_PERCENT_MIND = percentmind()
-      else
+      if (match = lines.find { |l| l =~ /Field Exp\:\s*([0-9,]+)\/([0-9,]+)/i })
+        in_bucket, max_bucket = $1.delete(",").to_f, $2.delete(",").to_f
+        actual_percent = (in_bucket / max_bucket) * 100
         @CORRECT_PERCENT_MIND = actual_percent
+        debug_msg(@DEBUG_STATUS, "check_mind | in_bucket: #{in_bucket} | max_bucket: #{max_bucket} | actual_percent: #{actual_percent} | called by #{caller[0]}")
+      else
+        # fallback if regex fails
+        @CORRECT_PERCENT_MIND = current_percent
+        debug_msg(@DEBUG_STATUS, "check_mind | percentmind(): #{current_percent} (fallback) | called by #{caller[0]}")
       end
-      debug_msg(@DEBUG_STATUS, "check_mind | in_bucket: #{in_bucket} | max_bucket: #{max_bucket} | actual_percent: #{actual_percent} | called by #{caller[0]}")
     end
 
     return @CORRECT_PERCENT_MIND
-  end
-
-  def ammo_on_ground(ammo) # Not used
-    debug_msg(@DEBUG_COMBAT, "ammo_on_ground | ammo: #{ammo} | called by #{caller[0]}")
-    return GameObj.loot.find { |i| i.name =~ /\b#{ammo}s?\b/i or i.noun =~ /^#{ammo}s?$/i }
-  end
-
-  def gather_ammo() # Not used
-    debug_msg(@DEBUG_COMMANDS, "gather_ammo | called by #{caller[0]}")
-
-    ammo = @AMMO
-    container = GameObj.inv.find { |obj| obj.name =~ /#{@AMMO_CONTAINER}/ }
-    hide = @HIDE_FOR_AMMO
-
-    return if wounded?
-
-    if ammo.nil? or ammo.empty?
-      return
-    end
-
-    if ammo =~ /\b(arrow|bolt|dart)\b/i
-      ammo_noun = $1
-    else
-      echo "failed to gather: invalid ammo type specified (use the full name)"
-    end
-
-    if container.nil?
-      echo "failed to gather: you must specify an ammo container to use this feature"
-      return
-    end
-
-    while (ammo_on_ground(ammo_noun))
-      change_stance(@WANDER_STANCE)
-
-      unless GameObj.right_hand.id.nil?
-        line = dothistimeout "stow ##{GameObj.right_hand.id}", 3, /put|closed/
-        if line =~ /closed/
-          fput "open my ##{container.id}"
-          fput "put ##{GameObj.right_hand.id} in my ##{container.id}"
-        end
-      end
-
-      result = dothistimeout("gather #{ammo_noun}", 2, /^You gather|^You pick up|^I could not|^What were you|^You may only|reach|on the ground/)
-
-      if (result =~ /on the ground/)
-        result = dothistimeout "get #{ammo_noun}s", 3, /^You gather|^You pick up|^I could not|^What were you|^You may only|reach|on the ground/
-      end
-
-      if (result =~ /^You gather|^You pick up/)
-        dothistimeout("put my #{ammo_noun} in my #{ammo_noun}s in my #{container.noun}", 2, /^I could not find|^You can't seem to|^You add|^You bundle|You cannot bundle/)
-        bs_put "put my #{ammo_noun} in my ##{container.id}" if righthand?
-      elsif (result =~ /You may only/)
-        return
-      elsif (result == false || result =~ /^I could not find|^What were you/)
-        return
-      elsif (result =~ /reach/)
-        bs_put 'hide' if hide and not hidden?
-        sleep(4)
-      end
-    end
   end
 
   def reset_variables(moved = true)
@@ -6897,24 +6855,32 @@ class Bigshot
   def creeping_dread?
     debug_msg(@DEBUG_STATUS, "creeping_dread? | called by #{caller[0]}")
 
-    Effects::Debuffs.to_h.keys.map(&:to_s).find { |k| k.include? "Creeping Dread" }.match(/\((\d+)\)/)[1].to_i
-    counter = $1.to_i
-    return counter >= @CREEPING_DREAD && @CREEPING_DREAD > 0
+    return false unless @CREEPING_DREAD.positive?
+
+    key = Effects::Debuffs.to_h.keys.find { |k| k.to_s.include?("Creeping Dread") }
+    return false unless key
+
+    key.to_s[/\((\d+)\)/, 1].to_i >= @CREEPING_DREAD
   end
 
   def crushing_dread?
     debug_msg(@DEBUG_STATUS, "crushing_dread? | called by #{caller[0]}")
 
-    Effects::Debuffs.to_h.keys.map(&:to_s).find { |k| k.include? "Crushing Dread" }.match(/\((\d+)\)/)[1].to_i
-    counter = $1.to_i
-    return counter >= @CRUSHING_DREAD && @CRUSHING_DREAD > 0
+    return false unless @CRUSHING_DREAD.positive?
+
+    key = Effects::Debuffs.to_h.keys.find { |k| k.to_s.include?("Crushing Dread") }
+    return false unless key
+
+    key.to_s[/\((\d+)\)/, 1].to_i >= @CRUSHING_DREAD
   end
 
   def wot_poison?
     debug_msg(@DEBUG_STATUS, "wot_poison? | called by #{caller[0]}")
 
+    return false unless @WOT_POISON
+
     poisoned = Effects::Debuffs.to_h.keys.any? { |key| key.to_s =~ /Wall of Thorns Poison/ }
-    return poisoned && @WOT_POISON == true
+    return poisoned
   end
 
   def bounty_check?()
@@ -6934,24 +6900,25 @@ class Bigshot
 
   def ready_to_hunt?
     debug_msg(@DEBUG_STATUS, "ready_to_hunt? | called by #{caller[0]}")
-
     $not_hunting_reason = nil
-    not_hunting = {
-      'wounded.'                           => lambda { wounded? },
-      'encumbered.'                        => lambda { Char.percent_encumbrance >= @ENCUMBERED },
-      'creeping dread active.'             => lambda { creeping_dread? },
-      'crushing dread active.'             => lambda { crushing_dread? },
-      'confusion debuff active.'           => lambda { Effects::Debuffs.active?("Confused") && @CONFUSION == true },
-      'wall of thorns poison active.'      => lambda { wot_poison? },
-      'resting scripts are still running.' => lambda { @RESTING_SCRIPTS.any? { |i| running?(i) } },
-      'mind still above threshold.'        => lambda { @CORRECT_PERCENT_MIND > @REST_TILL_EXP },
-      'mana still below threshold.'        => lambda { Char.percent_mana < @REST_TILL_MANA },
-      'spirit still below threshold.'      => lambda { Char.spirit < @REST_TILL_SPIRIT },
-      'stamina still below threshold.'     => lambda { Char.percent_stamina < @REST_TILL_PERCENTSTAMINA }
-    }
 
-    not_hunting.each do |reason, condition|
-      if condition.call
+    # Array of [condition, reason] pairs
+    not_hunting_checks = [
+      [wounded?, 'wounded.'],
+      [Char.percent_encumbrance >= @ENCUMBERED, 'encumbered.'],
+      [creeping_dread?, 'creeping dread active.'],
+      [crushing_dread?, 'crushing dread active.'],
+      [Effects::Debuffs.active?("Confused") && @CONFUSION, 'confusion debuff active.'],
+      [wot_poison?, 'wall of thorns poison active.'],
+      [@RESTING_SCRIPTS.any? { |i| running?(i) }, 'resting scripts are still running.'],
+      [@CORRECT_PERCENT_MIND > @REST_TILL_EXP, 'mind still above threshold.'],
+      [Char.percent_mana < @REST_TILL_MANA, 'mana still below threshold.'],
+      [Char.spirit < @REST_TILL_SPIRIT, 'spirit still below threshold.'],
+      [Char.percent_stamina < @REST_TILL_PERCENTSTAMINA, 'stamina still below threshold.']
+    ]
+
+    not_hunting_checks.each do |condition, reason|
+      if condition
         $not_hunting_reason = reason
         return reason
       end
@@ -6989,43 +6956,28 @@ class Bigshot
     debug_msg(@DEBUG_STATUS, "ready_to_rest? | called by #{caller[0]}")
     return false if $bigshot_quick
 
-    # Define rest_conditions with lambda functions representing conditions
-    rest_conditions = {
-      bounty_mode: lambda { @BOUNTY_MODE && $bigshot_should_rest },
-      should_rest: lambda { $bigshot_should_rest },
-      wounded: lambda { wounded? },
-      percentencumbrance: lambda { Char.percent_encumbrance >= @ENCUMBERED },
-      creeping_dread: lambda { creeping_dread? },
-      crushing_dread: lambda { crushing_dread? },
-      wot_poison: lambda { wot_poison? },
-      confusion_debuff: lambda { @CONFUSION == true && Effects::Debuffs.active?("Confused") },
-      fried_overkill_and_lte_boost: lambda { fried? && overkill? && lte_boost? },
-      oom: lambda { oom? }
-    }
+    rest_checks = [
+      [@BOUNTY_MODE && $bigshot_should_rest, 'bounty complete.'],
+      [$bigshot_should_rest, '$bigshot_should_rest was set to true.'],
+      [wounded?, 'wounded.'],
+      [Char.percent_encumbrance >= @ENCUMBERED, 'encumbered.'],
+      [creeping_dread?, 'creeping dread limit.'],
+      [crushing_dread?, 'crushing dread limit.'],
+      [wot_poison?, 'wall of thorns poison.'],
+      [@CONFUSION && Effects::Debuffs.active?("Confused"), 'confusion debuff.'],
+      [fried? && overkill? && lte_boost?, 'fried.'],
+      # OOM handled inline with side effect
+      [oom? && (!@USE_WRACKING || (wrack(); oom?)), 'out of mana.']
+    ]
 
-    # Define rest_actions with lambda functions representing actions
-    rest_actions = {
-      bounty_mode: lambda { $rest_reason = 'bounty complete.' },
-      should_rest: lambda { $rest_reason ? $rest_reason : $rest_reason = '$bigshot_should_rest was set to true.' },
-      wounded: lambda { $rest_reason = 'wounded.' },
-      percentencumbrance: lambda { $rest_reason = 'encumbered.' },
-      creeping_dread: lambda { $rest_reason = 'creeping dread limit.' },
-      crushing_dread: lambda { $rest_reason = 'crushing dread limit.' },
-      wot_poison: lambda { $rest_reason = 'wall of thorns poison.' },
-      confusion_debuff: lambda { $rest_reason = 'confusion debuff.' },
-      fried_overkill_and_lte_boost: lambda { $rest_reason = 'fried.' },
-      oom: lambda { wrack() if @USE_WRACKING; return false unless oom?; $rest_reason = 'out of mana.' }
-    }
-
-    # Iterate through rest_conditions and execute corresponding actions from rest_actions
-    rest_conditions.each do |condition, lambda_function|
-      if lambda_function.call
-        if rest_actions[condition].call
-          $bigshot_status = :resting
-          return $rest_reason
-        end
+    rest_checks.each do |condition, reason|
+      if condition
+        $rest_reason = reason
+        $bigshot_status = :resting
+        return $rest_reason
       end
     end
+
     return false
   end
 
@@ -7362,9 +7314,14 @@ class Bigshot
       new_room = true
 
       if !@followers.all_present? || Lich::Gemstone::Group.broken?
-        @followers.add_event(:FOLLOW_NOW) # trigger rubber band
         message("yellow", "Waiting for followers....")
-        sleep(0.5) while (!@followers.all_present?)
+
+        # Keep prompting followers until all are present
+        until @followers.all_present?
+          @followers.add_event(:FOLLOW_NOW) # trigger rubber band
+          sleep 2
+        end
+
         groupcheck
       end
 
