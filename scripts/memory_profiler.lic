@@ -1,0 +1,1832 @@
+=begin
+  Memory Profiler - Track object allocations and memory growth
+  Cross-platform: Windows, Linux, macOS
+
+  Usage:
+    ;memory_profiler snapshot     # Take a snapshot
+    ;memory_profiler compare      # Compare current state to last snapshot
+    ;memory_profiler top          # Show top memory consumers right now
+    ;memory_profiler gc           # Force GC and show stats
+    ;memory_profiler system       # Detailed system memory breakdown
+    ;memory_profiler fragtest     # Test if gap is fragmentation vs leak
+    ;memory_profiler trend        # Show memory trend over snapshots
+    ;memory_profiler trim         # Force malloc to return memory (Linux only)
+=end
+
+require 'objspace'
+
+module MemoryProfiler
+  # Use globals to persist between script runs
+  $memory_profiler_snapshot ||= nil
+  $memory_profiler_history ||= []
+
+  def self.format_bytes(bytes)
+    return "0 B" if bytes == 0
+
+    # Handle negative values
+    negative = bytes < 0
+    bytes = bytes.abs
+
+    units = ['B', 'KB', 'MB', 'GB']
+    exp = (Math.log(bytes) / Math.log(1024)).to_i
+    exp = [exp, units.length - 1].min
+    result = "#{(bytes / 1024.0 ** exp).round(2)} #{units[exp]}"
+
+    negative ? "-#{result}" : result
+  end
+
+  def self.count_by_class
+    counts = Hash.new(0)
+    sizes = Hash.new(0)
+
+    ObjectSpace.each_object do |obj|
+      begin
+        klass = obj.class.name rescue obj.class.to_s rescue "Unknown"
+        counts[klass] += 1
+        sizes[klass] += ObjectSpace.memsize_of(obj)
+      rescue => e
+        # Skip objects that can't be inspected
+        counts["<error>"] += 1
+      end
+    end
+
+    { counts: counts, sizes: sizes }
+  end
+
+  def self.platform
+    @platform ||= case RUBY_PLATFORM
+    when /win32|mingw|mswin/
+      :windows
+    when /linux/
+      :linux
+    when /darwin/
+      :macos
+    else
+      :unknown
+    end
+  end
+
+  def self.get_process_rss
+    case platform
+    when :linux
+      # Read from /proc/[pid]/status
+      begin
+        status = File.read("/proc/#{Process.pid}/status")
+        # VmRSS is the actual physical memory used
+        if status =~ /VmRSS:\s+(\d+)\s+kB/
+          return $1.to_i * 1024  # Convert KB to bytes
+        end
+      rescue => e
+        return nil
+      end
+    when :windows
+      # Get Windows process memory via WMI
+      begin
+        require 'win32ole'
+        wmi = WIN32OLE.connect("winmgmts://")
+        processes = wmi.ExecQuery("SELECT * FROM Win32_Process WHERE ProcessId = #{Process.pid}")
+        processes.each do |process|
+          return process.WorkingSetSize.to_i
+        end
+      rescue => e
+        return nil
+      end
+    when :macos
+      # macOS via ps command
+      begin
+        output = `ps -o rss= -p #{Process.pid}`.strip
+        return output.to_i * 1024  # ps returns KB, convert to bytes
+      rescue
+        return nil
+      end
+    end
+    nil
+  end
+
+  def self.get_linux_memory_stats
+    # Parse /proc/[pid]/status for comprehensive memory info
+    stats = {}
+    begin
+      status = File.read("/proc/#{Process.pid}/status")
+
+      # Extract various memory metrics (all in kB, convert to bytes)
+      stats[:vm_size] = $1.to_i * 1024 if status =~ /VmSize:\s+(\d+)\s+kB/
+      stats[:vm_rss] = $1.to_i * 1024 if status =~ /VmRSS:\s+(\d+)\s+kB/
+      stats[:vm_peak] = $1.to_i * 1024 if status =~ /VmPeak:\s+(\d+)\s+kB/
+      stats[:vm_data] = $1.to_i * 1024 if status =~ /VmData:\s+(\d+)\s+kB/
+      stats[:vm_stk] = $1.to_i * 1024 if status =~ /VmStk:\s+(\d+)\s+kB/
+      stats[:vm_exe] = $1.to_i * 1024 if status =~ /VmExe:\s+(\d+)\s+kB/
+      stats[:vm_lib] = $1.to_i * 1024 if status =~ /VmLib:\s+(\d+)\s+kB/
+      stats[:threads] = $1.to_i if status =~ /Threads:\s+(\d+)/
+    rescue
+    end
+    stats
+  end
+
+  def self.get_linux_thread_count
+    # Count threads via /proc/[pid]/task directory
+    begin
+      Dir.entries("/proc/#{Process.pid}/task").count { |e| e =~ /^\d+$/ }
+    rescue
+      Thread.list.count
+    end
+  end
+
+  def self.malloc_trim
+    # Force glibc malloc to return memory to OS (Linux only)
+    return unless platform == :linux
+
+    begin
+      require 'fiddle'
+      libc = Fiddle::Handle.new('libc.so.6')
+      malloc_trim_func = Fiddle::Function.new(
+        libc['malloc_trim'],
+        [Fiddle::TYPE_INT],
+        Fiddle::TYPE_INT
+      )
+
+      rss_before = get_process_rss
+      result = malloc_trim_func.call(0)  # Trim all arenas
+      sleep 0.5  # Give OS time to release
+      rss_after = get_process_rss
+
+      respond ""
+      respond "=" * 70
+      respond "MALLOC_TRIM EXECUTED"
+      respond "=" * 70
+      respond ""
+      respond "RSS before:  #{format_bytes(rss_before)}" if rss_before
+      respond "RSS after:   #{format_bytes(rss_after)}" if rss_after
+      if rss_before && rss_after
+        change = rss_after - rss_before
+        respond "Change:      #{format_bytes(change)}"
+        respond ""
+        if change < -1024 * 1024  # More than 1 MB freed
+          respond "Successfully freed #{format_bytes(-change)} back to OS!"
+        else
+          respond "No significant memory returned (arenas already trimmed or memory in use)."
+        end
+      end
+      respond ""
+    rescue => e
+      respond "Error calling malloc_trim: #{e.message}"
+      respond "This only works on Linux with glibc."
+    end
+  end
+
+  def self.snapshot
+    GC.start  # Clean up first for accurate reading
+
+    # Capture comprehensive snapshot data
+    data = count_by_class
+    ruby_heap = ObjectSpace.memsize_of_all
+    process_rss = get_process_rss
+    gc_stat = GC.stat
+    thread_count = Thread.list.count
+
+    $memory_profiler_snapshot = {
+      timestamp: Time.now,
+      counts: data[:counts],
+      sizes: data[:sizes],
+      ruby_heap: ruby_heap,
+      process_rss: process_rss,
+      gap: process_rss ? (process_rss - ruby_heap) : 0,
+      gc_stat: {
+        count: gc_stat[:count],
+        heap_pages: gc_stat[:heap_allocated_pages],
+        live_slots: gc_stat[:heap_live_slots],
+        malloc_increase: gc_stat[:malloc_increase_bytes] || gc_stat[:malloc_increase] || 0,
+        oldmalloc_increase: gc_stat[:oldmalloc_increase_bytes] || gc_stat[:oldmalloc_increase] || 0
+      },
+      threads: thread_count
+    }
+
+    # Add to history
+    $memory_profiler_history << $memory_profiler_snapshot
+
+    respond ""
+    respond "=" * 70
+    respond "MEMORY SNAPSHOT - #{$memory_profiler_snapshot[:timestamp].strftime('%H:%M:%S')}"
+    respond "=" * 70
+    respond ""
+    respond "Total objects:            #{$memory_profiler_snapshot[:counts].values.sum}"
+    respond "Ruby heap memory:         #{format_bytes(ruby_heap)}"
+
+    if process_rss
+      gap_pct = ((($memory_profiler_snapshot[:gap].to_f / process_rss) * 100).round(1))
+      respond "Process RSS:              #{format_bytes(process_rss)}"
+      respond "Memory gap:               #{format_bytes($memory_profiler_snapshot[:gap])} (#{gap_pct}%)"
+    end
+
+    respond "Active threads:           #{thread_count}"
+    respond "GC count:                 #{$memory_profiler_snapshot[:gc_stat][:count]}"
+    respond ""
+    respond "Snapshot saved. Use ';memory_profiler compare' after hunting to see growth."
+    respond "Use ';memory_profiler trend' to see memory trends over time."
+    respond ""
+  end
+
+  def self.compare
+    unless $memory_profiler_snapshot
+      respond "No snapshot taken. Run ';memory_profiler snapshot' first."
+      return
+    end
+
+    current = count_by_class
+
+    # Get current system metrics
+    current_ruby_heap = ObjectSpace.memsize_of_all
+    current_process_rss = get_process_rss
+    current_gap = current_process_rss ? (current_process_rss - current_ruby_heap) : 0
+    current_threads = Thread.list.count
+
+    # Calculate deltas
+    growth = {}
+    current[:counts].each do |klass, count|
+      old_count = $memory_profiler_snapshot[:counts][klass] || 0
+      old_size = $memory_profiler_snapshot[:sizes][klass] || 0
+      new_size = current[:sizes][klass]
+
+      if count > old_count
+        growth[klass] = {
+          count_delta: count - old_count,
+          size_delta: new_size - old_size,
+          total_count: count,
+          total_size: new_size
+        }
+      end
+    end
+
+    # Sort by memory growth
+    sorted = growth.sort_by { |k, v| -v[:size_delta] }
+
+    respond ""
+    respond "=" * 70
+    respond "MEMORY GROWTH ANALYSIS"
+    respond "=" * 70
+    respond ""
+    respond "Snapshot taken:           #{$memory_profiler_snapshot[:timestamp].strftime('%H:%M:%S')}"
+    respond "Current time:             #{Time.now.strftime('%H:%M:%S')}"
+    elapsed = Time.now - $memory_profiler_snapshot[:timestamp]
+    respond "Elapsed:                  #{(elapsed / 60).round(1)} minutes"
+    respond ""
+
+    respond "SYSTEM MEMORY CHANGES:"
+    respond ""
+    if $memory_profiler_snapshot[:process_rss] && current_process_rss
+      rss_delta = current_process_rss - $memory_profiler_snapshot[:process_rss]
+      gap_delta = current_gap - $memory_profiler_snapshot[:gap]
+
+      respond "Process RSS:              #{format_bytes($memory_profiler_snapshot[:process_rss])} -> #{format_bytes(current_process_rss)} (#{rss_delta >= 0 ? '+' : ''}#{format_bytes(rss_delta)})"
+      respond "Ruby heap:                #{format_bytes($memory_profiler_snapshot[:ruby_heap])} -> #{format_bytes(current_ruby_heap)} (#{format_bytes(current_ruby_heap - $memory_profiler_snapshot[:ruby_heap])})"
+      respond "Memory gap:               #{format_bytes($memory_profiler_snapshot[:gap])} -> #{format_bytes(current_gap)} (#{gap_delta >= 0 ? '+' : ''}#{format_bytes(gap_delta)})"
+
+      gap_pct_old = (($memory_profiler_snapshot[:gap].to_f / $memory_profiler_snapshot[:process_rss]) * 100).round(1)
+      gap_pct_new = ((current_gap.to_f / current_process_rss) * 100).round(1)
+      respond "  Gap percentage:         #{gap_pct_old}% -> #{gap_pct_new}%"
+      respond ""
+
+      if gap_delta > $memory_profiler_snapshot[:gap] * 0.5  # Gap grew >50%
+        respond "WARNING: Memory gap grew significantly!"
+        respond "  This suggests native memory leak or fragmentation."
+        respond "  Run ';memory_profiler fragtest' to diagnose."
+        respond ""
+      end
+    end
+
+    respond "Active threads:           #{$memory_profiler_snapshot[:threads]} -> #{current_threads} (#{current_threads >= $memory_profiler_snapshot[:threads] ? '+' : ''}#{current_threads - $memory_profiler_snapshot[:threads]})"
+    respond ""
+
+    respond "Total object growth:      #{current[:counts].values.sum - $memory_profiler_snapshot[:counts].values.sum}"
+    respond "Total memory growth:      #{format_bytes(ObjectSpace.memsize_of_all - $memory_profiler_snapshot[:sizes].values.sum)}"
+    respond ""
+    respond "Top 20 classes by memory growth:"
+    respond ""
+
+    sorted.first(20).each do |klass, data|
+      respond sprintf("  %-40s +%6d objs  +%10s  (total: %s)",
+        klass,
+        data[:count_delta],
+        format_bytes(data[:size_delta]),
+        format_bytes(data[:total_size])
+      )
+    end
+
+    respond ""
+    respond "Creature/Combat specific:"
+    creature_classes = growth.select { |k, v| k.include?('Creature') || k.include?('Combat') }
+    if creature_classes.any?
+      creature_classes.each do |klass, data|
+        respond sprintf("  %-40s +%6d objs  +%10s",
+          klass,
+          data[:count_delta],
+          format_bytes(data[:size_delta])
+        )
+      end
+    else
+      respond "  No growth in Creature/Combat classes"
+    end
+
+    respond ""
+  end
+
+  def self.top_consumers
+    data = count_by_class
+    sorted_by_size = data[:sizes].sort_by { |k, v| -v }
+
+    respond ""
+    respond "=" * 70
+    respond "TOP MEMORY CONSUMERS (Current State)"
+    respond "=" * 70
+    respond ""
+    respond "Total memory: #{format_bytes(ObjectSpace.memsize_of_all)}"
+    respond ""
+    respond "Top 30 classes by memory usage:"
+    respond ""
+
+    sorted_by_size.first(30).each do |klass, size|
+      count = data[:counts][klass]
+      avg = count > 0 ? size / count : 0
+      respond sprintf("  %-40s %7d objs  %10s  (avg: %s)",
+        klass,
+        count,
+        format_bytes(size),
+        format_bytes(avg)
+      )
+    end
+
+    respond ""
+
+    # Check for common memory hogs
+    respond "Script-specific checks:"
+    respond ""
+
+    # Threads
+    thread_count = Thread.list.count
+    respond "  Threads alive: #{thread_count}"
+
+    # Lich scripts
+    script_count = Script.list.count
+    respond "  Active scripts: #{script_count}"
+
+    # Combat tracker if available
+    if defined?(Lich::Gemstone::Combat::Tracker)
+      stats = Lich::Gemstone::Combat::Tracker.stats rescue nil
+      if stats && stats[:async]
+        respond "  Combat threads: #{stats[:async][:total_alive]} alive, #{stats[:async][:pool_size]} total (#{stats[:async][:dead_threads]} dead)"
+      end
+    end
+
+    # CreatureInstance if available
+    if defined?(Lich::Gemstone::CreatureInstance)
+      instances = Lich::Gemstone::CreatureInstance.all
+      respond "  Creature instances: #{instances.size}"
+    end
+
+    respond ""
+  end
+
+  def self.gc_stats
+    before_count = GC.count
+    before_size = ObjectSpace.memsize_of_all
+
+    respond ""
+    respond "Running GC.start..."
+    GC.start
+
+    if GC.respond_to?(:compact)
+      respond "Running GC.compact..."
+      GC.compact
+    end
+
+    after_count = GC.count
+    after_size = ObjectSpace.memsize_of_all
+    freed = before_size - after_size
+
+    gc_stat = GC.stat
+
+    respond ""
+    respond "=" * 70
+    respond "GARBAGE COLLECTION STATS"
+    respond "=" * 70
+    respond ""
+    respond "GC runs: #{before_count} -> #{after_count} (+#{after_count - before_count})"
+    respond "Memory freed: #{format_bytes(freed)}"
+    respond "Memory after GC: #{format_bytes(after_size)}"
+    respond ""
+    respond "GC stats:"
+    respond "  Total allocated objects: #{gc_stat[:total_allocated_objects]}"
+    respond "  Total freed objects: #{gc_stat[:total_freed_objects]}"
+    respond "  Heap live slots: #{gc_stat[:heap_live_slots]}"
+    respond "  Heap free slots: #{gc_stat[:heap_free_slots]}"
+    respond "  Heap pages: #{gc_stat[:heap_allocated_pages]}"
+    respond ""
+  end
+
+  def self.analyze_strings(sample_size = 100)
+    strings = []
+    total_count = 0
+    total_size = 0
+    size_buckets = { "0-100" => 0, "101-1K" => 0, "1K-10K" => 0, "10K-100K" => 0, "100K+" => 0 }
+
+    ObjectSpace.each_object(String) do |str|
+      total_count += 1
+      size = str.bytesize rescue 0
+      total_size += size
+
+      case size
+      when 0..100 then size_buckets["0-100"] += 1
+      when 101..1024 then size_buckets["101-1K"] += 1
+      when 1025..10240 then size_buckets["1K-10K"] += 1
+      when 10241..102400 then size_buckets["10K-100K"] += 1
+      else size_buckets["100K+"] += 1
+      end
+
+      # Sample large strings
+      if strings.size < sample_size && size > 100
+        strings << { size: size, content: str[0..200], frozen: str.frozen? }
+      end
+    end
+
+    respond ""
+    respond "=" * 70
+    respond "STRING ANALYSIS"
+    respond "=" * 70
+    respond ""
+    respond "Total strings: #{total_count}"
+    respond "Total string memory: #{format_bytes(total_size)}"
+    respond "Average size: #{total_size / total_count} bytes" if total_count > 0
+    respond ""
+    respond "Size distribution:"
+    size_buckets.each { |range, count| respond "  #{range} bytes: #{count}" }
+    respond ""
+    respond "Sample of large strings (first 200 chars):"
+    strings.sort_by { |s| -s[:size] }.first(20).each_with_index do |str, i|
+      frozen = str[:frozen] ? " [FROZEN]" : ""
+      content = str[:content].inspect.gsub(/\n/, "\\n")[0..100]
+      respond "  #{i+1}. #{format_bytes(str[:size])}#{frozen}: #{content}"
+    end
+    respond ""
+  end
+
+  def self.analyze_arrays(sample_size = 50)
+    arrays = []
+    total_count = 0
+    total_size = 0
+    total_elements = 0
+
+    ObjectSpace.each_object(Array) do |arr|
+      total_count += 1
+      size = ObjectSpace.memsize_of(arr) rescue 0
+      total_size += size
+      total_elements += arr.size rescue 0
+
+      if arrays.size < sample_size && arr.size > 10
+        sample = arr.first(5).map { |e| e.class.name rescue "?" }.join(", ")
+        arrays << { size: size, length: arr.size, sample: sample, frozen: arr.frozen? }
+      end
+    end
+
+    respond ""
+    respond "=" * 70
+    respond "ARRAY ANALYSIS"
+    respond "=" * 70
+    respond ""
+    respond "Total arrays: #{total_count}"
+    respond "Total array memory: #{format_bytes(total_size)}"
+    respond "Total elements: #{total_elements}"
+    respond "Average array size: #{total_elements / total_count} elements" if total_count > 0
+    respond ""
+    respond "Sample of large arrays (>10 elements):"
+    arrays.sort_by { |a| -a[:length] }.first(20).each_with_index do |arr, i|
+      frozen = arr[:frozen] ? " [FROZEN]" : ""
+      respond "  #{i+1}. #{arr[:length]} elements#{frozen} (#{format_bytes(arr[:size])}): [#{arr[:sample]}, ...]"
+    end
+    respond ""
+  end
+
+  def self.analyze_hashes(sample_size = 50)
+    hashes = []
+    total_count = 0
+    total_size = 0
+    total_keys = 0
+
+    ObjectSpace.each_object(Hash) do |hash|
+      total_count += 1
+      size = ObjectSpace.memsize_of(hash) rescue 0
+      total_size += size
+      total_keys += hash.size rescue 0
+
+      if hashes.size < sample_size && hash.size > 5
+        begin
+          keys_sample = hash.keys.first(5).map { |k| k.inspect[0..30] }.join(", ")
+          hashes << { size: size, keys: hash.size, sample: keys_sample, frozen: hash.frozen? }
+        rescue
+          # Skip problematic hashes
+        end
+      end
+    end
+
+    respond ""
+    respond "=" * 70
+    respond "HASH ANALYSIS"
+    respond "=" * 70
+    respond ""
+    respond "Total hashes: #{total_count}"
+    respond "Total hash memory: #{format_bytes(total_size)}"
+    respond "Total keys: #{total_keys}"
+    respond "Average hash size: #{total_keys / total_count} keys" if total_count > 0
+    respond ""
+    respond "Sample of large hashes (>5 keys):"
+    hashes.sort_by { |h| -h[:keys] }.first(20).each_with_index do |hash, i|
+      frozen = hash[:frozen] ? " [FROZEN]" : ""
+      respond "  #{i+1}. #{hash[:keys]} keys#{frozen} (#{format_bytes(hash[:size])}): {#{hash[:sample]}, ...}"
+    end
+    respond ""
+  end
+
+  def self.detailed_analysis
+    respond ""
+    respond "=" * 70
+    respond "DETAILED MEMORY ANALYSIS"
+    respond "=" * 70
+    respond ""
+    respond "Analyzing String objects..."
+    analyze_strings
+    respond "Analyzing Array objects..."
+    analyze_arrays
+    respond "Analyzing Hash objects..."
+    analyze_hashes
+    respond "=" * 70
+  end
+
+  def self.trace_allocations(klass_name = "String", limit = 50)
+    klass = Object.const_get(klass_name) rescue nil
+    unless klass
+      respond "Unknown class: #{klass_name}"
+      return
+    end
+
+    allocations = Hash.new { |h, k| h[k] = { count: 0, size: 0, method: nil } }
+
+    ObjectSpace.each_object(klass) do |obj|
+      file = ObjectSpace.allocation_sourcefile(obj)
+      line = ObjectSpace.allocation_sourceline(obj)
+      method = ObjectSpace.allocation_method_id(obj)
+
+      next unless file  # Skip objects allocated before tracing started
+
+      # Clean up file path for readability
+      file = file.gsub(/^.*[\/\\]scripts[\/\\]/, "scripts/")
+                 .gsub(/^.*[\/\\]lib[\/\\]/, "lib/")
+                 .gsub(/^.*[\/\\]Ruby4Lich5[\/\\]/, "")
+
+      location = "#{file}:#{line}"
+      allocations[location][:count] += 1
+      allocations[location][:size] += (obj.bytesize rescue ObjectSpace.memsize_of(obj) rescue 0)
+      allocations[location][:method] = method
+    end
+
+    respond ""
+    respond "=" * 70
+    respond "ALLOCATION SOURCES FOR #{klass_name.upcase}"
+    respond "=" * 70
+    respond ""
+
+    if allocations.empty?
+      respond "No allocation data available."
+      respond ""
+      respond "To enable allocation tracking, run this before hunting:"
+      respond "  ;e ObjectSpace.trace_object_allocations_start"
+      respond ""
+      respond "Then hunt for a while and run:"
+      respond "  ;memory_profiler trace #{klass_name}"
+      respond ""
+      return
+    end
+
+    respond "Total allocation sites: #{allocations.size}"
+    respond ""
+    respond "Top #{limit} allocation sites by object count:"
+    respond ""
+
+    sorted = allocations.sort_by { |loc, data| -data[:count] }
+    sorted.first(limit).each_with_index do |(location, data), i|
+      method_info = data[:method] ? " in #{data[:method]}" : ""
+      respond sprintf("  %3d. %6d objs  %10s  %s%s",
+        i + 1,
+        data[:count],
+        format_bytes(data[:size]),
+        location,
+        method_info
+      )
+    end
+
+    respond ""
+    respond "Top #{limit} allocation sites by memory size:"
+    respond ""
+
+    sorted = allocations.sort_by { |loc, data| -data[:size] }
+    sorted.first(limit).each_with_index do |(location, data), i|
+      method_info = data[:method] ? " in #{data[:method]}" : ""
+      respond sprintf("  %3d. %10s  %6d objs  %s%s",
+        i + 1,
+        format_bytes(data[:size]),
+        data[:count],
+        location,
+        method_info
+      )
+    end
+
+    respond ""
+  end
+
+  def self.start_tracing
+    respond ""
+    respond "To enable allocation tracing, choose one of these options:"
+    respond ""
+    respond "Option 1 (Quick - Inline eval):"
+    respond "  ;e ObjectSpace.trace_object_allocations_start"
+    respond ""
+    respond "Option 2 (Background service):"
+    respond "  ;memory_tracer"
+    respond ""
+    respond "Then hunt for a while and run:"
+    respond "  ;memory_profiler trace String"
+    respond "  ;memory_profiler trace Array"
+    respond "  ;memory_profiler trace Hash"
+    respond ""
+  end
+
+  def self.fragmentation_test
+    respond ""
+    respond "=" * 70
+    respond "FRAGMENTATION vs LEAK TEST"
+    respond "=" * 70
+    respond ""
+    respond "This test helps determine if memory gap is due to:"
+    respond "  1. Malloc fragmentation (freed memory not returned to OS)"
+    respond "  2. Actual memory leak (allocated and never freed)"
+    respond ""
+    respond "How it works:"
+    respond "  - Measure memory before/after GC.compact"
+    respond "  - If RSS drops significantly = fragmentation"
+    respond "  - If RSS stays high = likely a leak"
+    respond ""
+    respond "Starting test..."
+    respond ""
+
+    # Get initial state
+    rss_before = get_process_rss
+    heap_before = ObjectSpace.memsize_of_all
+    gc_stat_before = GC.stat
+
+    unless rss_before
+      respond "ERROR: Unable to get process memory for platform: #{platform}"
+      respond "This test requires process RSS measurement, which may not be available."
+      return
+    end
+
+    gap_before = rss_before - heap_before
+    gap_pct_before = ((gap_before.to_f / rss_before) * 100).round(1)
+
+    respond "BEFORE compaction:"
+    respond "  Process RSS:              #{format_bytes(rss_before)}"
+    respond "  Ruby heap:                #{format_bytes(heap_before)}"
+    respond "  Memory gap:               #{format_bytes(gap_before)} (#{gap_pct_before}%)"
+    respond "  Heap pages:               #{gc_stat_before[:heap_allocated_pages]}"
+    respond "  GC count:                 #{gc_stat_before[:count]}"
+    respond ""
+
+    # Run aggressive GC
+    respond "Running GC.start (may take a few seconds)..."
+    3.times { GC.start }
+
+    # Wait a moment for OS to potentially release memory
+    sleep 0.5
+
+    rss_after_gc = get_process_rss
+    heap_after_gc = ObjectSpace.memsize_of_all
+    gap_after_gc = rss_after_gc - heap_after_gc
+    gap_pct_after_gc = ((gap_after_gc.to_f / rss_after_gc) * 100).round(1)
+
+    respond ""
+    respond "AFTER GC.start:"
+    respond "  Process RSS:              #{format_bytes(rss_after_gc)}"
+    respond "  Ruby heap:                #{format_bytes(heap_after_gc)}"
+    respond "  Memory gap:               #{format_bytes(gap_after_gc)} (#{gap_pct_after_gc}%)"
+    respond ""
+
+    rss_change_gc = rss_after_gc - rss_before
+    heap_change_gc = heap_after_gc - heap_before
+    gap_change_gc = gap_after_gc - gap_before
+
+    respond "  RSS change:               #{format_bytes(rss_change_gc)}"
+    respond "  Heap change:              #{format_bytes(heap_change_gc)}"
+    respond "  Gap change:               #{format_bytes(gap_change_gc)}"
+    respond ""
+
+    # Run compaction if available
+    if GC.respond_to?(:compact)
+      respond "Running GC.compact (may take 10-30 seconds)..."
+      respond "  (This will defragment the Ruby heap and attempt to return memory to OS)"
+      respond ""
+
+      compact_start = Time.now
+      GC.compact
+      compact_elapsed = Time.now - compact_start
+
+      # Wait a moment for OS
+      sleep 0.5
+
+      rss_after_compact = get_process_rss
+      heap_after_compact = ObjectSpace.memsize_of_all
+      gc_stat_after = GC.stat
+
+      gap_after_compact = rss_after_compact - heap_after_compact
+      gap_pct_after_compact = ((gap_after_compact.to_f / rss_after_compact) * 100).round(1)
+
+      respond "AFTER GC.compact (took #{compact_elapsed.round(1)}s):"
+      respond "  Process RSS:              #{format_bytes(rss_after_compact)}"
+      respond "  Ruby heap:                #{format_bytes(heap_after_compact)}"
+      respond "  Memory gap:               #{format_bytes(gap_after_compact)} (#{gap_pct_after_compact}%)"
+      respond "  Heap pages:               #{gc_stat_after[:heap_allocated_pages]}"
+      respond ""
+
+      rss_change_total = rss_after_compact - rss_before
+      heap_change_total = heap_after_compact - heap_before
+      gap_change_total = gap_after_compact - gap_before
+      rss_change_compact = rss_after_compact - rss_after_gc
+
+      respond "TOTAL CHANGES (before -> after compact):"
+      respond "  RSS change:               #{format_bytes(rss_change_total)}"
+      respond "  Heap change:              #{format_bytes(heap_change_total)}"
+      respond "  Gap change:               #{format_bytes(gap_change_total)}"
+      respond ""
+      respond "  RSS freed by compact:     #{format_bytes(-rss_change_compact)}" if rss_change_compact < 0
+      respond ""
+
+      # Analyze results
+      respond "=" * 70
+      respond "ANALYSIS"
+      respond "=" * 70
+      respond ""
+
+      rss_reduction_pct = ((rss_change_total.to_f / rss_before) * 100).abs.round(1)
+
+      if rss_change_total < -50 * 1024 * 1024  # More than 50 MB freed
+        respond "RESULT: Significant RSS reduction (#{format_bytes(-rss_change_total)}, #{rss_reduction_pct}%)"
+        respond ""
+        respond "This indicates MALLOC FRAGMENTATION was the primary issue:"
+        respond "  - Memory was allocated and then freed by Ruby GC"
+        respond "  - But malloc didn't return it to the OS (fragmentation)"
+        respond "  - GC.compact forced compaction and memory return"
+        respond ""
+        respond "RECOMMENDATIONS:"
+        respond "  1. Run GC.compact periodically (hourly) during long sessions"
+        respond "  2. This is normal for long-running Ruby processes"
+        respond "  3. Consider adding to async_processor.rb cleanup:"
+        respond "     if GC.respond_to?(:compact) && (Time.now - @last_compact) > 3600"
+        respond "       GC.compact"
+        respond "     end"
+        if platform == :linux
+          respond ""
+          respond "  LINUX-SPECIFIC:"
+          respond "  4. Limit malloc arenas: export MALLOC_ARENA_MAX=2"
+          respond "  5. Force memory return with malloc_trim(0):"
+          respond "     require 'fiddle'"
+          respond "     libc = Fiddle::Handle.new('libc.so.6')"
+          respond "     malloc_trim = Fiddle::Function.new(libc['malloc_trim'], [Fiddle::TYPE_INT], Fiddle::TYPE_INT)"
+          respond "     malloc_trim.call(0)"
+        end
+      elsif rss_change_total.abs < 10 * 1024 * 1024  # Less than 10 MB change
+        respond "RESULT: RSS barely changed (#{format_bytes(rss_change_total.abs)}, #{rss_reduction_pct}%)"
+        respond ""
+        respond "This indicates a MEMORY LEAK, not fragmentation:"
+        respond "  - Memory is allocated but never freed"
+        respond "  - GC.compact can't help because the objects/memory are still referenced"
+        respond "  - Something is holding onto memory indefinitely"
+        respond ""
+        respond "LIKELY CULPRITS:"
+        respond "  1. Thread pool accumulating dead Thread objects"
+        respond "  2. Creature registry growing unbounded"
+        respond "  3. SQLite cache/memory not being released"
+        respond "  4. Native extension memory leak (invisible to GC)"
+        respond ""
+        respond "NEXT STEPS:"
+        respond "  1. Take snapshots before/after hunting"
+        respond "  2. Check: ;e Lich::Gemstone::Combat::Tracker.stats"
+        respond "  3. Check: ;e Lich::Gemstone::CreatureInstance.all.size"
+        respond "  4. Check: ;e Thread.list.count { |t| !t.alive? }"
+        respond "  5. Use allocation tracing to find leak source"
+      else
+        respond "RESULT: Moderate RSS reduction (#{format_bytes(-rss_change_total)}, #{rss_reduction_pct}%)"
+        respond ""
+        respond "This indicates BOTH fragmentation AND potential leaks:"
+        respond "  - Some memory was fragmentation (freed by compact)"
+        respond "  - But significant gap remains"
+        respond ""
+        respond "RECOMMENDATIONS:"
+        respond "  1. Run GC.compact periodically to handle fragmentation"
+        respond "  2. Also investigate potential leaks (see below)"
+        respond "  3. Take snapshots to track which is growing more"
+        respond ""
+        respond "Potential leak sources to check:"
+        respond "  - Thread pool: ;e Lich::Gemstone::Combat::Tracker.stats"
+        respond "  - Creatures: ;e Lich::Gemstone::CreatureInstance.all.size"
+        respond "  - Dead threads: ;e Thread.list.count { |t| !t.alive? }"
+      end
+
+      respond ""
+    else
+      respond "GC.compact not available (Ruby 2.7+ required)"
+      respond ""
+      respond "Based on GC.start results:"
+      if rss_change_gc < -10 * 1024 * 1024
+        respond "  RSS reduced by #{format_bytes(-rss_change_gc)} - some fragmentation"
+      else
+        respond "  RSS barely changed - likely a memory leak"
+      end
+      respond ""
+      respond "Upgrade to Ruby 2.7+ for full fragmentation testing with GC.compact"
+      respond ""
+    end
+
+    respond "=" * 70
+    respond ""
+  end
+
+  def self.trend_analysis
+    respond ""
+    respond "=" * 70
+    respond "MEMORY TREND ANALYSIS"
+    respond "=" * 70
+    respond ""
+
+    if $memory_profiler_history.empty?
+      respond "No snapshot history available."
+      respond "Take snapshots over time with ';memory_profiler snapshot' to track trends."
+      respond ""
+      respond "Recommended workflow:"
+      respond "  1. At startup: ;memory_profiler snapshot"
+      respond "  2. After 30 min hunting: ;memory_profiler snapshot"
+      respond "  3. After 1 hour: ;memory_profiler snapshot"
+      respond "  4. After 2 hours: ;memory_profiler snapshot"
+      respond "  5. Then run: ;memory_profiler trend"
+      respond ""
+      return
+    end
+
+    respond "Snapshots captured: #{$memory_profiler_history.size}"
+    respond ""
+
+    # Show trend over time
+    respond "%-10s  %12s  %12s  %12s  %8s  %6s" % ["Time", "Process RSS", "Ruby Heap", "Gap", "Gap %", "Threads"]
+    respond "-" * 80
+
+    $memory_profiler_history.each do |snap|
+      time_str = snap[:timestamp].strftime("%H:%M:%S")
+      rss_str = snap[:process_rss] ? format_bytes(snap[:process_rss]) : "N/A"
+      heap_str = format_bytes(snap[:ruby_heap])
+      gap_str = format_bytes(snap[:gap])
+      gap_pct = snap[:process_rss] ? ((snap[:gap].to_f / snap[:process_rss]) * 100).round(1) : 0
+      threads = snap[:threads]
+
+      respond "%-10s  %12s  %12s  %12s  %7.1f%%  %6d" % [time_str, rss_str, heap_str, gap_str, gap_pct, threads]
+    end
+
+    respond ""
+
+    # Calculate growth rates
+    if $memory_profiler_history.size >= 2
+      first = $memory_profiler_history.first
+      last = $memory_profiler_history.last
+      duration = (last[:timestamp] - first[:timestamp]) / 3600.0  # Hours
+
+      respond "=" * 70
+      respond "GROWTH ANALYSIS (#{first[:timestamp].strftime('%H:%M:%S')} -> #{last[:timestamp].strftime('%H:%M:%S')})"
+      respond "=" * 70
+      respond ""
+      respond "Duration:                 #{duration.round(2)} hours"
+      respond ""
+
+      if first[:process_rss] && last[:process_rss]
+        rss_growth = last[:process_rss] - first[:process_rss]
+        rss_growth_pct = ((rss_growth.to_f / first[:process_rss]) * 100).round(1)
+        rss_per_hour = duration > 0 ? (rss_growth / duration) : 0
+
+        respond "Process RSS:"
+        respond "  Start:                    #{format_bytes(first[:process_rss])}"
+        respond "  Current:                  #{format_bytes(last[:process_rss])}"
+        respond "  Growth:                   #{format_bytes(rss_growth)} (#{rss_growth_pct}%)"
+        respond "  Growth rate:              #{format_bytes(rss_per_hour)}/hour" if duration > 0
+        respond ""
+
+        gap_growth = last[:gap] - first[:gap]
+        gap_growth_pct = ((gap_growth.to_f / first[:gap]) * 100).round(1) rescue 0
+        gap_per_hour = duration > 0 ? (gap_growth / duration) : 0
+
+        respond "Memory gap:"
+        respond "  Start:                    #{format_bytes(first[:gap])} (#{((first[:gap].to_f / first[:process_rss]) * 100).round(1)}%)"
+        respond "  Current:                  #{format_bytes(last[:gap])} (#{((last[:gap].to_f / last[:process_rss]) * 100).round(1)}%)"
+        respond "  Growth:                   #{format_bytes(gap_growth)} (#{gap_growth_pct}%)"
+        respond "  Growth rate:              #{format_bytes(gap_per_hour)}/hour" if duration > 0
+        respond ""
+
+        heap_growth = last[:ruby_heap] - first[:ruby_heap]
+        heap_growth_pct = ((heap_growth.to_f / first[:ruby_heap]) * 100).round(1)
+        heap_per_hour = duration > 0 ? (heap_growth / duration) : 0
+
+        respond "Ruby heap:"
+        respond "  Start:                    #{format_bytes(first[:ruby_heap])}"
+        respond "  Current:                  #{format_bytes(last[:ruby_heap])}"
+        respond "  Growth:                   #{format_bytes(heap_growth)} (#{heap_growth_pct}%)"
+        respond "  Growth rate:              #{format_bytes(heap_per_hour)}/hour" if duration > 0
+        respond ""
+
+        thread_growth = last[:threads] - first[:threads]
+        respond "Threads:"
+        respond "  Start:                    #{first[:threads]}"
+        respond "  Current:                  #{last[:threads]}"
+        respond "  Growth:                   #{thread_growth > 0 ? '+' : ''}#{thread_growth}"
+        respond ""
+
+        # Diagnosis
+        respond "=" * 70
+        respond "DIAGNOSIS"
+        respond "=" * 70
+        respond ""
+
+        if duration > 0 && rss_per_hour > 100 * 1024 * 1024  # Growing > 100 MB/hour
+          respond "WARNING: Significant memory growth detected!"
+          respond ""
+          respond "Growth rate: #{format_bytes(rss_per_hour)}/hour"
+
+          if duration > 0.5  # At least 30 minutes
+            projected_4h = first[:process_rss] + (rss_per_hour * 4)
+            projected_8h = first[:process_rss] + (rss_per_hour * 8)
+
+            respond ""
+            respond "Projected memory usage:"
+            respond "  After 4 hours:            #{format_bytes(projected_4h.to_i)}"
+            respond "  After 8 hours:            #{format_bytes(projected_8h.to_i)}"
+            respond ""
+
+            if projected_4h > 2 * 1024 * 1024 * 1024
+              respond "CRITICAL: Will exceed 2 GB within 4 hours!"
+              respond ""
+            end
+          end
+
+          # Identify what's growing
+          gap_contribution = (gap_growth.to_f / rss_growth * 100).round(1) rescue 0
+          heap_contribution = (heap_growth.to_f / rss_growth * 100).round(1) rescue 0
+
+          respond "Growth breakdown:"
+          respond "  Gap growth:               #{gap_contribution}% of total"
+          respond "  Heap growth:              #{heap_contribution}% of total"
+          respond ""
+
+          if gap_contribution > 60
+            respond "PRIMARY ISSUE: Gap is growing faster than heap"
+            respond ""
+            respond "This indicates NATIVE MEMORY leak or fragmentation:"
+            respond "  - Thread pool not cleaning up dead threads"
+            respond "  - SQLite memory growing unbounded"
+            respond "  - Native extension leak"
+            respond "  - Malloc fragmentation"
+            respond ""
+            respond "Run ';memory_profiler fragtest' to determine if it's fragmentation vs leak"
+            respond ""
+          elsif heap_contribution > 60
+            respond "PRIMARY ISSUE: Ruby heap growing faster than gap"
+            respond ""
+            respond "This indicates RUBY OBJECT leak:"
+            respond "  - Objects being created but not garbage collected"
+            respond "  - Likely: CreatureInstance registry not cleaning up"
+            respond "  - Possibly: String/Array accumulation"
+            respond ""
+            respond "Run ';memory_profiler compare' to see which objects are growing"
+            respond ""
+          else
+            respond "BOTH heap and gap are growing"
+            respond ""
+            respond "Multiple issues likely present:"
+            respond "  - Ruby object leak (heap growth)"
+            respond "  - Native memory issue (gap growth)"
+            respond ""
+            respond "Investigate both:"
+            respond "  1. ;memory_profiler compare (for Ruby objects)"
+            respond "  2. ;memory_profiler fragtest (for native memory)"
+            respond ""
+          end
+        else
+          respond "Memory appears stable or growing slowly."
+          respond ""
+          if duration > 0
+            respond "Growth rate: #{format_bytes(rss_per_hour)}/hour"
+            respond ""
+            respond "This is normal for a Ruby process."
+            respond "Some growth is expected due to:"
+            respond "  - Normal object churn"
+            respond "  - Malloc fragmentation over time"
+            respond "  - Ruby heap expansion"
+            respond ""
+          end
+        end
+      end
+    end
+
+    respond "=" * 70
+    respond ""
+  end
+
+  def self.system_memory
+    respond ""
+    respond "=" * 70
+    respond "SYSTEM MEMORY BREAKDOWN"
+    respond "=" * 70
+    respond ""
+    respond "Generated: #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}"
+    respond "Process ID: #{Process.pid}"
+    respond "Ruby version: #{RUBY_VERSION}"
+    respond "Ruby platform: #{RUBY_PLATFORM}"
+    respond "Ruby patchlevel: #{RUBY_PATCHLEVEL}" if defined?(RUBY_PATCHLEVEL)
+    respond "Detected OS: #{platform}"
+    respond ""
+
+    # Ruby heap memory (what ObjectSpace tracks)
+    ruby_heap = ObjectSpace.memsize_of_all
+
+    # Get GC stats for actual VM memory data
+    gc_stat = GC.stat
+
+    # Get process memory - cross-platform
+    process_rss = get_process_rss
+    virtual_size = nil
+    peak_working_set = nil
+    page_faults = nil
+    linux_stats = {}
+
+    # Platform-specific memory data
+    case platform
+    when :windows
+      begin
+        # Get detailed process memory info via WMI
+        require 'win32ole'
+        wmi = WIN32OLE.connect("winmgmts://")
+        processes = wmi.ExecQuery("SELECT * FROM Win32_Process WHERE ProcessId = #{Process.pid}")
+        processes.each do |process|
+          virtual_size = process.VirtualSize.to_i rescue nil
+          page_faults = process.PageFaults.to_i rescue nil
+          peak_working_set = process.PeakWorkingSetSize.to_i rescue nil
+        end
+      rescue => e
+        # Fallback handled below
+      end
+    when :linux
+      linux_stats = get_linux_memory_stats
+      virtual_size = linux_stats[:vm_size]
+      peak_working_set = linux_stats[:vm_peak]
+    end
+
+    respond "=" * 70
+    case platform
+    when :windows
+      respond "PROCESS MEMORY (Windows WMI data)"
+    when :linux
+      respond "PROCESS MEMORY (Linux /proc data)"
+    else
+      respond "PROCESS MEMORY"
+    end
+    respond "=" * 70
+    respond ""
+
+    if process_rss
+      respond "Physical Memory (RSS):    #{format_bytes(process_rss)}"
+      respond "  Peak RSS:               #{format_bytes(peak_working_set)}" if peak_working_set
+      respond "Virtual Size:             #{format_bytes(virtual_size)}" if virtual_size
+
+      # Platform-specific metrics
+      if platform == :linux && linux_stats.any?
+        respond "Data segment:             #{format_bytes(linux_stats[:vm_data])}" if linux_stats[:vm_data]
+        respond "Stack:                    #{format_bytes(linux_stats[:vm_stk])}" if linux_stats[:vm_stk]
+        respond "Executable:               #{format_bytes(linux_stats[:vm_exe])}" if linux_stats[:vm_exe]
+        respond "Libraries:                #{format_bytes(linux_stats[:vm_lib])}" if linux_stats[:vm_lib]
+      elsif platform == :windows
+        respond "Page Faults:              #{page_faults}" if page_faults
+      end
+      respond ""
+
+      if virtual_size && process_rss
+        virtual_gap = virtual_size - process_rss
+        respond "Virtual - Physical Gap:   #{format_bytes(virtual_gap)}"
+        case platform
+        when :linux
+          respond "  (Reserved but not resident; includes malloc arenas)"
+        when :windows
+          respond "  (Reserved but not committed virtual memory)"
+        end
+        respond ""
+      end
+    else
+      respond "Unable to retrieve process memory information"
+      respond ""
+    end
+    respond "=" * 70
+    respond "RUBY HEAP MEMORY (ObjectSpace tracked)"
+    respond "=" * 70
+    respond ""
+    respond "Ruby heap objects:        #{format_bytes(ruby_heap)}"
+    respond "  Live objects:           #{gc_stat[:heap_live_slots]}"
+    respond "  Free slots:             #{gc_stat[:heap_free_slots]}"
+    respond "  Allocated pages:        #{gc_stat[:heap_allocated_pages]}"
+    respond "  Eden pages:             #{gc_stat[:heap_eden_pages] || 'N/A'}"
+    respond "  Tomb pages:             #{gc_stat[:heap_tomb_pages] || 'N/A'}"
+    respond ""
+
+    respond "=" * 70
+    respond "RUBY VM INTERNALS (GC.stat actual data)"
+    respond "=" * 70
+    respond ""
+
+    # Malloc memory tracked by Ruby GC
+    malloc_increase = gc_stat[:malloc_increase_bytes] || gc_stat[:malloc_increase] || 0
+    malloc_increase_limit = gc_stat[:malloc_increase_bytes_limit] || gc_stat[:malloc_increase_limit] || 0
+    oldmalloc_increase = gc_stat[:oldmalloc_increase_bytes] || gc_stat[:oldmalloc_increase] || 0
+    oldmalloc_increase_limit = gc_stat[:oldmalloc_increase_bytes_limit] || gc_stat[:oldmalloc_increase_limit] || 0
+
+    respond "Malloc memory (incremental since last GC):"
+    respond "  Current malloc:         #{format_bytes(malloc_increase)}"
+    respond "  Malloc limit:           #{format_bytes(malloc_increase_limit)}"
+    respond "  Old malloc:             #{format_bytes(oldmalloc_increase)}"
+    respond "  Old malloc limit:       #{format_bytes(oldmalloc_increase_limit)}"
+    respond ""
+
+    total_malloc = malloc_increase + oldmalloc_increase
+    respond "  Tracked (incremental):  #{format_bytes(total_malloc)}"
+    respond ""
+    respond "NOTE: malloc_increase_bytes only tracks malloc since last GC,"
+    respond "      NOT total malloc'd memory. Actual malloc backing Ruby's heap"
+    respond "      is likely 2-3x the heap size due to allocator overhead."
+    respond ""
+
+    # Estimate actual heap memory
+    estimated_heap_malloc = ruby_heap * 2.5
+    respond "  Estimated actual heap malloc: ~#{format_bytes(estimated_heap_malloc.to_i)}"
+    respond "    (Ruby heap #{format_bytes(ruby_heap)} x 2.5 allocator multiplier)"
+    respond ""
+
+    # GC statistics - COMPREHENSIVE
+    respond "GC activity:"
+    respond "  Total allocated:        #{gc_stat[:total_allocated_objects]} objects"
+    respond "  Total freed:            #{gc_stat[:total_freed_objects]} objects"
+    respond "  Live objects:           #{gc_stat[:total_allocated_objects] - gc_stat[:total_freed_objects]}"
+    respond "  GC count:               #{gc_stat[:count]}"
+    respond "  Major GC count:         #{gc_stat[:major_gc_count] || 'N/A'}"
+    respond "  Minor GC count:         #{gc_stat[:minor_gc_count] || 'N/A'}"
+    respond ""
+
+    # Heap detailed stats
+    respond "Heap details:"
+    respond "  Total heap slots:       #{gc_stat[:heap_available_slots]}" if gc_stat[:heap_available_slots]
+    respond "  Live slots:             #{gc_stat[:heap_live_slots]}"
+    respond "  Free slots:             #{gc_stat[:heap_free_slots]}"
+    respond "  Final slots:            #{gc_stat[:heap_final_slots]}" if gc_stat[:heap_final_slots]
+    respond "  Marked slots:           #{gc_stat[:heap_marked_slots]}" if gc_stat[:heap_marked_slots]
+    respond "  Swept slots:            #{gc_stat[:heap_swept_slots]}" if gc_stat[:heap_swept_slots]
+    respond ""
+
+    respond "Heap pages:"
+    respond "  Total pages:            #{gc_stat[:heap_allocated_pages]}"
+    respond "  Eden pages:             #{gc_stat[:heap_eden_pages]}" if gc_stat[:heap_eden_pages]
+    respond "  Tomb pages:             #{gc_stat[:heap_tomb_pages]}" if gc_stat[:heap_tomb_pages]
+    respond "  Sortable pages:         #{gc_stat[:heap_sortable_pages]}" if gc_stat[:heap_sortable_pages]
+    respond ""
+
+    # Old generation stats
+    if gc_stat[:old_objects]
+      respond "Old generation:"
+      respond "  Old objects:            #{gc_stat[:old_objects]}"
+      respond "  Old malloc nodes:       #{gc_stat[:old_objects_limit]}" if gc_stat[:old_objects_limit]
+      respond "  Remembered shady:       #{gc_stat[:remembered_wb_unprotected_objects]}" if gc_stat[:remembered_wb_unprotected_objects]
+      respond ""
+    end
+
+    # GC timing
+    if gc_stat[:time] || gc_stat[:total_time]
+      respond "GC timing:"
+      respond "  Total GC time:          #{gc_stat[:time] || gc_stat[:total_time]}ms" if gc_stat[:time] || gc_stat[:total_time]
+      respond ""
+    end
+
+    respond "=" * 70
+    respond "THREAD MEMORY"
+    respond "=" * 70
+    respond ""
+    threads = Thread.list
+    respond "Active threads:           #{threads.count}"
+    respond ""
+
+    # Categorize threads
+    main_threads = threads.select { |t| t == Thread.main }
+    script_threads = threads.select { |t| t[:name] && t[:name].include?('Script') rescue false }
+    combat_threads = threads.select { |t| t[:name] && t[:name].include?('Combat') rescue false }
+    other_threads = threads - main_threads - script_threads - combat_threads
+
+    respond "Thread breakdown:"
+    respond "  Main thread:            #{main_threads.count}"
+    respond "  Script threads:         #{script_threads.count}"
+    respond "  Combat threads:         #{combat_threads.count}"
+    respond "  Other threads:          #{other_threads.count}"
+    respond ""
+
+    # List individual threads with details
+    respond "Individual threads (showing first 20):"
+    threads.first(20).each_with_index do |thread, i|
+      name = thread[:name] || "unnamed"
+      status = thread.status || "dead"
+      alive = thread.alive? ? "alive" : "DEAD"
+
+      # Try to get thread priority and other metadata
+      priority = thread.priority rescue "N/A"
+
+      details = "#{i+1}. #{alive.ljust(5)} status=#{status.to_s.ljust(8)}"
+      details += " pri=#{priority}" if priority != "N/A"
+      details += " name=#{name}" if name != "unnamed"
+
+      respond "  #{details}"
+    end
+
+    if threads.count > 20
+      respond "  ... and #{threads.count - 20} more threads"
+    end
+    respond ""
+
+    # Get thread count and calculate stack memory - cross-platform
+    actual_thread_memory = 0
+    os_thread_count = threads.count  # Default fallback
+
+    case platform
+    when :windows
+      # Windows: 1 MB default stack, get actual count via API
+      begin
+        require 'fiddle'
+        require 'fiddle/import'
+
+        # Load kernel32 for thread queries
+        kernel32 = Fiddle::Handle.new('kernel32.dll')
+
+        # Define Windows API functions
+        create_toolhelp32_snapshot = Fiddle::Function.new(
+          kernel32['CreateToolhelp32Snapshot'],
+          [Fiddle::TYPE_INT, Fiddle::TYPE_INT],
+          Fiddle::TYPE_VOIDP
+        )
+
+        thread32_first = Fiddle::Function.new(
+          kernel32['Thread32First'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_INT
+        )
+
+        thread32_next = Fiddle::Function.new(
+          kernel32['Thread32Next'],
+          [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_INT
+        )
+
+        close_handle = Fiddle::Function.new(
+          kernel32['CloseHandle'],
+          [Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_INT
+        )
+
+        # TH32CS_SNAPTHREAD = 0x00000004
+        snapshot = create_toolhelp32_snapshot.call(0x00000004, 0)
+
+        if snapshot != -1
+          te32_size = 28
+          te32 = Fiddle::Pointer.malloc(te32_size)
+          te32[0, 4] = [te32_size].pack('L')
+
+          our_pid = Process.pid
+          thread_count = 0
+
+          if thread32_first.call(snapshot, te32) != 0
+            loop do
+              owner_pid = te32[12, 4].unpack('L').first
+              thread_count += 1 if owner_pid == our_pid
+              break if thread32_next.call(snapshot, te32) == 0
+            end
+          end
+
+          close_handle.call(snapshot)
+          os_thread_count = thread_count
+
+          # Windows default stack: 1 MB per thread
+          actual_thread_memory = thread_count * 1024 * 1024
+
+          respond "Windows thread info (measured via API):"
+          respond "  OS threads in process:  #{thread_count}"
+          respond "  Ruby Thread.list count: #{threads.count}"
+          respond "  Stack memory estimate:  #{format_bytes(actual_thread_memory)}"
+          respond "    (#{thread_count} threads x 1 MB stack)"
+          respond ""
+        end
+      rescue => e
+        respond "Windows thread query (API):"
+        respond "  Error: #{e.message}"
+        respond "  Falling back to estimate: ~#{(threads.count * 1.5).round(1)} MB"
+        respond ""
+        actual_thread_memory = threads.count * 1.5 * 1024 * 1024
+      end
+
+      # Also get WMI info for CPU time
+      begin
+        if defined?(WIN32OLE)
+          wmi = WIN32OLE.connect("winmgmts://")
+          wmi_threads = wmi.ExecQuery("SELECT * FROM Win32_Thread WHERE ProcessHandle = '#{Process.pid}'")
+
+          total_user_time = 0
+          total_kernel_time = 0
+
+          wmi_threads.each do |t|
+            total_user_time += t.UserModeTime.to_i rescue 0
+            total_kernel_time += t.KernelModeTime.to_i rescue 0
+          end
+
+          respond "Thread CPU time (WMI):"
+          respond "  User mode time:         #{total_user_time / 10000}ms"
+          respond "  Kernel mode time:       #{total_kernel_time / 10000}ms"
+          respond ""
+        end
+      rescue => e
+        # WMI thread query failed, skip silently
+      end
+
+    when :linux
+      # Linux: 8 MB reserved stack per thread (different from Windows!)
+      os_thread_count = get_linux_thread_count || linux_stats[:threads] || threads.count
+
+      # Linux default stack reservation: 8 MB per thread
+      # (ulimit -s typically shows 8192 KB)
+      actual_thread_memory = os_thread_count * 8 * 1024 * 1024
+
+      respond "Linux thread info (from /proc):"
+      respond "  OS threads in process:  #{os_thread_count}"
+      respond "  Ruby Thread.list count: #{threads.count}"
+      respond "  Stack memory RESERVED:  #{format_bytes(actual_thread_memory)}"
+      respond "    (#{os_thread_count} threads x 8 MB reserved stack)"
+      respond ""
+      respond "NOTE: Linux reserves 8 MB per thread but commits much less."
+      respond "      Actual committed stack shown in VmStk above."
+      respond "      THIS IS A KEY DIFFERENCE from Windows (1 MB)!"
+      respond ""
+
+    else
+      # Unknown platform - use conservative estimate
+      actual_thread_memory = threads.count * 2 * 1024 * 1024
+      respond "Thread stack estimate:    #{format_bytes(actual_thread_memory)}"
+      respond "  (#{threads.count} threads x ~2 MB average)"
+      respond ""
+    end
+
+    respond "NOTE: Thread stack memory is NOT tracked by ObjectSpace or GC.stat."
+    respond "      Stack size varies by platform and configuration."
+    respond ""
+
+    respond "=" * 70
+    respond "LOADED FEATURES (Native extensions & gems)"
+    respond "=" * 70
+    respond ""
+
+    loaded = $LOADED_FEATURES
+    respond "Total loaded files:       #{loaded.count}"
+    respond ""
+
+    # Categorize loaded features and calculate actual file sizes
+    rb_files = loaded.select { |f| f.end_with?('.rb') }
+    so_files = loaded.select { |f| f.end_with?('.so') || f.end_with?('.dll') }
+    other_files = loaded - rb_files - so_files
+
+    # Calculate actual file sizes
+    rb_total_size = 0
+    rb_files.each do |file|
+      rb_total_size += File.size(file) rescue 0
+    end
+
+    so_total_size = 0
+    so_file_sizes = []
+    so_files.each do |file|
+      size = File.size(file) rescue 0
+      so_total_size += size
+      so_file_sizes << { path: file, size: size } if size > 0
+    end
+
+    respond "Breakdown:"
+    respond "  Ruby files (.rb):       #{rb_files.count}"
+    respond "    Total file size:      #{format_bytes(rb_total_size)}"
+    respond "  Native extensions:      #{so_files.count}"
+    respond "    (.so/.dll files)"
+    respond "    Total file size:      #{format_bytes(so_total_size)}"
+    respond "  Other:                  #{other_files.count}"
+    respond ""
+
+    if so_files.count > 0
+      respond "Native extensions loaded (sorted by size):"
+
+      # Sort by size descending
+      sorted_so = so_file_sizes.sort_by { |f| -f[:size] }
+
+      sorted_so.first(20).each do |file_info|
+        filename = file_info[:path].split(/[\/\\]/).last
+        respond "  - #{filename.ljust(30)} #{format_bytes(file_info[:size]).rjust(10)}"
+      end
+
+      if so_files.count > 20
+        respond "  ... and #{so_files.count - 20} more"
+      end
+      respond ""
+    end
+
+    # Key gems/extensions that use native memory
+    heavy_extensions = so_files.select do |f|
+      f.include?('sqlite') || f.include?('concurrent') || f.include?('win32ole') ||
+      f.include?('json') || f.include?('socket') || f.include?('thread')
+    end
+
+    if heavy_extensions.any?
+      respond "Heavy native extensions (likely using extra memory):"
+      heavy_extensions.each do |file|
+        filename = file.split(/[\/\\]/).last
+        respond "  - #{filename}"
+      end
+      respond ""
+    end
+
+    respond "NOTE: Native extensions allocate memory outside Ruby heap."
+    respond "      This memory is invisible to ObjectSpace and GC.stat."
+    respond ""
+
+    # Platform-specific heap information
+    if platform == :windows
+      respond "=" * 70
+      respond "WINDOWS PROCESS HEAPS"
+      respond "=" * 70
+      respond ""
+
+      begin
+        require 'fiddle'
+        require 'fiddle/import'
+
+        # Load kernel32.dll and call GetProcessHeaps directly
+        kernel32 = Fiddle::Handle.new('kernel32.dll')
+        get_process_heaps = Fiddle::Function.new(
+          kernel32['GetProcessHeaps'],
+          [Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP],
+          Fiddle::TYPE_INT
+        )
+
+        # Get number of heaps
+        num_heaps = get_process_heaps.call(0, nil)
+        respond "Number of process heaps:  #{num_heaps}"
+
+        if num_heaps > 0 && num_heaps < 100  # Sanity check
+          # Try to get heap handles
+          heap_array = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP * num_heaps)
+          actual = get_process_heaps.call(num_heaps, heap_array)
+          respond "Heap handles retrieved:   #{actual}"
+        end
+
+        respond ""
+      rescue => e
+        respond "Unable to query Windows heaps: #{e.message}"
+        respond ""
+      end
+    elsif platform == :linux
+      respond "=" * 70
+      respond "LINUX MALLOC ARENAS"
+      respond "=" * 70
+      respond ""
+
+      respond "glibc malloc uses multiple arenas for multithreaded programs."
+      respond "Each arena can fragment and hold onto memory."
+      respond ""
+      respond "To reduce arena fragmentation, try setting:"
+      respond "  export MALLOC_ARENA_MAX=2"
+      respond ""
+      respond "To force malloc to return memory to OS:"
+      respond "  require 'fiddle'"
+      respond "  libc = Fiddle::Handle.new('libc.so.6')"
+      respond "  malloc_trim = Fiddle::Function.new(libc['malloc_trim'], [Fiddle::TYPE_INT], Fiddle::TYPE_INT)"
+      respond "  malloc_trim.call(0)  # Trim all arenas"
+      respond ""
+    end
+
+    # Check SQLite memory usage if available
+    respond "=" * 70
+    respond "SQLITE3 MEMORY USAGE"
+    respond "=" * 70
+    respond ""
+
+    sqlite_memory = 0
+    sqlite_memory_high = 0
+    begin
+      if defined?(Lich::Util::DB_Store)
+        # Try to get SQLite memory stats
+        db = Lich::Util::DB_Store.instance_variable_get(:@db) rescue nil
+        if db
+          # Get memory used by SQLite
+          memory_used = db.execute("PRAGMA cache_size").first.first rescue nil
+          page_size = db.execute("PRAGMA page_size").first.first rescue nil
+
+          if memory_used && page_size
+            cache_kb = (memory_used.abs * page_size) / 1024
+            respond "SQLite cache size:        #{cache_kb} KB"
+            sqlite_memory = cache_kb * 1024
+          end
+
+          # Get temp store
+          temp_store = db.execute("PRAGMA temp_store").first.first rescue nil
+          respond "Temp store:               #{temp_store == 2 ? 'memory' : 'file'}" if temp_store
+
+          # Get database page count
+          page_count = db.execute("PRAGMA page_count").first.first rescue nil
+          if page_count && page_size
+            db_size_mb = (page_count * page_size) / (1024.0 * 1024.0)
+            respond "Database size:            #{db_size_mb.round(2)} MB (#{page_count} pages)"
+          end
+
+          # Check if mmap is enabled
+          mmap_size = db.execute("PRAGMA mmap_size").first.first rescue 0
+          if mmap_size > 0
+            respond "Memory-mapped I/O:        #{format_bytes(mmap_size)} (ENABLED)"
+            respond "  ** This adds to RSS but not Ruby heap **"
+          else
+            respond "Memory-mapped I/O:        Disabled"
+          end
+
+          # Try to get SQLite memory stats directly
+          begin
+            mem_used = db.execute("SELECT * FROM pragma_status WHERE name='MEMORY_USED'").first
+            mem_highwater = db.execute("SELECT * FROM pragma_status WHERE name='MEMORY_HIGHWATER'").first
+
+            if mem_used
+              sqlite_memory_high = mem_used[1].to_i
+              respond "SQLite memory used:       #{format_bytes(sqlite_memory_high)}"
+            end
+
+            if mem_highwater
+              highwater = mem_highwater[1].to_i
+              respond "SQLite memory highwater:  #{format_bytes(highwater)}"
+            end
+          rescue
+            # pragma_status not available
+          end
+
+          respond ""
+        else
+          respond "DB_Store exists but database not accessible"
+          respond ""
+        end
+      else
+        respond "DB_Store not loaded"
+        respond ""
+      end
+    rescue => e
+      respond "Error checking SQLite: #{e.message}"
+      respond ""
+    end
+
+    if process_rss
+      respond "=" * 70
+      respond "MEMORY GAP ANALYSIS"
+      respond "=" * 70
+      respond ""
+
+      gap = process_rss - ruby_heap
+      gap_percent = ((gap.to_f / process_rss) * 100).round(1)
+
+      respond "Process RSS:              #{format_bytes(process_rss)}"
+      respond "Ruby heap (ObjectSpace):  #{format_bytes(ruby_heap)}"
+      respond ""
+      respond "UNACCOUNTED GAP:          #{format_bytes(gap)} (#{gap_percent}%)"
+      respond ""
+
+      # Try to account for the gap with actual data
+      respond "Accounting for the gap:"
+      respond ""
+
+      # Break down the gap with REAL data where possible
+      respond "Breaking down the gap with measured data:"
+      respond ""
+
+      # The gap is: process_rss - ruby_heap
+      # We need to account for everything that's in process memory but NOT counted by ObjectSpace
+
+      # 1. Malloc overhead for Ruby objects
+      # ObjectSpace reports logical size, but malloc allocates more due to alignment, metadata, fragmentation
+      # Estimate: 30-50% overhead on top of Ruby heap
+      malloc_overhead_percent = 0.4  # 40% overhead is reasonable
+      malloc_overhead = (ruby_heap * malloc_overhead_percent).to_i
+      respond "1. Malloc allocator overhead:"
+      respond "   Ruby heap (ObjectSpace):      #{format_bytes(ruby_heap)}"
+      respond "   Malloc overhead (~40%):       #{format_bytes(malloc_overhead)}"
+      respond "   (Allocator adds metadata, alignment, fragmentation)"
+      respond ""
+
+      # 2. Threads (use actual measurement from platform-specific APIs)
+      respond "2. Thread stacks:"
+      respond "   Thread stack memory:          #{format_bytes(actual_thread_memory)}"
+      case platform
+      when :windows
+        respond "   (MEASURED: #{os_thread_count} threads x 1 MB on Windows)"
+      when :linux
+        respond "   (ESTIMATED: #{os_thread_count} threads x 8 MB reserved on Linux)"
+        respond "   (Note: Linux reserves 8 MB but commits less - see VmStk)"
+      else
+        respond "   (ESTIMATED: #{os_thread_count} threads)"
+      end
+      respond ""
+
+      # 3. SQLite - use the better stat if available
+      actual_sqlite = sqlite_memory_high > 0 ? sqlite_memory_high : sqlite_memory
+      if actual_sqlite > 0
+        respond "3. SQLite database memory:"
+        respond "   SQLite memory used:           #{format_bytes(actual_sqlite)}"
+        respond "   (MEASURED from SQLite status)"
+        respond ""
+      end
+
+      # 4. Native extensions - REAL file sizes, reasonable multiplier
+      dll_memory_estimate = (so_total_size * 1.5).to_i  # More conservative 1.5x
+      respond "4. Native extensions (DLLs):"
+      respond "   Extensions loaded: #{so_files.count}"
+      respond "   Total DLL file size:          #{format_bytes(so_total_size)}"
+      respond "   (MEASURED from actual .dll files)"
+      respond "   In-memory estimate:           ~#{format_bytes(dll_memory_estimate)}"
+      respond "   (DLLs expand ~1.5x due to alignment, relocations)"
+      respond ""
+
+      # 5. Ruby .rb files in memory (parsed/compiled)
+      rb_memory_estimate = (rb_total_size * 2).to_i  # Compiled code is bigger
+      respond "5. Ruby source files (compiled):"
+      respond "   .rb files loaded: #{rb_files.count}"
+      respond "   Total .rb file size:          #{format_bytes(rb_total_size)}"
+      respond "   (MEASURED from actual .rb files)"
+      respond "   Compiled in-memory estimate:  ~#{format_bytes(rb_memory_estimate)}"
+      respond "   (Compiled bytecode + AST ~2x source)"
+      respond ""
+
+      # 6. VM internals - use GC overhead as proxy
+      vm_estimate = gc_stat[:heap_allocated_pages] * 16 * 1024  # ~16 KB per page overhead
+      respond "6. Ruby VM page overhead:"
+      respond "   Heap pages: #{gc_stat[:heap_allocated_pages]}"
+      respond "   Estimated VM overhead:        ~#{format_bytes(vm_estimate)}"
+      respond "   (~16 KB per page for page tables, metadata)"
+      respond ""
+
+      respond ""
+      total_estimated = malloc_overhead + actual_thread_memory + actual_sqlite + dll_memory_estimate + rb_memory_estimate + vm_estimate
+      remaining_gap = gap - total_estimated
+
+      respond "SUMMARY:"
+      respond "  Total accounted:              ~#{format_bytes(total_estimated.to_i)}"
+      respond "  Remaining unexplained:        ~#{format_bytes(remaining_gap.to_i)}"
+
+      if remaining_gap > 0
+        remaining_percent = ((remaining_gap.to_f / process_rss) * 100).round(1)
+        respond ""
+        respond "Remaining #{format_bytes(remaining_gap.to_i)} (#{remaining_percent}%) likely includes:"
+        respond "  - Malloc fragmentation (freed memory not returned to OS)"
+        respond "  - Additional thread-local storage and TLS"
+        respond "  - Memory mapped files (database, shared libs)"
+        respond "  - Windows memory manager overhead"
+        respond "  - DLL code pages and data segments"
+        respond "  - CRT (C Runtime) library overhead"
+        respond "  - Windows kernel structures for this process"
+      else
+        respond ""
+        respond "Gap fully accounted for!"
+      end
+      respond ""
+    end
+
+    respond "=" * 70
+    respond "INVESTIGATION RECOMMENDATIONS"
+    respond "=" * 70
+    respond ""
+
+    if process_rss
+      # Check if memory usage is concerning
+      rss_mb = process_rss / (1024.0 * 1024.0)
+      heap_mb = ruby_heap / (1024.0 * 1024.0)
+
+      if rss_mb > 1000
+        respond "WARNING: Process memory is #{rss_mb.round(0)} MB (over 1 GB)!"
+        respond ""
+        respond "Immediate actions:"
+        respond "  1. Check for memory leaks with snapshot/compare workflow"
+        respond "  2. Look for dead threads in thread pool"
+        respond "  3. Check SQLite cache size and database growth"
+        respond ""
+      end
+
+      respond "To track memory growth during hunting:"
+      respond "  1. At startup: ;memory_profiler snapshot"
+      respond "  2. At startup: ;memory_profiler system > startup.txt"
+      respond "  3. Hunt for 30-60 minutes"
+      respond "  4. After hunting: ;memory_profiler compare"
+      respond "  5. After hunting: ;memory_profiler system > after_hunting.txt"
+      respond "  6. Compare the two system reports to see what changed"
+      respond ""
+
+      respond "Key metrics to watch for memory leaks:"
+      respond "  - Working Set growing beyond 1 GB"
+      respond "  - Ruby heap not being freed after GC"
+      respond "  - Thread count steadily increasing"
+      respond "  - SQLite memory growing unbounded"
+      respond "  - Gap percentage increasing (native memory leak)"
+      respond ""
+
+      respond "If you see growth, check:"
+      respond "  - ;e Lich::Gemstone::Combat::Tracker.stats (thread pool status)"
+      respond "  - ;e Lich::Gemstone::CreatureInstance.all.size (creature registry)"
+      respond "  - ;e Thread.list.count { |t| !t.alive? } (dead threads)"
+      respond ""
+    else
+      respond "Unable to provide recommendations without process memory data."
+      respond ""
+    end
+
+    respond "=" * 70
+    respond ""
+  end
+end
+
+# Parse command
+command = script.vars[1]&.downcase || 'top'
+arg = script.vars[2]
+
+case command
+when 'snapshot', 'snap'
+  MemoryProfiler.snapshot
+when 'compare', 'diff'
+  MemoryProfiler.compare
+when 'top', 'show'
+  MemoryProfiler.top_consumers
+when 'gc'
+  MemoryProfiler.gc_stats
+when 'detail', 'detailed', 'strings'
+  MemoryProfiler.detailed_analysis
+when 'trace', 'allocations'
+  klass = arg || 'String'
+  MemoryProfiler.trace_allocations(klass)
+when 'start', 'enable'
+  MemoryProfiler.start_tracing
+when 'system', 'gap', 'breakdown'
+  MemoryProfiler.system_memory
+when 'fragtest', 'frag', 'fragmentation'
+  MemoryProfiler.fragmentation_test
+when 'trend', 'trends', 'history'
+  MemoryProfiler.trend_analysis
+when 'trim', 'malloc_trim'
+  MemoryProfiler.malloc_trim
+else
+  respond "Unknown command: #{command}"
+  respond ""
+  respond "Usage:"
+  respond "  ;memory_profiler snapshot           - Take a baseline snapshot"
+  respond "  ;memory_profiler compare            - Compare to snapshot and show growth"
+  respond "  ;memory_profiler top                - Show top memory consumers now"
+  respond "  ;memory_profiler gc                 - Force GC and show stats"
+  respond "  ;memory_profiler detail             - Deep dive into String/Array/Hash objects"
+  respond "  ;memory_profiler system             - Show Ruby heap vs process memory gap"
+  respond "  ;memory_profiler fragtest           - Test if gap is fragmentation vs leak"
+  respond "  ;memory_profiler trend              - Show memory trend over snapshots"
+  respond "  ;memory_profiler trim               - Force malloc to return memory (Linux only)"
+  respond ""
+  respond "Allocation tracing (shows WHERE objects are created):"
+  respond "  ;memory_profiler start              - Show how to enable allocation tracing"
+  respond "  ;memory_profiler trace [Class]      - Show allocation sources (default: String)"
+  respond ""
+  respond "Examples:"
+  respond "  ;e ObjectSpace.trace_object_allocations_start"
+  respond "  # ... hunt for 30 minutes ..."
+  respond "  ;memory_profiler trace String       - See where strings are allocated"
+  respond "  ;memory_profiler trace Array        - See where arrays are allocated"
+  respond "  ;memory_profiler trace Thread       - See where threads are allocated"
+  respond "  ;memory_profiler system             - See memory gap breakdown"
+  respond ""
+  respond "Fragmentation vs Leak Detection:"
+  respond "  ;memory_profiler fragtest           - Run GC.compact and see if RSS drops"
+  respond "    If RSS drops significantly -> fragmentation (run GC.compact periodically)"
+  respond "    If RSS stays high -> memory leak (investigate with snapshot/compare)"
+  respond ""
+  respond "Trend Analysis (track growth over time):"
+  respond "  1. ;memory_profiler snapshot        - At startup"
+  respond "  2. Hunt for 30 minutes"
+  respond "  3. ;memory_profiler snapshot        - After hunting"
+  respond "  4. ;memory_profiler trend           - See growth rate and projections"
+end
