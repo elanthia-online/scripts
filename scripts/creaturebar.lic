@@ -627,48 +627,39 @@ module CreatureBar
 
     # -- Appearance / CSS ---------------------------------------------------------------------
     def apply_css
-      @@css_provider ||= Gtk::CssProvider.new.tap do |provider|
-        Gtk::StyleContext.add_provider_for_screen(
-          Gdk::Screen.default,
-          provider,
-          Gtk::StyleProvider::PRIORITY_APPLICATION
-        )
-      end
+      @@css_provider ||= Gtk::CssProvider.new
       colors = @@config['colors']
 
       # Use transparent background for the window when configured; keep panel backgrounds opaque
       window_bg = @@config['window']['transparent'] ? 'rgba(0, 0, 0, 0)' : colors['window_background']
       panel_bg = colors['window_background']
 
-      # Scope all CSS to #creaturebar_window to avoid affecting other GTK windows
+      # CSS without scoping - will only be applied to our window via add_css_to_widget
       css = <<~CSS
-        #creaturebar_window {
+        window {
           background-color: #{window_bg};
         }
-        #creaturebar_window box, #creaturebar_window grid {
-          background-color: #{window_bg};
-        }
-        #creaturebar_window #creature_name {
+        #creature_name {
           color: #{colors['name_font']};
           padding: 5px;
           background-color: #{colors['name_background']};
         }
-        #creaturebar_window #hp_label {
+        #hp_label {
           color: #{colors['hp_text']};
           font-size: 11px;
           font-weight: bold;
         }
-        #creaturebar_window #status_label {
+        #status_label {
           font-weight: bold;
           padding: 0px;
           margin: 0px;
         }
-        #creaturebar_window frame#creature_panel_frame {
+        frame#creature_panel_frame {
           border: 2px solid #{colors['other_target_border']};
           border-radius: 3px;
           background-color: #{panel_bg};
         }
-        #creaturebar_window frame#creature_panel_frame.current_target {
+        frame#creature_panel_frame.current_target {
           border: 3px solid #{colors['current_target_border']};
           border-radius: 3px;
           background-color: #{panel_bg};
@@ -676,6 +667,14 @@ module CreatureBar
       CSS
 
       @@css_provider.load(data: css)
+    end
+
+    # Apply CSS provider to a widget and all its children (for window-scoped CSS)
+    def add_css_to_widget(widget)
+      widget.style_context.add_provider(@@css_provider, Gtk::StyleProvider::PRIORITY_APPLICATION)
+      return unless widget.respond_to?(:each)
+
+      widget.each { |child| add_css_to_widget(child) }
     end
 
     # -- Window lifecycle ---------------------------------------------------------------------
@@ -707,6 +706,9 @@ module CreatureBar
       setup_menu
       setup_content
       setup_signals
+
+      # Apply CSS only to our window (not screen-wide) to avoid affecting dialogs
+      add_css_to_widget(@@window)
 
       @@window.show_all
     end
@@ -1219,7 +1221,7 @@ module CreatureBar
           script_name = Script.current.name rescue 'creaturebar'
           Script.kill(script_name) if Script.running?(script_name)
         end
-        false # Allow window to close normally
+        true # Prevent GTK from destroying window - we handle it in stop()
       end
 
       @@window.signal_connect('configure-event') do
@@ -1260,7 +1262,6 @@ module CreatureBar
 
       dialog = Gtk::Dialog.new(
         title: 'CreatureBar Settings',
-        parent: @@window,
         flags: [:modal]
       )
       @@active_dialog = dialog
@@ -1365,29 +1366,35 @@ module CreatureBar
 
           save_config
 
-          # Determine whether we need a full window recreate (for transparency/decorations/OK)
+          # Check what changed
           transparency_changed = original_transparent != @@config['window']['transparent']
           decorations_changed = original_decorated != @@config['window']['decorated']
           interval_changed = old_interval != @@config['update_interval']
-          needs_recreate = (response == Gtk::ResponseType::OK) || transparency_changed || decorations_changed
-          pending_recreate ||= needs_recreate
 
-          # Refresh CSS for color/background changes
-          apply_css unless needs_recreate
+          # Track if recreate will be needed (for transparency/decorations)
+          pending_recreate ||= (transparency_changed || decorations_changed)
 
-          # Restart update timer only if interval changed and we are not recreating
-          if interval_changed && !needs_recreate
+          # Apply CSS for color changes (safe to do without recreate)
+          apply_css
+
+          # Restart update timer if interval changed
+          if interval_changed
             stop_update_timer
             start_update_timer
           end
 
+          # Apply always_on_top immediately (doesn't require recreate)
+          @@window.set_keep_above(@@config['window']['always_on_top']) if @@window && !@@window.destroyed?
+
           respond "[CreatureBar] Settings updated"
+          respond "[CreatureBar] Note: Transparency/title bar changes will apply when dialog closes." if pending_recreate && response == Gtk::ResponseType::APPLY
 
           # Update originals for subsequent Apply runs
           original_transparent = @@config['window']['transparent']
           original_decorated = @@config['window']['decorated']
 
-          break if response == Gtk::ResponseType::OK || needs_recreate
+          # Only break on OK (Apply keeps dialog open)
+          break if response == Gtk::ResponseType::OK
         when Gtk::ResponseType::CANCEL, Gtk::ResponseType::DELETE_EVENT
           break
         end
@@ -1703,7 +1710,6 @@ module CreatureBar
     def add_status_effect_dialog(list_box)
       dialog = Gtk::Dialog.new(
         title: 'Add Status Effect',
-        parent: @@window,
         flags: :modal,
         buttons: [
           ['Cancel', :cancel],
@@ -1781,7 +1787,6 @@ module CreatureBar
 
       dialog = Gtk::Dialog.new(
         title: 'Edit Status Effect',
-        parent: @@window,
         flags: :modal,
         buttons: [
           ['Cancel', :cancel],
@@ -1860,7 +1865,6 @@ module CreatureBar
 
     def show_message_dialog(message)
       dialog = Gtk::MessageDialog.new(
-        parent: @@window,
         flags: :modal,
         type: :info,
         buttons: :ok,
@@ -1918,7 +1922,7 @@ module CreatureBar
           # No creature data yet - remove panels and resize
           @@creature_panels.keys.each { |id| remove_creature_panel(id) }
           resize_window_for_panels
-          return
+          next
         end
 
         # Remove panels for creatures no longer present OR beyond max_shown
@@ -1947,7 +1951,8 @@ module CreatureBar
     end
 
     def resize_window_for_panels
-      return unless @@window
+      # Guard against destroyed window
+      return unless @@window && !@@window.destroyed?
 
       panel_count = @@creature_panels.size
       layout_mode = @@config.dig('layout', 'mode') || 'horizontal'
@@ -2079,6 +2084,9 @@ module CreatureBar
         end
 
         @@creature_panels[creature_id] = panel_widgets
+
+        # Apply CSS to the new panel widgets
+        add_css_to_widget(panel_widgets[:container])
 
         # Add to grid at appropriate position
         panel_index = @@creature_panels.size - 1
@@ -2502,28 +2510,42 @@ module CreatureBar
       respond "Stopping CreatureBar..."
 
       stop_update_timer
-      @@save_timer.kill if @@save_timer
+      @@save_timer&.kill rescue nil
+      @@save_timer = nil
 
-      # Clean up panel pool
-      @@panel_pool.each_value { |family_panels| family_panels.each { |panel| destroy_panel(panel) } }
-      @@panel_pool.clear
-
-      if @@window
+      # Save window settings before any destruction (check destroyed state)
+      if @@window && !@@window.destroyed?
         begin
-          Gtk.queue do
-            # Close any active dialog first (must be on GTK thread)
-            if @@active_dialog && !@@active_dialog.destroyed?
-              @@active_dialog.destroy
-              @@active_dialog = nil
-            end
-
-            save_window_settings if @@window
-            @@window.destroy if @@window && !@@window.destroyed?
-            @@window = nil
-          end
-        rescue
-          @@window = nil
+          save_window_settings
+        rescue StandardError
+          # Window may have been destroyed, ignore
         end
+      end
+
+      # Clean up panel pool (outside GTK thread is OK for data cleanup)
+      @@panel_pool.clear
+      @@creature_panels.clear
+
+      # Handle GTK cleanup on the GTK thread
+      window_ref = @@window
+      dialog_ref = @@active_dialog
+      @@window = nil
+      @@active_dialog = nil
+
+      begin
+        Gtk.queue do
+          # Close any active dialog first
+          if dialog_ref && !dialog_ref.destroyed?
+            dialog_ref.destroy rescue nil
+          end
+
+          # Destroy the main window
+          if window_ref && !window_ref.destroyed?
+            window_ref.destroy rescue nil
+          end
+        end
+      rescue StandardError
+        # Ignore GTK errors during shutdown
       end
     end
   end
