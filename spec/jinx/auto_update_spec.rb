@@ -2,6 +2,13 @@ require 'tmpdir'
 require "rack"
 require 'webmock'
 
+# Mock XMLData
+module XMLData
+  def self.game
+    "GSIV"
+  end
+end
+
 load "scripts/jinx.lic"
 
 $fake_game_output = ""
@@ -19,13 +26,6 @@ end
 # Define Spell class for testing
 class Spell
   def self.load
-  end
-end
-
-# Mock XMLData
-module XMLData
-  def self.game
-    "GSIV"
   end
 end
 
