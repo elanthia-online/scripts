@@ -2,6 +2,13 @@ require 'tmpdir'
 require "rack"
 require 'webmock'
 
+# Mock XMLData
+module XMLData
+  def self.game
+    "GSIV"
+  end
+end
+
 load "scripts/jinx.lic"
 
 $fake_game_output = ""
@@ -14,13 +21,6 @@ def game_output
   buffered = $fake_game_output.dup
   $fake_game_output = ""
   return buffered
-end
-
-# Mock XMLData
-module XMLData
-  def self.game
-    "GSIV"
-  end
 end
 
 module ::Lich
