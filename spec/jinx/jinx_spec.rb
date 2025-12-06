@@ -16,6 +16,13 @@ def game_output
   return buffered
 end
 
+# Mock XMLData
+module XMLData
+  def self.game
+    "GSIV"
+  end
+end
+
 module ::Lich
   module Common
     module Jinx
