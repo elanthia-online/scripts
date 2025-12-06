@@ -22,6 +22,13 @@ class Spell
   end
 end
 
+# Mock XMLData
+module XMLData
+  def self.game
+    "GSIV"
+  end
+end
+
 module ::Lich
   module Common
     module Jinx
