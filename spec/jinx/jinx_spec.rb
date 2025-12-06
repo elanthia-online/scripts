@@ -17,6 +17,10 @@ def _respond(*args)
   $fake_game_output = $fake_game_output + "\n" + args.join("\n")
 end
 
+def respond(*args)
+  $fake_game_output = $fake_game_output + "\n" + args.join("\n")
+end
+
 def game_output
   buffered = $fake_game_output.dup
   $fake_game_output = ""
@@ -45,10 +49,11 @@ module ::Lich
           before(:all) do
             WebMock.enable!
             {
-              'extras'  => 'extras.repo.elanthia.online',
-              'archive' => 'archive.lich.elanthia.online',
-              'gtk3'    => 'gtk3.elanthia.online',
-              'mirror'  => 'ffnglichrepoarchive.netlify.app',
+              'extras'          => 'extras.repo.elanthia.online',
+              'archive'         => 'archive.lich.elanthia.online',
+              'gtk3'            => 'gtk3.elanthia.online',
+              'mirror'          => 'ffnglichrepoarchive.netlify.app',
+              'mapdb-backup-gs' => 'elanthia-online.github.io/mapdb-backup-gs',
             }.each do |(dir, domain)|
               WebMock.stub_request(:any, %r{https://#{domain}})
                      .to_rack(Rack::Directory.new(File.join(__dir__, 'repos', dir)))
