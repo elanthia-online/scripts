@@ -1,0 +1,1819 @@
+=begin
+  CreatureBar Coordinate Calibrator
+
+  Visual tool to calibrate body part coordinates for CreatureBar silhouettes.
+
+  Usage: ;CreatureBarCalibrate
+
+        author: Elanthia Online
+  contributors: Nisugi
+          game: Gemstone
+          tags: hunting, combat, creatures
+       version: 1.0
+      required: Lich >= 5.13.0
+
+  Author: Coordinate calibration helper
+  v1.0 (2025/11/30)
+    - initial release
+=end
+
+require 'gtk3'
+require 'yaml'
+require 'fileutils'
+
+module CreatureBarCalibrate
+  VERSION = '1.0.0'
+
+  CONFIG_DIR = File.join(DATA_DIR, 'creature_bar')
+  CONFIG_FILE = File.join(CONFIG_DIR, 'config.yaml')
+  SILHOUETTE_DIR = File.join(CONFIG_DIR, 'silhouettes')
+  SILHOUETTE_CONFIG_DIR = File.join(CONFIG_DIR, 'configs')
+
+  BODY_PARTS = [
+    'head', 'neck', 'chest', 'abdomen', 'back',
+    'leftArm', 'rightArm', 'leftHand', 'rightHand',
+    'leftLeg', 'rightLeg', 'leftFoot', 'rightFoot',
+    'leftEye', 'rightEye', 'nerves'
+  ]
+
+  @@window = nil
+  @@layout = nil
+  @@silhouette_image = nil
+  @@wound_marker = nil
+  @@info_label = nil
+  @@save_button = nil
+  @@copy_to_all_button = nil
+  @@next_button = nil
+  @@prev_button = nil
+  @@rank_selector = nil
+  @@size_display = nil
+  @@scale_display = nil
+  @@family_combo = nil
+  @@panel_frame = nil # Reference to panel preview frame for dynamic resizing
+  @@running = false
+
+  @@current_part_index = 0
+  @@current_rank = 1 # Default to rank 1 for preview
+  @@current_family = 'default' # Default family
+  @@current_subfolder = 'default' # Subfolder where current silhouette lives
+  @@silhouette_map = {} # Maps display names to {family:, subfolder:, path:}
+  @@coordinates = {}
+  @@config = nil # Silhouette-specific config
+  @@main_config = nil # Main config.yaml (HP bar, colors, fonts, etc)
+  @@silhouette_file = nil
+  @@silhouette_pixbuf = nil
+  @@overlay_image = nil # eyes_back_nerves overlay for back-facing body parts
+  @@panel_width_entry = nil
+  @@panel_height_entry = nil
+  @@marker_size_entry = nil
+  @@scale_entry = nil
+  @@name_font_size_entry = nil
+  @@name_font_weight_combo = nil
+  @@name_show_check = nil
+  @@hp_width_entry = nil
+  @@hp_height_entry = nil
+  @@hp_text_style_combo = nil
+  @@hp_show_check = nil
+  @@hp_show_bar_check = nil
+  @@hp_show_text_check = nil
+  @@hp_show_percentage_check = nil
+  @@status_font_size_entry = nil
+  @@status_show_check = nil
+  @@panel_preview_container = nil # Container holding the panel preview
+  @@main_box = nil # Main window box
+  # Layout size now comes from panel_width/panel_height in config (no longer hardcoded)
+  @@loading_config = false # Flag to prevent signal handlers from firing during config load
+  @@panel_size_feedback_label = nil # Shows actual vs configured panel size
+
+  class << self
+    # Find a silhouette file by searching style/region structure
+    # Structure: silhouettes/{style}/{region}/{family}.png
+    # Returns the full path or nil if not found
+    def find_silhouette_file(family)
+      return nil unless Dir.exist?(SILHOUETTE_DIR)
+
+      # Check for default.png at root first
+      if family == 'default'
+        path = File.join(SILHOUETTE_DIR, 'default.png')
+        return path if File.exist?(path)
+      end
+
+      # Search style directories (greyscale, color)
+      %w[greyscale color].each do |style|
+        style_dir = File.join(SILHOUETTE_DIR, style)
+        next unless Dir.exist?(style_dir)
+
+        # Search each region folder within the style
+        Dir.entries(style_dir).each do |region|
+          region_path = File.join(style_dir, region)
+          next unless File.directory?(region_path) && !region.start_with?('.')
+
+          path = File.join(region_path, "#{family}.png")
+          return path if File.exist?(path)
+        end
+      end
+
+      nil
+    end
+
+    # Find a config file by searching style/region structure
+    # Structure: configs/{style}/{region}/{family}.yaml or configs/default.yaml
+    # Returns the full path or nil if not found
+    def find_config_file(family)
+      return nil unless Dir.exist?(SILHOUETTE_CONFIG_DIR)
+
+      # Check for default.yaml at root first
+      if family == 'default'
+        path = File.join(SILHOUETTE_CONFIG_DIR, 'default.yaml')
+        return path if File.exist?(path)
+      end
+
+      # If we have a current subfolder set (e.g., "greyscale/hinterwilds"), look there first
+      if @@current_subfolder && @@current_subfolder != 'default'
+        path = File.join(SILHOUETTE_CONFIG_DIR, @@current_subfolder, "#{family}.yaml")
+        return path if File.exist?(path)
+      end
+
+      # Search all style/region combinations
+      %w[greyscale color].each do |style|
+        style_dir = File.join(SILHOUETTE_CONFIG_DIR, style)
+        next unless Dir.exist?(style_dir)
+
+        Dir.entries(style_dir).each do |region|
+          region_path = File.join(style_dir, region)
+          next unless File.directory?(region_path) && !region.start_with?('.')
+
+          path = File.join(region_path, "#{family}.yaml")
+          return path if File.exist?(path)
+        end
+      end
+
+      nil
+    end
+
+    # Find the rank marker files (at root level of silhouettes/)
+    def find_rank_file(rank)
+      path = File.join(SILHOUETTE_DIR, "rank#{rank}.png")
+      return path if File.exist?(path)
+
+      nil
+    end
+
+    # Find the eyes_back_nerves overlay (at root level of silhouettes/)
+    # This overlay shows back-facing body parts (back, eyes, nerves)
+    def find_overlay_file
+      path = File.join(SILHOUETTE_DIR, 'eyes_back_nerves.png')
+      return path if File.exist?(path)
+
+      nil
+    end
+
+    def get_available_silhouettes
+      # Get all silhouette variants from style/region structure
+      # Structure: silhouettes/{style}/{region}/{family}.png
+      # Returns array of display names, populates @@silhouette_map with details
+      @@silhouette_map = {}
+      return [] unless Dir.exist?(SILHOUETTE_DIR)
+
+      # Add default.png at root if it exists
+      default_path = File.join(SILHOUETTE_DIR, 'default.png')
+      if File.exist?(default_path)
+        @@silhouette_map['default'] = {
+          family: 'default',
+          subfolder: 'default',
+          path: default_path,
+          style: nil
+        }
+      end
+
+      # Search style directories (greyscale, color)
+      %w[greyscale color].each do |style|
+        style_dir = File.join(SILHOUETTE_DIR, style)
+        next unless Dir.exist?(style_dir)
+
+        # Search each region folder within the style
+        Dir.entries(style_dir).each do |region|
+          region_path = File.join(style_dir, region)
+          next unless File.directory?(region_path) && !region.start_with?('.')
+
+          Dir[File.join(region_path, '*.png')].each do |path|
+            family = File.basename(path, '.png')
+
+            # Skip any marker files that might be here
+            next if family =~ /^rank[0-9]+$/i
+            next if family =~ /^eyes_back_nerves$/i
+
+            # Create display name: "valravn (greyscale/hinterwilds)"
+            display_name = "#{family} (#{style}/#{region})"
+
+            # Store in map - subfolder is now "style/region"
+            @@silhouette_map[display_name] = {
+              family: family,
+              subfolder: "#{style}/#{region}",
+              path: path,
+              style: style
+            }
+          end
+        end
+      end
+
+      @@silhouette_map.keys.sort
+    end
+
+    def load_config(silhouette = nil)
+      silhouette ||= @@current_family
+
+      # Load main config.yaml for HP bar, colors, fonts, status settings
+      if File.exist?(CONFIG_FILE)
+        begin
+          @@main_config = YAML.load_file(CONFIG_FILE)
+        rescue StandardError
+          @@main_config = {}
+        end
+      else
+        @@main_config = {}
+      end
+
+      # Load silhouette-specific config (search subfolders)
+      config_file = find_config_file(silhouette)
+
+      if config_file && File.exist?(config_file)
+        begin
+          @@config = YAML.load_file(config_file)
+        rescue StandardError
+          @@config = { 'scale' => 1.0, 'panel_width' => 100, 'panel_height' => 220, 'marker_size' => 12, 'body_parts' => {} }
+        end
+      else
+        @@config = { 'scale' => 1.0, 'panel_width' => 100, 'panel_height' => 220, 'marker_size' => 12, 'body_parts' => {} }
+      end
+
+      # Merge with global config for any missing display settings
+      # This ensures we don't save hardcoded defaults when user loads old configs
+      @@config['name_display'] ||= {}
+      @@config['hp_bar'] ||= {}
+      @@config['status'] ||= {}
+
+      # Merge each section with global defaults
+      # IMPORTANT: Check for nil specifically, not falsy (false is a valid value!)
+      if @@main_config['name_display']
+        @@main_config['name_display'].each do |key, value|
+          if @@config['name_display'][key].nil?
+            @@config['name_display'][key] = value
+          end
+        end
+      end
+
+      if @@main_config['hp_bar']
+        @@main_config['hp_bar'].each do |key, value|
+          next if key == 'ranges' # Don't merge ranges
+          @@config['hp_bar'][key] = value if @@config['hp_bar'][key].nil?
+        end
+      end
+
+      if @@main_config['status']
+        @@main_config['status'].each do |key, value|
+          @@config['status'][key] = value if @@config['status'][key].nil?
+        end
+      end
+
+      # Extract coordinates
+      @@coordinates = (@@config['body_parts'] || {}).dup
+
+      # Initialize any missing body parts with default coordinates (centered in layout)
+      BODY_PARTS.each do |part|
+        @@coordinates[part] ||= [100, 100]
+      end
+    end
+
+    # Determine which subfolder a silhouette belongs to
+    # Returns "style/region" (e.g., "greyscale/hinterwilds") or "default"
+    def get_silhouette_subfolder(family)
+      # Use stored subfolder if available (set when user selects from dropdown)
+      return @@current_subfolder if @@current_subfolder
+
+      # For default family, return 'default'
+      return 'default' if family == 'default'
+
+      # Fall back to searching by path
+      silhouette_path = find_silhouette_file(family)
+      return 'default' unless silhouette_path
+
+      # Extract style/region from path
+      # Path format: .../silhouettes/{style}/{region}/{family}.png
+      parts = silhouette_path.split(File::SEPARATOR)
+      sil_idx = parts.index { |p| p == 'silhouettes' }
+      return 'default' unless sil_idx && parts.size > sil_idx + 2
+
+      # Return "style/region" format
+      "#{parts[sil_idx + 1]}/#{parts[sil_idx + 2]}"
+    end
+
+    def save_config(show_popup = false)
+      unless @@config
+        @@config = {}
+      end
+
+      @@config['body_parts'] = @@coordinates
+
+      # Determine target subfolder based on where the silhouette is located
+      subfolder = get_silhouette_subfolder(@@current_family)
+
+      # Handle default family specially - save at root level
+      if @@current_family == 'default' || subfolder == 'default'
+        config_file = File.join(SILHOUETTE_CONFIG_DIR, 'default.yaml')
+        display_path = 'default.yaml'
+      else
+        # Ensure the config subfolder exists (e.g., configs/greyscale/hinterwilds/)
+        config_subfolder = File.join(SILHOUETTE_CONFIG_DIR, subfolder)
+        FileUtils.mkdir_p(config_subfolder) unless Dir.exist?(config_subfolder)
+
+        # Save to silhouette-specific config file in the appropriate subfolder
+        config_file = File.join(config_subfolder, "#{@@current_family}.yaml")
+        display_path = "#{subfolder}/#{@@current_family}.yaml"
+      end
+
+      File.write(config_file, @@config.to_yaml)
+
+      if show_popup
+        show_message("Settings saved for #{@@current_family}!\n\nSaved to: #{display_path}\n\nAll silhouette settings saved:\n- Wound coordinates\n- Panel dimensions & scale\n- HP bar display\n- Name & status display")
+      end
+    rescue => e
+      if show_popup
+        show_message("Error saving: #{e.message}")
+      end
+    end
+
+    def copy_settings_to_all_creatures
+      # Confirm action with user
+      dialog = Gtk::MessageDialog.new(
+        parent: @@window,
+        flags: :destroy_with_parent,
+        type: :question,
+        buttons: :yes_no,
+        message: "Copy current UI settings to ALL creature configs?\n\n" \
+                 "This will update: scale, marker_size, panel dimensions, name/HP/status settings\n" \
+                 "Body part coordinates will NOT be affected."
+      )
+
+      response = dialog.run
+      dialog.destroy
+      return unless response == Gtk::ResponseType::YES
+
+      # Apply all current UI values before copying
+      apply_scale
+      apply_panel_width
+      apply_panel_height if @@panel_height_entry
+      apply_marker_size
+      apply_name_settings
+      apply_hp_settings
+      apply_status_settings
+
+      # Extract current settings (everything except body_parts)
+      settings_to_copy = {
+        'scale'        => @@config['scale'],
+        'marker_size'  => @@config['marker_size'],
+        'panel_width'  => @@config['panel_width'],
+        'panel_height' => @@config['panel_height'],
+        'name_display' => @@config['name_display'],
+        'hp_bar'       => @@config['hp_bar'],
+        'status'       => @@config['status']
+      }
+
+      updated_count = 0
+      error_count = 0
+
+      # Helper to update a single YAML file
+      update_yaml = proc do |yaml_file|
+        begin
+          # Load existing config
+          existing_config = File.exist?(yaml_file) ? YAML.load_file(yaml_file) : {}
+
+          # Preserve body_parts, update everything else
+          updated_config = settings_to_copy.merge({
+            'body_parts' => existing_config['body_parts'] || {}
+          })
+
+          # Save updated config
+          File.write(yaml_file, updated_config.to_yaml)
+          updated_count += 1
+        rescue => e
+          puts "Error updating #{File.basename(yaml_file)}: #{e.message}"
+          error_count += 1
+        end
+      end
+
+      # Update root-level default.yaml if it exists
+      default_yaml = File.join(SILHOUETTE_CONFIG_DIR, 'default.yaml')
+      update_yaml.call(default_yaml) if File.exist?(default_yaml)
+
+      # Iterate through all creature YAML files in style/region subfolders
+      Dir.glob(File.join(SILHOUETTE_CONFIG_DIR, '*', '*', '*.yaml')).each do |yaml_file|
+        update_yaml.call(yaml_file)
+      end
+
+      # Show success message
+      message = "UI settings copied to #{updated_count} creature config(s)!\n\n" \
+                "Settings synced: scale, marker_size, panel dimensions, name/HP/status\n" \
+                "Body part coordinates preserved."
+      message += "\n\n#{error_count} error(s) occurred." if error_count > 0
+      show_message(message)
+    rescue => e
+      show_message("Error during bulk sync: #{e.message}")
+    end
+
+    def create_window
+      @@window = Gtk::Window.new('CreatureBar Calibrator')
+      @@window.set_default_size(300, 500)
+      @@window.signal_connect('delete-event') do
+        # Queue the cleanup and script termination
+        Thread.new do
+          stop
+          sleep 0.1 # Give GTK time to clean up
+          script_name = Script.current.name rescue 'calibrate_creaturebar'
+          Script.kill(script_name) if Script.running?(script_name)
+        end
+        false # Allow window to close normally
+      end
+
+      # Apply dark mode CSS styling
+      css_provider = Gtk::CssProvider.new
+
+      # Load main config to get border colors
+      main_config = {}
+      if File.exist?(CONFIG_FILE)
+        main_config = YAML.load_file(CONFIG_FILE) rescue {}
+      end
+
+      other_border = main_config.dig('colors', 'other_target_border') || '#555555'
+
+      css_provider.load(data: <<-CSS)
+        window {
+          background-color: #2e2e2e;
+          background-image: none;
+        }
+        box {
+          background-color: #2e2e2e;
+          background-image: none;
+        }
+        button {
+          min-height: 18px;
+          min-width: 50px;
+          padding: 3px 6px;
+          background-color: #3a3a3a;
+          background-image: none;
+          color: #e0e0e0;
+          border: 1px solid #555555;
+          border-radius: 3px;
+          font-size: 11px;
+          box-shadow: none;
+        }
+        button:hover {
+          background-color: #4a4a4a;
+          background-image: none;
+          border-color: #666666;
+        }
+        button:active {
+          background-color: #2a2a2a;
+          background-image: none;
+        }
+        entry {
+          background-color: #2a2a2a;
+          background-image: none;
+          color: #e0e0e0;
+          border: 1px solid #555555;
+          border-radius: 3px;
+          padding: 2px 4px;
+          min-height: 20px;
+        }
+        entry:focus {
+          border-color: #777777;
+        }
+        label {
+          color: #b0b0b0;
+        }
+        combobox {
+          background-color: #2a2a2a;
+          background-image: none;
+          color: #e0e0e0;
+        }
+        combobox button {
+          background-color: #2a2a2a;
+          background-image: none;
+          color: #e0e0e0;
+        }
+        combobox entry {
+          background-color: #2a2a2a;
+          background-image: none;
+          color: #e0e0e0;
+        }
+        checkbutton {
+          background-color: #2e2e2e;
+          background-image: none;
+          color: #b0b0b0;
+        }
+        checkbutton check {
+          background-color: #2a2a2a;
+          background-image: none;
+          border: 1px solid #555555;
+        }
+        notebook {
+          background-color: #2e2e2e;
+          background-image: none;
+        }
+        notebook > header {
+          background-color: #2e2e2e;
+          background-image: none;
+        }
+        notebook > header > tabs {
+          background-color: #2e2e2e;
+          background-image: none;
+        }
+        notebook tab {
+          background-color: #3a3a3a;
+          background-image: none;
+          color: #b0b0b0;
+          padding: 4px 8px;
+          border: 1px solid #555555;
+        }
+        notebook tab:checked {
+          background-color: #2e2e2e;
+          background-image: none;
+          color: #e0e0e0;
+        }
+        notebook > stack {
+          background-color: #2e2e2e;
+          background-image: none;
+        }
+        label#status_label {
+          padding: 0px;
+          margin: 0px;
+          font-weight: bold;
+        }
+        frame#creature_panel {
+          border: 2px solid #{other_border};
+          border-radius: 3px;
+        }
+      CSS
+
+      Gtk::StyleContext.add_provider_for_screen(
+        Gdk::Screen.default,
+        css_provider,
+        Gtk::StyleProvider::PRIORITY_USER
+      )
+
+      @@main_box = Gtk::Box.new(:vertical, 5)
+      @@main_box.set_margin_top(5)
+      @@main_box.set_margin_bottom(5)
+      @@main_box.set_margin_left(5)
+      @@main_box.set_margin_right(5)
+
+      # Silhouette selector at top
+      silhouette_box = Gtk::Box.new(:horizontal, 5)
+      silhouette_label = Gtk::Label.new('Silhouette:')
+      silhouette_box.pack_start(silhouette_label, expand: false, fill: false, padding: 5)
+
+      @@family_combo = Gtk::ComboBoxText.new
+      available_silhouettes = get_available_silhouettes
+
+      # Find the display name that matches current family, or use first available
+      current_display_name = available_silhouettes.find { |name| name.start_with?("#{@@current_family} (") }
+      current_display_name ||= available_silhouettes.first
+
+      # Initialize from the selected entry
+      if current_display_name && @@silhouette_map[current_display_name]
+        info = @@silhouette_map[current_display_name]
+        @@current_family = info[:family]
+        @@current_subfolder = info[:subfolder]
+        @@silhouette_file = info[:path]
+      end
+
+      available_silhouettes.each { |silhouette| @@family_combo.append_text(silhouette) }
+      silhouette_index = available_silhouettes.index(current_display_name) || 0
+      # Set active BEFORE connecting signal to avoid triggering change_family during UI creation
+      @@family_combo.active = silhouette_index
+      @@family_combo.signal_connect('changed') do
+        new_display_name = @@family_combo.active_text
+        # Check if this is actually a different silhouette by comparing display names
+        current_info = @@silhouette_map.find { |_, v| v[:family] == @@current_family && v[:subfolder] == @@current_subfolder }
+        current_key = current_info ? current_info[0] : nil
+        change_family(new_display_name) if new_display_name && new_display_name != current_key
+      end
+      silhouette_box.pack_start(@@family_combo, expand: true, fill: true, padding: 2)
+      @@main_box.pack_start(silhouette_box, expand: false, fill: false, padding: 5)
+
+      # Tabbed notebook for settings
+      notebook = Gtk::Notebook.new
+      notebook.set_tab_pos(:top)
+
+      # Tab 1: Silhouette Settings
+      sil_tab = Gtk::Box.new(:vertical, 5)
+      sil_tab.set_margin_top(10)
+      sil_tab.set_margin_bottom(10)
+      sil_tab.set_margin_left(10)
+      sil_tab.set_margin_right(10)
+
+      # Scale
+      scale_box = Gtk::Box.new(:horizontal, 5)
+      scale_box.pack_start(Gtk::Label.new('Scale:'), expand: false, fill: false, padding: 5)
+      @@scale_entry = Gtk::Entry.new
+      @@scale_entry.text = (@@config['scale'] || 0.8).round(1).to_s
+      @@scale_entry.width_chars = 5
+      @@scale_entry.signal_connect('activate') { apply_scale }
+      @@scale_entry.signal_connect('focus-out-event') { apply_scale; false }
+      scale_box.pack_start(@@scale_entry, expand: false, fill: false, padding: 2)
+      sil_tab.pack_start(scale_box, expand: false, fill: false, padding: 5)
+
+      # Marker Size
+      marker_box = Gtk::Box.new(:horizontal, 5)
+      marker_box.pack_start(Gtk::Label.new('Marker Size (px):'), expand: false, fill: false, padding: 5)
+      @@marker_size_entry = Gtk::Entry.new
+      @@marker_size_entry.text = (@@config['marker_size'] || 12).to_s
+      @@marker_size_entry.width_chars = 5
+      @@marker_size_entry.signal_connect('activate') { apply_marker_size }
+      @@marker_size_entry.signal_connect('focus-out-event') { apply_marker_size; false }
+      marker_box.pack_start(@@marker_size_entry, expand: false, fill: false, padding: 2)
+      sil_tab.pack_start(marker_box, expand: false, fill: false, padding: 5)
+
+      # Panel Width
+      pw_box = Gtk::Box.new(:horizontal, 5)
+      pw_box.pack_start(Gtk::Label.new('Panel Width (px):'), expand: false, fill: false, padding: 5)
+      @@panel_width_entry = Gtk::Entry.new
+      @@panel_width_entry.text = (@@config['panel_width'] || 100).to_s
+      @@panel_width_entry.width_chars = 5
+      @@panel_width_entry.signal_connect('activate') { apply_panel_width }
+      @@panel_width_entry.signal_connect('focus-out-event') { apply_panel_width; false }
+      pw_box.pack_start(@@panel_width_entry, expand: false, fill: false, padding: 2)
+      sil_tab.pack_start(pw_box, expand: false, fill: false, padding: 5)
+
+      # Panel Height
+      ph_box = Gtk::Box.new(:horizontal, 5)
+      ph_box.pack_start(Gtk::Label.new('Panel Height (px):'), expand: false, fill: false, padding: 5)
+      @@panel_height_entry = Gtk::Entry.new
+      @@panel_height_entry.text = (@@config['panel_height'] || 220).to_s
+      @@panel_height_entry.width_chars = 5
+      @@panel_height_entry.signal_connect('activate') { apply_panel_height }
+      @@panel_height_entry.signal_connect('focus-out-event') { apply_panel_height; false }
+      ph_box.pack_start(@@panel_height_entry, expand: false, fill: false, padding: 2)
+      sil_tab.pack_start(ph_box, expand: false, fill: false, padding: 5)
+
+      # Panel size feedback - shows actual content size vs configured
+      @@panel_size_feedback_label = Gtk::Label.new
+      @@panel_size_feedback_label.set_markup("<small><i>Content size: calculating...</i></small>")
+      sil_tab.pack_start(@@panel_size_feedback_label, expand: false, fill: false, padding: 2)
+
+      notebook.append_page(sil_tab, Gtk::Label.new('Silhouette'))
+
+      # Tab 2: Name Display Settings
+      name_tab = Gtk::Box.new(:vertical, 5)
+      name_tab.set_margin_top(10)
+      name_tab.set_margin_bottom(10)
+      name_tab.set_margin_left(10)
+      name_tab.set_margin_right(10)
+
+      @@name_show_check = Gtk::CheckButton.new('Show Name')
+      @@name_show_check.active = @@config.dig('name_display', 'show')
+      @@name_show_check.signal_connect('toggled') { apply_name_settings }
+      name_tab.pack_start(@@name_show_check, expand: false, fill: false, padding: 5)
+
+      # Radio buttons for name vs noun
+      @@name_mode_name_radio = Gtk::RadioButton.new(label: 'Full Name (truncated)')
+      current_mode = @@config.dig('name_display', 'mode') || 'name'
+      @@name_mode_name_radio.active = (current_mode == 'name')
+      @@name_mode_name_radio.signal_connect('toggled') { apply_name_settings }
+      name_tab.pack_start(@@name_mode_name_radio, expand: false, fill: false, padding: 5)
+
+      @@name_mode_noun_radio = Gtk::RadioButton.new(member: @@name_mode_name_radio, label: 'Noun Only')
+      @@name_mode_noun_radio.active = (current_mode == 'noun')
+      @@name_mode_noun_radio.signal_connect('toggled') { apply_name_settings }
+      name_tab.pack_start(@@name_mode_noun_radio, expand: false, fill: false, padding: 5)
+
+      name_size_box = Gtk::Box.new(:horizontal, 5)
+      name_size_box.pack_start(Gtk::Label.new('Font Size:'), expand: false, fill: false, padding: 5)
+      @@name_font_size_entry = Gtk::Entry.new
+      initial_font_size = @@config.dig('name_display', 'font_size') || 12
+      @@name_font_size_entry.text = initial_font_size.to_s
+      @@name_font_size_entry.width_chars = 5
+      @@name_font_size_entry.signal_connect('activate') { apply_name_settings }
+      @@name_font_size_entry.signal_connect('focus-out-event') { apply_name_settings; false }
+      name_size_box.pack_start(@@name_font_size_entry, expand: false, fill: false, padding: 2)
+      name_tab.pack_start(name_size_box, expand: false, fill: false, padding: 5)
+
+      weight_box = Gtk::Box.new(:horizontal, 5)
+      weight_box.pack_start(Gtk::Label.new('Font Weight:'), expand: false, fill: false, padding: 5)
+      @@name_font_weight_combo = Gtk::ComboBoxText.new
+      @@name_font_weight_combo.append_text('normal')
+      @@name_font_weight_combo.append_text('bold')
+      current_weight = @@config.dig('name_display', 'font_weight') || 'bold'
+      @@name_font_weight_combo.active = current_weight == 'bold' ? 1 : 0
+      @@name_font_weight_combo.signal_connect('changed') { apply_name_settings }
+      weight_box.pack_start(@@name_font_weight_combo, expand: true, fill: true, padding: 2)
+      name_tab.pack_start(weight_box, expand: false, fill: false, padding: 5)
+
+      notebook.append_page(name_tab, Gtk::Label.new('Name'))
+
+      # Tab 3: HP Bar Settings
+      hp_tab = Gtk::Box.new(:vertical, 5)
+      hp_tab.set_margin_top(10)
+      hp_tab.set_margin_bottom(10)
+      hp_tab.set_margin_left(10)
+      hp_tab.set_margin_right(10)
+
+      @@hp_show_check = Gtk::CheckButton.new('Show HP Bar')
+      @@hp_show_check.active = @@config.dig('hp_bar', 'show') != false
+      @@hp_show_check.signal_connect('toggled') { apply_hp_settings }
+      hp_tab.pack_start(@@hp_show_check, expand: false, fill: false, padding: 5)
+
+      # Row: Text Style dropdown + Show Text checkbox + Show Bar checkbox
+      style_row = Gtk::Box.new(:horizontal, 5)
+      style_row.pack_start(Gtk::Label.new('Style:'), expand: false, fill: false, padding: 5)
+      @@hp_text_style_combo = Gtk::ComboBoxText.new
+      @@hp_text_style_combo.append_text('overlay')
+      @@hp_text_style_combo.append_text('embedded')
+      current_style = @@config.dig('hp_bar', 'text_style') || 'overlay'
+      @@hp_text_style_combo.active = current_style == 'embedded' ? 1 : 0
+      @@hp_text_style_combo.signal_connect('changed') { apply_hp_settings }
+      style_row.pack_start(@@hp_text_style_combo, expand: false, fill: false, padding: 2)
+      @@hp_show_bar_check = Gtk::CheckButton.new('Bar')
+      @@hp_show_bar_check.active = @@config.dig('hp_bar', 'show_bar') != false
+      @@hp_show_bar_check.signal_connect('toggled') { apply_hp_settings }
+      style_row.pack_start(@@hp_show_bar_check, expand: false, fill: false, padding: 10)
+      @@hp_show_text_check = Gtk::CheckButton.new('Text')
+      @@hp_show_text_check.active = @@config.dig('hp_bar', 'show_text')
+      @@hp_show_text_check.signal_connect('toggled') { apply_hp_settings }
+      style_row.pack_start(@@hp_show_text_check, expand: false, fill: false, padding: 10)
+      # Text position (only for overlay mode)
+      style_row.pack_start(Gtk::Label.new('Pos:'), expand: false, fill: false, padding: 2)
+      @@hp_text_position_combo = Gtk::ComboBoxText.new
+      @@hp_text_position_combo.append_text('Top')
+      @@hp_text_position_combo.append_text('Bottom')
+      text_pos = @@config.dig('hp_bar', 'text_position') || 'top'
+      @@hp_text_position_combo.active = (text_pos == 'bottom' ? 1 : 0)
+      @@hp_text_position_combo.signal_connect('changed') { apply_hp_settings }
+      style_row.pack_start(@@hp_text_position_combo, expand: false, fill: false, padding: 2)
+      hp_tab.pack_start(style_row, expand: false, fill: false, padding: 5)
+
+      # Row: Text format checkboxes
+      text_opts_row = Gtk::Box.new(:horizontal, 5)
+      @@hp_show_hp_prefix_check = Gtk::CheckButton.new('HP:')
+      @@hp_show_hp_prefix_check.active = @@config.dig('hp_bar', 'show_hp_prefix') != false
+      @@hp_show_hp_prefix_check.signal_connect('toggled') { apply_hp_settings }
+      text_opts_row.pack_start(@@hp_show_hp_prefix_check, expand: false, fill: false, padding: 5)
+      @@hp_show_numbers_check = Gtk::CheckButton.new('###/###')
+      @@hp_show_numbers_check.active = @@config.dig('hp_bar', 'show_numbers') != false
+      @@hp_show_numbers_check.signal_connect('toggled') { apply_hp_settings }
+      text_opts_row.pack_start(@@hp_show_numbers_check, expand: false, fill: false, padding: 5)
+      @@hp_show_percentage_check = Gtk::CheckButton.new('(##%)')
+      @@hp_show_percentage_check.active = @@config.dig('hp_bar', 'show_percentage') != false
+      @@hp_show_percentage_check.signal_connect('toggled') { apply_hp_settings }
+      text_opts_row.pack_start(@@hp_show_percentage_check, expand: false, fill: false, padding: 5)
+      hp_tab.pack_start(text_opts_row, expand: false, fill: false, padding: 5)
+
+      # Row: Dimensions (Width, Height, Font Size)
+      dims_row = Gtk::Box.new(:horizontal, 5)
+      dims_row.pack_start(Gtk::Label.new('W:'), expand: false, fill: false, padding: 5)
+      @@hp_width_entry = Gtk::Entry.new
+      @@hp_width_entry.text = (@@config.dig('hp_bar', 'width') || 120).to_s
+      @@hp_width_entry.width_chars = 4
+      @@hp_width_entry.signal_connect('activate') { apply_hp_settings }
+      @@hp_width_entry.signal_connect('focus-out-event') { apply_hp_settings; false }
+      dims_row.pack_start(@@hp_width_entry, expand: false, fill: false, padding: 2)
+      dims_row.pack_start(Gtk::Label.new('H:'), expand: false, fill: false, padding: 5)
+      @@hp_height_entry = Gtk::Entry.new
+      @@hp_height_entry.text = (@@config.dig('hp_bar', 'height') || 16).to_s
+      @@hp_height_entry.width_chars = 4
+      @@hp_height_entry.signal_connect('activate') { apply_hp_settings }
+      @@hp_height_entry.signal_connect('focus-out-event') { apply_hp_settings; false }
+      dims_row.pack_start(@@hp_height_entry, expand: false, fill: false, padding: 2)
+      dims_row.pack_start(Gtk::Label.new('Font:'), expand: false, fill: false, padding: 5)
+      @@hp_font_size_entry = Gtk::Entry.new
+      @@hp_font_size_entry.text = (@@config.dig('hp_bar', 'font_size') || 11).to_s
+      @@hp_font_size_entry.width_chars = 3
+      @@hp_font_size_entry.signal_connect('activate') { apply_hp_settings }
+      @@hp_font_size_entry.signal_connect('focus-out-event') { apply_hp_settings; false }
+      dims_row.pack_start(@@hp_font_size_entry, expand: false, fill: false, padding: 2)
+      hp_tab.pack_start(dims_row, expand: false, fill: false, padding: 5)
+
+      hp_note = Gtk::Label.new
+      hp_note.set_markup("<small><i>Default height: 8px overlay, 25px embedded</i></small>")
+      hp_tab.pack_start(hp_note, expand: false, fill: false, padding: 5)
+
+      notebook.append_page(hp_tab, Gtk::Label.new('HP Bar'))
+
+      # Tab 4: Status Settings
+      status_tab = Gtk::Box.new(:vertical, 5)
+      status_tab.set_margin_top(10)
+      status_tab.set_margin_bottom(10)
+      status_tab.set_margin_left(10)
+      status_tab.set_margin_right(10)
+
+      @@status_show_check = Gtk::CheckButton.new('Show Status')
+      @@status_show_check.active = @@config.dig('status', 'show')
+      @@status_show_check.signal_connect('toggled') { apply_status_settings }
+      status_tab.pack_start(@@status_show_check, expand: false, fill: false, padding: 5)
+
+      status_size_box = Gtk::Box.new(:horizontal, 5)
+      status_size_box.pack_start(Gtk::Label.new('Font Size:'), expand: false, fill: false, padding: 5)
+      @@status_font_size_entry = Gtk::Entry.new
+      @@status_font_size_entry.text = (@@config.dig('status', 'font_size') || 12).to_s
+      @@status_font_size_entry.width_chars = 5
+      @@status_font_size_entry.signal_connect('activate') { apply_status_settings }
+      @@status_font_size_entry.signal_connect('focus-out-event') { apply_status_settings; false }
+      status_size_box.pack_start(@@status_font_size_entry, expand: false, fill: false, padding: 2)
+      status_tab.pack_start(status_size_box, expand: false, fill: false, padding: 5)
+
+      notebook.append_page(status_tab, Gtk::Label.new('Status'))
+
+      @@main_box.pack_start(notebook, expand: false, fill: false, padding: 5)
+
+      # Info label
+      @@info_label = Gtk::Label.new
+      @@info_label.set_markup("<span color='#b0b0b0'><b>Calibrating: #{current_part_name}</b></span>")
+      @@main_box.pack_start(@@info_label, expand: false, fill: false, padding: 5)
+
+      # Navigation and Save buttons
+      nav_box = Gtk::Box.new(:horizontal, 5)
+      @@prev_button = Gtk::Button.new(label: '← Previous')
+      @@prev_button.signal_connect('clicked') { previous_body_part }
+      nav_box.pack_start(@@prev_button, expand: true, fill: true, padding: 0)
+
+      @@next_button = Gtk::Button.new(label: 'Next →')
+      @@next_button.signal_connect('clicked') { next_body_part }
+      nav_box.pack_start(@@next_button, expand: true, fill: true, padding: 0)
+
+      @@save_button = Gtk::Button.new(label: 'Save (S)')
+      @@save_button.signal_connect('clicked') do
+        # Apply all current UI values before saving
+        apply_scale
+        apply_panel_width
+        apply_panel_height if @@panel_height_entry
+        apply_marker_size
+        apply_name_settings
+        apply_hp_settings
+        apply_status_settings
+        # Now save with popup
+        save_config(true)
+      end
+      nav_box.pack_start(@@save_button, expand: true, fill: true, padding: 0)
+      @@main_box.pack_start(nav_box, expand: false, fill: false, padding: 2)
+
+      # Copy UI Settings to All button
+      copy_box = Gtk::Box.new(:horizontal, 5)
+      @@copy_to_all_button = Gtk::Button.new(label: 'Copy UI Settings to All Creatures')
+      @@copy_to_all_button.set_tooltip_text('Copy scale, marker size, panel dimensions, and display settings to all creature configs (preserves body_parts)')
+      @@copy_to_all_button.signal_connect('clicked') { copy_settings_to_all_creatures }
+      copy_box.pack_start(@@copy_to_all_button, expand: true, fill: true, padding: 0)
+      @@main_box.pack_start(copy_box, expand: false, fill: false, padding: 2)
+
+      # Panel preview
+      @@panel_preview_container = create_panel_preview
+      @@main_box.pack_start(@@panel_preview_container, expand: true, fill: true, padding: 5)
+
+      # Instructions
+      instructions = Gtk::Label.new
+      instructions.set_markup("<small><i>Click to position wounds | S: save | Q: quit</i></small>")
+      @@main_box.pack_start(instructions, expand: false, fill: false, padding: 2)
+
+      @@window.add(@@main_box)
+      @@window.signal_connect('key-press-event') { |_widget, event| handle_key_press(event) }
+
+      # Track window position changes and save to config
+      @@window.signal_connect('configure-event') do |_widget, event|
+        # Only save if window is visible and position has actually changed
+        if @@window.visible?
+          @@main_config['calibrator'] ||= {}
+          @@main_config['calibrator']['window_x'] = event.x
+          @@main_config['calibrator']['window_y'] = event.y
+          save_main_config
+        end
+        false
+      end
+
+      @@window.show_all
+
+      # Restore saved window position after showing
+      if @@main_config.dig('calibrator', 'window_x') && @@main_config.dig('calibrator', 'window_y')
+        @@window.move(@@main_config['calibrator']['window_x'], @@main_config['calibrator']['window_y'])
+      end
+    end
+
+    def current_part_name
+      BODY_PARTS[@@current_part_index]
+    end
+
+    def handle_click(x, y)
+      # Center the marker on the click position by subtracting half the marker size
+      marker_size = @@config['marker_size'] || 12
+      half_size = marker_size / 2
+      centered_x = x - half_size
+      centered_y = y - half_size
+
+      # Normalize coordinates to scale 1.0 for storage
+      # This allows coordinates to automatically adjust when scale changes
+      current_scale = @@config['scale'] || 1.0
+      normalized_x = (centered_x / current_scale).round
+      normalized_y = (centered_y / current_scale).round
+
+      # Store normalized (scale 1.0) coordinates
+      @@coordinates[current_part_name] = [normalized_x, normalized_y]
+
+      # Update display - queue these operations
+      Gtk.queue do
+        update_wound_marker
+        update_info_label
+      end
+    end
+
+    def create_panel_preview
+      # Create EXACT panel preview - same dimensions as actual CreatureBar
+      @@panel_frame = Gtk::Frame.new
+      @@panel_frame.set_shadow_type(:etched_in)
+      @@panel_frame.name = 'creature_panel'
+
+      # EXACT panel dimensions as configured
+      panel_width = @@config['panel_width'] || 100
+      panel_height = @@config['panel_height'] || 220
+      @@panel_frame.set_size_request(panel_width, panel_height)
+
+      # Force fixed size - prevent expansion beyond size_request
+      @@panel_frame.width_request = panel_width
+      @@panel_frame.height_request = panel_height
+
+      panel_box = Gtk::Box.new(:vertical, 0)
+      panel_box.set_margin_top(2)
+      panel_box.set_margin_bottom(1)
+      panel_box.set_margin_left(4)
+      panel_box.set_margin_right(4)
+
+      # Name label (top) - use exact settings from per-silhouette config
+      if @@config.dig('name_display', 'show')
+        # Show different preview text based on mode
+        name_mode = @@config.dig('name_display', 'mode') || 'name'
+        preview_text = name_mode == 'noun' ? @@current_family : "#{@@current_family.capitalize} Defender"
+
+        name_label = Gtk::Label.new(preview_text)
+        name_label.name = 'creature_name'
+        name_label.halign = :center
+        name_label.set_max_width_chars(15)
+        name_label.set_ellipsize(Pango::EllipsizeMode::MIDDLE)
+
+        # Apply font settings
+        font_size = @@config.dig('name_display', 'font_size') || 12
+        font_family = @@config.dig('name_display', 'font_family') || ''
+        font_weight = @@config.dig('name_display', 'font_weight') || 'bold'
+        color = @@main_config.dig('colors', 'name_font') || '#FFFFFF'
+
+        markup = "<span"
+        markup += " size='#{font_size * 1024}'" if font_size
+        markup += " font_family='#{font_family}'" unless font_family.empty?
+        markup += " weight='#{font_weight}'" if font_weight
+        markup += " color='#{color}'"
+        markup += ">#{preview_text}</span>"
+        name_label.set_markup(markup)
+
+        panel_box.pack_start(name_label, expand: false, fill: false, padding: 0)
+      end
+
+      # Silhouette area (middle - expands to fill)
+      silhouette_scale = @@config['scale'] || 0.8
+      # Use already-set silhouette_file, or fall back to search
+      @@silhouette_file ||= find_silhouette_file(@@current_family)
+
+      @@layout = Gtk::Layout.new
+      @@layout.add_events(Gdk::EventMask::BUTTON_PRESS_MASK)
+      @@layout.signal_connect('button-press-event') do |_widget, event|
+        handle_click(event.x.to_i, event.y.to_i)
+      end
+
+      if @@silhouette_file && File.exist?(@@silhouette_file)
+        begin
+          @@silhouette_pixbuf = GdkPixbuf::Pixbuf.new(file: @@silhouette_file)
+
+          # Apply scaling
+          scaled_pixbuf = if (silhouette_scale - 1.0).abs > 0.001
+                            new_width = (@@silhouette_pixbuf.width * silhouette_scale).to_i
+                            new_height = (@@silhouette_pixbuf.height * silhouette_scale).to_i
+                            @@silhouette_pixbuf.scale_simple(new_width, new_height, GdkPixbuf::InterpType::BILINEAR)
+                          else
+                            @@silhouette_pixbuf
+                          end
+
+          # Set layout to pixbuf size (keeps calibrator compact)
+          @@layout.set_size_request(scaled_pixbuf.width, scaled_pixbuf.height)
+
+          # Place silhouette at origin
+          @@silhouette_image = Gtk::Image.new(pixbuf: scaled_pixbuf)
+          @@layout.put(@@silhouette_image, 0, 0)
+
+          # Add eyes_back_nerves overlay on top (for back, eyes, nerves positioning)
+          overlay_file = find_overlay_file
+          if overlay_file && File.exist?(overlay_file)
+            overlay_pixbuf = GdkPixbuf::Pixbuf.new(file: overlay_file)
+            # Scale overlay to match silhouette
+            if (silhouette_scale - 1.0).abs > 0.001
+              overlay_pixbuf = overlay_pixbuf.scale_simple(
+                (overlay_pixbuf.width * silhouette_scale).to_i,
+                (overlay_pixbuf.height * silhouette_scale).to_i,
+                GdkPixbuf::InterpType::BILINEAR
+              )
+            end
+            @@overlay_image = Gtk::Image.new(pixbuf: overlay_pixbuf)
+            @@layout.put(@@overlay_image, 0, 0)
+          end
+        rescue StandardError # Silently ignore image loading errors
+          nil
+        end
+      end
+
+      # Center the silhouette
+      silhouette_container = Gtk::Box.new(:horizontal, 0)
+      silhouette_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+      silhouette_container.pack_start(@@layout, expand: false, fill: false, padding: 0)
+      silhouette_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+      panel_box.pack_start(silhouette_container, expand: false, fill: false, padding: 1)
+
+      # HP bar - use exact settings from per-silhouette config (EXACT same logic as CreatureBar)
+      if @@config.dig('hp_bar', 'show') != false
+        text_style = @@config.dig('hp_bar', 'text_style') || 'overlay'
+        show_bar_graphic = @@config.dig('hp_bar', 'show_bar') != false
+        text_position = @@config.dig('hp_bar', 'text_position') || 'top'
+
+        # Create HP label for overlay mode
+        hp_label = nil
+        if text_style == 'overlay' && @@config.dig('hp_bar', 'show_text')
+          hp_label = Gtk::Label.new
+          hp_label.name = 'hp_label'
+          hp_label.halign = :center
+          hp_text_color = @@main_config.dig('colors', 'hp_text') || '#FFFFFF'
+          font_size = (@@config.dig('hp_bar', 'font_size') || 11) * 1024
+          hp_text = build_hp_text(350, 350, 100, @@config.dig('hp_bar'))
+          hp_label.set_markup("<span color='#{hp_text_color}' size='#{font_size}'>#{hp_text}</span>")
+        end
+
+        # Create HP bar graphic (only if show_bar is true)
+        hp_container = nil
+        if show_bar_graphic
+          hp_bar_width = @@config.dig('hp_bar', 'width') || 120
+          # Use configured height for both modes (different defaults)
+          default_height = text_style == 'embedded' ? 25 : 8
+          hp_bar_height = @@config.dig('hp_bar', 'height') || default_height
+
+          hp_bar = Gtk::DrawingArea.new
+          hp_bar.set_size_request(hp_bar_width, hp_bar_height)
+          hp_bar.signal_connect('draw') do |widget, cr|
+            width = widget.allocated_width
+            height = widget.allocated_height
+
+            # Draw background
+            bg_color = parse_color(@@main_config.dig('colors', 'hp_background') || 'rgba(60, 20, 20, 0.9)')
+            cr.set_source_rgba(bg_color[:r], bg_color[:g], bg_color[:b], bg_color[:a])
+            draw_rounded_rect(cr, 0, 0, width, height, 3)
+            cr.fill
+
+            # Draw filled part (100% for preview)
+            fill_color = parse_color(@@main_config.dig('colors', 'hp_high') || '#2E7D32')
+            cr.set_source_rgba(fill_color[:r], fill_color[:g], fill_color[:b], fill_color[:a])
+            draw_rounded_rect(cr, 0, 0, width, height, 3)
+            cr.fill
+
+            # Draw text for embedded mode
+            if text_style == 'embedded' && @@config.dig('hp_bar', 'show_text')
+              text_color = parse_color(@@main_config.dig('colors', 'hp_text') || '#FFFFFF')
+              cr.set_source_rgba(text_color[:r], text_color[:g], text_color[:b], text_color[:a])
+              cr.select_font_face('Sans', Cairo::FONT_SLANT_NORMAL, Cairo::FONT_WEIGHT_BOLD)
+              font_size = @@config.dig('hp_bar', 'font_size') || 11
+              cr.set_font_size(font_size)
+
+              # Build HP text based on config options
+              hp_text = build_hp_text(350, 350, 100, @@config.dig('hp_bar'))
+              extents = cr.text_extents(hp_text)
+              x = (width - extents.width) / 2
+              y = (height / 2) - (extents.height / 2) - extents.y_bearing
+              cr.move_to(x, y)
+              cr.show_text(hp_text)
+            end
+
+            false
+          end
+
+          hp_container = Gtk::Box.new(:horizontal, 0)
+          hp_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+          hp_container.pack_start(hp_bar, expand: false, fill: false, padding: 0)
+          hp_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+        end
+
+        # Pack HP elements based on text_position setting (only affects overlay mode)
+        if text_position == 'bottom'
+          # Bar first, then text below
+          panel_box.pack_start(hp_container, expand: false, fill: false, padding: 0) if hp_container
+          panel_box.pack_start(hp_label, expand: false, fill: false, padding: 0) if hp_label
+        else
+          # Text first (top), then bar below (default)
+          panel_box.pack_start(hp_label, expand: false, fill: false, padding: 0) if hp_label
+          panel_box.pack_start(hp_container, expand: false, fill: false, padding: 0) if hp_container
+        end
+      end
+
+      # Status label - use exact settings from per-silhouette config
+      if @@config.dig('status', 'show')
+        status_label = Gtk::Label.new
+        status_label.name = 'status_label'
+        status_label.halign = :center
+
+        # Use actual status colors from config
+        stunned_color = @@main_config.dig('colors', 'status_stunned') || '#FFD700'
+        immobilized_color = @@main_config.dig('colors', 'status_immobilized') || '#FF69B4'
+        font_size = @@config.dig('status', 'font_size') || 12
+
+        markup = "<span size='#{font_size * 1024}'>"
+        markup += "<span color='#{stunned_color}'>S</span> "
+        markup += "<span color='#{immobilized_color}'>I</span>"
+        markup += "</span>"
+        status_label.set_markup(markup)
+
+        panel_box.pack_start(status_label, expand: false, fill: false, padding: 0)
+      end
+
+      @@panel_frame.add(panel_box)
+
+      # Wrap panel in container that centers it and prevents expansion
+      container = Gtk::Box.new(:vertical, 0)
+      # Add expanding space above
+      container.pack_start(Gtk::Box.new(:vertical, 0), expand: true, fill: true, padding: 0)
+      # Add panel frame with NO expansion
+      container.pack_start(@@panel_frame, expand: false, fill: false, padding: 0)
+      # Add expanding space below
+      container.pack_start(Gtk::Box.new(:vertical, 0), expand: true, fill: true, padding: 0)
+
+      # Center horizontally too
+      h_container = Gtk::Box.new(:horizontal, 0)
+      h_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+      h_container.pack_start(container, expand: false, fill: false, padding: 0)
+      h_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+
+      # Create initial wound marker (only if layout was created successfully)
+      if @@layout && @@silhouette_image
+        update_wound_marker
+      end
+
+      h_container
+    end
+
+    def update_wound_marker
+      # Skip if no layout exists (can happen during panel recreation)
+      return unless @@layout
+
+      # Remove old marker if exists
+      if @@wound_marker
+        # Layout may have been destroyed, just clear the reference
+        @@layout.remove(@@wound_marker) if @@wound_marker.parent == @@layout rescue nil
+        @@wound_marker = nil
+      end
+
+      # Create new marker
+      rank_file = find_rank_file(@@current_rank)
+
+      if rank_file && File.exist?(rank_file)
+        begin
+          pixbuf = GdkPixbuf::Pixbuf.new(file: rank_file)
+
+          # Use marker size from per-family config
+          size = @@config['marker_size'] || 12
+          pixbuf = pixbuf.scale_simple(size, size, GdkPixbuf::InterpType::BILINEAR)
+
+          @@wound_marker = Gtk::Image.new(pixbuf: pixbuf)
+        rescue StandardError
+          @@wound_marker = Gtk::Label.new("R#{@@current_rank}")
+        end
+      else
+        @@wound_marker = Gtk::Label.new("R#{@@current_rank}")
+      end
+
+      # Position at current coordinates
+      coords = @@coordinates[current_part_name]
+
+      if coords && coords.is_a?(Array) && coords.length >= 2
+        # Scale coordinates from normalized (1.0) to current scale for display
+        current_scale = @@config['scale'] || 1.0
+        scaled_x = (coords[0] * current_scale).round
+        scaled_y = (coords[1] * current_scale).round
+
+        @@layout.put(@@wound_marker, [scaled_x, 0].max, [scaled_y, 0].max)
+        @@wound_marker.show
+      else
+        # No coords yet, hide the marker
+        @@wound_marker.hide if @@wound_marker
+      end
+    end
+
+    def update_info_label
+      coords = @@coordinates[current_part_name]
+      part_num = @@current_part_index + 1
+      total = BODY_PARTS.length
+      size = @@config.dig('wound_markers', 'size') || 20
+
+      @@info_label.set_markup(
+        "<span color='#b0b0b0'><big><b>Calibrating: #{current_part_name}</b> (#{part_num}/#{total})</big>\n" +
+        "Coordinates: [#{coords[0]}, #{coords[1]}] | Rank: #{@@current_rank} | Size: #{size}px\n" +
+        "<small>Click on silhouette to reposition</small></span>"
+      )
+    end
+
+    def next_body_part
+      @@current_part_index = (@@current_part_index + 1) % BODY_PARTS.length
+      Gtk.queue do
+        update_wound_marker
+        update_info_label
+      end
+    end
+
+    def previous_body_part
+      @@current_part_index = (@@current_part_index - 1) % BODY_PARTS.length
+      Gtk.queue do
+        update_wound_marker
+        update_info_label
+      end
+    end
+
+    def set_rank(rank)
+      @@current_rank = rank
+      Gtk.queue do
+        update_wound_marker
+        update_info_label
+      end
+    end
+
+    def apply_scale
+      return if @@loading_config # Skip if loading config to prevent overwriting values
+
+      new_scale = @@scale_entry.text.to_f
+      new_scale = [[new_scale, 0.1].max, 5.0].min # Clamp between 0.1 and 5.0
+
+      # Update config
+      @@config['scale'] = new_scale
+
+      # Update entry to show clamped value
+      @@scale_entry.text = new_scale.round(1).to_s
+
+      # Auto-calculate marker size based on scale (14px at scale 1.0)
+      new_marker_size = (14 * new_scale).round.clamp(2, 30)
+      @@config['marker_size'] = new_marker_size
+      @@marker_size_entry.text = new_marker_size.to_s
+
+      Gtk.queue do
+        reload_silhouette
+        update_wound_marker
+      end
+    rescue StandardError
+      nil
+    end
+
+    def apply_panel_width
+      return if @@loading_config # Skip if loading config to prevent overwriting values
+
+      new_width = @@panel_width_entry.text.to_i
+      new_width = [[new_width, 20].max, 300].min # Clamp between 20 and 300
+
+      @@config['panel_width'] = new_width
+      @@panel_width_entry.text = new_width.to_s
+
+      # Update the panel frame size to show new dimensions
+      if @@panel_frame
+        panel_height = @@config['panel_height'] || 220
+        @@panel_frame.set_size_request(new_width, panel_height)
+      end
+
+      update_panel_size_feedback
+    rescue StandardError
+      nil
+    end
+
+    def apply_panel_height
+      return if @@loading_config # Skip if loading config to prevent overwriting values
+
+      new_height = @@panel_height_entry.text.to_i
+      new_height = [[new_height, 20].max, 400].min # Clamp between 20 and 400
+
+      @@config['panel_height'] = new_height
+      @@panel_height_entry.text = new_height.to_s
+
+      # Update the panel frame size to show new dimensions
+      if @@panel_frame
+        panel_width = @@config['panel_width'] || 100
+        @@panel_frame.set_size_request(panel_width, new_height)
+      end
+
+      update_panel_size_feedback
+    rescue StandardError
+      nil
+    end
+
+    def apply_marker_size
+      return if @@loading_config # Skip if loading config to prevent overwriting values
+
+      new_size = @@marker_size_entry.text.to_i
+      new_size = [[new_size, 2].max, 30].min # Clamp between 2 and 30
+
+      @@config['marker_size'] = new_size
+      @@marker_size_entry.text = new_size.to_s
+
+      # Update the wound marker display
+      Gtk.queue do
+        update_wound_marker
+      end
+    rescue StandardError
+      nil
+    end
+
+    def apply_name_settings
+      return if @@loading_config # Skip if loading config to prevent overwriting values
+
+      # Update per-silhouette config
+      @@config['name_display'] ||= {}
+      @@config['name_display']['show'] = @@name_show_check.active?
+      @@config['name_display']['font_size'] = @@name_font_size_entry.text.to_i.clamp(6, 24)
+      @@config['name_display']['font_weight'] = @@name_font_weight_combo.active == 1 ? 'bold' : 'normal'
+      @@config['name_display']['mode'] = @@name_mode_name_radio.active? ? 'name' : 'noun'
+
+      # Update entry to show clamped value
+      @@name_font_size_entry.text = @@config['name_display']['font_size'].to_s
+
+      rebuild_preview
+    rescue StandardError
+      nil
+    end
+
+    def apply_hp_settings
+      return if @@loading_config # Skip if loading config to prevent overwriting values
+
+      # Update per-silhouette config
+      @@config['hp_bar'] ||= {}
+      @@config['hp_bar']['show'] = @@hp_show_check.active?
+      @@config['hp_bar']['show_bar'] = @@hp_show_bar_check.active?
+      @@config['hp_bar']['text_style'] = @@hp_text_style_combo.active == 1 ? 'embedded' : 'overlay'
+      @@config['hp_bar']['show_text'] = @@hp_show_text_check.active?
+      @@config['hp_bar']['text_position'] = @@hp_text_position_combo.active == 1 ? 'bottom' : 'top'
+      @@config['hp_bar']['show_hp_prefix'] = @@hp_show_hp_prefix_check.active?
+      @@config['hp_bar']['show_numbers'] = @@hp_show_numbers_check.active?
+      @@config['hp_bar']['show_percentage'] = @@hp_show_percentage_check.active?
+      @@config['hp_bar']['width'] = @@hp_width_entry.text.to_i.clamp(20, 200)
+      @@config['hp_bar']['height'] = @@hp_height_entry.text.to_i.clamp(4, 40)
+      @@config['hp_bar']['font_size'] = @@hp_font_size_entry.text.to_i.clamp(6, 20)
+
+      # Update entries to show clamped values
+      @@hp_width_entry.text = @@config['hp_bar']['width'].to_s
+      @@hp_height_entry.text = @@config['hp_bar']['height'].to_s
+      @@hp_font_size_entry.text = @@config['hp_bar']['font_size'].to_s
+
+      rebuild_preview
+    rescue StandardError
+      nil
+    end
+
+    def apply_status_settings
+      return if @@loading_config # Skip if loading config to prevent overwriting values
+
+      # Update per-silhouette config
+      @@config['status'] ||= {}
+      @@config['status']['show'] = @@status_show_check.active?
+      @@config['status']['font_size'] = @@status_font_size_entry.text.to_i.clamp(6, 24)
+
+      # Update entry to show clamped value
+      @@status_font_size_entry.text = @@config['status']['font_size'].to_s
+
+      rebuild_preview
+    rescue StandardError
+      nil
+    end
+
+    def save_main_config
+      File.open(CONFIG_FILE, 'w') { |f| f.write(@@main_config.to_yaml) }
+    rescue StandardError
+      nil
+    end
+
+    def update_panel_size_feedback
+      return unless @@panel_size_feedback_label && !@@panel_size_feedback_label.destroyed?
+      return unless @@config
+
+      # Calculate actual content size based on current settings
+      scale = @@config['scale'] || 0.8
+
+      # Get silhouette dimensions
+      silhouette_width = 0
+      silhouette_height = 0
+      if @@silhouette_pixbuf
+        silhouette_width = (@@silhouette_pixbuf.width * scale).to_i
+        silhouette_height = (@@silhouette_pixbuf.height * scale).to_i
+      end
+
+      # Estimate other element heights (font_size * ~1.4 for line height + padding)
+      name_height = @@config.dig('name_display', 'show') ? ((@@config.dig('name_display', 'font_size') || 12) * 1.4).to_i + 2 : 0
+
+      hp_height = 0
+      if @@config.dig('hp_bar', 'show') != false
+        text_style = @@config.dig('hp_bar', 'text_style') || 'overlay'
+        if text_style == 'overlay' && @@config.dig('hp_bar', 'show_text')
+          hp_height += ((@@config.dig('hp_bar', 'font_size') || 11) * 1.4).to_i + 1
+        end
+        if @@config.dig('hp_bar', 'show_bar') != false
+          default_height = text_style == 'embedded' ? 25 : 8
+          hp_height += @@config.dig('hp_bar', 'height') || default_height
+        end
+      end
+
+      status_height = @@config.dig('status', 'show') ? ((@@config.dig('status', 'font_size') || 12) * 1.4).to_i + 2 : 0
+
+      # Calculate total content size
+      # panel_box margins: left=4, right=4, top=2, bottom=1
+      # frame border: 2px each side + GTK internal spacing
+      horizontal_padding = 4 + 4 + 2 + 2 + 2  # margins + border + frame padding = 14
+      vertical_padding = 2 + 1 + 2 + 2 + 7    # margins + border + GTK spacing = 14
+
+      content_width = [silhouette_width, @@config.dig('hp_bar', 'width') || 0].max + horizontal_padding
+      content_height = name_height + silhouette_height + hp_height + status_height + vertical_padding
+
+      # Get configured size
+      configured_width = @@config['panel_width'] || 100
+      configured_height = @@config['panel_height'] || 220
+
+      # Build feedback message
+      width_ok = content_width <= configured_width
+      height_ok = content_height <= configured_height
+
+      if width_ok && height_ok
+        markup = "<small><span color='#88cc88'>Content fits: #{content_width}x#{content_height}px</span></small>"
+      else
+        warnings = []
+        warnings << "W:#{content_width}" unless width_ok
+        warnings << "H:#{content_height}" unless height_ok
+        markup = "<small><span color='#ffaa44'>Content needs: #{content_width}x#{content_height}px</span></small>"
+      end
+
+      Gtk.queue do
+        @@panel_size_feedback_label.set_markup(markup) if @@panel_size_feedback_label && !@@panel_size_feedback_label.destroyed?
+      end
+    rescue StandardError
+      nil # Silently fail
+    end
+
+    def rebuild_preview
+      # Completely recreate the panel preview with new settings
+      # This is called when name/hp/status settings change
+      return if @@loading_config # Skip if loading config to prevent rebuilding with inconsistent values
+      return unless @@running
+      return unless @@main_box && @@panel_preview_container
+      return if @@main_box.destroyed? || @@panel_preview_container.destroyed?
+
+      Gtk.queue do
+        next unless @@running
+        next if @@main_box.destroyed? || @@panel_preview_container.destroyed?
+
+        # Remove old panel preview
+        @@main_box.remove(@@panel_preview_container)
+        @@panel_preview_container.destroy
+
+        # Create new panel preview with updated settings
+        @@panel_preview_container = create_panel_preview
+
+        # Re-insert it in the right position (before instructions)
+        children = @@main_box.children
+        instructions_index = children.size - 1 # Instructions is last
+        @@main_box.pack_start(@@panel_preview_container, expand: true, fill: true, padding: 5)
+        @@main_box.reorder_child(@@panel_preview_container, instructions_index)
+
+        @@panel_preview_container.show_all
+
+        # Update size feedback after rebuild
+        update_panel_size_feedback
+      end
+    end
+
+    def change_family(display_name)
+      # Look up the silhouette info from the map
+      info = @@silhouette_map[display_name]
+      if info
+        @@current_family = info[:family]
+        @@current_subfolder = info[:subfolder]
+        @@silhouette_file = info[:path]
+      else
+        # Fallback for legacy/direct family names
+        @@current_family = display_name
+        @@current_subfolder = nil
+        @@silhouette_file = find_silhouette_file(display_name)
+      end
+
+      # Block signal handlers during config load to prevent UI updates from triggering apply functions
+      @@loading_config = true
+
+      # Reload config for new silhouette (uses @@current_family and @@current_subfolder)
+      load_config(@@current_family)
+
+      # Update UI with new values - Silhouette settings
+      @@scale_entry.text = (@@config['scale'] || 0.8).round(1).to_s
+      @@panel_width_entry.text = (@@config['panel_width'] || 100).to_s
+      @@panel_height_entry.text = (@@config['panel_height'] || 220).to_s if @@panel_height_entry
+      @@marker_size_entry.text = (@@config['marker_size'] || 12).to_s
+
+      # Update HP bar UI fields
+      if @@config['hp_bar']
+        @@hp_show_check.active = @@config['hp_bar']['show'] != false
+        @@hp_show_bar_check.active = @@config['hp_bar']['show_bar'] != false
+        @@hp_text_style_combo.active = (@@config['hp_bar']['text_style'] == 'embedded' ? 1 : 0)
+        @@hp_show_text_check.active = @@config['hp_bar']['show_text'] != false
+        text_pos = @@config['hp_bar']['text_position'] || 'top'
+        @@hp_text_position_combo.active = (text_pos == 'bottom' ? 1 : 0)
+        @@hp_show_hp_prefix_check.active = @@config['hp_bar']['show_hp_prefix'] != false
+        @@hp_show_numbers_check.active = @@config['hp_bar']['show_numbers'] != false
+        @@hp_show_percentage_check.active = @@config['hp_bar']['show_percentage'] != false
+        @@hp_width_entry.text = (@@config['hp_bar']['width'] || 120).to_s
+        @@hp_height_entry.text = (@@config['hp_bar']['height'] || 16).to_s
+        @@hp_font_size_entry.text = (@@config['hp_bar']['font_size'] || 11).to_s
+      end
+
+      # Update name display UI fields
+      if @@config['name_display']
+        @@name_show_check.active = @@config['name_display']['show'] != false
+        font_size_value = @@config['name_display']['font_size'] || 8
+        @@name_font_size_entry.text = font_size_value.to_s
+
+        weight_value = @@config['name_display']['font_weight']
+        weight_index = (weight_value == 'bold' ? 1 : 0)
+        @@name_font_weight_combo.active = weight_index
+
+        # Update radio buttons for mode
+        mode = @@config['name_display']['mode'] || 'name'
+        if mode == 'noun'
+          @@name_mode_noun_radio.active = true
+        else
+          @@name_mode_name_radio.active = true
+        end
+      end
+
+      # Update status UI fields
+      if @@config['status']
+        @@status_show_check.active = @@config['status']['show'] != false
+        @@status_font_size_entry.text = (@@config['status']['font_size'] || 8).to_s
+      end
+
+      # Unblock signal handlers - config load is complete
+      @@loading_config = false
+
+      # Reload silhouette
+      Gtk.queue do
+        reload_silhouette
+        @@current_part_index = 0
+        update_info_label
+        update_wound_marker
+        rebuild_preview
+      end
+    end
+
+    def reload_silhouette
+      # Don't operate on destroyed widgets
+      return unless @@running
+      return unless @@layout && !@@layout.destroyed?
+
+      # @@silhouette_file is already set by change_family, just verify it exists
+      return unless @@silhouette_file && File.exist?(@@silhouette_file)
+
+      @@silhouette_pixbuf = GdkPixbuf::Pixbuf.new(file: @@silhouette_file) rescue nil
+      return unless @@silhouette_pixbuf
+
+      # Get current scale
+      scale = @@config['scale'] || 0.8
+
+      # Scale the pixbuf
+      scaled_pixbuf = if (scale - 1.0).abs > 0.001
+                        new_width = (@@silhouette_pixbuf.width * scale).to_i
+                        new_height = (@@silhouette_pixbuf.height * scale).to_i
+                        @@silhouette_pixbuf.scale_simple(new_width, new_height, GdkPixbuf::InterpType::BILINEAR)
+                      else
+                        @@silhouette_pixbuf
+                      end
+      scaled_pixbuf ||= @@silhouette_pixbuf
+
+      return unless scaled_pixbuf && scaled_pixbuf.width > 0 && scaled_pixbuf.height > 0
+
+      # Update layout size to match new scaled image
+      @@layout.set_size_request(scaled_pixbuf.width, scaled_pixbuf.height) if @@layout && !@@layout.destroyed?
+
+      # Remove old image, overlay, and marker
+      @@layout.remove(@@silhouette_image) if @@silhouette_image && @@layout && !@@layout.destroyed?
+      @@layout.remove(@@overlay_image) if @@overlay_image && @@layout && !@@layout.destroyed?
+      @@layout.remove(@@wound_marker) if @@wound_marker && @@layout && !@@layout.destroyed?
+
+      # Add new image at 0,0 (layout is already sized to match)
+      if @@layout && !@@layout.destroyed?
+        @@silhouette_image = Gtk::Image.new(pixbuf: scaled_pixbuf)
+        @@layout.put(@@silhouette_image, 0, 0)
+        @@silhouette_image.show
+
+        # Add eyes_back_nerves overlay on top
+        overlay_file = find_overlay_file
+        if overlay_file && File.exist?(overlay_file)
+          begin
+            overlay_pixbuf = GdkPixbuf::Pixbuf.new(file: overlay_file)
+            if (scale - 1.0).abs > 0.001
+              overlay_pixbuf = overlay_pixbuf.scale_simple(
+                (overlay_pixbuf.width * scale).to_i,
+                (overlay_pixbuf.height * scale).to_i,
+                GdkPixbuf::InterpType::BILINEAR
+              )
+            end
+            @@overlay_image = Gtk::Image.new(pixbuf: overlay_pixbuf)
+            @@layout.put(@@overlay_image, 0, 0)
+            @@overlay_image.show
+          rescue StandardError
+            nil
+          end
+        end
+      end
+
+      # Use configured panel dimensions (no auto-adjustment - user controls size)
+      if @@panel_frame && !@@panel_frame.destroyed?
+        panel_width = @@config['panel_width'] || 100
+        panel_height = @@config['panel_height'] || 220
+        @@panel_frame.set_size_request(panel_width, panel_height)
+      end
+
+      # Update wound marker
+      update_wound_marker
+
+      # Update size feedback
+      update_panel_size_feedback
+    end
+
+    def handle_key_press(event)
+      case event.keyval
+      when Gdk::Keyval::KEY_Left
+        previous_body_part
+      when Gdk::Keyval::KEY_Right
+        next_body_part
+      when Gdk::Keyval::KEY_s, Gdk::Keyval::KEY_S
+        save_config
+      when Gdk::Keyval::KEY_q, Gdk::Keyval::KEY_Q
+        stop
+        Script.kill('CreatureBarCalibrate') if Script.running?('CreatureBarCalibrate')
+      end
+    end
+
+    def show_message(text)
+      dialog = Gtk::MessageDialog.new(
+        parent: @@window,
+        flags: :modal,
+        type: :info,
+        buttons: :ok,
+        message: text
+      )
+      dialog.run
+      dialog.destroy
+    end
+
+    def run
+      respond "Starting CreatureBar Calibrator..."
+      respond "Silhouette directory: #{SILHOUETTE_DIR}"
+
+      @@running = true
+
+      # Ensure current_family is valid
+      available = get_available_silhouettes
+      unless available.include?(@@current_family)
+        @@current_family = available.first || 'default'
+      end
+
+      Gtk.queue do
+        load_config
+        # Block signal handlers during UI creation to prevent them from corrupting @@config
+        @@loading_config = true
+        create_window
+        # Unblock signal handlers after UI is fully created
+        @@loading_config = false
+      end
+
+      respond "\nCalibration Instructions:"
+      respond "  - Click on silhouette to position wound markers"
+      respond "  - Use arrow keys or buttons to navigate body parts"
+      respond "  - Press 1/2/3 to preview different wound ranks"
+      respond "  - Use +/- buttons to adjust marker size and silhouette scale"
+      respond "  - Press 'S' or click Save to save all settings"
+      respond "  - Press 'Q' to quit"
+      respond "\nBody parts to calibrate: #{BODY_PARTS.join(', ')}"
+    end
+
+    def running?
+      @@running
+    end
+
+    def stop
+      return unless @@running
+
+      respond "Stopping CreatureBar Calibrator..."
+      @@running = false
+
+      # Clean up pixbuf references to free memory
+      @@silhouette_pixbuf = nil
+      @@silhouette_image = nil
+      @@overlay_image = nil
+      @@wound_marker = nil
+      @@layout = nil
+      @@config = nil
+      @@coordinates = nil
+      @@silhouette_map = {}
+      @@current_subfolder = nil
+
+      if @@window
+        begin
+          Gtk.queue do
+            @@window.destroy if @@window && !@@window.destroyed?
+            @@window = nil
+          end
+        rescue
+          @@window = nil
+        end
+      end
+
+      # Explicit GC to release pixbuf memory
+      GC.start
+
+      # Kill the script to ensure cleanup
+      script_name = Script.current.name rescue 'creaturebarcalibrate'
+      Script.kill(script_name) if Script.running?(script_name)
+    end
+
+    # Helper methods for panel preview (matching CreatureBar exactly)
+    def build_hp_text(current_hp, max_hp, percentage, hp_config)
+      return '' unless hp_config
+
+      parts = []
+      parts << 'HP:' if hp_config['show_hp_prefix']
+      parts << "#{current_hp}/#{max_hp}" if hp_config['show_numbers']
+      parts << "(#{percentage}%)" if hp_config['show_percentage']
+
+      parts.join(' ')
+    end
+
+    def parse_color(color_string)
+      # Parse color string (hex or rgba) into normalized RGBA values
+      if color_string.start_with?('#')
+        # Hex format
+        hex = color_string.gsub('#', '')
+        r = hex[0..1].to_i(16) / 255.0
+        g = hex[2..3].to_i(16) / 255.0
+        b = hex[4..5].to_i(16) / 255.0
+        a = 1.0
+      elsif color_string.start_with?('rgba(')
+        # RGBA format: rgba(r, g, b, a)
+        values = color_string.match(/rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)/)
+        r = values[1].to_f / 255.0
+        g = values[2].to_f / 255.0
+        b = values[3].to_f / 255.0
+        a = values[4].to_f
+      else
+        # Default to white
+        r = g = b = a = 1.0
+      end
+      { r: r, g: g, b: b, a: a }
+    end
+
+    def draw_rounded_rect(cr, x, y, width, height, radius)
+      # Draw a rounded rectangle path
+      degrees = Math::PI / 180.0
+
+      cr.new_sub_path
+      cr.arc(x + width - radius, y + radius, radius, -90 * degrees, 0 * degrees)
+      cr.arc(x + width - radius, y + height - radius, radius, 0 * degrees, 90 * degrees)
+      cr.arc(x + radius, y + height - radius, radius, 90 * degrees, 180 * degrees)
+      cr.arc(x + radius, y + radius, radius, 180 * degrees, 270 * degrees)
+      cr.close_path
+    end
+  end
+end
+
+# Script execution
+if Script.current.name.downcase == 'calibrate_creaturebar'
+  begin
+    require 'gtk3'
+  rescue LoadError
+    echo "Error: GTK3 gem not found. Install with: gem install gtk3"
+    exit
+  end
+
+  # Ensure cleanup on script termination
+  before_dying do
+    CreatureBarCalibrate.stop
+  end
+
+  Signal.trap("INT") { CreatureBarCalibrate.stop }
+  Signal.trap("TERM") { CreatureBarCalibrate.stop }
+
+  CreatureBarCalibrate.run
+
+  # Keep script alive
+  script_name = Script.current.name
+  loop do
+    sleep 1
+    break unless Script.running?(script_name) && CreatureBarCalibrate.running?
+  end
+
+  CreatureBarCalibrate.stop
+end
