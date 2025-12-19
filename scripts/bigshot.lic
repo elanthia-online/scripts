@@ -25,6 +25,7 @@
     - reworked debug process
     - refactor attack loop for followers
     - only call group open call if grouped
+    - refactor escape from oozes, crawlers, and roa'ters
   v5.10.0  (2025-10-31)
     - update BSAreaRooms
     - fix MA so leader has group open
@@ -2228,7 +2229,7 @@ class Bigshot
                 :GROUP_DEADER, :NEVER_LOOT, :RANDOM_LOOT, :BANDIT_HUNTING, :INDEPENDENT_TRAVEL, :INDEPENDENT_RETURN, :DESIGNATED_LOOTER, :CONTAINERS,
                 :REMAINING_SKINS, :SKIN, :BUNDLE_SKIN, :GEM, :GEM_NUMBER, :TRACKING_CREATURE, :BOUNTY_EVAL, :CHECK_FAVOR,
                 :DEBUG_COMBAT, :DEBUG_COMMANDS, :DEBUG_STATUS, :DEBUG_SYSTEM, :DEBUG_FILE, :debug_logger, :LAST_CALLED, :REST_PREP, :FINAL_LOOT,
-                :COMMAND_AMOUNT_CHECKS, :COMMAND_BUFF_CHECKS, :COMMAND_MODIFIER_REGEX, :COMMAND_AMOUNT_REGEX, :COMMAND_BUFF_REGEX
+                :COMMAND_AMOUNT_CHECKS, :COMMAND_BUFF_CHECKS, :COMMAND_MODIFIER_REGEX, :COMMAND_AMOUNT_REGEX, :COMMAND_BUFF_REGEX, :DAGGER_REGEX, :BLUNT_REGEX
 
   PRONE ||= /sleeping|webbed|stunned|kneeling|sitting|^lying|prone|frozen|held in place|entangled/
 
@@ -2645,6 +2646,27 @@ class Bigshot
 
     @TRACKING_CREATURE = options[0].gsub(/(solo|bounty|quick|single|head|tail)\s*/i, '').strip
     @BANDIT_NOUN_REGEX = /bandit|brigand|robber|thug|thief|rogue|outlaw|mugger|marauder|highwayman/i
+
+    @DAGGER_REGEX = /alfange|basilard|bodkin|cinquedea|dagger|dirk|knife|kozuka|ice pick|misericord|parazonium|pavade|poignard|pugio|scramasax|sgian achlais|spike|stiletto|tanto|sidearm-of-Onar/i
+    @BLUNT_REGEX = Regexp.union(
+      # Blunt Weapons
+      /\b(?:whip|bull whip|cat o' nine tails|signal whip|single-tail whip|training whip)\b/, # whip - crush
+      # /\b(?:crowbill|hakapik|skull-piercer)\b/, # crowbill - puncture/crush
+      /\b(?:cudgel|aklys|baculus|club|jo stick|lisan|periperiu|shillelagh|tambara|truncheon|waihaka|war club)\b/, # cudgel - crush
+      /\b(?:mace|bulawa|dhara|flanged mace|knee-breaker|massuelle|mattina|nifa otti|ox mace|pernat|quadrelle|ridgemace|studded mace)\b/, # mace - crush
+      /\b(?:ball and chain|binnol|goupillon|mace and chain)\b/, # ball and chain - crush
+      # /\b(?:war hammer|fang|hammerbeak|hoolurge|horseman's hammer|skull-crusher|taavish)\b/, # war hammer - puncture/crush
+      /\b(?:morning star|spiked mace|holy water sprinkler|spikestar)\b/, # morning star - crush/puncture
+      # Brawling Weapons
+      /\b(?:cestus)\b/, # cestus - crush
+      /\b(?:knuckle-duster|knuckle guard|\w+ knuckles)\b/, # knuckle-duster - crush
+      /\b(?:blackjack|bludgeon|sap)\b/, # blackjack - crush
+      # Two-handed Weapons
+      /\b(?:runestaff|asaya|crook|crosier|pastoral staff|rune staff|scepter|staff|staff-of-Lumnis|walking stick)\b/, # runestaff - crush
+      /\b(?:quaterstaff|bo stick|toyak|walking staff|warstaff|yoribo)\b/, # quarterstaff - crush
+      /\b(?:war mattock|mattock|oncin|pickaxe|sabar)\b/, # war mattock - crush
+      /\b(?:maul|battle hammer|footman's hammer|sledgehammer|tetsubo)\b/, # maul - crush
+    )
 
     if options.any? { |var| var =~ /bounty/i }
       @BOUNTY_MODE = true
@@ -7521,12 +7543,12 @@ class Bigshot
   def escape_rooms
     # Used to escape from Roa'ter swallowing
     unless checkroom("The Belly of the Beast").nil?
-      roater_escape()
+      creature_escape('worm')
     end
 
     # Used to escape from Hinterwilds Ooze swallowing
     unless checkroom("Ooze, Innards").nil?
-      ooze_escape()
+      creature_escape('ooze')
     end
 
     # Used to escape a Temporal Rift due to failed 930 casting
@@ -7535,112 +7557,118 @@ class Bigshot
     end
   end
 
-  def roater_escape()
-    debug_msg(@DEBUG_COMBAT, "roater_escape")
+  def find_escape_weapon(creature)
+    weapon = nil
+    weapon_container = nil
+    weapon_regex = creature == 'worm' ? @DAGGER_REGEX : @BLUNT_REGEX
 
-    dagger_found = false
-    container_ids = []
-    empty_hands
-    res = Lich::Util.quiet_command_xml("inventory containers", /Your worn items are:/, /<prompt time=/)
-    res.each { |l|
-      container_ids = l.scan(/<a exist=\"([^\"]+)\"/).flatten if (l =~ /<a exist=\"([^\"]+)\"/)
-    }
-    find_all_containers_var = container_ids.collect { |id| GameObj[id] }
-    find_all_containers_var.each { |i|
-      if i.contents.nil?
-        res = Lich::Util.quiet_command_xml("look in ##{i.id}", /In the|There is nothing|This|is closed|shut too tightly/, /<prompt time=/)
-        if res.any? { |line| line =~ /is closed|shut too tightly/i } # do we want it to open containers to look for daggers?
-          Lich::Util.quiet_command_xml("open ##{i.id}", /<a exist=/, /<prompt time=/)
-          Lich::Util.quiet_command_xml("look in ##{i.id}", /In the|There is nothing|This/, /<prompt time=/)
-        end
+    res = Lich::Util.quiet_command_xml("inventory containers", /You are (wearing|holding)/, /<prompt time=/)
+    container_ids = res.flat_map { |l| l.scan(/<a exist=\"([^\"]+)\"/) }.flatten
+    containers = container_ids.map { |id| GameObj[id] }
+
+    # Loop thru open containers first
+    containers.each do |container|
+      next if container.contents.nil?
+
+      container.contents.each do |item|
+        next unless item.name =~ weapon_regex && item.type.include?("weapon")
+
+        weapon = item
+        weapon_container = container
+        break
       end
-      i.contents.each { |s|
-        if s.name =~ /alfange|basilard|bodkin|cinquedea|dagger|dirk|knife|kozuka|ice pick|misericord|parazonium|pavade|poignard|pugio|scramasax|sgian achlais|spike|stiletto|tanto|sidearm-of-Onar/i
-          fput "_drag ##{s.id} right"
-          dagger_found = true if (checkright =~ /#{s.noun}/)
-          while !checkroom("The Belly of the Beast").nil?
-            waitrt?
-            fput "attack wall"
-          end
-          fput "_drag ##{s.id} ##{i.id}"
-          break
-        end
-      }
-      break if dagger_found
-    }
-    fill_hands
-  end
 
-  def ooze_escape
-    debug_msg(@DEBUG_COMBAT, "ooze_escape")
-
-    weapon_found = false
-    container_ids = []
-    weapon_nouns = Regexp.union(
-      # Blunt Weapons
-      /\b(?:whip|bull whip|cat o' nine tails|signal whip|single-tail whip|training whip)\b/, # whip - crush
-      # /\b(?:crowbill|hakapik|skull-piercer)\b/, # crowbill - puncture/crush
-      /\b(?:cudgel|aklys|baculus|club|jo stick|lisan|periperiu|shillelagh|tambara|truncheon|waihaka|war club)\b/, # cudgel - crush
-      /\b(?:mace|bulawa|dhara|flanged mace|knee-breaker|massuelle|mattina|nifa otti|ox mace|pernat|quadrelle|ridgemace|studded mace)\b/, # mace - crush
-      /\b(?:ball and chain|binnol|goupillon|mace and chain)\b/, # ball and chain - crush
-      # /\b(?:war hammer|fang|hammerbeak|hoolurge|horseman's hammer|skull-crusher|taavish)\b/, # war hammer - puncture/crush
-      /\b(?:morning star|spiked mace|holy water sprinkler|spikestar)\b/, # morning star - crush/puncture
-      # Brawling Weapons
-      /\b(?:cestus)\b/, # cestus - crush
-      /\b(?:knuckle-duster|knuckle guard|\w+ knuckles)\b/, # knuckle-duster - crush
-      /\b(?:blackjack|bludgeon|sap)\b/, # blackjack - crush
-      # Two-handed Weapons
-      /\b(?:runestaff|asaya|crook|crosier|pastoral staff|rune staff|scepter|staff|staff-of-Lumnis|walking stick)\b/, # runestaff - crush
-      /\b(?:quaterstaff|bo stick|toyak|walking staff|warstaff|yoribo)\b/, # quarterstaff - crush
-      /\b(?:war mattock|mattock|oncin|pickaxe|sabar)\b/, # war mattock - crush
-      /\b(?:maul|battle hammer|footman's hammer|sledgehammer|tetsubo)\b/, # maul - crush
-    )
-    waitrt?
-    result = dothistimeout('kill organ', 3, /causing the ooze around you to convulse violently!|but the spongey amorphous organ is impervious to this kind of attack!/)
-    case result
-    when /causing the ooze around you to convulse violently!/
-      while !checkroom('Ooze, Innards').nil?
-        waitrt?
-        fput 'kill organ'
-      end
-      return true
-    when /but the spongey amorphous organ is impervious to this kind of attack!/
-      empty_hands
-    else
-      echo "ooze_escape error, result: #{result}"
-      echo "Please report issue and you're on your own for escaping for now!"
-      sleep(0.5) until checkroom('Ooze, Innards').nil?
-      return true
+      break if weapon
     end
 
-    res = Lich::Util.quiet_command_xml("inventory containers", /Your worn items are:/, /<prompt time=/)
-    res.each { |l|
-      container_ids = l.scan(/<a exist=\"([^\"]+)\"/).flatten if (l =~ /<a exist=\"([^\"]+)\"/)
-    }
-    find_all_containers_var = container_ids.collect { |id| GameObj[id] }
-    find_all_containers_var.each { |i|
-      if i.contents.nil?
-        res = Lich::Util.quiet_command_xml("look in ##{i.id}", /In the|There is nothing|This|is closed|shut too tightly/, /<prompt time=/)
-        if res.any? { |line| line =~ /is closed|shut too tightly/i } # do we want it to open containers to look for daggers?
-          Lich::Util.quiet_command_xml("open ##{i.id}", /<a exist=/, /<prompt time=/)
-          Lich::Util.quiet_command_xml("look in ##{i.id}", /In the|There is nothing|This/, /<prompt time=/)
-        end
-      end
-      i.contents.each { |s|
-        if s.name =~ weapon_nouns
-          fput "_drag ##{s.id} right"
-          weapon_found = true if (checkright =~ /#{s.noun}/)
-          while !checkroom('Ooze, Innards').nil?
-            waitrt?
-            fput 'kill organ'
-          end
-          fput "_drag ##{s.id} ##{i.id}"
+    unless weapon
+      containers.each do |container|
+        next unless container.contents.nil?
+
+        Lich::Util.quiet_command_xml("open ##{container.id}", /<a exist=/, /<prompt time=/)
+        Lich::Util.quiet_command_xml("look in ##{container.id}", /In the|There is nothing|This/, /<prompt time=/)
+
+        container.contents.each do |item|
+          next unless item.name =~ weapon_regex && item.type.include?("weapon")
+
+          weapon = item
+          weapon_container = container
           break
         end
-      }
-      break if weapon_found
+
+        break if weapon
+      end
+    end
+
+    [weapon, weapon_container]
+  end
+
+  def creature_escape(creature)
+    debug_msg(@DEBUG_COMBAT, "creature_escape | #{creature}")
+
+    weapon = nil
+    container = nil
+
+    creature_config = {
+      'worm' => { attack_cmd: 'attack wall', room: 'The Belly of the Beast', weapon_regex: @DAGGER_REGEX },
+      'ooze'   => { attack_cmd: 'kill organ', room: 'Ooze, Innards', weapon_regex: @BLUNT_REGEX }
     }
-    fill_hands
+
+    config = creature_config[creature]
+
+    # If we have the correct type in our right hand just use it
+    right_hand = GameObj.right_hand
+    if right_hand.name != "Empty" && right_hand.name =~ config[:weapon_regex] && right_hand.type.include?("weapon")
+      weapon = right_hand
+    end
+
+    if weapon.nil?
+      empty_hands
+      weapon, container = find_escape_weapon(creature)
+    end
+
+    unless weapon
+      # Is there another way out if no weapon available?
+      respond
+      message('yellow', 'No escape weapon found!')
+      respond
+
+      fput "stow right" if checkright
+      fput "stow left" if checkleft
+
+      fill_hands
+      sleep 1 until checkroom(config[:room]).nil?
+      return
+    end
+
+    # Try to get the weapon
+    5.times do
+      break if GameObj.right_hand.id == weapon.id
+      fput "_drag ##{weapon.id} right"
+      sleep 0.2
+    end
+
+    unless GameObj.right_hand.id == weapon.id
+      respond
+      message('yellow', 'Failed to wield escape weapon!')
+      respond
+
+      fput "stow all"
+      fill_hands
+      sleep 1 until checkroom(config[:room]).nil?
+      return
+    end
+
+    while checkroom(config[:room])
+      waitrt?
+      result = fput config[:attack_cmd]
+      break if result =~ /What were you referring to/
+    end
+
+    if container
+      fput "_drag ##{weapon.id} ##{container.id}"
+      fill_hands
+    end
   end
 
   def temporal_escape()
