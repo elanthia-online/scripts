@@ -1,0 +1,491 @@
+#quiet
+=begin
+
+   Implements aliases for Lich.
+
+   Start the script and type ;alias help
+
+   author: Tillmen (tillmen@lichproject.org)
+   game: any
+   tags: core
+   required: Lich >= 4.6.0
+   version: 0.8
+
+   changelog:
+      0.8 (2018-08-29):
+         fixes for compatibility with Ruby >= 2.3
+      0.7 (2015-08-31):
+         make triggers case-insensitive
+      0.6 (2015-03-10):
+         don't allow the script to run as trusted
+         update trigger regex after deleting a trigger
+
+=end
+=begin
+
+      0.5 (2015-02-01):
+         add gui
+      0.4 (2014-11-13):
+         remove leading spaces before sending the alias target
+      0.3 (2014-11-07):
+         sort ;alias list
+      0.2 (2014-10-05):
+         don't crash from recursive aliases 
+
+=end
+
+$SAFE = 3 if ($SAFE < 3) and (RUBY_VERSION =~ /^2\.[012]\./)
+
+if script.vars[1] =~ /^stop/i
+   if UpstreamHook.list.include('alias-service')
+      UpstreamHook.remove('alias-service')
+      respond "\n--- Lich: alias service stopped\n\n"
+   else
+      respond "\n--- Lich: alias service is not running\n\n"
+   end
+   exit
+end
+
+db = Script.open_file('db3')
+character = "#{XMLData.game.downcase}_#{XMLData.name.downcase}".gsub(/[^a-z_]/, '').encode('UTF-8')
+
+db.execute("CREATE TABLE IF NOT EXISTS global (trigger TEXT NOT NULL, target TEXT NOT NULL, UNIQUE(trigger));")
+db.execute("CREATE TABLE IF NOT EXISTS #{character} (trigger TEXT NOT NULL, target TEXT NOT NULL, UNIQUE(trigger));")
+
+character_regex = nil
+global_regex = nil
+
+update_regex = proc {
+   global_regex = Array.new
+   db.execute("SELECT trigger FROM global;") do |row|
+      global_regex.push(Regexp.escape(row[0]))
+   end
+   if global_regex.empty?
+      global_regex = nil
+   else
+      global_regex = /^(?:<c>)?(#{global_regex.join('|')})(?:\s+|$)(.*)/i
+   end
+
+   character_regex = Array.new
+   db.execute("SELECT trigger FROM #{character};") do |row|
+      character_regex.push(Regexp.escape(row[0]))
+   end
+   if character_regex.empty?
+      character_regex = nil
+   else
+      character_regex = /^(?:<c>)?(#{character_regex.join('|')})(?:\s+|$)(.*)/i
+   end
+   true
+}
+
+update_regex.call
+
+hook_proc = proc { |client_string|
+   if client_string =~ /^(?:<c>)?#{$lich_char}alias\s+(.*)/
+      args = $1
+      if (args == 'setup') and defined?(Gtk)
+         if defined?($alias_setup_window) and not $alias_setup_window.nil?
+            $alias_setup_window.present # fixme: show window
+         else
+            Thread.new {
+               done = false
+               Gtk.queue {
+                  character     = "#{XMLData.game.downcase}_#{XMLData.name.downcase}".gsub(/[^a-z_]/, '').encode('UTF-8')
+                  char_aliases  = Array.new
+                  db.execute("SELECT trigger,target FROM #{character};") do |row|
+                     char_aliases.push [ row[0], row[1] ]
+                  end
+                  char_aliases.sort! { |a,b| a[0].to_s <=> b[0].to_s }
+                  char_table     = Gtk::Table.new((char_aliases.length + 1), 3)
+                  char_textboxes = Array.new
+                  char_aliases.each_index { |i|
+                     label = Gtk::Label.new(char_aliases[i][0].to_s)
+                     box   = Gtk::HBox.new
+                     box.pack_end(label, false, false, 0)
+                     char_table.attach(box, 0, 1, i, (i + 1), Gtk::FILL, Gtk::FILL, 3, 3)
+                     textbox      = Gtk::Entry.new
+                     textbox.text = char_aliases[i][1]
+                     char_table.attach(textbox, 1, 2, i, (i + 1), (Gtk::EXPAND|Gtk::FILL), Gtk::FILL, 3, 3)
+                     char_textboxes[i] = textbox
+                     delete_button = Gtk::Button.new(Gtk::Stock::DELETE)
+                     char_table.attach(delete_button, 2, 3, i, (i + 1), Gtk::SHRINK, Gtk::FILL, 3, 3)
+                     delete_button.signal_connect('clicked') {
+                        report_errors {
+                           label.sensitive = false
+                           textbox.sensitive = false
+                           delete_button.sensitive = false
+                           char_textboxes[i] = nil
+                        }
+                     }
+                  }
+                  new_char_aliases = Array.new
+                  char_sw = nil
+                  add_new_char_row = proc {
+                     i = new_char_aliases.length
+                     char_table.n_rows = char_table.n_rows + 1
+                     label = Gtk::Entry.new
+                     label.text = "(new alias trigger)"
+                     char_table.attach(label, 0, 1, (char_table.n_rows - 1), char_table.n_rows, Gtk::FILL, Gtk::FILL, 3, 3)
+                     textbox = Gtk::Entry.new
+                     textbox.text = "(new alias target)"
+                     textbox.sensitive = false
+                     char_table.attach(textbox, 1, 2, (char_table.n_rows - 1), char_table.n_rows, (Gtk::EXPAND|Gtk::FILL), Gtk::FILL, 3, 3)
+                     new_char_aliases[i] = [ label, textbox ]
+                     delete_button = Gtk::Button.new(Gtk::Stock::DELETE)
+                     delete_button.sensitive = false
+                     char_table.attach(delete_button, 2, 3, (char_table.n_rows - 1), char_table.n_rows, Gtk::SHRINK, Gtk::FILL, 3, 3)
+                     label.show
+                     textbox.show
+                     delete_button.show
+                     label.signal_connect('focus-in-event') {
+                        report_errors {
+                           if label.text == "(new alias trigger)"
+                              label.text = ''
+                           end
+                           unless textbox.sensitive?
+                              textbox.sensitive = true
+                              delete_button.sensitive = true
+                              add_new_char_row.call
+                              Thread.new {
+                                 sleep 0.05
+                                 inc = (char_sw.vadjustment.upper - char_sw.vadjustment.value - char_sw.vadjustment.page_size) / 10.0
+                                 10.times { char_sw.vadjustment.value = char_sw.vadjustment.value + inc; sleep 0.02 }
+                                 char_sw.vadjustment.value = (char_sw.vadjustment.upper - char_sw.vadjustment.page_size)
+                              }
+                           end
+                        }
+                     }
+                     textbox.signal_connect('focus-in-event') {
+                        report_errors {
+                           if textbox.text == "(new alias target)"
+                              textbox.text = ''
+                           end
+                        }
+                     }
+                     delete_button.signal_connect('clicked') {
+                        report_errors {
+                           label.sensitive = false
+                           textbox.sensitive = false
+                           delete_button.sensitive = false
+                           new_char_aliases[i][1] = nil
+                        }
+                     }
+                  }
+                  add_new_char_row.call
+
+                  char_vp = Gtk::Viewport.new(nil, nil)
+                  char_vp.add(char_table)
+                  char_sw = Gtk::ScrolledWindow.new
+                  char_sw.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_ALWAYS)
+                  char_sw.add(char_vp)
+
+                  global_aliases = Array.new
+                  db.execute("SELECT trigger,target FROM global;") do |row|
+                     global_aliases.push [ row[0], row[1] ]
+                  end
+                  global_aliases.sort! { |a,b| a[0].to_s <=> b[0].to_s }
+                  global_table     = Gtk::Table.new((global_aliases.length + 1), 3)
+                  global_textboxes = Array.new
+                  global_aliases.each_index { |i|
+                     label = Gtk::Label.new(global_aliases[i][0].to_s)
+                     box   = Gtk::HBox.new
+                     box.pack_end(label, false, false, 0)
+                     global_table.attach(box, 0, 1, i, (i + 1), Gtk::FILL, Gtk::FILL, 3, 3)
+                     textbox      = Gtk::Entry.new
+                     textbox.text = global_aliases[i][1]
+                     global_table.attach(textbox, 1, 2, i, (i + 1), (Gtk::EXPAND|Gtk::FILL), Gtk::FILL, 3, 3)
+                     global_textboxes[i] = textbox
+                     delete_button = Gtk::Button.new(Gtk::Stock::DELETE)
+                     global_table.attach(delete_button, 2, 3, i, (i + 1), Gtk::SHRINK, Gtk::FILL, 3, 3)
+                     delete_button.signal_connect('clicked') {
+                        report_errors {
+                           label.sensitive = false
+                           textbox.sensitive = false
+                           delete_button.sensitive = false
+                           global_textboxes[i] = nil
+                        }
+                     }
+                  }
+                  new_global_aliases = Array.new
+                  global_sw = nil
+                  add_new_global_row = proc {
+                     i = new_global_aliases.length
+                     global_table.n_rows = global_table.n_rows + 1
+                     label = Gtk::Entry.new
+                     label.text = "(new alias trigger)"
+                     global_table.attach(label, 0, 1, (global_table.n_rows - 1), global_table.n_rows, Gtk::FILL, Gtk::FILL, 3, 3)
+                     textbox = Gtk::Entry.new
+                     textbox.text = "(new alias target)"
+                     textbox.sensitive = false
+                     global_table.attach(textbox, 1, 2, (global_table.n_rows - 1), global_table.n_rows, (Gtk::EXPAND|Gtk::FILL), Gtk::FILL, 3, 3)
+                     new_global_aliases[i] = [ label, textbox ]
+                     delete_button = Gtk::Button.new(Gtk::Stock::DELETE)
+                     delete_button.sensitive = false
+                     global_table.attach(delete_button, 2, 3, (global_table.n_rows - 1), global_table.n_rows, Gtk::SHRINK, Gtk::FILL, 3, 3)
+                     label.show
+                     textbox.show
+                     delete_button.show
+                     label.signal_connect('focus-in-event') {
+                        report_errors {
+                           if label.text == "(new alias trigger)"
+                              label.text = ''
+                           end
+                           unless textbox.sensitive?
+                              textbox.sensitive = true
+                              delete_button.sensitive = true
+                              add_new_global_row.call
+                              Thread.new {
+                                 sleep 0.05
+                                 inc = (global_sw.vadjustment.upper - global_sw.vadjustment.value - global_sw.vadjustment.page_size) / 10.0
+                                 10.times { global_sw.vadjustment.value = global_sw.vadjustment.value + inc; sleep 0.02 }
+                                 global_sw.vadjustment.value = (global_sw.vadjustment.upper - global_sw.vadjustment.page_size)
+                              }
+                           end
+                        }
+                     }
+                     textbox.signal_connect('focus-in-event') {
+                        report_errors {
+                           if textbox.text == "(new alias target)"
+                              textbox.text = ''
+                           end
+                        }
+                     }
+                     delete_button.signal_connect('clicked') {
+                        report_errors {
+                           label.sensitive = false
+                           textbox.sensitive = false
+                           delete_button.sensitive = false
+                           new_global_aliases[i][1] = nil
+                        }
+                     }
+                  }
+                  add_new_global_row.call
+
+                  global_vp = Gtk::Viewport.new(nil, nil)
+                  global_vp.add(global_table)
+                  global_sw = Gtk::ScrolledWindow.new
+                  global_sw.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_ALWAYS)
+                  global_sw.add(global_vp)
+
+                  global_tab = Gtk::VBox.new
+                  notebook = Gtk::Notebook.new
+                  notebook.append_page(char_sw, Gtk::Label.new("#{Char.name}'s Aliases"))
+                  notebook.append_page(global_sw, Gtk::Label.new('Global Aliases'))
+                  $alias_setup_window = Gtk::Window.new
+                  $alias_setup_window.title = "Lich - Aliases"
+                  $alias_setup_window.add(notebook)
+                  $alias_setup_window.signal_connect('delete_event') {
+                     report_errors {
+                        modified = false
+                        char_aliases.each_index { |i| if char_textboxes[i].nil? or new_char_aliases.any? { |a| (a[1] != nil) and a[1].sensitive? } or (char_aliases[i][1] != char_textboxes[i].text); modified = true; break; end }
+                        global_aliases.each_index { |i| if global_textboxes[i].nil? or new_global_aliases.any? { |a| (a[1] != nil) and a[1].sensitive? } or (global_aliases[i][1] != global_textboxes[i].text); modified = true; break; end }
+                        if modified
+                           dialog = Gtk::MessageDialog.new(nil, Gtk::Dialog::MODAL, Gtk::MessageDialog::QUESTION, Gtk::MessageDialog::BUTTONS_YES_NO, "Save changes?")
+                           dialog.title = "Lich - #{Char.name}'s Aliases"
+                           response = nil
+                           dialog.run { |r| response = r; dialog.destroy }
+                           if response == Gtk::Dialog::RESPONSE_YES
+                              char_aliases.each_index { |i|
+                                 if char_textboxes[i].nil?
+                                    db.execute("DELETE FROM #{character} WHERE trigger=?", char_aliases[i][0].encode('UTF-8'))
+                                 elsif (char_aliases[i][1] != char_textboxes[i].text)
+                                    db.execute("INSERT OR REPLACE INTO #{character} (trigger,target) VALUES(?,?);", char_aliases[i][0].encode('UTF-8'), char_textboxes[i].text.encode('UTF-8'))
+                                 end
+                              }
+                              new_char_aliases.each { |a|
+                                 if (a[1] != nil) and a[1].sensitive?
+                                    if a[0].text.empty?
+                                       respond "[alias: warning: ignoring new alias with no trigger]"
+                                    elsif db.get_first_value("SELECT target FROM #{character} WHERE trigger=? COLLATE NOCASE;", a[0].text.encode('UTF-8'))
+                                       respond "[alias: warning: new alias #{a[0].text} already exists; ignoring]"
+                                    else
+                                       db.execute("INSERT INTO #{character} (trigger,target) VALUES(?,?);", a[0].text.encode('UTF-8'), a[1].text.encode('UTF-8'))
+                                    end
+                                 end
+                              }
+                              global_aliases.each_index { |i|
+                                 if global_textboxes[i].nil?
+                                    db.execute("DELETE FROM global WHERE trigger=?", global_aliases[i][0].encode('UTF-8'))
+                                 elsif (global_aliases[i][1] != global_textboxes[i].text)
+                                    db.execute("INSERT OR REPLACE INTO global (trigger,target) VALUES(?,?);", global_aliases[i][0].encode('UTF-8'), global_textboxes[i].text.encode('UTF-8'))
+                                 end
+                              }
+                              new_global_aliases.each { |a|
+                                 if (a[1] != nil) and a[1].sensitive?
+                                    if a[0].text.empty?
+                                       respond "[alias: warning: ignoring new alias with no trigger]"
+                                    elsif db.get_first_value("SELECT target FROM global WHERE trigger=? COLLATE NOCASE;", a[0].text.encode('UTF-8'))
+                                       respond "[alias: warning: new alias #{a[0].text} already exists; ignoring]"
+                                    else
+                                       db.execute("INSERT INTO global (trigger,target) VALUES(?,?);", a[0].text.encode('UTF-8'), a[1].text.encode('UTF-8'))
+                                    end
+                                 end
+                              }
+                              update_regex.call
+                           end
+                        end
+                        done = true
+                     }
+                  }
+                  $alias_setup_window.set_default_size((Gdk.screen_width/2), (Gdk.screen_height/2))
+                  $alias_setup_window.set_window_position(Gtk::Window::POS_CENTER)
+                  $alias_setup_window.show_all
+               }
+               begin
+                  wait_until { done }
+               ensure
+                  Gtk.queue { $alias_setup_window.destroy; $alias_setup_window = nil }
+               end
+            }
+         end
+      elsif args =~ /^(\-\-global\s+)?(?:add|set)\s+(\-\-global\s+)?([^=]+)=\s*(.+)$/i
+         if ($1 || $2)
+            table = 'global'
+         else
+            table = character
+         end
+         trigger = $3.strip
+         target = $4
+         if old_target = db.get_first_value("SELECT target FROM #{table} WHERE trigger=? COLLATE NOCASE;", trigger.encode('UTF-8'))
+            db.execute("UPDATE #{table} SET target=? WHERE trigger=?;", target.encode('UTF-8'), trigger.encode('UTF-8'))
+            respond "\n--- Alias updated.  (old alias was: #{old_target})\n\n"
+         else
+            db.execute("INSERT INTO #{table} (trigger,target) VALUES(?,?);", trigger.encode('UTF-8'), target.encode('UTF-8'))
+            respond "\n--- Alias saved\n\n"
+         end
+         update_regex.call
+      elsif args =~ /^(\-\-global\s+)?(?:rem(?:ove)?|del(?:ete)?)\s+(\-\-global\s+)?(.+)/i
+         if ($1 || $2)
+            table = 'global'
+         else
+            table = character
+         end
+         trigger = $3
+         if target = db.get_first_value("SELECT target FROM #{table} WHERE trigger=? COLLATE NOCASE;", trigger.encode('UTF-8'))
+            db.execute("DELETE FROM #{table} WHERE trigger=?", trigger.encode('UTF-8'))
+            update_regex.call
+            respond "\n--- Alias deleted (#{trigger} => #{target})\n\n"
+         else
+            respond "\n--- Alias was not found in #{if table == 'global'; 'global'; else; "#{XMLData.name}'s"; end} list\n\n"
+         end
+      elsif args =~ /^list$/i
+         output = "\nGlobal Aliases:\n\n"
+         list = Array.new
+         db.execute("SELECT trigger,target FROM global;") do |row|
+            list.push "   #{row[0]} => #{row[1]}\n"
+         end
+         if list.empty?
+            output.concat "   (none)\n"
+         else
+            output.concat list.sort.join
+         end
+         output.concat "\n#{XMLData.name}'s Aliases:\n\n"
+         list.clear
+         db.execute("SELECT trigger,target FROM #{character};") do |row|
+            list.push "   #{row[0]} => #{row[1]}\n"
+         end
+         if list.empty?
+            output.concat "   (none)\n"
+         else
+            output.concat list.sort.join
+         end
+         output.concat "\n"
+         respond output
+      elsif args =~ /^reload/i
+         update_regex.call
+         respond "\n--- Alias data reloaded\n\n"
+      elsif args =~ /^stop/i
+         UpstreamHook.remove('alias-service')
+         db.close rescue()
+         respond "\n--- Lich: alias service stopped\n\n"
+      else
+         output = "\n"
+         output.concat "Usage:\n"
+         output.concat "\n"
+         if defined?(Gtk)
+            output.concat "     #{$clean_lich_char}alias setup\n"
+            output.concat "          Opens a window to configure aliases.\n"
+         end
+         output.concat "     #{$clean_lich_char}alias add <trigger> = <target>\n"
+         output.concat "     #{$clean_lich_char}alias add --global <trigger> = <target>\n"
+         output.concat "          Creates a new alias.  When you send a command that starts with <trigger>, it will be replaced\n"
+         output.concat "          with <target>.  If --global is specified, the alias will be active for all characters.\n"
+         output.concat "          \\r and \\? in the target are treated special.\n"
+         output.concat "\n"
+         output.concat "     #{$clean_lich_char}alias remove <trigger>\n"
+         output.concat "     #{$clean_lich_char}alias remove --global <trigger>\n"
+         output.concat "          Deletes the given alias\n"
+         output.concat "\n"
+         output.concat "     #{$clean_lich_char}alias list\n"
+         output.concat "          Lists the currently active aliases\n"
+         output.concat "\n"
+         output.concat "Examples:\n"
+         output.concat "\n"
+         output.concat "     ;alias add zap = ;eq cast(901, \"\\?\")\n"
+         output.concat "     ;alias add --global ;code = ;lnet chat on code\n"
+         output.concat "     ;alias add --global ls = look\n"
+         output.concat "\n"
+         respond output
+      end
+      nil
+   elsif caller.count { |x| x =~ /do_client/ } < 2
+      if character_regex and (client_string =~ character_regex)
+         trigger, extra = $1, $2
+         if target = db.get_first_value("SELECT target FROM #{character} WHERE trigger=? COLLATE NOCASE;", trigger.encode('UTF-8'))
+            target = target.split('\\r')#.collect { |line| line.sub(/^\s+/, '') }
+            if extra.empty?
+               target.collect! { |line| line.gsub('\\?', '') }
+            elsif target.any? { |line| line.include?('\\?') }
+               target.collect! { |line|
+                  if line =~ /^;e.*"\\\?"/
+                     line.gsub('"\\?"', extra.inspect)
+                  elsif line.include?('\\?')
+                     line.gsub('\\?', extra)
+                  else
+                     line
+                  end
+               }
+            elsif target.length == 1
+               target.first.concat(" #{extra}")
+            end
+            target.each { |line| do_client("#{line.chomp}\n") }
+         else
+            respond "[alias: fixme 1]"
+         end
+         nil
+      elsif global_regex and (client_string =~ global_regex)
+         trigger, extra = $1, $2
+         if target = db.get_first_value("SELECT target FROM global WHERE trigger=? COLLATE NOCASE;", trigger.encode('UTF-8'))
+            target = target.split('\\r')#.collect { |line| line.sub(/^\s+/, '') }
+            if extra.empty?
+               target.collect! { |line| line.gsub('\\?', '') }
+            elsif target.any? { |line| line.include?('\\?') }
+               target.collect! { |line|
+                  if line =~ /^;e.*"\\\?"/
+                     line.gsub('"\\?"', extra.inspect)
+                  elsif line.include?('\\?')
+                     line.gsub('\\?', extra)
+                  else
+                     line
+                  end
+               }
+            elsif target.length == 1
+               target.first.concat(" #{extra}")
+            end
+            target.each { |line| do_client("#{line.chomp}\n") }
+         else
+            respond "[alias: fixme 2]"
+         end
+         nil
+      else
+         client_string
+      end
+   else
+      client_string
+   end
+}
+
+UpstreamHook.add('alias-service', hook_proc)
+respond "--- Lich: alias service started"
+
+# fixme: override voodoo
