@@ -17,35 +17,49 @@
       req.room.go2
     end
 
-
   Contracts examples:
 
-    Contracts.on_contract(:box, 
+    Contracts.on_contract(:box,
       { contract_win:  -> req { Log.out(req, label: :won) },
         contract_open: -> req { rand }
       })
-
 
     Contracts.collect_bids(:box, valid_bidders: GameObj.pcs.map(&:noun)) do |contract|
       Log.out(contract, label: %i[on_empty_bids])
     end
 
   Author: Ondreian
-  Requirements: Ruby >= 2.3, redis
-  version: 0.1
+  Requirements: Ruby >= 2.3, redis, connection_pool
+  required: Lich >= 5.12.0
+  version: 1.0.0
+
+  Setup Instructions: https://github.com/elanthia-online/scripts/wiki/cluster.lic-Documentation
+     Help Contribute: https://github.com/elanthia-online/scripts
+
+  Version Control:
+    Major_change.feature_addition.bugfix
+  v1.0.0  (2025-10-27)
+    - update version to semantic versioning
+    - include link to setup instructions in header
+    - switch to using connection_pool
+  v0.1.0  (2019-06-22)
+    - add contract system
+  v0.0.0  (2019-01-14)
+    - initial release
 =end
 
-require 'redis'
 require 'json'
 require 'ostruct'
 require 'securerandom'
 require 'benchmark'
 
+install_gem_requirements({ "connection_pool" => true, "redis" => true })
+
 class Cluster
   ##
   ## contextual logging
   ##
-  module Log  
+  module Log
     def self.out(msg, label: :debug)
       return _write _view(msg, label) unless msg.is_a?(Exception)
       ## pretty-print exception
@@ -66,7 +80,7 @@ class Cluster
     def self._view(msg, label)
       label = [Script.current.name, label].flatten.compact.join(".")
       safe = msg.inspect
-      #safe = safe.gsub("<", "&lt;").gsub(">", "&gt;") if safe.include?("<") and safe.include?(">")
+      # safe = safe.gsub("<", "&lt;").gsub(">", "&gt;") if safe.include?("<") and safe.include?(">")
       "[#{label}] #{safe}"
     end
 
@@ -84,12 +98,13 @@ class Cluster
       end
     end
   end
+
   ##
   ## minimal options parser
   ##
   module Opts
-    FLAG_PREFIX    = "--"
-    
+    FLAG_PREFIX = "--"
+
     def self.parse_command(h, c)
       h[c.to_sym] = true
     end
@@ -105,7 +120,7 @@ class Cluster
       end
     end
 
-    def self.parse(args = Script.current.vars[1..-1])        
+    def self.parse(args = Script.current.vars[1..-1])
       OpenStruct.new(**args.to_a.reduce(Hash.new) do |opts, v|
         if v.start_with?(FLAG_PREFIX)
           Opts.parse_flag(opts, v)
@@ -125,39 +140,44 @@ end
 class Cluster
   PERSONAL_GS_EVENTS = [%[gs], Char.name.downcase, %[*]].join(".")
   PUBLIC_GS_EVENTS   = [%[gs], %[pub], %[*]].join(".")
-  NOOP               = -> channel, message {}
-  UNSUPPORTED_METHOD = -> channel, message { return {error: "#{channel} is not implemented on #{Char.name}"} }
+  NOOP               = ->channel, message {}
+  UNSUPPORTED_METHOD = ->channel, _message { return { error: "#{channel} is not implemented on #{Char.name}" } }
   TTL                = 5
+  POOL_SIZE          = 5
+  POOL_TIMEOUT       = 5
 
-  attr_reader :cb_map, :pending_requests, 
-              :connected, :last_publish,
-              :keep_alive, :event_loop,
-              :pub, :sub
+  attr_reader :cb_map, :pending_requests,
+              :last_publish, :keep_alive,
+              :event_loop, :pool, :sub
 
   def initialize()
-    @cb_map           ||= {}
-    @pending_requests ||= {}
-    @connected        ||= {}
-    @last_publish     ||= 0
+    @cb_map           = {}
+    @pending_requests = {}
+    @connected        = {}
+    @last_publish     = 0
     _connect()
     _link()
     _keepalive()
   end
 
   def _connect_local()
-    #Log.out("...connecting to local redis instance...")
-    @pub = Redis.new()
+    # Log.out("...connecting to local redis instance...")
+    @pool = ConnectionPool.new(size: POOL_SIZE, timeout: POOL_TIMEOUT) do
+      Redis.new()
+    end
     @sub = Redis.new()
   end
 
   def _connect_remote(url)
-    #Log.out("...connecting to remote redis instance at\n\n\t#{url}\n")
-    @pub = Redis.new(url: url)
+    # Log.out("...connecting to remote redis instance at\n\n\t#{url}\n")
+    @pool = ConnectionPool.new(size: POOL_SIZE, timeout: POOL_TIMEOUT) do
+      Redis.new(url: url)
+    end
     @sub = Redis.new(url: url)
   end
 
   def _connect()
-    if url = Opts.url
+    if (url = Opts.url)
       _connect_remote(url.split("=").last)
     else
       _connect_local()
@@ -180,37 +200,39 @@ class Cluster
 
   def publish(*args)
     @last_publish = Time.now
-    @pub.publish(*args)
+    @pool.with do |conn|
+      conn.publish(*args)
+    end
   end
-  
+
   def emit(channel, **payload)
     channel = make_channel_name(Char.name, channel)
-    #Log.out([channel, payload], label: %i[msg out])
+    # Log.out([channel, payload], label: %i[msg out])
     publish(channel,
-      payload.merge({from: Char.name}).to_json())
+            payload.merge({ from: Char.name }).to_json())
   end
 
   def broadcast(channel, **payload)
     channel = make_channel_name(%[pub], channel)
-    #Log.out([channel, payload], label: %i[msg broadcast])
+    # Log.out([channel, payload], label: %i[msg broadcast])
     publish(channel,
-      payload.merge({from: Char.name}).to_json())
+            payload.merge({ from: Char.name }).to_json())
   end
 
   def cast(person, channel: nil, **payload)
     channel = make_channel_name(person, channel)
-    #Log.out([channel, **payload], label: %i[cast to])
-    publish(channel, 
-      payload.merge({from: Char.name}).to_json())
+    # Log.out([channel, **payload], label: %i[cast to])
+    publish(channel,
+            payload.merge({ from: Char.name }).to_json())
   end
 
   def request(person, **payload)
     req_id = SecureRandom.hex(10)
-    cast(person,  
-      **payload.merge({ 
-        uuid:    req_id,
-        channel: [payload.fetch(:channel), %(request)]
-      }))
+    cast(person,
+         **payload.merge({
+           uuid: req_id,
+           channel: [payload.fetch(:channel), %(request)]
+         }))
     ttl = payload.fetch(:timeout, TTL)
     @pending_requests[req_id] = Thread.current
     timeout_thread = Thread.new { sleep ttl; @pending_requests[req_id].wakeup }
@@ -233,7 +255,7 @@ class Cluster
 
   def map(people, **payload)
     people.map do |name| Thread.new do request(name, **payload) end end
-      .map(&:value)
+          .map(&:value)
   end
 
   def _route_incoming(channel, message)
@@ -248,8 +270,8 @@ class Cluster
       return _handle_request(channel, incoming)  if incoming[:uuid] and kind_of_channel.eql?(:request)
       _handle_leave(channel, incoming) if kind_of_channel.eql?(:leave)
       return _handle_cast(channel, incoming)
-    rescue Exception => err
-      Log.out(err, label: %i[dispatch error] + channel.split(".")) and defined?(Log)
+    rescue StandardError => err
+      Log.out(err, label: %i[dispatch error] + channel.split(".")) if defined?(Log)
     end
   end
 
@@ -262,80 +284,80 @@ class Cluster
     from = incoming.fetch(:from, false)
     @connected.delete(from) if from
   end
-  
+
   def _handle_cast(channel, incoming)
     begin
-      #Log.out([channel, incoming], label: %i[in cast])
-      _callback = @cb_map.fetch(channel, NOOP).call(channel, 
-        OpenStruct.new(incoming))
-    rescue Exception => err
-      Log.out(err, label: %i[dispatch error] + channel.split(".")) and defined?(Log)
+      # Log.out([channel, incoming], label: %i[in cast])
+      _callback = @cb_map.fetch(channel, NOOP).call(channel,
+                                                    OpenStruct.new(incoming))
+    rescue StandardError => err
+      Log.out(err, label: %i[dispatch error] + channel.split(".")) if defined?(Log)
     end
   end
 
   def _handle_request(channel, incoming)
-    begin 
-      #Log.out([channel, incoming], label: %i[in request])
+    begin
+      # Log.out([channel, incoming], label: %i[in request])
       callback = @cb_map.fetch(channel, UNSUPPORTED_METHOD)
-      response = callback.call(channel, 
-        OpenStruct.new(incoming))
+      response = callback.call(channel,
+                               OpenStruct.new(incoming))
       _dispatch_response_object(incoming, response)
-    rescue Exception => err
-      #Log.out(err, label: %i[local request error] + channel.split("."))
-      _dispatch_response_object(incoming, {error: err.message})
+    rescue StandardError => err
+      # Log.out(err, label: %i[local request error] + channel.split("."))
+      _dispatch_response_object(incoming, { error: err.message })
     end
   end
 
-  def _handle_response(channel, incoming)
-    begin 
-      #Log.out([channel, incoming], label: %i[in response])
+  def _handle_response(_channel, incoming)
+    begin
+      # Log.out([channel, incoming], label: %i[in response])
       resp_id  = incoming.fetch(:uuid)
       pending  = @pending_requests.fetch(resp_id, false)
       @pending_requests[resp_id] = incoming if pending
       pending.wakeup
-    rescue Exception => err
-      #Log.out(err, label: %i[local response error] + channel.split("."))
+    rescue StandardError => err
+      # Log.out(err, label: %i[local response error] + channel.split("."))
       @pending_requests[resp_id] = err.message
     end
   end
 
   def _dispatch_response_object(incoming, response)
     from = incoming.fetch(:from, false) or fail "Request[`from` was missing]"
-    cast(from, 
-      **response.merge({
-          channel: [incoming.fetch(:uuid), %(response)],
-          uuid:    incoming.fetch(:uuid),
-          from:    Char.name,
-        }))
+    cast(from,
+         **response.merge({
+           channel: [incoming.fetch(:uuid), %(response)],
+           uuid: incoming.fetch(:uuid),
+           from: Char.name,
+         }))
   end
 
   def on_broadcast(channel, &block)
     fail "no block given to Cluster#on_broadcast" unless block_given?
-    @cb_map[%(gs.pub.#{channel.to_s}).downcase] = block
+    @cb_map[%(gs.pub.#{channel}).downcase] = block
     self
   end
 
   def on_cast(channel, &block)
     fail "no block given to Cluster#on_cast" unless block_given?
-    @cb_map[%(gs.#{Char.name}.#{channel.to_s}).downcase] = block
+    @cb_map[%(gs.#{Char.name}.#{channel}).downcase] = block
     self
   end
 
   def on_request(channel, &block)
     fail "no block given to Cluster#on_request" unless block_given?
-    @cb_map[%(gs.#{Char.name}.#{channel.to_s}.request).downcase] = block
+    @cb_map[%(gs.#{Char.name}.#{channel}.request).downcase] = block
     self
   end
 
   def _link()
-    @event_loop = Thread.new do 
+    @event_loop = Thread.new do
       begin
         @sub.psubscribe(PERSONAL_GS_EVENTS, PUBLIC_GS_EVENTS) do |on|
           on.psubscribe do |channel| Log.out(channel, label: %i[subscribed]) end
-          on.pmessage do |pattern, channel, message| _route_incoming(channel, message) end
+          on.pmessage do |_pattern, channel, message| _route_incoming(channel, message) end
         end
       rescue Redis::BaseConnectionError => error
-        Log.out(error, label: %i[err conn]) and defined?(Log)
+        Log.out(error, label: %i[err conn]) if defined?(Log)
         sleep 1
         retry
       end
@@ -343,8 +365,8 @@ class Cluster
   end
 
   def _keepalive()
-    @keepalive = Thread.new do 
-      loop do 
+    @keepalive = Thread.new do
+      loop do
         broadcast(:ping)
         sleep 35
       end
@@ -352,20 +374,22 @@ class Cluster
   end
 
   def destroy()
-    Log.out("cleaning up", label: %i[destroy]) and defined?(Log)
+    Log.out("cleaning up", label: %i[destroy]) if defined?(Log)
     broadcast(:leave)
     [@event_loop, @keepalive].map(&:kill).each(&:join)
+    @pool.shutdown { |conn| conn.quit }
+    @sub.quit
   end
 
   def self.of()
     cluster = Cluster.new()
     before_dying do cluster.destroy() end
-    cluster.on_request(:api) do |_, req| {methods: cluster.cb_map.keys} end
+    cluster.on_request(:api) do |_, _req| { methods: cluster.cb_map.keys } end
     cluster.on_broadcast(:announce) do |_, req| cluster.cast(req.from, channel: :ack) end
     cluster.broadcast(:announce)
     return cluster
   end
-  
+
   def self.cluster()
     @cluster
   end
@@ -376,7 +400,7 @@ class Cluster
 
   def self.method_missing(method, *args, &block)
     Cluster.init()
-    fail Exception, "Cluster.init() must be called before performing singleton Cluster actions" unless up?
+    fail StandardError, "Cluster.init() must be called before performing singleton Cluster actions" unless up?
     @cluster.send(method, *args, &block)
   end
 
@@ -397,6 +421,7 @@ end
 class Cluster
   class Registry
     attr_reader :namespace
+
     def initialize(namespace = Char.name)
       @namespace = namespace
     end
@@ -404,26 +429,45 @@ class Cluster
     def _key(str)
       [@namespace, str].map(&:downcase).map(&:to_s).join(".")
     end
-    
+
     def put(key, val)
-      Cluster.pub.set(_key(key), val.to_json)
+      Cluster.pool.with do |conn|
+        conn.set(_key(key), val.to_json)
+      end
     end
 
     def get(key)
-      Cluster.parse(
-        Cluster.pub.get(
-          _key(key)))
+      result = Cluster.pool.with do |conn|
+        conn.get(_key(key))
+      end
+      Cluster.parse(result) if result
+    end
+
+    def delete(key)
+      Cluster.pool.with do |conn|
+        conn.del(_key(key))
+      end
+    end
+
+    def exists?(key)
+      Cluster.pool.with do |conn|
+        conn.exists?(_key(key))
+      end
     end
   end
 
   def self.registry(namespace = nil)
     Registry.new(namespace)
   end
+
+  def self.pool
+    @cluster&.pool
+  end
 end
 
 module Contracts
-  SHOULD_NEVER_RUN = -> req { fail "won invalid contract(#{req})" }
-  INVALID_BID      = -> req {-1}
+  SHOULD_NEVER_RUN = ->req { fail "won invalid contract(#{req})" }
+  INVALID_BID      = ->_req { -1 }
   VALID_BID        = (0..1)
   TTL              = 1
   OPEN_CONTRACTS ||= {}
@@ -453,13 +497,13 @@ module Contracts
     OPEN_BIDS.delete(req.contract_id)
 
     CALLBACKS.fetch(req.kind.to_sym, {})
-      .fetch(Events::CONTRACT_WIN, SHOULD_NEVER_RUN)
-      .call(req)
+             .fetch(Events::CONTRACT_WIN, SHOULD_NEVER_RUN)
+             .call(req)
   end
 
   def self.fetch_open_contract(contract_id)
     Contracts.prune()
-    if contract = OPEN_CONTRACTS.fetch(contract_id, false)
+    if (contract = OPEN_CONTRACTS.fetch(contract_id, false))
       yield(contract)
     end
   end
@@ -469,9 +513,9 @@ module Contracts
   end
 
   def self.prune()
-    [OPEN_CONTRACTS, OPEN_BIDS].each do |kv| 
-      kv.each do |id, contract| 
-        kv.delete(id) if expired?(contract) 
+    [OPEN_CONTRACTS, OPEN_BIDS].each do |kv|
+      kv.each do |id, contract|
+        kv.delete(id) if expired?(contract)
       end
     end
   end
@@ -485,12 +529,12 @@ module Contracts
   end
 
   def self.make_contract(**args)
-    args.merge({ 
+    args.merge({
       contract_id: SecureRandom.hex(10),
-      kind:        args.fetch(:kind).to_s.downcase.to_sym,
-      from:        Char.name,
-      expiry:      next_expiry(),
-      bids:        [],
+      kind: args.fetch(:kind).to_s.downcase.to_sym,
+      from: Char.name,
+      expiry: next_expiry(),
+      bids: [],
     })
   end
 
@@ -498,20 +542,21 @@ module Contracts
     return unless contract.valid_bidders.include?(Char.name)
 
     bid_for_contract = CALLBACKS.fetch(contract.kind.to_sym, {})
-      .fetch(Events::CONTRACT_OPEN, INVALID_BID)
-      .call(contract)
+                                .fetch(Events::CONTRACT_OPEN, INVALID_BID)
+                                .call(contract)
 
     bid_for_contract = -1 unless bid_for_contract > contract.min_bid
 
     OPEN_BIDS[contract.contract_id] = contract if VALID_BID.include?(bid_for_contract)
-  
+
     Contracts.bid(contract, bid_for_contract)
   end
 
   def self.collect_bids(kind, valid_bidders:, min_bid: 0, **vars)
     Contracts.prune()
     contract = make_contract(
-      vars.merge({kind: kind, valid_bidders: valid_bidders, min_bid: min_bid}))
+      vars.merge({ kind: kind, valid_bidders: valid_bidders, min_bid: min_bid })
+    )
     OPEN_CONTRACTS[contract[:contract_id]] = contract
     Log.out(contract, label: Events::CONTRACT_OPEN)
     Cluster.broadcast(Events::CONTRACT_OPEN, **contract)
@@ -520,7 +565,7 @@ module Contracts
     return yield(contract) if (expired?(contract) and valid_bids.empty?) or valid_bids.empty? and block_given?
     # highest bid wins
     winning_bid = valid_bids.sort do |a, b| a.bid <=> b.bid end.last
-    Log.out(winning_bid, label: :winning_bid) 
+    Log.out(winning_bid, label: :winning_bid)
     Contracts.tell_remote_winner(winning_bid[:from], contract)
   end
 
@@ -532,17 +577,17 @@ module Contracts
   end
 
   def self.tell_remote_winner(winner, contract)
-    Cluster.cast(winner, 
-      contract.merge({ channel: Events::CONTRACT_WIN }))
+    Cluster.cast(winner,
+                 contract.merge({ channel: Events::CONTRACT_WIN }))
   end
 
   def self.bid(contract, value)
     Log.out("bidding #{value} on Contract(#{contract.contract_id}) from #{contract.from}", label: :bid)
 
     Cluster.cast(contract[:from], {
-      channel:     Events::CONTRACT_BID, 
+      channel: Events::CONTRACT_BID,
       contract_id: contract[:contract_id],
-      bid:         value,
+      bid: value,
     })
   end
 end
@@ -551,6 +596,5 @@ class Cluster
   load("scripts/cluster_callbacks.rb") if Script.exists?("cluster_callbacks.rb")
 end
 
-
 # keepalive
-loop do sleep(1) end 
+loop do sleep(1) end
