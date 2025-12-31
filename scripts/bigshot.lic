@@ -435,6 +435,7 @@ $room_npcs_last_check = []
 $mstrike_taken = false
 $bigshot_single = false
 $bigshot_sneaky_hunt = false
+$bigshot_in_fog = false
 
 # debug file logger
 class Bigshot
@@ -462,7 +463,7 @@ class Bigshot
 
     def start_logging
       # Startup Message
-      log("Starting up!")
+      log("Starting up! Character: #{Char.name} | Version: #{get_script_version}")
 
       @worker_thread = Thread.new {
         UpstreamHook.add("debug_upstream_hook", proc { |data|
@@ -2329,6 +2330,8 @@ class Bigshot
         $bigshot_cast902 = true
       elsif server_string =~ /The scintillating.*?light surrounding the <a exist=".*?" noun=".*?">.*?<\/a> fades away./i
         $bigshot_cast411 = true
+      elsif server_string =~ /Blinded by the mists, you stumble around until you are free from the bank of fog/
+        $bigshot_in_fog = true
       end
       server_string
     }
@@ -5722,8 +5725,8 @@ class Bigshot
   def bigclaim?(check_disks: true)
     debug_msg(@DEBUG_STATUS, "bigclaim? | $bigshot_quick: #{$bigshot_quick} | Claim.mine?: #{Lich::Gemstone::Claim.mine?} | Disks: #{(Lich::Gemstone::Disk.all - Lich::Gemstone::Group.disks)}")
 
+    return true unless Char.name == @leader
     return true if $bigshot_quick
-    return @group.leader_claim?(check_disks: check_disks) if Char.name != @leader
     return false unless Lich::Gemstone::Claim.mine?
     return false unless @IGNORE_DISKS || (!check_disks || (Lich::Gemstone::Disk.all - Lich::Gemstone::Group.disks).empty?)
     return true
@@ -5857,8 +5860,9 @@ class Bigshot
 
       if @INDEPENDENT_TRAVEL
         Lich::Util.quiet_command_xml("disband group", /You have no group to disband|You disband your group/)
-        until Lich::Gemstone::Group.members.map(&:noun).empty?
+        until Lich::Gemstone::Group.empty?
           groupcheck()
+          sleep(0.25)
         end
         @followers.add_event(:GO2_RALLY_ROOM)
         @RALLYPOINT_ROOM_IDS.each { |room| go2(room.to_i) }
@@ -5963,7 +5967,7 @@ class Bigshot
       while ((target = find_target(target, just_arrived)) && !should_rest? && no_players_hunt && !should_flee?)
         debug_msg(@DEBUG_COMBAT, "inside do_hunt loop | target: #{target}")
 
-        if @PRIORITY && !priority(target)
+        if !priority(target)
           target = find_target(nil)
         end
 
@@ -6059,10 +6063,8 @@ class Bigshot
     @BOON_CACHE = {}
 
     # Wait for follower to finish looting if needed
-    while !@followers.looting_done
-      $looting_inactive = @followers.looting_done
-      sleep 0.5
-    end
+    wait_while { !@followers.looting_done }
+    $looting_inactive = true
 
     wait_while { @followers.roundtime? }
     prepare_for_movement
@@ -6082,6 +6084,7 @@ class Bigshot
         Lich::Util.quiet_command_xml("disband group", /You have no group to disband|You disband your group/)
         until Lich::Gemstone::Group.empty?
           groupcheck()
+          sleep(0.25)
         end
       end
 
@@ -6143,7 +6146,7 @@ class Bigshot
     # join everyone back to the leader
     Lich::Util.quiet_command_xml("group open", /Your group status/) unless solo?
     @followers.add_event(:FOLLOW_NOW)
-    message("yellow", "Waiting for followers....") if (!@followers.all_present? || @followers.roundtime? || !@followers.rest_prep_complete?)
+    message("yellow", "Waiting for followers to finish....") if (!@followers.all_present? || @followers.roundtime? || !@followers.rest_prep_complete?)
     wait_while { !@followers.all_present? }
     wait_while { @followers.roundtime? }
     wait_while { !@followers.rest_prep_complete? }
@@ -6299,24 +6302,27 @@ class Bigshot
 
   def attack_break(target)
     break_conditions = {
-      "No Claim"                  => !bigclaim?(check_disks: false),
-      "Invalid target"            => !valid_target?(target),
-      "Should Rest"               => $bigshot_should_rest,
-      "Ambusher present"          => $ambusher_here,
-      "Should rest"               => should_rest?,
-      "Priority target available" => !$bigshot_bandits && @PRIORITY && !priority(target),
-      "Event stack has PREP_REST" => @event_stack.any? { |a| a.type == :PREP_REST }
+      "No Claim"                  => -> { !bigclaim?(check_disks: false) },
+      "Invalid target"            => -> { !valid_target?(target) },
+      "Should Rest"               => -> { $bigshot_should_rest },
+      "Ambusher present"          => -> { $ambusher_here },
+      "Should rest"               => -> { should_rest? },
+      "Priority target available" => -> { !$bigshot_bandits && @PRIORITY && !priority(target) },
+      "Event stack has PREP_REST" => -> { @event_stack.any? { |a| a.type == :PREP_REST } }
     }
 
-    break_conditions.each do |condition, result|
-      if result
-        debug_msg(@DEBUG_COMBAT, "attack_break| target: #{target} | returning true from attack_break | reason: #{condition}")
+    break_conditions.each do |condition, check|
+      if check.call
+        debug_msg(@DEBUG_COMBAT,
+          "attack_break| target: #{target} | returning true from attack_break | reason: #{condition}"
+        )
         return true
       end
     end
 
-    return false
+    false
   end
+
 
   def attack(target) # Starts the process when a target is found
     commands = find_routine(target)
@@ -6754,27 +6760,20 @@ class Bigshot
   end
 
   def priority(target)
+    return false if target.nil?
+    return true if $bigshot_bandits
+    return true if !@PRIORITY
     return true if (!$current_room_npcs.zip($room_npcs_last_check).map { |x, y| x.id == y.id }.any? { |s| s == false })
 
     $room_npcs_last_check = GameObj.npcs
     priority = false
-    stoppriority = false
-    npcs = GameObj.targets.find_all { |i| i.status !~ /dead|gone/ }
-    npcs.delete_if { |npc| CharSettings['untargetable'].include?(npc.name) }
-    @TARGETS.keys.each do |t|
-      break if stoppriority == true
+    npcs = GameObj.targets.reject { |npc| CharSettings['untargetable'].include?(npc.name) }
 
-      npcs.each do |s|
-        break if stoppriority == true
-
-        if (s.name =~ /#{t}/i or s.noun =~ /#{t}/i)
-          if s.name == target.name
-            stoppriority = true
-            priority = true
-          else
-            stoppriority = true
-          end
-        end
+    @TARGETS.keys.each do |name|
+      name_regex = /#{name}/i
+      if (npc = npcs.find { |s| s.name =~ name_regex || s.noun =~ name_regex })
+        priority = (npc.name == target.name)
+        break
       end
     end
 
@@ -6791,13 +6790,8 @@ class Bigshot
       return target
     end
 
-    if @PRIORITY && !$bigshot_bandits
-      debug_msg(@DEBUG_COMBAT, "find_target | @PRIORITY: #{@PRIORITY} && !$bigshot_bandits")
-      sort_npcs.each { |i| return i if valid_target?(i, just_entered) && priority(i) }
-    else
-      sort_npcs.each { |i| return i if valid_target?(i, just_entered) }
-    end
-    debug_msg(@DEBUG_COMBAT, "find_target | returning nil")
+    sort_npcs.each { |i| return i if valid_target?(i, just_entered) && priority(i) }
+
     return nil
   end
 
@@ -7020,19 +7014,19 @@ class Bigshot
     return false if $bigshot_quick
 
     rest_checks = [
-      [@BOUNTY_MODE && $bigshot_should_rest, 'bounty complete.'],
-      [$bigshot_should_rest, '$bigshot_should_rest was set to true.'],
-      [wounded?, 'wounded.'],
-      [Char.percent_encumbrance >= @ENCUMBERED, 'encumbered.'],
-      [creeping_dread?, 'creeping dread limit.'],
-      [crushing_dread?, 'crushing dread limit.'],
-      [wot_poison?, 'wall of thorns poison.'],
-      [@CONFUSION && Effects::Debuffs.active?("Confused"), 'confusion debuff.'],
-      [fried? && overkill? && lte_boost?, 'fried.'],
+      [-> { @BOUNTY_MODE && $bigshot_should_rest }, 'bounty complete.'],
+      [-> { $bigshot_should_rest }, '$bigshot_should_rest was set to true.'],
+      [-> { wounded? }, 'wounded.'],
+      [-> { fried? && overkill? && lte_boost? }, 'fried.'],
+      [-> { Char.percent_encumbrance >= @ENCUMBERED }, 'encumbered.'],
+      [-> { creeping_dread? }, 'creeping dread limit.'],
+      [-> { crushing_dread? }, 'crushing dread limit.'],
+      [-> { wot_poison? }, 'wall of thorns poison.'],
+      [-> { @CONFUSION && Effects::Debuffs.active?("Confused") }, 'confusion debuff.'],     
     ]
 
-    rest_checks.each do |condition, reason|
-      if condition
+    rest_checks.each do |check, reason|
+      if check.call
         $rest_reason = reason
         $bigshot_status = :resting
         return $rest_reason
@@ -7309,7 +7303,12 @@ class Bigshot
   def group_all_followers
     until Lich::Gemstone::Group.members.map(&:noun).include?(@leader)
       stand()
-      go2(@group.room_id) until checkpcs.include?(@leader)
+      
+      until checkpcs.include?(@leader)
+        go2(@group.room_id)
+        sleep(0.5)
+      end
+
       result = dothistimeout("join #{@leader}", 3, /You are already a member|You join|What were you referring to/)
       groupcheck unless result =~ /What were you referring to/
       sleep 0.1
@@ -7391,10 +7390,8 @@ class Bigshot
       end
 
       # Wait for follower to finish looting if needed
-      while !@followers.looting_done
-        $looting_inactive = @followers.looting_done
-        sleep 0.5
-      end
+      wait_while { !@followers.looting_done }
+      $looting_inactive = true
 
       # Final room loot by leader for any missed items by follower
       if @FINAL_LOOT && leading? && !solo? && bigclaim?
@@ -8014,6 +8011,10 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
         bs.stand() if !standing?
         bs.hunting_prep
       elsif (event.type == :FOLLOW_NOW)
+        if $bigshot_in_fog
+          Lich::Util.issue_command("look", /<resource picture/, silent: true, quiet: true)
+          $bigshot_in_fog = false
+        end
         bs.group_all_followers
       elsif (event.type == :LEAVE_GROUP)
         dothistimeout('leave group', 1, /You leave|But you are not in a group/)
@@ -8060,9 +8061,11 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
           bs.group_all_followers
 
           # Sync to leader’s target if available or find one
-          unless group.leader_target.nil? || group.leader_target.status =~ /dead|gone/
-            target = group.leader_target
+          leader_tgt = group.leader_target
+          unless leader_tgt.nil? || leader_tgt.status =~ /dead|gone/
+            target = leader_tgt
           end
+
           target ||= bs.find_target(target)
 
           # Set priority target if needed
@@ -8078,6 +8081,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
 
           # Finally do the attack
           bs.attack(target)
+          sleep(0.1) #Prevents tight loop when target is dead/invalid
         end
 
         # remove extra attacks in stack
