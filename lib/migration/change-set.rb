@@ -1,35 +1,49 @@
 require "pathname"
 
 module Migration
-  class PrettyError < Exception 
+  class PrettyError < StandardError
     def initialize(changeset, msg)
       super <<~ERROR
         \n\t#{changeset.file.split("../").last} >> #{changeset.table.log_name} #{msg}
         ERROR
     end
   end
+
   class KeyError < PrettyError; end
   class RuleError < PrettyError; end
+
   ##
   ## this is execution instance for
   ## evaluating a new set of changes
   ## to be applied to a table
   ##
   class ChangeSet
-    def self.run(table, file, &block)
-      changeset = ChangeSet.new(table, file)
+    def self.run(table, file, tables, &block)
+      changeset = ChangeSet.new(table, file, tables)
       changeset.instance_eval(&block)
       changeset
     end
 
-    attr_reader :table, :file, :inserts, :deletes, :creates
-    def initialize(table, file)
+    attr_reader :table, :file, :inserts, :deletes, :creates, :tables
+
+    def initialize(table, file, tables)
       @table   = table
       @file    = file
+      @tables  = tables # Add this line
       @inserts = {}
       @deletes = {}
       @creates = []
       @table.pending << self
+    end
+
+    # Add helper methods
+    def get_table(table_name)
+      @tables[Table.normalize_key(table_name)]
+    end
+
+    def copy_rules_from(source_table_name, key)
+      source_table = get_table(source_table_name)
+      source_table.get_rules(key)
     end
 
     def will_create?(key)
