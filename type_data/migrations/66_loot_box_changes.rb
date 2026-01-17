@@ -6,3 +6,7 @@ end
 migrate :uncommon do
   insert(:exclude, %{((?:gold-trimmed|copper-(?:edged|trimmed)|rune-incised|badly damaged|corroded|waterlogged|weathered|engraved|simple|blackened|lacquered|scratched|battered|riveted|enruned|charred|painted|rotting|scuffed|jeweled|scarred|ornate|singed|fluted|banded|sturdy|plain) )?(?:cherrywood|white oak|mahogany|iron-bound|rusted|hickory|bronze|modwir|walnut|silver|mithril|maoral|cooper|wooden|cedar|maple|steel|haon|thanot|monir|tanik|brass|iron|gold|fel) (?:strongbox|coffer|chest|trunk|box)})
 end
+
+migrate :valuable, :gemshop do
+  insert(:name, %{bright gold ingot})
+end
