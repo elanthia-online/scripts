@@ -15,9 +15,14 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.12.9
-           version: 2.6.7
+           version: 2.7.0
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.7.0  (2026-01-19)
+    - added ground looting of boxes
+    - added selling of ingots if too heavy to store
+    - updated find_trash to fully use trash verb
+    - general inventory code cleanup
   v2.6.7  (2026-01-18)
     - bugfix in silver breakdown
   v2.6.6  (2026-01-17)
@@ -2328,6 +2333,7 @@ module ELoot # Script utility type methods
     rows << ["#{$lich_char}#{Script.current.name} setup", "UI configuration tool"]
     rows << [' ', ' ']
     rows << ["#{$lich_char}#{Script.current.name}", "Loots items/creatures"]
+    rows << ["#{$lich_char}#{Script.current.name} ground", "Loots open boxes on the ground"]
     rows << ["#{$lich_char}#{Script.current.name} sell", "Sells loot based on UI options"]
     rows << ["#{$lich_char}#{Script.current.name} sell alchemy_mode", "Doesn't sell alchemy reagents"]
     rows << ["#{$lich_char}#{Script.current.name} deposit", "Deposits coins and notes"]
@@ -2699,7 +2705,7 @@ module ELoot # Game utility type methods
 
       if lines.any? { |line| line =~ /In the|There is nothing/i }
         if box.contents.length.positive?
-          unless [GameObj.left_hand.type, GameObj.right_hand.type].include?("box")
+          unless ELoot.in_hand?(box)
             Inventory.drag(box)
           end
           Loot.box_loot(box)
@@ -2712,47 +2718,20 @@ module ELoot # Game utility type methods
   end
 
   def self.find_trash
-    trashcan = nil
-    trash_id = nil
-
-    # Use new trash verb first
     lines = ELoot.get_command('trash', /You could discard items|You do not notice/, silent: true, quiet: true)
 
+    # If any line says there is no trashcan, stop early
+    return nil if lines.any? { |line| line =~ /You do not notice a trash receptacle here/ }
+
     lines.each do |line|
-      if (match_data = line.match(/You could discard items in (?:an?|the) <a exist="(-?\d+)" noun=".*?">.*?<\/a>/))
-        trash_id = match_data[1]
+      if (match_data = line.match(/You could discard items in (?:an?|the) <a exist="(?<exist>-?\d+)" noun="(?<noun>.*?)">(?<name>.*?)<\/a>/))
+        return GameObj.new(match_data[:exist], match_data[:noun], match_data[:name])
       end
     end
+  end
 
-    unless trash_id.nil?
-      trashcan = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.id == trash_id }
-      return trashcan unless trashcan.nil?
-    end
-
-    # Still here see if the meta tag is present
-    can = Regexp.last_match(1) if Room.current.tags.find { |t| t =~ /meta:trashcan:(.*)/ }
-
-    # Most common scenario - meta:trashcan is defined and GameObj.room_desc is available or trashcan is in GameObj.loot
-    trashcan = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.name =~ Regexp.union(can.to_a) }
-    return trashcan unless trashcan.nil?
-
-    # Still here? Either the meta:can isn't defined or the room description isn't available. Either way we have to use the noun.
-    can = ["barrel", "bin", "basket", "bucket", "canister", "case", "casket", "crate", "hearth", "pit", "stump", "urn", "wastebasket", "wastebin", "wastecan"]
-    trash = (Room.current.description.to_s + GameObj.room_desc.to_s + GameObj.loot.to_s).scan(Regexp.union(can)).uniq
-
-    # Check to make sure it's actually a trashcan and not a custom disk/container
-    trash.each { |item|
-      lines = ELoot.get_command("look in #{item}", /<container|I could not find what you were referring to.|The(.*?)is filled with a variety of garbage/, silent: true, quiet: true)
-
-      if lines.grep(/variety of garbage/).any?
-        trashcan = GameObj.new(Regexp.last_match(1), item, item) if lines.find { |l| l =~ /^<container id='(-?[0-9]+)' title/ }
-      end
-
-      break unless trashcan.nil?
-    }
-
-    ELoot.msg(type: "debug", text: "trashcan: #{trashcan}")
-    return trashcan
+  def self.in_hand?(obj)
+    [GameObj.right_hand.id, GameObj.left_hand.id].include?(obj.id)
   end
 
   def self.find_worker
@@ -2878,7 +2857,7 @@ module ELoot # Game utility type methods
     fput("deposit note")
 
     20.times do
-      break if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(note.id))
+      break if !ELoot.in_hand?(note)
       sleep 0.1
     end
 
@@ -3257,10 +3236,16 @@ module ELoot # Inventory methods
       line = ELoot.get_res("_drag ##{item.id} #{to}")
 
       20.times {
-        return true if ([GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id))
-        break if line =~ /Get what|I could not find what you were referring to/
+        return true if ELoot.in_hand?(item)
+        break if line =~ /Get what|I could not find what you were referring to|You are unable to handle the additional load/
         sleep 0.1
       }
+
+      if line =~ /You are unable to handle the additional load/
+        ELoot.msg(type: "yellow", text: " Unable to pick up the #{item.name}. Exiting...")
+        exit
+        ELoot.wait_rt
+      end
 
       if line =~ /Get what|I could not find what you were referring to/
         StowList.stow_list.each_value do |bag_obj|
@@ -3288,13 +3273,13 @@ module ELoot # Inventory methods
 
       # Give it time to update and confirm action
       20.times {
-        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)) && (GameObj.inv.map(&:id).compact.include?(item.id))
+        return true if !ELoot.in_hand?(item) && GameObj.inv.map(&:id).compact.include?(item.id)
         break if line =~ /You can't wear that/
         sleep 0.1
       }
 
       # Still here? Something is wrong, inform the player and exit.
-      if [GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
+      if ELoot.in_hand?(item)
         ELoot.msg(type: "warn", text: " Something is wrong. Unable to wear the #{item}. Exiting to avoid losing items.")
         ELoot.msg(type: "warn", text: " Please grab a short log of what just happened and post it to the scripting discord for debugging")
         exit
@@ -3433,7 +3418,7 @@ module ELoot # Inventory methods
       10.times {
         ELoot.get_res("ready #{ELoot.fix_item_key(ready_item.to_s)}", ELoot.data.get_regex)
         sleep 0.2
-        return true if [GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
+        return true if ELoot.in_hand?(item)
       }
 
       return false
@@ -3488,11 +3473,15 @@ module ELoot # Inventory methods
 
       # If item wasn't stored, pause and address
       unless stored
-        ELoot.msg(type: "info", text: " Failed to store the #{item.name}.")
-        ELoot.msg(type: "info", text: " Pausing the script to handle it yourself")
-        ELoot.msg(type: "info", text: " ;unpause #{Script.current.name} after addressing to continue!")
+        if Room.current.tags.any?(/locksmith|locksmith pool/i) && (gold_ingot = [GameObj.right_hand, GameObj.left_hand].find { |obj| obj.name == "gold ingot" })
+          Sell.handle_ingot(gold_ingot)
+        else
+          ELoot.msg(type: "info", text: " Failed to store the #{item.name}.")
+          ELoot.msg(type: "info", text: " Pausing the script to handle it yourself")
+          ELoot.msg(type: "info", text: " ;unpause #{Script.current.name} after addressing to continue!")
 
-        Script.current.pause
+          Script.current.pause
+        end
       end
     end
 
@@ -3547,9 +3536,9 @@ module ELoot # Inventory methods
       end
 
       20.times {
-        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id) and StowList.stow_list[item.type.to_sym].contents.to_a.map(&:id).include?(item.id))
-        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id) and StowList.stow_list[:default].contents.to_a.map(&:id).include?(item.id))
-        return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id) and item.type =~ /skin/)
+        return true if (!ELoot.in_hand?(item) && StowList.stow_list[item.type.to_sym].contents.to_a.map(&:id).include?(item.id))
+        return true if (!ELoot.in_hand?(item) && StowList.stow_list[:default].contents.to_a.map(&:id).include?(item.id))
+        return true if (!ELoot.in_hand?(item) && item.type =~ /skin/)
 
         sleep 0.1
       }
@@ -3602,11 +3591,11 @@ module ELoot # Inventory methods
         Inventory.open_single_container(bag) unless bag.contents.is_a?(Array) || is_skinner
 
         20.times do
-          return true if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id) && bag.contents.to_a.map(&:id).include?(item.id))
+          return true if (!ELoot.in_hand?(item) && bag.contents.to_a.map(&:id).include?(item.id))
 
           # Lousy weapon displayers don't have contents
           if is_skinner
-            return true if ![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
+            return true if !ELoot.in_hand?(item)
           end
           sleep 0.1
         end
@@ -3629,7 +3618,7 @@ module ELoot # Inventory methods
       10.times {
         ELoot.get_res("store #{ELoot.fix_item_key(ready_item.to_s)}", ELoot.data.put_regex)
         sleep 0.2
-        return true if ![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
+        return true if !ELoot.in_hand?(item)
       }
 
       return false
@@ -4172,7 +4161,7 @@ module ELoot # Gem and Reagent hoarding
 
       3.times do
         Inventory.drag(jar)
-        break if [GameObj.right_hand.id, GameObj.left_hand.id].include?(jar.id)
+        break if ELoot.in_hand?(jar)
         # assuming if we are still here and its a locker it reset on us
         if ELoot.data.locker || ELoot.data.use_house_locker
           Hoard.open_locker(reset: true)
@@ -4197,7 +4186,7 @@ module ELoot # Gem and Reagent hoarding
 
       3.times do
         Inventory.store_item(ELoot.data.stash, jar)
-        break unless [GameObj.right_hand.id, GameObj.left_hand.id].include?(jar.id)
+        break unless ELoot.in_hand?(jar)
         # assuming if we are still here and its a locker it reset on us
         if ELoot.data.locker || ELoot.data.use_house_locker
           Hoard.open_locker(reset: true)
@@ -4331,7 +4320,7 @@ module ELoot # Gem and Reagent hoarding
         if bottle
           3.times do
             Inventory.drag(bottle)
-            break if [GameObj.right_hand.id, GameObj.left_hand.id].include?(bottle.id)
+            break if ELoot.in_hand?(bottle)
             # assuming if we are still here and its a locker it reset on us
             if ELoot.data.locker || ELoot.data.use_house_locker
               Hoard.open_locker(reset: true)
@@ -4342,7 +4331,7 @@ module ELoot # Gem and Reagent hoarding
         elsif empty
           3.times do
             Inventory.drag(empty)
-            break if [GameObj.right_hand.id, GameObj.left_hand.id].include?(empty.id)
+            break if ELoot.in_hand?(empty)
             # assuming if we are still here and its a locker it reset on us
             if ELoot.data.locker || ELoot.data.use_house_locker
               Hoard.open_locker(reset: true)
@@ -4403,7 +4392,7 @@ module ELoot # Gem and Reagent hoarding
 
         3.times do
           Inventory.store_item(ELoot.data.stash, jar)
-          break unless [GameObj.right_hand.id, GameObj.left_hand.id].include?(jar.id)
+          break unless ELoot.in_hand?(jar)
           # assuming if we are still here and its a locker it reset on us
           if ELoot.data.locker || ELoot.data.use_house_locker
             Hoard.open_locker(reset: true)
@@ -4543,24 +4532,94 @@ module ELoot # Room looting
         end
 
         objs = box.contents
-        if objs.empty?
-          Sell.save_trash_box(box)
-          return
-        end
-
-        objs = Loot.loot_specials(objs)
-
-        # Anything left after boxes, collectibles, and uncommon weapon/armor?
-        if objs.empty?
-          Sell.save_trash_box(box)
-          return
-        end
-
-        Loot.loot_regular(objs, "Box", box)
+        objs = Loot.loot_specials(objs) unless objs.empty?
+        Loot.loot_regular(objs, "Box", box) unless objs.empty?
         Sell.save_trash_box(box)
       elsif box.type == "plinite"
         ELoot.get_res("pluck ##{box.id}", /You carefully pluck/)
         Inventory.free_hands(both: true)
+      end
+    end
+
+    def self.box_loot_ground
+      Inventory.free_hands(both: true)
+
+      box_list = GameObj.loot.find_all { |x| x.type == "box" }
+
+      box_list.each do |box|
+        line = ELoot.get_res("open ##{box.id}", /open|locked/)
+        next if line.any?(/That is locked/)
+
+        quiet_msg = ELoot.data.settings[:display_box_contents] ? false : true
+        ELoot.get_command("look in ##{box.id}", ELoot.data.look_regex, silent: quiet_msg, quiet: quiet_msg)
+
+        # Makes sure the item's contents are available
+        next unless Inventory.container_contents(box)
+
+        # Drag the box to our hand
+        Inventory.drag(box)
+
+        # Get the coins
+        while box.contents.any? { |obj| obj.name =~ /silver coins/ }
+          unless ELoot.data.charm.nil?
+            res = ELoot.get_res("point ##{ELoot.data.charm.id} at ##{box.id}", /You summon/)
+            data[location] += ELoot.silver_check - start_silvers
+          else
+            res = ELoot.get_res("get coins from ##{box.id}", /You gather the remaining|Get what|You can only collect|You cannot hold any more silvers/)
+            if res =~ /You gather the remaining/
+              data[location] += ELoot.silver_check - start_silvers
+              ELoot.wait_rt
+              break
+            elsif res =~ /You can only collect|You cannot hold any more silvers/
+              data[location] += ELoot.silver_check - start_silvers
+              ELoot.wait_rt
+              room = Room.current.id
+              ELoot.silver_deposit
+              start_silvers = ELoot.silver_check
+              ELoot.go2(room)
+            else
+              ELoot.msg(type: "info", text: " Unknown get coin result...Exiting!")
+              exit
+            end
+          end
+        end
+
+        # Loot the rest of the stuff
+        objs = box.contents
+        objs = Loot.loot_specials(objs) unless objs.empty?
+        Loot.loot_regular(objs, "Box", box) unless objs.empty?
+
+        save_box = ELoot.data.settings[:sell_loot_types].include?("box")
+        valuable_box = /gold|mithril|silver/
+
+        # If it's a save box and empty, just store it immediately also don't toss Reliquaries
+        if (save_box && box.contents.empty? && box.name =~ valuable_box) || box.name =~ /reliquary/i
+          Inventory.single_drag(box, false)
+          next
+        end
+
+        trash = ELoot.find_trash
+
+        if save_box && box.name =~ valuable_box && !box.contents.any? { |obj| obj.type =~ /cursed/ }
+          box.contents.each do |item|
+            Inventory.drag(item)
+            fput("trash ##{item.id}")
+            ELoot.wait_rt
+
+            # if its not gone it might be special - save it
+            Inventory.single_drag(item) if ELoot.in_hand?(item)
+          end
+        else
+          # Attempt to trash the box up to 4 times
+          4.times do
+            break unless ELoot.in_hand?(box)
+
+            fput("trash ##{box.id}")
+            ELoot.wait_rt
+          end
+        end
+
+        Inventory.single_drag(box, false) if ELoot.in_hand?(box)
       end
     end
 
@@ -4911,14 +4970,14 @@ module ELoot # Room looting
 
         ELoot.msg(type: "debug", text: "edged skinner: #{skinner.inspect}")
 
-        dont_stow = true if [GameObj.right_hand.id, GameObj.left_hand.id].include?(skinner.id)
+        dont_stow = true if ELoot.in_hand?(skinner)
 
         unless dont_stow
           Inventory.free_hand
         end
       end
 
-      unless [GameObj.right_hand.id, GameObj.left_hand.id].include?(skinner.id)
+      unless ELoot.in_hand?(skinner)
         waitrt?
         Inventory.drag(skinner)
       end
@@ -4987,7 +5046,7 @@ module ELoot # Room looting
 
       Inventory.store_item(bag, skinner, true)
 
-      if [GameObj.right_hand.id, GameObj.left_hand.id].include?(skinner.id)
+      if ELoot.in_hand?(skinner)
         Inventory.store_item(StowList.stow_list[:default], skinner)
       end
     end
@@ -5252,10 +5311,7 @@ module ELoot # Sells the loot
             Inventory.drag(item)
 
             if item.name =~ /bundle/
-              # grab the bundle ID
-              bundle_id = GameObj.right_hand.id || GameObj.left_hand.id
-
-              until ![GameObj.right_hand.id, GameObj.left_hand.id].include?(bundle_id)
+              until !ELoot.in_hand?(item)
                 # remove a skin
                 result = dothistimeout "bundle remove", 5, /You remove|Those were the last two/
 
@@ -5264,7 +5320,7 @@ module ELoot # Sells the loot
                   Sell.sell_item(GameObj.left_hand, "Furrier", ELoot.data.silver_breakdown)
                 else
                   # get the skin id
-                  skin = GameObj.right_hand.id != bundle_id ? GameObj.right_hand : GameObj.left_hand
+                  skin = GameObj.right_hand.id != item.id ? GameObj.right_hand : GameObj.left_hand
                   Sell.sell_item(skin, "Furrier", ELoot.data.silver_breakdown)
                 end
               end
@@ -5469,7 +5525,7 @@ module ELoot # Sells the loot
           dothistimeout("deposit ##{thing.id}", 3, /You hand your/)
 
           20.times {
-            break if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(thing.id))
+            break if !ELoot.in_hand?(thing)
 
             sleep 0.1
           }
@@ -5676,72 +5732,39 @@ module ELoot # Sells the loot
     end
 
     def self.dump_herbs_junk
-      # What stuff are we supposed to dump?
-      dump_stuff = []
-      ["herb", "junk", "food"].each { |item|
-        if ELoot.data.settings[:sell_loot_types].include?(item)
-          dump_stuff.push(item)
-        end
-      }
+      # Determine which types of loot we are supposed to dump
+      dump_stuff = ["herb", "junk", "food"].select { |type| ELoot.data.settings[:sell_loot_types].include?(type) }
+      alchemy_regex = /^(some ground|flask of pure water|some powdered|some mashed|handful of sea salt|spirit shard|tincture of)/
 
-      # Return if nothing
-      if dump_stuff.empty?
-        return
+      # Collect items to dump
+      dump_items = ELoot.set_selling_containers.flat_map(&:contents).select do |item|
+        next false unless dump_stuff.any? { |type| item.type =~ /#{type}/ } || (ELoot.data.alchemy_mode && item.name =~ alchemy_regex)
+        next false if ELoot.data.alchemy_mode && Vars.needed_reagents.any? { |r| item.name =~ /#{r}/ }
+        true
       end
 
-      # Do we have anything to dump?
-      dump_items = []
-      sacks = ELoot.set_selling_containers
-      sacks.each { |sack|
-        sack.contents.each { |item|
-          if item.type =~ Regexp.union(dump_stuff) || (ELoot.data.alchemy_mode && item.name =~ /^some ground|flask of pure water|some powdered|some mashed|handful of sea salt|spirit shard|tincture of/)
-            if ELoot.data.alchemy_mode
-              next if item.name =~ /#{Vars.needed_reagents}/ && Vars.needed_reagents.length.to_i > 0
-            end
-            dump_items.push(item)
-          end
-        }
-      }
+      # If nothing to dump just return
+      return if dump_items.empty?
 
-      # No items to dump so return
-      if dump_items.empty?
-        return
-      end
+      # Find the trash can
+      zul_in_shattered = XMLData.game == 'GSF' && Room[Room.current.find_nearest_by_tag("town")].location == 'the tunnels and caverns of Zul Logoth'
+      trash_spot = zul_in_shattered ? 1005 : 'locksmith pool'
+      trash = ELoot.find_trash || (ELoot.go2(trash_spot); ELoot.find_trash)
 
-      # Is there a trash can here?
-      trash = ELoot.find_trash
-
-      unless trash
-        # going here because they have trash cans. Don't want to litter
-        if XMLData.game == 'GSF' && Room[Room.current.find_nearest_by_tag("town")].location == 'the tunnels and caverns of Zul Logoth'
-          trash_spot = 1005
-        else
-          trash_spot = 'locksmith pool'
-        end
-
-        ELoot.go2(trash_spot)
-        trash = ELoot.find_trash
-      end
-
-      if trash.nil?
-        ELoot.msg(type: "info", text: " No trashcan found! Skipping herb/junk/food disposal so as not to litter and be a pest.")
-        return
-      end
-
-      dump_items.each { |item|
+      dump_items.each do |item|
         Inventory.drag(item)
-        fput("put ##{item.id} in ##{trash.id}")
+        fput("trash ##{item.id}")
 
-        20.times {
-          break if ![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id)
+        20.times do
+          break unless ELoot.in_hand?(item)
           sleep 0.1
-        }
+        end
 
-        if [GameObj.right_hand.id, GameObj.left_hand.id].include?(item.id)
-          ELoot.msg(type: "info", text: " #{item.name} isn't gone so maybe its special...keeping it.")
+        if ELoot.in_hand?(item)
+          ELoot.msg(type: "info", text: " #{item.name} isn't trashed so maybe its special...keeping it.")
           Inventory.single_drag(item)
         end
-      }
+      end
 
       Inventory.free_hands(both: true)
     end
@@ -5815,9 +5838,9 @@ module ELoot # Sells the loot
 
           if item.name =~ /bundle/
             # grab the bundle ID
-            bundle_id = !GameObj.right_hand.id.nil? ? GameObj.right_hand.id : GameObj.left_hand.id
+            bundle = !GameObj.right_hand.id.nil? ? GameObj.right_hand : GameObj.left_hand
 
-            until ![GameObj.right_hand.id, GameObj.left_hand.id].include?(bundle_id)
+            until !ELoot.in_hand?(bundle)
               # remove a skin
               result = dothistimeout "bundle remove", 5, /You remove|Those were the last two/
 
@@ -5826,7 +5849,7 @@ module ELoot # Sells the loot
                 Sell.sell_item(GameObj.left_hand, "Furrier", ELoot.data.silver_breakdown)
               else
                 # get the skin id
-                skin = GameObj.right_hand.id != bundle_id ? GameObj.right_hand : GameObj.left_hand
+                skin = GameObj.right_hand.id != bundle.id ? GameObj.right_hand : GameObj.left_hand
                 # Sell.sell_item(skin)
                 Sell.sell_item(skin, "Furrier", ELoot.data.silver_breakdown)
               end
@@ -6075,7 +6098,7 @@ module ELoot # Sells the loot
             fput "give ##{item.id} to ##{npc.id}"
 
             20.times {
-              break if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id))
+              break if !ELoot.in_hand?(item)
 
               sleep 0.1
             }
@@ -6084,6 +6107,23 @@ module ELoot # Sells the loot
           end
         }
       end
+    end
+
+    def self.handle_ingot(gold_ingot)
+      original_room = Room.current.id
+      ELoot.go2("gemshop")
+      start_silvers = ELoot.silver_check
+
+      Sell.sell_item(gold_ingot, "Gemshop", ELoot.data.silver_breakdown)
+
+      ELoot.data.silver_breakdown["Gemshop"] += (ELoot.silver_check - start_silvers)
+
+      # put note in container if needed
+      if (note = [GameObj.right_hand, GameObj.left_hand].find { |i| i.noun =~ /\b(?:note|scrip|chit)\b/ })
+        Inventory.single_drag(note)
+      end
+
+      ELoot.go2(original_room)
     end
 
     def self.inbetween_scripts
@@ -6128,9 +6168,9 @@ module ELoot # Sells the loot
             activator = 'ring chime'
           end
 
-          if activator
+          if activator # fixme - shouldn't stow both hands just not the box
             boxes.each { |box|
-              Inventory.free_hands(both: true) unless [GameObj.left_hand.type, GameObj.right_hand.type].include?("box")
+              Inventory.free_hands(both: true) unless ELoot.in_hand?(box)
               Sell.locksmith_open(box, activator)
             }
           else
@@ -6146,7 +6186,7 @@ module ELoot # Sells the loot
       lines = ELoot.get_command("look in ##{box.id}", /<container|That is closed|You see the shifting form/, silent: true, quiet: true)
       return unless lines.any? { |line| line =~ /That is closed|You see the shifting form/i }
 
-      Inventory.drag(box) unless [GameObj.left_hand.type, GameObj.right_hand.type].include?("box")
+      Inventory.drag(box) unless ELoot.in_hand?(box)
       box = ELoot.box_unphase(box)
 
       lines = ELoot.get_command("open ##{box.id}", /That is already open|You open|You throw back|It appears to be locked/, silent: true, quiet: true)
@@ -6520,26 +6560,27 @@ module ELoot # Sells the loot
 
     def self.process_boxes
       boxes = ELoot.find_boxes
+      return unless boxes.any?
 
-      cur_len = boxes.length.to_i
-      ELoot.msg(type: "debug", text: "length: #{cur_len}")
+      ELoot.msg(type: "debug", text: "length: #{boxes.length}")
 
       # Process boxes in the locksmithpool
-      if (ELoot.data.settings[:always_check_pool] || (ELoot.data.settings[:sell_locksmith_pool] && boxes.any?)) && !(Bounty.task.gem? && ELoot.data.settings[:sell_locksmith] && ELoot.data.settings[:locksmith_when_gem_bounty] && boxes.length.positive?)
-        Sell.locksmith_pool(boxes) unless !ELoot.data.settings[:sell_locksmith_pool]
+      should_check_pool = ELoot.data.settings[:always_check_pool] || (ELoot.data.settings[:sell_locksmith_pool] && boxes.any?)
+      skip_for_gem_bounty = Bounty.task.gem? && ELoot.data.settings[:sell_locksmith] && ELoot.data.settings[:locksmith_when_gem_bounty] && boxes.any?
+
+      if should_check_pool && !skip_for_gem_bounty
+        Sell.locksmith_pool(boxes) if ELoot.data.settings[:sell_locksmith_pool]
         Sell.pool_return # retrieve (and loot) any boxes in the pool
 
         # Refresh the boxes
         boxes = ELoot.find_boxes
       end
 
-      # Sell off any remaining boxes
-      Sell.locksmith(boxes) if ELoot.data.settings[:sell_locksmith] && boxes.length.positive?
+      # Go to Locksmith for remaining boxes
+      Sell.locksmith(boxes) if ELoot.data.settings[:sell_locksmith] && boxes.any?
 
       # Deposit silvers if encumbered
-      if Char.percent_encumbrance > 80
-        ELoot.silver_deposit
-      end
+      ELoot.silver_deposit if Char.percent_encumbrance > 80
     end
 
     def self.save_trash_box(box)
@@ -6550,43 +6591,36 @@ module ELoot # Sells the loot
       valuable_box = /gold|mithril|silver/
 
       # If it's a save box and empty, just store it immediately also don't toss Reliquaries
-      if (save_box && box.name =~ valuable_box && box.contents.empty?) || box.name =~ /reliquary/i
+      if (save_box && box.contents.empty? && box.name =~ valuable_box) || box.name =~ /reliquary/i
         Inventory.single_drag(box, false)
         return
       end
 
-      trash = ELoot.find_trash
-
-      unless trash
-        trash_spot = if XMLData.game == 'GSF' && Room[Room.current.find_nearest_by_tag("town")].location == 'the tunnels and caverns of Zul Logoth'
-                       1005
-                     else
-                       'locksmith pool'
-                     end
-        ELoot.go2(trash_spot)
-        trash = ELoot.find_trash
-      end
+      # Find the trash can
+      zul_in_shattered = XMLData.game == 'GSF' && Room[Room.current.find_nearest_by_tag("town")].location == 'the tunnels and caverns of Zul Logoth'
+      trash_spot = zul_in_shattered ? 1005 : 'locksmith pool'
+      trash = ELoot.find_trash || (ELoot.go2(trash_spot); ELoot.find_trash)
 
       if save_box && box.name =~ valuable_box && !box.contents.any? { |obj| obj.type =~ /cursed/ }
         box.contents.each do |item|
           Inventory.drag(item)
-          fput("put ##{item.id} in ##{trash.id}") if trash
-          sleep(0.5)
-          Inventory.single_drag(item) if [GameObj.right_hand.id, GameObj.left_hand.id].include?(item.id)
-        end
+          fput("trash ##{item.id}")
+          ELoot.wait_rt
 
-        Inventory.single_drag(box, false)
-      elsif trash
-        t = Time.now + 3
-        loop do
-          dothistimeout "put ##{box.id} in ##{trash.id}", 1, /As you place|If you wish to continue/
-          break if ![GameObj.right_hand.id, GameObj.left_hand.id].include?(box.id) || Time.now > t
+          # if its not gone it might be special - save it
+          Inventory.single_drag(item) if ELoot.in_hand?(item)
         end
       else
-        until ![GameObj.right_hand.id, GameObj.left_hand.id].include?(box.id)
-          fput("drop ##{box.id}")
+        # Attempt to trash the box up to 4 times
+        4.times do
+          break unless ELoot.in_hand?(box)
+
+          fput("trash ##{box.id}")
+          ELoot.wait_rt
         end
       end
+
+      Inventory.single_drag(box, false) if ELoot.in_hand?(box)
 
       # Always return to the original room
       ELoot.go2(return_room)
@@ -6648,8 +6682,7 @@ module ELoot # Sells the loot
       return if lines.any?(/That's not quite my field|That's basically worthless here|Can't say I'm interested in that|This is a pawnshop, sir, not a junkshop|The company don't buy trash|as if you were a lunatic/)
 
       20.times {
-        break if (![GameObj.right_hand, GameObj.left_hand].map(&:id).compact.include?(item.id))
-
+        break if !ELoot.in_hand?(item)
         sleep 0.1
       }
 
@@ -6838,6 +6871,8 @@ module ELoot # Starts the script
   when /^skin/i
     ELoot.data.debug_logger = ELoot::DebugLogger.new if ELoot.data.settings[:debug_file]
     ELoot::Loot.skin
+  when /ground/
+    ELoot::Loot.box_loot_ground
   when /test/i
     ELoot.test
   else
