@@ -1,17 +1,17 @@
 module Migration
   module Convert
-    # (?:seasoned |grizzled |battle\-scarred |ancient |veteran )?  
+    # (?:seasoned |grizzled |battle\-scarred |ancient |veteran )?
     def self.maybe_pattern_to_regex(maybes = nil, space: nil, required_match: nil)
       return %{} if maybes.nil?
-      #Migration.log(maybes, label: %i[maybes])
+      # Migration.log(maybes, label: %i[maybes])
       with_whitespace = maybes.map do |maybe|
         if space.eql?(:left)
           " " + maybe
         elsif space.eql?(:right)
-          maybe + " " 
+          maybe + " "
         else
           maybe
-        end 
+        end
       end.join("|")
       if required_match.nil?
         %{(?:#{with_whitespace})?}
