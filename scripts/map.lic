@@ -13,7 +13,7 @@ Tracks your current room on visual maps
       author: elanthia-online
       game: Gemstone
       tags: core, movement, mapping
-      required: Lich > 5.0.1
+      required: Lich >= 5.13.0
       version: 2.0.0
 
   changelog:
@@ -118,7 +118,39 @@ if Script.current.vars[1] == 'help'
 end
 
 # Main namespace for the Elanthia map visualization tool
+#
+# This module provides GTK-based map visualization for Lich scripting framework,
+# with full cross-platform support for Linux, native Windows, WSL, and macOS.
+#
+# @note Platform-Specific Behavior
+#   - **macOS**: Uses Quartz backend with special handling for window visibility
+#     and presentation. X11-specific features (UTILITY window hints, stick/unstick)
+#     are automatically skipped.
+#   - **Native Windows**: Uses Windows backend. X11-specific features are skipped
+#     to ensure proper taskbar integration and window behavior.
+#   - **Linux/WSL+X11**: Uses X11/Wayland backends with full window manager
+#     integration and all X11-specific features enabled.
+#
+# @example Basic Usage
+#   # Run the map script
+#   ;map
+#
+#   # Show specific room
+#   ;map 12345
+#
+#   # Enable debug output
+#   ;map trouble
 module ElanthiaMap
+  # Platform detection constants for GTK backend compatibility
+  # Uses Lich's OS module for consistent platform detection across scripts
+  #
+  # @return [Boolean] True if running on macOS (Quartz backend)
+  IS_MACOS = OS.mac? unless defined?(IS_MACOS)
+  # @return [Boolean] True if running on native Windows (Windows backend)
+  IS_WINDOWS = OS.windows? unless defined?(IS_WINDOWS)
+  # @return [Boolean] True if X11-specific features should be used (Linux/WSL+X11)
+  USE_X11_FEATURES = (!IS_MACOS && !IS_WINDOWS) unless defined?(USE_X11_FEATURES)
+
   # Module instance variable to store current window for cleanup
   @current_window = nil
 
@@ -346,7 +378,31 @@ module ElanthiaMap
   # Main window manager for the map interface
   #
   # Handles GTK window creation, map display, user interaction,
-  # and room tracking.
+  # and room tracking. Provides cross-platform support with special
+  # handling for macOS and Windows GTK backend quirks.
+  #
+  # @note Platform Compatibility
+  #   The Window class includes special handling for different GTK backends:
+  #
+  #   **macOS (Quartz backend)**:
+  #   - Explicit window presentation via `present()` and `activate_focus()`
+  #   - Skips X11-specific window hints (UTILITY type, stick/unstick)
+  #   - Uses fixed delay instead of `visible?` check for window readiness
+  #   - Positions window before showing to ensure correct placement
+  #
+  #   **Native Windows (Windows backend)**:
+  #   - Skips X11-specific window hints to ensure proper taskbar integration
+  #   - Uses standard GTK keep_above without UTILITY type or stick methods
+  #
+  #   **Linux/WSL+X11 (X11/Wayland backends)**:
+  #   - Full X11 feature support including UTILITY hints and stick/unstick
+  #   - Better integration with various window managers
+  #
+  # @example Create and show a window
+  #   window = ElanthiaMap::Window.new(script, MAP_DIR)
+  #   window.show
+  #   # Window will automatically present itself on macOS
+  #   # and appear in taskbar on Windows
   class Window
     # @return [Gtk::Window] The GTK window instance
     attr_reader :gtk_window
@@ -406,10 +462,26 @@ module ElanthiaMap
 
     # Shows the window and enters the main event loop
     #
+    # On MacOS, GTK windows require explicit presentation and activation to become visible.
+    # The window is positioned before showing to ensure correct placement, then presented
+    # to the user with focus activation.
+    #
     # @return [void]
     def show
-      @gtk_window.show_all
+      # Position before showing to ensure correct placement
       position_window
+      @gtk_window.show_all
+
+      # MacOS-specific: Explicitly present and activate the window
+      # GTK's window visibility works differently on MacOS than Linux/X11
+      if IS_MACOS
+        @gtk_window.present
+        begin
+          @gtk_window.activate_focus if @gtk_window.respond_to?(:activate_focus)
+        rescue StandardError
+          # Ignore if method doesn't work in current environment
+        end
+      end
     end
 
     # Changes the currently displayed map
@@ -464,6 +536,10 @@ module ElanthiaMap
     # Captures current window position and size
     # This is a separate method to maintain DRY principle
     #
+    # On macOS, the captured Y position is adjusted to account for the 28-pixel
+    # menu bar offset that will be applied during position_window(). This prevents
+    # the window from creeping up the screen on each restart.
+    #
     # @return [Array] Two-element array: [position_array, size_array] or [nil, nil] if capture fails
     def capture_window_geometry
       window_pos = window_size = nil
@@ -491,6 +567,32 @@ module ElanthiaMap
           if window_exists && !window_destroyed && window_visible
             window_pos = @gtk_window.position
             window_size = [@gtk_window.allocation.width, @gtk_window.allocation.height]
+
+            # On macOS, detect and compensate for GTK's automatic position adjustment.
+            # GTK adjusts our positioned Y by ~31 pixels, but we add +28, causing ~3px drift.
+            # If captured Y is close to expected (within 10px), maintain original Y to prevent drift.
+            # If captured Y is far from expected, user manually moved window - honor that.
+            if ElanthiaMap::IS_MACOS && window_pos && @char_settings[:window_position]
+              original_y = @char_settings[:window_position][1]
+              captured_y = window_pos[1]
+              expected_y = original_y + 28 - 31 # We add 28, GTK subtracts ~31
+
+              drift = (captured_y - expected_y).abs
+
+              if @trouble_mode
+                respond "[map: DEBUG - Original Y: #{original_y}]"
+                respond "[map: DEBUG - Captured Y: #{captured_y}]"
+                respond "[map: DEBUG - Expected Y: #{expected_y}]"
+                respond "[map: DEBUG - Drift: #{drift}px]"
+              end
+
+              if drift < 10 # Within 10px = GTK adjustment, not user move
+                respond "[map: DEBUG - Drift < 10px, maintaining original Y]" if @trouble_mode
+                window_pos = [window_pos[0], original_y]
+              else
+                respond "[map: DEBUG - Drift >= 10px, user moved window, using captured Y]" if @trouble_mode
+              end
+            end
           end
         rescue StandardError => e
           # Window already destroyed or error accessing properties
@@ -616,6 +718,17 @@ module ElanthiaMap
     end
 
     # Creates the main GTK window
+    #
+    # Sets up the window with appropriate size and type hints. The UTILITY type hint is
+    # skipped on macOS (Quartz backend) and native Windows (Windows backend) as it can
+    # cause visibility and taskbar issues. On Linux/X11, UTILITY hint helps with
+    # keep_above behavior in various window managers.
+    #
+    # @note Platform-Specific Behavior
+    #   - **macOS**: No UTILITY hint (prevents window visibility issues)
+    #   - **Native Windows**: No UTILITY hint (ensures taskbar presence)
+    #   - **Linux/WSL+X11**: Uses UTILITY hint (better window manager integration)
+    #
     # @return [void]
     def create_window
       @gtk_window = Gtk::Window.new
@@ -624,7 +737,10 @@ module ElanthiaMap
       @gtk_window.resize(@char_settings[:window_width], @char_settings[:window_height])
 
       # Set window type hints to help with keep_above in various window managers
-      @gtk_window.set_type_hint(Gdk::WindowTypeHint::UTILITY)
+      # Skip UTILITY hint on macOS and native Windows - causes visibility/taskbar issues
+      if USE_X11_FEATURES
+        @gtk_window.set_type_hint(Gdk::WindowTypeHint::UTILITY)
+      end
     end
 
     # Creates the context menu
@@ -658,18 +774,24 @@ module ElanthiaMap
           if @settings[:keep_above]
             @gtk_window.keep_above = true
             # Try additional methods for stubborn window managers
-            begin
-              @gtk_window.stick if @gtk_window.respond_to?(:stick)
-              @gtk_window.set_keep_above(true)
-            rescue StandardError
-              # Ignore errors
+            # Skip stick on macOS and native Windows as it's X11/Wayland specific
+            if USE_X11_FEATURES
+              begin
+                @gtk_window.stick if @gtk_window.respond_to?(:stick)
+                @gtk_window.set_keep_above(true)
+              rescue StandardError
+                # Ignore errors
+              end
             end
           else
             @gtk_window.keep_above = false
-            begin
-              @gtk_window.unstick if @gtk_window.respond_to?(:unstick)
-            rescue StandardError
-              # Ignore errors
+            # Skip unstick on macOS and native Windows as it's X11/Wayland specific
+            if USE_X11_FEATURES
+              begin
+                @gtk_window.unstick if @gtk_window.respond_to?(:unstick)
+              rescue StandardError
+                # Ignore errors
+              end
             end
           end
         end
@@ -1908,17 +2030,30 @@ module ElanthiaMap
     end
 
     # Applies current settings to the window
+    #
+    # Updates window properties like keep_above, opacity, borders, and scrollbars.
+    # On macOS and native Windows, X11-specific features (UTILITY hint, stick) are
+    # skipped as they can cause compatibility issues with their respective backends.
+    #
+    # @note Platform-Specific Behavior
+    #   - **macOS**: Skips UTILITY hint and stick (Quartz backend incompatibility)
+    #   - **Native Windows**: Skips UTILITY hint and stick (Windows backend, ensures taskbar)
+    #   - **Linux/WSL+X11**: Uses all X11 features (better window manager integration)
+    #
     # @return [void]
     def apply_window_settings
       Gtk.queue do
         if @settings[:keep_above]
           @gtk_window.keep_above = true
           # Try multiple approaches for X11 forwarding compatibility
-          begin
-            @gtk_window.set_type_hint(Gdk::WindowTypeHint::UTILITY)
-            @gtk_window.stick if @gtk_window.respond_to?(:stick)
-          rescue StandardError
-            # Ignore if these methods don't work in current environment
+          # Skip UTILITY hint and stick on macOS and native Windows as they can cause issues
+          if USE_X11_FEATURES
+            begin
+              @gtk_window.set_type_hint(Gdk::WindowTypeHint::UTILITY)
+              @gtk_window.stick if @gtk_window.respond_to?(:stick)
+            rescue StandardError
+              # Ignore if these methods don't work in current environment
+            end
           end
         else
           @gtk_window.keep_above = false
@@ -1953,8 +2088,8 @@ module ElanthiaMap
       y = [[monitor_y, @char_settings[:window_position][1]].max,
            monitor_y + monitor_height - @char_settings[:window_height]].min
 
-      # macOS requires extra offset
-      y += 28 if RUBY_PLATFORM =~ /darwin/
+      # macOS requires extra offset for menu bar
+      y += 28 if IS_MACOS
 
       @gtk_window.move(x, y)
 
@@ -1974,6 +2109,15 @@ module ElanthiaMap
   end
 
   # Main entry point for the script
+  #
+  # Creates the window, handles initial room display, waits for window readiness,
+  # and enters the main event loop to track room changes.
+  #
+  # @note Platform-Specific Window Readiness
+  #   - **MacOS**: Uses a fixed 0.3s delay as GTK's `visible?` method doesn't
+  #     reliably report window visibility on the Quartz backend.
+  #   - **Linux/Windows**: Waits for `visible?` to return true with a 3-second
+  #     timeout to prevent infinite hangs.
   #
   # @param script [Script] The running script instance
   # @return [void]
@@ -2002,8 +2146,17 @@ module ElanthiaMap
 
       Gtk.queue { window.show }
 
-      # Wait for window to be ready
-      sleep 0.1 while !window.gtk_window.visible?
+      # Wait for window to be ready (with timeout for MacOS compatibility)
+      # On MacOS, GTK windows may not report visible? correctly, so use a fixed delay
+      # On Linux, wait for visibility with timeout to prevent infinite hangs
+      if IS_MACOS
+        # On MacOS, give the window a moment to show but don't wait for visible flag
+        sleep 0.3
+      else
+        # On Linux, wait for visibility with timeout
+        timeout = 30 # 3 seconds (30 * 0.1s)
+        sleep 0.1 while !window.gtk_window.visible? && timeout > 0 && (timeout -= 1)
+      end
 
       # Main loop: track room changes
       until window.should_exit
