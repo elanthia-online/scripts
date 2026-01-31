@@ -7,5 +7,6 @@ require_relative("../../lib/migration.rb")
 ##
 Migration.run(
   migrations: Dir[Migration.cwd("type_data", "migrations", "**", "*.rb")],
-  tables:     Dir[Migration.cwd("type_data", "tables", "**", "*.yaml")],
-  dist:       Migration.cwd("dist"))
+  tables: Dir[Migration.cwd("type_data", "tables", "**", "*.yaml")],
+  dist: Migration.cwd("dist")
+)
