@@ -8,7 +8,7 @@ puts '1'
 ##
 Migration.run(
   migrations: Dir[Migration.cwd("type_data", "migrations", "**", "*.rb")],
-  tables:     Dir[Migration.cwd("type_data", "tables", "**", "*.yaml")],
-  dist:       Migration.cwd("dist")
+  tables: Dir[Migration.cwd("type_data", "tables", "**", "*.yaml")],
+  dist: Migration.cwd("dist")
 )
 puts '2'
