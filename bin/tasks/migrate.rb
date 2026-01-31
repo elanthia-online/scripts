@@ -2,7 +2,6 @@
 ## load all assets
 ##
 require_relative("../../lib/migration.rb")
-puts '1'
 ##
 ## do eeet
 ##
@@ -11,4 +10,3 @@ Migration.run(
   tables: Dir[Migration.cwd("type_data", "tables", "**", "*.yaml")],
   dist: Migration.cwd("dist")
 )
-puts '2'
