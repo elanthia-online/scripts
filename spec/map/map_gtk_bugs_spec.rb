@@ -109,8 +109,6 @@ describe "map.lic GTK bugfixes" do
     end
 
     it "correctly round-trips through multiple toggles" do
-      setting_borderless = false
-
       # Toggle on
       setting_borderless = apply_borderless_toggle(window, true)
       expect(setting_borderless).to eq(true)
@@ -170,11 +168,11 @@ describe "map.lic GTK bugfixes" do
       run_cleanup(image, circle_image, menu, window)
 
       expect(call_log).to eq([
-        :image_hide,
-        :circle_hide,
-        :menu_destroy,
-        :window_destroy
-      ])
+                               :image_hide,
+                               :circle_hide,
+                               :menu_destroy,
+                               :window_destroy
+                             ])
     end
 
     it "hides all images before any destroy call" do
