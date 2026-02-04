@@ -95,6 +95,8 @@ if Script.current.vars[1] == 'help'
   respond "   ;map <text to search>       - shows room# that first matches text instead of current room"
   respond "   ;map fix                    - enables coordinate fix mode (ctrl+shift+click to set room) "
   respond "   ;map trouble                - enables debug output for troubleshooting window issues     "
+  respond "   ;map genie                  - shows Genie zone:node for current room (DR only)          "
+  respond "   ;map g<zone>:<node>         - opens map centered on Genie ref (e.g., ;map g1:335)       "
   respond "   ;map reset                  - resets map settings to default values                      "
   respond "                                      keep_above = true                                     "
   respond "                                      keep_centered = true                                  "
@@ -376,6 +378,238 @@ module ElanthiaMap
     end
   end
 
+  # Zone detection for dynamic map rendering
+  #
+  # Resolves which "zone" (group of rooms) a room belongs to, using a
+  # 4-layer fallback: genie_zone → @image → @location → BFS flood-fill.
+  # Results are cached for performance.
+  module ZoneResolver
+    @cache = {}
+
+    def self.clear_cache
+      @cache = {}
+    end
+
+    def self.resolve(room)
+      return nil if room.nil?
+
+      zone_key = if room.respond_to?(:genie_zone) && room.genie_zone
+                   "gz:#{room.genie_zone}"
+                 elsif room.image
+                   "img:#{room.image}"
+                 elsif has_location?(room)
+                   "loc:#{room.location}"
+                 else
+                   "cc:#{room.id}"
+                 end
+
+      return @cache[zone_key] if @cache[zone_key]
+
+      rooms = if room.respond_to?(:genie_zone) && room.genie_zone
+                Map.list.select { |r| r && r.respond_to?(:genie_zone) && r.genie_zone == room.genie_zone }
+              elsif room.image
+                Map.list.select { |r| r && r.image == room.image }
+              elsif has_location?(room)
+                Map.list.select { |r| r && r.location == room.location }
+              else
+                bfs_zone(room)
+              end
+
+      @cache[zone_key] = { zone_id: zone_key, rooms: rooms }
+    end
+
+    def self.bfs_zone(start_room, max_depth: 40)
+      visited = { start_room.id => true }
+      queue = [[start_room, 0]]
+      result = [start_room]
+      while (entry = queue.shift)
+        current, depth = entry
+        next if depth >= max_depth
+
+        current.wayto.each_key do |target_id|
+          tid = target_id.to_i
+          next if visited[tid]
+
+          neighbor = Map[tid]
+          next if neighbor.nil?
+          next if (neighbor.respond_to?(:genie_zone) && neighbor.genie_zone) || neighbor.image || has_location?(neighbor)
+
+          visited[tid] = true
+          result << neighbor
+          queue << [neighbor, depth + 1]
+        end
+      end
+      result
+    end
+
+    def self.has_location?(room)
+      room.location.is_a?(String) && !room.location.empty?
+    end
+    private_class_method :has_location?
+  end
+
+  # Direction-based auto-layout engine for dynamic map rendering
+  #
+  # Supports two modes:
+  # - Mode A: Genie positions (when rooms have genie_pos data)
+  # - Mode B: Direction-based BFS layout (compass directions → grid offsets)
+  module LayoutEngine
+    DIRECTION_OFFSETS = {
+      'north' => [0, -1], 'south' => [0, 1],
+      'east' => [1, 0], 'west' => [-1, 0],
+      'northeast' => [1, -1], 'northwest' => [-1, -1],
+      'southeast' => [1, 1], 'southwest' => [-1, 1],
+      'n' => [0, -1], 's' => [0, 1], 'e' => [1, 0], 'w' => [-1, 0],
+      'ne' => [1, -1], 'nw' => [-1, -1], 'se' => [1, 1], 'sw' => [-1, 1],
+      'up' => [0, -1], 'down' => [0, 1], 'out' => [1, 0]
+    }.freeze
+
+    GRID_SPACING = 20
+
+    # Check if point (px, py) lies on the line segment between (ax, ay) and (bx, by).
+    def self.point_on_segment?(px, py, ax, ay, bx, by)
+      return false if ax == bx && ay == by
+
+      cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+      return false unless cross == 0
+
+      px.between?([ax, bx].min, [ax, bx].max) && py.between?([ay, by].min, [ay, by].max)
+    end
+
+    # Check if a candidate position lies on any connection line between already-positioned rooms.
+    def self.on_connection_line?(px, py, positions, room_index, skip_neighbors_of: nil)
+      skip_set = nil
+      if skip_neighbors_of
+        skip_room = room_index[skip_neighbors_of]
+        if skip_room
+          skip_set = {}
+          skip_room.wayto.each_key { |k| skip_set[k.to_i] = true }
+          room_index.each do |rid, r|
+            skip_set[rid] = true if r.wayto.key?(skip_neighbors_of.to_s)
+          end
+        end
+      end
+
+      positions.each do |room_id, pos|
+        room = room_index[room_id]
+        next unless room
+
+        room.wayto.each_key do |target_id|
+          tid = target_id.to_i
+          target_pos = positions[tid]
+          next unless target_pos
+          next if (px == pos[:x] && py == pos[:y]) || (px == target_pos[:x] && py == target_pos[:y])
+          next if skip_set && (skip_set[room_id] || skip_set[tid])
+
+          return true if point_on_segment?(px, py, pos[:x], pos[:y], target_pos[:x], target_pos[:y])
+        end
+      end
+      false
+    end
+
+    # Compute positions for a set of rooms.
+    # Mode A: if all rooms have genie_pos, use those directly.
+    # Mode B: direction-based BFS layout from seed_room.
+    def self.layout(rooms, seed_room)
+      if rooms.all? { |r| r.respond_to?(:genie_pos) && r.genie_pos.is_a?(Array) && r.genie_pos.size == 3 }
+        positions = {}
+        rooms.each do |r|
+          positions[r.id] = { x: r.genie_pos[0], y: r.genie_pos[1], z: r.genie_pos[2] }
+        end
+        return positions
+      end
+
+      room_index = {}
+      rooms.each { |r| room_index[r.id] = r }
+
+      positions = {}
+      positions[seed_room.id] = { x: 0, y: 0, z: 0 }
+      occupied = { [0, 0] => true }
+
+      queue = [seed_room]
+      visited = { seed_room.id => true }
+
+      while (current = queue.shift)
+        cx = positions[current.id][:x]
+        cy = positions[current.id][:y]
+
+        current.wayto.each do |target_id, move_cmd|
+          tid = target_id.to_i
+          next if visited[tid]
+          next unless room_index[tid]
+
+          offset = direction_offset(move_cmd.to_s)
+
+          if offset
+            new_x = cx + offset[0] * GRID_SPACING
+            new_y = cy + offset[1] * GRID_SPACING
+            attempts = 0
+            while occupied[[new_x, new_y]] && attempts < 15
+              new_x += offset[0] * GRID_SPACING
+              new_y += offset[1] * GRID_SPACING
+              attempts += 1
+            end
+          else
+            new_x = cx + GRID_SPACING
+            new_y = cy
+          end
+
+          if occupied[[new_x, new_y]]
+            [[1, 0], [0, 1], [-1, 0], [0, -1], [1, -1], [-1, -1], [1, 1], [-1, 1]].each do |dx, dy|
+              test_x = cx + dx * GRID_SPACING
+              test_y = cy + dy * GRID_SPACING
+              unless occupied[[test_x, test_y]]
+                new_x = test_x
+                new_y = test_y
+                break
+              end
+            end
+          end
+
+          positions[tid] = { x: new_x, y: new_y, z: 0 }
+          occupied[[new_x, new_y]] = true
+          visited[tid] = true
+          queue << room_index[tid]
+        end
+      end
+
+      resolve_line_collisions(positions, occupied, room_index)
+      positions
+    end
+
+    # Post-processing: nudge rooms sitting on unrelated connection lines.
+    def self.resolve_line_collisions(positions, occupied, room_index, max_passes: 3)
+      max_passes.times do
+        moved = false
+        positions.each do |room_id, pos|
+          next unless on_connection_line?(pos[:x], pos[:y], positions, room_index, skip_neighbors_of: room_id)
+
+          [[0, -1], [0, 1], [-1, 0], [1, 0], [1, -1], [-1, -1], [1, 1], [-1, 1]].each do |dx, dy|
+            nx = pos[:x] + dx * GRID_SPACING
+            ny = pos[:y] + dy * GRID_SPACING
+            unless occupied[[nx, ny]] || on_connection_line?(nx, ny, positions, room_index, skip_neighbors_of: room_id)
+              occupied.delete([pos[:x], pos[:y]])
+              pos[:x] = nx
+              pos[:y] = ny
+              occupied[[nx, ny]] = true
+              moved = true
+              break
+            end
+          end
+        end
+        break unless moved
+      end
+    end
+
+    def self.direction_offset(move_cmd)
+      return nil if move_cmd.start_with?(';e ')
+
+      d = move_cmd.strip.downcase
+      DIRECTION_OFFSETS[d]
+    end
+    private_class_method :direction_offset, :point_on_segment?, :on_connection_line?, :resolve_line_collisions
+  end
+
   # Main window manager for the map interface
   #
   # Handles GTK window creation, map display, user interaction,
@@ -442,6 +676,11 @@ module ElanthiaMap
       @fix_click = nil
       @last_user_scroll = nil
 
+      # Dynamic map rendering state
+      @layout_cache = {}
+      @current_z_level = 0
+      @dynamic_zone_data = nil
+
       # Check for special modes
       @fix_mode = script.vars[1] =~ /fix/ ? true : false
       @trouble_mode = script.vars[1] =~ /trouble/ ? true : false
@@ -473,6 +712,16 @@ module ElanthiaMap
       # Position before showing to ensure correct placement
       position_window
       @gtk_window.show_all
+
+      # Dynamic map mode: hide static widgets, show drawing area (or vice versa)
+      if @settings[:dynamic_map]
+        @map_image.hide
+        @room_marker.hide
+        @drawing_area.show
+      else
+        @drawing_area.hide
+      end
+
       # Establish keep_above status after showing (window is mapped)
       @gtk_window.keep_above = @settings[:keep_above]
 
@@ -545,6 +794,10 @@ module ElanthiaMap
     def destroy
       begin
         Gtk.queue do
+          if @drawing_area && !@drawing_area.destroyed?
+            @drawing_area.hide
+            @drawing_area.destroy
+          end
           if @menu && !@menu.destroyed?
             @menu.destroy
           end
@@ -688,6 +941,7 @@ module ElanthiaMap
       Settings['keep_centered'] = @settings[:keep_centered]
       Settings['follow_mode'] = @follow_mode
       Settings['dynamic_indicator_size'] = @settings[:dynamic_indicator_size]
+      Settings['dynamic_map'] = @settings[:dynamic_map]
 
       Settings.save
 
@@ -721,6 +975,7 @@ module ElanthiaMap
       Settings['keep_centered'] = true
       Settings['follow_mode'] = true
       Settings['dynamic_indicator_size'] = false
+      Settings['dynamic_map'] = false
 
       # Reset character-specific settings
       CharSettings['window_width'] = DEFAULT_WIDTH
@@ -746,7 +1001,8 @@ module ElanthiaMap
         hide_scrollbars: Settings['hide_scrollbars'] || false,
         keep_centered: Settings['keep_centered'].nil? ? true : Settings['keep_centered'],
         follow_mode: Settings['follow_mode'].nil? ? true : Settings['follow_mode'],
-        dynamic_indicator_size: Settings['dynamic_indicator_size'] || false
+        dynamic_indicator_size: Settings['dynamic_indicator_size'] || false,
+        dynamic_map: Settings['dynamic_map'] || false
       }
 
       @char_settings = {
@@ -913,6 +1169,16 @@ module ElanthiaMap
         update_room_marker
       end
       @menu.append(menu_dynamic_indicator)
+
+      # Dynamic Map (Cairo renderer) toggle
+      @menu.append(Gtk::SeparatorMenuItem.new)
+      menu_dynamic_map = Gtk::CheckMenuItem.new(label: 'Dynamic Map')
+      menu_dynamic_map.active = @settings[:dynamic_map]
+      menu_dynamic_map.signal_connect('activate') do
+        @settings[:dynamic_map] = menu_dynamic_map.active?
+        toggle_dynamic_mode(@settings[:dynamic_map])
+      end
+      @menu.append(menu_dynamic_map)
 
       # Rebuild dynamic menus when menu is about to show
       @menu.signal_connect('show') do
@@ -1282,6 +1548,21 @@ module ElanthiaMap
       @room_marker = Gtk::Image.new
       @layout.put(@room_marker, 0, 0)
 
+      # Dynamic map drawing area (Cairo-based renderer)
+      @drawing_area = Gtk::DrawingArea.new
+      @drawing_area.signal_connect('draw') do |_widget, cr|
+        render_dynamic_map(cr, @drawing_area.allocated_width, @drawing_area.allocated_height)
+      end
+      @layout.put(@drawing_area, 0, 0)
+      @drawing_area.hide
+
+      @scroller.signal_connect('size-allocate') do
+        next unless @settings[:dynamic_map]
+
+        resize_drawing_area
+        @drawing_area.queue_draw
+      end
+
       @scroller.add(@layout)
       @gtk_window.add(@scroller)
     end
@@ -1484,6 +1765,11 @@ module ElanthiaMap
     # @param event [Gdk::EventButton] The button release event
     # @return [void]
     def handle_click(event)
+      if @settings[:dynamic_map]
+        handle_dynamic_click(event)
+        return
+      end
+
       pointer = get_pointer_position
       map_data = @map_cache[@current_map, dark_mode: @settings[:dark_mode]]
       return unless map_data
@@ -2151,6 +2437,242 @@ module ElanthiaMap
         respond
       end
     end
+
+    # ---------------------------------------------------------------
+    # Dynamic map rendering methods (Cairo-based zone renderer)
+    # ---------------------------------------------------------------
+
+    public
+
+    # Whether dynamic map mode is enabled
+    # @return [Boolean]
+    def dynamic_map_enabled?
+      @settings[:dynamic_map]
+    end
+
+    # Update dynamic display for a room change
+    # Resolves zone, computes/caches layout, updates z-level, redraws.
+    # @param current_room [Room] The current room
+    # @return [void]
+    def update_dynamic_display(current_room)
+      @current_room = current_room
+      zone = ZoneResolver.resolve(current_room)
+      return unless zone
+
+      unless @layout_cache[zone[:zone_id]]
+        positions = LayoutEngine.layout(zone[:rooms], current_room)
+        @layout_cache[zone[:zone_id]] = { positions: positions, rooms: zone[:rooms] }
+      end
+
+      @dynamic_zone_data = @layout_cache[zone[:zone_id]]
+      pos = @dynamic_zone_data[:positions][current_room.id]
+      @current_z_level = pos[:z] if pos
+
+      Gtk.queue do
+        resize_drawing_area
+        @drawing_area.queue_draw
+      end
+    end
+
+    private
+
+    # Render the dynamic map onto a Cairo context
+    # @param cr [Cairo::Context] The Cairo drawing context
+    # @param widget_width [Integer] Widget width in pixels
+    # @param widget_height [Integer] Widget height in pixels
+    # @return [void]
+    def render_dynamic_map(cr, widget_width, widget_height)
+      room = @current_room
+      zone_data = @dynamic_zone_data
+      return unless room && zone_data
+
+      positions = zone_data[:positions]
+      rooms = zone_data[:rooms]
+      z_level = @current_z_level
+      dyn_scale = calculate_dynamic_scale
+
+      # Background
+      cr.set_source_rgb(0.12, 0.12, 0.18)
+      cr.paint
+
+      room_size = (8 * dyn_scale).to_i
+      half = room_size / 2
+
+      # Viewport offset: center on current room
+      current_pos = positions[room.id]
+      return unless current_pos
+
+      offset_x = (widget_width / 2) - (current_pos[:x] * dyn_scale).to_i
+      offset_y = (widget_height / 2) - (current_pos[:y] * dyn_scale).to_i
+
+      # Store offsets for click handling
+      zone_data[:offset_x] = offset_x
+      zone_data[:offset_y] = offset_y
+      zone_data[:scale] = dyn_scale
+
+      # Pass 1: Connection lines
+      cr.set_line_width(1)
+      rooms.each do |r|
+        pos = positions[r.id]
+        next unless pos && pos[:z] == z_level
+
+        rx = (pos[:x] * dyn_scale + offset_x).to_i
+        ry = (pos[:y] * dyn_scale + offset_y).to_i
+        r.wayto.each_key do |target_id|
+          tpos = positions[target_id.to_i]
+          next unless tpos
+
+          tx = (tpos[:x] * dyn_scale + offset_x).to_i
+          ty = (tpos[:y] * dyn_scale + offset_y).to_i
+          if tpos[:z] == z_level
+            cr.set_source_rgb(0.45, 0.45, 0.50)
+          else
+            cr.set_source_rgba(0.45, 0.45, 0.50, 0.25)
+          end
+          cr.move_to(rx, ry)
+          cr.line_to(tx, ty)
+          cr.stroke
+        end
+      end
+
+      # Pass 2: Off-level rooms (dimmed)
+      rooms.each do |r|
+        pos = positions[r.id]
+        next unless pos
+        next if pos[:z] == z_level
+
+        rx = (pos[:x] * dyn_scale + offset_x).to_i - half
+        ry = (pos[:y] * dyn_scale + offset_y).to_i - half
+        cr.set_source_rgba(0.35, 0.35, 0.40, 0.3)
+        cr.rectangle(rx, ry, room_size, room_size)
+        cr.fill
+      end
+
+      # Pass 3: Current-level rooms
+      rooms.each do |r|
+        pos = positions[r.id]
+        next unless pos && pos[:z] == z_level
+        next if r.id == room.id
+
+        rx = (pos[:x] * dyn_scale + offset_x).to_i - half
+        ry = (pos[:y] * dyn_scale + offset_y).to_i - half
+        cr.set_source_rgb(0.22, 0.58, 0.88)
+        cr.rectangle(rx, ry, room_size, room_size)
+        cr.fill
+        cr.set_source_rgb(0.65, 0.65, 0.70)
+        cr.rectangle(rx, ry, room_size, room_size)
+        cr.stroke
+      end
+
+      # Pass 4: Current room (magenta highlight)
+      if current_pos[:z] == z_level
+        rx = (current_pos[:x] * dyn_scale + offset_x).to_i - half
+        ry = (current_pos[:y] * dyn_scale + offset_y).to_i - half
+        cr.set_source_rgb(0.95, 0.15, 0.85)
+        cr.rectangle(rx, ry, room_size, room_size)
+        cr.fill
+        cr.set_source_rgb(1.0, 1.0, 1.0)
+        cr.rectangle(rx, ry, room_size, room_size)
+        cr.stroke
+      end
+    end
+
+    # Find the room at a click position in dynamic mode
+    # @param click_x [Integer] X coordinate of the click
+    # @param click_y [Integer] Y coordinate of the click
+    # @return [Room, nil] The room at the click position
+    def find_dynamic_room_at(click_x, click_y)
+      return nil unless @dynamic_zone_data
+
+      positions = @dynamic_zone_data[:positions]
+      rooms = @dynamic_zone_data[:rooms]
+      dyn_scale = @dynamic_zone_data[:scale] || calculate_dynamic_scale
+      offset_x = @dynamic_zone_data[:offset_x] || 0
+      offset_y = @dynamic_zone_data[:offset_y] || 0
+      room_size = (8 * dyn_scale).to_i
+      half = room_size / 2
+
+      best_room = nil
+      best_dist = Float::INFINITY
+      rooms.each do |room|
+        pos = positions[room.id]
+        next unless pos
+
+        rx = (pos[:x] * dyn_scale + offset_x).to_i
+        ry = (pos[:y] * dyn_scale + offset_y).to_i
+        dist = Math.sqrt((click_x - rx)**2 + (click_y - ry)**2)
+        if dist < best_dist && dist < half + 5
+          best_dist = dist
+          best_room = room
+        end
+      end
+      best_room
+    end
+
+    # Toggle between static and dynamic map modes
+    # @param enabled [Boolean] Whether to enable dynamic mode
+    # @return [void]
+    def toggle_dynamic_mode(enabled)
+      Gtk.queue do
+        if enabled
+          @map_image.hide
+          @room_marker.hide
+          resize_drawing_area
+          @drawing_area.show
+
+          if @current_room
+            zone = ZoneResolver.resolve(@current_room)
+            if zone
+              positions = LayoutEngine.layout(zone[:rooms], @current_room)
+              @layout_cache[zone[:zone_id]] = { positions: positions, rooms: zone[:rooms] }
+              @dynamic_zone_data = @layout_cache[zone[:zone_id]]
+            end
+          end
+          @drawing_area.queue_draw
+        else
+          @drawing_area.hide
+          @map_image.show
+          if @current_room&.image
+            map_path = File.join(@map_dir, @current_room.image)
+            change_map(map_path)
+            update_room_marker(@current_room)
+          end
+        end
+      end
+    end
+
+    # Resize the drawing area to match the scroller allocation
+    # @return [void]
+    def resize_drawing_area
+      @drawing_area.set_size_request(@scroller.allocation.width, @scroller.allocation.height)
+    end
+
+    # Calculate the scale factor for dynamic mode rendering
+    # @return [Float] Scale factor
+    def calculate_dynamic_scale
+      @settings[:global_scale_enabled] ? @settings[:global_scale].to_f : 1.0
+    end
+
+    # Handle a click event in dynamic map mode
+    # @param event [Gdk::EventButton] The button release event
+    # @return [void]
+    def handle_dynamic_click(event)
+      pointer = get_pointer_position
+      return unless @dynamic_zone_data && @dynamic_zone_data[:offset_x]
+
+      clicked_room = find_dynamic_room_at(pointer[0], pointer[1])
+      if clicked_room
+        if event.state.shift_mask?
+          respond
+          respond clicked_room
+          respond
+        else
+          start_script('go2', [clicked_room.id.to_s, '_disable_confirm_'])
+        end
+      else
+        respond '[map: no matching room found]'
+      end
+    end
   end
 
   # Main entry point for the script
@@ -2175,6 +2697,19 @@ module ElanthiaMap
         return
       end
 
+      # Handle genie info command
+      if script.vars[1] =~ /^genie$/i
+        current = Room.current
+        if current && current.respond_to?(:genie_zone) && current.genie_zone
+          respond "[map: Current room ##{current.id} = Genie zone:#{current.genie_zone} node:#{current.genie_id}]"
+        elsif current
+          respond "[map: Current room ##{current.id} has no Genie reference]"
+        else
+          respond '[map: No current room]'
+        end
+        return
+      end
+
       # Determine which room to display
       display_room = determine_display_room(script)
 
@@ -2187,7 +2722,9 @@ module ElanthiaMap
       # Handle initial room display if specified
       if display_room
         window.follow_mode = false
-        if display_room.image
+        if window.dynamic_map_enabled?
+          window.update_dynamic_display(display_room)
+        elsif display_room.image
           map_path = File.join(MAP_DIR, display_room.image)
           Gtk.queue do
             window.change_map(map_path)
@@ -2214,7 +2751,11 @@ module ElanthiaMap
       until window.should_exit
         if window.follow_mode
           current_room = Room.current
-          if current_room&.image
+          if window.dynamic_map_enabled?
+            # Dynamic mode: resolve zone, compute layout, redraw
+            window.update_dynamic_display(current_room) if current_room
+            window.update_window_title(current_room)
+          elsif current_room&.image
             map_path = File.join(MAP_DIR, current_room.image)
             Gtk.queue do
               window.change_map(map_path) unless window.current_map == map_path
@@ -2257,7 +2798,26 @@ module ElanthiaMap
   # @return [Room, nil] The room to display, or nil for normal operation
   def self.determine_display_room(script)
     return nil unless script.vars[1]
-    return nil if script.vars[1] =~ /^(help|fix|trouble|reset)$/
+    return nil if script.vars[1] =~ /^(help|fix|trouble|reset|genie)$/
+
+    # Genie cross-reference: ;map g<zone>:<node>
+    if script.vars[1] =~ /^g(\w+):(\w+)$/i
+      zone_id = Regexp.last_match(1)
+      node_id = Regexp.last_match(2)
+      if Room.respond_to?(:by_genie_ref)
+        room = Room.by_genie_ref(zone_id, node_id)
+        if room
+          respond "[map: Found room ##{room.id} for Genie ref #{zone_id}:#{node_id}]"
+          return room
+        else
+          respond "[map: No room found for Genie ref #{zone_id}:#{node_id}]"
+          return nil
+        end
+      else
+        respond '[map: Genie cross-reference not available (requires DR map support)]'
+        return nil
+      end
+    end
 
     # Try to find room by ID or description
     search_term = script.vars[1..-1].join(' ')
