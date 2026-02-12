@@ -14,9 +14,13 @@ Tracks your current room on visual maps
       game: Gemstone
       tags: core, movement, mapping
       required: Lich >= 5.13.0
-      version: 2.0.0
+      version: 2.0.1
 
   changelog:
+    v2.0.1 (2025-02-12)
+      * Fix GTK crash on long running sessions
+      * Fix follow_me getting disabled when opening with specific room#
+      * Fix showing empty canvas/layout around the map as toggleable option
     v2.0.0 (2025-01-21)
       * Complete refactor into ElanthiaMap namespace
       * Added proper module/class architecture
@@ -98,6 +102,7 @@ if Script.current.vars[1] == 'help'
   respond "   ;map reset                  - resets map settings to default values                      "
   respond "                                      keep_above = true                                     "
   respond "                                      keep_centered = true                                  "
+  respond "                                      expanded_canvas = true                                "
   respond "                                      follow_mode = true                                    "
   respond "                                      global_scale = 1                                      "
   respond "                                      global_scale_enabled = false                          "
@@ -417,6 +422,9 @@ module ElanthiaMap
     # @return [Boolean] Whether to follow room changes automatically
     attr_accessor :follow_mode
 
+    # @return [Boolean] Whether follow_mode was temporarily disabled (don't save on exit)
+    attr_accessor :temp_follow_disabled
+
     # @return [Boolean] Whether debug/trouble mode is enabled
     attr_reader :trouble_mode
 
@@ -441,6 +449,8 @@ module ElanthiaMap
       @location_markers = []
       @fix_click = nil
       @last_user_scroll = nil
+      @map_offset_x = 0  # X offset of map image within layout
+      @map_offset_y = 0  # Y offset of map image within layout
 
       # Check for special modes
       @fix_mode = script.vars[1] =~ /fix/ ? true : false
@@ -451,6 +461,10 @@ module ElanthiaMap
 
       # Set follow_mode from loaded settings
       @follow_mode = @settings[:follow_mode]
+
+      # Track if follow_mode was temporarily disabled (e.g., for viewing specific room)
+      # When true, don't save follow_mode state on exit
+      @temp_follow_disabled = false
 
       # Create GTK components
       create_window
@@ -545,15 +559,52 @@ module ElanthiaMap
     def destroy
       begin
         Gtk.queue do
+          # Clean up markers first
+          begin
+            @tag_markers.each do |marker|
+              marker.destroy if marker && !marker.destroyed?
+            end
+            @tag_markers.clear
+          rescue StandardError
+            # Ignore errors
+          end
+
+          begin
+            @location_markers.each do |marker|
+              marker.destroy if marker && !marker.destroyed?
+            end
+            @location_markers.clear
+          rescue StandardError
+            # Ignore errors
+          end
+
+          # Destroy menu before window
           if @menu && !@menu.destroyed?
+            # Detach menu from any parent to prevent signal issues
+            @menu.detach if @menu.respond_to?(:detach) rescue nil
             @menu.destroy
           end
+          @menu = nil
+
+          # Destroy child widgets explicitly
           if @gtk_window && !@gtk_window.destroyed?
+            begin
+              # Remove all children from layout to clean up signal handlers
+              if @layout && !@layout.destroyed?
+                @layout.each { |child| @layout.remove(child) rescue nil }
+              end
+            rescue StandardError
+              # Ignore errors
+            end
+
+            # Now destroy the window
             @gtk_window.destroy
           end
+          @gtk_window = nil
         end
-      rescue StandardError
-        # Silently ignore errors during destruction - window may already be destroyed
+      rescue StandardError => e
+        # Log error if in trouble mode but don't raise
+        respond "[map: Error during cleanup: #{e.message}]" if @trouble_mode rescue nil
       end
     end
 
@@ -686,8 +737,10 @@ module ElanthiaMap
       Settings['borderless'] = @settings[:borderless]
       Settings['hide_scrollbars'] = @settings[:hide_scrollbars]
       Settings['keep_centered'] = @settings[:keep_centered]
-      Settings['follow_mode'] = @follow_mode
+      # Only save follow_mode if it wasn't temporarily disabled
+      Settings['follow_mode'] = @follow_mode unless @temp_follow_disabled
       Settings['dynamic_indicator_size'] = @settings[:dynamic_indicator_size]
+      Settings['expanded_canvas'] = @settings[:expanded_canvas]
 
       Settings.save
 
@@ -721,6 +774,7 @@ module ElanthiaMap
       Settings['keep_centered'] = true
       Settings['follow_mode'] = true
       Settings['dynamic_indicator_size'] = false
+      Settings['expanded_canvas'] = true
 
       # Reset character-specific settings
       CharSettings['window_width'] = DEFAULT_WIDTH
@@ -746,7 +800,8 @@ module ElanthiaMap
         hide_scrollbars: Settings['hide_scrollbars'] || false,
         keep_centered: Settings['keep_centered'].nil? ? true : Settings['keep_centered'],
         follow_mode: Settings['follow_mode'].nil? ? true : Settings['follow_mode'],
-        dynamic_indicator_size: Settings['dynamic_indicator_size'] || false
+        dynamic_indicator_size: Settings['dynamic_indicator_size'] || false,
+        expanded_canvas: Settings['expanded_canvas'].nil? ? true : Settings['expanded_canvas']
       }
 
       @char_settings = {
@@ -806,6 +861,7 @@ module ElanthiaMap
       @menu_follow.active = @follow_mode
       @menu_follow.signal_connect('activate') do
         @follow_mode = @menu_follow.active?
+        @temp_follow_disabled = false # User explicitly changed it, so save this state
       end
       @menu.append(@menu_follow)
 
@@ -816,6 +872,21 @@ module ElanthiaMap
         @settings[:keep_centered] = menu_keep_centered.active?
       end
       @menu.append(menu_keep_centered)
+
+      # Expanded canvas toggle
+      menu_expanded_canvas = Gtk::CheckMenuItem.new(label: 'Expanded Canvas')
+      menu_expanded_canvas.active = @settings[:expanded_canvas]
+      menu_expanded_canvas.signal_connect('activate') do
+        @settings[:expanded_canvas] = menu_expanded_canvas.active?
+        # Reload current map to apply new canvas size
+        if @current_map
+          temp_map = @current_map
+          @current_map = nil
+          change_map(temp_map)
+          update_room_marker
+        end
+      end
+      @menu.append(menu_expanded_canvas)
 
       # Keep above toggle
       menu_keep_above = Gtk::CheckMenuItem.new(label: 'Keep window on top')
@@ -1450,23 +1521,17 @@ module ElanthiaMap
             diff_x = start_x - pointer[0]
             diff_y = start_y - pointer[1]
 
-            map_data = @map_cache[@current_map, dark_mode: @settings[:dark_mode]]
-            next unless map_data
-
-            scale = calculate_scale(map_data)
-            scaled_width = map_data[:width] * scale
-            scaled_height = map_data[:height] * scale
-
             new_x = start_hadj + diff_x
             new_y = start_vadj + diff_y
 
             if @trouble_mode
-              respond "[map drag: diff=(#{diff_x},#{diff_y}) new=(#{new_x},#{new_y}) max=(#{scaled_width},#{scaled_height}) start=(#{start_hadj},#{start_vadj})]"
+              respond "[map drag: diff=(#{diff_x},#{diff_y}) new=(#{new_x},#{new_y}) start=(#{start_hadj},#{start_vadj})]"
             end
 
             Gtk.queue do
-              @scroller.hadjustment.value = [[new_x, 0].max, scaled_width].min
-              @scroller.vadjustment.value = [[new_y, 0].max, scaled_height].min
+              # Don't constrain to image size - let GTK handle the scroll limits naturally
+              @scroller.hadjustment.value = [new_x, 0].max
+              @scroller.vadjustment.value = [new_y, 0].max
             end
           end
         end
@@ -1489,8 +1554,9 @@ module ElanthiaMap
       return unless map_data
 
       scale = calculate_scale(map_data)
-      click_x = (@scroller.hadjustment.value.to_i + pointer[0]) / scale.to_f
-      click_y = (@scroller.vadjustment.value.to_i + pointer[1]) / scale.to_f
+      # Account for map offset within layout
+      click_x = (@scroller.hadjustment.value.to_i + pointer[0] - @map_offset_x) / scale.to_f
+      click_y = (@scroller.vadjustment.value.to_i + pointer[1] - @map_offset_y) / scale.to_f
 
       # Check for ctrl+shift click in fix mode
       if event.state.shift_mask? && event.state.control_mask? && @fix_mode
@@ -1514,8 +1580,9 @@ module ElanthiaMap
           change_map(link[:target_map])
           Gtk.queue do
             scale = calculate_scale(@map_cache[@current_map, dark_mode: @settings[:dark_mode]])
-            @scroller.hadjustment.value = link[:target_x].to_i * scale
-            @scroller.vadjustment.value = link[:target_y].to_i * scale
+            # Account for map offset when positioning after link navigation
+            @scroller.hadjustment.value = (link[:target_x].to_i * scale) + @map_offset_x
+            @scroller.vadjustment.value = (link[:target_y].to_i * scale) + @map_offset_y
           end
         elsif (room = find_room_at(click_x, click_y))
           start_script('go2', [room.id.to_s, '_disable_confirm_'])
@@ -1660,9 +1727,48 @@ module ElanthiaMap
           GdkPixbuf::InterpType::BILINEAR
         )
 
+        # Layout size and offset depend on expanded_canvas setting
+        if @settings[:expanded_canvas]
+          # Make layout 200% of image size to allow dragging in all directions
+          layout_width = (scaled_width * 2).to_i
+          layout_height = (scaled_height * 2).to_i
+
+          # Center the image within the layout
+          @map_offset_x = (layout_width - scaled_width) / 2
+          @map_offset_y = (layout_height - scaled_height) / 2
+        else
+          # Legacy mode: layout matches image size exactly
+          layout_width = scaled_width
+          layout_height = scaled_height
+          @map_offset_x = 0
+          @map_offset_y = 0
+        end
+
         Gtk.queue do
           @map_image.pixbuf = scaled_pixbuf
-          @layout.set_size(scaled_width, scaled_height)
+          @layout.set_size(layout_width, layout_height)
+          @layout.move(@map_image, @map_offset_x, @map_offset_y)
+
+          # Center the viewport on the map image (only if expanded canvas is enabled)
+          # Calculate center point of the image within the layout
+          if @settings[:expanded_canvas]
+            center_x = @map_offset_x + (scaled_width / 2)
+            center_y = @map_offset_y + (scaled_height / 2)
+
+            # Only center if this is a new map or if keep_centered is disabled
+            # (if keep_centered is enabled, the room marker display will handle centering)
+            unless @settings[:keep_centered]
+              # Wait a moment for the layout to be realized with new size
+              GLib::Timeout.add(50) do
+                begin
+                  center_viewport_on(center_x, center_y)
+                rescue StandardError
+                  # Ignore if window is being destroyed
+                end
+                false # Don't repeat
+              end
+            end
+          end
         end
       rescue StandardError => e
         respond "[map: Error updating map display: #{e.message}]"
@@ -1736,8 +1842,8 @@ module ElanthiaMap
         center_offset_x = ((marker_width - base_width) / 2).to_i
         center_offset_y = ((marker_height - base_height) / 2).to_i
 
-        marker_x = (x1 * scale).to_i - center_offset_x
-        marker_y = (y1 * scale).to_i - center_offset_y
+        marker_x = (x1 * scale).to_i - center_offset_x + @map_offset_x
+        marker_y = (y1 * scale).to_i - center_offset_y + @map_offset_y
       else
         # Fixed size indicator (original behavior): 58x58 pixels
         marker_width = 58
@@ -1747,8 +1853,8 @@ module ElanthiaMap
         room_center_x = ((x1 + x2) / 2.0 * scale).to_i
         room_center_y = ((y1 + y2) / 2.0 * scale).to_i
 
-        marker_x = room_center_x - (marker_width / 2)
-        marker_y = room_center_y - (marker_height / 2)
+        marker_x = room_center_x - (marker_width / 2) + @map_offset_x
+        marker_y = room_center_y - (marker_height / 2) + @map_offset_y
       end
 
       # Create a circular marker
@@ -1880,6 +1986,7 @@ module ElanthiaMap
         if room && room.image
           @fake_room = room
           @follow_mode = false
+          @temp_follow_disabled = true # Mark as temporary, don't save this state
           @menu_follow.active = false
 
           map_path = File.join(@map_dir, room.image)
@@ -1960,8 +2067,8 @@ module ElanthiaMap
         next unless coords
 
         x1, y1, x2, y2 = coords
-        marker_x = (x1 * scale).to_i
-        marker_y = (y1 * scale).to_i
+        marker_x = (x1 * scale).to_i + @map_offset_x
+        marker_y = (y1 * scale).to_i + @map_offset_y
         marker_width = ((x2 - x1) * scale).to_i
         marker_height = ((y2 - y1) * scale).to_i
 
@@ -2004,8 +2111,8 @@ module ElanthiaMap
         next unless coords
 
         x1, y1, x2, y2 = coords
-        marker_x = (x1 * scale).to_i
-        marker_y = (y1 * scale).to_i
+        marker_x = (x1 * scale).to_i + @map_offset_x
+        marker_y = (y1 * scale).to_i + @map_offset_y
         marker_width = ((x2 - x1) * scale).to_i
         marker_height = ((y2 - y1) * scale).to_i
 
@@ -2187,6 +2294,7 @@ module ElanthiaMap
       # Handle initial room display if specified
       if display_room
         window.follow_mode = false
+        window.temp_follow_disabled = true # Mark as temporary, don't save this state
         if display_room.image
           map_path = File.join(MAP_DIR, display_room.image)
           Gtk.queue do
