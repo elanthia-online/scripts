@@ -16,8 +16,6 @@ migrate "jarable" do
   insert(:name, %{egg cowrie shell})
   insert(:name, %{fluted limpet shell})
   insert(:name, %{golden cowrie shell})
-  insert(:name, %{polished hornsnail shell})
-  insert(:name, %{piece of iridescent mother-of-pearl})
   insert(:name, %{large chipped clam shell})
   insert(:name, %{large moonsnail shell})
   insert(:name, %{lavender nassa shell})
@@ -27,10 +25,12 @@ migrate "jarable" do
   insert(:name, %{multi-colored snail shell})
   insert(:name, %{opaque spiral shell})
   insert(:name, %{pearl nautilus shell})
+  insert(:name, %{piece of iridescent mother-of-pearl})
   insert(:name, %{pink-banded coquina shell})
   insert(:name, %{pink clam shell})
   insert(:name, %{polished batwing chiton shell})
   insert(:name, %{polished black tegula shell})
+  insert(:name, %{polished hornsnail shell})
   insert(:name, %{purple-cap cowrie shell})
   insert(:name, %{ruby-lined nassa shell})
   insert(:name, %{sea urchin shell})
@@ -52,6 +52,8 @@ migrate "jarable" do
   insert(:name, %{white clam shell})
   insert(:name, %{white gryphon's wing shell})
 
+  insert(:name, %{polished shark tooth})
+
   copy_rules_from("gem", :name).each do |gem_name|
     insert(:name, gem_name)
   end
@@ -61,4 +63,7 @@ migrate "jarable" do
   copy_rules_from("gem", :exclude).each do |gem_name|
     insert(:exclude, gem_name)
   end
+
+  insert(:exclude, %{piece of blue ridge coral})
+  insert(:exclude, %{piece of cat's-paw coral})
 end
