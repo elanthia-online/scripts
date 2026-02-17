@@ -1,5 +1,3 @@
-require "pathname"
-
 module Migration
   class PrettyError < StandardError
     def initialize(changeset, msg)
