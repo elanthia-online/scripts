@@ -7,7 +7,6 @@ end
 
 # Tell GameObj where to find the GameObj data XML file
 class GameObj
-  require 'pathname'
   DATA_DIR = Pathname.new('./dist').expand_path
   # should inform the developer where the data is
   # being loaded from
@@ -31,17 +30,18 @@ class GameObj
   @@fam_pcs       = Array.new
   @@fam_room_desc = Array.new
   @@type_data     = Hash.new
+  @@type_cache    = Hash.new
   @@sellable_data = Hash.new
-  @@elevated_load = proc { GameObj.load_data }
 
   attr_reader :id
   attr_accessor :noun, :name, :before_name, :after_name
 
   def initialize(id, noun, name, before = nil, after = nil)
-    @id = id
+    @id = id.is_a?(Integer) ? id.to_s : id
     @noun = noun
     @noun = 'lapis' if @noun == 'lapis lazuli'
     @noun = 'hammer' if @noun == "Hammer of Kai"
+    @noun = 'ball' if @noun == "ball and chain" # DR item 'ball and chain' doesn't work.
     @noun = 'mother-of-pearl' if (@noun == 'pearl') and (@name =~ /mother\-of\-pearl/)
     @name = name
     @before_name = before
@@ -50,12 +50,18 @@ class GameObj
 
   def type
     GameObj.load_data if @@type_data.empty?
+    return @@type_cache[@name] if @@type_cache.key?(@name)
     list = @@type_data.keys.find_all { |t| (@name =~ @@type_data[t][:name] or @noun =~ @@type_data[t][:noun]) and (@@type_data[t][:exclude].nil? or @name !~ @@type_data[t][:exclude]) }
     if list.empty?
-      nil
+      return @@type_cache[@name] = nil
     else
-      list.join(',')
+      return @@type_cache[@name] = list.join(',')
     end
+  end
+
+  def type?(type_to_check)
+    # handle nil types
+    return self.type.to_s.split(',').any?(type_to_check)
   end
 
   def sellable
@@ -103,15 +109,28 @@ class GameObj
   end
 
   def GameObj.[](val)
-    if val.class == String
-      if val =~ /^\-?[0-9]+$/
-        @@inv.find { |o| o.id == val } || @@loot.find { |o| o.id == val } || @@npcs.find { |o| o.id == val } || @@pcs.find { |o| o.id == val } || [@@right_hand, @@left_hand].find { |o| o.id == val } || @@room_desc.find { |o| o.id == val }
-      elsif val.split(' ').length == 1
-        @@inv.find { |o| o.noun == val } || @@loot.find { |o| o.noun == val } || @@npcs.find { |o| o.noun == val } || @@pcs.find { |o| o.noun == val } || [@@right_hand, @@left_hand].find { |o| o.noun == val } || @@room_desc.find { |o| o.noun == val }
+    unless val.is_a?(String) || val.is_a?(Regexp)
+      respond "--- Lich: error: GameObj[] passed with #{val.class} #{val} via caller: #{caller[0]}"
+      respond "--- Lich: error: GameObj[] supports String or Regexp only"
+      Lich.log "--- Lich: error: GameObj[] passed with #{val.class} #{val} via caller: #{caller[0]}\n\t"
+      Lich.log "--- Lich: error: GameObj[] supports String or Regexp only\n\t"
+      if val.is_a?(Integer)
+        respond "--- Lich: error: GameObj[] converted Integer #{val} to String to continue"
+        val = val.to_s
       else
+        return
+      end
+    end
+    if val.is_a?(String)
+      if val =~ /^\-?[0-9]+$/ # ID lookup
+        # excludes @@room_desc ID lookup due to minimal use case, but could be added in future if desired
+        @@inv.find { |o| o.id == val } || @@loot.find { |o| o.id == val } || @@npcs.find { |o| o.id == val } || @@pcs.find { |o| o.id == val } || [@@right_hand, @@left_hand].find { |o| o.id == val } || @@room_desc.find { |o| o.id == val } || @@contents.values.flatten.find { |o| o.id == val }
+      elsif val.split(' ').length == 1 # noun lookup
+        @@inv.find { |o| o.noun == val } || @@loot.find { |o| o.noun == val } || @@npcs.find { |o| o.noun == val } || @@pcs.find { |o| o.noun == val } || [@@right_hand, @@left_hand].find { |o| o.noun == val } || @@room_desc.find { |o| o.noun == val }
+      else # name lookup
         @@inv.find { |o| o.name == val } || @@loot.find { |o| o.name == val } || @@npcs.find { |o| o.name == val } || @@pcs.find { |o| o.name == val } || [@@right_hand, @@left_hand].find { |o| o.name == val } || @@room_desc.find { |o| o.name == val } || @@inv.find { |o| o.name =~ /\b#{Regexp.escape(val.strip)}$/i } || @@loot.find { |o| o.name =~ /\b#{Regexp.escape(val.strip)}$/i } || @@npcs.find { |o| o.name =~ /\b#{Regexp.escape(val.strip)}$/i } || @@pcs.find { |o| o.name =~ /\b#{Regexp.escape(val.strip)}$/i } || [@@right_hand, @@left_hand].find { |o| o.name =~ /\b#{Regexp.escape(val.strip)}$/i } || @@room_desc.find { |o| o.name =~ /\b#{Regexp.escape(val.strip)}$/i } || @@inv.find { |o| o.name =~ /\b#{Regexp.escape(val).sub(' ', ' .*')}$/i } || @@loot.find { |o| o.name =~ /\b#{Regexp.escape(val).sub(' ', ' .*')}$/i } || @@npcs.find { |o| o.name =~ /\b#{Regexp.escape(val).sub(' ', ' .*')}$/i } || @@pcs.find { |o| o.name =~ /\b#{Regexp.escape(val).sub(' ', ' .*')}$/i } || [@@right_hand, @@left_hand].find { |o| o.name =~ /\b#{Regexp.escape(val).sub(' ', ' .*')}$/i } || @@room_desc.find { |o| o.name =~ /\b#{Regexp.escape(val).sub(' ', ' .*')}$/i }
       end
-    elsif val.class == Regexp
+    elsif val.is_a?(Regexp) # name only lookup when passed a Regexp
       @@inv.find { |o| o.name =~ val } || @@loot.find { |o| o.name =~ val } || @@npcs.find { |o| o.name =~ val } || @@pcs.find { |o| o.name =~ val } || [@@right_hand, @@left_hand].find { |o| o.name =~ val } || @@room_desc.find { |o| o.name =~ val }
     end
   end
@@ -318,12 +337,40 @@ class GameObj
     @@contents.delete(container_id)
   end
 
+  def GameObj.targets
+    a = Array.new
+    XMLData.current_target_ids.each { |id|
+      if (npc = @@npcs.find { |n| n.id == id })
+        next if (npc.status =~ /dead|gone/i)
+        next if (npc.name =~ /^animated\b/i && npc.name !~ /^animated slush/i)
+        next if (npc.noun =~ /^(?:arm|appendage|claw|limb|pincer|tentacle)s?$|^(?:palpus|palpi)$/i && npc.name !~ /(?:amaranthine|ghostly|grizzled|ancient) kraken tentacle/i)
+        a.push(npc)
+      end
+    }
+    a
+  end
+
+  def GameObj.hidden_targets
+    a = Array.new
+    XMLData.current_target_ids.each { |id|
+      unless @@npcs.find { |n| n.id == id }
+        a.push(id)
+      end
+    }
+    a
+  end
+
+  def GameObj.target
+    return (@@npcs + @@pcs).find { |n| n.id == XMLData.current_target_id }
+  end
+
   def GameObj.dead
     dead_list = Array.new
     for obj in @@npcs
       dead_list.push(obj) if obj.status == "dead"
     end
     return nil if dead_list.empty?
+
     return dead_list
   end
 
@@ -331,61 +378,91 @@ class GameObj
     @@contents.dup
   end
 
+  def GameObj.reload(filename = nil)
+    GameObj.load_data(filename)
+  end
+
+  def GameObj.merge_data(data, newData)
+    return newData unless data.is_a?(Regexp)
+    return Regexp.union(data, newData)
+  end
+
   def GameObj.load_data(filename = nil)
-    if $SAFE == 0
-      if filename.nil?
-        if File.exist?("#{DATA_DIR}/gameobj-data.xml")
-          filename = "#{DATA_DIR}/gameobj-data.xml"
-        elsif File.exist?("#{SCRIPT_DIR}/gameobj-data.xml") # deprecated
-          filename = "#{SCRIPT_DIR}/gameobj-data.xml"
-        else
-          filename = "#{DATA_DIR}/gameobj-data.xml"
-        end
-      end
-      if File.exist?(filename)
-        begin
-          @@type_data = Hash.new
-          @@sellable_data = Hash.new
-          File.open(filename) { |file|
-            doc = REXML::Document.new(file.read)
-            doc.elements.each('data/type') { |e|
-              if (type = e.attributes['name'])
-                @@type_data[type] = Hash.new
-                @@type_data[type][:name]    = Regexp.new(e.elements['name'].text) unless e.elements['name'].text.nil? or e.elements['name'].text.empty?
-                @@type_data[type][:noun]    = Regexp.new(e.elements['noun'].text) unless e.elements['noun'].text.nil? or e.elements['noun'].text.empty?
-                @@type_data[type][:exclude] = Regexp.new(e.elements['exclude'].text) unless e.elements['exclude'].text.nil? or e.elements['exclude'].text.empty?
-              end
-            }
-            doc.elements.each('data/sellable') { |e|
-              if (sellable = e.attributes['name'])
-                @@sellable_data[sellable] = Hash.new
-                @@sellable_data[sellable][:name]    = Regexp.new(e.elements['name'].text) unless e.elements['name'].text.nil? or e.elements['name'].text.empty?
-                @@sellable_data[sellable][:noun]    = Regexp.new(e.elements['noun'].text) unless e.elements['noun'].text.nil? or e.elements['noun'].text.empty?
-                @@sellable_data[sellable][:exclude] = Regexp.new(e.elements['exclude'].text) unless e.elements['exclude'].text.nil? or e.elements['exclude'].text.empty?
-              end
-            }
+    filename = File.join(DATA_DIR, 'gameobj-data.xml') if filename.nil?
+    if File.exist?(filename)
+      begin
+        @@type_data = Hash.new
+        @@sellable_data = Hash.new
+        @@type_cache = Hash.new
+        File.open(filename) { |file|
+          doc = REXML::Document.new(file.read)
+          doc.elements.each('data/type') { |e|
+            if (type = e.attributes['name'])
+              @@type_data[type] = Hash.new
+              @@type_data[type][:name]    = Regexp.new(e.elements['name'].text) unless e.elements['name'].text.nil? or e.elements['name'].text.empty?
+              @@type_data[type][:noun]    = Regexp.new(e.elements['noun'].text) unless e.elements['noun'].text.nil? or e.elements['noun'].text.empty?
+              @@type_data[type][:exclude] = Regexp.new(e.elements['exclude'].text) unless e.elements['exclude'].text.nil? or e.elements['exclude'].text.empty?
+            end
           }
-          true
-        rescue
-          @@type_data = nil
-          @@sellable_data = nil
-          echo "error: GameObj.load_data: #{$!}"
-          respond $!.backtrace[0..1]
-          false
-        end
-      else
+          doc.elements.each('data/sellable') { |e|
+            if (sellable = e.attributes['name'])
+              @@sellable_data[sellable] = Hash.new
+              @@sellable_data[sellable][:name]    = Regexp.new(e.elements['name'].text) unless e.elements['name'].text.nil? or e.elements['name'].text.empty?
+              @@sellable_data[sellable][:noun]    = Regexp.new(e.elements['noun'].text) unless e.elements['noun'].text.nil? or e.elements['noun'].text.empty?
+              @@sellable_data[sellable][:exclude] = Regexp.new(e.elements['exclude'].text) unless e.elements['exclude'].text.nil? or e.elements['exclude'].text.empty?
+            end
+          }
+        }
+      rescue
         @@type_data = nil
         @@sellable_data = nil
-        echo "error: GameObj.load_data: file does not exist: #{filename}"
-        false
+        echo "error: GameObj.load_data: #{$!}"
+        respond $!.backtrace[0..1]
+        return false
       end
     else
-      @@elevated_load.call
+      @@type_data = nil
+      @@sellable_data = nil
+      echo "error: GameObj.load_data: file does not exist: #{filename}"
+      return false
     end
+    filename = File.join(DATA_DIR, 'gameobj-custom', 'gameobj-data.xml')
+    if (File.exist?(filename))
+      begin
+        File.open(filename) { |file|
+          doc = REXML::Document.new(file.read)
+          doc.elements.each('data/type') { |e|
+            if (type = e.attributes['name'])
+              @@type_data[type] ||= Hash.new
+              @@type_data[type][:name]	  = GameObj.merge_data(@@type_data[type][:name], Regexp.new(e.elements['name'].text)) unless e.elements['name'].text.nil? or e.elements['name'].text.empty?
+              @@type_data[type][:noun]	  = GameObj.merge_data(@@type_data[type][:noun], Regexp.new(e.elements['noun'].text)) unless e.elements['noun'].text.nil? or e.elements['noun'].text.empty?
+              @@type_data[type][:exclude] = GameObj.merge_data(@@type_data[type][:exclude], Regexp.new(e.elements['exclude'].text)) unless e.elements['exclude'].text.nil? or e.elements['exclude'].text.empty?
+            end
+          }
+          doc.elements.each('data/sellable') { |e|
+            if (sellable = e.attributes['name'])
+              @@sellable_data[sellable] ||= Hash.new
+              @@sellable_data[sellable][:name]	  = GameObj.merge_data(@@sellable_data[sellable][:name], Regexp.new(e.elements['name'].text)) unless e.elements['name'].text.nil? or e.elements['name'].text.empty?
+              @@sellable_data[sellable][:noun]	  = GameObj.merge_data(@@sellable_data[sellable][:noun], Regexp.new(e.elements['noun'].text)) unless e.elements['noun'].text.nil? or e.elements['noun'].text.empty?
+              @@sellable_data[sellable][:exclude] = GameObj.merge_data(@@sellable_data[sellable][:exclude], Regexp.new(e.elements['exclude'].text)) unless e.elements['exclude'].text.nil? or e.elements['exclude'].text.empty?
+            end
+          }
+        }
+      rescue
+        echo "error: Custom GameObj.load_data: #{$!}"
+        respond $!.backtrace[0..1]
+        return false
+      end
+    end
+    return true
   end
 
   def GameObj.type_data
     @@type_data
+  end
+
+  def GameObj.type_cache
+    @@type_cache
   end
 
   def GameObj.sellable_data
