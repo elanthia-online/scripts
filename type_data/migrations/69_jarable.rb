@@ -10,7 +10,7 @@ migrate "jarable" do
   copy_rules_from("reagent", :name).each do |reagent_name|
     insert(:name, reagent_name)
   end
-  
+
   # Insert jarable "valuable" shells to :name
   insert(:name, %{amethyst clam shell})
   insert(:name, %{angulate wentletrap shell})
