@@ -1,0 +1,837 @@
+=begin
+  ELore - Modernized Loresinging Script
+
+        author: Elanthia Online
+  contributors: DrunkenDurfin, Tysong, Nisugi
+          game: Gemstone
+          tags: bard, loresing, loresong, magic
+       version: 2.0.0
+      required: Lich >= 5.0.0
+
+  Changelog:
+    2.0.0 - Major rewrite:
+      - 2-line verses default (fast, ~3-5s RT), 4-line optional (powerful, ~11-12s RT)
+      - Added retry logic for incomplete revelations
+      - Integrated container processing (merged loreloop.lic)
+      - Removed logging functionality
+      - Made bot mode pause script configurable via CharSettings
+      - Proper error handling and cleanup
+
+  Usage:
+    ;elore              - Sing to item in right hand (2-line, fast)
+    ;elore power        - Sing with 4-line verses (more powerful, slower)
+    ;elore target <noun>           - Sing to item in room (can't hold)
+    ;elore target <noun> power     - Sing to room item with 4-line verses
+    ;elore bot          - Service mode (accept items from players)
+    ;elore bot power    - Service mode with 4-line verses
+    ;elore container <noun>        - Process all items in container
+    ;elore container <noun> power  - Container mode with 4-line verses
+    ;elore settings     - Show current settings
+    ;elore set <key> <value>  - Change a setting
+    ;elore help         - Show this message
+
+  CharSettings (per-character):
+    CharSettings['elore.pause'] = 'scriptname'  - Script to pause in bot mode
+    CharSettings['elore.retry'] = 3             - Max retries per verse
+    CharSettings['elore.mana'] = 50             - Min mana before singing
+    CharSettings['elore.power'] = false         - Use 4-line by default
+=end
+
+# ELore module provides loresinging functionality for bards in GemStone IV
+# Supports multiple verse formats, container processing, bot mode, and target mode
+module ELore
+  # Fast 2-line loresinging verses for held items (~3-5s roundtime)
+  # @return [Hash<Symbol, String>] verse templates keyed by type
+  unless const_defined?(:VERSES_FAST)
+    VERSES_FAST = {
+      value: '%{item} that I hold;let your value now be told',
+      purpose: '%{item} that I hold;let your purpose now be told',
+      magic: '%{item} that I hold;let your magic now be told',
+      special: '%{item} that I hold;let your special ability now be told'
+    }.freeze
+  end
+
+  # Powerful 4-line rhyming verses for held items (~11-12s roundtime)
+  # More powerful per GSWiki - rhymes must be spelling-based
+  # @return [Hash<Symbol, Array<String>>] verse templates with 4 lines each
+  unless const_defined?(:VERSES_POWER)
+    VERSES_POWER = {
+      value: [
+        '%{item} that I hold in my hand',
+        'Let your value be scanned',
+        "Tell me what you're truly worth",
+        'From your origin and birth'
+      ],
+      purpose: [
+        '%{item} that I hold in my hand',
+        'Let your purpose now expand',
+        'Tell me why you were made',
+        'And the role that you have played'
+      ],
+      magic: [
+        '%{item} that I hold in my hand',
+        'Let your magic be unmanned',
+        'Show the power that you wield',
+        'Let your enchantments be revealed'
+      ],
+      special: [
+        '%{item} that I hold in my hand',
+        'Let your secrets now be fanned',
+        'Special powers you possess',
+        'I command you to confess'
+      ]
+    }.freeze
+  end
+
+  # Fast 2-line verses for room items that cannot be held
+  # @return [Hash<Symbol, String>] verse templates for room targets
+  unless const_defined?(:VERSES_ROOM_FAST)
+    VERSES_ROOM_FAST = {
+      value: '%{item} I now see;let your value sing to me',
+      purpose: '%{item} I now see;let your purpose sing to me',
+      magic: '%{item} I now see;let your magic sing to me',
+      special: '%{item} I now see;let your secrets sing to me'
+    }.freeze
+  end
+
+  # Powerful 4-line verses for room items that cannot be held
+  # @return [Hash<Symbol, Array<String>>] verse templates for room targets
+  unless const_defined?(:VERSES_ROOM_POWER)
+    VERSES_ROOM_POWER = {
+      value: [
+        '%{item} that I see before me now',
+        'Let your value take a bow',
+        "Tell me what you're truly worth",
+        'From your origin and birth'
+      ],
+      purpose: [
+        '%{item} that I see before me now',
+        'Your purpose you must avow',
+        'Tell me why you were made',
+        'And the role that you have played'
+      ],
+      magic: [
+        '%{item} that I see before me now',
+        'Your magic I must know how',
+        'Show the power that you wield',
+        'Let your enchantments be revealed'
+      ],
+      special: [
+        '%{item} that I see before me now',
+        'To my song you must bow',
+        'Special powers you possess',
+        'I command you to confess'
+      ]
+    }.freeze
+  end
+
+  # Types of verses to sing in order
+  # @return [Array<Symbol>] ordered list of verse types
+  VERSE_TYPES = %i[value purpose magic special].freeze unless const_defined?(:VERSE_TYPES)
+
+  # Patterns indicating the loresong needs to be retried with more power
+  # @return [Array<Regexp>] patterns to match incomplete revelations
+  unless const_defined?(:NEEDS_RETRY)
+    NEEDS_RETRY = [
+      /has more to share.*wasn't powerful enough/i,
+      /could probably find out something more/i
+    ].freeze
+  end
+
+  # Patterns indicating the item cannot be loresung
+  # @return [Array<Regexp>] patterns to match unsuccessful loresinging
+  unless const_defined?(:CANNOT_LORESING)
+    CANNOT_LORESING = [
+      /song falters and fades without impact/i,
+      /failed to resonate with it properly/i
+    ].freeze
+  end
+
+  # Patterns indicating successful loresinging
+  # @return [Array<Regexp>] patterns to match successful revelations
+  unless const_defined?(:SUCCESS_PATTERNS)
+    SUCCESS_PATTERNS = [
+      /and you learn something about it/i,
+      /resonating vibration.*in your hand\.\.\./i,
+      /simply resonates with what you previously learned/i
+    ].freeze
+  end
+
+  # Configuration metadata for CharSettings
+  # @return [Hash<String, Hash>] setting definitions with type and defaults
+  unless const_defined?(:SETTING_KEYS)
+    SETTING_KEYS = {
+      'pause' => { type: :string, default: nil, desc: 'Script to pause in bot mode' },
+      'retry' => { type: :integer, default: 3, desc: 'Max retries per verse' },
+      'mana'  => { type: :integer, default: 50, desc: 'Min mana before singing' },
+      'power' => { type: :boolean, default: false, desc: 'Use 4-line verses by default' }
+    }.freeze
+  end
+
+  class << self
+    # @!attribute [rw] power_mode
+    #   @return [Boolean] whether to use 4-line powerful verses (true) or 2-line fast verses (false)
+    # @!attribute [rw] target_mode
+    #   @return [Boolean] whether singing to room items (true) or held items (false)
+    attr_accessor :power_mode, :target_mode
+
+    # Get the maximum number of retry attempts per verse
+    # @return [Integer] max retries from CharSettings or default of 3
+    def max_retries
+      CharSettings['elore.retry'] || 3
+    end
+
+    # Get the minimum mana threshold before singing
+    # @return [Integer] mana threshold from CharSettings or default of 50
+    def mana_threshold
+      CharSettings['elore.mana'] || 50
+    end
+
+    # Get the name of the script to pause during bot mode
+    # @return [String, nil] script name from CharSettings or nil if not set
+    def pause_script_name
+      CharSettings['elore.pause']
+    end
+
+    # Check if power mode should be used by default
+    # @return [Boolean] true if CharSettings has power mode enabled
+    def default_power?
+      CharSettings['elore.power'] == true
+    end
+
+    # Display current settings configuration to the user
+    # Shows all CharSettings values with their defaults and descriptions
+    # @return [void]
+    def show_settings
+      respond
+      respond 'ELore Settings (Character: %s)' % [Char.name]
+      respond '-' * 50
+      SETTING_KEYS.each do |key, info|
+        current = CharSettings["elore.#{key}"]
+        display_value = current.nil? ? "(default: #{info[:default] || 'none'})" : current.to_s
+        respond "   #{key.ljust(16)} = #{display_value}"
+        respond "                      #{info[:desc]}"
+      end
+      respond
+      respond "To change: #{$clean_lich_char}#{Script.current.name} set <key> <value>"
+      respond "Example:   #{$clean_lich_char}#{Script.current.name} set retry 5"
+      respond
+    end
+
+    # Update a CharSettings value after validating the key and value
+    # @param key [String] the setting key to update
+    # @param value [String, nil] the new value to set
+    # @return [Boolean] true if setting was updated successfully, false otherwise
+    # @example
+    #   set_setting('retry', '5')  # => true (sets max retries to 5)
+    #   set_setting('power', 'on') # => true (enables power mode)
+    def set_setting(key, value)
+      unless SETTING_KEYS.key?(key)
+        echo "ERROR: Unknown setting '#{key}'"
+        echo "Valid settings: #{SETTING_KEYS.keys.join(', ')}"
+        return false
+      end
+
+      info = SETTING_KEYS[key]
+      parsed_value = parse_setting_value(value, info[:type])
+
+      if parsed_value == :invalid
+        echo "ERROR: Invalid value '#{value}' for #{key} (expected #{info[:type]})"
+        return false
+      end
+
+      if parsed_value.nil? || (parsed_value.is_a?(String) && parsed_value.empty?)
+        CharSettings["elore.#{key}"] = nil
+        echo "#{key} cleared (will use default: #{info[:default] || 'none'})"
+      else
+        CharSettings["elore.#{key}"] = parsed_value
+        echo "#{key} set to: #{parsed_value}"
+      end
+      true
+    end
+
+    # Parse and validate a setting value based on its expected type
+    # @param value [String, nil] the raw value to parse
+    # @param type [Symbol] the expected type (:string, :integer, or :boolean)
+    # @return [Object, :invalid, nil] parsed value, :invalid if parse failed, or nil to clear
+    # @example
+    #   parse_setting_value('5', :integer)   # => 5
+    #   parse_setting_value('yes', :boolean) # => true
+    #   parse_setting_value('abc', :integer) # => :invalid
+    def parse_setting_value(value, type)
+      return nil if value.nil? || value.downcase == 'none' || value.downcase == 'clear'
+
+      case type
+      when :string
+        value.to_s
+      when :integer
+        return :invalid unless value =~ /^\d+$/
+
+        value.to_i
+      when :boolean
+        case value.downcase
+        when 'true', 'yes', '1', 'on'
+          true
+        when 'false', 'no', '0', 'off'
+          false
+        else
+          :invalid
+        end
+      else
+        value
+      end
+    end
+
+    # Build a loresinging verse based on type, mode, and item
+    # Selects appropriate verse template based on power_mode and target_mode
+    # @param verse_type [Symbol] the type of verse (:value, :purpose, :magic, or :special)
+    # @param item_noun [String] the noun of the item to sing to
+    # @return [String] formatted verse ready to send to game
+    # @example
+    #   build_verse(:value, 'sword')  # => "Sword that I hold;let your value now be told"
+    def build_verse(verse_type, item_noun)
+      if target_mode
+        # Room target verses
+        if power_mode
+          lines = VERSES_ROOM_POWER[verse_type].map { |line| line % { item: item_noun.capitalize } }
+          lines.join(';')
+        else
+          VERSES_ROOM_FAST[verse_type] % { item: item_noun.capitalize }
+        end
+      elsif power_mode
+        lines = VERSES_POWER[verse_type].map { |line| line % { item: item_noun.capitalize } }
+        lines.join(';')
+      else
+        VERSES_FAST[verse_type] % { item: item_noun.capitalize }
+      end
+    end
+
+    # Wait for mana to reach the configured threshold before singing
+    # Does nothing if mana is already sufficient
+    # @return [void]
+    def wait_for_mana
+      return if checkmana >= mana_threshold
+
+      echo "Waiting for mana (#{checkmana}/#{mana_threshold})..."
+      wait_until { checkmana >= mana_threshold }
+    end
+
+    # Sing a single verse and return the result type
+    # @param item_noun [String] the noun of the item to sing to
+    # @param verse_type [Symbol] the type of verse to sing
+    # @param item_id [String, nil] the GameObj ID for precise targeting (target mode only)
+    # @return [Symbol] result type (:success, :needs_retry, :cannot_loresing, :timeout, :wait_rt)
+    def sing_verse(item_noun, verse_type, item_id: nil)
+      wait_for_mana
+      waitrt?
+      waitcastrt?
+
+      verse = build_verse(verse_type, item_noun)
+      # Use item ID for target mode (room items) for precise targeting
+      command = if target_mode && item_id
+                  "loresing ::##{item_id}:: #{verse}"
+                elsif target_mode
+                  "loresing ::#{item_noun}:: #{verse}"
+                else
+                  "loresing #{verse}"
+                end
+      result = dothistimeout(command, 5, /Roundtime|has more to share|falters and fades|failed to resonate|simply resonates with what you previously learned|\.\.\.wait \d+/)
+
+      # Return the result type
+      if result.nil?
+        :timeout
+      elsif result =~ /\.\.\.wait \d+/
+        :wait_rt
+      elsif CANNOT_LORESING.any? { |pattern| result =~ pattern }
+        :cannot_loresing
+      elsif NEEDS_RETRY.any? { |pattern| result =~ pattern }
+        :needs_retry
+      else
+        :success
+      end
+    end
+
+    # Sing a verse with automatic retry logic
+    # Retries if the loresong indicates incomplete information
+    # @param item_noun [String] the noun of the item to sing to
+    # @param verse_type [Symbol] the type of verse to sing
+    # @param item_id [String, nil] the GameObj ID for precise targeting (target mode only)
+    # @return [Boolean] true if verse completed (or max retries reached), false if item can't be loresung
+    def sing_verse_with_retry(item_noun, verse_type, item_id: nil)
+      retries = 0
+
+      loop do
+        result = sing_verse(item_noun, verse_type, item_id: item_id)
+
+        case result
+        when :success
+          waitrt?
+          waitcastrt?
+          return true
+        when :cannot_loresing
+          echo "Item cannot be loresung - skipping"
+          return false
+        when :needs_retry
+          retries += 1
+          if retries >= max_retries
+            echo "Max retries (#{max_retries}) reached for #{verse_type} verse"
+            waitrt?
+            waitcastrt?
+            return true # Move on to next verse
+          end
+          echo "Retry #{retries}/#{max_retries} for #{verse_type} verse..."
+          waitrt?
+          waitcastrt?
+          sleep 0.5
+        when :timeout
+          echo "Timeout waiting for loresong response"
+          return false
+        when :wait_rt
+          # Game said "wait X seconds" - wait for RT to clear and retry
+          waitrt?
+          waitcastrt?
+          # Loop continues to retry the verse
+        end
+      end
+    end
+
+    # Perform a complete loresong sequence (all verse types)
+    # Automatically stops if item cannot be loresung
+    # @param item_noun [String] the noun of the item to sing to
+    # @param item_id [String, nil] the GameObj ID for precise targeting (target mode only)
+    # @return [void]
+    def full_loresong(item_noun, item_id: nil)
+      mode_str = power_mode ? '4-line power' : '2-line fast'
+      echo "Loresinging with #{mode_str} verses..."
+
+      fput 'speak bard'
+      sleep 0.3
+
+      VERSE_TYPES.each do |verse_type|
+        result = sing_verse_with_retry(item_noun, verse_type, item_id: item_id)
+        break unless result # Stop if item can't be loresung
+      end
+
+      fput 'speak common'
+    end
+
+    # Check if right hand is empty
+    # @return [Boolean] true if right hand contains nothing
+    def right_hand_empty?
+      checkright.nil? || checkright.empty?
+    end
+
+    # Check if left hand is empty
+    # @return [Boolean] true if left hand contains nothing
+    def left_hand_empty?
+      checkleft.nil? || checkleft.empty?
+    end
+
+    # Wrapper for containers found on surfaces (tables, counters, etc.)
+    # Provides same interface as GameObj but tracks on_surface status
+    # for proper item retrieval syntax ("get #item from #container")
+    class OnSurfaceContainer
+      # @return [String] the GameObj ID of the container
+      # @return [String] the full name of the container
+      # @return [String] the noun of the container
+      # @return [Array<GameObj>] the items contained within
+      attr_reader :id, :name, :noun, :contents
+
+      # Create a new on-surface container wrapper
+      # @param id [String] the GameObj ID
+      # @param name [String] the full name
+      # @param noun [String] the noun
+      def initialize(id:, name:, noun:)
+        @id = id
+        @name = name
+        @noun = noun
+        @contents = []
+      end
+
+      # Always returns true to indicate this container is on a surface
+      # @return [Boolean] always true
+      def on_surface?
+        true
+      end
+
+      # Load container contents by looking in it
+      # Populates @contents with items found via XML parsing
+      # @return [void]
+      def load_contents
+        # Look in container to populate contents via XML parser
+        clear
+        fput "look in ##{@id}"
+        sleep 0.5
+
+        # GameObj should now have the container with contents
+        container_obj = GameObj[@id]
+        @contents = container_obj&.contents || []
+      end
+    end
+
+    # Find a container by name in various locations
+    # Searches in order: right hand, left hand, worn items, room loot, room desc, on furniture
+    # @param name [String] the container name or noun to search for
+    # @return [GameObj, OnSurfaceContainer, nil] the found container or nil if not found
+    # @example
+    #   find_container('backpack')           # => GameObj for backpack
+    #   find_container('brown haversack')    # => GameObj for brown haversack
+    def find_container(name)
+      # Build flexible regex: "brown haversack" -> /brown.*haversack/i
+      name_pattern = Regexp.new(name.downcase.split.map { |word| Regexp.escape(word) }.join('.*'), Regexp::IGNORECASE)
+
+      # Check right hand first - if found, swap to left
+      if matches_container?(GameObj.right_hand, name_pattern, name)
+        echo "Container in right hand, swapping to left..."
+        fput 'swap'
+        sleep 0.3
+        return GameObj.left_hand
+      end
+
+      # Check left hand
+      return GameObj.left_hand if matches_container?(GameObj.left_hand, name_pattern, name)
+
+      # Check worn containers
+      GameObj.inv.each do |item|
+        return item if matches_container?(item, name_pattern, name) && item.contents
+      end
+
+      # Check open containers in room (loot)
+      GameObj.loot.each do |item|
+        next unless matches_container?(item, name_pattern, name)
+
+        # If contents not loaded, try looking in it
+        if item.contents.nil?
+          fput "look in ##{item.id}"
+          sleep 0.5
+        end
+        return item if item.contents
+      end
+
+      # Check room description items (furniture, barrels, etc.)
+      GameObj.room_desc.each do |item|
+        next unless matches_container?(item, name_pattern, name)
+
+        # If contents not loaded, try looking in it
+        if item.contents.nil?
+          fput "look in ##{item.id}"
+          sleep 0.5
+        end
+        return item if item.contents
+      end
+
+      # Check for containers ON furniture - after "look on", furniture.contents is populated
+      # Items ON surfaces don't appear in GameObj.loot until interacted with
+      all_furniture = GameObj.loot.to_a + GameObj.room_desc.to_a
+
+      all_furniture.each do |furniture|
+        next unless furniture&.id
+
+        # Look on furniture to populate its contents
+        result = dothistimeout("look on ##{furniture.id}", 3, /^On the|There is nothing on/)
+        next unless result =~ /^On the/
+
+        sleep 0.3
+
+        # After "look on", check if furniture now has contents matching our search
+        # The XML parser populates furniture.contents with items ON the surface
+        furniture_obj = GameObj[furniture.id]
+
+        next unless furniture_obj&.contents
+
+        furniture_obj.contents.each do |item_on_surface|
+          next unless matches_container?(item_on_surface, name_pattern, name)
+
+          echo "Found on-surface container: #{item_on_surface.name} (ID: #{item_on_surface.id})"
+
+          # Create wrapper and load the container's contents
+          container = OnSurfaceContainer.new(
+            id: item_on_surface.id,
+            name: item_on_surface.name,
+            noun: item_on_surface.noun
+          )
+          container.load_contents
+
+          return container if container.contents && !container.contents.empty?
+        end
+      end
+
+      nil
+    end
+
+    # Process all items in a container by loresinging each one
+    # Items are temporarily moved to right hand, loresung, then returned
+    # @param container [GameObj, OnSurfaceContainer] the container to process
+    # @return [void]
+    # @raise [RuntimeError] if right hand is not empty at start
+    def process_container(container)
+      unless right_hand_empty?
+        echo "ERROR: Right hand must be empty (currently holding: #{checkright})"
+        echo "Please empty your right hand and try again."
+        return
+      end
+
+      if container.contents.nil? || container.contents.empty?
+        echo "Container is empty or contents not visible. Try opening it first."
+        return
+      end
+
+      item_count = container.contents.length
+      mode_str = power_mode ? '4-line power' : '2-line fast'
+      on_surface = container.respond_to?(:on_surface?) && container.on_surface?
+      location_str = on_surface ? ' (on surface)' : ''
+      echo "Processing #{item_count} items from #{container.name}#{location_str} (#{mode_str} mode)..."
+
+      container.contents.each_with_index do |item, index|
+        echo "--- Item #{index + 1}/#{item_count}: #{item.name} ---"
+
+        # Get item into right hand
+        # For on-surface containers, use "get #item from #container" syntax
+        get_cmd = if on_surface
+                    "get ##{item.id} from ##{container.id}"
+                  else
+                    "get ##{item.id}"
+                  end
+
+        result = dothistimeout(get_cmd, 5, /You remove|You get|You pick up|could not find/)
+        unless result =~ /You remove|You get|You pick up/
+          echo "Failed to get item, skipping..."
+          next
+        end
+
+        # Perform loresong (item is now in hand)
+        full_loresong(item.noun)
+
+        # Put item back
+        dothistimeout("put ##{item.id} in ##{container.id}", 5, /You put|You place/)
+
+        sleep 0.5
+      end
+
+      echo "Container processing complete!"
+    end
+
+    # Run in bot/service mode accepting items from other players
+    # Continuously waits for item offers, performs loresongs, and returns items
+    # Includes retry logic if customer doesn't accept the return offer
+    # @return [void] (runs in infinite loop until killed)
+    def bot_mode
+      pause_script = pause_script_name
+      mode_str = power_mode ? '4-line power' : '2-line fast'
+
+      echo "Bot mode activated (#{mode_str}) - waiting for item offers..."
+      echo "Pause script: #{pause_script || 'none'}"
+      echo "Use #{$clean_lich_char}k #{Script.current.name} to stop."
+
+      loop do
+        customer = matchfind '? offers you'
+
+        pause_script(pause_script) if pause_script && running?(pause_script)
+
+        fput 'accept'
+        sleep 1
+
+        item_noun = checkright
+        if item_noun.nil? || item_noun.empty?
+          echo 'No item received, continuing...'
+          unpause_script(pause_script) if pause_script && Script.paused?(pause_script)
+          next
+        end
+
+        # Perform full loresong
+        full_loresong(item_noun)
+
+        # Return item to customer (offers last 60 seconds)
+        # Attempt 1: Initial offer
+        fput "give #{customer}"
+        result = matchtimeout 65, 'has accepted', 'has declined', 'has expired'
+
+        unless result && result.include?('has accepted')
+          # Attempt 2: Whisper and offer again
+          echo "#{customer} did not accept - trying again..."
+          fput "whisper #{customer} Your item is ready! Please ACCEPT my offer."
+          fput "give #{customer}"
+          result = matchtimeout 65, 'has accepted', 'has declined', 'has expired'
+        end
+
+        unless result && result.include?('has accepted')
+          # Attempt 3: Wait, different whisper, final offer
+          echo "#{customer} still not accepting - final attempt..."
+          sleep 30
+          fput "whisper #{customer} I still have your item. Please ACCEPT when ready."
+          fput "give #{customer}"
+          result = matchtimeout 65, 'has accepted', 'has declined', 'has expired'
+        end
+
+        unless result && result.include?('has accepted')
+          # Give up active attempts - just wait for them
+          echo "#{customer} appears unresponsive - please handle"
+          while checkright && !checkright.empty?
+            sleep 5
+          end
+        end
+
+        unpause_script(pause_script) if pause_script && Script.paused?(pause_script)
+      end
+    end
+
+    # Display help information showing all usage commands and features
+    # @return [void]
+    def show_help
+      respond
+      respond 'ELore - Modernized Loresinging Script'
+      respond
+      respond 'Usage:'
+      respond "   #{$clean_lich_char}#{Script.current.name}                         - Sing to item in hand (2-line, fast)"
+      respond "   #{$clean_lich_char}#{Script.current.name} power                   - Sing to item in hand (4-line, powerful)"
+      respond "   #{$clean_lich_char}#{Script.current.name} target <noun>           - Sing to item in room (can't hold)"
+      respond "   #{$clean_lich_char}#{Script.current.name} target <noun> power     - Sing to room item (4-line)"
+      respond "   #{$clean_lich_char}#{Script.current.name} bot                     - Service mode (2-line)"
+      respond "   #{$clean_lich_char}#{Script.current.name} bot power               - Service mode (4-line)"
+      respond "   #{$clean_lich_char}#{Script.current.name} container <noun>        - Process container (2-line)"
+      respond "   #{$clean_lich_char}#{Script.current.name} container <noun> power  - Process container (4-line)"
+      respond "   #{$clean_lich_char}#{Script.current.name} settings                - Show current settings"
+      respond "   #{$clean_lich_char}#{Script.current.name} set <key> <value>       - Change a setting"
+      respond "   #{$clean_lich_char}#{Script.current.name} help                    - Show this message"
+      respond
+      respond 'Verse Modes:'
+      respond '   2-line (default): Fast (~3-5s RT per verse)'
+      respond '   4-line (power):   More powerful (~11-12s RT per verse), better for difficult items'
+      respond
+      respond 'Settings (use "settings" command to view/change):'
+      respond '   pause  - Script to pause in bot mode (default: none)'
+      respond '   retry  - Max retries per verse (default: 3)'
+      respond '   mana   - Min mana before singing (default: 50)'
+      respond '   power  - Use 4-line verses by default (default: false)'
+      respond
+      respond 'Features:'
+      respond '   - Automatic retry when "has more to share" is detected'
+      respond '   - Skips items that cannot be loresung'
+      respond '   - Container mode processes all items in a container'
+      respond '   - Target mode for items you cannot hold (furniture, heavy items)'
+      respond
+    end
+
+    private
+
+    # Helper method to match container by name pattern
+    # @param item [GameObj, nil] The item to check
+    # @param name_pattern [Regexp] Pattern to match against item name
+    # @param name [String] Original container name for single-word matching
+    # @return [Boolean] true if item matches container criteria
+    def matches_container?(item, name_pattern, name)
+      return false unless item&.id
+
+      # Check regex pattern against full name
+      return true if item.name =~ name_pattern
+
+      # Check if noun matches (single word search)
+      return true if name.split.length == 1 && item.noun =~ /#{Regexp.escape(name)}/i
+
+      false
+    end
+  end
+end
+
+# Initialize modes
+ELore.power_mode = ELore.default_power?
+ELore.target_mode = false
+
+# Check for 'power' anywhere in args
+if Script.current.vars.any? { |v| v&.downcase == 'power' }
+  ELore.power_mode = true
+end
+
+# Main script execution
+case Script.current.vars[1]&.downcase
+when nil, ''
+  # Single item mode - sing to item in right hand
+  item_noun = checkright
+  if item_noun.nil? || item_noun.empty?
+    echo 'ERROR: No item in right hand!'
+    echo "Usage: #{$clean_lich_char}#{Script.current.name} help"
+    exit
+  end
+  ELore.full_loresong(item_noun)
+
+when 'power'
+  # Single item mode with power verses
+  item_noun = checkright
+  if item_noun.nil? || item_noun.empty?
+    echo 'ERROR: No item in right hand!'
+    echo "Usage: #{$clean_lich_char}#{Script.current.name} help"
+    exit
+  end
+  ELore.full_loresong(item_noun)
+
+when 'bot'
+  ELore.bot_mode
+
+when 'container'
+  # Join all args after 'container', excluding 'power'
+  container_args = Script.current.vars[2..].reject { |v| v&.downcase == 'power' }
+  container_name = container_args.join(' ')
+
+  if container_name.nil? || container_name.empty?
+    echo 'ERROR: Please specify a container name'
+    echo "Usage: #{$clean_lich_char}#{Script.current.name} container <name>"
+    echo "Example: #{$clean_lich_char}#{Script.current.name} container backpack"
+    echo "Example: #{$clean_lich_char}#{Script.current.name} container green haversack"
+    exit
+  end
+
+  container = ELore.find_container(container_name)
+  if container.nil?
+    echo "ERROR: Could not find container matching '#{container_name}'"
+    echo 'Make sure the container is in your left hand, worn, or open in the room.'
+    exit
+  end
+
+  ELore.process_container(container)
+
+when 'target'
+  target_noun = Script.current.vars[2]
+  if target_noun.nil? || target_noun.empty?
+    echo 'ERROR: Please specify an item noun'
+    echo "Usage: #{$clean_lich_char}#{Script.current.name} target <noun>"
+    echo "Example: #{$clean_lich_char}#{Script.current.name} target statue"
+    exit
+  end
+
+  # Skip 'power' if it was the target noun
+  if target_noun.downcase == 'power'
+    echo 'ERROR: Please specify an item noun'
+    echo "Usage: #{$clean_lich_char}#{Script.current.name} target <noun>"
+    exit
+  end
+
+  # Look up item ID from GameObj for precise targeting
+  target_item = (GameObj.loot.to_a + GameObj.room_desc.to_a).find { |item| item.noun =~ /#{Regexp.escape(target_noun)}/i }
+  target_id = target_item&.id
+
+  ELore.target_mode = true
+  ELore.full_loresong(target_noun, item_id: target_id)
+
+when 'help'
+  ELore.show_help
+
+when 'settings'
+  ELore.show_settings
+
+when 'set'
+  key = Script.current.vars[2]
+  value = Script.current.vars[3]
+
+  if key.nil? || key.empty?
+    echo 'ERROR: Please specify a setting key'
+    echo "Usage: #{$clean_lich_char}#{Script.current.name} set <key> <value>"
+    echo "Use '#{$clean_lich_char}#{Script.current.name} settings' to see available settings"
+    exit
+  end
+
+  ELore.set_setting(key.downcase, value)
+
+else
+  echo "Unknown command: #{Script.current.vars[1]}"
+  echo "Use '#{$clean_lich_char}#{Script.current.name} help' for usage information."
+end

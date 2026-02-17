@@ -22,6 +22,11 @@ migrate :gem, :gemshop do
   insert(:name, %{fragment of pale green-blue aquamarine})
   insert(:name, %{lilac-crested molten gold ametrine})
   insert(:name, %{pear-shaped greenish[\s\-]yellow citrine})
+  insert(:name, %{versicolored sharp crimson crystal})
+end
+
+migrate :magic, :pawnshop do
+  insert(:exclude, %{versicolored sharp crimson crystal})
 end
 
 migrate :breakable, :valuable do
