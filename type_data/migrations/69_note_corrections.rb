@@ -1,5 +1,5 @@
 migrate :note do
-  delete(:name, %{.* promissory note})
+  delete(:name, %{.+ promissory note})
 end
 
 migrate :note do
