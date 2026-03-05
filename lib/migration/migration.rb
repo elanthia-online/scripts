@@ -8,8 +8,9 @@ module Migration
   # creates a raw xml element that does not escape
   # html entities, so regexp can properly be serialized
   def self.raw_element(name, parent = nil)
-    Element.new(name, parent, context = {raw: :all, attribute_quote: :quote})
+    Element.new(name, parent, { raw: :all, attribute_quote: :quote })
   end
+
   ##
   ## lookup from cwd
   ##
@@ -25,19 +26,19 @@ module Migration
   end
 
   def self.load_tables(tables)
-    Hash[tables.map do |table| 
+    Hash[tables.map do |table|
       table = Table.from_yaml(table)
       [table.name, table]
     end]
   end
 
   def self.load_migrations(migrations, tables)
-    migrations.sort.map do |migration| 
-      Migrator.new(migration, tables) 
+    migrations.sort.map do |migration|
+      Migrator.new(migration, tables)
     end
   end
 
-  def self.to_xml(tables)
+  def self.to_xml(_tables)
     root = raw_element(%{data})
     @tables.values.map(&:to_xml).each do |child|
       root.add_element(child)
@@ -51,9 +52,9 @@ module Migration
     @migrations = Migration.load_migrations(opts.fetch(:migrations), @tables)
     @migrations.each(&:build).each(&:validate).each(&:apply)
     asset = File.join(opts.fetch(:dist), "gameobj-data.xml")
-    Migration.log(%{writing #{asset}}, 
-      label: :write,
-      color: :pink)
+    Migration.log(%{writing #{asset}},
+                  label: :write,
+                  color: :pink)
     File.open(asset, %{w+}) do |file|
       file.write Migration.to_xml(@tables).to_s
     end
