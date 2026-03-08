@@ -5,10 +5,14 @@
   contributors: LostRanger, Doug, Tysong
           game: gs
           tags: utility, version
-       version: 1.2.2
+       version: 1.3.0
 
   Version Control:
     Major_change.feature_addition.bugfix
+  v1.3.0 (2026-03-08)
+    - integrate core SessionsSettings snapshot when available
+    - simplify default session report to user-facing totals and recommendation
+    - keep detailed per-session diagnostics for full/all/details mode only
   v1.2.2 (2026-02-14)
     - show Lich branch/repo info if available
   v1.2.1 (2025-09-08)
@@ -98,7 +102,7 @@ module VersionScript
       v = o::VERSION
       return v.join('.') if v.is_a?(Array)
       return v.to_s
-    rescue
+    rescue StandardError
       return 'error'
     end
   end
@@ -108,7 +112,7 @@ module VersionScript
       return 'not installed' unless Object.const_defined?(:Gtk)
       return 'unknown' unless Gtk.const_defined?(:Version)
       return Gtk::Version::STRING
-    rescue
+    rescue StandardError
       return 'error'
     end
   end
@@ -118,7 +122,7 @@ module VersionScript
   end
 
   def self.get_script_version(filename)
-    data = File.open(filename, 'r').read
+    data = File.read(filename)
     if data =~ /^=begin\r?\n?(.+?)^=end/m
       comments = $1.split("\n")
     else
@@ -132,7 +136,7 @@ module VersionScript
       }
     end
 
-    for line in comments
+    comments.each do |line|
       if line =~ /^[\s\t#]*version:[\s\t]*([\w\s\d\.,-]+)/i
         return $1.sub(/\s\(.*?\)/, '').strip
       end
@@ -141,18 +145,102 @@ module VersionScript
     return nil
   end
 
+  def self.stub_session_snapshot
+    {
+      supported: false,
+      source: 'stub',
+      total: 0,
+      idle_over_30m: 0,
+      stale: 0,
+      running: 0,
+      sleeping: 0,
+      hidden: 0,
+      sessions: [],
+      error: 'SessionSettings integration pending core implementation'
+    }
+  end
+
+  def self.normalize_session_snapshot(snapshot)
+    base = stub_session_snapshot
+    return base unless snapshot.is_a?(Hash)
+
+    base.merge(
+      supported: true,
+      source: snapshot[:source] || 'SessionSettings',
+      total: snapshot[:total].to_i,
+      idle_over_30m: snapshot[:idle_over_30m].to_i,
+      stale: snapshot[:stale].to_i,
+      running: snapshot[:running].to_i,
+      sleeping: snapshot[:sleeping].to_i,
+      hidden: snapshot[:hidden].to_i,
+      sessions: Array(snapshot[:sessions]),
+      error: nil
+    )
+  end
+
+  def self.session_snapshot
+    if defined?(Lich::Common::SessionsSettings) &&
+       Lich::Common::SessionsSettings.respond_to?(:snapshot)
+      return normalize_session_snapshot(Lich::Common::SessionsSettings.snapshot)
+    end
+
+    stub_session_snapshot
+  rescue StandardError => e
+    snapshot = stub_session_snapshot
+    snapshot[:error] = "SessionsSettings read failed: #{e.message}"
+    snapshot
+  end
+
+  # Determine likely stale sessions using best available markers from core snapshot.
+  # Prefer explicit stale marker, then fallback to heartbeat-age threshold.
+  def self.potential_stale_sessions_count(session_state)
+    return 0 unless session_state[:supported]
+    return session_state[:stale].to_i if session_state.key?(:stale)
+
+    Array(session_state[:sessions]).count do |session_info|
+      session_info[:stale] || session_info[:marker] == 'stale' || session_info[:heartbeat_age].to_i > 360
+    end
+  end
+
+  def self.session_recommendation(_total_sessions, potential_stale, duplicate_names)
+    return 'No action needed.' if potential_stale.zero? && duplicate_names.zero?
+    return 'Duplicate session detected. Log all characters out, then reboot your system.' if duplicate_names.positive?
+    return 'Log all characters out, then reboot your system.' if potential_stale.positive?
+
+    'No action needed.'
+  end
+
+  def self.duplicate_session_name_count(session_state)
+    names = Array(session_state[:sessions]).map { |s| s[:session_name].to_s.strip }.reject(&:empty?)
+    names.group_by(&:itself).count { |_name, instances| instances.length > 1 }
+  end
+
+  # Returns autostart script entries for a specific scope.
+  def self.load_autostart_scripts(scope)
+    marshaled = Lich.db.get_first_value(
+      'SELECT hash FROM script_auto_settings WHERE script=? AND scope=?;',
+      "autostart".encode('UTF-8'),
+      scope.encode('UTF-8')
+    )
+    return nil if marshaled.nil?
+
+    Marshal.load(marshaled)['scripts']
+  rescue StandardError
+    nil
+  end
+
   def self.main
     if Script.current.vars[1]
       if Script.current.vars[1] =~ /^(?:all|full|details?)$/i
         show_report = true
-        scripts_to_check = Dir[File.join(SCRIPT_DIR, "*")].find_all { |x| x =~ /\.lic$/i }
+        scripts_to_check = Dir[File.join(SCRIPT_DIR, "*")].select { |x| x =~ /\.lic$/i }
       else
         show_report = false
         scripts_to_check = Set.new
         Script.current.vars[1..-1].each do |prefix|
-          scripts = Dir[File.join(SCRIPT_DIR, "#{prefix}*")].find_all { |x| x =~ /\.lic$/i }
-          scripts += Dir[File.join(SCRIPT_DIR, 'custom', "#{prefix}*")].find_all { |x| x =~ /\.lic$/i }
-          if scripts.length == 0
+          scripts = Dir[File.join(SCRIPT_DIR, "#{prefix}*")].select { |x| x =~ /\.lic$/i }
+          scripts += Dir[File.join(SCRIPT_DIR, 'custom', "#{prefix}*")].select { |x| x =~ /\.lic$/i }
+          if scripts.empty?
             echo "#{prefix}: No matching scripts found!"
           end
           scripts.each { |x| scripts_to_check << x }
@@ -166,6 +254,8 @@ module VersionScript
     end
 
     msg = []
+    detail_mode = !Script.current.vars[1].nil? && Script.current.vars[1] =~ /^(?:all|full|details?)$/i
+    session_summary = nil
 
     if show_report
       msg << "```"
@@ -176,6 +266,22 @@ module VersionScript
       report["Lich version"]         = const_get(:LICH_VERSION, missing: 'unknown')
       report["Lich branch"]          = const_get(:LICH_BRANCH, missing: 'unknown') if defined?(LICH_BRANCH)
       report["Lich repo"]            = const_get(:LICH_BRANCH_REPO, missing: 'unknown') if defined?(LICH_BRANCH_REPO)
+      session_state = session_snapshot
+      if session_state[:supported]
+        stale_sessions = potential_stale_sessions_count(session_state)
+        duplicate_names = duplicate_session_name_count(session_state)
+        session_summary = {
+          total: session_state[:total].to_i,
+          stale: stale_sessions,
+          recommendation: session_recommendation(session_state[:total].to_i, stale_sessions, duplicate_names)
+        }
+      else
+        session_summary = {
+          total: 'pending core SessionsSettings',
+          stale: 'pending core SessionsSettings',
+          recommendation: 'Session summary unavailable.'
+        }
+      end
       report["Dependency"]           = $DEPENDENCY_VERSION if XMLData.game =~ /^DR/
       report["SQLite3 version"]      = module_version(:SQLite3)
       report["Gtk version"]          = gtk_version
@@ -203,17 +309,17 @@ module VersionScript
 
       begin
         report["Lich location"] = File.join(LICH_DIR, "lich.rbw")
-      rescue
+      rescue StandardError
         report["Lich location"] = 'error'
       end
 
       begin
-        report["Ruby location"] = RbConfig::CONFIG['bindir'] + '/' + \
-                                  (RbConfig::CONFIG['RUBYW_INSTALL_NAME'].empty? ? \
-                                    RbConfig::CONFIG['RUBY_INSTALL_NAME'] : \
-                                    RbConfig::CONFIG['RUBYW_INSTALL_NAME']) + \
+        report["Ruby location"] = RbConfig::CONFIG['bindir'] + '/' +
+                                  (RbConfig::CONFIG['RUBYW_INSTALL_NAME'].empty? ?
+                                    RbConfig::CONFIG['RUBY_INSTALL_NAME'] :
+                                    RbConfig::CONFIG['RUBYW_INSTALL_NAME']) +
                                   RbConfig::CONFIG['EXEEXT']
-      rescue
+      rescue StandardError
         report["Ruby location"] = 'error'
       end
 
@@ -222,14 +328,14 @@ module VersionScript
 
       report = {}
       begin
-        fn = Dir.entries(File.join(DATA_DIR, XMLData.game)).find_all { |filename| filename =~ /^map\-[0-9]+\.(?:dat|xml|json)$/ }.collect { |filename| File.join(DATA_DIR, XMLData.game, filename) }.sort[-1]
+        fn = Dir.entries(File.join(DATA_DIR, XMLData.game)).select { |filename| filename =~ /^map\-[0-9]+\.(?:dat|xml|json)$/ }.map { |filename| File.join(DATA_DIR, XMLData.game, filename) }.sort[-1]
         if fn
           report["MapDB filename"] = File.basename(fn)
           report["MapDB last modified"] = File.mtime(fn).to_s
         else
           report["MapDB filename"] = 'not found'
         end
-      rescue
+      rescue StandardError
         report["MapDB filename"] = 'error'
       end
 
@@ -240,7 +346,7 @@ module VersionScript
             fn = File.join(dir, "#{file}.xml")
             time = File.mtime(fn) if File.exist?(fn)
             break
-          rescue
+          rescue StandardError
             time = nil
           end
         end
@@ -253,16 +359,16 @@ module VersionScript
       msg << ''
 
       custom_scripts = []
-      Dir[File.join(SCRIPT_DIR, 'custom', "*")].find_all { |x| x =~ /\.lic$/i }.each { |filename|
+      Dir[File.join(SCRIPT_DIR, 'custom', "*")].select { |x| x =~ /\.lic$/i }.each { |filename|
         name = File::basename(filename)
         name.gsub!(/\.lic$/i, '')
         custom_scripts << name
       }
 
       report = {}
-      unless Lich.db.get_first_value('SELECT hash FROM script_auto_settings WHERE script=? AND scope=?;', "autostart".encode('UTF-8'), ":".encode('UTF-8')).nil?
+      if (scripts_hashes = load_autostart_scripts(":"))
         scripts = []
-        Marshal.load(Lich.db.get_first_value('SELECT hash FROM script_auto_settings WHERE script=? AND scope=?;', "autostart".encode('UTF-8'), ":".encode('UTF-8')))['scripts'].each { |hash|
+        scripts_hashes.each { |hash|
           if hash[:args].nil? || hash[:args].empty?
             scripts.push("#{hash[:name]}")
           else
@@ -271,9 +377,9 @@ module VersionScript
         }
         report["Autostart global"] = scripts.join(', ')
       end
-      unless Lich.db.get_first_value('SELECT hash FROM script_auto_settings WHERE script=? AND scope=?;', "autostart".encode('UTF-8'), "#{XMLData.game}:#{XMLData.name}".encode('UTF-8')).nil?
+      if (scripts_hashes = load_autostart_scripts("#{XMLData.game}:#{XMLData.name}"))
         scripts = []
-        Marshal.load(Lich.db.get_first_value('SELECT hash FROM script_auto_settings WHERE script=? AND scope=?;', "autostart".encode('UTF-8'), "#{XMLData.game}:#{XMLData.name}".encode('UTF-8')))['scripts'].each { |hash|
+        scripts_hashes.each { |hash|
           if hash[:args].nil? || hash[:args].empty?
             scripts.push("#{hash[:name]}")
           else
@@ -290,10 +396,39 @@ module VersionScript
       report["Custom scripts"]         = custom_scripts.flatten.join(', ')
 
       msg += format_report(report, 26)
+      msg << ''
+
+      if detail_mode
+        session_report = {}
+        if session_state[:supported]
+          session_report["Session source"] = session_state[:source]
+          session_report["Ruby running"] = session_state[:running]
+          session_report["Ruby sleeping"] = session_state[:sleeping]
+          session_report["Ruby hidden"] = session_state[:hidden]
+          session_state[:sessions].each do |session_info|
+            pid = session_info[:pid] || 'n/a'
+            name = session_info[:session_name] || session_info[:name] || 'unnamed'
+            state = session_info[:state] || 'unspecified'
+            marker = session_info[:marker] || (session_info[:stale] ? 'stale' : 'active')
+            session_report["Session #{pid}"] = "name=#{name}, state=#{state}, marker=#{marker}"
+          end
+        else
+          session_report["Session state"] = session_state[:error]
+        end
+        msg += format_report(session_report, 26)
+      end
       msg << "```"
     end
 
-    if scripts_to_check.length > 0
+    if show_report && !session_summary.nil?
+      msg << Lich::Messaging.monsterbold('========================================')
+      msg << "Total ruby sessions.......: #{session_summary[:total]}"
+      msg << "Potential stale sessions..: #{session_summary[:stale]}"
+      msg << "#{Lich::Messaging.monsterbold('Recommendation..........')}: #{session_summary[:recommendation]}"
+      msg << Lich::Messaging.monsterbold('========================================')
+    end
+
+    if scripts_to_check.any?
       msg << "```"
       known_versions = []
       unknown_versions = []
@@ -309,7 +444,7 @@ module VersionScript
       scripts_to_check.each do |filename|
         name = File::basename(filename)
         name.gsub!(/\.lic$/i, '')
-        name = "#{filename.to_s.match(/\/custom\//) ? 'custom/' : ''}#{name}"
+        name = "#{filename.to_s.include?('/custom/') ? 'custom/' : ''}#{name}"
 
         begin
           version = get_script_version(filename)
@@ -318,18 +453,18 @@ module VersionScript
           else
             unknown_versions << name
           end
-        rescue
+        rescue StandardError
           error_versions << name
         end
       end
 
-      msg << "Installed script versions: #{known_versions.join(', ')}" if known_versions.length > 0
-      msg << "Unknown script versions: #{unknown_versions.join(', ')}" if unknown_versions.length > 0
-      msg << "Failed to retrieve data for: #{error_versions.join(', ')}" if error_versions.length > 0
+      msg << "Installed script versions: #{known_versions.join(', ')}" if known_versions.any?
+      msg << "Unknown script versions: #{unknown_versions.join(', ')}" if unknown_versions.any?
+      msg << "Failed to retrieve data for: #{error_versions.join(', ')}" if error_versions.any?
       msg << "```"
     end
 
-    if scripts_to_check.length == 0
+    if scripts_to_check.empty?
       msg << "Use `#{$clean_lich_char}version SCRIPT [SCRIPT2 [SCRIPT3...]]` to report the installed versions of one or more Lich scripts."
       msg << "Use `#{$clean_lich_char}version ALL` to report the installed versions of ALL downloaded Lich scripts."
     end
