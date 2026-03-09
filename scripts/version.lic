@@ -173,7 +173,10 @@ module VersionScript
       running: snapshot[:running].to_i,
       sleeping: snapshot[:sleeping].to_i,
       hidden: snapshot[:hidden].to_i,
-      sessions: Array(snapshot[:sessions]),
+      sessions: Array(snapshot[:sessions]).map { |session|
+        next session unless session.is_a?(Hash)
+        session.key?(:game_code) ? session : session.merge(game_code: session[:game])
+      },
       error: nil
     )
   end
@@ -202,17 +205,71 @@ module VersionScript
     end
   end
 
-  def self.session_recommendation(_total_sessions, potential_stale, duplicate_names)
-    return 'No action needed.' if potential_stale.zero? && duplicate_names.zero?
-    return 'Duplicate session detected. Log all characters out, then reboot your system.' if duplicate_names.positive?
+  # Determine user-facing recommendation severity.
+  # Duplicate live sessions (same character + game on multiple resident PIDs)
+  # are treated as the highest-priority issue.
+  def self.session_recommendation(_total_sessions, potential_stale, duplicate_sessions)
+    return 'No action needed.' if potential_stale.zero? && duplicate_sessions.zero?
+    return 'Duplicate session detected. Log all characters out, then reboot your system.' if duplicate_sessions.positive?
     return 'Log all characters out, then reboot your system.' if potential_stale.positive?
 
     'No action needed.'
   end
 
-  def self.duplicate_session_name_count(session_state)
-    names = Array(session_state[:sessions]).map { |s| s[:session_name].to_s.strip }.reject(&:empty?)
-    names.group_by(&:itself).count { |_name, instances| instances.length > 1 }
+  # Counts duplicate *live* sessions by character+game identity.
+  #
+  # A duplicate session requires:
+  # - same session_name
+  # - same game_code
+  # - different pid
+  # - os_seen == true for each row considered
+  #
+  # Historical rows (os_seen false/nil) are excluded.
+  def self.duplicate_live_session_count(session_state)
+    live_sessions = Array(session_state[:sessions]).select { |s| session_os_seen?(s) == true }
+
+    keys = live_sessions.map { |s|
+      [
+        session_name_value(s),
+        session_game_code_value(s),
+        session_pid_value(s)
+      ]
+    }.reject { |name, game, _pid| name.empty? || game.empty? }
+
+    grouped = keys.group_by { |name, game, _pid| [name, game] }
+    grouped.count { |_identity, rows| rows.map { |_name, _game, pid| pid }.uniq.length > 1 }
+  end
+
+  # Extractors tolerate symbol/string-keyed hashes from different core versions.
+  # If row-level game code is absent, use current XMLData game as a conservative fallback.
+  def self.session_name_value(session)
+    (session[:session_name] || session['session_name']).to_s.strip.downcase
+  end
+
+  def self.session_game_code_value(session)
+    raw = session[:game_code] || session['game_code'] || session[:game] || session['game']
+    raw = XMLData.game if raw.nil? || raw.to_s.strip.empty?
+    raw.to_s.strip.downcase
+  end
+
+  def self.session_pid_value(session)
+    session[:pid] || session['pid']
+  end
+
+  def self.session_os_seen?(session)
+    value = session[:os_seen]
+    value = session['os_seen'] if value.nil?
+    value == true || value == 1 || value == '1'
+  end
+
+  def self.active_session_count(session_state)
+    Array(session_state[:sessions]).count { |s|
+      if s.key?(:marker)
+        s[:marker] == 'active'
+      else
+        s[:state].to_s != 'exited' && !s[:stale]
+      end
+    }
   end
 
   # Returns autostart script entries for a specific scope.
@@ -269,16 +326,19 @@ module VersionScript
       session_state = session_snapshot
       if session_state[:supported]
         stale_sessions = potential_stale_sessions_count(session_state)
-        duplicate_names = duplicate_session_name_count(session_state)
+        duplicate_sessions = duplicate_live_session_count(session_state)
+        active_sessions = active_session_count(session_state)
         session_summary = {
-          total: session_state[:total].to_i,
+          total: active_sessions,
           stale: stale_sessions,
-          recommendation: session_recommendation(session_state[:total].to_i, stale_sessions, duplicate_names)
+          issue: stale_sessions.positive? || duplicate_sessions.positive?,
+          recommendation: session_recommendation(active_sessions, stale_sessions, duplicate_sessions)
         }
       else
         session_summary = {
           total: 'pending core SessionsSettings',
           stale: 'pending core SessionsSettings',
+          issue: false,
           recommendation: 'Session summary unavailable.'
         }
       end
@@ -421,11 +481,18 @@ module VersionScript
     end
 
     if show_report && !session_summary.nil?
-      msg << Lich::Messaging.monsterbold('========================================')
-      msg << "Total ruby sessions.......: #{session_summary[:total]}"
-      msg << "Potential stale sessions..: #{session_summary[:stale]}"
-      msg << "#{Lich::Messaging.monsterbold('Recommendation..........')}: #{session_summary[:recommendation]}"
-      msg << Lich::Messaging.monsterbold('========================================')
+      label_width = 25
+      recommendation_line = "#{'Recommendation'.ljust(label_width, '.')}: #{session_summary[:recommendation]}"
+
+      msg << ''
+      msg << "#{'Total ruby sessions'.ljust(label_width, '.')}: #{session_summary[:total]}"
+      msg << "#{'Potential stale sessions'.ljust(label_width, '.')}: #{session_summary[:stale]}"
+      if session_summary[:issue]
+        msg << Lich::Messaging.monsterbold(recommendation_line)
+      else
+        msg << recommendation_line
+      end
+      msg << ''
     end
 
     if scripts_to_check.any?
