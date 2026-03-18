@@ -9,10 +9,14 @@
 
   Author: Ondreian
   Requirements: Ruby >= 2.3
-  version: 0.5
+  version: 0.6
   tags: playershops
 
   changelog:
+    v0.6 - Fix shop ID swap handling during maintenance reboots
+           - Smart scan now automatically syncs room_title with preamble
+           - Prevents stale room metadata when shop IDs are reassigned
+           - Maintains shop type detection during synchronization
     v0.5 - Add smart parsing mode for 90%+ performance improvement
            - New --smart flag for intelligent item inspection
            - Loads existing JSON, compares IDs, only inspects new items
@@ -156,7 +160,7 @@ module Bodega
     COMMAND  = %r[You can use the (?<command>.*?) command to browse the inventory of a particular shop.]
     NEW_ROOM = %r[^(?<room_title>.*)\s\((?<branch>\w+)\)$]
     SIGN     = %r[^Written on]
-    ITEM     = %r[^(?<item_id>\d+)\)]
+    ITEM     = %r[^\s*(?<item_id>\d+)\).*?for\s+(?<price>[\d,]+)\s+silver]
   end
 end
 
@@ -625,9 +629,12 @@ module Bodega
     end
 
     def self.add_item(acc, row)
-      acc.last.items.push(
-        row.match(Messages::ITEM)[:item_id]
-      )
+      match = row.match(Messages::ITEM)
+      # Store both item_id and price from browse output
+      acc.last.items.push({
+        id: match[:item_id],
+        browse_price: match[:price]&.gsub(',', '')&.to_i
+      })
     end
 
     def self.parse_inv(inv)
@@ -641,30 +648,35 @@ module Bodega
       end
       .map do |room|
         max_item_depth = (Opts["max-item-depth"] || 100).to_i
-        room.items = room.items.take(max_item_depth).map do |id| Parser.scan_item(id) end
+        room.items = room.items.take(max_item_depth).map do |item_data|
+          # item_data is now a hash with {id: ..., browse_price: ...}
+          Parser.scan_item(item_data[:id] || item_data, item_data[:browse_price])
+        end
         room
       end
       .map(&:to_h)
     end
 
     def self.get_browse_ids(inv)
-      # Extract item IDs from browse output without doing full inspection
-      item_ids = Set.new
+      # Extract item IDs and prices from browse output without doing full inspection
+      item_prices = {}
 
       inv.reduce([]) do |acc, row|
         break acc if row.include?("SHOP INSPECT")
         Parser.add_room(acc, row) if row.match(Messages::NEW_ROOM)
         Parser.add_sign(acc, row) if row.match(Messages::SIGN) or not acc.last.sign.nil?
 
-        # Extract item ID without full inspection
+        # Extract item ID and price without full inspection
         if row.match(Messages::ITEM) and acc.last.sign.nil?
-          item_id = row.match(Messages::ITEM)[:item_id]
-          item_ids.add(item_id)
+          match = row.match(Messages::ITEM)
+          item_id = match[:item_id]
+          price = match[:price]&.gsub(',', '')&.to_i
+          item_prices[item_id] = price
         end
         acc
       end
 
-      item_ids
+      item_prices
     end
 
     def self.load_and_validate_town_json(town)
@@ -752,7 +764,8 @@ module Bodega
       )
 
       (preamble, *inv) = coll.run()
-      current_ids = get_browse_ids(inv.map(&:strip))
+      current_items = get_browse_ids(inv.map(&:strip)) # Now returns {id => price}
+      current_ids = current_items.keys.to_set
 
       Log.out("Found #{current_ids.size} items currently in shop #{shop_id}", label: :smart)
 
@@ -810,11 +823,14 @@ module Bodega
         current_time = Time.now.utc.iso8601
         new_ids.take(max_item_depth).each do |item_id|
           begin
-            item_data = scan_item(item_id)
+            # Pass browse price to scan_item for more reliable cost tracking
+            browse_price = current_items[item_id]
+            item_data = scan_item(item_id, browse_price)
             new_items << item_data
 
             # Track in added_items.json for persistence across full scans
-            track_added_item(item_id, current_time)
+            # Pass town, preamble, and item_data for hash-based tracking
+            track_added_item(item_id, current_time, town: town, preamble: preamble, item_data: item_data)
           rescue => e
             Log.out("Failed to inspect item #{item_id}: #{e.message}", label: :smart)
           end
@@ -824,6 +840,34 @@ module Bodega
       # Step 8: Add new items to existing shop structure
       if new_items.any?
         add_items_to_shop(existing_shop, new_items)
+      end
+
+      # Step 9: Update room_title to match current preamble (handles shop ID swaps during maintenance)
+      # The preamble is always fresh from the game, but room_title comes from cached inv structure
+      # Extract the shop name from the preamble and update the entry room's title
+      preamble_shop_name = extract_shop_name_from_preamble(preamble)
+      if existing_shop['inv'] && existing_shop['inv'][0] && preamble_shop_name != 'unknown'
+        # Get the current room title to determine shop type
+        current_room_title = existing_shop['inv'][0]['room_title']
+
+        # Extract shop type from current room_title (e.g., "Magic Shoppe", "Weaponry", etc.)
+        shop_type_match = current_room_title&.match(/(?:'s?\s+)?(Magic Shoppe|Weaponry|Armory|Outfitting|General Store|Combat Gear|Locksmith Shop|Shop|Boutique|Treasures|Cupboard|Pantry|Market|Tower|Stash|Castle|Eye|Claw|Kiss|Ransom|Den|Hoard|Goods|Emporium|Salon|Parlor|Boutique|Imports|Defence|Couture|Station|Things|Wares|Snack Pantry|Icemule Trade Station|Confectionery Castle|Smuggling Emporium|Arcane Antiquities|Fine Furs|Supply Center|Lost Things|Locksmith Shop|Lockpicks|Trade Station)$/i)
+        shop_type = shop_type_match ? shop_type_match[1] : nil
+
+        # Construct new room_title: "Owner's Shop Type" or just shop type for business names
+        new_room_title = if shop_type && !preamble_shop_name.match(/^(The|A)\s+/i)
+                           # Owner-possessive format: "Painz's Magic Shoppe"
+                           "#{preamble_shop_name}'s #{shop_type}"
+                         elsif shop_type
+                           # Business name format: "The Best Defence" or "Dark Tower Imports"
+                           "#{preamble_shop_name} #{shop_type}"
+                         else
+                           # Fallback: use preamble shop name as-is
+                           preamble_shop_name
+                         end
+
+        existing_shop['inv'][0]['room_title'] = new_room_title
+        Log.out("Updated room_title from '#{current_room_title}' to '#{new_room_title}'", label: :smart)
       end
 
       # Return the updated shop structure, preserving room_id if it exists
@@ -946,24 +990,63 @@ module Bodega
       @added_items_data
     end
 
-    def self.track_added_item(item_id, timestamp)
+    def self.track_added_item(item_id, timestamp, town: nil, preamble: nil, item_data: nil)
       # Initialize added items tracking if needed
       load_added_items
 
-      # Add this item to our tracking
-      @added_items_data[item_id.to_s] = timestamp
+      # Only store by hash signature (not by ID which can be recycled)
+      # If we don't have the data needed for hash, skip tracking
+      if town && preamble && item_data
+        signature = create_item_signature(town, preamble, item_data)
+        if signature
+          @added_items_data[signature] = timestamp
+        else
+          Log.out("Warning: Could not create signature for item #{item_id}", label: :smart)
+        end
+      else
+        Log.out("Warning: Missing data to track item #{item_id} (town: #{town.nil?}, preamble: #{preamble.nil?}, item_data: #{item_data.nil?})", label: :smart)
+      end
+    end
+
+    def self.create_item_signature(town, preamble, item_data)
+      # Create a unique signature for the item based on stable attributes
+      # This matches the JavaScript implementation in data-loader.js
+      return nil unless item_data && item_data[:name]
+
+      # Extract shop name from preamble
+      shop_name = extract_shop_name_from_preamble(preamble)
+
+      # Extract price from item details
+      price = item_data.dig(:details, :cost) || 0
+
+      # Create signature using safe_string
+      safe_town = Utils.safe_string(town)
+      safe_shop = Utils.safe_string(shop_name)
+      safe_item = item_data[:name].to_s.downcase.strip
+      safe_price = price.to_s
+
+      "#{safe_town}:#{safe_shop}:#{safe_item}:#{safe_price}"
+    end
+
+    def self.extract_shop_name_from_preamble(preamble)
+      # Extract shop name from preamble like "Starsworn's Shop is located in..."
+      return 'unknown' unless preamble
+
+      match = preamble.match(/^(.*?)'s?\s+Shop\s+is\s+located/i) ||
+              preamble.match(/^(.*?)\s+is\s+located/i)
+
+      match ? match[1].strip : 'unknown'
     end
 
     def self.save_added_items
       # Save added_items.json (only called during smart scans)
       return unless @added_items_data
 
-      # Clean up old items (older than 32 days) to prevent file growth
-      thirty_two_days_ago = Time.now.utc - (32 * 24 * 60 * 60)
-
+      # Remove items with invalid timestamps only
       @added_items_data = @added_items_data.select do |_item_id, timestamp_str|
         begin
-          Time.parse(timestamp_str) >= thirty_two_days_ago
+          Time.parse(timestamp_str)
+          true
         rescue
           false # Remove items with invalid timestamps
         end
@@ -1145,7 +1228,7 @@ module Bodega
       @smart_stats = nil
     end
 
-    def self.scan_item(id)
+    def self.scan_item(id, browse_price = nil)
       coll = Collector.new(
         command: %[shop inspect #{id}],
         start: %[You request a thorough inspection of],
@@ -1153,10 +1236,14 @@ module Bodega
       )
 
       details = coll.run()
+      extracted_details = Extractor.of(details.slice(1..-2))
+
+      # Add browse price if available (more reliable than parsing from inspect output)
+      extracted_details[:cost] = browse_price if browse_price
 
       { id: id,
         name: details.first.gsub("You request a thorough inspection of ", "").gsub(%r[\sfrom [A-Z].*?\.$], ""),
-        details: Extractor.of(details.slice(1..-2)) }
+        details: extracted_details }
     end
 
     def self.towns_to_search()

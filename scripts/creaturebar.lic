@@ -1,0 +1,3155 @@
+=begin
+  CreatureBar - Visual creature status display with injury doll
+
+        author: Elanthia Online
+  contributors: Nisugi
+          game: Gemstone
+          tags: hunting, combat, creatures
+       version: 1.1
+      required: Lich >= 5.13.0
+
+  Change Log:
+  v1.1 (2025/12/21)
+    - Alt + drag to move window around
+    - Warning if combat tracking disabled
+  v1.0 (2025/11/30)
+    - Shows current target (XMLData.current_target_id)
+    - Visual injury doll with wound overlays
+    - HP progress bar with color-coded ranges
+    - Status effect indicators
+    - Fully configurable colors and appearance
+    - Click panel to target creature
+    - Supports Frontend Focus Return tm
+
+=end
+
+require 'gtk3'
+require 'yaml'
+require 'fileutils'
+require File.join(LIB_DIR, 'common', 'db_store.rb')
+load(File.join(SCRIPT_DIR, 'jinx.lic'))
+
+module CreatureBar
+  VERSION = '1.0.0'
+
+  CONFIG_DIR = File.join(DATA_DIR, 'creature_bar')
+  CONFIG_FILE = File.join(CONFIG_DIR, 'config.yaml')
+  SILHOUETTE_DIR = File.join(CONFIG_DIR, 'silhouettes')
+
+  # Default configuration with all colors
+  # Global settings shared across all characters (saved to config.yaml)
+  DEFAULT_GLOBAL_CONFIG = {
+    'update_interval'  => 250,
+    'window'           => {
+      'decorated'     => true,
+      'always_on_top' => true,
+      'transparent'   => false,
+    },
+    'silhouette_style' => 'greyscale', # 'greyscale' (grayscale, tintable) or 'color' (full artwork)
+    'colors'           => {
+      # Window
+      'window_background'     => 'rgba(46, 46, 46, 0.95)',
+      # Name label
+      'name_font'             => '#FFFFFF',
+      'name_background'       => 'rgba(0, 0, 0, 0.5)',
+      # Multi-creature borders
+      'current_target_border' => '#FFD700', # Gold border for current target
+      'other_target_border'   => '#555555', # Grey border for other targets
+      # HP Bar
+      'hp_background'         => 'rgba(60, 20, 20, 0.9)',
+      'hp_high'               => '#2E7D32',
+      'hp_mid'                => '#FFB000',
+      'hp_low'                => '#FF4444',
+      'hp_text'               => '#FFFFFF',
+      # Tint colors (for grayscale images)
+      'silhouette_tint'       => '#808080', # Gray = neutral (no tint)
+      'markers_tint'          => '#FFFFFF', # White = full brightness
+      'wound_rank1_tint'      => '#FFFF00', # Yellow - minor wounds
+      'wound_rank2_tint'      => '#FFA500', # Orange - moderate wounds
+      'wound_rank3_tint'      => '#FF0000'  # Red - severe wounds
+    },
+    'status_effects'   => [
+      { 'name' => 'stunned', 'symbol' => 'S', 'color' => '#FFD700' },
+      { 'name' => 'immobilized', 'symbol' => 'I', 'color' => '#FF69B4' },
+      { 'name' => 'webbed', 'symbol' => 'W', 'color' => '#C0C0C0' },
+      { 'name' => 'prone', 'symbol' => 'P', 'color' => '#FFA500' },
+      { 'name' => 'blind', 'symbol' => 'B', 'color' => '#8B4513' },
+      { 'name' => 'sunburst', 'symbol' => 'U', 'color' => '#FFFF00' },
+      { 'name' => 'sleeping', 'symbol' => 'Z', 'color' => '#9370DB' },
+      { 'name' => 'poisoned', 'symbol' => 'T', 'color' => '#32CD32' },
+      { 'name' => 'dead', 'symbol' => 'D', 'color' => '#000000' },
+      { 'name' => 'bleeding', 'symbol' => 'X', 'color' => '#DC143C' }
+    ],
+    'wound_markers'    => {
+      'opacity' => 0.9
+    }
+    # Note: hp_bar, status, and name_display are per-silhouette settings
+    # Note: body_parts and wound_markers.size are per-silhouette settings
+    # See data/creature_bar/configs/*.yaml
+  }.freeze
+
+  # Character-specific settings (saved to DB_Store per character)
+  DEFAULT_CHARACTER_CONFIG = {
+    'position'       => { 'x' => 100, 'y' => 100 },
+    'window'         => {
+      'width'  => 100,
+      'height' => 175,
+    },
+    'multi_creature' => {
+      'max_shown' => 5 # Maximum creatures to show: 1 = single panel mode, >1 = multi-panel mode
+    },
+    'layout'         => {
+      'mode'        => 'horizontal', # 'vertical' or 'horizontal' - controls multi-creature panel arrangement
+      'max_rows'    => 2, # Maximum rows before wrapping to next column (vertical mode)
+      'max_columns' => 5 # Maximum columns before wrapping to next row (horizontal mode)
+    }
+  }.freeze
+
+  # Helper method to get status symbol from config
+  def self.get_status_symbol(status_name)
+    status_name = status_name.to_s.downcase
+    status = @@config['status_effects']&.find { |s| s['name'].downcase == status_name }
+    status ? status['symbol'] : status_name[0].upcase
+  end
+
+  # Helper method to get status color from config
+  def self.get_status_color(status_name)
+    status_name = status_name.to_s.downcase
+    status = @@config['status_effects']&.find { |s| s['name'].downcase == status_name }
+    status ? status['color'] : '#FFFFFF'
+  end
+
+  # Helper method to get user input without sending to game
+  # Uses UpstreamHook to intercept valid menu responses (y/n, numbers, cancel)
+  # Other commands pass through to the game normally
+  def self.get_user_input(valid_pattern = /^(?:<c>)?(a|y|n|yes|no|\d+|cancel)$/i)
+    hook_name = "creaturebar_input_#{Time.now.to_i}"
+    input_buffer = []
+
+    action = proc { |cmd|
+      if cmd =~ valid_pattern
+        input_buffer.push(cmd)
+        nil # block from going to game
+      else
+        cmd # let other commands through to game
+      end
+    }
+    UpstreamHook.add(hook_name, action)
+    # Wait for input to appear in buffer
+    sleep 0.1 while input_buffer.empty?
+    result = input_buffer.shift.gsub(/^<c>/, '')
+    UpstreamHook.remove(hook_name)
+    result
+  end
+
+  @@window = nil
+  @@config = nil
+  @@update_timer = nil
+  @@save_timer = nil
+  @@last_target_id = nil
+  @@active_dialog = nil
+  @@main_box = nil
+  @@creature_panels = {} # Hash of creature_id => panel widgets for multi-creature mode
+  @@panel_pool = {} # Hash: family => [panels] for family-aware pooling
+  @@panels_container = nil # Scrolled window container for creature panels
+  @@css_provider = nil
+  @@running = false
+
+  # LRU cache for silhouette pixbufs (limit 15 families)
+  @@pixbuf_cache = {} # Hash: family => {pixbuf: pixbuf, accessed: Time.now}
+  @@silhouette_configs = {} # Hash: family => config_hash
+  @@max_cached_pixbufs = 15
+
+  # Cache of available silhouette files to avoid repeated File.exist? calls
+  # Hash: style => { family_name => full_path }
+  @@silhouette_file_cache = {}
+
+  # Silhouette config directory
+  SILHOUETTE_CONFIG_DIR = File.join(CONFIG_DIR, 'configs')
+
+  # Asset Manager for Jinx distribution
+  module AssetManager
+    JINX_REPO_NAME = :creaturebar
+    JINX_REPO_URL = "https://raw.githubusercontent.com/Nisugi/CreatureBar/main"
+
+    class << self
+      def silhouettes_installed?
+        return false unless Dir.exist?(SILHOUETTE_DIR)
+
+        # Check for required shared files at root level
+        # Minimum required: default.png, one rank marker, eyes_back_nerves.png
+        shared_files = %w[default.png rank1.png eyes_back_nerves.png]
+        shared_files.all? { |f| File.exist?(File.join(SILHOUETTE_DIR, f)) }
+      end
+
+      def configs_installed?
+        return false unless Dir.exist?(SILHOUETTE_CONFIG_DIR)
+
+        # Check for default config at root level
+        File.exist?(File.join(SILHOUETTE_CONFIG_DIR, 'default.yaml'))
+      end
+
+      def assets_installed?
+        silhouettes_installed? && configs_installed?
+      end
+
+      def ensure_directories
+        FileUtils.mkdir_p(CONFIG_DIR) unless Dir.exist?(CONFIG_DIR)
+        FileUtils.mkdir_p(SILHOUETTE_DIR) unless Dir.exist?(SILHOUETTE_DIR)
+        FileUtils.mkdir_p(SILHOUETTE_CONFIG_DIR) unless Dir.exist?(SILHOUETTE_CONFIG_DIR)
+      end
+
+      def ensure_jinx_available
+        unless defined?(Jinx)
+          respond ""
+          respond "[CreatureBar] Jinx package manager is required."
+          respond "Install Jinx first with: ;repository download jinx"
+          respond ""
+          return false
+        end
+        true
+      end
+
+      def ensure_repo_registered(skip_prompt: false)
+        return true if Jinx::Repo.exists?(JINX_REPO_NAME)
+
+        unless skip_prompt
+          respond ""
+          respond "CreatureBar needs to register its asset repository with Jinx:"
+          respond "  Name: #{JINX_REPO_NAME}"
+          respond "  URL:  #{JINX_REPO_URL}"
+          respond ""
+          respond "Register this repository? (y/n)"
+
+          input = CreatureBar.get_user_input
+
+          unless input =~ /^y/i
+            respond "Repository registration cancelled."
+            return false
+          end
+        end
+
+        respond "Registering CreatureBar asset repository..."
+        Jinx::Repo.create(name: JINX_REPO_NAME, url: JINX_REPO_URL)
+        true
+      rescue => e
+        respond "[CreatureBar] Failed to register repo: #{e.message}"
+        false
+      end
+
+      def get_repo
+        repo = Jinx::Repo.lookup(JINX_REPO_NAME)
+        Jinx::Repo.manifest(repo) # Fetches/updates available assets
+        repo
+      end
+
+      # Discover available packages from Jinx manifest
+      # Returns hash: { 'package_name' => { assets: [...], count: N, base: 'base-name', version: N } }
+      def discover_packages(repo)
+        packages = {}
+
+        repo[:available].each do |asset|
+          pkg_name = asset[:package]
+          next unless pkg_name&.start_with?('creaturebar-')
+
+          # Extract package name (e.g., 'creaturebar-hinterwilds-shadow-v2' -> 'hinterwilds-shadow-v2')
+          short_name = pkg_name.sub('creaturebar-', '')
+
+          # Parse version and base name
+          if short_name =~ /^(.+)-v(\d+)$/
+            base_name = $1
+            version = $2.to_i
+          else
+            base_name = short_name
+            version = 0 # No version suffix = version 0 (older than v1)
+          end
+
+          packages[short_name] ||= { assets: [], count: 0, base: base_name, version: version }
+          packages[short_name][:assets] << asset
+          packages[short_name][:count] += 1
+        end
+
+        packages
+      end
+
+      # Get the latest version package for each base package name
+      def get_latest_packages(packages)
+        # Group by base name, pick highest version
+        by_base = {}
+        packages.each do |pkg_name, pkg_data|
+          base = pkg_data[:base]
+          if !by_base[base] || pkg_data[:version] > by_base[base][:version]
+            by_base[base] = { name: pkg_name, version: pkg_data[:version] }
+          end
+        end
+        by_base.values.map { |v| v[:name] }
+      end
+
+      def prompt_download
+        respond ""
+        respond "==========================================================="
+        respond " CreatureBar - Asset Download"
+        respond "==========================================================="
+        respond ""
+        respond "Fetching available packages..."
+
+        begin
+          repo = get_repo
+          packages = discover_packages(repo)
+        rescue => e
+          respond "[CreatureBar] Failed to fetch repository: #{e.message}"
+          return false
+        end
+
+        if packages.empty?
+          respond "[CreatureBar] No packages found in repository."
+          return false
+        end
+
+        respond ""
+        respond "Download silhouette assets via Jinx."
+        respond "(Already installed files will be skipped)"
+        respond ""
+        respond "Available packages:"
+        respond ""
+
+        # Sort packages: default first, then by base name, then by version (highest first)
+        sorted_packages = packages.keys.sort_by do |name|
+          pkg = packages[name]
+          base = pkg[:base]
+          version = pkg[:version]
+          # Sort: default first (0_), then alphabetically by base (1_), then by version descending
+          if base == 'default'
+            "0_#{base}_#{1000 - version}"
+          else
+            "1_#{base}_#{1000 - version}"
+          end
+        end
+
+        # Display numbered list
+        sorted_packages.each_with_index do |pkg_name, idx|
+          pkg = packages[pkg_name]
+          respond "  [#{idx + 1}] #{pkg_name} (#{pkg[:count]} files)"
+        end
+        respond "  [A] All packages (latest versions only)"
+        respond ""
+        respond "Enter choice (1-#{sorted_packages.size}, A for all), or 'cancel' to exit:"
+
+        input = CreatureBar.get_user_input
+
+        case input.downcase
+        when 'a', 'all'
+          # Download only latest version of each base package (default first)
+          latest = get_latest_packages(packages)
+          # Sort so default is first
+          latest.sort_by! { |name| name.start_with?('default') ? "0_#{name}" : "1_#{name}" }
+          latest.each { |pkg| download_package(pkg, repo) }
+        when /cancel/i
+          respond "Setup cancelled. Run ;creaturebar again when ready."
+          return false
+        when /^\d+$/
+          idx = input.to_i - 1
+          if idx >= 0 && idx < sorted_packages.size
+            selected = sorted_packages[idx]
+            # Always ensure default is downloaded first if not selecting default
+            unless packages[selected][:base] == 'default'
+              default_pkg = sorted_packages.find { |p| packages[p][:base] == 'default' }
+              download_package(default_pkg, repo) if default_pkg
+            end
+            download_package(selected, repo)
+          else
+            respond "Invalid choice. Please run ;creaturebar again."
+            return false
+          end
+        else
+          respond "Invalid choice. Please run ;creaturebar again."
+          return false
+        end
+
+        true
+      end
+
+      def download_package(package_name, repo = nil)
+        begin
+          repo ||= get_repo
+        rescue => e
+          respond "[CreatureBar] Failed to fetch repository: #{e.message}"
+          return false
+        end
+
+        respond ""
+        respond "Downloading #{package_name} via Jinx..."
+
+        ensure_directories
+
+        # Filter assets for this package
+        package_assets = repo[:available].select { |a| a[:package] == "creaturebar-#{package_name}" }
+
+        if package_assets.empty?
+          respond "[CreatureBar] No assets found for package: #{package_name}"
+          return false
+        end
+
+        success_count = 0
+        package_assets.each do |asset|
+          if download_asset(repo, asset)
+            success_count += 1
+          end
+        end
+
+        respond "Downloaded #{success_count}/#{package_assets.size} files for #{package_name}"
+        success_count == package_assets.size
+      end
+
+      # Strip version suffix from folder names (e.g., 'hinterwilds_shadow_v2' -> 'hinterwilds_shadow')
+      def strip_version_suffix(folder_name)
+        folder_name.sub(/_v\d+$/, '')
+      end
+
+      def download_asset(repo, asset, overwrite: false)
+        remote_path = asset[:file]
+        filename = File.basename(remote_path)
+
+        # New structure for remote paths:
+        # - assets/silhouettes/color/region/family.png
+        # - assets/silhouettes/greyscale/region/family.png
+        # - assets/silhouettes/default.png (root files)
+        # - assets/configs/color/region/family.yaml
+        # - assets/configs/greyscale/region/family.yaml
+        # - assets/configs/default/default.yaml
+        path_parts = remote_path.split('/')
+
+        # Determine base directory and reconstruct path hierarchy
+        if remote_path.include?('/silhouettes/')
+          base_dir = SILHOUETTE_DIR
+          sil_idx = path_parts.index('silhouettes')
+
+          if sil_idx && path_parts.size > sil_idx + 3
+            # Has style and region: silhouettes/color/atoll/valravn.png
+            style = path_parts[sil_idx + 1]
+            region = path_parts[sil_idx + 2]
+            target_dir = File.join(base_dir, style, region)
+          elsif sil_idx && path_parts.size == sil_idx + 2
+            # Root file: silhouettes/default.png
+            target_dir = base_dir
+          else
+            respond "[CreatureBar] Unexpected silhouette path structure: #{remote_path}"
+            return false
+          end
+        elsif remote_path.include?('/configs/')
+          base_dir = SILHOUETTE_CONFIG_DIR
+          cfg_idx = path_parts.index('configs')
+
+          if cfg_idx && path_parts.size > cfg_idx + 3
+            # Has style and region: configs/color/atoll/valravn.yaml
+            style = path_parts[cfg_idx + 1]
+            region = path_parts[cfg_idx + 2]
+            target_dir = File.join(base_dir, style, region)
+          elsif cfg_idx && path_parts.size == cfg_idx + 2
+            # Root file: configs/default.yaml
+            target_dir = base_dir
+          else
+            respond "[CreatureBar] Unexpected config path structure: #{remote_path}"
+            return false
+          end
+        else
+          respond "[CreatureBar] Unknown asset type: #{remote_path}"
+          return false
+        end
+
+        # Ensure target directory exists
+        FileUtils.mkdir_p(target_dir) unless Dir.exist?(target_dir)
+
+        # Use Jinx's installer with our custom target directory
+        Jinx::LichInstaller.install(
+          filename,
+          [repo],
+          target_dir,
+          filename,
+          overwrite: overwrite,
+          force: false,
+          asset_type: "data"
+        )
+        true
+      rescue Jinx::Error => e
+        respond "[CreatureBar] #{e.message}"
+        false
+      end
+
+      def check_for_updates
+        respond "Checking for CreatureBar asset updates via Jinx..."
+
+        begin
+          repo = get_repo
+        rescue => e
+          respond "[CreatureBar] Failed to fetch repository: #{e.message}"
+          return
+        end
+
+        updates = []
+
+        # Check each file in manifest against local files
+        repo[:available].each do |asset|
+          remote_path = asset[:file]
+          remote_digest = asset[:md5]
+
+          # Determine local path based on asset type
+          if remote_path.include?('/silhouettes/')
+            filename = File.basename(remote_path)
+            local_path = File.join(SILHOUETTE_DIR, filename)
+          elsif remote_path.include?('/configs/')
+            filename = File.basename(remote_path)
+            local_path = File.join(SILHOUETTE_CONFIG_DIR, filename)
+          else
+            next
+          end
+
+          # Skip if file doesn't exist locally (not installed)
+          next unless File.exist?(local_path)
+
+          # Compare digests
+          if needs_update?(local_path, remote_digest)
+            updates << { local: local_path, asset: asset, filename: filename, repo: repo }
+          end
+        end
+
+        if updates.empty?
+          respond "All installed assets are up to date!"
+          return
+        end
+
+        respond ""
+        respond "#{updates.size} update(s) available:"
+        updates.first(10).each { |u| respond "  - #{u[:filename]}" }
+        respond "  ... and #{updates.size - 10} more" if updates.size > 10
+        respond ""
+        respond "Download updates? (y/n)"
+
+        input = CreatureBar.get_user_input
+
+        if input =~ /^y/i
+          success = 0
+          updates.each do |update|
+            if download_asset(update[:repo], update[:asset], overwrite: true)
+              success += 1
+            end
+          end
+          respond ""
+          respond "Updated #{success}/#{updates.size} files."
+
+          # Clear caches so changes take effect
+          CreatureBar.clear_silhouette_config_cache if success > 0
+        else
+          respond "Update cancelled."
+        end
+      end
+
+      def needs_update?(local_path, remote_digest)
+        return true unless File.exist?(local_path)
+
+        require 'digest'
+
+        # Jinx manifests supply MD5 digests; compare both hex and base64 forms
+        local_hex = Digest::MD5.file(local_path).hexdigest
+        local_b64 = [[local_hex].pack('H*')].pack('m0')
+
+        return true if remote_digest.nil?
+        remote_digest != local_hex && remote_digest != local_b64
+      end
+
+      def clear_assets
+        respond ""
+        respond "This will back up and delete all CreatureBar silhouette assets and configs."
+        respond "You will be prompted to re-download them."
+        respond ""
+        respond "Are you sure? (y/n)"
+
+        input = CreatureBar.get_user_input
+
+        unless input =~ /^y/i
+          respond "Reset cancelled."
+          return false
+        end
+
+        # Create backup directory with timestamp
+        timestamp = Time.now.strftime('%Y%m%d_%H%M%S')
+        backup_dir = File.join(CONFIG_DIR, "backup_#{timestamp}")
+        FileUtils.mkdir_p(backup_dir)
+
+        # Backup and delete silhouettes
+        if Dir.exist?(SILHOUETTE_DIR)
+          silhouette_backup = File.join(backup_dir, 'silhouettes')
+          FileUtils.mkdir_p(silhouette_backup)
+
+          Dir.glob(File.join(SILHOUETTE_DIR, '*.png')).each do |f|
+            FileUtils.cp(f, silhouette_backup) rescue nil
+            File.delete(f) rescue nil
+          end
+          respond "Backed up and cleared silhouettes."
+        end
+
+        # Backup and delete configs
+        if Dir.exist?(SILHOUETTE_CONFIG_DIR)
+          config_backup = File.join(backup_dir, 'silhouette_configs')
+          FileUtils.mkdir_p(config_backup)
+
+          Dir.glob(File.join(SILHOUETTE_CONFIG_DIR, '*.yaml')).each do |f|
+            FileUtils.cp(f, config_backup) rescue nil
+            File.delete(f) rescue nil
+          end
+          respond "Backed up and cleared silhouette configs."
+        end
+
+        respond ""
+        respond "Backup saved to: #{backup_dir}"
+        respond ""
+        true
+      end
+    end
+  end
+
+  class << self
+    # -- Configuration & persistence ----------------------------------------------------------
+    def load_config
+      # Load global settings from YAML
+      global = load_global_config
+
+      # Load character-specific settings from DB_Store
+      scope = "#{XMLData.game}:#{XMLData.name}"
+      character = Lich::Common::DB_Store.read(scope, 'creaturebar')
+      character = DEFAULT_CHARACTER_CONFIG.dup.tap do |config|
+        config['position'] = DEFAULT_CHARACTER_CONFIG['position'].dup
+        config['window'] = DEFAULT_CHARACTER_CONFIG['window'].dup
+        config['multi_creature'] = DEFAULT_CHARACTER_CONFIG['multi_creature'].dup
+        config['layout'] = DEFAULT_CHARACTER_CONFIG['layout'].dup
+      end.merge(character || {})
+
+      # Merge global and character configs
+      @@config = global.dup
+      @@config.merge!(character) do |key, global_val, char_val|
+        if key == 'window'
+          # Merge window settings (global behavior + character size)
+          global_val.merge(char_val)
+        else
+          char_val
+        end
+      end
+
+      # Handle migration from old unified config.yaml format
+      if File.exist?(CONFIG_FILE)
+        begin
+          saved_config = YAML.load_file(CONFIG_FILE)
+          if saved_config.is_a?(Hash)
+            # If old config has character-specific settings, migrate them
+            if saved_config['position'] || (saved_config['window'] && (saved_config['window']['width'] || saved_config['window']['height']))
+              # Extract and migrate character settings
+              old_character = {}
+              old_character['position'] = saved_config['position'] if saved_config['position']
+              if saved_config['window']
+                old_character['window'] = {}
+                old_character['window']['width'] = saved_config['window']['width'] if saved_config['window']['width']
+                old_character['window']['height'] = saved_config['window']['height'] if saved_config['window']['height']
+              end
+              old_character['multi_creature'] = saved_config['multi_creature'] if saved_config['multi_creature']
+              old_character['layout'] = saved_config['layout'] if saved_config['layout']
+
+              # Save migrated character settings to DB_Store
+              Lich::Common::DB_Store.save(scope, 'creaturebar', old_character)
+
+              # Merge into current config
+              @@config['position'] = old_character['position'] if old_character['position']
+              @@config['window'].merge!(old_character['window']) if old_character['window']
+              @@config['multi_creature'] = old_character['multi_creature'] if old_character['multi_creature']
+              @@config['layout'] = old_character['layout'] if old_character['layout']
+
+              respond "[CreatureBar] Migrated character-specific settings to DB_Store"
+            end
+          end
+        rescue => e
+          respond "[CreatureBar] Error during config migration: #{e.message}"
+        end
+      end
+    end
+
+    # Extract global settings from merged config
+    def extract_global_settings(config)
+      global = {}
+      global['update_interval'] = config['update_interval'] if config.key?('update_interval')
+      global['silhouette_style'] = config['silhouette_style'] if config.key?('silhouette_style')
+
+      # Window behavior settings (not size/position)
+      if config['window']
+        global['window'] = {}
+        global['window']['decorated'] = config['window']['decorated'] if config['window'].key?('decorated')
+        global['window']['always_on_top'] = config['window']['always_on_top'] if config['window'].key?('always_on_top')
+        global['window']['transparent'] = config['window']['transparent'] if config['window'].key?('transparent')
+      end
+
+      global['colors'] = config['colors'].dup if config['colors']
+      global['status_effects'] = config['status_effects'].map(&:dup) if config['status_effects']
+      global['wound_markers'] = config['wound_markers'].dup if config['wound_markers']
+
+      global
+    end
+
+    # Extract character-specific settings from merged config
+    def extract_character_settings(config)
+      character = {}
+      character['position'] = config['position'].dup if config['position']
+      character['multi_creature'] = config['multi_creature'].dup if config['multi_creature']
+      character['layout'] = config['layout'].dup if config['layout']
+
+      # Window size (not behavior)
+      if config['window']
+        character['window'] = {}
+        character['window']['width'] = config['window']['width'] if config['window'].key?('width')
+        character['window']['height'] = config['window']['height'] if config['window'].key?('height')
+      end
+
+      character
+    end
+
+    # Load global config from YAML file
+    def load_global_config
+      if File.exist?(CONFIG_FILE)
+        saved = YAML.load_file(CONFIG_FILE)
+        DEFAULT_GLOBAL_CONFIG.dup.tap do |global|
+          global.merge!(saved) if saved.is_a?(Hash)
+          # Deep merge nested hashes
+          global['window'] = DEFAULT_GLOBAL_CONFIG['window'].merge(saved['window'] || {})
+          global['colors'] = DEFAULT_GLOBAL_CONFIG['colors'].merge(saved['colors'] || {})
+          global['wound_markers'] = DEFAULT_GLOBAL_CONFIG['wound_markers'].merge(saved['wound_markers'] || {})
+          global['status_effects'] = saved['status_effects'] || DEFAULT_GLOBAL_CONFIG['status_effects']
+        end
+      else
+        DEFAULT_GLOBAL_CONFIG.dup.tap do |global|
+          global['colors'] = DEFAULT_GLOBAL_CONFIG['colors'].dup
+          global['window'] = DEFAULT_GLOBAL_CONFIG['window'].dup
+          global['wound_markers'] = DEFAULT_GLOBAL_CONFIG['wound_markers'].dup
+          global['status_effects'] = DEFAULT_GLOBAL_CONFIG['status_effects'].map(&:dup)
+        end
+      end
+    end
+
+    def save_config
+      FileUtils.mkdir_p(CONFIG_DIR) unless Dir.exist?(CONFIG_DIR)
+
+      # Split settings into global and character-specific
+      global = extract_global_settings(@@config)
+      character = extract_character_settings(@@config)
+
+      # Clean up deprecated settings
+      global.delete('body_parts')
+      global.delete('silhouette')
+      global['wound_markers']&.delete('size')
+
+      # Save global settings to YAML
+      File.write(CONFIG_FILE, global.to_yaml)
+
+      # Save character-specific settings to DB_Store
+      scope = "#{XMLData.game}:#{XMLData.name}"
+      Lich::Common::DB_Store.save(scope, 'creaturebar', character)
+    rescue => e
+      respond "[CreatureBar] Error saving config: #{e.message}"
+    end
+
+    def save_config_debounced
+      @@save_timer.kill if @@save_timer
+      @@save_timer = Thread.new do
+        sleep 1
+        save_window_settings # Capture current position/size before saving
+        @@save_timer = nil
+      end
+    end
+
+    def save_window_settings
+      return unless @@window
+      return if @@window.destroyed?
+
+      x, y = @@window.position
+      @@config['position']['x'] = x
+      @@config['position']['y'] = y
+
+      w, h = @@window.size
+      layout_mode = @@config.dig('layout', 'mode') || 'vertical'
+
+      # Only save window dimensions in vertical mode
+      # In horizontal mode, width is calculated dynamically from panel widths
+      if layout_mode == 'vertical'
+        @@config['window']['width'] = w
+        @@config['window']['height'] = h
+      else
+        # Horizontal mode: only save height, calculate width dynamically
+        @@config['window']['height'] = h
+      end
+
+      @@config['window']['decorated'] = @@window.decorated?
+
+      save_config
+    end
+
+    # -- Appearance / CSS ---------------------------------------------------------------------
+    def apply_css
+      @@css_provider ||= Gtk::CssProvider.new
+      colors = @@config['colors']
+
+      # Use transparent background for the window when configured; keep panel backgrounds opaque
+      window_bg = @@config['window']['transparent'] ? 'rgba(0, 0, 0, 0)' : colors['window_background']
+      panel_bg = colors['window_background']
+
+      # CSS without scoping - will only be applied to our window via add_css_to_widget
+      css = <<~CSS
+        window {
+          background-color: #{window_bg};
+        }
+        #creature_name {
+          color: #{colors['name_font']};
+          padding: 5px;
+          background-color: #{colors['name_background']};
+        }
+        #hp_label {
+          color: #{colors['hp_text']};
+          font-size: 11px;
+          font-weight: bold;
+        }
+        #status_label {
+          font-weight: bold;
+          padding: 0px;
+          margin: 0px;
+        }
+        frame#creature_panel_frame {
+          border: 2px solid #{colors['other_target_border']};
+          border-radius: 3px;
+          background-color: #{panel_bg};
+        }
+        frame#creature_panel_frame.current_target {
+          border: 3px solid #{colors['current_target_border']};
+          border-radius: 3px;
+          background-color: #{panel_bg};
+        }
+      CSS
+
+      @@css_provider.load(data: css)
+    end
+
+    # Apply CSS provider to a widget and all its children (for window-scoped CSS)
+    def add_css_to_widget(widget)
+      widget.style_context.add_provider(@@css_provider, Gtk::StyleProvider::PRIORITY_APPLICATION)
+      return unless widget.respond_to?(:each)
+
+      widget.each { |child| add_css_to_widget(child) }
+    end
+
+    # -- Window lifecycle ---------------------------------------------------------------------
+    def create_window
+      @@window = Gtk::Window.new('CB')
+      @@window.name = 'creaturebar_window' # For scoped CSS
+
+      # Enable transparency if configured
+      if @@config['window']['transparent']
+        screen = @@window.screen
+        visual = screen.rgba_visual
+        @@window.set_visual(visual) if visual
+        @@window.set_app_paintable(true)
+        @@window.accept_focus = false
+        @@window.focus_on_map = false
+        # @@window.override_background_color(:normal, Gdk::RGBA.parse("rgba(0,0,0,0)"))
+      end
+
+      # Set window size - use a reasonable default, will resize when panels are added
+      @@window.set_default_size(@@config['window']['width'], @@config['window']['height'])
+
+      @@window.decorated = @@config['window']['decorated']
+      @@window.set_keep_above(@@config['window']['always_on_top'])
+
+      if @@config['position']['x'] && @@config['position']['y']
+        @@window.move(@@config['position']['x'], @@config['position']['y'])
+      end
+
+      setup_menu
+      setup_content
+      setup_signals
+
+      # Apply CSS only to our window (not screen-wide) to avoid affecting dialogs
+      add_css_to_widget(@@window)
+
+      @@window.show_all
+    end
+
+    def setup_menu
+      menu = Gtk::Menu.new
+
+      # Toggle title bar
+      border_item = Gtk::MenuItem.new(label: 'Toggle Title Bar')
+      border_item.signal_connect('activate') { toggle_decorations }
+      menu.append(border_item)
+
+      # Always on top
+      top_item = Gtk::CheckMenuItem.new(label: 'Always on Top')
+      top_item.active = @@config['window']['always_on_top']
+      top_item.signal_connect('toggled') do
+        @@config['window']['always_on_top'] = top_item.active?
+        @@window.set_keep_above(top_item.active?)
+        save_config
+      end
+      menu.append(top_item)
+
+      menu.append(Gtk::SeparatorMenuItem.new)
+
+      # Settings
+      settings_item = Gtk::MenuItem.new(label: 'Settings...')
+      settings_item.signal_connect('activate') { configure_appearance }
+      menu.append(settings_item)
+
+      # Reload config
+      reload_item = Gtk::MenuItem.new(label: 'Reload Configuration')
+      reload_item.signal_connect('activate') do
+        load_config
+        recreate_window
+        respond "[CreatureBar] Configuration reloaded"
+      end
+      menu.append(reload_item)
+
+      menu.show_all
+
+      # Right-click to show menu, Alt+left-click to move window
+      @@window.add_events(Gdk::EventMask::BUTTON_PRESS_MASK)
+      @@window.signal_connect('button-press-event') do |_, event|
+        if event.button == 1 && (event.state & Gdk::ModifierType::MOD1_MASK) != 0
+          # Alt+left-click: begin window drag
+          @@window.begin_move_drag(event.button, event.x_root.to_i, event.y_root.to_i, event.time)
+          true
+        elsif event.button == 3
+          menu.popup_at_pointer(event)
+          true
+        else
+          false
+        end
+      end
+    end
+
+    # -- Target/creature lookup ---------------------------------------------------------------
+    def get_current_targets
+      return [] unless defined?(GameObj) && GameObj.respond_to?(:targets)
+
+      GameObj.targets.select do |obj|
+        obj.id && obj.id.to_i > 0 && obj.noun && obj.name
+      end
+    rescue => e
+      respond "[CreatureBar] Error getting targets: #{e.message}"
+      []
+    end
+
+    def get_creature(creature_id)
+      Creature[creature_id] rescue nil
+    end
+
+    # Get the family for a creature (with fallback to 'default')
+    def get_creature_family(creature)
+      return 'default' unless creature
+
+      # Get current style preference
+      style = @@config['silhouette_style'] || 'greyscale'
+
+      # Priority order: noun → family → default
+      # 1. Check for noun-specific silhouette (e.g., valravn_shadow.png or valravn_color.png)
+      noun = creature.noun rescue nil
+      if noun && !noun.empty?
+        path, _ = find_silhouette_file(noun, style)
+        if path
+          respond "[CreatureBar] Creature '#{creature.name}' (ID: #{creature.id}) → noun silhouette: '#{noun}'" if $creature_bar_debug
+          return noun
+        end
+      end
+
+      # 2. Check for family silhouette (e.g., bird_shadow.png or bird_color.png)
+      family = creature.template&.family rescue nil
+      if family && !family.empty?
+        path, _ = find_silhouette_file(family, style)
+        if path
+          respond "[CreatureBar] Creature '#{creature.name}' (ID: #{creature.id}) → family silhouette: '#{family}'" if $creature_bar_debug
+          return family
+        end
+      end
+
+      # 3. Fallback to default
+      respond "[CreatureBar] Creature '#{creature.name}' (ID: #{creature.id}) → default silhouette" if $creature_bar_debug
+      'default'
+    end
+
+    # -- Silhouette config/pixbuf management --------------------------------------------------
+    # Find a config file by searching style-based directory structure
+    # New structure: configs/{style}/{region}/{family}.yaml
+    # Style can be 'color' or 'greyscale'
+    def find_config_file(family, style = nil)
+      return nil unless Dir.exist?(SILHOUETTE_CONFIG_DIR)
+
+      # If style specified, search in style-specific directory first
+      if style
+        other_style = style == 'color' ? 'greyscale' : 'color'
+
+        # First pass: look in preferred style directory (e.g., configs/color/atoll/)
+        style_dir = File.join(SILHOUETTE_CONFIG_DIR, style)
+        if Dir.exist?(style_dir)
+          region_dirs = Dir.entries(style_dir).select do |entry|
+            path = File.join(style_dir, entry)
+            File.directory?(path) && !entry.start_with?('.')
+          end
+
+          region_dirs.each do |region|
+            path = File.join(style_dir, region, "#{family}.yaml")
+            return path if File.exist?(path)
+          end
+        end
+
+        # Second pass: look in other style directory as fallback
+        other_style_dir = File.join(SILHOUETTE_CONFIG_DIR, other_style)
+        if Dir.exist?(other_style_dir)
+          region_dirs = Dir.entries(other_style_dir).select do |entry|
+            path = File.join(other_style_dir, entry)
+            File.directory?(path) && !entry.start_with?('.')
+          end
+
+          region_dirs.each do |region|
+            path = File.join(other_style_dir, region, "#{family}.yaml")
+            return path if File.exist?(path)
+          end
+        end
+      end
+
+      # Final pass: check for default.yaml at root (only for 'default' family)
+      if family == 'default'
+        path = File.join(SILHOUETTE_CONFIG_DIR, 'default.yaml')
+        return path if File.exist?(path)
+      end
+
+      nil
+    end
+
+    def load_silhouette_config(family, style = nil, force_reload = false)
+      # Use style-aware cache key
+      cache_key = style ? "#{family}_#{style}" : family
+
+      # Force reload clears cache (useful after calibration)
+      @@silhouette_configs.delete(cache_key) if force_reload
+
+      return @@silhouette_configs[cache_key] if @@silhouette_configs[cache_key]
+
+      # Search subfolders for config file, prioritizing style-specific folders
+      config_path = find_config_file(family, style)
+      respond "[CreatureBar] Looking for config: #{family}.yaml (style: #{style || 'any'}) in subfolders" if $creature_bar_debug
+
+      # Fall back to default if family config doesn't exist
+      unless config_path
+        respond "[CreatureBar] Config not found for family '#{family}', trying 'default'" if $creature_bar_debug
+        family = 'default'
+        config_path = find_config_file(family, style)
+        respond "[CreatureBar] Now looking for: default.yaml" if $creature_bar_debug
+      end
+
+      if config_path
+        begin
+          config = YAML.load_file(config_path)
+          @@silhouette_configs[cache_key] = config
+
+          # Debug: Show first few body part coords
+          if $creature_bar_debug
+            sample_parts = config['body_parts']&.first(3) || []
+            respond "[CreatureBar] Loaded config for family '#{family}' (cache_key: #{cache_key}):"
+            respond "  - Config file: #{config_path}"
+            respond "  - Scale: #{config['scale']}"
+            respond "  - Panel width: #{config['panel_width']}"
+            respond "  - Marker size: #{config['marker_size']}"
+            respond "  - Body parts: #{config['body_parts']&.keys&.size || 0}"
+            sample_parts.each { |part, coords| respond "    - #{part}: #{coords.inspect}" }
+          end
+
+          return config
+        rescue => e
+          respond "[CreatureBar] Error loading silhouette config for #{family}: #{e.message}"
+        end
+      end
+
+      # Ultimate fallback: use DEFAULT_CONFIG body_parts
+      respond "[CreatureBar] Using minimal fallback silhouette config for family '#{family}'" if $creature_bar_debug
+      {
+        'scale'        => 0.8,
+        'panel_width'  => 100,
+        'panel_height' => 220,
+        'marker_size'  => 12,
+        'body_parts'   => {}
+      }
+    end
+
+    # Clear cached configs (useful for reloading after calibration)
+    def clear_silhouette_config_cache
+      @@silhouette_configs.clear
+      @@silhouette_file_cache.clear
+      respond "[CreatureBar] Cleared silhouette config cache"
+    end
+
+    # Build cache of available silhouette files to avoid repeated File.exist? calls
+    # Scans silhouettes/{style}/{region}/*.png and builds a lookup table
+    def build_silhouette_file_cache
+      @@silhouette_file_cache.clear
+
+      %w[greyscale color].each do |style|
+        @@silhouette_file_cache[style] = {}
+        style_dir = File.join(SILHOUETTE_DIR, style)
+        next unless Dir.exist?(style_dir)
+
+        Dir.entries(style_dir).each do |region|
+          next if region.start_with?('.')
+          region_path = File.join(style_dir, region)
+          next unless File.directory?(region_path)
+
+          Dir.glob(File.join(region_path, '*.png')).each do |png_path|
+            family_name = File.basename(png_path, '.png')
+            @@silhouette_file_cache[style][family_name] = png_path
+          end
+        end
+      end
+
+      total = @@silhouette_file_cache.values.map(&:size).sum
+      respond "[CreatureBar] Cached #{total} silhouette files" if $creature_bar_debug
+    end
+
+    # Find a silhouette file using the cached file list
+    # New structure: silhouettes/{style}/{region}/{family}.png
+    # Returns [path, actual_style] or [nil, nil] if not found
+    def find_silhouette_file(family, preferred_style)
+      # Build cache on first access
+      build_silhouette_file_cache if @@silhouette_file_cache.empty?
+
+      other_style = preferred_style == 'color' ? 'greyscale' : 'color'
+
+      # Try preferred style first (fast hash lookup)
+      if @@silhouette_file_cache[preferred_style]&.key?(family)
+        return [@@silhouette_file_cache[preferred_style][family], preferred_style]
+      end
+
+      # Try other style as fallback
+      if @@silhouette_file_cache[other_style]&.key?(family)
+        return [@@silhouette_file_cache[other_style][family], other_style]
+      end
+
+      # Not found in cache
+      [nil, nil]
+    end
+
+    # Get or load pixbuf for a family (with LRU caching)
+    def get_pixbuf_for_family(family)
+      # Determine style FIRST (before loading config, since configs are style-specific)
+      style = @@config['silhouette_style'] || 'greyscale'
+
+      # Use style-aware cache key (different styles may have different scales/configs)
+      cache_key = "#{family}_#{style}"
+
+      # Check cache first
+      if @@pixbuf_cache[cache_key]
+        @@pixbuf_cache[cache_key][:accessed] = Time.now
+        return @@pixbuf_cache[cache_key][:pixbuf]
+      end
+
+      # Search subfolders for the silhouette
+      silhouette_path, actual_style = find_silhouette_file(family, style)
+
+      # Fall back to default if not found (default.png is at root level, not in style/region)
+      unless silhouette_path
+        family = 'default'
+        default_path = File.join(SILHOUETTE_DIR, 'default.png')
+        if File.exist?(default_path)
+          silhouette_path = default_path
+          actual_style = style # Use preferred style for config lookup
+        end
+      end
+
+      return nil unless silhouette_path
+
+      # Load config AFTER determining actual_style (configs are style-specific)
+      config = load_silhouette_config(family, actual_style)
+      scale = config['scale'] || 0.8
+
+      begin
+        # Load and scale pixbuf
+        pixbuf = GdkPixbuf::Pixbuf.new(file: silhouette_path)
+
+        if (scale - 1.0).abs > 0.001
+          new_width = (pixbuf.width * scale).to_i
+          new_height = (pixbuf.height * scale).to_i
+          pixbuf = pixbuf.scale_simple(new_width, new_height, GdkPixbuf::InterpType::BILINEAR)
+        end
+
+        # Apply silhouette tint only for greyscale style (not color)
+        if actual_style == 'greyscale'
+          silhouette_tint = @@config.dig('colors', 'silhouette_tint')
+          pixbuf = apply_tint(pixbuf, silhouette_tint) if silhouette_tint
+        end
+
+        # Evict LRU entry if cache is full
+        if @@pixbuf_cache.size >= @@max_cached_pixbufs
+          evict_lru_pixbuf
+        end
+
+        # Cache the pixbuf with style-aware key
+        @@pixbuf_cache[cache_key] = {
+          pixbuf: pixbuf,
+          accessed: Time.now
+        }
+
+        pixbuf
+      rescue => e
+        respond "[CreatureBar] Error loading pixbuf for #{family}: #{e.message}"
+        nil
+      end
+    end
+
+    # Evict the least recently used pixbuf from cache
+    def evict_lru_pixbuf
+      return if @@pixbuf_cache.empty?
+
+      # Find least recently accessed
+      lru_family = @@pixbuf_cache.min_by { |_family, data| data[:accessed] }&.first
+      @@pixbuf_cache.delete(lru_family) if lru_family
+      respond "[CreatureBar] Evicted pixbuf cache for family: #{lru_family}" if $creature_bar_debug
+    end
+
+    # -- Panel creation/pooling/layout --------------------------------------------------------
+    def create_creature_panel(creature_id)
+      creature = get_creature(creature_id)
+      return nil unless creature
+
+      respond "[CreatureBar] create_creature_panel: Creating panel for '#{creature.name}' (ID: #{creature_id})" if $creature_bar_debug
+
+      # Get family and determine style for config lookup
+      family = get_creature_family(creature)
+      style = @@config['silhouette_style'] || 'greyscale'
+
+      # Find the actual silhouette to determine which style's config to use
+      _silhouette_path, actual_style = find_silhouette_file(family, style)
+      actual_style ||= style # Fall back to preferred style if not found
+
+      # Load style-specific config (e.g., atoll_color vs atoll_shadow configs differ)
+      silhouette_config = load_silhouette_config(family, actual_style)
+
+      # Create panel container with border frame at EXACT dimensions
+      panel_frame = Gtk::Frame.new
+      panel_frame.set_shadow_type(:etched_in)
+
+      # Use family-specific panel dimensions - EXACT size
+      panel_width = silhouette_config['panel_width'] || 100
+      panel_height = silhouette_config['panel_height'] || 220
+      panel_frame.set_size_request(panel_width, panel_height)
+
+      # Force fixed size - prevent expansion beyond size_request
+      panel_frame.width_request = panel_width
+      panel_frame.height_request = panel_height
+
+      panel_box = Gtk::Box.new(:vertical, 0)
+      panel_box.set_margin_top(2)
+      panel_box.set_margin_bottom(1)
+      panel_box.set_margin_left(4)
+      panel_box.set_margin_right(4)
+
+      # Store widgets for this panel
+      panel_widgets = {}
+
+      # Merge display settings: silhouette config takes precedence, fall back to global config
+      panel_widgets[:config] = {
+        'panel_width'  => panel_width,
+        'panel_height' => panel_height,
+        'name_display' => silhouette_config['name_display'] || @@config['name_display'],
+        'hp_bar'       => silhouette_config['hp_bar'] || @@config['hp_bar'],
+        'status'       => silhouette_config['status'] || @@config['status']
+      }
+
+      # Name label with optional current target icon
+      if panel_widgets[:config]['name_display']['show']
+        # Use noun or full name based on mode
+        name_mode = panel_widgets[:config]['name_display']['mode'] || 'name'
+        display_name = if name_mode == 'noun'
+                         creature.noun || 'unknown'
+                       else
+                         creature.name || 'Unknown'
+                       end
+
+        name_label = Gtk::Label.new
+        name_label.name = 'creature_name'
+        name_label.halign = :center
+        name_label.set_max_width_chars(15)
+        name_label.set_ellipsize(Pango::EllipsizeMode::MIDDLE)
+
+        # Apply per-panel styling using markup (overrides global CSS)
+        name_config = panel_widgets[:config]['name_display']
+        font_size = (name_config['font_size'] || 8) * 1024 # Pango size units
+        font_weight = name_config['font_weight'] || 'normal'
+        color = @@config['colors']['name_font'] || '#FFFFFF'
+
+        markup = "<span size='#{font_size}' weight='#{font_weight}' color='#{color}'>#{display_name}</span>"
+        name_label.set_markup(markup)
+
+        panel_box.pack_start(name_label, expand: false, fill: false, padding: 0)
+        panel_widgets[:name_label] = name_label
+      end
+
+      # Silhouette with wounds (family-specific)
+      layout, silhouette_image, wound_overlays = create_silhouette_for_panel(family, silhouette_config)
+      silhouette_container = Gtk::Box.new(:horizontal, 0)
+      silhouette_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+      silhouette_container.pack_start(layout, expand: false, fill: false, padding: 0)
+      silhouette_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+      panel_box.pack_start(silhouette_container, expand: false, fill: false, padding: 0)
+
+      panel_widgets[:layout] = layout
+      panel_widgets[:silhouette_image] = silhouette_image
+      panel_widgets[:wound_overlays] = wound_overlays
+
+      # HP bar (only if enabled in config)
+      if panel_widgets[:config]['hp_bar']['show'] != false
+        hp_bar, hp_label = create_hp_bar_for_panel(panel_widgets[:config])
+        panel_widgets[:hp_bar] = hp_bar
+        panel_widgets[:hp_label] = hp_label
+        panel_widgets[:hp_fraction] = 0.0
+        panel_widgets[:hp_color] = @@config['colors']['hp_high']
+        panel_widgets[:hp_text] = ''
+
+        # Create HP container if bar exists
+        hp_container = nil
+        if hp_bar
+          hp_container = Gtk::Box.new(:horizontal, 0)
+          hp_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+          hp_container.pack_start(hp_bar, expand: false, fill: false, padding: 0)
+          hp_container.pack_start(Gtk::Box.new(:horizontal, 0), expand: true, fill: true, padding: 0)
+        end
+
+        # Pack HP elements based on text_position setting (only affects overlay mode)
+        text_position = panel_widgets[:config]['hp_bar']['text_position'] || 'top'
+        if text_position == 'bottom'
+          # Bar first, then text below
+          panel_box.pack_start(hp_container, expand: false, fill: false, padding: 0) if hp_container
+          panel_box.pack_start(hp_label, expand: false, fill: false, padding: 0) if hp_label
+        else
+          # Text first (top), then bar below (default)
+          panel_box.pack_start(hp_label, expand: false, fill: false, padding: 0) if hp_label
+          panel_box.pack_start(hp_container, expand: false, fill: false, padding: 0) if hp_container
+        end
+      end
+
+      # Status label
+      if panel_widgets[:config]['status']['show']
+        status_label = Gtk::Label.new('')
+        status_label.name = 'status_label'
+        status_label.halign = :center
+        panel_box.pack_start(status_label, expand: false, fill: false, padding: 0)
+        panel_widgets[:status_label] = status_label
+      end
+
+      panel_frame.add(panel_box)
+      panel_frame.name = 'creature_panel_frame'
+      panel_frame.hexpand = false
+      panel_frame.vexpand = false
+
+      # Transparent event box to capture clicks across the full panel area
+      panel_container = Gtk::EventBox.new
+      panel_container.name = 'creature_panel' # For CSS styling/border
+      panel_container.visible_window = true   # ensure it receives events across the whole area
+      panel_container.above_child = true      # draw above child so border/clicks aren't blocked
+      panel_container.set_size_request(panel_width, panel_height)
+      panel_container.add_events(Gdk::EventMask::BUTTON_PRESS_MASK)
+      panel_container.add(panel_frame)
+      panel_container.hexpand = false
+      panel_container.vexpand = false
+
+      panel_widgets[:container] = panel_container
+      panel_widgets[:frame] = panel_frame
+      panel_widgets[:creature_id] = creature_id
+      panel_widgets[:family] = family # Track family for pooling
+
+      # Click to target this creature
+      panel_container.signal_connect('button-press-event') do |_, event|
+        if event.button == 1 # left click
+          target_creature(panel_widgets[:creature_id])
+          true
+        else
+          false
+        end
+      end
+
+      panel_widgets
+    end
+
+    def create_silhouette_for_panel(family, silhouette_config)
+      layout = Gtk::Layout.new
+      wound_overlays = {}
+
+      # Get pixbuf from LRU cache
+      pixbuf = get_pixbuf_for_family(family)
+
+      if pixbuf
+        begin
+          # Set layout to pixbuf size (compact, matching calibrator)
+          layout.set_size_request(pixbuf.width, pixbuf.height)
+
+          # Layer 0: Place silhouette at origin
+          silhouette_image = Gtk::Image.new(pixbuf: pixbuf)
+          layout.put(silhouette_image, 0, 0)
+
+          # Layer 1: Add markers overlay (eyes_back_nerves.png) if it exists
+          markers_file = File.join(SILHOUETTE_DIR, 'eyes_back_nerves.png')
+          if File.exist?(markers_file)
+            begin
+              markers_pixbuf = GdkPixbuf::Pixbuf.new(file: markers_file)
+
+              # Scale markers to match silhouette if needed
+              scale = silhouette_config['scale'] || 1.0
+              if (scale - 1.0).abs > 0.001
+                new_width = (markers_pixbuf.width * scale).to_i
+                new_height = (markers_pixbuf.height * scale).to_i
+                markers_pixbuf = markers_pixbuf.scale_simple(new_width, new_height, GdkPixbuf::InterpType::BILINEAR)
+              end
+
+              # Apply markers tint
+              markers_tint = @@config.dig('colors', 'markers_tint')
+              markers_pixbuf = apply_tint(markers_pixbuf, markers_tint) if markers_tint
+
+              markers_image = Gtk::Image.new(pixbuf: markers_pixbuf)
+              layout.put(markers_image, 0, 0)
+            rescue => e
+              respond "[CreatureBar] Error loading markers overlay: #{e.message}" if $creature_bar_debug
+            end
+          end
+
+          # Layer 2: Create wound overlays using family-specific body parts
+          body_parts = silhouette_config['body_parts'] || {}
+          marker_size = silhouette_config['marker_size'] # Get family-specific marker size
+          scale = silhouette_config['scale'] || 1.0 # Get scale for coordinate adjustment
+
+          respond "[CreatureBar] Creating wound overlays for family '#{family}': #{body_parts.keys.size} body parts, marker_size=#{marker_size}, scale=#{scale}" if $creature_bar_debug
+
+          body_parts.each do |part, coords|
+            (1..3).each do |level|
+              key = "#{part}_w#{level}"
+              overlay = create_wound_marker(level, marker_size)
+              overlay.hide
+              # Scale coordinates from normalized (1.0) to current scale
+              scaled_x = (coords[0] * scale).round
+              scaled_y = (coords[1] * scale).round
+              layout.put(overlay, scaled_x, scaled_y)
+              wound_overlays[key] = overlay
+            end
+          end
+
+          return [layout, silhouette_image, wound_overlays]
+        rescue => e
+          respond "[CreatureBar] Error creating silhouette layout for #{family}: #{e.message}"
+        end
+      end
+
+      # Fallback if pixbuf loading failed
+      fallback_width = silhouette_config['panel_width'] || 100
+      fallback_height = silhouette_config['panel_height'] || 150
+      layout.set_size_request(fallback_width, fallback_height)
+      silhouette_image = Gtk::Label.new("No\nImage\n(#{family})")
+      layout.put(silhouette_image, fallback_width / 4, fallback_height / 3)
+      [layout, silhouette_image, wound_overlays]
+    end
+
+    def create_hp_bar_for_panel(panel_config = nil)
+      # Use panel-specific config if provided, otherwise fall back to global config
+      config = panel_config || @@config
+
+      text_style = config['hp_bar']['text_style'] || 'overlay'
+      show_bar_graphic = config['hp_bar']['show_bar'] != false
+
+      # HP bar graphic (only if show_bar is true)
+      hp_bar = nil
+      if show_bar_graphic
+        hp_bar_width = config['hp_bar']['width'] || 100
+        # Use configured height for both modes (different defaults)
+        default_height = text_style == 'embedded' ? 25 : 8
+        hp_bar_height = config['hp_bar']['height'] || default_height
+
+        hp_bar = Gtk::DrawingArea.new
+        hp_bar.set_size_request(hp_bar_width, hp_bar_height)
+      end
+
+      # HP label for overlay mode (or text-only when bar is hidden)
+      hp_label = nil
+      if text_style == 'overlay' && config['hp_bar']['show_text']
+        hp_label = Gtk::Label.new('')
+        hp_label.name = 'hp_label'
+        hp_label.halign = :center
+      end
+
+      # Note: Draw callback will be set up when panel is added to @@creature_panels
+      [hp_bar, hp_label]
+    end
+
+    # -- Window content & signals -------------------------------------------------------------
+    def setup_content
+      # Use Gtk::Grid for flexible wrapping layout
+      # Grid supports both horizontal and vertical layouts with wrapping
+      @@panels_container = Gtk::Grid.new
+      @@panels_container.row_spacing = 2
+      @@panels_container.column_spacing = 2
+      @@panels_container.row_homogeneous = false
+      @@panels_container.column_homogeneous = false
+      @@panels_container.hexpand = false
+      @@panels_container.halign = :start
+
+      # Main container with zero margins
+      @@main_box = Gtk::Box.new(:vertical, 0)
+      @@main_box.set_margin_top(0)
+      @@main_box.set_margin_bottom(0)
+      @@main_box.set_margin_left(0)
+      @@main_box.set_margin_right(0)
+      @@main_box.pack_start(@@panels_container, expand: false, fill: false, padding: 0)
+      @@window.add(@@main_box)
+    end
+
+    def create_wound_marker(level, marker_size = nil)
+      # Load wound image from Rank PNG files (at root of silhouettes dir)
+      # Falls back to rank1.png if specific rank not found
+      rank_file = File.join(SILHOUETTE_DIR, "rank#{level}.png")
+
+      # If requested rank doesn't exist, fall back to rank1
+      unless File.exist?(rank_file)
+        rank_file = File.join(SILHOUETTE_DIR, "rank1.png")
+      end
+
+      if File.exist?(rank_file)
+        begin
+          pixbuf = GdkPixbuf::Pixbuf.new(file: rank_file)
+
+          # Use provided marker_size (per-family) or fall back to global config
+          size = marker_size || @@config.dig('wound_markers', 'size') || 12
+          pixbuf = pixbuf.scale_simple(size, size, GdkPixbuf::InterpType::BILINEAR)
+
+          # Apply tint color for this wound level (use actual level, not fallback file)
+          tint_color = @@config.dig('colors', "wound_rank#{level}_tint")
+
+          # Debug logging for tint investigation
+          if $creature_bar_debug
+            respond "[CreatureBar] Rank #{level} tinting:"
+            respond "  - Rank file: #{rank_file}"
+            respond "  - Tint color: #{tint_color || 'none'}"
+            respond "  - Pixbuf size: #{pixbuf.width}x#{pixbuf.height}"
+          end
+
+          pixbuf = apply_tint(pixbuf, tint_color) if tint_color
+
+          Gtk::Image.new(pixbuf: pixbuf)
+        rescue => e
+          respond "[CreatureBar] Error loading wound image #{rank_file}: #{e.message}"
+          # Fallback: text label
+          Gtk::Label.new("R#{level}")
+        end
+      else
+        respond "[CreatureBar] No rank images found (not even rank1.png)"
+        # Fallback: text label
+        Gtk::Label.new("R#{level}")
+      end
+    end
+
+    def setup_signals
+      @@window.signal_connect('delete-event') do
+        # Queue the cleanup and script termination
+        Thread.new do
+          stop
+          sleep 0.1 # Give GTK time to clean up
+          script_name = Script.current.name rescue 'creaturebar'
+          Script.kill(script_name) if Script.running?(script_name)
+        end
+        true # Prevent GTK from auto-destroying; let stop() handle cleanup
+      end
+
+      @@window.signal_connect('configure-event') do
+        save_config_debounced
+        false
+      end
+    end
+
+    def toggle_decorations
+      save_window_settings
+      @@config['window']['decorated'] = !@@window.decorated?
+      save_config
+      recreate_window
+    end
+
+    def recreate_window
+      stop_update_timer
+      Gtk.queue do
+        # Clear panel references before destroying window
+        # (widgets will be destroyed with window, but we need to clear the hash)
+        @@creature_panels.clear
+        @@panel_pool.clear
+
+        @@window.destroy if @@window
+        apply_css
+        create_window
+        start_update_timer
+      end
+    end
+
+    # -- Settings dialog ----------------------------------------------------------------------
+    def configure_appearance
+      # Close any existing dialog first
+      if @@active_dialog
+        @@active_dialog.destroy rescue nil
+        @@active_dialog = nil
+      end
+
+      dialog = Gtk::Dialog.new(
+        title: 'CreatureBar Settings',
+        flags: [:modal]
+      )
+      @@active_dialog = dialog
+
+      dialog.add_button('Cancel', :cancel)
+      dialog.add_button('Apply', :apply)
+      dialog.add_button('OK', :ok)
+
+      content = dialog.content_area
+      content.spacing = 10
+
+      notebook = Gtk::Notebook.new
+
+      # Track values that require a full recreate when changed
+      @@config.dig('window', 'transparent')
+      @@config.dig('window', 'decorated')
+
+      # Store all widgets for later retrieval
+      widgets = {}
+
+      # Tab 1: Layout & Display
+      layout_tab = create_layout_tab(widgets)
+      notebook.append_page(layout_tab, Gtk::Label.new('Layout'))
+
+      # Tab 2: HP Bar Colors
+      hp_box = create_color_tab([
+                                  ['HP High', 'hp_high'],
+                                  ['HP Mid', 'hp_mid'],
+                                  ['HP Low', 'hp_low'],
+                                  ['HP Background', 'hp_background'],
+                                  ['HP Text', 'hp_text']
+                                ])
+      notebook.append_page(hp_box, Gtk::Label.new('HP Colors'))
+
+      # Tab 3: Status Colors (configurable)
+      status_box = create_status_effects_tab(widgets)
+      notebook.append_page(status_box, Gtk::Label.new('Status Colors'))
+
+      # Tab 4: Window & Border Colors
+      window_box = create_color_tab([
+                                      ['Current Target Border', 'current_target_border'],
+                                      ['Other Target Border', 'other_target_border'],
+                                      ['Name Font', 'name_font']
+                                    ])
+      notebook.append_page(window_box, Gtk::Label.new('Window Colors'))
+
+      # Tab 5: Tint Colors (for grayscale images)
+      tint_box = create_color_tab([
+                                    ['Silhouette Tint', 'silhouette_tint'],
+                                    ['Markers Tint', 'markers_tint'],
+                                    ['Wound Rank 1 Tint', 'wound_rank1_tint'],
+                                    ['Wound Rank 2 Tint', 'wound_rank2_tint'],
+                                    ['Wound Rank 3 Tint', 'wound_rank3_tint']
+                                  ])
+      notebook.append_page(tint_box, Gtk::Label.new('Tint Colors'))
+
+      # Tab 6: Behavior
+      behavior_tab = create_behavior_tab(widgets)
+      notebook.append_page(behavior_tab, Gtk::Label.new('Behavior'))
+
+      content.pack_start(notebook, expand: true, fill: true, padding: 0)
+      dialog.set_size_request(500, 500)
+      dialog.show_all
+
+      # Store color entries for later
+      color_entries = {}
+      [hp_box, status_box, window_box, tint_box].each do |box|
+        box.children.each do |row|
+          next unless row.is_a?(Gtk::Box)
+          entry = row.children.find { |c| c.is_a?(Gtk::Entry) }
+          next unless entry && entry.name
+          color_entries[entry.name] = entry
+        end
+      end
+
+      # Track values that require a full recreate when changed
+      original_transparent = @@config.dig('window', 'transparent')
+      original_decorated = @@config.dig('window', 'decorated')
+      pending_recreate = false
+
+      loop do
+        response = dialog.run
+
+        case response
+        when Gtk::ResponseType::APPLY, Gtk::ResponseType::OK
+          # Validate colors before applying
+          invalid_colors = color_entries.select { |_, entry| !valid_color?(entry.text) }
+          if invalid_colors.any?
+            bad_keys = invalid_colors.map { |key, _| key }
+            show_message_dialog("Invalid color value(s): #{bad_keys.join(', ')}. Use #RRGGBB or rgba(r, g, b, a).")
+            next
+          end
+
+          # Track original tint values to detect changes
+          original_tints = {
+            'silhouette_tint'  => @@config.dig('colors', 'silhouette_tint'),
+            'markers_tint'     => @@config.dig('colors', 'markers_tint'),
+            'wound_rank1_tint' => @@config.dig('colors', 'wound_rank1_tint'),
+            'wound_rank2_tint' => @@config.dig('colors', 'wound_rank2_tint'),
+            'wound_rank3_tint' => @@config.dig('colors', 'wound_rank3_tint')
+          }
+
+          # Apply color changes
+          color_entries.each do |key, entry|
+            @@config['colors'][key] = entry.text.to_s.strip
+          end
+
+          # Check if any tint colors changed
+          tints_changed = original_tints.any? do |key, original|
+            @@config.dig('colors', key) != original
+          end
+
+          # Clear pixbuf cache if tint colors changed (forces regeneration with new tints)
+          if tints_changed
+            @@pixbuf_cache.clear
+            @@panel_pool.clear # Also clear panel pool since they have old tinted images
+          end
+
+          # Apply layout settings
+          @@config['layout']['mode'] = widgets[:layout_mode].active_text.downcase
+          @@config['layout']['max_columns'] = widgets[:max_columns].text.to_i
+          @@config['layout']['max_rows'] = widgets[:max_rows].text.to_i
+          @@config['multi_creature']['max_shown'] = widgets[:max_shown].text.to_i
+
+          # Apply behavior settings
+          old_interval = @@config['update_interval']
+          @@config['update_interval'] = widgets[:update_interval].text.to_i
+          @@config['window']['always_on_top'] = widgets[:always_on_top].active?
+          @@config['window']['decorated'] = widgets[:decorated].active?
+          @@config['window']['transparent'] = widgets[:transparent].active?
+          @@config['wound_markers']['opacity'] = widgets[:wound_opacity].text.to_f.clamp(0.0, 1.0)
+
+          # Apply silhouette style
+          old_style = @@config['silhouette_style']
+          new_style = widgets[:silhouette_style].active == 0 ? 'greyscale' : 'color'
+          @@config['silhouette_style'] = new_style
+
+          # Clear caches if style changed
+          if old_style != new_style
+            @@pixbuf_cache.clear
+            @@panel_pool.clear
+            @@silhouette_configs.clear
+          end
+
+          save_config
+
+          # Check what changed
+          transparency_changed = original_transparent != @@config['window']['transparent']
+          decorations_changed = original_decorated != @@config['window']['decorated']
+          interval_changed = old_interval != @@config['update_interval']
+
+          # Track if recreate will be needed (for transparency/decorations)
+          pending_recreate ||= (transparency_changed || decorations_changed)
+
+          # Apply CSS for color changes (safe to do without recreate)
+          apply_css
+
+          # Restart update timer if interval changed
+          if interval_changed
+            stop_update_timer
+            start_update_timer
+          end
+
+          # Apply always_on_top immediately (doesn't require recreate)
+          @@window.set_keep_above(@@config['window']['always_on_top']) if @@window && !@@window.destroyed?
+
+          respond "[CreatureBar] Settings updated"
+          respond "[CreatureBar] Note: Transparency/title bar changes will apply when dialog closes." if pending_recreate && response == Gtk::ResponseType::APPLY
+
+          # Update originals for subsequent Apply runs
+          original_transparent = @@config['window']['transparent']
+          original_decorated = @@config['window']['decorated']
+
+          # Only break on OK (Apply keeps dialog open)
+          break if response == Gtk::ResponseType::OK
+        when Gtk::ResponseType::CANCEL, Gtk::ResponseType::DELETE_EVENT
+          break
+        end
+      end
+
+      dialog.destroy rescue nil
+      @@active_dialog = nil
+
+      # Apply any pending recreate after dialog has closed to avoid destroyed-object errors
+      recreate_window if pending_recreate
+    end
+
+    def create_layout_tab(widgets)
+      box = Gtk::Box.new(:vertical, 10)
+      box.set_margin_left(15)
+      box.set_margin_right(15)
+      box.set_margin_top(15)
+      box.set_margin_bottom(15)
+
+      # Layout Mode
+      mode_row = Gtk::Box.new(:horizontal, 10)
+      mode_label = Gtk::Label.new('Layout Mode:')
+      mode_label.set_size_request(150, -1)
+      mode_label.halign = :start
+      mode_row.pack_start(mode_label, expand: false, fill: false, padding: 0)
+
+      widgets[:layout_mode] = Gtk::ComboBoxText.new
+      widgets[:layout_mode].append_text('Horizontal')
+      widgets[:layout_mode].append_text('Vertical')
+      current_mode = @@config.dig('layout', 'mode') || 'horizontal'
+      widgets[:layout_mode].active = current_mode == 'horizontal' ? 0 : 1
+      mode_row.pack_start(widgets[:layout_mode], expand: true, fill: true, padding: 0)
+      box.pack_start(mode_row, expand: false, fill: false, padding: 5)
+
+      # Max Columns
+      cols_row = Gtk::Box.new(:horizontal, 10)
+      cols_label = Gtk::Label.new('Max Columns:')
+      cols_label.set_size_request(150, -1)
+      cols_label.halign = :start
+      cols_label.set_tooltip_text('Maximum panels per row (horizontal mode)')
+      cols_row.pack_start(cols_label, expand: false, fill: false, padding: 0)
+
+      widgets[:max_columns] = Gtk::Entry.new
+      widgets[:max_columns].text = (@@config.dig('layout', 'max_columns') || 5).to_s
+      widgets[:max_columns].width_chars = 5
+      cols_row.pack_start(widgets[:max_columns], expand: true, fill: true, padding: 0)
+      box.pack_start(cols_row, expand: false, fill: false, padding: 5)
+
+      # Max Rows
+      rows_row = Gtk::Box.new(:horizontal, 10)
+      rows_label = Gtk::Label.new('Max Rows:')
+      rows_label.set_size_request(150, -1)
+      rows_label.halign = :start
+      rows_label.set_tooltip_text('Maximum panels per column (vertical mode)')
+      rows_row.pack_start(rows_label, expand: false, fill: false, padding: 0)
+
+      widgets[:max_rows] = Gtk::Entry.new
+      widgets[:max_rows].text = (@@config.dig('layout', 'max_rows') || 5).to_s
+      widgets[:max_rows].width_chars = 5
+      rows_row.pack_start(widgets[:max_rows], expand: true, fill: true, padding: 0)
+      box.pack_start(rows_row, expand: false, fill: false, padding: 5)
+
+      # Max Shown
+      shown_row = Gtk::Box.new(:horizontal, 10)
+      shown_label = Gtk::Label.new('Max Creatures Shown:')
+      shown_label.set_size_request(150, -1)
+      shown_label.halign = :start
+      shown_row.pack_start(shown_label, expand: false, fill: false, padding: 0)
+
+      widgets[:max_shown] = Gtk::Entry.new
+      widgets[:max_shown].text = (@@config.dig('multi_creature', 'max_shown') || 5).to_s
+      widgets[:max_shown].width_chars = 5
+      shown_row.pack_start(widgets[:max_shown], expand: true, fill: true, padding: 0)
+      box.pack_start(shown_row, expand: false, fill: false, padding: 5)
+
+      box
+    end
+
+    def create_behavior_tab(widgets)
+      box = Gtk::Box.new(:vertical, 10)
+      box.set_margin_left(15)
+      box.set_margin_right(15)
+      box.set_margin_top(15)
+      box.set_margin_bottom(15)
+
+      # Update Interval
+      interval_row = Gtk::Box.new(:horizontal, 10)
+      interval_label = Gtk::Label.new('Update Interval (ms):')
+      interval_label.set_size_request(180, -1)
+      interval_label.halign = :start
+      interval_row.pack_start(interval_label, expand: false, fill: false, padding: 0)
+
+      widgets[:update_interval] = Gtk::Entry.new
+      widgets[:update_interval].text = (@@config['update_interval'] || 250).to_s
+      widgets[:update_interval].width_chars = 6
+      interval_row.pack_start(widgets[:update_interval], expand: true, fill: true, padding: 0)
+      box.pack_start(interval_row, expand: false, fill: false, padding: 5)
+
+      # Always On Top
+      widgets[:always_on_top] = Gtk::CheckButton.new('Always on top')
+      always_on_top = @@config.dig('window', 'always_on_top')
+      widgets[:always_on_top].active = always_on_top.nil? ? true : always_on_top
+      box.pack_start(widgets[:always_on_top], expand: false, fill: false, padding: 5)
+
+      # Decorated
+      widgets[:decorated] = Gtk::CheckButton.new('Show window title bar')
+      decorated = @@config.dig('window', 'decorated')
+      widgets[:decorated].active = decorated.nil? ? true : decorated
+      box.pack_start(widgets[:decorated], expand: false, fill: false, padding: 5)
+
+      # Transparent
+      widgets[:transparent] = Gtk::CheckButton.new('Enable window transparency')
+      widgets[:transparent].active = @@config.dig('window', 'transparent') || false
+      box.pack_start(widgets[:transparent], expand: false, fill: false, padding: 5)
+
+      # Wound Marker Opacity
+      opacity_row = Gtk::Box.new(:horizontal, 10)
+      opacity_label = Gtk::Label.new('Wound Marker Opacity:')
+      opacity_label.set_size_request(180, -1)
+      opacity_label.halign = :start
+      opacity_row.pack_start(opacity_label, expand: false, fill: false, padding: 0)
+
+      widgets[:wound_opacity] = Gtk::Entry.new
+      widgets[:wound_opacity].text = (@@config.dig('wound_markers', 'opacity') || 0.9).to_s
+      widgets[:wound_opacity].width_chars = 6
+      opacity_row.pack_start(widgets[:wound_opacity], expand: true, fill: true, padding: 0)
+      box.pack_start(opacity_row, expand: false, fill: false, padding: 5)
+
+      # Silhouette Style
+      style_row = Gtk::Box.new(:horizontal, 10)
+      style_label = Gtk::Label.new('Silhouette Style:')
+      style_label.set_size_request(180, -1)
+      style_label.halign = :start
+      style_row.pack_start(style_label, expand: false, fill: false, padding: 0)
+
+      widgets[:silhouette_style] = Gtk::ComboBoxText.new
+      widgets[:silhouette_style].append_text('Greyscale (tintable)')
+      widgets[:silhouette_style].append_text('Color (full artwork)')
+      current_style = @@config['silhouette_style'] || 'greyscale'
+      widgets[:silhouette_style].active = current_style == 'greyscale' ? 0 : 1
+      style_row.pack_start(widgets[:silhouette_style], expand: true, fill: true, padding: 0)
+      box.pack_start(style_row, expand: false, fill: false, padding: 5)
+
+      box
+    end
+
+    def create_color_tab(color_configs)
+      box = Gtk::Box.new(:vertical, 5)
+      box.set_margin_left(10)
+      box.set_margin_right(10)
+      box.set_margin_top(10)
+      box.set_margin_bottom(10)
+
+      color_configs.each do |label_text, config_key|
+        row = Gtk::Box.new(:horizontal, 5)
+
+        label = Gtk::Label.new("#{label_text}:")
+        label.set_size_request(150, -1)
+        label.halign = :start
+        row.pack_start(label, expand: false, fill: false, padding: 0)
+
+        # Color preview box
+        color_preview = Gtk::DrawingArea.new
+        color_preview.set_size_request(30, 20)
+        current_color = @@config['colors'][config_key] || '#FFFFFF'
+        color_preview.signal_connect('draw') do |widget, cr|
+          # Parse color and draw rectangle
+          color = @@config['colors'][config_key] || '#FFFFFF'
+          if color =~ /^#([0-9A-Fa-f]{6})$/
+            r = $1[0..1].to_i(16) / 255.0
+            g = $1[2..3].to_i(16) / 255.0
+            b = $1[4..5].to_i(16) / 255.0
+            cr.set_source_rgb(r, g, b)
+          elsif color =~ /^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*[\d.]+)?\)$/
+            r = $1.to_i / 255.0
+            g = $2.to_i / 255.0
+            b = $3.to_i / 255.0
+            cr.set_source_rgb(r, g, b)
+          else
+            cr.set_source_rgb(1.0, 1.0, 1.0)
+          end
+          cr.rectangle(0, 0, widget.allocated_width, widget.allocated_height)
+          cr.fill
+        end
+        row.pack_start(color_preview, expand: false, fill: false, padding: 5)
+
+        entry = Gtk::Entry.new
+        entry.text = current_color
+        entry.name = config_key
+
+        # Update preview when entry changes
+        entry.signal_connect('changed') do
+          color_preview.queue_draw
+        end
+
+        row.pack_start(entry, expand: true, fill: true, padding: 0)
+
+        box.pack_start(row, expand: false, fill: false, padding: 2)
+      end
+
+      box
+    end
+
+    def create_status_effects_tab(widgets)
+      box = Gtk::Box.new(:vertical, 5)
+      box.set_margin_left(10)
+      box.set_margin_right(10)
+      box.set_margin_top(10)
+      box.set_margin_bottom(10)
+
+      # Instructions label
+      instructions = Gtk::Label.new('Configure status effects shown on creature panels:')
+      instructions.halign = :start
+      box.pack_start(instructions, expand: false, fill: false, padding: 5)
+
+      # Scrolled window for status list
+      scrolled = Gtk::ScrolledWindow.new
+      scrolled.set_policy(:automatic, :automatic)
+      scrolled.set_size_request(-1, 300)
+
+      # ListBox to show status effects
+      list_box = Gtk::ListBox.new
+      list_box.selection_mode = :single
+      scrolled.add(list_box)
+
+      # Store reference to list_box in widgets for later access
+      widgets[:status_list_box] = list_box
+
+      # Populate list with current status effects
+      @@config['status_effects'].each_with_index do |status_effect, index|
+        row = create_status_effect_row(status_effect, index)
+        list_box.add(row)
+      end
+
+      box.pack_start(scrolled, expand: true, fill: true, padding: 5)
+
+      # Button row for Add/Edit/Delete
+      button_row = Gtk::Box.new(:horizontal, 5)
+      button_row.halign = :center
+
+      add_button = Gtk::Button.new(label: 'Add Status')
+      add_button.signal_connect('clicked') do
+        add_status_effect_dialog(list_box)
+      end
+      button_row.pack_start(add_button, expand: false, fill: false, padding: 5)
+
+      edit_button = Gtk::Button.new(label: 'Edit Status')
+      edit_button.signal_connect('clicked') do
+        selected_row = list_box.selected_row
+        if selected_row
+          index = selected_row.index
+          edit_status_effect_dialog(list_box, index)
+        else
+          show_message_dialog('Please select a status effect to edit.')
+        end
+      end
+      button_row.pack_start(edit_button, expand: false, fill: false, padding: 5)
+
+      delete_button = Gtk::Button.new(label: 'Delete Status')
+      delete_button.signal_connect('clicked') do
+        selected_row = list_box.selected_row
+        if selected_row
+          index = selected_row.index
+          @@config['status_effects'].delete_at(index)
+          list_box.remove(selected_row)
+        else
+          show_message_dialog('Please select a status effect to delete.')
+        end
+      end
+      button_row.pack_start(delete_button, expand: false, fill: false, padding: 5)
+
+      box.pack_start(button_row, expand: false, fill: false, padding: 5)
+
+      box
+    end
+
+    def create_status_effect_row(status_effect, _index)
+      row = Gtk::ListBoxRow.new
+      row_box = Gtk::Box.new(:horizontal, 10)
+      row_box.set_margin_left(10)
+      row_box.set_margin_right(10)
+      row_box.set_margin_top(5)
+      row_box.set_margin_bottom(5)
+
+      # Name
+      name_label = Gtk::Label.new(status_effect['name'].capitalize)
+      name_label.set_size_request(120, -1)
+      name_label.halign = :start
+      row_box.pack_start(name_label, expand: false, fill: false, padding: 0)
+
+      # Symbol
+      symbol_label = Gtk::Label.new("Symbol: #{status_effect['symbol']}")
+      symbol_label.set_size_request(80, -1)
+      symbol_label.halign = :start
+      row_box.pack_start(symbol_label, expand: false, fill: false, padding: 0)
+
+      # Color preview
+      color_box = Gtk::Box.new(:horizontal, 5)
+      color_preview = Gtk::DrawingArea.new
+      color_preview.set_size_request(30, 20)
+      color_preview.signal_connect('draw') do |widget, cr|
+        # Parse color and draw rectangle
+        color = status_effect['color']
+        if color =~ /^#([0-9A-Fa-f]{6})$/
+          r = $1[0..1].to_i(16) / 255.0
+          g = $1[2..3].to_i(16) / 255.0
+          b = $1[4..5].to_i(16) / 255.0
+          cr.set_source_rgb(r, g, b)
+        else
+          cr.set_source_rgb(1.0, 1.0, 1.0)
+        end
+        cr.rectangle(0, 0, widget.allocated_width, widget.allocated_height)
+        cr.fill
+      end
+      color_box.pack_start(color_preview, expand: false, fill: false, padding: 0)
+
+      color_text = Gtk::Label.new(status_effect['color'])
+      color_text.halign = :start
+      color_box.pack_start(color_text, expand: false, fill: false, padding: 5)
+
+      row_box.pack_start(color_box, expand: true, fill: true, padding: 0)
+
+      row.add(row_box)
+      row.show_all
+      row
+    end
+
+    def add_status_effect_dialog(list_box)
+      dialog = Gtk::Dialog.new(
+        title: 'Add Status Effect',
+        flags: :modal,
+        buttons: [
+          ['Cancel', :cancel],
+          ['Add', :ok]
+        ]
+      )
+      dialog.set_default_size(400, 200)
+
+      content = dialog.child
+      content.set_margin_left(10)
+      content.set_margin_right(10)
+      content.set_margin_top(10)
+      content.set_margin_bottom(10)
+
+      # Name field
+      name_row = Gtk::Box.new(:horizontal, 10)
+      name_label = Gtk::Label.new('Name:')
+      name_label.set_size_request(80, -1)
+      name_label.halign = :start
+      name_row.pack_start(name_label, expand: false, fill: false, padding: 0)
+
+      name_entry = Gtk::Entry.new
+      name_row.pack_start(name_entry, expand: true, fill: true, padding: 0)
+      content.pack_start(name_row, expand: false, fill: false, padding: 5)
+
+      # Symbol field
+      symbol_row = Gtk::Box.new(:horizontal, 10)
+      symbol_label = Gtk::Label.new('Symbol:')
+      symbol_label.set_size_request(80, -1)
+      symbol_label.halign = :start
+      symbol_row.pack_start(symbol_label, expand: false, fill: false, padding: 0)
+
+      symbol_entry = Gtk::Entry.new
+      symbol_entry.max_length = 3
+      symbol_row.pack_start(symbol_entry, expand: true, fill: true, padding: 0)
+      content.pack_start(symbol_row, expand: false, fill: false, padding: 5)
+
+      # Color field
+      color_row = Gtk::Box.new(:horizontal, 10)
+      color_label = Gtk::Label.new('Color:')
+      color_label.set_size_request(80, -1)
+      color_label.halign = :start
+      color_row.pack_start(color_label, expand: false, fill: false, padding: 0)
+
+      color_entry = Gtk::Entry.new
+      color_entry.text = '#FFFFFF'
+      color_row.pack_start(color_entry, expand: true, fill: true, padding: 0)
+      content.pack_start(color_row, expand: false, fill: false, padding: 5)
+
+      dialog.show_all
+
+      if dialog.run == :ok
+        name = name_entry.text.strip.downcase
+        symbol = symbol_entry.text.strip.upcase
+        color = color_entry.text.strip
+
+        if name.empty? || symbol.empty?
+          show_message_dialog('Name and symbol are required.')
+        else
+          # Add to config
+          new_status = { 'name' => name, 'symbol' => symbol, 'color' => color }
+          @@config['status_effects'] << new_status
+
+          # Add to list
+          row = create_status_effect_row(new_status, @@config['status_effects'].size - 1)
+          list_box.add(row)
+        end
+      end
+
+      dialog.destroy
+    end
+
+    def edit_status_effect_dialog(list_box, index)
+      status_effect = @@config['status_effects'][index]
+
+      dialog = Gtk::Dialog.new(
+        title: 'Edit Status Effect',
+        flags: :modal,
+        buttons: [
+          ['Cancel', :cancel],
+          ['Save', :ok]
+        ]
+      )
+      dialog.set_default_size(400, 200)
+
+      content = dialog.child
+      content.set_margin_left(10)
+      content.set_margin_right(10)
+      content.set_margin_top(10)
+      content.set_margin_bottom(10)
+
+      # Name field
+      name_row = Gtk::Box.new(:horizontal, 10)
+      name_label = Gtk::Label.new('Name:')
+      name_label.set_size_request(80, -1)
+      name_label.halign = :start
+      name_row.pack_start(name_label, expand: false, fill: false, padding: 0)
+
+      name_entry = Gtk::Entry.new
+      name_entry.text = status_effect['name']
+      name_row.pack_start(name_entry, expand: true, fill: true, padding: 0)
+      content.pack_start(name_row, expand: false, fill: false, padding: 5)
+
+      # Symbol field
+      symbol_row = Gtk::Box.new(:horizontal, 10)
+      symbol_label = Gtk::Label.new('Symbol:')
+      symbol_label.set_size_request(80, -1)
+      symbol_label.halign = :start
+      symbol_row.pack_start(symbol_label, expand: false, fill: false, padding: 0)
+
+      symbol_entry = Gtk::Entry.new
+      symbol_entry.text = status_effect['symbol']
+      symbol_entry.max_length = 3
+      symbol_row.pack_start(symbol_entry, expand: true, fill: true, padding: 0)
+      content.pack_start(symbol_row, expand: false, fill: false, padding: 5)
+
+      # Color field
+      color_row = Gtk::Box.new(:horizontal, 10)
+      color_label = Gtk::Label.new('Color:')
+      color_label.set_size_request(80, -1)
+      color_label.halign = :start
+      color_row.pack_start(color_label, expand: false, fill: false, padding: 0)
+
+      color_entry = Gtk::Entry.new
+      color_entry.text = status_effect['color']
+      color_row.pack_start(color_entry, expand: true, fill: true, padding: 0)
+      content.pack_start(color_row, expand: false, fill: false, padding: 5)
+
+      dialog.show_all
+
+      if dialog.run == :ok
+        name = name_entry.text.strip.downcase
+        symbol = symbol_entry.text.strip.upcase
+        color = color_entry.text.strip
+
+        if name.empty? || symbol.empty?
+          show_message_dialog('Name and symbol are required.')
+        else
+          # Update config
+          @@config['status_effects'][index] = { 'name' => name, 'symbol' => symbol, 'color' => color }
+
+          # Update list row
+          selected_row = list_box.get_row_at_index(index)
+          list_box.remove(selected_row)
+          row = create_status_effect_row(@@config['status_effects'][index], index)
+          list_box.insert(row, index)
+          list_box.select_row(row)
+        end
+      end
+
+      dialog.destroy
+    end
+
+    def show_message_dialog(message)
+      dialog = Gtk::MessageDialog.new(
+        flags: :modal,
+        type: :info,
+        buttons: :ok,
+        message: message
+      )
+      dialog.run
+      dialog.destroy
+    end
+
+    # -- Update loop & display refresh --------------------------------------------------------
+    def start_update_timer
+      # Use GLib::Timeout for better GTK main loop integration
+      interval_ms = @@config['update_interval'] || 250
+      @@update_timer = GLib::Timeout.add(interval_ms) do
+        update_display
+        true # Return true to keep the timeout active
+      end
+    end
+
+    def update_display
+      targets = get_current_targets
+      _current_ids = targets.map { |t| t.id.to_i }.to_set
+
+      if $creature_bar_debug && !targets.empty?
+        respond "[CreatureBar] update_multi_creature_display: #{targets.size} targets detected"
+      end
+
+      # Handle no targets case
+      if targets.empty?
+        Gtk.queue do
+          # Remove all creature panels
+          @@creature_panels.keys.each { |id| remove_creature_panel(id) }
+
+          # Resize window to minimal size
+          resize_window_for_panels
+        end
+        return
+      end
+
+      Gtk.queue do
+        # Limit to max_shown
+        max_shown = @@config.dig('multi_creature', 'max_shown') || 5
+
+        # Get IDs we want to keep (first max_shown targets with creature data)
+        ids_to_keep = []
+        targets.each do |target|
+          break if ids_to_keep.size >= max_shown
+          creature_id = target.id.to_i
+          creature = get_creature(creature_id)
+          ids_to_keep << creature_id if creature
+        end
+
+        # Only show window if we have at least one creature with data
+        if ids_to_keep.empty?
+          # No creature data yet - remove panels and resize
+          @@creature_panels.keys.each { |id| remove_creature_panel(id) }
+          resize_window_for_panels
+          next
+        end
+
+        # Remove panels for creatures no longer present OR beyond max_shown
+        @@creature_panels.keys.each do |creature_id|
+          unless ids_to_keep.include?(creature_id)
+            remove_creature_panel(creature_id)
+          end
+        end
+
+        # Add/update panels for creatures in ids_to_keep
+        ids_to_keep.each do |creature_id|
+          creature = get_creature(creature_id)
+
+          if @@creature_panels[creature_id]
+            # Panel exists - update it
+            update_creature_panel(creature_id, creature) if creature
+          elsif creature
+            # No panel yet - create it
+            add_creature_panel(creature_id)
+          end
+        end
+
+        # Auto-resize window based on number of panels
+        resize_window_for_panels
+      end
+    end
+
+    def resize_window_for_panels
+      # Guard against destroyed window
+      return unless @@window && !@@window.destroyed?
+
+      panel_count = @@creature_panels.size
+      layout_mode = @@config.dig('layout', 'mode') || 'horizontal'
+
+      if panel_count > 0
+        @@window.set_opacity(1.0) if @@window.respond_to?(:set_opacity)
+        # Calculate grid dimensions
+        if layout_mode == 'horizontal'
+          max_cols = @@config.dig('layout', 'max_columns') || 5
+          num_cols = [panel_count, max_cols].min
+          num_rows = (panel_count.to_f / max_cols).ceil
+        else # vertical
+          max_rows = @@config.dig('layout', 'max_rows') || 5
+          num_rows = [panel_count, max_rows].min
+          num_cols = (panel_count.to_f / max_rows).ceil
+        end
+
+        # Calculate dimensions based on actual panel sizes
+        panel_widths = @@creature_panels.values.map { |p| p[:config]['panel_width'] || 100 }
+        panel_heights = @@creature_panels.values.map { |p| p[:config]['panel_height'] || 220 }
+
+        # For width: take the widest panel per column
+        max_panel_width = panel_widths.max || 100
+
+        # For height: take the tallest panel per row
+        max_panel_height = panel_heights.max || 220
+
+        # Calculate total window size
+        spacing = 2 # Grid spacing
+        borders = 4 # Window chrome
+        new_width = (max_panel_width * num_cols) + (spacing * (num_cols - 1)) + borders
+        new_height = (max_panel_height * num_rows) + (spacing * (num_rows - 1)) + borders
+
+        if $creature_bar_debug
+          respond "[CreatureBar] Resizing #{layout_mode} window: #{num_cols}x#{num_rows} grid, #{new_width}x#{new_height}px"
+        end
+
+        @@window.resize(new_width, new_height)
+      else
+        # Only hide window (opacity 0) if transparency is enabled
+        if @@config.dig('window', 'transparent') && @@window.respond_to?(:set_opacity)
+          @@window.set_opacity(0.0)
+        end
+        # No creature panels: keep a small, draggable footprint
+        panel_width = @@config.dig('window', 'width') || 100
+        min_draggable_width = 200
+        new_width = [panel_width, min_draggable_width].max
+
+        if $creature_bar_debug
+          respond "[CreatureBar] Resizing no-target window to #{new_width}px (min draggable width)"
+        end
+
+        @@window.resize(new_width, @@window.allocated_height)
+      end
+    end
+
+    def calculate_grid_position(panel_index)
+      # Calculate grid position based on layout mode and wrapping settings
+      layout_mode = @@config.dig('layout', 'mode') || 'horizontal'
+
+      if layout_mode == 'horizontal'
+        # Horizontal: fill columns first, wrap to next row
+        max_cols = @@config.dig('layout', 'max_columns') || 5
+        row = panel_index / max_cols
+        col = panel_index % max_cols
+      else
+        # Vertical: fill rows first, wrap to next column
+        max_rows = @@config.dig('layout', 'max_rows') || 5
+        col = panel_index / max_rows
+        row = panel_index % max_rows
+      end
+
+      [col, row]
+    end
+
+    def rebuild_grid_layout
+      # Guard against destroyed container
+      return unless @@panels_container && !@@panels_container.destroyed?
+
+      # Remove all panels from grid
+      @@panels_container.each { |child| @@panels_container.remove(child) }
+
+      # Re-add panels in order with correct grid positions
+      @@creature_panels.values.each_with_index do |panel, index|
+        col, row = calculate_grid_position(index)
+        @@panels_container.attach(panel[:container], col, row, 1, 1)
+      end
+    end
+
+    def add_creature_panel(creature_id)
+      # Guard against destroyed container (race condition during window recreation)
+      return unless @@panels_container && !@@panels_container.destroyed?
+
+      creature = get_creature(creature_id)
+      return unless creature
+
+      # Get family for family-aware pooling
+      family = get_creature_family(creature)
+      panel_widgets = get_panel_from_pool(family)
+
+      if $creature_bar_debug
+        respond "[CreatureBar] add_creature_panel: Adding panel for creature ID #{creature_id}, family='#{family}', pooled=#{panel_widgets ? 'YES' : 'NO'}"
+      end
+
+      if panel_widgets
+        # Reuse existing panel - just update the creature_id and data
+        panel_widgets[:creature_id] = creature_id
+        panel_widgets[:last_creature_id] = nil
+        panel_widgets[:wound_overlays]&.each_value { |w| w.hide }
+        @@creature_panels[creature_id] = panel_widgets
+
+        # Add to grid at appropriate position
+        panel_index = @@creature_panels.size - 1
+        col, row = calculate_grid_position(panel_index)
+        @@panels_container.attach(panel_widgets[:container], col, row, 1, 1)
+        panel_widgets[:container].show_all
+        update_creature_panel(creature_id, creature)
+      else
+        # No pooled panel available - create new one
+        panel_widgets = create_creature_panel(creature_id)
+        return unless panel_widgets
+
+        # Set up HP bar draw callback with panel-specific data (if bar exists)
+        # Store the signal handler ID so we can disconnect it later
+        hp_bar = panel_widgets[:hp_bar]
+        if hp_bar
+          signal_id = hp_bar.signal_connect('draw') do |widget, cr|
+            draw_hp_bar_for_panel(widget, cr, panel_widgets)
+            false
+          end
+          panel_widgets[:draw_signal_id] = signal_id
+        end
+
+        @@creature_panels[creature_id] = panel_widgets
+
+        # Apply CSS to the new panel widgets
+        add_css_to_widget(panel_widgets[:container])
+
+        # Add to grid at appropriate position
+        panel_index = @@creature_panels.size - 1
+        col, row = calculate_grid_position(panel_index)
+        @@panels_container.attach(panel_widgets[:container], col, row, 1, 1)
+        panel_widgets[:container].show_all
+        update_creature_panel(creature_id, creature)
+      end
+    end
+
+    def remove_creature_panel(creature_id)
+      panel = @@creature_panels.delete(creature_id)
+      return unless panel
+
+      # Remove from container and hide (but don't destroy)
+      # Guard against destroyed container
+      if @@panels_container && !@@panels_container.destroyed?
+        @@panels_container.remove(panel[:container])
+      end
+      panel[:container].hide unless panel[:container].destroyed?
+
+      # Rebuild grid layout to fix positioning after removal
+      rebuild_grid_layout unless @@creature_panels.empty?
+
+      # Try to add to pool for reuse (family-aware)
+      max_shown = @@config.dig('multi_creature', 'max_shown') || 5
+      pool_size_limit = max_shown * 2 + 1
+      family = panel[:family] || 'default'
+
+      # Count total panels in pool
+      total_pooled = @@panel_pool.values.map(&:size).sum
+
+      if total_pooled < pool_size_limit
+        # Add to family-specific pool for reuse
+        @@panel_pool[family] ||= []
+        @@panel_pool[family] << panel
+      else
+        # Pool is full - destroy this panel
+        destroy_panel(panel)
+      end
+    end
+
+    def destroy_panel(panel)
+      # Disconnect signal handler to prevent memory leak
+      if panel[:draw_signal_id] && panel[:hp_bar]
+        panel[:hp_bar].signal_handler_disconnect(panel[:draw_signal_id])
+      end
+
+      # Destroy wound overlays explicitly
+      if panel[:wound_overlays]
+        panel[:wound_overlays].each_value do |overlay|
+          overlay.destroy if overlay.respond_to?(:destroy)
+        end
+        panel[:wound_overlays].clear
+      end
+
+      # Destroy the frame (destroys child widgets)
+      panel[:container].destroy if panel[:container].respond_to?(:destroy)
+
+      # Clear all references to help garbage collection
+      panel.clear
+    end
+
+    def get_panel_from_pool(family)
+      return nil if @@panel_pool.empty?
+
+      # Look for panel from same family
+      family_pool = @@panel_pool[family]
+      return nil if family_pool.nil? || family_pool.empty?
+
+      # FIFO: get oldest panel for this family
+      family_pool.shift
+    end
+
+    # -- Panel updates (name, border, hp, wounds, status) -------------------------------------
+    def update_creature_panel(creature_id, creature)
+      panel = @@creature_panels[creature_id]
+      return unless panel
+
+      if $creature_bar_debug
+        respond "[CreatureBar] update_creature_panel called for '#{creature.name}' (ID: #{creature_id})"
+      end
+
+      # Update name label if present
+      if panel[:name_label]
+        # Use noun or full name based on mode
+        name_mode = panel[:config]['name_display']['mode'] || 'name'
+        name = if name_mode == 'noun'
+                 creature.noun || 'unknown'
+               else
+                 creature.name || 'Unknown'
+               end
+
+        # Only truncate for name mode (full names can be long)
+        if name_mode == 'name'
+          max_length = panel[:config]['name_display']['max_length']
+          name = "#{name[0, max_length - 3]}..." if name.length > max_length
+        end
+
+        # OPTIMIZATION: Only rebuild markup if name changed (avoids redundant Pango parsing)
+        if panel[:last_name] != name
+          panel[:last_name] = name
+
+          # Apply per-panel styling using markup
+          name_config = panel[:config]['name_display']
+          font_size = (name_config['font_size'] || 8) * 1024
+          font_weight = name_config['font_weight'] || 'normal'
+          color = @@config['colors']['name_font'] || '#FFFFFF'
+
+          markup = "<span size='#{font_size}' weight='#{font_weight}' color='#{color}'>#{name}</span>"
+          panel[:name_label].set_markup(markup)
+        end
+      end
+
+      # Update border via CSS class (only if current target changed)
+      current_target_id = XMLData.current_target_id&.to_i
+      is_current = (creature_id == current_target_id)
+
+      # DEBUG
+      if $creature_bar_debug
+        has_class = panel[:frame].style_context.has_class?('current_target')
+        respond "[CreatureBar] Border check: creature_id=#{creature_id} current_target_id=#{current_target_id} is_current=#{is_current} has_class_before=#{has_class}"
+      end
+
+      if panel[:is_current_target] != is_current
+        panel[:is_current_target] = is_current
+        style_context = panel[:frame].style_context
+        if is_current
+          style_context.add_class('current_target') unless style_context.has_class?('current_target')
+        else
+          style_context.remove_class('current_target') if style_context.has_class?('current_target')
+        end
+
+        if $creature_bar_debug
+          classes = style_context.list_classes rescue []
+          respond "[CreatureBar] Border toggle: creature_id=#{creature_id} is_current=#{is_current} classes=#{classes.inspect}"
+        end
+      end
+
+      # Update HP
+      update_hp_for_panel(panel, creature)
+
+      # Update wounds
+      update_wounds_for_panel(panel, creature)
+
+      # Update status
+      update_status_for_panel(panel, creature)
+    end
+
+    def update_hp_for_panel(panel, creature)
+      # Skip if HP bar and HP label are both disabled
+      return unless panel[:hp_bar] || panel[:hp_label]
+
+      max_hp = creature.max_hp
+      current_hp = creature.current_hp
+
+      if max_hp && max_hp > 0 && current_hp
+        new_fraction = [current_hp.to_f / max_hp, 0.0].max
+        percentage = (new_fraction * 100).to_i
+        new_color = get_hp_color(percentage, panel[:config])
+
+        # Only update if values changed
+        fraction_changed = (panel[:hp_fraction] - new_fraction).abs > 0.001
+        color_changed = panel[:hp_color] != new_color
+
+        if fraction_changed || color_changed
+          panel[:hp_fraction] = new_fraction
+          panel[:hp_color] = new_color
+
+          if panel[:config]['hp_bar']['show_text'] && panel[:hp_label]
+            new_text = build_hp_text(current_hp, max_hp, percentage, panel[:config]['hp_bar'])
+
+            if panel[:hp_text] != new_text
+              panel[:hp_text] = new_text
+              font_size = (panel[:config]['hp_bar']['font_size'] || 11) * 1024
+              panel[:hp_label].set_markup("<span color='#{@@config['colors']['hp_text']}' size='#{font_size}'>#{new_text}</span>")
+            end
+          end
+
+          # Queue redraw only if values changed
+          panel[:hp_bar].queue_draw if panel[:hp_bar]
+        end
+      else
+        # No HP data - only update if changed
+        no_hp_text = panel[:config]['hp_bar']['show_text'] ? build_hp_text('--', '--', '--', panel[:config]['hp_bar']) : ''
+        if (panel[:hp_fraction] - 1.0).abs > 0.001 || panel[:hp_text] != no_hp_text
+          panel[:hp_fraction] = 1.0
+          panel[:hp_color] = @@config['colors']['hp_background']
+          panel[:hp_text] = no_hp_text
+
+          if panel[:hp_label]
+            font_size = (panel[:config]['hp_bar']['font_size'] || 11) * 1024
+            panel[:hp_label].set_markup("<span color='#{@@config['colors']['hp_text']}' size='#{font_size}'>#{panel[:hp_text]}</span>")
+          end
+          panel[:hp_bar].queue_draw if panel[:hp_bar]
+        end
+      end
+    end
+
+    def update_wounds_for_panel(panel, creature)
+      injuries = creature.injuries || {}
+
+      # Hide all wounds when switching creatures or when injuries are empty
+      if panel[:last_creature_id] != creature.id || injuries.empty?
+        panel[:wound_overlays].each { |_, widget| widget.hide }
+        panel[:last_creature_id] = creature.id
+      end
+
+      return if injuries.empty?
+
+      if $creature_bar_debug
+        respond "[CreatureBar] Updating wounds for '#{creature.name}' (ID: #{creature.id})"
+        respond "  - Injuries: #{creature.injuries.inspect}"
+        respond "  - Available overlay keys: #{panel[:wound_overlays].keys.first(5).inspect}..." if panel[:wound_overlays].size > 0
+      end
+
+      creature.injuries.each do |body_part, level|
+        next if level == 0
+        wound_level = [level, 3].min
+        key = "#{body_part}_w#{wound_level}"
+        overlay = panel[:wound_overlays][key]
+
+        if $creature_bar_debug
+          respond "  - Injury: #{body_part} level #{level} → key: '#{key}' → overlay #{overlay ? 'FOUND' : 'NOT FOUND'}"
+        end
+
+        # Only show if not already visible (avoids redundant GTK calls)
+        overlay.show if overlay && !overlay.destroyed? && !overlay.visible?
+      end
+    end
+
+    def update_status_for_panel(panel, creature)
+      return unless panel[:status_label]
+
+      statuses = creature.status rescue []
+
+      if statuses.nil? || statuses.empty?
+        # Only clear if not already empty
+        panel[:status_label].text = '' unless panel[:status_label].text.empty?
+        return
+      end
+
+      # Build status markup (only if statuses changed)
+      status_key_string = statuses.map(&:to_s).sort.join('|')
+
+      # Cache the last status key to avoid rebuilding markup unnecessarily
+      if panel[:last_status_key] != status_key_string
+        panel[:last_status_key] = status_key_string
+
+        # Get font size from config
+        font_size = (panel[:config]['status']['font_size'] || 8) * 1024
+
+        status_parts = statuses.map do |status|
+          abbrev = get_status_symbol(status)
+          color = get_status_color(status)
+          "<span color='#{color}'>#{abbrev}</span>"
+        end
+
+        # Use font size and no brackets (matching calibrator)
+        markup = "<span size='#{font_size}'>#{status_parts.join(' ')}</span>"
+        panel[:status_label].set_markup(markup)
+      end
+    end
+
+    # -- Drawing helpers ----------------------------------------------------------------------
+    def draw_hp_bar_for_panel(widget, cr, panel)
+      width = widget.allocated_width
+      height = widget.allocated_height
+      text_style = panel[:config]['hp_bar']['text_style'] || 'overlay'
+
+      # Draw background
+      bg_color = parse_color(@@config['colors']['hp_background'])
+      cr.set_source_rgba(bg_color[:r], bg_color[:g], bg_color[:b], bg_color[:a])
+      draw_rounded_rect(cr, 0, 0, width, height, 3)
+      cr.fill
+
+      # Draw progress
+      if panel[:hp_fraction] > 0
+        fill_width = (width * panel[:hp_fraction]).to_i
+        fill_color = parse_color(panel[:hp_color] || @@config['colors']['hp_high'])
+        cr.set_source_rgba(fill_color[:r], fill_color[:g], fill_color[:b], fill_color[:a])
+        draw_rounded_rect(cr, 0, 0, fill_width, height, 3)
+        cr.fill
+      end
+
+      # Draw text for embedded mode
+      if text_style == 'embedded' && panel[:config]['hp_bar']['show_text'] && !panel[:hp_text].empty?
+        text_color = parse_color(@@config['colors']['hp_text'])
+        cr.set_source_rgba(text_color[:r], text_color[:g], text_color[:b], text_color[:a])
+        cr.select_font_face('Sans', Cairo::FONT_SLANT_NORMAL, Cairo::FONT_WEIGHT_BOLD)
+        font_size = panel[:config]['hp_bar']['font_size'] || 11
+        cr.set_font_size(font_size)
+
+        extents = cr.text_extents(panel[:hp_text])
+        x = (width - extents.width) / 2
+        y = (height / 2) - (extents.height / 2) - extents.y_bearing
+        cr.move_to(x, y)
+        cr.show_text(panel[:hp_text])
+      end
+    end
+
+    def stop_update_timer
+      if @@update_timer
+        GLib::Source.remove(@@update_timer)
+        @@update_timer = nil
+      end
+    end
+
+    def show_display
+      return unless @@window
+      # Restore position before showing (in case it was reset)
+      if @@config['position']['x'] && @@config['position']['y']
+        @@window.move(@@config['position']['x'], @@config['position']['y'])
+      end
+      @@window.show_all
+    end
+
+    # -- Shared helpers -----------------------------------------------------------------------
+    def build_hp_text(current_hp, max_hp, percentage, hp_config)
+      return '' unless hp_config
+
+      parts = []
+      parts << 'HP:' if hp_config['show_hp_prefix']
+      parts << "#{current_hp}/#{max_hp}" if hp_config['show_numbers']
+      parts << "(#{percentage}%)" if hp_config['show_percentage']
+
+      parts.join(' ')
+    end
+
+    def valid_color?(color_string)
+      return false unless color_string.is_a?(String)
+      color_string = color_string.strip
+
+      hex_match = color_string =~ /^#([0-9A-Fa-f]{6})$/
+      rgba_match = color_string =~ /^rgba\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*(?:0|1|0?\.\d+)\s*\)$/
+      hex_match || rgba_match
+    end
+
+    def parse_color(color_string)
+      # Parse color string (hex or rgba) into normalized RGBA values
+      default = { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+      return default unless color_string.is_a?(String)
+
+      color_string = color_string.strip
+
+      if color_string =~ /^#([0-9A-Fa-f]{6})$/
+        hex = Regexp.last_match(1)
+        r = hex[0..1].to_i(16) / 255.0
+        g = hex[2..3].to_i(16) / 255.0
+        b = hex[4..5].to_i(16) / 255.0
+        a = 1.0
+        { r: r, g: g, b: b, a: a }
+      elsif color_string =~ /^rgba\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*([\d.]+)\s*\)$/
+        r = Regexp.last_match(1).to_i.clamp(0, 255) / 255.0
+        g = Regexp.last_match(2).to_i.clamp(0, 255) / 255.0
+        b = Regexp.last_match(3).to_i.clamp(0, 255) / 255.0
+        a = Regexp.last_match(4).to_f.clamp(0.0, 1.0)
+        { r: r, g: g, b: b, a: a }
+      else
+        default
+      end
+    end
+
+    # Apply color tint to a grayscale pixbuf using multiply blend
+    # Gray (#808080) = neutral/no tint, White (#FFFFFF) = full brightness
+    def apply_tint(pixbuf, hex_color)
+      # Skip tinting if no color or neutral gray
+      return pixbuf unless hex_color
+      return pixbuf if hex_color == '#808080'
+
+      tint = parse_color(hex_color)
+
+      # Debug logging for tint investigation
+      if $creature_bar_debug
+        respond "[CreatureBar] Applying tint:"
+        respond "  - Hex color: #{hex_color}"
+        respond "  - Parsed RGB: R=#{(tint[:r] * 255).to_i}, G=#{(tint[:g] * 255).to_i}, B=#{(tint[:b] * 255).to_i}"
+      end
+
+      # GdkPixbuf doesn't allow direct pixel modification in Ruby bindings
+      # Use Cairo to composite the tint
+      width = pixbuf.width
+      height = pixbuf.height
+
+      # Create a Cairo surface from the pixbuf
+      surface = Cairo::ImageSurface.new(Cairo::FORMAT_ARGB32, width, height)
+      cr = Cairo::Context.new(surface)
+
+      # Draw the original pixbuf
+      cr.set_source_pixbuf(pixbuf, 0, 0)
+      cr.paint
+
+      # Apply multiply blend by drawing tint color with MULTIPLY operator
+      cr.set_operator(Cairo::OPERATOR_MULTIPLY)
+      cr.set_source_rgba(tint[:r], tint[:g], tint[:b], 1.0)
+      cr.rectangle(0, 0, width, height)
+      cr.fill
+
+      # Restore alpha from original (multiply affects alpha too)
+      cr.set_operator(Cairo::OPERATOR_DEST_IN)
+      cr.set_source_pixbuf(pixbuf, 0, 0)
+      cr.paint
+
+      # Convert back to pixbuf
+      # Cairo ARGB32 stores as BGRA in memory on little-endian systems (Windows)
+      # GdkPixbuf expects RGBA, so we need to swap R and B channels
+      raw = surface.data
+      pixels = raw.unpack('C*')
+      (0...pixels.length).step(4) do |i|
+        pixels[i], pixels[i + 2] = pixels[i + 2], pixels[i] # Swap B and R
+      end
+      rgba_data = pixels.pack('C*')
+
+      GdkPixbuf::Pixbuf.new(
+        data: rgba_data,
+        colorspace: :rgb,
+        has_alpha: true,
+        bits_per_sample: 8,
+        width: width,
+        height: height,
+        row_stride: width * 4 # RGBA = 4 bytes per pixel
+      )
+    end
+
+    def draw_rounded_rect(cr, x, y, width, height, radius)
+      # Draw a rounded rectangle path
+      degrees = Math::PI / 180.0
+
+      cr.new_sub_path
+      cr.arc(x + width - radius, y + radius, radius, -90 * degrees, 0 * degrees)
+      cr.arc(x + width - radius, y + height - radius, radius, 0 * degrees, 90 * degrees)
+      cr.arc(x + radius, y + height - radius, radius, 90 * degrees, 180 * degrees)
+      cr.arc(x + radius, y + radius, radius, 180 * degrees, 270 * degrees)
+      cr.close_path
+    end
+
+    def get_hp_color(percentage, panel_config = nil)
+      # Use panel-specific config if provided, otherwise fall back to global config
+      config = panel_config || @@config
+      ranges = config.dig('hp_bar', 'ranges') || { 'high' => { 'min' => 75 }, 'mid' => { 'min' => 40 } }
+      colors = @@config['colors']
+
+      if percentage >= ranges['high']['min']
+        colors['hp_high']
+      elsif percentage >= ranges['mid']['min']
+        colors['hp_mid']
+      else
+        colors['hp_low']
+      end
+    end
+
+    def target_creature(creature_id)
+      return unless creature_id
+      cmd = "target ##{creature_id}"
+      do_client(cmd) if defined?(do_client)
+
+      # Focus game window after click (matches BarBar behavior)
+      begin
+        if defined?(Frontend) && Frontend.respond_to?(:refocus_callback) && Frontend.refocus_callback
+          pid_ok = !Frontend.respond_to?(:pid) || !Frontend.pid.nil?
+          Frontend.refocus_callback.call if pid_ok
+        end
+      rescue
+        # ignore refocus errors
+      end
+    end
+
+    def run
+      respond "Starting CreatureBar..."
+      @@running = true
+
+      Gtk.queue do
+        load_config
+        apply_css
+        create_window
+        start_update_timer
+      end
+    end
+
+    def running?
+      @@running
+    end
+
+    def stop
+      return unless @@running
+
+      respond "Stopping CreatureBar..."
+      @@running = false
+
+      stop_update_timer
+      @@save_timer&.kill rescue nil
+      @@save_timer = nil
+
+      # Save window settings before any destruction (check destroyed state)
+      if @@window && !@@window.destroyed?
+        begin
+          save_window_settings
+        rescue StandardError
+          # Window may have been destroyed, ignore
+        end
+      end
+
+      # Clean up panel pool (outside GTK thread is OK for data cleanup)
+      @@panel_pool.clear
+      @@creature_panels.clear
+
+      # Handle GTK cleanup on the GTK thread
+      window_ref = @@window
+      dialog_ref = @@active_dialog
+      @@window = nil
+      @@active_dialog = nil
+
+      # Handle GTK cleanup - window may still exist since delete-event returns true
+      # to prevent GTK from auto-destroying before we can clean up
+      begin
+        Gtk.queue do
+          begin
+            # Close any active dialog first
+            dialog_ref.destroy if dialog_ref && !dialog_ref.destroyed?
+          rescue StandardError
+            # Already destroyed, ignore
+          end
+
+          begin
+            # Destroy the main window
+            window_ref.destroy if window_ref && !window_ref.destroyed?
+          rescue StandardError
+            # Already destroyed, ignore
+          end
+        end
+      rescue StandardError
+        # Ignore GTK errors during shutdown
+      end
+
+      # Kill the script to ensure cleanup
+      script_name = Script.current.name rescue 'creaturebar'
+      Script.kill(script_name) if Script.running?(script_name)
+    end
+  end
+end
+
+# Script execution
+if Script.current.name.downcase == 'creaturebar'
+  begin
+    require 'gtk3'
+  rescue LoadError
+    echo "Error: GTK3 gem not found. Install with: gem install gtk3"
+    exit
+  end
+
+  # Check if Creature module is available
+  unless defined?(Creature)
+    echo "Error: Creature module not found. Make sure creature.rb is loaded."
+    exit
+  end
+
+  # Check if Combat::Tracker is enabled (required for wound/HP/status tracking)
+  if defined?(Combat::Tracker) && !Combat::Tracker.enabled?
+    respond ""
+    respond "[CreatureBar] Warning: Combat::Tracker is not enabled."
+    respond "  Wounds, HP, and status effects will not update."
+    respond "  To enable: ;e Combat::Tracker.enable!"
+    respond ""
+  end
+
+  # Handle help command
+  if script.vars[1] =~ /^help$/i
+    respond ""
+    respond "═══════════════════════════════════════════════════════════"
+    respond " CreatureBar - Visual creature tracking for GemStone IV"
+    respond "═══════════════════════════════════════════════════════════"
+    respond ""
+    respond " Usage: ;creaturebar [command]"
+    respond ""
+    respond " Commands:"
+    respond "   (none)     Start CreatureBar"
+    respond "   config     Start with settings dialog open"
+    respond "   download   Download/re-download asset packs"
+    respond "   update     Check for and install asset updates"
+    respond "   reset      Clear all assets and re-run setup"
+    respond "   help       Show this help message"
+    respond ""
+    respond " In-window:"
+    respond "   Right-click   Open context menu (settings, reload, close)"
+    respond "   Click panel   Target that creature"
+    respond ""
+    respond " Related:"
+    respond "   ;calibrate_creaturebar   Visual silhouette calibrator"
+    respond ""
+    exit
+  end
+
+  # Handle update command (no GTK needed)
+  if script.vars[1] =~ /^update$/i
+    CreatureBar::AssetManager.ensure_jinx_available or exit
+    CreatureBar::AssetManager.ensure_repo_registered or exit
+    CreatureBar::AssetManager.check_for_updates
+    exit
+  end
+
+  # Handle download command (force re-download)
+  if script.vars[1] =~ /^download$/i
+    CreatureBar::AssetManager.ensure_jinx_available or exit
+    CreatureBar::AssetManager.ensure_repo_registered or exit
+    CreatureBar::AssetManager.prompt_download
+    exit
+  end
+
+  # Handle reset command (clear assets and re-run first-time setup)
+  if script.vars[1] =~ /^reset$/i
+    CreatureBar::AssetManager.clear_assets or exit
+
+    # Re-run first-time setup
+    CreatureBar::AssetManager.ensure_jinx_available or exit
+    CreatureBar::AssetManager.ensure_repo_registered or exit
+    CreatureBar::AssetManager.prompt_download or exit
+
+    respond "Reset complete! Starting CreatureBar..."
+    respond ""
+  end
+
+  # Check if assets are installed (first-run detection)
+  unless CreatureBar::AssetManager.assets_installed?
+    respond "[CreatureBar] Silhouette assets not found."
+
+    # Ensure Jinx is available
+    CreatureBar::AssetManager.ensure_jinx_available or exit
+
+    # Register the CreatureBar repo with Jinx
+    CreatureBar::AssetManager.ensure_repo_registered or exit
+
+    # Prompt user to download assets via Jinx
+    success = CreatureBar::AssetManager.prompt_download
+    unless success
+      exit
+    end
+    respond ""
+    respond "Assets downloaded successfully! Starting CreatureBar..."
+    respond ""
+  end
+
+  # Ensure cleanup on script termination
+  before_dying do
+    CreatureBar.stop
+  end
+
+  Signal.trap("INT") { CreatureBar.stop }
+  Signal.trap("TERM") { CreatureBar.stop }
+
+  # Handle script arguments
+  if script.vars[1] =~ /^config|^setup/i
+    CreatureBar.run
+    sleep 0.5 # Give window time to initialize
+    Gtk.queue { CreatureBar.configure_appearance }
+  else
+    CreatureBar.run
+  end
+
+  # Keep script alive
+  script_name = Script.current.name
+  loop do
+    sleep 1
+    break unless Script.running?(script_name) && CreatureBar.running?
+  end
+
+  CreatureBar.stop
+end
