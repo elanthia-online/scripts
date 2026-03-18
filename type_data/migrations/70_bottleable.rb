@@ -1,17 +1,17 @@
-create_table "jarable", keys: [:name, :noun, :exclude]
+create_table "bottleable", keys: [:name, :noun, :exclude]
 
-migrate "jarable" do
-  # insert jarable "gem" names into :name
+migrate "bottleable" do
+  # insert bottleable "gem" names into :name
   copy_rules_from("gem", :name).each do |gem_name|
     insert(:name, gem_name)
   end
 
-  # insert jarable "reagent" names into :name
+  # insert bottleable "reagent" names into :name
   copy_rules_from("reagent", :name).each do |reagent_name|
     insert(:name, reagent_name)
   end
 
-  # Insert jarable "valuable" shells to :name
+  # Insert bottleable "valuable" shells to :name
   insert(:name, %{amethyst clam shell})
   insert(:name, %{angulate wentletrap shell})
   insert(:name, %{beige clam shell})
@@ -63,25 +63,25 @@ migrate "jarable" do
   insert(:name, %{white clam shell})
   insert(:name, %{white gryphon's wing shell})
 
-  # insert jarable "valuable" other stuff to :name
+  # insert bottleable "valuable" other stuff to :name
   insert(:name, %{polished shark tooth})
 
-  # insert jarable "gem" nouns into :noun
+  # insert bottleable "gem" nouns into :noun
   copy_rules_from("gem", :noun).each do |gem_name|
     insert(:noun, gem_name)
   end
 
-  # insert jarable "reagent" nouns into :noun
+  # insert bottleable "reagent" nouns into :noun
   copy_rules_from("reagent", :noun).each do |reagent_name|
     insert(:noun, reagent_name)
   end
 
-  # insert jarable "gem" exclusions into :exclude
+  # insert bottleable "gem" exclusions into :exclude
   copy_rules_from("gem", :exclude).each do |gem_name|
     insert(:exclude, gem_name)
   end
 
-  # insert additional "gem" that are not jarable
+  # insert additional "gem" that are not bottleable
   insert(:exclude, %{piece of blue ridge coral})
   insert(:exclude, %{piece of cat's-paw coral})
 end
