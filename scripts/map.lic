@@ -14,9 +14,18 @@ Tracks your current room on visual maps
       game: Gemstone
       tags: core, movement, mapping
       required: Lich >= 5.13.0
-      version: 2.0.5
+      version: 2.1.0
 
   changelog:
+    v2.1.0 (2026-03-08)
+      * Add map notes feature
+    v2.0.6 (2026-03-05)
+      * Fix tag and location markers not clearing when map image changes;
+        if the selected tag/location exists on the new map, markers are re-applied there
+      * Fix Tags/Locations menus showing all mapdb entries when no map is loaded
+      * Fix marker offsets when zoom level differs between maps
+      * Fix Scale menu not reflecting per-map zoom level after map change
+      * Fix maps only appearing under their first category tag; now indexed under all categories
     v2.0.5 (2025-02-20)
       * Fix map drag errors when no map currently shown
     v2.0.4 (2025-02-20)
@@ -458,10 +467,15 @@ module ElanthiaMap
       @fake_room = nil
       @tag_markers = []
       @location_markers = []
+      @note_pin_widgets = []
+      @active_tag = nil
+      @active_location = nil
       @fix_click = nil
       @last_user_scroll = nil
       @map_offset_x = 0  # X offset of map image within layout
       @map_offset_y = 0  # Y offset of map image within layout
+      @right_click_x = 0
+      @right_click_y = 0
 
       # Check for special modes
       @fix_mode = script.vars[1] =~ /fix/ ? true : false
@@ -519,12 +533,13 @@ module ElanthiaMap
     # @return [Boolean] Whether the map was successfully changed
     def change_map(map_path)
       return false if @current_map == map_path
-
       map_data = @map_cache.load_map(map_path, dark_mode: @settings[:dark_mode])
       return false unless map_data
-
       @current_map = map_path
       update_map_display(map_data)
+      refresh_tag_markers
+      refresh_location_markers
+      redraw_note_pins
       true
     end
 
@@ -796,6 +811,43 @@ module ElanthiaMap
 
     private
 
+    # Returns the per-game path to the map notes JSON file.
+    #
+    # @return [String] Absolute path to `map_notes.json` under {DATA_DIR}
+    def notes_file_path
+      File.join(DATA_DIR, XMLData.game, 'map_notes.json')
+    end
+
+    # Loads saved map notes from disk.
+    #
+    # Returns an empty hash when the file does not exist or cannot be parsed,
+    # so callers never need to handle nil.
+    #
+    # @return [Hash{String => String}] Map of room ID strings to note text
+    def load_notes
+      File.exist?(notes_file_path) ? JSON.parse(File.read(notes_file_path)) : {}
+    rescue StandardError
+      {}
+    end
+
+    # Persists the given notes hash to disk and redraws note pins.
+    #
+    # Responds with a success or error message. The `deleted` flag switches
+    # the success message between "saved" and "deleted".
+    #
+    # @param notes [Hash{String => String}] Updated notes hash to write
+    # @param room_id [Integer, String] Room ID used in user-facing messages
+    # @param deleted [Boolean] When true, reports "deleted" instead of "saved"
+    # @return [void]
+    def persist_notes(notes, room_id, deleted: false)
+      File.write(notes_file_path, JSON.generate(notes))
+      action = deleted ? 'deleted' : 'saved'
+      respond "[map notes: #{action} for room #{room_id}]"
+      redraw_note_pins
+    rescue StandardError => e
+      respond "[map notes: error saving - #{e.message}]"
+    end
+
     # Loads settings from Lich's Settings store
     # @return [void]
     def load_settings
@@ -1047,6 +1099,84 @@ module ElanthiaMap
         rebuild_dynamic_menus
       end
 
+      # Map notes menu item
+      @menu.append(Gtk::SeparatorMenuItem.new)
+      @menu_note = Gtk::MenuItem.new(label: 'Add/Edit Note')
+      @menu_note.signal_connect('activate') do
+        Gtk.queue do
+          map_data = @map_cache[@current_map, dark_mode: @settings[:dark_mode]]
+          next unless map_data
+
+          scale = calculate_scale(map_data)
+          click_x = (@scroller.hadjustment.value.to_i + @right_click_x - @map_offset_x) / scale.to_f
+          click_y = (@scroller.vadjustment.value.to_i + @right_click_y - @map_offset_y) / scale.to_f
+          room = find_room_at(click_x, click_y)
+          unless room
+            respond '[map notes: no room found at click position]'
+            next
+          end
+
+          notes    = load_notes
+          room_key = room.id.to_s
+
+          note_window = Gtk::Window.new
+          note_window.title = "Note: Room #{room.id}"
+          note_window.set_default_size(340, 220)
+          note_window.window_position = :center
+
+          vbox = Gtk::Box.new(:vertical, 8)
+          vbox.margin = 10
+
+          room_label = Gtk::Label.new
+          room_label.markup = "<small><b>Room #{room.id}</b></small>"
+          room_label.halign = :start
+          vbox.pack_start(room_label, expand: false, fill: false, padding: 0)
+
+          scrolled = Gtk::ScrolledWindow.new
+          scrolled.set_policy(:automatic, :automatic)
+          text_view = Gtk::TextView.new
+          text_view.wrap_mode = :word
+          text_view.buffer.text = notes[room_key] || ''
+          scrolled.add(text_view)
+          vbox.pack_start(scrolled, expand: true, fill: true, padding: 0)
+
+          hbox          = Gtk::Box.new(:horizontal, 6)
+          save_button   = Gtk::Button.new(label: 'Save')
+          delete_button = Gtk::Button.new(label: 'Delete Note')
+          cancel_button = Gtk::Button.new(label: 'Cancel')
+
+          save_button.signal_connect('clicked') do
+            Gtk.queue do
+              note_text = text_view.buffer.text.strip
+              note_text.empty? ? notes.delete(room_key) : notes[room_key] = note_text
+              persist_notes(notes, room.id)
+              note_window.destroy
+            end
+          end
+
+          delete_button.signal_connect('clicked') do
+            Gtk.queue do
+              notes.delete(room_key)
+              persist_notes(notes, room.id, deleted: true)
+              note_window.destroy
+            end
+          end
+
+          cancel_button.signal_connect('clicked') { Gtk.queue { note_window.destroy } }
+
+          hbox.pack_start(save_button,   expand: true, fill: true, padding: 0)
+          hbox.pack_start(delete_button, expand: true, fill: true, padding: 0)
+          hbox.pack_start(cancel_button, expand: true, fill: true, padding: 0)
+          vbox.pack_start(hbox, expand: false, fill: false, padding: 0)
+
+          note_window.add(vbox)
+          note_window.show_all
+          # Mirror the main window's keep_above so the note editor is never obscured by it
+          note_window.keep_above = true
+        end
+      end
+      @menu.append(@menu_note)
+
       @menu.show_all
     end
 
@@ -1083,9 +1213,15 @@ module ElanthiaMap
     # Creates the scale submenu
     # @return [void]
     def create_scale_menu
-      menu_scale = Gtk::MenuItem.new(label: 'Scale')
+      @menu_scale = Gtk::MenuItem.new(label: 'Scale')
+      @menu_scale.submenu = build_scale_submenu
+      @menu.append(@menu_scale)
+    end
+
+    # Builds the scale submenu with current map scale reflected
+    # @return [Gtk::Menu] The constructed submenu
+    def build_scale_submenu
       submenu = Gtk::Menu.new
-      menu_scale.submenu = submenu
 
       # Global Scale checkbox at top
       global_scale_item = Gtk::CheckMenuItem.new(label: 'Global Scale')
@@ -1111,10 +1247,8 @@ module ElanthiaMap
 
         # Show active state based on mode
         if @settings[:global_scale_enabled]
-          # Global mode: show if matches global_scale
           item.active = (@settings[:global_scale] == scale_value)
         else
-          # Per-map mode: show if matches current map's scale
           current_map_scale = @settings[:map_scale][@current_map] || @settings[:global_scale]
           item.active = (current_map_scale == scale_value)
         end
@@ -1125,10 +1259,8 @@ module ElanthiaMap
           next unless item.active?
 
           if @settings[:global_scale_enabled]
-            # Global mode: set global_scale
             @settings[:global_scale] = value_to_apply
           else
-            # Per-map mode: set this map's scale
             @settings[:map_scale][@current_map] = value_to_apply if @current_map
           end
 
@@ -1143,7 +1275,7 @@ module ElanthiaMap
         submenu.append(item)
       end
 
-      @menu.append(menu_scale)
+      submenu
     end
 
     # Creates the map selection submenu
@@ -1163,15 +1295,15 @@ module ElanthiaMap
       uncategorized = []
       all_maps = []
 
-      # Group maps by their primary category
+      # Group maps by all their categories
       MapData.data.values.sort_by { |m| (m[:name] || '').downcase }.each do |map_info|
         all_maps << map_info
 
         if map_info[:categories] && !map_info[:categories].empty?
-          # Use the first category only (primary category)
-          primary_category = map_info[:categories].keys.first
-          categories[primary_category] ||= []
-          categories[primary_category] << map_info
+          map_info[:categories].keys.each do |category|
+            categories[category] ||= []
+            categories[category] << map_info
+          end
         else
           uncategorized << map_info
         end
@@ -1275,13 +1407,17 @@ module ElanthiaMap
     def build_tags_submenu
       submenu = Gtk::Menu.new
 
+      # Return empty menu when no map is loaded
+      unless @current_map
+        no_map = Gtk::MenuItem.new(label: '(No map loaded)')
+        no_map.sensitive = false
+        submenu.append(no_map)
+        return submenu
+      end
+
       # Filter rooms to current map only
-      current_map_name = @current_map ? File.basename(@current_map) : nil
-      rooms_on_map = if current_map_name
-                       Room.list.select { |r| r.image == current_map_name }
-                     else
-                       Room.list
-                     end
+      current_map_name = File.basename(@current_map)
+      rooms_on_map = Room.list.select { |r| r.image == current_map_name }
 
       # Safely collect and sort tags from rooms on current map
       # Exclude silver-cost and meta tags
@@ -1299,13 +1435,14 @@ module ElanthiaMap
       else
         # Add Clear option at top
         clear_item = Gtk::MenuItem.new(label: 'Clear Tag Markers')
-        clear_item.signal_connect('activate') { clear_tag_markers }
+        clear_item.signal_connect('activate') { @active_tag = nil; clear_tag_markers }
         submenu.append(clear_item)
         submenu.append(Gtk::SeparatorMenuItem.new)
 
         all_tags.each do |tag|
           item = Gtk::MenuItem.new(label: tag)
           item.signal_connect('activate') do
+            @active_tag = tag
             rooms_with_tag = rooms_on_map.select { |r| r.tags&.include?(tag) }
             display_tag_markers(rooms_with_tag)
           end
@@ -1328,13 +1465,17 @@ module ElanthiaMap
     def build_locations_submenu
       submenu = Gtk::Menu.new
 
+      # Return empty menu when no map is loaded
+      unless @current_map
+        no_map = Gtk::MenuItem.new(label: '(No map loaded)')
+        no_map.sensitive = false
+        submenu.append(no_map)
+        return submenu
+      end
+
       # Filter rooms to current map only
-      current_map_name = @current_map ? File.basename(@current_map) : nil
-      rooms_on_map = if current_map_name
-                       Room.list.select { |r| r.image == current_map_name }
-                     else
-                       Room.list
-                     end
+      current_map_name = File.basename(@current_map)
+      rooms_on_map = Room.list.select { |r| r.image == current_map_name }
 
       # Filter out nil and false, ensure we have strings, then sort
       locations = rooms_on_map
@@ -1352,14 +1493,14 @@ module ElanthiaMap
       else
         # Add Clear option at top
         clear_item = Gtk::MenuItem.new(label: 'Clear Location Markers')
-        clear_item.signal_connect('activate') { clear_location_markers }
+        clear_item.signal_connect('activate') { @active_location = nil; clear_location_markers }
         submenu.append(clear_item)
         submenu.append(Gtk::SeparatorMenuItem.new)
 
         locations.each do |location|
           item = Gtk::MenuItem.new(label: location)
           item.signal_connect('activate') do
-            # Compare using string representation since we converted above
+            @active_location = location
             rooms_in_location = rooms_on_map.select { |r| r.location.to_s == location }
             display_location_markers(rooms_in_location)
           end
@@ -1370,9 +1511,17 @@ module ElanthiaMap
       submenu
     end
 
-    # Rebuilds dynamic menus (tags, locations) with current map data
+    # Rebuilds dynamic menus (tags, locations, scale) with current map data
     # @return [void]
     def rebuild_dynamic_menus
+      # Rebuild scale menu only in per-map mode (global mode doesn't vary per map)
+      if @menu_scale && !@settings[:global_scale_enabled]
+        @menu_scale.submenu.destroy if @menu_scale.submenu
+        submenu = build_scale_submenu
+        @menu_scale.submenu = submenu
+        submenu.show_all
+      end
+
       # Rebuild tags menu
       if @menu_tags
         @menu_tags.submenu.destroy if @menu_tags.submenu
@@ -1477,6 +1626,7 @@ module ElanthiaMap
     def handle_button_press(event)
       case event.button
       when 3 # Right click
+        @right_click_x, @right_click_y = get_pointer_position
         @menu.popup_at_pointer(event)
       when 1 # Left click
         start_drag(event)
@@ -1936,6 +2086,71 @@ module ElanthiaMap
       end
     end
 
+    # Clears and redraws all note pin widgets for rooms with saved notes on the current map.
+    #
+    # For each noted room, places two widgets in `@layout`:
+    # - An invisible {Gtk::EventBox} sized to the full room bounding box, which provides
+    #   the hover tooltip over the entire room square.
+    # - A pin emoji {Gtk::Label} pinned to the top-right corner of the room as a visual indicator.
+    #
+    # Reads notes from {#notes_file_path}. Safe to call when no map is loaded.
+    #
+    # @return [void]
+    def redraw_note_pins
+      notes = load_notes
+      Gtk.queue do
+        @note_pin_widgets.each do |w|
+          @layout.remove(w) rescue nil
+          w.destroy rescue nil
+        end
+        @note_pin_widgets = []
+        next unless @current_map
+
+        map_data = @map_cache[@current_map, dark_mode: @settings[:dark_mode]]
+        next unless map_data
+
+        scale = calculate_scale(map_data)
+        notes.each do |room_id, note_text|
+          begin
+            room = Room[room_id.to_i]
+            next unless room && room.image
+            next unless File.join(@map_dir, room.image) == @current_map
+
+            coords = extract_room_coordinates(room)
+            next unless coords
+
+            x1, y1, x2, y2 = coords
+            box_x = (x1 * scale).to_i + @map_offset_x
+            box_y = (y1 * scale).to_i + @map_offset_y
+            box_w = [((x2 - x1) * scale).to_i, 1].max
+            box_h = [((y2 - y1) * scale).to_i, 1].max
+
+            # Invisible EventBox covering the full room square - provides the hover tooltip
+            hover_box = Gtk::EventBox.new
+            hover_box.set_size_request(box_w, box_h)
+            hover_box.tooltip_text = note_text
+            hover_box.has_tooltip = true
+            hover_box.visible_window = false # transparent - doesn't obscure map or clicks
+            @layout.put(hover_box, box_x, box_y)
+            hover_box.show
+            @note_pin_widgets << hover_box
+
+            # pin in the top-right corner of the room as a visual indicator
+            pin = Gtk::Label.new
+            pin.markup = "<span size=\"xx-large\">\u{1F4CC}</span>"
+            pin.tooltip_text = note_text
+            pin.has_tooltip = true
+            @layout.put(pin, box_x + box_w - 10, box_y - 10)
+            pin.show
+            @note_pin_widgets << pin
+          rescue StandardError => e
+            respond "[map notes: error drawing pin for room #{room_id} - #{e.message}]" if @trouble_mode
+          end
+        end
+        @layout.show_all
+      end
+    end
+
     # Centers the viewport on the given coordinates
     # @param x [Integer] X coordinate to center on
     # @param y [Integer] Y coordinate to center on
@@ -2086,6 +2301,34 @@ module ElanthiaMap
           @tag_markers << marker
         end
       end
+    end
+
+    # Refreshes tag markers after a map change.
+    # Re-applies the active tag selection on the new map if the tag exists there,
+    # otherwise just clears the existing markers.
+    #
+    # @return [void]
+    def refresh_tag_markers
+      clear_tag_markers
+      return unless @active_tag && @current_map
+
+      current_map_name = File.basename(@current_map)
+      rooms = Room.list.select { |r| r.image == current_map_name && r.tags&.include?(@active_tag) }
+      display_tag_markers(rooms) unless rooms.empty?
+    end
+
+    # Refreshes location markers after a map change.
+    # Re-applies the active location selection on the new map if the location exists there,
+    # otherwise just clears the existing markers.
+    #
+    # @return [void]
+    def refresh_location_markers
+      clear_location_markers
+      return unless @active_location && @current_map
+
+      current_map_name = File.basename(@current_map)
+      rooms = Room.list.select { |r| r.image == current_map_name && r.location.to_s == @active_location }
+      display_location_markers(rooms) unless rooms.empty?
     end
 
     # Clears all tag markers

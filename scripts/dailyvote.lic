@@ -1,0 +1,399 @@
+# frozen_string_literal: true
+
+=begin
+  author: elanthia-online
+  game: gs
+  tags: utility, vote
+  required: Lich > 5.0.0
+  version: 1.0.0
+
+  changelog:
+    1.0.0 (2025-03-08):
+      Refactored into DailyVote module namespace.
+      Ruby 3+ idioms: frozen string literals, pattern matching, endless methods,
+      hash shorthand, and rightward assignment.
+      Full YARD documentation.
+      DRY HTTP client helper; headers and constants centralised.
+      Migrated from topmudsites.com to mudverse.com/vote/566.
+      Switched to HTTPS with cookie+CSRF session handling.
+      Vote interval changed from 13h to 24h per site rules.
+      Added pre/post vote count and ranking report.
+      Original ;autovote topmudsites.com implementation by Drafix.
+=end
+
+require "net/http"
+require "net/https"
+require "uri"
+
+i_stand_alone
+hide_me
+Script.current.want_downstream = false
+clear
+
+# @!parse
+#   # DailyVote - daily MudVerse voting script for GemStone IV.
+#   #
+#   # Votes once per 24 hours at https://www.mudverse.com/vote/566,
+#   # handles CSRF token extraction and cookie session forwarding,
+#   # and reports pre/post ranking and vote count after each submission.
+#   #
+#   # Usage:
+#   #   ;dailyvote           # start the daily voting loop
+#   #   ;dailyvote test      # print IP, timer state, and current stats (no vote)
+#   #   ;dailyvote now       # force an immediate vote with before/after report
+#   #   ;dailyvote clear     # reset the vote timer so the next loop fires immediately
+module DailyVote
+  # @!group Constants
+
+  # MudVerse host (no scheme).
+  # @return [String]
+  HOST = "www.mudverse.com" unless const_defined?(:HOST)
+
+  # Path to the vote landing page (GET to retrieve CSRF token).
+  # @return [String]
+  VOTE_PATH = "/vote/566" unless const_defined?(:VOTE_PATH)
+
+  # Path that receives the vote POST.
+  # @return [String]
+  POST_PATH = "/" unless const_defined?(:POST_PATH)
+
+  # Path to the game listing page used for stats scraping.
+  # @return [String]
+  STATS_PATH = "/game/566" unless const_defined?(:STATS_PATH)
+
+  # MudVerse listing ID for GemStone IV.
+  # @return [String]
+  LISTING_ID = "566" unless const_defined?(:LISTING_ID)
+
+  # Secondary obfuscation listing ID embedded in the vote form.
+  # @return [String]
+  LISTING_ID2 = "434" unless const_defined?(:LISTING_ID2)
+
+  # Minimum seconds between votes (24 hours).
+  # @return [Integer]
+  VOTE_INTERVAL = 86_400 unless const_defined?(:VOTE_INTERVAL)
+
+  # Settings key used to persist per-IP vote timestamps.
+  # @return [String]
+  SETTINGS_KEY = "mv_last_vote_time" unless const_defined?(:SETTINGS_KEY)
+
+  # Browser-style User-Agent string sent with every request.
+  # @return [String]
+  USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0" unless const_defined?(:USER_AGENT)
+
+  # Common headers included on every HTTPS request.
+  # @return [Hash{String => String}]
+  BASE_HEADERS = {
+    "User-Agent"      => USER_AGENT,
+    "Accept"          => "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language" => "en-US,en;q=0.5",
+    "Connection"      => "keep-alive"
+  }.freeze unless const_defined?(:BASE_HEADERS)
+
+  # @!endgroup
+
+  # Lightweight value object returned by {DailyVote.fetch_stats}.
+  #
+  # @!attribute [r] rank
+  #   @return [String, nil] current ranking on MudVerse, or +nil+ if unparseable
+  # @!attribute [r] votes
+  #   @return [String, nil] vote count (digits only), or +nil+ if unparseable
+  VoteStats = Data.define(:rank, :votes) unless const_defined?(:VoteStats)
+
+  module_function
+
+  # -------------------------------------------------------------------------
+  # Persistence helpers
+  # -------------------------------------------------------------------------
+
+  # Plain-text IPv4 lookup endpoints tried in order. Each must return a bare
+  # IP address string with no extra markup.
+  # @return [Array<Array(String, String)>]
+  IP_PROVIDERS = [
+    ["api.ipify.org",    "/"],
+    ["icanhazip.com",    "/"],
+    ["checkip.amazonaws.com", "/"]
+  ].freeze unless const_defined?(:IP_PROVIDERS)
+
+  # Returns the player's current external IPv4 address, used as a per-machine
+  # key so multiple players sharing a Lich install each track their own timer.
+  #
+  # Tries each provider in {IP_PROVIDERS} in order, returning the first
+  # well-formed IPv4 response. Falls back to +"unknown"+ only if every
+  # provider fails.
+  #
+  # @return [String] dotted-decimal IPv4 address, or +"unknown"+ on total failure
+  def external_ip
+    IP_PROVIDERS.each do |host, path|
+      response = Net::HTTP.get(host, path).strip
+      return response if response.match?(/\A\d{1,3}(?:\.\d{1,3}){3}\z/)
+    rescue => e
+      echo "Warning: IP provider #{host} failed (#{e.message}), trying next..."
+    end
+
+    echo "Warning: all IP providers failed. Using fallback key."
+    "unknown"
+  end
+
+  # Returns the Unix timestamp of the last successful vote for this IP.
+  # Defaults to a time one full interval in the past so the first run fires
+  # immediately.
+  #
+  # @return [Integer] Unix timestamp
+  def last_vote_time
+    Settings[SETTINGS_KEY] ||= {}
+    Settings[SETTINGS_KEY][external_ip] ||= Time.now.to_i - VOTE_INTERVAL
+  end
+
+  # Persists the current time as the last vote timestamp for this IP.
+  #
+  # @return [void]
+  def record_vote_time
+    Settings[SETTINGS_KEY] ||= {}
+    Settings[SETTINGS_KEY][external_ip] = Time.now.to_i
+  end
+
+  # Returns the number of seconds remaining before the next vote is allowed.
+  #
+  # @return [Integer] seconds until next eligible vote (0 if past due)
+  def seconds_until_next_vote
+    [last_vote_time + VOTE_INTERVAL - Time.now.to_i, 0].max
+  end
+
+  # -------------------------------------------------------------------------
+  # Formatting
+  # -------------------------------------------------------------------------
+
+  # Formats a duration in seconds as a human-readable string.
+  #
+  # @param seconds [Integer, Float] duration in seconds
+  # @return [String] formatted string, e.g. +"23h 45m 00s"+
+  def format_duration(seconds)
+    total   = seconds.to_i
+    hours   = total / 3600
+    minutes = (total % 3600) / 60
+    secs    = total % 60
+    format("%02dh %02dm %02ds", hours, minutes, secs)
+  end
+
+  # Formats a {VoteStats} value for inline display.
+  #
+  # @param stats [VoteStats]
+  # @param label [String] prefix label, e.g. +"Before"+ or +"After"+
+  # @return [String]
+  def format_stats(stats, label)
+    rank  = stats.rank  || "(unknown)"
+    votes = stats.votes || "(unknown)"
+    "#{label} - rank: #{rank}, votes: #{votes}"
+  end
+
+  # -------------------------------------------------------------------------
+  # HTTP primitives
+  # -------------------------------------------------------------------------
+
+  # Builds a reusable {Net::HTTP} instance for the MudVerse host with SSL
+  # verification enabled.
+  #
+  # @return [Net::HTTP]
+  def build_http_client
+    Net::HTTP.new(HOST, 443).tap do |http|
+      http.use_ssl     = true
+      http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+    end
+  end
+
+  # Performs a GET request over HTTPS and returns the response body and any
+  # session cookies set by the server.
+  #
+  # @param path [String] absolute path on {HOST}
+  # @return [Array(String, String)] two-element array of +[body, cookie_string]+
+  # @raise [StandardError] on connection or SSL failure
+  def https_get(path)
+    req = Net::HTTP::Get.new(path, BASE_HEADERS)
+    res = build_http_client.request(req)
+
+    cookies = Array(res.get_fields("set-cookie"))
+              .map { _1.split(";").first }
+              .join("; ")
+
+    [res.body.to_s, cookies]
+  end
+
+  # Extracts the value of a hidden HTML +<input>+ field by name.
+  # Handles both attribute orderings (name-before-value and value-before-name).
+  #
+  # @param html [String] raw HTML document
+  # @param field_name [String] the +name+ attribute to search for
+  # @return [String, nil] the field value, or +nil+ if not found
+  def extract_hidden_field(html, field_name)
+    escaped    = Regexp.escape(field_name)
+    pattern_nv = /<input[^>]+name="#{escaped}"[^>]+value="([^"]*)"/
+    pattern_vn = /<input[^>]+value="([^"]*)"[^>]+name="#{escaped}"/
+
+    html.match(pattern_nv)&.[](1) || html.match(pattern_vn)&.[](1)
+  end
+
+  # -------------------------------------------------------------------------
+  # Domain logic
+  # -------------------------------------------------------------------------
+
+  # Fetches the MudVerse game listing page and parses the current ranking and
+  # vote count.
+  #
+  # Targets the canonical summary sentence emitted inside +.listing-rank-summary+:
+  #   Ranked <strong>#4</strong> with <strong>61</strong> votes this month.
+  # Anchoring to that container avoids spurious digit matches elsewhere on the page.
+  #
+  # @return [VoteStats] parsed stats; individual fields are +nil+ if unparseable
+  def fetch_stats
+    body, = https_get(STATS_PATH)
+
+    # Primary: both values from the exact summary sentence inside the container.
+    summary = /listing-rank-summary[^>]*>.*?Ranked\s*<strong>#(\d+)<\/strong>\s*with\s*<strong>(\d[\d,]*)<\/strong>\s*votes/im
+    if (m = body.match(summary))
+      return VoteStats.new(rank: m[1], votes: m[2].gsub(",", ""))
+    end
+
+    # Fallback: scrape each field individually in case sentence structure shifts.
+    rank  = body.match(/<strong>#(\d+)<\/strong>\s*with\s*<strong>\d/)&.[](1)
+    votes = body.match(/<strong>#\d+<\/strong>\s*with\s*<strong>(\d[\d,]*)<\/strong>\s*votes/i)
+                &.[](1)&.gsub(",", "")
+
+    VoteStats.new(rank:, votes:)
+  rescue => e
+    echo "Warning: could not fetch stats - #{e.message}"
+    VoteStats.new(rank: nil, votes: nil)
+  end
+
+  # Executes a single vote against MudVerse:
+  #
+  # 1. GETs the vote landing page to capture the CSRF token and session cookie.
+  # 2. POSTs the vote form with all required hidden fields.
+  #
+  # @return [Boolean] +true+ if the server returned a non-error response;
+  #   +false+ on network failure or an explicit server-side rejection
+  def cast_vote
+    echo "Fetching vote page for CSRF token..."
+    body, cookies = https_get(VOTE_PATH)
+
+    csrf = extract_hidden_field(body, "csrf_token")
+    unless csrf
+      echo "Error: csrf_token not found - the site form may have changed."
+      return false
+    end
+
+    post_headers = BASE_HEADERS.merge(
+      "Content-Type" => "application/x-www-form-urlencoded",
+      "Referer"      => "https://#{HOST}#{VOTE_PATH}",
+      "Origin"       => "https://#{HOST}",
+      "Cookie"       => cookies
+    )
+
+    form_data = {
+      "listing_id"  => LISTING_ID,
+      "csrf_token"  => csrf,
+      "p"           => "vote",
+      "listing_id2" => LISTING_ID2,
+      "submit"      => "Vote"
+    }
+
+    req = Net::HTTP::Post.new(POST_PATH, post_headers)
+    req.set_form_data(form_data)
+    res = build_http_client.request(req)
+
+    case res
+    when Net::HTTPSuccess, Net::HTTPRedirection
+      downcased = res.body.to_s.downcase
+      echo "Vote response: already voted today." if downcased.match?(/already (voted|cast)/)
+      true
+    else
+      echo "Error: HTTP #{res.code} #{res.message}"
+      false
+    end
+  rescue => e
+    echo "Error during vote POST: #{e.message}"
+    false
+  end
+
+  # -------------------------------------------------------------------------
+  # Entry points
+  # -------------------------------------------------------------------------
+
+  # Prints current IP, vote timer state, and live stats without casting a vote.
+  #
+  # @return [void]
+  def run_test
+    echo "External IP     : #{external_ip}"
+    echo "Since last vote : #{format_duration(Time.now.to_i - last_vote_time)}"
+    echo "Until next vote : #{format_duration(seconds_until_next_vote)}"
+    stats = fetch_stats
+    echo "Current rank    : #{stats.rank  || "(could not parse)"}"
+    echo "Current votes   : #{stats.votes || "(could not parse)"}"
+  end
+
+  # Resets the vote timer so the main loop fires on its next iteration.
+  #
+  # @return [void]
+  def run_clear
+    Settings[SETTINGS_KEY] ||= {}
+    Settings[SETTINGS_KEY][external_ip] = Time.now.to_i - VOTE_INTERVAL
+    echo "Vote timer cleared - will vote on next loop."
+  end
+
+  # Forces an immediate vote regardless of the timer, printing before/after stats.
+  #
+  # @return [void]
+  def run_now
+    echo "Forcing immediate vote..."
+    echo format_stats(fetch_stats, "Before")
+
+    if cast_vote
+      record_vote_time
+      echo "Vote submitted!"
+      sleep 5
+      echo format_stats(fetch_stats, "After")
+    else
+      echo "Vote may have failed - check output above."
+    end
+  end
+
+  # Starts the daily voting loop. Sleeps until the next vote is due, then
+  # fetches stats, casts a vote, and reports the result. On failure, retries
+  # after one hour rather than waiting a full 24-hour interval.
+  #
+  # @return [void]
+  def run_loop
+    loop do
+      wait_secs = seconds_until_next_vote
+      if wait_secs.positive?
+        echo "Next vote in #{format_duration(wait_secs)}."
+        sleep wait_secs
+      end
+
+      echo "--- MudVerse DailyVote ---"
+      echo format_stats(fetch_stats, "Before")
+
+      if cast_vote
+        record_vote_time
+        echo "Vote cast successfully!"
+        sleep 5
+        echo format_stats(fetch_stats, "After")
+        echo "Next vote in #{format_duration(VOTE_INTERVAL)}."
+      else
+        echo "Vote attempt failed. Retrying in 1 hour."
+        sleep 3600
+      end
+    end
+  end
+end
+
+# -------------------------------------------------------------------------
+# Dispatch
+# -------------------------------------------------------------------------
+
+case Script.current.vars[1]
+when "test"  then DailyVote.run_test
+when "clear" then DailyVote.run_clear
+when "now"   then DailyVote.run_now
+else              DailyVote.run_loop
+end
