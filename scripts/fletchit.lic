@@ -3,6 +3,7 @@
   Automated fletching script for creating arrows, light bolts, and heavy bolts.
 
   Learning mode will restart after cutting nocks and wait while mind is above the configured threshold.
+  Skips glue, fletchings, paint, and paintsticks. Tries to trash shafts if a receptacle is available.
   Has the ability to make arrows, light bolts, and heavy bolts with full support for painting and cresting.
 
   Have only the fletchings you want to use in your supplies container. The script does not distinguish
@@ -28,10 +29,14 @@
           game: Gemstone
           tags: crafting, fletching, arrows, bolts
       required: Lich >= 5.4.1
-       version: 2.1.0
+       version: 2.2.0
         source: https://github.com/elanthia-online/lich-5-scripts
 
   changelog:
+    2.2.0 (2026-03-05):
+      Significantly expanded capabilities of handling "trash" shafts when in learning mode.
+      Learning mode no longer requires glue, fletchings, paint, or paintsticks.
+      Learning mode will skip attempting to apply paint/paintsticks even when they are configured.
     2.1.0 (2026-02-02):
       Added debug mode setting to enable/disable debug logging
       Fixed bug with cutting shafts
@@ -214,7 +219,7 @@ module FletchIt
     # Current version of the script
     #
     # @note This should be updated whenever significant changes are made
-    VERSION = "2.1.0" unless defined?(FletchIt::Config::VERSION)
+    VERSION = "2.2.0" unless defined?(FletchIt::Config::VERSION)
 
     # Default configuration values for new characters
     #
@@ -688,6 +693,15 @@ module FletchIt
         paintstick2: true
       }
 
+      # In learning mode, we only need wood — no glue, fletchings, paint, or paintsticks
+      if settings[:learning]
+        needs[:glue] = false
+        needs[:fletchings] = false
+        needs[:paint] = false
+        needs[:paintstick1] = false
+        needs[:paintstick2] = false
+      end
+
       # Check what we have
       fletch_sack_contents.each do |item|
         needs[:wood] = false if item.name =~ /shaft/ || item.name =~ /#{settings[:wood]}/
@@ -862,6 +876,24 @@ module FletchIt
   # - Testing with bow/crossbow
   #============================================================================
   module Crafting
+    # Tracks whether a trash receptacle is available in a given room.
+    # Stored as { room_id => true/false } to avoid retesting each iteration.
+    @trash_can_cache = {}
+    # Set to true after user confirms they are OK dropping shafts without a trash can or table.
+    @drop_confirmed = false
+
+    def self.trash_can_available?(room_id)
+      @trash_can_cache[room_id]
+    end
+
+    def self.set_trash_can_status(room_id, available)
+      @trash_can_cache[room_id] = available
+    end
+
+    def self.drop_confirmed?
+      @drop_confirmed
+    end
+
     # Stow an item from left or right hand
     #
     # Checks which hand contains an item and stows it in the specified container.
@@ -1147,23 +1179,24 @@ module FletchIt
 
     # Cut a nock in the shaft (arrows only)
     #
-    # For arrows without paint/crest, cuts nock twice for proper depth.
-    # For painted/crested arrows, cuts nock once (shaft already shortened).
-    # Returns false if shaft is ruined during process.
+    # If painted is true, retrieves the knife (stowed during painting) and
+    # cuts nock once (shaft already shortened by paint/crest application).
+    # If painted is false, cuts nock twice for proper depth.
     #
     # @param settings [Hash] Settings containing ammo type and knife name
+    # @param painted [Boolean] Whether paint/paintsticks were actually applied
     # @return [Symbol] :success, :failed, or :not_arrow
     # @note Only executes for arrows (settings[:ammo] == 1)
     # @note Waits for roundtime between cuts
     # @see GameActions.haste!
-    def self.cut_nock(settings)
-      FletchIt.debug_log("cut_nock called with ammo type: #{settings[:ammo]}")
+    def self.cut_nock(settings, painted: false)
+      FletchIt.debug_log("cut_nock called with ammo type: #{settings[:ammo]}, painted: #{painted}")
       return :not_arrow unless settings[:ammo] == 1 # Only for arrows
 
       waitrt?
 
       # Get knife if we just did painting (it will be stowed)
-      if settings[:paint] != 0 || settings[:paintstick1].length != 0 || settings[:paintstick2].length != 0
+      if painted
         GameActions.get_knife(settings)
         waitrt?
       end
@@ -1175,8 +1208,8 @@ module FletchIt
       pause 0.25
       waitrt?
 
-      # If no paint/paintsticks were used, cut twice
-      if settings[:paint] == 0 && settings[:paintstick1].length == 0 && settings[:paintstick2].length == 0
+      # If shaft was not painted/crested, cut twice for proper nock depth
+      unless painted
         GameActions.haste!
         waitrt?
         fput "cut nock in my shaft with my #{settings[:knife]}"
@@ -1199,8 +1232,12 @@ module FletchIt
 
     # Finalize arrow by adding glue, fletchings, and testing with bow
     #
-    # For learning mode, simply drops the shaft and cleans the table.
-    # Otherwise, completes the arrow:
+    # For learning mode, disposes of the shaft in priority order:
+    # 1. Trash receptacle (tested and cached per room)
+    # 2. Drop and clean table (if room title ends in "Table")
+    # 3. Drop on ground (pauses script once for user confirmation)
+    #
+    # For normal mode, completes the arrow:
     # 1. Gets glue bottle from container
     # 2. Pours glue on shaft
     # 3. Gets fletchings from container
@@ -1213,13 +1250,40 @@ module FletchIt
     # @return [Symbol] :completed or :no_supplies
     # @note Glue drying can take up to 120 seconds
     # @see make_arrow
+    # @see trash_can_available?
+    # @see set_trash_can_status
     def self.finalize_arrow(settings)
       FletchIt.debug_log("finalize_arrow called with learning: #{settings[:learning]}")
-      # For learning mode
+      # For learning mode — try trash can first, fall back to drop
       if settings[:learning]
         waitrt?
-        fput "drop right"
-        fput "clean table"
+        room_id = Room.current.id
+        cached = trash_can_available?(room_id)
+
+        if cached.nil?
+          # Unknown room — test for trash can
+          result = dothistimeout "trash my shaft", 3, /you feel pleased with yourself|You need to find a trash receptacle/
+          cached = result =~ /you feel pleased with yourself/ ? true : false
+          set_trash_can_status(room_id, cached)
+        elsif cached
+          fput "trash my shaft"
+        end
+
+        unless cached
+          if Room.current.title.last =~ /Table\]$/
+            fput "drop right"
+            fput "clean table"
+          else
+            unless drop_confirmed?
+              Lich::Messaging.msg("warn", "No trash can or table found in this room.")
+              Lich::Messaging.msg("warn", "Unpause the script to drop shafts on the ground.")
+              Script.current.pause
+              @drop_confirmed = true
+            end
+            fput "drop right"
+          end
+        end
+
         return :completed
       end
 
@@ -1373,25 +1437,30 @@ module FletchIt
         FletchIt.add_to_stats(:shaft_cut_successes, 1)
       end
 
-      # Apply paint and decorations
-      waitrt?
-      paint_result = apply_paint(settings, paints)
-      return :failed if paint_result == :failed
-      return :no_supplies if paint_result == :no_paint
+      # Apply paint and decorations (skip in learning mode)
+      painted = false
+      unless settings[:learning]
+        waitrt?
+        paint_result = apply_paint(settings, paints)
+        return :failed if paint_result == :failed
+        return :no_supplies if paint_result == :no_paint
 
-      waitrt?
-      paintstick1_result = apply_paintstick(settings, :paintstick1)
-      return :failed if paintstick1_result == :failed
-      return :no_supplies if paintstick1_result == :no_paintstick
+        waitrt?
+        paintstick1_result = apply_paintstick(settings, :paintstick1)
+        return :failed if paintstick1_result == :failed
+        return :no_supplies if paintstick1_result == :no_paintstick
 
-      waitrt?
-      paintstick2_result = apply_paintstick(settings, :paintstick2)
-      return :failed if paintstick2_result == :failed
-      return :no_supplies if paintstick2_result == :no_paintstick
+        waitrt?
+        paintstick2_result = apply_paintstick(settings, :paintstick2)
+        return :failed if paintstick2_result == :failed
+        return :no_supplies if paintstick2_result == :no_paintstick
+
+        painted = settings[:paint] != 0 || settings[:paintstick1].length != 0 || settings[:paintstick2].length != 0
+      end
 
       # Cut nock (for arrows only)
       waitrt?
-      nock_result = cut_nock(settings)
+      nock_result = cut_nock(settings, painted: painted)
       return :failed if nock_result == :failed
 
       # Finalize arrow
