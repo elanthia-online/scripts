@@ -22,6 +22,7 @@ describe GameObj do
         "ascension:quest",
         "bandit",
         "boon",
+        "bottleable",
         "box",
         "breakable",
         "clothing",
