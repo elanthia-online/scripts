@@ -14,9 +14,21 @@ Tracks your current room on visual maps
       game: Gemstone
       tags: core, movement, mapping
       required: Lich >= 5.13.0
-      version: 2.1.0
+      version: 2.1.1
 
   changelog:
+    v2.1.1 (2026-03-22)
+      * Fix crash on long sessions caused by GC collecting signal handler Procs;
+        ruby-gnome2 signal_connect stores Procs only in C-side GLib::Closure which
+        Ruby's GC cannot see — all long-lived handler Procs now explicitly anchored
+        in @_prevent_gc (permanent) and @_dynamic_menu_gc (cleared on menu rebuild)
+      * Fix dynamically rebuilt submenus (Scale, Tags, Locations) leaking GC-eligible
+        Procs on each rebuild via @_dynamic_menu_gc anchor with clear-on-rebuild
+      * Anchor GLib::Timeout callback Proc to prevent GC collection before it fires
+      * Fix position_window crash from GC of chained Gdk::Screen wrapper; break method
+        chain to hold intermediate ref
+      * Make window destroy synchronous to prevent script exit before GTK cleanup completes
+      * Add explicit note pin widget cleanup during window destroy
     v2.1.0 (2026-03-08)
       * Add map notes feature
     v2.0.6 (2026-03-05)
@@ -477,6 +489,14 @@ module ElanthiaMap
       @right_click_x = 0
       @right_click_y = 0
 
+      # Prevent GC of GTK widget Ruby wrappers whose signal handler Procs must stay alive.
+      # GTK's C layer keeps child widgets alive via container references, but Ruby's GC
+      # doesn't see those C-side refs. Without this anchor, wrappers (and their Procs) get
+      # collected, causing "undefined method `call' for String" crashes in lich.rbw's main loop.
+      @_prevent_gc = []
+      # Separate anchor for dynamically rebuilt submenu items (cleared on each rebuild)
+      @_dynamic_menu_gc = []
+
       # Check for special modes
       @fix_mode = script.vars[1] =~ /fix/ ? true : false
       @trouble_mode = script.vars[1] =~ /trouble/ ? true : false
@@ -583,50 +603,75 @@ module ElanthiaMap
     #
     # @return [void]
     def destroy
+      completed = false
       begin
         Gtk.queue do
-          # Clean up markers first
           begin
-            @tag_markers.each do |marker|
-              marker.destroy if marker && !marker.destroyed?
-            end
-            @tag_markers.clear
-          rescue StandardError
-            # Ignore errors
-          end
-
-          begin
-            @location_markers.each do |marker|
-              marker.destroy if marker && !marker.destroyed?
-            end
-            @location_markers.clear
-          rescue StandardError
-            # Ignore errors
-          end
-
-          # Destroy menu before window
-          if @menu && !@menu.destroyed?
-            # No need to detach - menus created with Gtk::Menu.new aren't attached
-            @menu.destroy
-          end
-          @menu = nil
-
-          # Destroy child widgets explicitly
-          if @gtk_window && !@gtk_window.destroyed?
+            # Clean up note pin widgets
             begin
-              # Remove all children from layout to clean up signal handlers
-              if @layout && !@layout.destroyed?
-                @layout.each { |child| @layout.remove(child) rescue nil }
+              @note_pin_widgets.each do |w|
+                @layout.remove(w) rescue nil
+                w.destroy rescue nil
               end
+              @note_pin_widgets.clear
             rescue StandardError
               # Ignore errors
             end
 
-            # Now destroy the window
-            @gtk_window.destroy
+            # Clean up markers
+            begin
+              @tag_markers.each do |marker|
+                marker.destroy if marker && !marker.destroyed?
+              end
+              @tag_markers.clear
+            rescue StandardError
+              # Ignore errors
+            end
+
+            begin
+              @location_markers.each do |marker|
+                marker.destroy if marker && !marker.destroyed?
+              end
+              @location_markers.clear
+            rescue StandardError
+              # Ignore errors
+            end
+
+            # Destroy menu before window
+            if @menu && !@menu.destroyed?
+              # No need to detach - menus created with Gtk::Menu.new aren't attached
+              @menu.destroy
+            end
+            @menu = nil
+
+            # Destroy child widgets explicitly
+            if @gtk_window && !@gtk_window.destroyed?
+              begin
+                # Remove all children from layout to clean up signal handlers
+                if @layout && !@layout.destroyed?
+                  @layout.each { |child| @layout.remove(child) rescue nil }
+                end
+              rescue StandardError
+                # Ignore errors
+              end
+
+              # Now destroy the window
+              @gtk_window.destroy
+            end
+            @gtk_window = nil
+
+            # Release all GC-prevention refs now that widgets are destroyed
+            @_prevent_gc.clear
+            @_dynamic_menu_gc.clear
+          ensure
+            completed = true
           end
-          @gtk_window = nil
         end
+
+        # Wait for Gtk.queue block to finish so GTK has fully disconnected
+        # all signal handlers before the script exits and Procs become GC-eligible
+        timeout = 100
+        sleep 0.01 while !completed && (timeout -= 1) > 0
       rescue StandardError => e
         # Log error if in trouble mode but don't raise
         respond "[map: Error during cleanup: #{e.message}]" if @trouble_mode rescue nil
@@ -921,24 +966,27 @@ module ElanthiaMap
       # Follow mode toggle
       @menu_follow = Gtk::CheckMenuItem.new(label: 'Follow')
       @menu_follow.active = @follow_mode
-      @menu_follow.signal_connect('activate') do
+      follow_handler = proc do
         @follow_mode = @menu_follow.active?
         @temp_follow_disabled = false # User explicitly changed it, so save this state
       end
+      @_prevent_gc << follow_handler
+      @menu_follow.signal_connect('activate', &follow_handler)
       @menu.append(@menu_follow)
 
       # Keep centered toggle
       menu_keep_centered = Gtk::CheckMenuItem.new(label: 'Keep Centered')
       menu_keep_centered.active = @settings[:keep_centered]
-      menu_keep_centered.signal_connect('activate') do
-        @settings[:keep_centered] = menu_keep_centered.active?
-      end
+      keep_centered_handler = proc { @settings[:keep_centered] = menu_keep_centered.active? }
+      @_prevent_gc << keep_centered_handler
+      menu_keep_centered.signal_connect('activate', &keep_centered_handler)
       @menu.append(menu_keep_centered)
+      @_prevent_gc << menu_keep_centered
 
       # Expanded canvas toggle
       menu_expanded_canvas = Gtk::CheckMenuItem.new(label: 'Expanded Canvas')
       menu_expanded_canvas.active = @settings[:expanded_canvas]
-      menu_expanded_canvas.signal_connect('activate') do
+      expanded_handler = proc do
         @settings[:expanded_canvas] = menu_expanded_canvas.active?
         # Reload current map to apply new canvas size
         if @current_map
@@ -948,12 +996,15 @@ module ElanthiaMap
           update_room_marker
         end
       end
+      @_prevent_gc << expanded_handler
+      menu_expanded_canvas.signal_connect('activate', &expanded_handler)
       @menu.append(menu_expanded_canvas)
+      @_prevent_gc << menu_expanded_canvas
 
       # Keep above toggle
       menu_keep_above = Gtk::CheckMenuItem.new(label: 'Keep window on top')
       menu_keep_above.active = @settings[:keep_above]
-      menu_keep_above.signal_connect('activate') do
+      keep_above_handler = proc do
         @settings[:keep_above] = menu_keep_above.active?
         # Apply keep_above setting (stays on top of other windows)
         Gtk.queue do
@@ -962,12 +1013,15 @@ module ElanthiaMap
           # which is separate from keep_above (z-order). Don't link them.
         end
       end
+      @_prevent_gc << keep_above_handler
+      menu_keep_above.signal_connect('activate', &keep_above_handler)
       @menu.append(menu_keep_above)
+      @_prevent_gc << menu_keep_above
 
       # Dark mode toggle
       @menu_dark = Gtk::CheckMenuItem.new(label: 'Dark Mode')
       @menu_dark.active = @settings[:dark_mode]
-      @menu_dark.signal_connect('activate') do
+      dark_handler = proc do
         @settings[:dark_mode] = @menu_dark.active?
         # Clear current map from cache to force reload
         if @current_map
@@ -977,6 +1031,8 @@ module ElanthiaMap
           update_room_marker
         end
       end
+      @_prevent_gc << dark_handler
+      @menu_dark.signal_connect('activate', &dark_handler)
       @menu.append(@menu_dark)
 
       # Opacity submenu
@@ -996,7 +1052,7 @@ module ElanthiaMap
 
       # Find room option
       menu_find = Gtk::MenuItem.new(label: 'Find room...')
-      menu_find.signal_connect('activate') do
+      find_handler = proc do
         Gtk.queue do
           find_window = Gtk::Window.new
           find_window.title = 'Find Room'
@@ -1051,12 +1107,15 @@ module ElanthiaMap
           find_window.show_all
         end
       end
+      @_prevent_gc << find_handler
+      menu_find.signal_connect('activate', &find_handler)
       @menu.append(menu_find)
+      @_prevent_gc << menu_find
 
       # Borderless toggle
       menu_borderless = Gtk::CheckMenuItem.new(label: 'Borderless Window')
       menu_borderless.active = @settings[:borderless]
-      menu_borderless.signal_connect('activate') do
+      borderless_handler = proc do
         @settings[:borderless] = menu_borderless.active?
         Gtk.queue do
           # Capture current window position before hiding
@@ -1073,36 +1132,45 @@ module ElanthiaMap
           @gtk_window.move(x, y)
         end
       end
+      @_prevent_gc << borderless_handler
+      menu_borderless.signal_connect('activate', &borderless_handler)
       @menu.append(menu_borderless)
+      @_prevent_gc << menu_borderless
 
       # Hide scrollbars toggle
       menu_hide_scroll = Gtk::CheckMenuItem.new(label: 'Hide Scrollbars')
       menu_hide_scroll.active = @settings[:hide_scrollbars]
-      menu_hide_scroll.signal_connect('activate') do
+      hide_scroll_handler = proc do
         @settings[:hide_scrollbars] = menu_hide_scroll.active?
         update_scrollbar_visibility
       end
+      @_prevent_gc << hide_scroll_handler
+      menu_hide_scroll.signal_connect('activate', &hide_scroll_handler)
       @menu.append(menu_hide_scroll)
+      @_prevent_gc << menu_hide_scroll
 
       # Dynamic indicator size toggle
       menu_dynamic_indicator = Gtk::CheckMenuItem.new(label: 'Dynamic Indicator Size')
       menu_dynamic_indicator.active = @settings[:dynamic_indicator_size]
-      menu_dynamic_indicator.signal_connect('activate') do
+      dynamic_indicator_handler = proc do
         @settings[:dynamic_indicator_size] = menu_dynamic_indicator.active?
         # Force marker redraw with new size
         update_room_marker
       end
+      @_prevent_gc << dynamic_indicator_handler
+      menu_dynamic_indicator.signal_connect('activate', &dynamic_indicator_handler)
       @menu.append(menu_dynamic_indicator)
+      @_prevent_gc << menu_dynamic_indicator
 
       # Rebuild dynamic menus when menu is about to show
-      @menu.signal_connect('show') do
-        rebuild_dynamic_menus
-      end
+      show_handler = proc { rebuild_dynamic_menus }
+      @_prevent_gc << show_handler
+      @menu.signal_connect('show', &show_handler)
 
       # Map notes menu item
       @menu.append(Gtk::SeparatorMenuItem.new)
       @menu_note = Gtk::MenuItem.new(label: 'Add/Edit Note')
-      @menu_note.signal_connect('activate') do
+      note_handler = proc do
         Gtk.queue do
           map_data = @map_cache[@current_map, dark_mode: @settings[:dark_mode]]
           next unless map_data
@@ -1175,6 +1243,8 @@ module ElanthiaMap
           note_window.keep_above = true
         end
       end
+      @_prevent_gc << note_handler
+      @menu_note.signal_connect('activate', &note_handler)
       @menu.append(@menu_note)
 
       @menu.show_all
@@ -1196,7 +1266,7 @@ module ElanthiaMap
 
         # Capture opacity_value in a local variable for the closure
         value_to_apply = opacity_value
-        item.signal_connect('activate') do
+        handler = proc do
           next unless item.active?
 
           @settings[:opacity] = value_to_apply
@@ -1204,10 +1274,14 @@ module ElanthiaMap
             @gtk_window.set_opacity(value_to_apply)
           end
         end
+        @_prevent_gc << handler
+        item.signal_connect('activate', &handler)
         submenu.append(item)
+        @_prevent_gc << item
       end
 
       @menu.append(menu_opacity)
+      @_prevent_gc << menu_opacity
     end
 
     # Creates the scale submenu
@@ -1226,7 +1300,7 @@ module ElanthiaMap
       # Global Scale checkbox at top
       global_scale_item = Gtk::CheckMenuItem.new(label: 'Global Scale')
       global_scale_item.active = @settings[:global_scale_enabled]
-      global_scale_item.signal_connect('activate') do
+      global_scale_handler = proc do
         @settings[:global_scale_enabled] = global_scale_item.active?
         # Force map reload to apply new scale mode
         if @current_map
@@ -1236,7 +1310,10 @@ module ElanthiaMap
           update_room_marker
         end
       end
+      @_dynamic_menu_gc << global_scale_handler
+      global_scale_item.signal_connect('activate', &global_scale_handler)
       submenu.append(global_scale_item)
+      @_dynamic_menu_gc << global_scale_item
       submenu.append(Gtk::SeparatorMenuItem.new)
 
       # Scale percentage options with radio buttons
@@ -1255,7 +1332,7 @@ module ElanthiaMap
 
         # Capture scale_value for closure
         value_to_apply = scale_value
-        item.signal_connect('activate') do
+        handler = proc do
           next unless item.active?
 
           if @settings[:global_scale_enabled]
@@ -1272,7 +1349,10 @@ module ElanthiaMap
             update_room_marker
           end
         end
+        @_dynamic_menu_gc << handler
+        item.signal_connect('activate', &handler)
         submenu.append(item)
+        @_dynamic_menu_gc << item
       end
 
       submenu
@@ -1321,19 +1401,18 @@ module ElanthiaMap
 
           if map_info[:filename]
             map_path = File.join(@map_dir, map_info[:filename])
-            map_item.signal_connect('activate') do
-              Gtk.queue do
-                change_map(map_path)
-                update_room_marker
-              end
-            end
+            handler = proc { Gtk.queue { change_map(map_path); update_room_marker } }
+            @_prevent_gc << handler
+            map_item.signal_connect('activate', &handler)
           end
 
           category_menu.append(map_item)
+          @_prevent_gc << map_item
         end
 
         category_item.submenu = category_menu
         submenu.append(category_item)
+        @_prevent_gc << category_item
       end
 
       # Add separator before "All Maps"
@@ -1349,19 +1428,18 @@ module ElanthiaMap
 
           if map_info[:filename]
             map_path = File.join(@map_dir, map_info[:filename])
-            map_item.signal_connect('activate') do
-              Gtk.queue do
-                change_map(map_path)
-                update_room_marker
-              end
-            end
+            handler = proc { Gtk.queue { change_map(map_path); update_room_marker } }
+            @_prevent_gc << handler
+            map_item.signal_connect('activate', &handler)
           end
 
           all_maps_menu.append(map_item)
+          @_prevent_gc << map_item
         end
 
         all_maps_item.submenu = all_maps_menu
         submenu.append(all_maps_item)
+        @_prevent_gc << all_maps_item
       end
 
       # Add "Uncategorized Maps" section at the bottom
@@ -1377,19 +1455,18 @@ module ElanthiaMap
 
           if map_info[:filename]
             map_path = File.join(@map_dir, map_info[:filename])
-            map_item.signal_connect('activate') do
-              Gtk.queue do
-                change_map(map_path)
-                update_room_marker
-              end
-            end
+            handler = proc { Gtk.queue { change_map(map_path); update_room_marker } }
+            @_prevent_gc << handler
+            map_item.signal_connect('activate', &handler)
           end
 
           uncategorized_menu.append(map_item)
+          @_prevent_gc << map_item
         end
 
         uncategorized_item.submenu = uncategorized_menu
         submenu.append(uncategorized_item)
+        @_prevent_gc << uncategorized_item
       end
 
       submenu
@@ -1435,18 +1512,24 @@ module ElanthiaMap
       else
         # Add Clear option at top
         clear_item = Gtk::MenuItem.new(label: 'Clear Tag Markers')
-        clear_item.signal_connect('activate') { @active_tag = nil; clear_tag_markers }
+        clear_handler = proc { @active_tag = nil; clear_tag_markers }
+        @_dynamic_menu_gc << clear_handler
+        clear_item.signal_connect('activate', &clear_handler)
         submenu.append(clear_item)
+        @_dynamic_menu_gc << clear_item
         submenu.append(Gtk::SeparatorMenuItem.new)
 
         all_tags.each do |tag|
           item = Gtk::MenuItem.new(label: tag)
-          item.signal_connect('activate') do
+          handler = proc do
             @active_tag = tag
             rooms_with_tag = rooms_on_map.select { |r| r.tags&.include?(tag) }
             display_tag_markers(rooms_with_tag)
           end
+          @_dynamic_menu_gc << handler
+          item.signal_connect('activate', &handler)
           submenu.append(item)
+          @_dynamic_menu_gc << item
         end
       end
 
@@ -1493,18 +1576,24 @@ module ElanthiaMap
       else
         # Add Clear option at top
         clear_item = Gtk::MenuItem.new(label: 'Clear Location Markers')
-        clear_item.signal_connect('activate') { @active_location = nil; clear_location_markers }
+        clear_handler = proc { @active_location = nil; clear_location_markers }
+        @_dynamic_menu_gc << clear_handler
+        clear_item.signal_connect('activate', &clear_handler)
         submenu.append(clear_item)
+        @_dynamic_menu_gc << clear_item
         submenu.append(Gtk::SeparatorMenuItem.new)
 
         locations.each do |location|
           item = Gtk::MenuItem.new(label: location)
-          item.signal_connect('activate') do
+          handler = proc do
             @active_location = location
             rooms_in_location = rooms_on_map.select { |r| r.location.to_s == location }
             display_location_markers(rooms_in_location)
           end
+          @_dynamic_menu_gc << handler
+          item.signal_connect('activate', &handler)
           submenu.append(item)
+          @_dynamic_menu_gc << item
         end
       end
 
@@ -1514,6 +1603,10 @@ module ElanthiaMap
     # Rebuilds dynamic menus (tags, locations, scale) with current map data
     # @return [void]
     def rebuild_dynamic_menus
+      # Release old dynamic menu item refs; the .destroy calls below
+      # disconnect GTK signals before GC can collect the Procs
+      @_dynamic_menu_gc.clear
+
       # Rebuild scale menu only in per-map mode (global mode doesn't vary per map)
       if @menu_scale && !@settings[:global_scale_enabled]
         @menu_scale.submenu.destroy if @menu_scale.submenu
@@ -1567,7 +1660,9 @@ module ElanthiaMap
     # @return [void]
     def setup_event_handlers
       # Window close event
-      @gtk_window.signal_connect('delete_event') do
+      # All signal handler Procs must be anchored on the Ruby side because
+      # signal_connect only stores them in a C-side GLib::Closure that Ruby's GC cannot see.
+      delete_handler = proc do
         respond '[map: === DELETE_EVENT HANDLER CALLED ===]' if @trouble_mode
 
         # Capture window geometry directly (we're already in GTK context, no need for Gtk.queue)
@@ -1600,24 +1695,26 @@ module ElanthiaMap
         # Return true to prevent automatic destruction - we'll handle cleanup in main loop
         true
       end
+      @_prevent_gc << delete_handler
+      @gtk_window.signal_connect('delete_event', &delete_handler)
 
       # Mouse button press
       @layout.add_events(:button_press_mask)
-      @layout.signal_connect('button_press_event') do |_widget, event|
-        handle_button_press(event)
-      end
+      press_handler = proc { |_widget, event| handle_button_press(event) }
+      @_prevent_gc << press_handler
+      @layout.signal_connect('button_press_event', &press_handler)
 
       # Mouse button release
       @layout.add_events(:button_release_mask)
-      @layout.signal_connect('button-release-event') do |_widget, event|
-        handle_button_release(event)
-      end
+      release_handler = proc { |_widget, event| handle_button_release(event) }
+      @_prevent_gc << release_handler
+      @layout.signal_connect('button-release-event', &release_handler)
 
       # Scroll wheel with modifiers for zoom
       @layout.add_events(:scroll_mask)
-      @layout.signal_connect('scroll_event') do |_widget, event|
-        handle_scroll(event)
-      end
+      scroll_handler = proc { |_widget, event| handle_scroll(event) }
+      @_prevent_gc << scroll_handler
+      @layout.signal_connect('scroll_event', &scroll_handler)
     end
 
     # Handles mouse button press events
@@ -1967,14 +2064,17 @@ module ElanthiaMap
             # (if keep_centered is enabled, the room marker display will handle centering)
             unless @settings[:keep_centered]
               # Wait a moment for the layout to be realized with new size
-              GLib::Timeout.add(50) do
+              # Store Proc in ivar to prevent GC before GLib invokes it
+              @_timeout_proc = proc do
                 begin
                   center_viewport_on(center_x, center_y)
                 rescue StandardError
                   # Ignore if window is being destroyed
                 end
+                @_timeout_proc = nil
                 false # Don't repeat
               end
+              GLib::Timeout.add(50, &@_timeout_proc)
             end
           end
         end
@@ -2458,13 +2558,14 @@ module ElanthiaMap
     # @return [void]
     def position_window
       # Get display geometry
+      # Hold intermediate refs to prevent GC of Ruby wrappers between chained calls
       display = Gdk::Display.default
-      geometry = display.default_screen.get_monitor_geometry(
-        display.default_screen.get_monitor_at_point(
-          @char_settings[:window_position][0],
-          @char_settings[:window_position][1]
-        )
+      screen = display.default_screen
+      monitor_idx = screen.get_monitor_at_point(
+        @char_settings[:window_position][0],
+        @char_settings[:window_position][1]
       )
+      geometry = screen.get_monitor_geometry(monitor_idx)
 
       monitor_x = geometry.x || 0
       monitor_y = geometry.y || 0
