@@ -220,5 +220,23 @@ RSpec.describe GameLogger do
       expect(log_content).to include('<!-- Above contents from reget; full logging now active -->')
       expect(log_content.lines.count { |l| l.include?('2026-04-23 10:00:00:') }).to eq(0)
     end
+
+    context 'log file header/footer format' do
+      it 'uses --timestamp format for header when enabled' do
+        $reget_lines = []
+        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%F %T %Z'))
+        run_main
+        header_line = log_content.lines.first.chomp
+        expect(header_line).to eq(frozen_time.strftime('%F %T %Z'))
+      end
+
+      it 'uses default format for header when timestamps disabled' do
+        $reget_lines = []
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        run_main
+        header_line = log_content.lines.first.chomp
+        expect(header_line).to eq(frozen_time.strftime("%Y-%m-%d %H:%M:%S.%L %:z"))
+      end
+    end
   end
 end
