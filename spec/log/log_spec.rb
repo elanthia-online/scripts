@@ -46,6 +46,9 @@ end
 script_path = File.join(__dir__, '..', '..', 'scripts', 'log.lic')
 script_content = File.read(script_path)
 module_code = script_content[/^module GameLogger.*?^end/m]
+raise "Failed to extract GameLogger module from #{script_path}" if module_code.nil?
+raise "Extracted code does not look like a single module" unless module_code.scan(/^module GameLogger/).one?
+
 eval(module_code, binding, script_path,
      script_content.lines.index { |l| l.start_with?('module GameLogger') } + 1)
 
@@ -77,7 +80,8 @@ RSpec.describe GameLogger do
         expect(result.exclude).to eq('288')
       end
 
-      it 'parses --lines with numeric value' do
+      # parse_flag returns strings; main calls .to_i on the result
+      it 'parses --lines as string (coerced later by caller)' do
         result = described_class.parse(['--lines=50000'])
         expect(result.lines).to eq('50000')
       end
