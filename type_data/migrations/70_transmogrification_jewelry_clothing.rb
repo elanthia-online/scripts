@@ -13,6 +13,7 @@ migrate :gemshop, :pawnshop, :jewelry do
   insert(:noun, %{hairpin})
   insert(:noun, %{hairsticks?})
   insert(:noun, %{necklet})
+  insert(:noun, %{pectoral})
 end
 
 migrate :pawnshop, :clothing do
