@@ -16,7 +16,7 @@ migrate :gemshop, :pawnshop, :jewelry do
 end
 
 migrate :pawnshop, :clothing do
-#  insert(:noun, %{case}) # conflicts with base "box" type
+  # insert(:noun, %{case}) # conflicts with base "box" type
   insert(:noun, %{cinch})
   insert(:noun, %{clogs})
   insert(:noun, %{coif})
