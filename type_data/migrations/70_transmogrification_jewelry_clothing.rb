@@ -1,8 +1,9 @@
 migrate :gemshop, :pawnshop, :jewelry do
-  insert(:noun, %{armbands})
+  insert(:noun, %{armbands?})
+  insert(:noun, %{armlet})
   insert(:noun, %{bangle})
   insert(:noun, %{beads})
-  insert(:noun, %{bracers})
+  insert(:noun, %{bracers?})
   insert(:noun, %{collar})
   insert(:noun, %{comb})
   insert(:noun, %{corsage})
@@ -14,6 +15,7 @@ migrate :gemshop, :pawnshop, :jewelry do
   insert(:noun, %{hairsticks?})
   insert(:noun, %{necklet})
   insert(:noun, %{pectoral})
+  insert(:noun, %{studs?})
 end
 
 migrate :pawnshop, :clothing do
