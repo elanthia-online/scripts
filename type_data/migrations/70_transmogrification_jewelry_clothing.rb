@@ -23,7 +23,7 @@ end
 
 migrate :pawnshop, :clothing do
   insert(:noun, %{buskins})
-  # insert(:noun, %{case}) # conflicts with base "box" type
+  insert(:noun, %{case})
   insert(:noun, %{cassock})
   insert(:noun, %{cinch})
   insert(:noun, %{cinture})
@@ -44,4 +44,8 @@ end
 migrate :gemshop, :jewelry do
   insert(:noun, %{periapt})
   insert(:exclude, %{small bone periapt})
+end
+
+migrate :clothing do
+  insert(:exclude, %{(?:(?:shifting) )?(?:(?:acid-pitted|austere|badly damaged|banded|battered|blackened|brass-inlaid|charred|copper-edged|copper-trimmed|corroded|crude|dented|engraved|enruned|fluted|gilded|gold-trimmed|iron-bound|jeweled|lacquered|ornate|painted|plain|riveted|rotting|rusted|rune-incised|scarred|scorched|scratched|scuffed|simple|singed|sturdy|waterlogged|weathered) )?(?:brass|bronze|carved modwir|cedar|cherrywood|cooper|cracked|deeply-scored|deeply scored|delicate|fel|gold|haon|hickory|iron|mahogany|maple|maoral|mithril|modwir|monir|red lacquered|silver|stained|steel|tanik|thanot|walnut|white oak|wooden) (?:box|case|chest|coffer|strongbox|trunk)})
 end
