@@ -29,6 +29,7 @@ migrate :pawnshop, :clothing do
   insert(:noun, %{gauntlets?})
   insert(:noun, %{jerkin})
   insert(:noun, %{haversack})
+  insert(:noun, %{sabots})
   insert(:noun, %{singlet})
   insert(:noun, %{shift})
   insert(:noun, %{smock})
