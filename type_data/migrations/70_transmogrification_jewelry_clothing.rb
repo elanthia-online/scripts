@@ -4,6 +4,7 @@ migrate :gemshop, :pawnshop, :jewelry do
   insert(:noun, %{bangle})
   insert(:noun, %{beads?})
   insert(:noun, %{bracers?})
+  insert(:noun, %{carcanet})
   insert(:noun, %{collar})
   insert(:noun, %{comb})
   insert(:noun, %{corsage})
@@ -13,6 +14,7 @@ migrate :gemshop, :pawnshop, :jewelry do
   insert(:noun, %{hairclip})
   insert(:noun, %{hairpin})
   insert(:noun, %{hairsticks?})
+  insert(:noun, %{locket})
   insert(:noun, %{necklet})
   insert(:noun, %{pectoral})
   insert(:noun, %{studs?})
@@ -22,7 +24,9 @@ end
 migrate :pawnshop, :clothing do
   insert(:noun, %{buskins})
   # insert(:noun, %{case}) # conflicts with base "box" type
+  insert(:noun, %{cassock})
   insert(:noun, %{cinch})
+  insert(:noun, %{cinture})
   insert(:noun, %{clogs})
   insert(:noun, %{coif})
   insert(:noun, %{cowl})
@@ -33,6 +37,7 @@ migrate :pawnshop, :clothing do
   insert(:noun, %{singlet})
   insert(:noun, %{shift})
   insert(:noun, %{smock})
+  insert(:noun, %{soutane})
   insert(:noun, %{tam'o'shanter})
 end
 
