@@ -1,6 +1,7 @@
 migrate :gemshop, :pawnshop, :jewelry do
   insert(:noun, %{armbands?})
   insert(:noun, %{armlets?})
+  insert(:noun, %{armwraps?})
   insert(:noun, %{bangle})
   insert(:noun, %{beads?})
   insert(:noun, %{bracers?})
@@ -40,6 +41,7 @@ migrate :pawnshop, :clothing do
   insert(:noun, %{smock})
   insert(:noun, %{soutane})
   insert(:noun, %{tam'o'shanter})
+  insert(:noun, %{tricorne})
 end
 
 migrate :gemshop, :jewelry do
