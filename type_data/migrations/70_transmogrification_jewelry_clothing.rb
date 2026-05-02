@@ -11,6 +11,7 @@ migrate :gemshop, :pawnshop, :jewelry do
   insert(:noun, %{choker})
   insert(:noun, %{ear studs?})
   insert(:noun, %{fichu})
+  insert(:noun, %{garland})
   insert(:noun, %{hairclip})
   insert(:noun, %{hairpin})
   insert(:noun, %{hairsticks?})
