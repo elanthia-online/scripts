@@ -6,6 +6,7 @@ migrate :gemshop, :pawnshop, :jewelry do
   insert(:noun, %{beads?})
   insert(:noun, %{bracers?})
   insert(:noun, %{carcanet})
+  insert(:noun, %{chaplet})
   insert(:noun, %{collar})
   insert(:noun, %{comb})
   insert(:noun, %{corsage})
