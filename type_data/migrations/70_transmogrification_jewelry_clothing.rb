@@ -19,6 +19,7 @@ migrate :gemshop, :pawnshop, :jewelry do
   insert(:noun, %{locket})
   insert(:noun, %{necklet})
   insert(:noun, %{pectoral})
+  insert(:noun, %{sautoir})
   insert(:noun, %{studs?})
   insert(:noun, %{wristlet})
 end
