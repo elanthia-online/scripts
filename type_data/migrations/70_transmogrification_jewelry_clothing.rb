@@ -52,6 +52,7 @@ migrate :pawnshop, :clothing do
   insert(:noun, %{tam'o'shanter})
   insert(:noun, %{tippet})
   insert(:noun, %{tricorne})
+  insert(:noun, %{undershirt})
 end
 
 migrate :gemshop, :jewelry do
