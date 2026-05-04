@@ -35,6 +35,7 @@ migrate :pawnshop, :clothing do
   insert(:noun, %{clogs})
   insert(:noun, %{coif})
   insert(:noun, %{cowl})
+  insert(:noun, %{diadem})
   insert(:noun, %{footwraps})
   insert(:noun, %{gauntlets})
   insert(:noun, %{handwarmers})
