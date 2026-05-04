@@ -42,6 +42,7 @@ migrate :pawnshop, :clothing do
   insert(:noun, %{jerkin})
   insert(:noun, %{haversack})
   insert(:noun, %{mandelion})
+  insert(:noun, %{plaid})
   insert(:noun, %{sabots})
   insert(:noun, %{singlet})
   insert(:noun, %{shift})
