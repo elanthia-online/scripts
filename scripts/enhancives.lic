@@ -16,9 +16,15 @@
       game: Gemstone
       tags: core, mechanics, utility
       required: Lich > 5.6.2
-      version: 0.0.3 experimental
+      version: 0.0.4 experimental
 
   changelog:
+    v 0.0.4 experimental (2026-05-06)
+      add support for time-charged enhancives (items charged until a date)
+      add separate :time_threshold setting (default 7 days)
+      report now renders a second table for time-charged items
+      main loop now warns on items expiring within the time threshold
+      save_history persists latest expiry for time-charged items
     v 0.0.3 experimental (2025-03-06)
       removed unnecessary namespace scope from script
     v 0.0.2 experimental (2024-07-26)
@@ -36,9 +42,38 @@
 module Enhancives
   extend self # I'ma hear about this one. . .
 
-  @enhancive_rx = %r[\s+(?:an?)? .*? noun=\"(?<noun>[\w]+)\">(?<name>[\w\s\-]+)<\/a>.*?\((?:<pushBold\/>)?(?<current>\d+)(?:<popBold\/>)?\/(?<max>\d+) charges\)]i
+  @enhancive_rx = %r[\s+(?:an?|some)? .*? noun=\"(?<noun>[\w]+)\">(?<name>[\w\s\-]+)<\/a>.*?\((?:<pushBold\/>)?(?<current>\d+)(?:<popBold\/>)?\/(?<max>\d+) charges\)]i
+  @time_charged_rx = %r[\s+(?:an?|some)? .*? noun=\"(?<noun>[\w]+)\">(?<name>[\w\s\-]+)<\/a>.*?\(charged until (?<expires>\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[A-Z]{2,4})\)]i
   @no_enhancive_rx = %r[^You are not (?:holding|wearing)]
   @first_run_detected = false
+
+  # Common North American TZ abbreviations the game emits. Ruby's Time.parse
+  # handles these on most platforms but not reliably on Windows; map explicitly
+  # to avoid a tzinfo dependency.
+  @tz_offsets = {
+    'EST' => '-0500', 'EDT' => '-0400',
+    'CST' => '-0600', 'CDT' => '-0500',
+    'MST' => '-0700', 'MDT' => '-0600',
+    'PST' => '-0800', 'PDT' => '-0700',
+    'AST' => '-0400', 'ADT' => '-0300',
+    'HST' => '-1000', 'AKST' => '-0900', 'AKDT' => '-0800',
+    'UTC' => '+0000', 'GMT' => '+0000'
+  }.freeze
+
+  def parse_expiry(str)
+    # str like "1/3/2031 18:22:31 CST"
+    if (m = str.match(/^(?<date>\d{1,2}\/\d{1,2}\/\d{4})\s+(?<time>\d{1,2}:\d{2}:\d{2})\s+(?<tz>[A-Z]{2,4})$/))
+      offset = @tz_offsets[m[:tz]]
+      if offset
+        Time.strptime("#{m[:date]} #{m[:time]} #{offset}", '%m/%d/%Y %H:%M:%S %z')
+      else
+        # Unknown abbreviation - fall back to Time.parse and accept platform behavior
+        Time.parse(str) rescue nil
+      end
+    else
+      Time.parse(str) rescue nil
+    end
+  end
 
   def db_read
     @settings = DB_Store.read("enhancives") # first run DB_Store will generate an empty hash if nothing is present
@@ -51,16 +86,29 @@ module Enhancives
     else
       @threshold = @settings[:threshold]
     end
+    # Seed time_threshold separately so existing users (who already have :threshold)
+    # also get a default for the time-charged threshold without re-running first-run setup.
+    if @settings[:time_threshold].nil?
+      @time_threshold = 7 # days
+      @settings[:time_threshold] = @time_threshold
+      DB_Store.save("enhancives", @settings)
+    else
+      @time_threshold = @settings[:time_threshold]
+    end
   end
 
   def init
     @enhancive_items = []
+    @time_charged_items = []
     @no_enhancive_found = false
     holding_pattern = 0
     enhancive_items = Lich::Util.issue_command('inventory enhancive list', /You are/, silent: true, quiet: true)
     enhancive_items.each do |returned_line|
-      if (results = returned_line.match(@enhancive_rx).named_captures.transform_keys(&:to_sym))
+      if (results = returned_line.match(@enhancive_rx)&.named_captures&.transform_keys(&:to_sym))
         @enhancive_items.push results
+      elsif (results = returned_line.match(@time_charged_rx)&.named_captures&.transform_keys(&:to_sym))
+        results[:expires_at] = parse_expiry(results[:expires])
+        @time_charged_items.push results
       elsif (results = returned_line.match(@no_enhancive_rx))
         holding_pattern += 1 if results.string =~ /not holding/ or results.string =~ /not wearing/
       end
@@ -69,6 +117,9 @@ module Enhancives
       end
     end
     @enhancive_items.sort_by! { |k| k[:noun] }
+    # Sort time-charged items by soonest expiry first so reports lead with the most urgent.
+    # Items that failed to parse get pushed to the end.
+    @time_charged_items.sort_by! { |k| k[:expires_at] || Time.at(2**31 - 1) }
   end
 
   def reset! # get fresh everything
@@ -106,6 +157,14 @@ module Enhancives
     new_setting(num)
   end
 
+  def time_threshold?
+    @settings[:time_threshold]
+  end
+
+  def time_threshold(num = 7)
+    new_time_setting(num)
+  end
+
   def first_run?
     @first_run_detected
   end
@@ -116,6 +175,10 @@ module Enhancives
 
   def enhancive_items?
     @enhancive_items
+  end
+
+  def time_charged_items?
+    @time_charged_items
   end
 
   def get_setting # largely for testing, may not be needed for production
@@ -130,6 +193,16 @@ module Enhancives
       DB_Store.save('enhancives', @settings)
     else
       _respond Enhancives.msg('Your current threshold of ' + @threshold.to_s + ' is unchanged.')
+    end
+  end
+
+  def new_time_setting(new_setting)
+    unless @time_threshold == new_setting
+      @time_threshold = new_setting
+      @settings[:time_threshold] = @time_threshold
+      DB_Store.save('enhancives', @settings)
+    else
+      _respond Enhancives.msg('Your current time threshold of ' + @time_threshold.to_s + ' days is unchanged.')
     end
   end
 
@@ -154,14 +227,42 @@ module Enhancives
     e_report.align_column 2, :right; e_report.align_column 3, :right; e_report.align_column 4, :center
     _respond Enhancives.msg('Your requested enhancives status report:')
     Lich::Messaging.mono(e_report.to_s)
+
+    # Second table: time-charged enhancives. Only render if any are present.
+    return if @time_charged_items.nil? || @time_charged_items.empty?
+    t_report = Terminal::Table.new  :headings => ['Noun', 'Name', 'Expires', 'Recharge'],
+                                    :style    => { :all_separators => false }
+    @time_charged_items.each { |item|
+      flagged = expiring_soon?(item, @time_threshold)
+      t_report.add_row [item[:noun], item[:name], format_expiry(item), flagged ? " * Yes * " : "No"]
+    }
+    t_report.align_column 2, :right; t_report.align_column 3, :center
+    _respond Enhancives.msg('Your time-charged enhancives:')
+    Lich::Messaging.mono(t_report.to_s)
+  end
+
+  # Returns true if the item's expiry is within `days` from now (or already expired).
+  # Items that failed to parse are treated as not expiring (false) so we don't spam warnings.
+  def expiring_soon?(item, days)
+    return false unless item[:expires_at].is_a?(Time)
+    item[:expires_at] <= Time.now + (days * 86400)
+  end
+
+  def format_expiry(item)
+    return item[:expires] || 'unknown' unless item[:expires_at].is_a?(Time)
+    item[:expires_at].strftime('%m/%d/%Y %H:%M %Z')
   end
 
   def show_item(item)
     results = @enhancive_items.find_all { |x| x[:noun] == item }
+    time_results = @time_charged_items.find_all { |x| x[:noun] == item }
     results.each do |line|
       _respond Enhancives.msg("Your " + line[:name] + " has " + line[:current] + " remaining charges.") unless results.empty?
     end
-    _respond Enhancives.msg("Could not find your item with the noun " + item + "!") if results.empty?
+    time_results.each do |line|
+      _respond Enhancives.msg("Your " + line[:name] + " is charged until " + format_expiry(line) + ".")
+    end
+    _respond Enhancives.msg("Could not find your item with the noun " + item + "!") if results.empty? && time_results.empty?
   end
 
   # This is the monitor method - checking this as shown in loop below prevents panic of 1 charge remaining
@@ -170,6 +271,12 @@ module Enhancives
     results = @enhancive_items.select { |x| x[:current].to_i <= desired }
     # noun, name, current, max
     results.map { |x| x.values[1] }
+  end
+
+  # Mirror of detect_charges for time-charged items.
+  # Returns the names of items expiring within `days` days (or already expired).
+  def detect_expirations(days = 7)
+    @time_charged_items.select { |x| expiring_soon?(x, days) }.map { |x| x[:name] }
   end
 
   def msg(msg)
@@ -191,6 +298,7 @@ module Enhancives
     end
     unless @history_enhancives.empty? # has prior history saved
       @history_enhancives.each do |k, v|
+        next if v[:dates].nil? # time-charged entry, managed by add_time_history
         case @converted.has_key?(k)
         when true
           v[:dates].merge! @converted[k][:dates]
@@ -217,22 +325,44 @@ module Enhancives
 
   def save_history
     add_history(enhancive_items?)
+    add_time_history(time_charged_items?)
     @settings[:last_saved] = Time.now
+  end
+
+  # Time-charged items don't have a fluctuating count to track day-over-day; we just
+  # persist the latest expiry. Stored in the same DB record but as flat entries
+  # (no :dates hash) so show_history can skip them.
+  def add_time_history(items)
+    return if items.nil? || items.empty?
+    @history_enhancives = DB_Store.read('ehistory')
+    @history_enhancives ||= {}
+    items.each do |item|
+      @history_enhancives[item[:name]] = {
+        noun: item[:noun],
+        expires_at: item[:expires_at],
+        expires: item[:expires]
+      }
+    end
+    DB_Store.save('ehistory', @history_enhancives)
   end
 
   def show_history
     # with thanks to Tysong for the Terminal::Table dynamic columns method!
     @history_enhancives = DB_Store.read('ehistory')
-    unless @history_enhancives.empty?
+    # Filter to only charge-history entries (those with a :dates hash). Time-charged
+    # items live in the same store but as flat records without :dates and are
+    # rendered via show_all / show_item instead.
+    charge_history = @history_enhancives.reject { |_k, v| v[:dates].nil? }
+    unless charge_history.empty?
       @dates = []
-      @history_enhancives.each do |_k, v|
+      charge_history.each do |_k, v|
         v[:dates].each { |a, _b|
           @dates.push(a).uniq!.sort!
         }
       end
       headings = ["Name"] + @dates
       rows = []
-      @history_enhancives.map { |h, k|
+      charge_history.map { |h, k|
         data_set = []
         data_set.push(h)
         @dates.each { |date| data_set.push(k[:dates][date]) }
@@ -255,8 +385,12 @@ module Enhancives
     _respond '     ;e Enhancives.threshold(NUM)'; _respond
     _respond 'You can verify your current threshold setting anytime by entering the following command.'
     _respond '     ;e echo Enhancives.threshold?'; _respond
+    _respond 'For time-charged enhancives (items charged until a date), the default warning is 7 days before expiry.'
+    _respond 'Adjust this with the following commands (NUM is days):'
+    _respond '     ;e Enhancives.time_threshold(NUM)'
+    _respond '     ;e echo Enhancives.time_threshold?'; _respond
     _respond 'When you swap or recharge items, after you are done with all the activities, you can update the current enhancive records for continued monitoring by entering the following command.'
-    _respond '     ;e Enhansives.rescan!'; _respond
+    _respond '     ;e Enhancives.rescan!'; _respond
     _respond 'You may also find useful the following commands:'
     _respond '     ;e Enhancives.report'
     _respond '     ;e Enhancives.show_item(\'item noun\')'; _respond
@@ -280,18 +414,27 @@ before_dying {
   Enhancives.unload! unless $_CLIENTBUFFER_.any? { |cmd| cmd =~ /^(?:\[.*?\])?(?:<c>)?(?:quit|exit)/i } or !defined? Enhancives
 }
 # first run, show helpful information
-Enhancives.help if Enhancives.first_run?
+if Enhancives.first_run? || Script.current.vars[1].eql?("help")
+  Enhancives.help
+end
 # main
 loop do
   tracking_threshold = Enhancives.threshold?
   tracking = Enhancives.detect_charges(tracking_threshold)
+  time_tracking_threshold = Enhancives.time_threshold?
+  time_tracking = Enhancives.detect_expirations(time_tracking_threshold)
   sleep 0.1
   _respond Enhancives.msg('You do not seem to have any enhancive items held or worn.') if Enhancives.no_enhancive_found?
-  _respond Enhancives.msg('Everything seems in order with your enhancives.') if tracking.empty? and not Enhancives.no_enhancive_found?
+  _respond Enhancives.msg('Everything seems in order with your enhancives.') if tracking.empty? and time_tracking.empty? and not Enhancives.no_enhancive_found?
   _respond # not useless white space for old eyes
   unless tracking.empty?
     tracking.each do |line|
       _respond Enhancives.msg('Your ' + line + ' is below your threshold!')
+    end
+  end
+  unless time_tracking.empty?
+    time_tracking.each do |line|
+      _respond Enhancives.msg('Your ' + line + ' is expiring within your time threshold!')
     end
   end
   sleep 3600 # pre 5.10 production check hourly for changes to charges
