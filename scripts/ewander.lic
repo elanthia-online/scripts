@@ -10,7 +10,7 @@
   Use   ;ewander add              and
           ;ewander remove           to set up boundaries to keep you in your hunting area.
   Use   ;ewander delay <number>   to set the movement delay
-  Use   ;ewander <npc1> <npc2>    to stop only for specific npcs.
+  Use   ;ewander <npc1> <npc2>    to stop and target specific npcs (priority order, left to right).
   Use   ;ewander <pc>             to stop for another specific character.
   Use   ;ewander                  to stop for any targetable npcs.
 
@@ -18,9 +18,22 @@
      game: Gemstone
      tags: movement
  required: Lich >= 5.11.0
-  version: 1.0.0
+  version: 2.0.0
 
   changelog:
+    2.0.0 (2026-04-29):
+      - refactored into EWander module namespace with proper class architecture
+      - find_target now filters animated NPCs (except animated slush) and
+        arm/appendage/claw/limb/pincer/tentacle nouns (except named kraken tentacles)
+      - targeting command only issued for hostile NPCs (via GameObj.targets); non-hostile
+        matches (e.g. town NPCs) still stop wandering but skip the target command
+      - pre-move PC detection now breaks instead of continuing to wander
+      - modern Ruby idioms throughout
+    1.1.0 (2026-03-27):
+      - when given NPC name arguments, auto-target the matched creature before stopping
+      - NPC name arguments are treated as priority order (first arg = highest priority)
+      - check for matching NPCs before moving, catching creatures that enter mid-room
+      - skip player-controlled animates (names containing "animated")
     1.0.0 (2025-03-19):
       - initial fork of wander.lic
 =end
@@ -40,248 +53,503 @@
 
 =end
 
-CharSettings['boundary']     ||= Array.new
-CharSettings['untargetable'] ||= Array.new
-CharSettings['targetable']   ||= Array.new
-CharSettings['delay']        ||= 1.0
-$wander_rooms                ||= Array.new
-dirs                           = ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest']
-reverse_dir                    = { 'north' => 'south', 'northeast' => 'southwest', 'east' => 'west', 'southeast' => 'northwest', 'south' => 'north', 'southwest' => 'northeast', 'west' => 'east', 'northwest' => 'southeast' }
-# fixme: room numbers are for Prime only
-hot_confluence_rooms           = [23282, 23283, 23284, 23285, 23286, 23287, 23288, 23289, 23290, 23291, 23292, 23293, 23294, 23295, 23296, 23297, 23298, 23299, 23300, 23301, 23302, 23303, 23329, 23330, 23331, 23332, 23333, 23334]
+module EWander
+  # Compass directions for Confluence rotation logic
+  DIRS = %w[north northeast east southeast south southwest west northwest].freeze unless defined?(DIRS)
 
-wander = proc {
-  if (checkroom == '[Elemental Confluence]') and (XMLData.game == 'GSIV')
-    $mapdb_confluence_wayto ||= Hash.new
-    begin
-      start_room = Room.current
-      if $mapdb_confluence_wayto[start_room.id].nil?
-        raise "Restarting" if Room.current != start_room
-        $mapdb_confluence_wayto[start_room.id] = Hash.new
-        XMLData.room_exits.each { |d| $mapdb_confluence_wayto[start_room.id][d] = nil }
+  # Reverse mapping for Confluence rotation
+  REVERSE_DIR = {
+    'north' => 'south', 'northeast' => 'southwest',
+    'east' => 'west', 'southeast' => 'northwest',
+    'south' => 'north', 'southwest' => 'northeast',
+    'west' => 'east', 'northwest' => 'southeast'
+  }.freeze unless defined?(REVERSE_DIR)
+
+  # fixme: room numbers are for Prime only
+  HOT_CONFLUENCE_ROOMS = [
+    23282, 23283, 23284, 23285, 23286, 23287, 23288, 23289,
+    23290, 23291, 23292, 23293, 23294, 23295, 23296, 23297,
+    23298, 23299, 23300, 23301, 23302, 23303, 23329, 23330,
+    23331, 23332, 23333, 23334
+  ].freeze unless defined?(HOT_CONFLUENCE_ROOMS)
+
+  # NPC noun patterns that represent body parts, not standalone creatures
+  APPENDAGE_NOUN_RE = /^(?:arm|appendage|claw|limb|pincer|tentacle)s?$|^(?:palpus|palpi)$/i unless defined?(APPENDAGE_NOUN_RE)
+
+  # Named kraken tentacles that ARE valid standalone targets
+  KRAKEN_TENTACLE_RE = /(?:amaranthine|ghostly|grizzled|ancient) kraken tentacle/i unless defined?(KRAKEN_TENTACLE_RE)
+
+  # ---------------------------------------------------------------------------
+  # Settings helpers
+  # ---------------------------------------------------------------------------
+  module Settings
+    module_function
+
+    def boundary
+      CharSettings['boundary'] ||= []
+    end
+
+    def untargetable
+      CharSettings['untargetable'] ||= []
+    end
+
+    def targetable
+      CharSettings['targetable'] ||= []
+    end
+
+    def delay
+      CharSettings['delay'] ||= 1.0
+    end
+
+    def delay=(value)
+      CharSettings['delay'] = value.to_f
+    end
+
+    def clear!
+      CharSettings['boundary']     = []
+      CharSettings['untargetable'] = []
+      CharSettings['targetable']   = []
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Targeting logic
+  # ---------------------------------------------------------------------------
+  module Targeting
+    module_function
+
+    # Find first live NPC matching any of +names+ in priority order,
+    # respecting animated/appendage filters. Does NOT require the NPC
+    # to be hostile — use target_npc! at the call site to gate the
+    # target command on hostility.
+    #
+    # @param names [Array<String>] NPC name patterns (priority order)
+    # @return [GameObj, nil]
+    def find_target(names)
+      names.each do |name|
+        found = GameObj.npcs.find do |npc|
+          next if npc.status =~ /dead|gone/i
+
+          # Skip animated NPCs (except animated slush)
+          next if npc.name =~ /^animated\b/i && npc.name !~ /^animated slush/i
+
+          # Skip appendage/arm nouns (except named kraken tentacles)
+          next if npc.noun =~ APPENDAGE_NOUN_RE && npc.name !~ KRAKEN_TENTACLE_RE
+
+          # Must match the requested name pattern
+          next unless npc.name =~ /#{name}/i
+
+          true
+        end
+        return found if found
       end
-      if ($mapdb_confluence_wayto[start_room.id].keys != XMLData.room_exits)
-        raise "Restarting" if Room.current != start_room
-        $mapdb_confluence_wayto = Hash.new
-        raise "Restarting"
-      end
-      dir = $mapdb_confluence_wayto[start_room.id].keys.find { |d| $mapdb_confluence_wayto[start_room.id][d].nil? }
-      if dir.nil?
-        dir = $mapdb_confluence_wayto[start_room.id].keys.find { |d| not $wander_rooms.include?($mapdb_confluence_wayto[start_room.id][d]) }
-      end
-      if dir.nil?
-        next_id = $wander_rooms.find { |i| $mapdb_confluence_wayto[start_room.id].values.include?(i) }
-        dir = $mapdb_confluence_wayto[start_room.id].keys.find { |d| $mapdb_confluence_wayto[start_room.id][d] == next_id }
-      end
-      if dir.nil?
-        dir = XMLData.room_exits[rand(XMLData.room_exits.length)]
-      end
-      r = move dir.dup
-      if r == false
-        # maze probably changed and XMLData.room_exits is wrong
-        status_tags
-        result = dothistimeout 'look', 5, /<compass>/
-        status_tags
-        options = result.scan(/<dir value=\"(.*?)\"/).flatten
-        move options[rand(options.length)]
+      nil
+    end
+
+    # Check whether an NPC is hostile (present in GameObj.targets).
+    #
+    # @param npc [GameObj]
+    # @return [Boolean]
+    def hostile?(npc)
+      GameObj.targets.map(&:id).include?(npc.id)
+    end
+
+    # Issue a target command for an NPC, but only if it is hostile
+    # (present in GameObj.targets). Non-hostile NPCs (e.g. town NPCs)
+    # are silently skipped — the caller should still break the loop.
+    #
+    # @param npc [GameObj]
+    # @return [Boolean] true if target command was sent
+    def target_npc!(npc)
+      if GameObj.targets.map(&:id).include?(npc.id)
+        fput("target ##{npc.id}")
+        waitrt?
+        true
       else
-        end_room = Room.current
-        $wander_rooms.delete(end_room.id)
-        $wander_rooms.push(end_room.id)
-        $mapdb_confluence_wayto[start_room.id][dir] = end_room.id
-        if hot_confluence_rooms.include?(end_room.id)
-          if GameObj.loot.any? { |o| o.name == 'point of elemental tranquility' }
-            $mapdb_confluence_hot_tranquility = end_room.id
-          elsif $mapdb_confluence_hot_tranquility == end_room.id
-            $mapdb_confluence_hot_tranquility = nil
-          end
-          if GameObj.loot.any? { |o| o.name == 'gaping bottomless pit' }
-            $mapdb_confluence_hot_pit = end_room.id
-          elsif $mapdb_confluence_hot_pit == end_room.id
-            $mapdb_confluence_hot_pit = nil
-          end
+        false
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Wander movement engine
+  # ---------------------------------------------------------------------------
+  module Movement
+    module_function
+
+    def wander_rooms
+      $wander_rooms ||= []
+    end
+
+    def wander!
+      if (checkroom == '[Elemental Confluence]') && (XMLData.game == 'GSIV')
+        wander_gsiv_confluence!
+      elsif checkroom == '[Elemental Confluence]'
+        wander_other_confluence!
+      else
+        wander_standard!
+      end
+    end
+
+    # Standard map-based wandering
+    def wander_standard!
+      room = Room.current
+      next_room_options = room.wayto.keys - Settings.boundary
+      next_room_options.delete_if { |room_id| room.timeto[room_id].is_a?(Proc) && room.timeto[room_id].call.nil? }
+
+      unvisited = next_room_options.reject { |r| wander_rooms.include?(r) }
+
+      next_room = if unvisited.empty?
+                    wander_rooms.find { |r| next_room_options.include?(r) }
+                  else
+                    unvisited.sample
+                  end
+      return sleep(Settings.delay) if next_room.nil?
+
+      wander_rooms.delete(next_room)
+      wander_rooms.push(next_room)
+
+      way = room.wayto[next_room]
+      wait_while { ($loot_grab_list.length.to_i > 0) || $loot_working }
+
+      if way.is_a?(String)
+        move(way)
+      elsif way.respond_to?(:call)
+        way.call
+      else
+        sleep Settings.delay
+      end
+    end
+
+    # GSIV Elemental Confluence wandering with room mapping
+    def wander_gsiv_confluence!
+      $mapdb_confluence_wayto ||= {}
+
+      begin
+        start_room = Room.current
+        wayto = ($mapdb_confluence_wayto[start_room.id] ||= {})
+
+        raise "Restarting" if Room.current != start_room
+
+        XMLData.room_exits.each { |d| wayto[d] = nil unless wayto.key?(d) }
+
+        if wayto.keys != XMLData.room_exits
+          raise "Restarting" if Room.current != start_room
+          $mapdb_confluence_wayto = {}
+          raise "Restarting"
+        end
+
+        # Priority: unexplored → unvisited → least-recently-visited
+        dir = wayto.keys.find { |d| wayto[d].nil? }
+        dir ||= wayto.keys.find { |d| !wander_rooms.include?(wayto[d]) }
+
+        if dir.nil?
+          next_id = wander_rooms.find { |i| wayto.values.include?(i) }
+          dir = wayto.keys.find { |d| wayto[d] == next_id }
+        end
+
+        dir ||= XMLData.room_exits.sample
+
+        result = move(dir.dup)
+        if result == false
+          status_tags
+          look_result = dothistimeout('look', 5, /<compass>/)
+          status_tags
+          options = look_result.scan(/<dir value="(.*?)"/).flatten
+          move(options.sample)
         else
-          if GameObj.loot.any? { |o| o.name == 'point of elemental tranquility' }
-            $mapdb_confluence_cold_tranquility = end_room.id
-          elsif $mapdb_confluence_cold_tranquility == end_room.id
-            $mapdb_confluence_cold_tranquility = nil
+          end_room = Room.current
+          wander_rooms.delete(end_room.id)
+          wander_rooms.push(end_room.id)
+          wayto[dir] = end_room.id
+          track_confluence_landmarks!(end_room)
+        end
+      rescue
+        retry
+      end
+    end
+
+    # Non-GSIV Confluence rotation-based wandering
+    def wander_other_confluence!
+      if $mapdb_confluence_last_dir.nil?
+        $mapdb_confluence_last_dir = XMLData.room_exits.sample
+        result = move($mapdb_confluence_last_dir)
+      else
+        reverse_idx = DIRS.index(REVERSE_DIR[$mapdb_confluence_last_dir])
+        idx = reverse_idx
+        8.times do
+          idx = (idx + 1) % 8
+          if XMLData.room_exits.include?(DIRS[idx])
+            $mapdb_confluence_last_dir = DIRS[idx]
+            break
           end
-          if GameObj.loot.any? { |o| o.name == 'gaping bottomless pit' }
-            $mapdb_confluence_cold_pit = end_room.id
-          elsif $mapdb_confluence_cold_pit == end_room.id
-            $mapdb_confluence_cold_pit = nil
+        end
+        result = move($mapdb_confluence_last_dir)
+      end
+
+      waitrt?
+
+      # Handle stale exit data
+      if result == false
+        status_tags
+        look_result = dothistimeout('look', 5, /<compass>/)
+        options = look_result.scan(/<dir value="(.*?)"/).flatten
+        $mapdb_confluence_last_dir = options.sample
+        move($mapdb_confluence_last_dir)
+      end
+    end
+
+    # Track tranquility/pit landmarks in confluence rooms
+    def track_confluence_landmarks!(end_room)
+      is_hot = HOT_CONFLUENCE_ROOMS.include?(end_room.id)
+
+      has_tranquility = GameObj.loot.any? { |o| o.name == 'point of elemental tranquility' }
+      has_pit         = GameObj.loot.any? { |o| o.name == 'gaping bottomless pit' }
+
+      if is_hot
+        if has_tranquility
+          $mapdb_confluence_hot_tranquility = end_room.id
+        elsif $mapdb_confluence_hot_tranquility == end_room.id
+          $mapdb_confluence_hot_tranquility = nil
+        end
+
+        if has_pit
+          $mapdb_confluence_hot_pit = end_room.id
+        elsif $mapdb_confluence_hot_pit == end_room.id
+          $mapdb_confluence_hot_pit = nil
+        end
+      else
+        if has_tranquility
+          $mapdb_confluence_cold_tranquility = end_room.id
+        elsif $mapdb_confluence_cold_tranquility == end_room.id
+          $mapdb_confluence_cold_tranquility = nil
+        end
+
+        if has_pit
+          $mapdb_confluence_cold_pit = end_room.id
+        elsif $mapdb_confluence_cold_pit == end_room.id
+          $mapdb_confluence_cold_pit = nil
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # CLI subcommands
+  # ---------------------------------------------------------------------------
+  module CLI
+    module_function
+
+    def run(script)
+      args = script.vars
+      cmd  = args[1]
+
+      case cmd
+      when /\Ahelp\z/i         then show_help
+      when /\A(?:add|set)\z/i  then add_boundary(script)
+      when /\A(?:del(?:ete)?|rem(?:ove)?)\z/i then remove_boundary(script)
+      when /\Adelay\z/i        then set_delay(script)
+      when /\Alist\z/i         then show_list
+      when /\Aclear\z/i        then clear_all
+      when nil                 then Loops.wander_any_target
+      else                          Loops.wander_named_targets(script)
+      end
+    end
+
+    def show_help
+      respond <<~HELP
+
+        ;ewander add              adds the current room to the boundary list
+        ;ewander add <room id>    adds the given room id to the boundary list
+        ;ewander rem              deletes the current room to the boundary list
+        ;ewander rem <room id>    deletes the given room id to the boundary list
+        ;ewander clear            clears the boundary list and npc info
+        ;ewander delay <seconds>  sets the delay before moving to the next room
+        ;ewander list             shows saved boundaries and npc info
+        ;ewander <npc1> <npc2>    wanders around, stopping only for the given npcs
+        ;ewander                  wanders around, stopping only for targetable npcs
+
+      HELP
+    end
+
+    def add_boundary(script)
+      if script.vars[2]
+        script.vars[2..].each do |var|
+          if var =~ /\A[0-9]+\z/
+            Settings.boundary.push(var)
+            echo "room #{var} has been added to the boundary list"
+          else
+            echo "ignoring #{var}: not a room id"
+          end
+        end
+      elsif (room = Room.current)
+        Settings.boundary.push(room.id.to_s)
+        echo "this room (#{room.id}) has been added to the boundary list"
+      else
+        echo 'error: current room is unknown'
+      end
+    end
+
+    def remove_boundary(script)
+      if script.vars[2]
+        script.vars[2..].each do |var|
+          if var =~ /\A[0-9]+\z/
+            if Settings.boundary.delete(var)
+              echo "room #{var} has been removed from the boundary list"
+            else
+              echo "room #{var} was not found in the boundary list"
+            end
+          else
+            echo "ignoring #{var}: not a room id"
+          end
+        end
+      elsif (room = Room.current)
+        if Settings.boundary.delete(room.id.to_s)
+          echo "this room (#{room.id}) has been removed from the boundary list"
+        else
+          echo "this room (#{room.id}) was not found in the boundary list"
+        end
+      else
+        echo 'current room is unknown'
+      end
+    end
+
+    def set_delay(script)
+      if script.vars[2] =~ /\A[0-9.]+\z/
+        Settings.delay = script.vars[2]
+        echo "movement delay is now #{Settings.delay}"
+      else
+        echo "usage: ;ewander delay <seconds>"
+      end
+    end
+
+    def show_list
+      output = "\n"
+
+      if Settings.boundary.empty?
+        output << "   boundaries: none\n"
+      else
+        output << "   boundaries:\n"
+        Settings.boundary.each do |boundary|
+          room = Room[boundary]
+          title = room&.title&.first || '(unknown room)'
+          output << "      #{boundary.to_s.rjust(5)}   #{title}\n"
+        end
+      end
+
+      output << "\n"
+      output << if Settings.targetable.empty?
+                  "   targetable npcs: none\n"
+                else
+                  "   targetable npcs: #{Settings.targetable.join(', ')}\n"
+                end
+
+      output << "\n"
+      output << if Settings.untargetable.empty?
+                  "   untargetable npcs: none\n"
+                else
+                  "   untargetable npcs: #{Settings.untargetable.join(', ')}\n"
+                end
+
+      output << "\n"
+      respond output
+    end
+
+    def clear_all
+      Settings.clear!
+      respond 'done'
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Main wander loops
+  # ---------------------------------------------------------------------------
+  module Loops
+    module_function
+
+    # Wander stopping for any hostile NPC (no name args given)
+    def wander_any_target
+      loop do
+        Movement.wander!
+        start_npcs = npcs = GameObj.targets
+        npcs = npcs.reject { |npc| Settings.untargetable.include?(npc.name) }
+
+        if !Claim.mine?
+          sleep Settings.delay
+        elsif npcs.any? { |npc| Settings.targetable.include?(npc.name) }
+          break
+        else
+          clear
+          target_result = dothistimeout('target random', 5, /^Could not find a valid target\.$|^You are now targeting/)
+          if target_result =~ /^You are now targeting \w+ (.*)\.$/
+            target_name = $1
+            Settings.targetable.push(target_name) unless Settings.targetable.include?(target_name)
+            break
+          elsif target_result == 'Could not find a valid target.'
+            if GameObj.targets == start_npcs
+              npcs.each { |npc| Settings.untargetable.push(npc.name) unless Settings.untargetable.include?(npc.name) }
+            end
+            sleep Settings.delay
           end
         end
       end
-    rescue
-      retry
     end
-  elsif checkroom == '[Elemental Confluence]'
-    if $mapdb_confluence_last_dir.nil?
-      $mapdb_confluence_last_dir = XMLData.room_exits[rand(XMLData.room_exits.length)]
-      result = move $mapdb_confluence_last_dir
-    else
-      i = dirs.index(reverse_dir[$mapdb_confluence_last_dir])
-      8.times {
-        i += 1
-        i = i % 8
-        if XMLData.room_exits.include?(dirs[i])
-          $mapdb_confluence_last_dir = dirs[i]
+
+    # Wander stopping for specific named NPCs / PCs
+    def wander_named_targets(script)
+      names    = script.vars[1..]
+      pc_regex = /#{names.join('|')}/i
+
+      loop do
+        # Pre-move: check for matching PC → break immediately
+        if GameObj.pcs.any? { |pc| pc.noun =~ pc_regex }
           break
         end
-      }
-      result = move $mapdb_confluence_last_dir
-    end
-    waitrt?
-    if result == false
-      # maze probably changed and XMLData.room_exits is wrong
-      status_tags
-      result = dothistimeout 'look', 5, /<compass>/
-      status_tags
-      options = result.scan(/<dir value="(.*?)"/).flatten
-      $mapdb_confluence_last_dir = options[rand(options.length)]
-      move $mapdb_confluence_last_dir
-    end
-  else
-    room = Room.current
-    next_room_options = room.wayto.keys - CharSettings['boundary']
-    next_room_options.delete_if { |room_id| (room.timeto[room_id].class == Proc) and room.timeto[room_id].call.nil? }
-    next_room = next_room_options.find_all { |w_r| not $wander_rooms.include?(w_r) }
-    if next_room.empty?
-      next_room = $wander_rooms.find { |w_r| next_room_options.include?(w_r) }
-    else
-      next_room = next_room[rand(next_room.length)]
-    end
-    $wander_rooms.delete(next_room)
-    $wander_rooms.push(next_room)
-    way = room.wayto[next_room]
-    wait_while { ($loot_grab_list.length.to_i > 0) or $loot_working }
-    if way.class == String
-      move(way)
-    else
-      way.call
-    end
-  end
-}
 
-if script.vars[1] =~ /help/i
-  output = "\n"
-  output.concat ";ewander add              adds the current room to the boundary list\n"
-  output.concat ";ewander add <room id>    adds the given room id to the boundary list\n"
-  output.concat ";ewander rem              deletes the current room to the boundary list\n"
-  output.concat ";ewander rem <room id>    deletes the given room id to the boundary list\n"
-  output.concat ";ewander clear            clears the boundary list and npc info\n"
-  output.concat ";ewander delay <seconds>  sets the delay before moving to the next room\n"
-  output.concat ";ewander list             shows saved boundaries and npc info\n"
-  output.concat ";ewander <npc1> <npc2>    wanders around, stopping only for the given npcs\n"
-  output.concat ";ewander                  wanders around, stopping only for targetable npcs\n"
-  output.concat "\n"
-  respond output
-elsif script.vars[1] =~ /^add$|^set$/i
-  if script.vars[2]
-    for var in script.vars[2..-1]
-      if var =~ /^[0-9]+$/
-        CharSettings['boundary'].push(var)
-        echo "room #{var} has been added to the boundary list"
-      else
-        echo "ignoring #{var}: not a room id"
-      end
-    end
-  elsif (room = Room.current)
-    CharSettings['boundary'].push(room.id.to_s)
-    echo "this room (#{room.id}) has been added to the boundary list"
-  else
-    echo 'error: current room is uknown'
-  end
-elsif script.vars[1] =~ /^del(?:ete)?$|^rem(?:ove)?$/i
-  if script.vars[2]
-    for var in script.vars[2..-1]
-      if var =~ /^[0-9]+$/
-        if CharSettings['boundary'].delete(var)
-          echo "room #{var} has been removed from the boundary list"
+        # Pre-move: check for matching NPC before wandering (catches spawns mid-room)
+        found_npc = Targeting.find_target(names)
+        if found_npc
+          if Targeting.hostile?(found_npc)
+            # Hostile NPC — only stop if we have valid claim
+            if Claim.mine?
+              Targeting.target_npc!(found_npc)
+              break
+            end
+          else
+            # Non-hostile NPC (e.g. constable) — always stop, never target
+            break
+          end
+        end
+
+        Movement.wander!
+
+        # Post-move: matching PC detected → stop
+        if GameObj.pcs.any? { |pc| pc.noun =~ pc_regex }
+          break
+        end
+
+        # Post-move: look for matching NPC
+        found_npc = Targeting.find_target(names)
+        if found_npc
+          if Targeting.hostile?(found_npc)
+            if Claim.mine?
+              Targeting.target_npc!(found_npc)
+              break
+            else
+              sleep Settings.delay
+            end
+          else
+            break
+          end
         else
-          echo "room #{var} was not found in the boundary list"
+          sleep Settings.delay
         end
-      else
-        echo "ignoring #{var}: not a room id"
       end
     end
-  elsif (room = Room.current)
-    if CharSettings['boundary'].delete(room.id.to_s)
-      echo "this room (#{room.id}) has been removed from the boundary list"
-    else
-      echo "this room (#{room.id}) was not found in the boundary list"
-    end
-  else
-    echo 'current room is uknown'
   end
-elsif (script.vars[1] =~ /^delay$/i) and (script.vars[2] =~ /^[0-9\.]+$/)
-  CharSettings['delay'] = script.vars[2].to_f
-  echo "movement delay is now #{CharSettings['delay']}"
-elsif script.vars[1] =~ /^list$/i
-  output = "\n"
-  if CharSettings['boundary'].empty?
-    output.concat "   boundaries: none\n"
-  else
-    output.concat "   boundaries:\n"
-    for boundary in CharSettings['boundary']
-      output.concat "      #{boundary.to_s.rjust(5)}   #{Room[boundary].title.first}\n"
-    end
-  end
-  output.concat "\n"
-  if CharSettings['targetable'].empty?
-    output.concat "   targetable npcs: none\n"
-  else
-    output.concat "   targetable npcs: #{CharSettings['targetable'].join(', ')}\n"
-  end
-  output.concat "\n"
-  if CharSettings['untargetable'].empty?
-    output.concat "   untargetable npcs: none\n"
-  else
-    output.concat "   untargetable npcs: #{CharSettings['untargetable'].join(', ')}\n"
-  end
-  output.concat "\n"
-  respond output
-elsif script.vars[1] =~ /^clear$/i
-  CharSettings['boundary'] = Array.new
-  CharSettings['untargetable'] = Array.new
-  CharSettings['targetable'] = Array.new
-  respond 'done'
-elsif script.vars.empty?
-  loop {
-    wander.call
-    start_npcs = npcs = GameObj.targets
-    npcs.delete_if { |npc| CharSettings['untargetable'].include?(npc.name) }
-    if !Claim.mine?
-      sleep CharSettings['delay']
-    elsif npcs.any? { |npc| CharSettings['targetable'].include?(npc.name) }
-      break
-    else
-      clear
-      target_result = dothistimeout('target random', 5, /^Could not find a valid target\.$|^You are now targeting/)
-      if target_result =~ /^You are now targeting \w+ (.*)\.$/
-        target = $1
-        CharSettings['targetable'].push(target) unless CharSettings['targetable'].include?(target)
-        break
-      elsif target_result == 'Could not find a valid target.'
-        if GameObj.targets == start_npcs
-          npcs.each { |npc| CharSettings['untargetable'].push(npc.name) unless CharSettings['untargetable'].include?(npc.name) }
-        end
-        sleep CharSettings['delay']
-      end
-    end
-  }
-else
-  loop {
-    wander.call
-    if GameObj.pcs.any? { |pc| pc.noun =~ /#{script.vars[1..-1].join('|')}/i }
-      break
-    elsif !Claim.mine?
-      sleep CharSettings['delay']
-    elsif GameObj.npcs.any? { |npc| (npc.status != 'dead') and npc.name =~ /#{script.vars[1..-1].join('|')}/ }
-      break
-    else
-      sleep CharSettings['delay']
-    end
-  }
 end
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+EWander::CLI.run(script)
