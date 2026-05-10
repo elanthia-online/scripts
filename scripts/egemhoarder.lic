@@ -10,6 +10,7 @@
     - collects gems from a configurable gem sack
     - full jars move to wardrobe; partial jars stay in bin; empty jars stay in chest
     - multi-locker support
+    - multiple jars per gem type supported
     - configurable via UserVars (gemsack, gemhoarder_exclude, gemhoarder_lockermode)
     - commands: help, list, search, newlocker, forget, set, raid
     - reports which locker gems are reserved for when left in gemsack
@@ -19,7 +20,7 @@
   contributors: Caithris, Falicor, elanthia-online
   game: gs
   tags: gems, hoarding, locker, jars
-  version: 3.0.0
+  version: 2.0.0
 
   Version Control:
   Major_change.feature_addition.bugfix
@@ -27,12 +28,10 @@
     - complete refactor
     - fixed gem_regex mangling internal spaces (pluralize last word only)
     - fixed deposit counter (^You put.*into.*jar response)
-    - fixed "I could not find" mid-drag handling
     - added lockermode strict/normal/loose
     - added list location filter
     - added forget [all] option
     - added location reporting for gems left in gemsack
-    - sort integrated into newlocker scan
   v1.2.0 (2025-09-09)
     - convert to yaml instead of using lich.db3
   v1.1.0 (2025-09-08)
@@ -188,7 +187,7 @@ module GemHoarder
 
   def self.show_help
     respond ""
-    respond "EGemHoarder v3.0 - Gem jar management for your locker"
+    respond "EGemHoarder v3.1 - Gem jar management for your locker"
     respond "-" * 55
     respond ""
     respond "Locker layout:"
@@ -232,6 +231,8 @@ module GemHoarder
   end
 
   # ── List / Search ─────────────────────────────────────────────────────────────
+  # Groups multiple jar records for the same gem+location into one display row,
+  # summing counts and marking full only if ALL jars for that gem are full.
 
   def self.show_list(jars, filter: nil, location: nil)
     display = jars.dup
@@ -244,18 +245,40 @@ module GemHoarder
       matcher = Regexp.new(f, Regexp::IGNORECASE)
       display.select! { |j| j[:gem].to_s.downcase =~ matcher }
     end
-    display.sort_by! { |j| [-j[:count].to_i, j[:gem].to_s] }
+
+    # Group by gem+location, summing counts
+    grouped = {}
+    display.each do |j|
+      key = "#{clean_name(j[:gem])}||#{j[:location]}"
+      if grouped[key]
+        grouped[key][:count] += j[:count].to_i
+        grouped[key][:full]   = false unless j[:full]
+        grouped[key][:jars]  += 1
+      else
+        grouped[key] = {
+          gem:      j[:gem].to_s,
+          count:    j[:count].to_i,
+          full:     j[:full] ? true : false,
+          location: j[:location].to_s,
+          jars:     1,
+        }
+      end
+    end
+
+    rows = grouped.values.sort_by { |r| [-r[:count], r[:gem]] }
+
     respond ""
-    respond format("  %-38s %5s  %-5s  %s", "Gem", "Count", "Full?", "Location")
-    respond "  " + "-" * 65
-    if display.empty?
+    respond format("  %-38s %5s  %-5s  %-4s  %s", "Gem", "Count", "Full?", "Jars", "Location")
+    respond "  " + "-" * 70
+    if rows.empty?
       respond "  (none)"
     else
-      display.each do |j|
-        respond format("  %-38s %5d  %-5s  %s",
-                       j[:gem].to_s, j[:count].to_i,
-                       j[:full] ? "yes" : "no",
-                       j[:location].to_s)
+      rows.each do |r|
+        respond format("  %-38s %5d  %-5s  %-4d  %s",
+                       r[:gem], r[:count],
+                       r[:full] ? "yes" : "no",
+                       r[:jars],
+                       r[:location])
       end
     end
     respond ""
@@ -293,6 +316,8 @@ module GemHoarder
   end
 
   # ── Scan + Sort Locker ────────────────────────────────────────────────────────
+  # One record per physical jar. Existing records for this location are cleared
+  # before scanning so we don't accumulate stale entries.
 
   def self.scan_locker(data, location)
     echo "GemHoarder: scanning locker at #{location}..."
@@ -300,6 +325,9 @@ module GemHoarder
     found  = 0
     moved  = { chest: 0, bin: 0, wardrobe: 0 }
     failed = []
+
+    # Collect new records separately; only commit if all slots succeed
+    new_records = []
 
     [:wardrobe, :bin, :chest].each do |slot|
       result = open_locker_part(slot.to_s)
@@ -326,7 +354,7 @@ module GemHoarder
         next if gem_name.empty?
 
         look = dothistimeout "look in ##{jar.id} from ##{slot_id}", 5,
-                            /Inside.*?you see \d+ portion|I could not find|That is not/
+                             /Inside.*?you see \d+ portion|I could not find|That is not/
         unless look =~ /Inside.*?you see (\d+) portion/
           next
         end
@@ -335,16 +363,8 @@ module GemHoarder
         is_full = (look =~ /It is full|filling it/) ? true : false
         correct = is_full ? :wardrobe : :bin
 
-        existing = data[:jars].find { |j|
-          clean_name(j[:gem]).casecmp?(gem_name) && j[:location] == location
-        }
-        if existing
-          existing[:count] = existing[:count].to_i + count
-          existing[:full]  = is_full if is_full
-        else
-          data[:jars] << { gem: gem_name, count: count, full: is_full, location: location }
-        end
-
+        # One record per physical jar
+        new_records << { gem: gem_name, count: count, full: is_full, location: location }
         found += 1
 
         if slot != correct
@@ -365,10 +385,15 @@ module GemHoarder
       return false
     end
 
+    # Commit: replace all records for this location
+    data[:jars].delete_if { |j| j[:location] == location }
+    data[:jars].concat(new_records)
+
     echo "GemHoarder: scan complete -- #{found} jar(s) catalogued, " \
-        "#{moved[:wardrobe]} -> wardrobe, #{moved[:bin]} -> bin, #{moved[:chest]} -> chest."
+         "#{moved[:wardrobe]} -> wardrobe, #{moved[:bin]} -> bin, #{moved[:chest]} -> chest."
     true
   end
+
   # ── Deposit Loop ──────────────────────────────────────────────────────────────
 
   def self.deposit_gems(data, location)
@@ -385,12 +410,12 @@ module GemHoarder
     other_loc_names = case locker_mode
                       when :strict
                         (data[:jars] || [])
-                      .select { |j| j[:location] != location }
-                      .map    { |j| clean_name(j[:gem]) }
+                          .select { |j| j[:location] != location }
+                          .map    { |j| clean_name(j[:gem]) }
                       when :normal
                         (data[:jars] || [])
-                      .select { |j| j[:location] != location && !j[:full] }
-                      .map    { |j| clean_name(j[:gem]) }
+                          .select { |j| j[:location] != location && !j[:full] }
+                          .map    { |j| clean_name(j[:gem]) }
                       when :loose
                         []
                       end
@@ -410,9 +435,9 @@ module GemHoarder
         next if jar_gem.empty?
 
         record = (data[:jars] || []).find { |j|
-          clean_name(j[:gem]).casecmp?(jar_gem) && j[:location] == location
+          clean_name(j[:gem]).casecmp?(jar_gem) && j[:location] == location && !j[:full]
         }
-        next if record && record[:full]
+        next unless record
 
         matching = gems.select { |g|
           !not_suitable.include?(g.id) &&
@@ -422,13 +447,6 @@ module GemHoarder
 
         get_r = dothistimeout "get ##{jar.id} from ##{bin_id}", 4, /^You remove|Get what/
         next unless get_r =~ /^You remove/
-
-        record ||= begin
-          r = { gem: jar_gem, count: 0, full: false, location: location }
-          data[:jars] ||= []
-          data[:jars] << r
-          r
-        end
 
         filled = false
         matching.each do |gem|
@@ -480,9 +498,10 @@ module GemHoarder
     gems.each do |g|
       cn = clean_name(g.name)
       next if other_loc_names.any? { |ol| cn =~ gem_regex(ol) }
+      # Skip if any non-full jar record exists for this gem at this location
       next if (data[:jars] || []).any? { |j|
         j[:location] == location && !j[:full] &&
-        clean_name(j[:gem]) =~ gem_regex(cn)
+          clean_name(j[:gem]) =~ gem_regex(cn)
       }
       gem_groups[cn] << g
     end
@@ -589,6 +608,9 @@ module GemHoarder
   end
 
   # ── Raid ──────────────────────────────────────────────────────────────────────
+  # Works across multiple jars of the same gem type until the requested count
+  # is met. Prefers full jars (wardrobe) then partial jars (bin) by descending
+  # count. Opens each jar, shakes out the required number, then routes it back.
 
   def self.raid(data, location)
     args     = Script.current.vars[2..-1].to_a
@@ -625,96 +647,105 @@ module GemHoarder
       return
     end
 
-    # Prefer full jar; otherwise use partial with most gems
-    jar_record = local.find { |j| j[:full] } ||
-                 local.max_by { |j| j[:count].to_i }
+    # Sort: full jars first, then by descending count
+    jar_records = local.sort_by { |j| [j[:full] ? 0 : 1, -j[:count].to_i] }
 
-    unless jar_record
-      echo "GemHoarder: could not find a suitable jar record."
-      return
-    end
+    raided    = 0
+    remaining = count
 
-    slot = jar_record[:full] ? :wardrobe : :bin
+    jar_records.each do |jar_record|
+      break if remaining <= 0
 
-    result = open_locker_part(slot.to_s)
-    unless result
-      echo "GemHoarder: could not open #{slot}."
-      return
-    end
-    slot_id, slot_contents = result
+      slot = jar_record[:full] ? :wardrobe : :bin
 
-    jar = slot_contents.find { |o|
-      o.noun =~ JAR_NOUNS &&
-        !o.after_name.to_s.strip.empty? &&
-        clean_name(o.after_name) =~ gem_regex(gem_name)
-    }
+      result = open_locker_part(slot.to_s)
+      unless result
+        echo "GemHoarder: could not open #{slot}, skipping."
+        next
+      end
+      slot_id, slot_contents = result
 
-    unless jar
-      echo "GemHoarder: could not find jar in #{slot}."
-      close_locker
-      return
-    end
+      jar = slot_contents.find { |o|
+        o.noun =~ JAR_NOUNS &&
+          !o.after_name.to_s.strip.empty? &&
+          clean_name(o.after_name) =~ gem_regex(gem_name)
+      }
 
-    get_r = dothistimeout "get ##{jar.id} from ##{slot_id}", 4, /^You remove|Get what/
-    unless get_r =~ /^You remove/
-      echo "GemHoarder: could not retrieve jar."
-      close_locker
-      return
-    end
-
-    raided = 0
-    jar.noun
-
-    count.times do
-      unless GameObj.right_hand&.id == jar.id || GameObj.left_hand&.id == jar.id
-        echo "GemHoarder: lost jar from hand, stopping."
-        break
+      unless jar
+        echo "GemHoarder: could not find jar in #{slot}, skipping."
+        close_locker
+        next
       end
 
-      res = dothistimeout "shake ##{jar.id}", 4,
-                          /fall into your|free hand|nothing falls out|realize that it is empty/
-      case res
-      when /fall into your/
-        dropped = [GameObj.right_hand, GameObj.left_hand].compact.find { |o|
-          o.id != jar.id && o.type =~ /gem/i
-        }
-        if dropped
-          fput "put my #{dropped.noun} in my ##{sack.id}"
-          jar_record[:count] = jar_record[:count].to_i - 1
-          raided += 1
-        else
-          echo "GemHoarder: shook jar but gem did not appear in hand, stopping."
-          break
-        end
-      when /free hand/
-        held = [GameObj.right_hand, GameObj.left_hand].compact.find { |o|
-          o.id != jar.id && o.type =~ /gem/i
-        }
-        if held
-          fput "put my #{held.noun} in my ##{sack.id}"
-          jar_record[:count] = jar_record[:count].to_i - 1
-          raided += 1
-        else
-          echo "GemHoarder: need free hand but no gem found to stow, stopping."
-          break
-        end
-      when /nothing falls out|realize that it is empty/
-        jar_record[:count] = 0
-        break
+      get_r = dothistimeout "get ##{jar.id} from ##{slot_id}", 4, /^You remove|Get what/
+      unless get_r =~ /^You remove/
+        echo "GemHoarder: could not retrieve jar from #{slot}, skipping."
+        close_locker
+        next
       end
-    end
 
-    # Route jar to correct slot using noun in case ID changed
-    jar_record[:full] = false
-    if jar_record[:count].to_i <= 0
-      data[:jars].delete(jar_record)
-      fput "put ##{jar.id} in chest"
-      echo "GemHoarder: jar emptied, returned to chest."
-    else
-      fput "put ##{jar.id} in bin"
-    end
+      # Locker stays open -- bin/chest accessible for routing after shaking
 
-    close_locker
+      need_from_this_jar = [remaining, jar_record[:count].to_i].min
+
+      need_from_this_jar.times do
+        break if remaining <= 0
+
+        unless GameObj.right_hand&.id == jar.id || GameObj.left_hand&.id == jar.id
+          echo "GemHoarder: lost jar from hand, stopping."
+          remaining = 0
+          break
+        end
+
+        res = dothistimeout "shake ##{jar.id}", 4,
+                            /fall into your|free hand|nothing falls out|realize that it is empty/
+        case res
+        when /fall into your/
+          dropped = [GameObj.right_hand, GameObj.left_hand].compact.find { |o|
+            o.id != jar.id && o.type =~ /gem/i
+          }
+          if dropped
+            fput "put my #{dropped.noun} in my ##{sack.id}"
+            jar_record[:count] = jar_record[:count].to_i - 1
+            raided    += 1
+            remaining -= 1
+          else
+            echo "GemHoarder: shook jar but gem did not appear in hand, stopping."
+            remaining = 0
+            break
+          end
+        when /free hand/
+          held = [GameObj.right_hand, GameObj.left_hand].compact.find { |o|
+            o.id != jar.id && o.type =~ /gem/i
+          }
+          if held
+            fput "put my #{held.noun} in my ##{sack.id}"
+            jar_record[:count] = jar_record[:count].to_i - 1
+            raided    += 1
+            remaining -= 1
+          else
+            echo "GemHoarder: need free hand but no gem found to stow, stopping."
+            remaining = 0
+            break
+          end
+        when /nothing falls out|realize that it is empty/
+          jar_record[:count] = 0
+          break
+        end
+      end
+
+      # Route jar to correct slot
+      jar_record[:full] = false
+      if jar_record[:count].to_i <= 0
+        data[:jars].delete(jar_record)
+        fput "put ##{jar.id} in chest"
+        echo "GemHoarder: jar emptied, returned to chest."
+      else
+        fput "put ##{jar.id} in bin"
+      end
+
+      close_locker
+    end
 
     echo "GemHoarder: raided #{raided} #{gem_name}(s) into gemsack."
     save_data(data)
@@ -776,7 +807,7 @@ module GemHoarder
       location = current_location
       data[:jars]          ||= []
       data[:known_lockers] ||= []
-      data[:jars].delete_if { |j| j[:location] == location }
+      # Records cleared inside scan_locker only on success
       if scan_locker(data, location)
         data[:known_lockers] |= [location]
         save_data(data)
@@ -795,9 +826,10 @@ module GemHoarder
 
       unless data[:known_lockers].include?(location)
         echo "GemHoarder: #{location} is a new locker -- scanning first..."
-        scan_locker(data, location)
-        data[:known_lockers] |= [location]
-        save_data(data)
+        if scan_locker(data, location)
+          data[:known_lockers] |= [location]
+          save_data(data)
+        end
       end
 
       deposit_gems(data, location)
