@@ -7,31 +7,29 @@
     Wardrobe = full jars (complete, archived)
 
   Features:
-    - collects gems from a configurable gem sack
-    - full jars move to wardrobe; partial jars stay in bin; empty jars stay in chest
-    - multi-locker support
-    - multiple jars per gem type supported
-    - configurable via UserVars (gemsack, gemhoarder_exclude, gemhoarder_lockermode)
-    - commands: help, list, search, newlocker, forget, set, raid
-    - reports which locker gems are reserved for when left in gemsack
-    - raid pulls a specific gem type from locker back into gemsack
+    - deposits gems into labeled jars; chest=empty, bin=partial, wardrobe=full
+    - multi-locker, multi-jar support with per-jar tracking
+    - auto-navigates to locker, stows hands, returns to origin after deposit/raid
+    - raid pulls gems from locker back into gemsack
+    - configurable via UserVars: gemsack, gemhoarder_exclude, gemhoarder_lockermode
 
   author: elanthia-online
   contributors: Caithris, Falicor, Yalathanil
   game: gs
   tags: gems, hoarding, locker, jars
-  version: 2.0.0
+  version: 3.2.0
 
   Version Control:
   Major_change.feature_addition.bugfix
-  v2.0.0 (2026-05-08)
-    - complete refactor
-    - fixed gem_regex mangling internal spaces (pluralize last word only)
-    - fixed deposit counter (^You put.*into.*jar response)
-    - added lockermode strict/normal/loose
-    - added list location filter
-    - added forget [all] option
-    - added location reporting for gems left in gemsack
+  v3.0.0 (2026-05-11)
+    - complete rewrite from egemhoarder v1.x
+    - auto-navigate to locker, stow hands, return to origin on deposit/raid
+    - multi-jar tracking; raid spans jars; list groups by gem
+    - chest=empty jars, bin=partial, wardrobe=full
+    - lockermode strict/normal/loose for multi-locker gem assignment
+    - search and raid support multi-word gem names
+    - scan is atomic -- rolls back on partial failure
+    - sort integrated into newlocker scan
   v1.2.0 (2025-09-09)
     - convert to yaml instead of using lich.db3
   v1.1.0 (2025-09-08)
@@ -149,11 +147,97 @@ module GemHoarder
 
   # ── Location ──────────────────────────────────────────────────────────────────
 
-  def self.current_location
-    fput "location"
-    matchfind "current location is ? or somewhere close to it."
-  rescue
-    "Unknown"
+def self.current_location
+  fput "location"
+  result = matchfind "current location is ? or somewhere close to it."
+  # Strip common town prefixes that vary by room
+  result.to_s
+        .sub(/^the (?:town|city|village|keep) of /i, '')
+        .strip
+rescue
+  "Unknown"
+end
+
+  # ── Hand Management ───────────────────────────────────────────────────────────
+
+  def self.stow_hands
+    stowed = []
+    { right: GameObj.right_hand, left: GameObj.left_hand }.each do |side, obj|
+      next if obj.nil? || obj.name.to_s.strip.empty? || obj.name =~ /^Empty$/i
+      fput "stow #{side}"
+      pause 0.3
+      stowed << { side: side, id: obj.id, noun: obj.noun, name: obj.name }
+    end
+    stowed
+  end
+
+  def self.restore_hands(stowed)
+    return if stowed.empty?
+    stowed.reverse.each do |item|
+      # Check if already in hand
+      next if [GameObj.right_hand, GameObj.left_hand].compact.any? { |o| o.id == item[:id] }
+      fput "get ##{item[:id]}"
+      pause 0.3
+    end
+  end
+
+  # ── Locker Navigation ─────────────────────────────────────────────────────────
+
+  def self.go_to_locker
+    echo "GemHoarder: navigating to public lockers..."
+    Script.run("go2", "publiclockers")
+    pause 0.5
+
+    # Try to enter a locker room; if occupied try adjacent rooms
+    10.times do
+      # Try opening first, then curtain
+      ["opening", "curtain"].each do |exit_name|
+        result = dothistimeout "go #{exit_name}", 3,
+          /^You (?:step|go|enter|pass|slip)|^There is no|^Sorry|closed|^What/
+        if result =~ /^You (?:step|go|enter|pass|slip)/i
+          echo "GemHoarder: entered locker room via #{exit_name}."
+          return true
+        end
+      end
+
+      # Neither worked -- locker occupied, try next room in hallway
+      echo "GemHoarder: locker occupied, trying next room..."
+      moved = false
+      ["north", "south", "east", "west"].each do |dir|
+        result = dothistimeout "go #{dir}", 2,
+          /^You (?:go|head|move|walk|step)|^You can't|^A closed|^What/
+        if result =~ /^You (?:go|head|move|walk|step)/i
+          moved = true
+          break
+        end
+      end
+
+      unless moved
+        echo "GemHoarder: could not find an available locker room."
+        return false
+      end
+
+      pause 0.5
+
+      # Check if new room has a locker entrance -- if not, wrong direction
+      room_nouns = GameObj.loot.map(&:noun) + GameObj.npcs.map(&:noun)
+      exits      = Room.current.exits rescue []
+      unless room_nouns.any? { |n| n =~ /opening|curtain/i } ||
+             exits.any? { |e| e =~ /opening|curtain/i }
+        echo "GemHoarder: no locker in this room, wrong direction."
+        return false
+      end
+    end
+
+    echo "GemHoarder: could not find an available locker room after 10 tries."
+    false
+  end
+
+  def self.go_to_origin(origin_id)
+    return if XMLData.room_id == origin_id
+    echo "GemHoarder: returning to original location..."
+    Script.run("go2", origin_id.to_s)
+    pause 0.5
   end
 
   # ── Locker Helpers ────────────────────────────────────────────────────────────
@@ -187,7 +271,7 @@ module GemHoarder
 
   def self.show_help
     respond ""
-    respond "EGemHoarder v3.1 - Gem jar management for your locker"
+    respond "EGemHoarder v3.2 - Gem jar management for your locker"
     respond "-" * 55
     respond ""
     respond "Locker layout:"
@@ -216,17 +300,23 @@ module GemHoarder
     respond "    normal = store here if other locker jar is full"
     respond "    loose  = always store regardless of other lockers"
     respond ""
+    respond "Notes:"
+    respond "  Deposit and raid auto-navigate to public lockers via go2,"
+    respond "  stow held items, and return you to your original location."
+    respond "  newlocker must be run from inside the locker room."
+    respond ""
     respond "Examples:"
     respond "  ;vars set gemsack=canvas gem pouch"
     respond "  ;vars set gemhoarder_exclude=doomstone,urglaes fang"
     respond "  ;vars set gemhoarder_lockermode=normal"
     respond "  ;egemhoarder set \"fire opals\" 12 false Solhaven"
     respond "  ;egemhoarder search ruby"
+    respond "  ;egemhoarder search green amber"
     respond "  ;egemhoarder list Wehnimer's"
     respond "  ;egemhoarder forget"
     respond "  ;egemhoarder forget all"
     respond "  ;egemhoarder raid ruby 5"
-    respond "  ;egemhoarder raid \"uncut emerald\" 3"
+    respond "  ;egemhoarder raid green amber 5"
     respond ""
   end
 
@@ -251,7 +341,6 @@ module GemHoarder
               end
       pattern = (words.map { |w| Regexp.escape(w) } + [last]).join('.*')
       matcher = Regexp.new(pattern, Regexp::IGNORECASE)
-      echo "DEBUG filter=#{filter} pattern=#{pattern} matcher=#{matcher}"
       display.select! { |j| j[:gem].to_s =~ matcher }
     end
 
@@ -417,17 +506,17 @@ module GemHoarder
     echo "GemHoarder: #{gems.size} gem(s) to deposit at #{location}."
 
     other_loc_names = case locker_mode
-                      when :strict
-                        (data[:jars] || [])
-                      .select { |j| j[:location] != location }
-                      .map    { |j| clean_name(j[:gem]) }
-                      when :normal
-                        (data[:jars] || [])
-                      .select { |j| j[:location] != location && !j[:full] }
-                      .map    { |j| clean_name(j[:gem]) }
-                      when :loose
-                        []
-                      end
+    when :strict
+      (data[:jars] || [])
+        .select { |j| j[:location] != location }
+        .map { |j| clean_name(j[:gem]) }
+    when :normal
+      (data[:jars] || [])
+        .select { |j| j[:location] != location && !j[:full] }
+        .map { |j| clean_name(j[:gem]) }
+    when :loose
+      []
+    end
 
     not_suitable = []
     deposited    = 0
@@ -507,7 +596,6 @@ module GemHoarder
     gems.each do |g|
       cn = clean_name(g.name)
       next if other_loc_names.any? { |ol| cn =~ gem_regex(ol) }
-      # Skip if any non-full jar record exists for this gem at this location
       next if (data[:jars] || []).any? { |j|
         j[:location] == location && !j[:full] &&
         clean_name(j[:gem]) =~ gem_regex(cn)
@@ -617,9 +705,6 @@ module GemHoarder
   end
 
   # ── Raid ──────────────────────────────────────────────────────────────────────
-  # Works across multiple jars of the same gem type until the requested count
-  # is met. Prefers full jars (wardrobe) then partial jars (bin) by descending
-  # count. Opens each jar, shakes out the required number, then routes it back.
 
   def self.raid(data, location)
     args     = Script.current.vars[2..-1].to_a
@@ -692,8 +777,6 @@ module GemHoarder
         close_locker
         next
       end
-
-      # Locker stays open -- bin/chest accessible for routing after shaking
 
       need_from_this_jar = [remaining, jar_record[:count].to_i].min
 
@@ -815,20 +898,36 @@ module GemHoarder
       cmd_set(data)
 
     when "raid"
+      origin_id = Room.current.id
+      stowed    = stow_hands
+
+      unless go_to_locker
+        restore_hands(stowed)
+        exit
+      end
+
       location = current_location
       data[:known_lockers] ||= []
       data[:jars]          ||= []
+
       unless data[:known_lockers].include?(location)
         echo "GemHoarder: #{location} is not a registered locker. Run ;egemhoarder newlocker first."
+        close_locker
+        go_to_origin(origin_id)
+        restore_hands(stowed)
         exit
       end
+
       raid(data, location)
+
+      close_locker
+      go_to_origin(origin_id)
+      restore_hands(stowed)
 
     when "newlocker"
       location = current_location
       data[:jars]          ||= []
       data[:known_lockers] ||= []
-      # Records cleared inside scan_locker only on success
       if scan_locker(data, location)
         data[:known_lockers] |= [location]
         save_data(data)
@@ -838,6 +937,14 @@ module GemHoarder
     when "", "none"
       if UserVars.gemsack.to_s.strip.empty?
         echo "GemHoarder: gemsack not set. Run: ;vars set gemsack=<container name>"
+        exit
+      end
+
+      origin_id = Room.current.id
+      stowed    = stow_hands
+
+      unless go_to_locker
+        restore_hands(stowed)
         exit
       end
 
@@ -855,6 +962,10 @@ module GemHoarder
 
       deposit_gems(data, location)
       save_data(data)
+
+      close_locker
+      go_to_origin(origin_id)
+      restore_hands(stowed)
 
     else
       echo "GemHoarder: unknown command '#{cmd}'. Run ;egemhoarder help for usage."
