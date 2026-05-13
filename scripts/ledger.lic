@@ -11,7 +11,7 @@
    contributors: Ondreian, Tysong
            game: Gemstone
            tags: silver, bounty, ledger, bank
-        version: 1.4.1
+        version: 1.4.2
    requirements:
     - sequel gem
     - terminal-table
@@ -20,6 +20,12 @@
   Help Contribute: https://github.com/elanthia-online/scripts
   Version Control:
   Major_change.feature_addition.bugfix
+    v1.4.2 - 2026-05-11
+      - Track Account.name on each transaction (new 'account' column).
+        On each run, backfills NULL account values for the currently-logged-in character
+        in the current game, using the resolved Account.name.
+        estimate_loot_cap now aggregates account-wide for the current week; falls back to the
+        current character when the account is not resolvable (e.g. proxy mode without ;account).
     v1.4.1 - 2026-05-06
       - Change estimate_loot_cap from monthly to weekly window (Monday 00:00 - Sunday 23:59:59, EST/EDT).
         Week boundaries are computed in America/New_York via tzinfo (DST-aware).
@@ -325,19 +331,23 @@ module Ledger
     end
 
     # Estimates loot cap earnings for the current week (Monday through Sunday, EST/EDT)
+    # across all characters on the current account.
     #
     # Calculates silver gained from creature kills (excluding large deposits/withdrawals)
-    # to estimate progress toward the weekly loot cap. The week boundary is computed
-    # in America/New_York (which observes EST/EDT, including DST transitions) and then
-    # converted to the machine's local time to match how `created_at` is stored.
+    # to estimate progress toward the weekly account-wide loot cap. The week boundary
+    # is computed in America/New_York (which observes EST/EDT, including DST transitions)
+    # and then converted to the machine's local time to match how `created_at` is stored.
     #
     # @param year [Integer] ignored, retained for backward compatibility
     # @param month [Integer] ignored, retained for backward compatibility
-    # @param character [String] character name (default: current character)
+    # @param account [String, nil] account name (default: current account via AccountInfo)
+    # @param character [String] character name; only used when account is nil (proxy mode)
     # @param game [String] game code (default: current game)
     # @return [Integer] estimated loot cap earnings for the current week
     # @note Filters out transactions over 1,000,000 silver (likely bank transactions)
-    def self.estimate_loot_cap(year: Time.now.year, month: Time.now.month, character: Char.name, game: XMLData.game)
+    # @note When `account` is nil and AccountInfo cannot resolve one, falls back to
+    #       the current character only (preserves pre-1.4.2 behavior in proxy mode).
+    def self.estimate_loot_cap(year: Time.now.year, month: Time.now.month, account: AccountInfo.name, character: Char.name, game: XMLData.game)
       _ = year; _ = month # accepted for backward compatibility, no longer used
 
       # Compute the start of the current week (Monday 00:00) in EST/EDT,
@@ -352,8 +362,10 @@ module Ledger
       monday_midnight_est = Time.utc(week_start_est_date.year, week_start_est_date.month, week_start_est_date.day)
       week_start_local    = tz.local_to_utc(monday_midnight_est).getlocal
 
+      identity_filter = account ? { account: account } : { character: character }
+
       Ledger::History::Transactions
-        .where(type: "silver", character: character, game: game)
+        .where({ type: "silver", game: game }.merge(identity_filter))
         .where { created_at >= week_start_local }
         .where { amount < 1_000_000 }
         .where { amount > 0 }
@@ -392,6 +404,32 @@ module Ledger
       line.gsub!('&gt;', '>')
       line.gsub!('&lt;', '<')
       return line
+    end
+  end
+
+  # Resolves the current Account.name, issuing an in-game ACCOUNT command
+  # if Lich's Account module is present but unpopulated (proxy-mode logins).
+  #
+  # @since 1.4.2
+  module AccountInfo
+    # Returns the current account name, populating it via the ACCOUNT verb if
+    # needed. Lich5 (Infomon) parses the ACCOUNT response and assigns
+    # Account.name itself; we just trigger the round-trip and read it back.
+    #
+    # @return [String, nil] account name, or nil if it cannot be resolved
+    def self.name
+      return nil unless Object.const_defined?(:Account)
+      return Account.name if Account.name && !Account.name.to_s.empty?
+
+      begin
+        fput('account')
+        sleep(1)
+      rescue StandardError => e
+        echo "AccountInfo: failed to resolve via ACCOUNT (#{e.message})"
+        return nil
+      end
+
+      Account.name if Account.name && !Account.name.to_s.empty?
     end
   end
 
@@ -443,6 +481,17 @@ module Ledger
       Integer :day
       Integer :hour
       String  :game
+      String  :account
+    end
+
+    # One-time migration: add `account` column to existing databases.
+    # Pre-existing rows remain NULL; new rows populate via record_transaction.
+    begin
+      unless Self.schema(:transactions).map(&:first).include?(:account)
+        Self.alter_table(:transactions) { add_column :account, String }
+      end
+    rescue => e
+      echo "Note: Could not add account column: #{e.message}"
     end
 
     # Add indexes for query optimization (one-time migration)
@@ -460,11 +509,31 @@ module Ledger
                        name: :transactions_game_type_year_index
       end
 
+      # Index for account-wide queries (estimate_loot_cap)
+      unless Self.indexes(:transactions).key?(:transactions_account_type_index)
+        Self.add_index :transactions, [:account, :type],
+                       name: :transactions_account_type_index
+      end
+
       # Update query optimizer statistics
       Self.run("ANALYZE transactions")
     rescue => e
       # Non-fatal - script continues even if indexing fails
       echo "Note: Could not add indexes: #{e.message}"
+    end
+
+    # Backfill NULL account values for the currently-logged-in character.
+    # Safe because we know with certainty which account this character belongs
+    # to right now. Idempotent (only touches NULL rows). Silent.
+    begin
+      current_account = AccountInfo.name
+      if current_account && !current_account.empty?
+        Self[:transactions]
+          .where(character: Char.name, game: XMLData.game, account: nil)
+          .update(account: current_account)
+      end
+    rescue => e
+      echo "Note: Could not backfill account: #{e.message}"
     end
 
     # Alias for easier access to transactions table
@@ -556,6 +625,7 @@ module Ledger
       now                      = Time.now
       # info fields
       transaction[:character]  = Char.name
+      transaction[:account]    = AccountInfo.name
       transaction[:amount]     = amount
       transaction[:type]       = type
       transaction[:game]       = XMLData.game
@@ -597,7 +667,7 @@ module Ledger
         max_bar_width = 40
         rows = hours.map do |hour, amount|
           bar_width = max_value > 0 ? (amount.to_f / max_value * max_bar_width).round : 0
-          bar = '▓' * bar_width
+          bar = '|' * bar_width
           formatted_amount = with_commas(amount)
 
           [sprintf("%02d:00", hour), "#{bar} #{formatted_amount}"]
