@@ -15,5 +15,5 @@ migrate :aggressive_npc do
 end
 
 migrate :skin, :furrier do
-  insert(:name, %{(?:multihued )?pegasus mana})
+  insert(:name, %{(?:multihued )?pegasus mane})
 end
