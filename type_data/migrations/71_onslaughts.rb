@@ -11,4 +11,9 @@ migrate :aggressive_npc do
   insert(:name, %{haze-shrouded goliath diviner})
   insert(:name, %{masked goliath plunderer})
   insert(:name, %{radiant-eyed goliath auramancer})
+  insert(:name, %{tawny armor-clad pegasus})
+end
+
+migrate :skin, :furrier do
+  insert(:name, %{(?:multihued )?pegasus mana})
 end
