@@ -1,0 +1,14 @@
+create_table "ascension:codex", keys: [:name]
+
+migrate "ascension:codex" do
+  insert(:name, %{marble-lined runic codex chiseled with cerulean runes})
+  insert(:name, %{skin-bound runic codex tattooed with thick crimson ink})
+end
+
+migrate :aggressive_npc do
+  insert(:name, %{branded goliath diviner})
+  insert(:name, %{burly goliath engineer})
+  insert(:name, %{haze-shrouded goliath diviner})
+  insert(:name, %{masked goliath plunderer})
+  insert(:name, %{radiant-eyed goliath auramancer})
+end
