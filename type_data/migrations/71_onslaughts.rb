@@ -6,6 +6,7 @@ migrate "ascension:codex" do
 end
 
 migrate :aggressive_npc do
+  insert(:name, %{battle-worn Empyrean captain})
   insert(:name, %{branded goliath diviner})
   insert(:name, %{burly goliath engineer})
   insert(:name, %{haze-shrouded goliath diviner})
