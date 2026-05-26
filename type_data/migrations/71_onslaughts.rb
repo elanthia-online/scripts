@@ -1,5 +1,4 @@
 create_table "ascension:codex", keys: [:name]
-create_table "ascension:jewel", keys: [:name, :noun, :exclude]
 
 migrate "ascension:codex" do
   insert(:name, %{marble-lined runic codex chiseled with cerulean runes})
@@ -7,6 +6,7 @@ migrate "ascension:codex" do
 end
 
 migrate "ascension:jewel" do
+  create_key(:name)
   insert(:name, %[rough crystalline geode])
 end
 
