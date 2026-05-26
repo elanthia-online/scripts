@@ -5,6 +5,11 @@ migrate "ascension:codex" do
   insert(:name, %{skin-bound runic codex tattooed with thick crimson ink})
 end
 
+migrate "ascension:jewel" do
+  create_key(:name)
+  insert(:name, %[rough crystalline geode])
+end
+
 migrate :aggressive_npc do
   insert(:name, %{battle-worn Empyrean captain})
   insert(:name, %{branded goliath diviner})
