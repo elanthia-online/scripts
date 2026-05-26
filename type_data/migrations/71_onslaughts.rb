@@ -1,8 +1,13 @@
 create_table "ascension:codex", keys: [:name]
+create_table "ascension:jewel", keys: [:name, :noun, :exclude]
 
 migrate "ascension:codex" do
   insert(:name, %{marble-lined runic codex chiseled with cerulean runes})
   insert(:name, %{skin-bound runic codex tattooed with thick crimson ink})
+end
+
+migrate "ascension:jewel" do
+  insert(:name, %[rough crystalline geode])
 end
 
 migrate :aggressive_npc do
