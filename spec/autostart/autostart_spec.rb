@@ -129,18 +129,22 @@ end
 # @param map_mod [Module] mock for Map (apply_wayto_overrides)
 # @param user_vars_mod [Module] mock for UserVars (autostart_scripts)
 # @param yaml_autostarts [Array<String>, nil] simulated get_settings.autostarts
+# @param has_get_settings [Boolean] whether get_settings is available (false on old GS lich)
 # @param respond_output [Array<String>] collects warning messages
-# @return [Array<String>] list of started script names
+# @return [Array<String>, nil] list of started script names, or nil if skipped
 def run_yaml_autostart_loop(script_mod: MockScript,
                             map_mod: MockMap,
                             user_vars_mod: MockUserVars,
                             yaml_autostarts: [],
+                            has_get_settings: true,
                             respond_output: [])
+  return unless has_get_settings
+
   user_vars_mod.autostart_scripts ||= []
   all_autostarts = (user_vars_mod.autostart_scripts.to_a +
                     yaml_autostarts.to_a).uniq
 
-  map_mod.apply_wayto_overrides
+  map_mod.apply_wayto_overrides if map_mod.respond_to?(:apply_wayto_overrides)
 
   started = []
   all_autostarts.each do |script_name|
@@ -173,11 +177,12 @@ def run_generic_autostart_loop(settings_mod: MockSettings,
                                char_settings_mod: MockCharSettings,
                                script_mod: MockScript,
                                xml_data_mod: MockXMLData,
+                               has_lich_update: true,
                                respond_output: [])
   for script_list in [settings_mod['scripts'], char_settings_mod['scripts']]
     if script_list.is_a?(Array)
       for script_info in script_list
-        if ['infomon', 'repository', 'dependency', 'lich5-update'].include?(script_info[:name])
+        if ['infomon', 'repository', 'dependency'].include?(script_info[:name])
           # dependency removal for DR
           if script_info[:name] == 'dependency' && xml_data_mod.game =~ /^DR/
             respond_output << "dependency removed"
@@ -194,6 +199,8 @@ def run_generic_autostart_loop(settings_mod: MockSettings,
               char_settings_mod['scripts'] = temp_script_list
             end
           end
+          next
+        elsif script_info[:name] == 'lich5-update' && has_lich_update
           next
         else
           next if script_mod.running?(script_info[:name])
@@ -318,11 +325,18 @@ RSpec.describe "Generic autostart loop" do
       expect(MockScript.started).to be_empty
     end
 
-    it "skips lich5-update" do
+    it "skips lich5-update when Lich::Util::Update is available" do
       MockSettings['scripts'] = [{ name: 'lich5-update', args: [] }]
 
-      run_generic_autostart_loop
+      run_generic_autostart_loop(has_lich_update: true)
       expect(MockScript.started).to be_empty
+    end
+
+    it "does not skip lich5-update on old lich without Lich::Util::Update" do
+      MockSettings['scripts'] = [{ name: 'lich5-update', args: [] }]
+
+      run_generic_autostart_loop(has_lich_update: false)
+      expect(MockScript.started).to eq([{ name: 'lich5-update', args: [] }])
     end
   end
 
@@ -386,6 +400,11 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
     it "starts scripts from YAML autostarts list" do
       started = run_yaml_autostart_loop(yaml_autostarts: ['esp', 'afk'])
       expect(started).to eq(['esp', 'afk'])
+    end
+
+    it "does nothing when get_settings is not available (old GS lich)" do
+      started = run_yaml_autostart_loop(yaml_autostarts: ['esp'], has_get_settings: false)
+      expect(started).to be_nil
     end
 
     it "handles empty YAML autostarts" do
