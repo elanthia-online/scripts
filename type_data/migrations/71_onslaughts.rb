@@ -14,7 +14,6 @@ migrate "ascension:misc" do
   insert(:name, %{viscous vial of violet vodka})
 end
 
-
 migrate :aggressive_npc do
   insert(:name, %{battle-worn Empyrean captain})
   insert(:name, %{branded goliath diviner})
