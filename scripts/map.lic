@@ -14,9 +14,16 @@ Tracks your current room on visual maps
       game: Gemstone
       tags: core, movement, mapping
       required: Lich >= 5.13.0
-      version: 2.1.3
+      version: 2.1.4
 
   changelog:
+    v2.1.4 (2026-05-29)
+      * Anchor transient dialog handlers (find + note dialogs). Their handler
+        Procs and widgets were connected but never rooted on the Ruby side, so
+        GC could collect them while the C-side GLib::Closure still referenced
+        them -- the same premature-GC family as the documented "undefined method
+        'call' for ..." crash. Added @_dialog_gc with identity-based release on
+        each dialog's destroy, so long sessions don't accumulate refs.
     v2.1.3 (2026-05-28)
       * Fix "undefined method 'call' for an instance of Array" crash on click.
         gobject-introspection 4.3.x strictly validates signal handler return
@@ -538,6 +545,9 @@ module ElanthiaMap
       @_prevent_gc = []
       # Separate anchor for dynamically rebuilt submenu items (cleared on each rebuild)
       @_dynamic_menu_gc = []
+      # Separate anchor for transient dialog handlers (find, note) — released on each
+      # dialog's destroy so long-running sessions don't accumulate refs in @_prevent_gc
+      @_dialog_gc = []
 
       # Check for special modes
       @fix_mode = script.vars[1] =~ /fix/ ? true : false
@@ -712,6 +722,7 @@ module ElanthiaMap
             # Release all GC-prevention refs now that widgets are destroyed
             @_prevent_gc.clear
             @_dynamic_menu_gc.clear
+            @_dialog_gc.clear
           ensure
             completed = true
           end
@@ -1148,6 +1159,14 @@ module ElanthiaMap
           end
           find_button.signal_connect('clicked', &find_click_handler)
 
+          # Anchor this dialog's handlers + widgets for its lifetime; see the note
+          # dialog and @_prevent_gc for why. Released on destroy via identity match.
+          find_refs = [find_enter_handler, find_click_handler, find_entry, find_button]
+          release_find_refs = gtk_safe { @_dialog_gc -= find_refs }
+          find_refs << release_find_refs
+          @_dialog_gc.concat(find_refs)
+          find_window.signal_connect('destroy', &release_find_refs)
+
           # Build layout
           find_box = Gtk::Box.new(:horizontal)
           find_box.pack_start(find_entry, expand: false, fill: false, padding: 2)
@@ -1285,6 +1304,19 @@ module ElanthiaMap
 
           cancel_click_handler = gtk_safe { Gtk.queue { note_window.destroy } }
           cancel_button.signal_connect('clicked', &cancel_click_handler)
+
+          # Anchor this dialog's handlers + buttons so Ruby's GC can't collect the
+          # wrapper Procs while the C-side GLib::Closure still references them. Without
+          # this they live only on the C side (invisible to Ruby GC), which is the
+          # "undefined method 'call' for ..." crash family documented at @_prevent_gc.
+          # Identity-based release on destroy keeps long sessions from leaking and
+          # supports multiple note dialogs open at once.
+          dialog_refs = [save_click_handler, delete_click_handler, cancel_click_handler,
+                         save_button, delete_button, cancel_button]
+          release_dialog_refs = gtk_safe { @_dialog_gc -= dialog_refs }
+          dialog_refs << release_dialog_refs
+          @_dialog_gc.concat(dialog_refs)
+          note_window.signal_connect('destroy', &release_dialog_refs)
 
           hbox.pack_start(save_button,   expand: true, fill: true, padding: 0)
           hbox.pack_start(delete_button, expand: true, fill: true, padding: 0)
@@ -1661,7 +1693,7 @@ module ElanthiaMap
       # submenu containers. Clearing @_dynamic_menu_gc *before* destroy creates
       # a window where Ruby GC may finalize child MenuItems while their parent
       # Gtk::Menu still holds C-side references, triggering gtk_container_remove
-      # g_signal_emit on a half-destroyed item. Clear at the end instead.
+      # -> g_signal_emit on a half-destroyed item. Clear at the end instead.
       old_dynamic_refs = @_dynamic_menu_gc.dup
 
       # Rebuild scale menu only in per-map mode (global mode doesn't vary per map)
