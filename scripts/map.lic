@@ -513,6 +513,60 @@ module ElanthiaMap
       end
     end
 
+    # Emits low-noise diagnostics in trouble mode. Keep this free of GTK calls so
+    # it is safe from worker threads and useful when chasing native crashes.
+    #
+    # @param event [String] Short event name
+    # @param details [Hash] Structured details to append
+    # @return [void]
+    def diag(event, details = {})
+      return unless @trouble_mode
+
+      @diag_seq ||= 0
+      @diag_seq += 1
+      base = {
+        seq: @diag_seq,
+        event: event,
+        time: Time.now.strftime('%H:%M:%S.%L'),
+        thread: Thread.current.object_id,
+        map: (@current_map ? File.basename(@current_map) : nil),
+        drag: (@drag_state ? { active: @drag_state[:active], dragging: @drag_state[:dragging] } : nil),
+        memory_releaser: memory_releaser_status,
+        gc_count: (GC.stat[:count] rescue nil),
+        threads: (Thread.list.length rescue nil)
+      }
+      message = (base.merge(details).map { |key, value| "#{key}=#{value.inspect}" }).join(' ')
+      respond "[map diag: #{message}]"
+      Lich.log "map diag: #{message}" if defined?(Lich) && Lich.respond_to?(:log)
+    rescue StandardError
+      nil
+    end
+
+    # Logs exception details for trouble-mode crash forensics.
+    #
+    # @param event [String] Event name
+    # @param error [Exception] Exception to describe
+    # @return [void]
+    def diag_exception(event, error)
+      diag(event, error_class: error.class, error: error.message, backtrace: (error.backtrace || []).first(3))
+    end
+
+    # Returns compact MemoryReleaser state for correlation with click crashes.
+    #
+    # @return [Hash, nil]
+    def memory_releaser_status
+      return nil unless defined?(Lich::Util::MemoryReleaser)
+
+      status = Lich::Util::MemoryReleaser.status
+      {
+        running: status[:running],
+        enabled: status[:enabled],
+        interval: status[:interval]
+      }
+    rescue StandardError
+      nil
+    end
+
     # Creates and initializes the map window
     #
     # @param script [Script] The running script instance
@@ -1809,6 +1863,13 @@ module ElanthiaMap
       @_prevent_gc << press_handler
       @layout.signal_connect('button_press_event', &press_handler)
 
+      # Pointer motion drives map panning while button 1 is held. This replaces
+      # the old per-click polling thread, keeping GTK reads/writes in GTK events.
+      @layout.add_events(:pointer_motion_mask)
+      motion_handler = gtk_safe { |_widget, event| handle_pointer_motion(event) }
+      @_prevent_gc << motion_handler
+      @layout.signal_connect('motion_notify_event', &motion_handler)
+
       # Mouse button release
       # Wrapped with gtk_safe because handle_button_release -> handle_click can
       # return an Array (from start_script('go2', [...])) that crashes the invoker.
@@ -1849,21 +1910,22 @@ module ElanthiaMap
         # Check if actual dragging occurred (threshold exceeded)
         was_dragging = @drag_state.fetch(:dragging, false)
 
-        # End the drag (stops the thread)
+        # End the drag before evaluating click behavior
         end_drag
-
-        # Wait for thread to finish
-        sleep 0.05
 
         # Clear drag state
         @drag_state = nil
 
         # Only treat as click if no dragging occurred
         unless was_dragging
+          diag('click.release', source: 'drag_state', dragging: false)
           handle_click(event)
+        else
+          diag('drag.end', source: 'release')
         end
       else
         # No drag state = pure click
+        diag('click.release', source: 'no_drag_state')
         handle_click(event)
       end
     end
@@ -1891,65 +1953,43 @@ module ElanthiaMap
     def start_drag(_event)
       pointer = get_pointer_position
 
-      # Capture drag state in local variables to prevent external modification
-      start_x = pointer[0]
-      start_y = pointer[1]
-      start_hadj = @scroller.hadjustment.value.to_i
-      start_vadj = @scroller.vadjustment.value.to_i
+      @drag_state = {
+        active: true,
+        dragging: false,
+        start_x: pointer[0],
+        start_y: pointer[1],
+        start_hadj: @scroller.hadjustment.value.to_i,
+        start_vadj: @scroller.vadjustment.value.to_i
+      }
+      diag('drag.start', x: pointer[0], y: pointer[1], hadj: @drag_state[:start_hadj], vadj: @drag_state[:start_vadj])
+    end
 
-      # Track dragging state (local to thread)
-      dragging = nil
+    # Handles pointer motion during a possible drag. GTK delivers this on the
+    # main GTK event path, so there is no polling worker touching GTK objects.
+    #
+    # @param event [Gdk::EventMotion] The motion event
+    # @return [void]
+    def handle_pointer_motion(_event)
+      return unless @drag_state && @drag_state[:active]
 
-      # Set minimal instance variable for button_release to check
-      @drag_state = { dragging: false, active: true }
+      pointer = get_pointer_position
+      dx = pointer[0] - @drag_state[:start_x]
+      dy = pointer[1] - @drag_state[:start_y]
 
-      # Start drag monitoring thread with captured local variables
-      Thread.new do
-        if @current_map && File.exist?(@current_map)
+      unless @drag_state[:dragging]
+        return unless dx.abs > 10 || dy.abs > 10
 
-          # Continue while drag is active (button not released)
-          while @drag_state && @drag_state[:active]
-            sleep 0.05
-
-            # Get current pointer position
-            pointer = nil
-            Gtk.queue { pointer = get_pointer_position }
-            sleep 0.01 while pointer.nil?
-
-            # Break if drag was ended
-            break unless @drag_state && @drag_state[:active]
-
-            # Check if drag threshold exceeded
-            if dragging.nil?
-              dx = (pointer[0] - start_x).abs
-              dy = (pointer[1] - start_y).abs
-              if dx > 10 || dy > 10
-                dragging = true
-                @drag_state[:dragging] = true if @drag_state
-              end
-            end
-
-            # Update scroll position during drag
-            if dragging
-              diff_x = start_x - pointer[0]
-              diff_y = start_y - pointer[1]
-
-              new_x = start_hadj + diff_x
-              new_y = start_vadj + diff_y
-
-              if @trouble_mode
-                respond "[map drag: diff=(#{diff_x},#{diff_y}) new=(#{new_x},#{new_y}) start=(#{start_hadj},#{start_vadj})]"
-              end
-
-              Gtk.queue do
-                # Don't constrain to image size - let GTK handle the scroll limits naturally
-                @scroller.hadjustment.value = [new_x, 0].max
-                @scroller.vadjustment.value = [new_y, 0].max
-              end
-            end
-          end
-        end
+        @drag_state[:dragging] = true
+        diag('drag.threshold', dx: dx, dy: dy)
       end
+
+      new_x = @drag_state[:start_hadj] - dx
+      new_y = @drag_state[:start_vadj] - dy
+      @scroller.hadjustment.value = [new_x, 0].max
+      @scroller.vadjustment.value = [new_y, 0].max
+      diag('drag.motion', x: pointer[0], y: pointer[1], dx: dx, dy: dy, hadj: new_x, vadj: new_y)
+    rescue StandardError => e
+      diag_exception('drag.motion.error', e)
     end
 
     # Ends a drag operation
@@ -1965,32 +2005,41 @@ module ElanthiaMap
     def handle_click(event)
       pointer = get_pointer_position
       map_data = @map_cache[@current_map, dark_mode: @settings[:dark_mode]]
+      diag('click.begin', button: event.button, state: event.state.inspect, pointer: pointer, map_data: !map_data.nil?)
       return unless map_data
 
       scale = calculate_scale(map_data)
       # Account for map offset within layout
       click_x = (@scroller.hadjustment.value.to_i + pointer[0] - @map_offset_x) / scale.to_f
       click_y = (@scroller.vadjustment.value.to_i + pointer[1] - @map_offset_y) / scale.to_f
+      diag('click.coords', click_x: click_x.round(2), click_y: click_y.round(2), scale: scale, offset: [@map_offset_x, @map_offset_y])
 
       # Check for ctrl+shift click in fix mode
       if event.state.shift_mask? && event.state.control_mask? && @fix_mode
+        diag('click.branch', branch: 'fix')
         handle_fix_mode_click(click_x, click_y)
       elsif event.state.control_mask?
         # Ctrl-click: show coordinates
+        diag('click.branch', branch: 'control')
         respond "x: #{click_x.round}, y: #{click_y.round}"
       elsif event.state.shift_mask?
         # Shift-click: show room description
+        diag('click.branch', branch: 'shift')
         room = find_room_at(click_x, click_y)
         if room
+          diag('click.room.inspect', room_id: room.id)
           respond
           respond room
           respond
         else
+          diag('click.room.miss')
           respond '[map: no matching room found]'
         end
       else
         # Regular click: navigate or follow link
+        diag('click.branch', branch: 'navigate')
         if (link = find_link_at(@current_map, click_x, click_y))
+          diag('click.link', target_map: File.basename(link[:target_map].to_s), target: [link[:target_x], link[:target_y]])
           change_map(link[:target_map])
           Gtk.queue do
             scale = calculate_scale(@map_cache[@current_map, dark_mode: @settings[:dark_mode]])
@@ -1999,11 +2048,16 @@ module ElanthiaMap
             @scroller.vadjustment.value = (link[:target_y].to_i * scale) + @map_offset_y
           end
         elsif (room = find_room_at(click_x, click_y))
-          start_script('go2', [room.id.to_s, '_disable_confirm_'])
+          diag('click.room.navigate', room_id: room.id, room_title: (room.title&.first rescue nil))
+          defer_start_script('go2', [room.id.to_s, '_disable_confirm_'])
         else
+          diag('click.room.miss')
           respond '[map: no matching room found]'
         end
       end
+    rescue StandardError => e
+      diag_exception('click.error', e)
+      raise
     end
 
     # Handles fix mode clicks for setting room coordinates
@@ -2065,6 +2119,31 @@ module ElanthiaMap
       update_room_marker
     end
 
+    # Starts a script from a short-lived worker so GTK signal callbacks can
+    # return before Lich script lifecycle changes begin.
+    #
+    # @param script_name [String] Script to start
+    # @param args [Array<String>] Arguments for the script
+    # @return [void]
+    def defer_start_script(script_name, args)
+      diag('script.defer', script: script_name, args: args)
+      Thread.new do
+        begin
+          diag('script.worker.start', script: script_name, args: args)
+          start_script(script_name, args)
+          diag('script.worker.done', script: script_name)
+        rescue StandardError => e
+          diag_exception('script.worker.error', e)
+          respond "[map: error starting #{script_name}: #{e.message}]"
+        end
+      end
+      nil
+    rescue StandardError => e
+      diag_exception('script.defer.error', e)
+      respond "[map: error deferring #{script_name}: #{e.message}]"
+      nil
+    end
+
     # Gets the current pointer position relative to the layout
     # @return [Array<Integer>] Pointer position [x, y]
     def get_pointer_position
@@ -2085,8 +2164,10 @@ module ElanthiaMap
       return nil unless @current_map
 
       current_map_name = File.basename(@current_map)
+      rooms = Room.list
+      diag('room.lookup.start', map_name: current_map_name, x: x.round(2), y: y.round(2), room_count: rooms.length)
 
-      Room.list.find do |room|
+      matched_room = rooms.find do |room|
         next unless room.image
         next unless room.image == current_map_name
 
@@ -2096,6 +2177,11 @@ module ElanthiaMap
         x1, y1, x2, y2 = coords
         x.between?(x1, x2) && y.between?(y1, y2)
       end
+      diag('room.lookup.done', matched: !matched_room.nil?, room_id: (matched_room.id rescue nil))
+      matched_room
+    rescue StandardError => e
+      diag_exception('room.lookup.error', e)
+      raise
     end
 
     # Finds a map link at the given coordinates
@@ -2105,11 +2191,13 @@ module ElanthiaMap
     # @return [Hash, nil] Link data with :target_map, :target_x, :target_y
     def find_link_at(map_path, x, y)
       map_name = File.basename(map_path)
+      diag('link.lookup.start', map_name: map_name, x: x.round(2), y: y.round(2))
 
       MapData::MAP_LINKS.each do |link|
         next unless link[0] == map_name
         next unless x.between?(link[1], link[2]) && y.between?(link[3], link[4])
 
+        diag('link.lookup.done', matched: true, target_map: link[5])
         return {
           target_map: File.join(@map_dir, link[5]),
           target_x: link[6],
@@ -2117,7 +2205,11 @@ module ElanthiaMap
         }
       end
 
+      diag('link.lookup.done', matched: false)
       nil
+    rescue StandardError => e
+      diag_exception('link.lookup.error', e)
+      raise
     end
 
     # Updates the map display with new map data
