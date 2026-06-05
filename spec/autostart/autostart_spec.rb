@@ -123,13 +123,13 @@ end
 
 # -- Helper that mirrors the game-agnostic YAML autostart loop ------------
 
-# Replicates lines 137-158 of autostart.lic.
+# Replicates the YAML autostart loop of autostart.lic.
 #
 # @param script_mod [Module] mock for Script (running?, exists?, start)
 # @param map_mod [Module] mock for Map (apply_wayto_overrides)
 # @param user_vars_mod [Module] mock for UserVars (autostart_scripts)
 # @param yaml_autostarts [Array<String>, nil] simulated get_settings.autostarts
-# @param has_get_settings [Boolean] whether get_settings is available
+# @param has_get_settings [Boolean] whether get_settings is available (false on old GS lich)
 # @param respond_output [Array<String>] collects warning messages
 # @return [Array<String>, nil] list of started script names, or nil if skipped
 def run_yaml_autostart_loop(script_mod: MockScript,
@@ -177,7 +177,7 @@ def run_generic_autostart_loop(settings_mod: MockSettings,
                                char_settings_mod: MockCharSettings,
                                script_mod: MockScript,
                                xml_data_mod: MockXMLData,
-                               lich_version: "5.7.0",
+                               has_lich_update: true,
                                respond_output: [])
   for script_list in [settings_mod['scripts'], char_settings_mod['scripts']]
     if script_list.is_a?(Array)
@@ -200,8 +200,7 @@ def run_generic_autostart_loop(settings_mod: MockSettings,
             end
           end
           next
-        elsif script_info[:name] == 'lich5-update' &&
-              Gem::Version.new(lich_version) > Gem::Version.new('5.6.2')
+        elsif script_info[:name] == 'lich5-update' && has_lich_update
           next
         else
           next if script_mod.running?(script_info[:name])
@@ -326,11 +325,18 @@ RSpec.describe "Generic autostart loop" do
       expect(MockScript.started).to be_empty
     end
 
-    it "skips lich5-update when LICH_VERSION > 5.6.2" do
+    it "skips lich5-update when Lich::Util::Update is available" do
       MockSettings['scripts'] = [{ name: 'lich5-update', args: [] }]
 
-      run_generic_autostart_loop(lich_version: "5.7.0")
+      run_generic_autostart_loop(has_lich_update: true)
       expect(MockScript.started).to be_empty
+    end
+
+    it "does not skip lich5-update on old lich without Lich::Util::Update" do
+      MockSettings['scripts'] = [{ name: 'lich5-update', args: [] }]
+
+      run_generic_autostart_loop(has_lich_update: false)
+      expect(MockScript.started).to eq([{ name: 'lich5-update', args: [] }])
     end
   end
 
@@ -396,7 +402,7 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
       expect(started).to eq(['esp', 'afk'])
     end
 
-    it "does nothing when get_settings is not available" do
+    it "does nothing when get_settings is not available (old GS lich)" do
       started = run_yaml_autostart_loop(yaml_autostarts: ['esp'], has_get_settings: false)
       expect(started).to be_nil
     end
