@@ -14,9 +14,36 @@ Tracks your current room on visual maps
       game: Gemstone
       tags: core, movement, mapping
       required: Lich >= 5.13.0
-      version: 2.1.1
+      version: 2.1.4
 
   changelog:
+    v2.1.4 (2026-05-29)
+      * Anchor transient dialog handlers (find + note dialogs). Their handler
+        Procs and widgets were connected but never rooted on the Ruby side, so
+        GC could collect them while the C-side GLib::Closure still referenced
+        them -- the same premature-GC family as the documented "undefined method
+        'call' for ..." crash. Added @_dialog_gc with identity-based release on
+        each dialog's destroy, so long sessions don't accumulate refs.
+    v2.1.3 (2026-05-28)
+      * Fix "undefined method 'call' for an instance of Array" crash on click.
+        gobject-introspection 4.3.x strictly validates signal handler return
+        values; handlers whose body ended in start_script (Array), Thread.new
+        (Thread), or respond (nil) crashed the invoker. Introduces gtk_safe
+        helper that wraps a block to guarantee a Boolean return for GTK signal
+        dispatch. Applied to every activate/clicked/show/button_press/release
+        handler. delete_handler and scroll_handler left as-is (already return
+        meaningful Booleans).
+    v2.1.2 (2026-05-28)
+      * Fix segfault in rb_objspace_call_finalizer during shutdown after
+        point-and-click interaction. rebuild_dynamic_menus was clearing
+        @_dynamic_menu_gc before destroying the old submenu containers,
+        creating a GC window where child MenuItems could be finalized while
+        their parent Gtk::Menu still held C-side references. Stage old refs
+        through a local, clear after the rebuild.
+      * Detach @menu from its attach_widget before destroy. popup_at_pointer
+        implicitly attaches the menu to @layout on first right-click; the
+        previous comment ("menus created with Gtk::Menu.new aren't attached")
+        was correct at creation time but stale after first popup.
     v2.1.1 (2026-03-22)
       * Fix crash on long sessions caused by GC collecting signal handler Procs;
         ruby-gnome2 signal_connect stores Procs only in C-side GLib::Closure which
@@ -31,6 +58,8 @@ Tracks your current room on visual maps
       * Add explicit note pin widget cleanup during window destroy
     v2.1.0 (2026-03-08)
       * Add map notes feature
+=end
+=begin
     v2.0.6 (2026-03-05)
       * Fix tag and location markers not clearing when map image changes;
         if the selected tag/location exists on the new map, markers are re-applied there
@@ -464,6 +493,80 @@ module ElanthiaMap
     DEFAULT_WIDTH = 400 unless defined?(DEFAULT_WIDTH)
     DEFAULT_HEIGHT = 300 unless defined?(DEFAULT_HEIGHT)
 
+    # Wraps a block so its return value is always a Boolean for GTK signal dispatch.
+    # gobject-introspection 4.3.x strictly validates handler return values; non-Boolean
+    # returns (Array from start_script, Thread from Thread.new, nil from respond, etc.)
+    # can crash the invoker with "undefined method 'call' for an instance of Array".
+    #
+    # The block's own return value is discarded. `next` inside the block still works
+    # for early-exit, and the wrapper always returns the configured Boolean.
+    #
+    # @param stop_propagation [Boolean] GTK return-value convention: false means
+    #   "let GTK propagate / run default handler" (correct for button press/release,
+    #   activate, clicked, show); true means "event handled, suppress default"
+    #   (correct for handled scroll, delete_event suppressing auto-destroy).
+    # @return [Proc] A Proc suitable for &-passing to signal_connect
+    def gtk_safe(stop_propagation: false, &block)
+      proc do |*args|
+        block.call(*args)
+        stop_propagation
+      end
+    end
+
+    # Emits low-noise diagnostics in trouble mode. Keep this free of GTK calls so
+    # it is safe from worker threads and useful when chasing native crashes.
+    #
+    # @param event [String] Short event name
+    # @param details [Hash] Structured details to append
+    # @return [void]
+    def diag(event, details = {})
+      return unless @trouble_mode
+
+      @diag_seq ||= 0
+      @diag_seq += 1
+      base = {
+        seq: @diag_seq,
+        event: event,
+        time: Time.now.strftime('%H:%M:%S.%L'),
+        thread: Thread.current.object_id,
+        map: (@current_map ? File.basename(@current_map) : nil),
+        drag: (@drag_state ? { active: @drag_state[:active], dragging: @drag_state[:dragging] } : nil),
+        memory_releaser: memory_releaser_status,
+        gc_count: (GC.stat[:count] rescue nil),
+        threads: (Thread.list.length rescue nil)
+      }
+      message = (base.merge(details).map { |key, value| "#{key}=#{value.inspect}" }).join(' ')
+      respond "[map diag: #{message}]"
+      Lich.log "map diag: #{message}" if defined?(Lich) && Lich.respond_to?(:log)
+    rescue StandardError
+      nil
+    end
+
+    # Logs exception details for trouble-mode crash forensics.
+    #
+    # @param event [String] Event name
+    # @param error [Exception] Exception to describe
+    # @return [void]
+    def diag_exception(event, error)
+      diag(event, error_class: error.class, error: error.message, backtrace: (error.backtrace || []).first(3))
+    end
+
+    # Returns compact MemoryReleaser state for correlation with click crashes.
+    #
+    # @return [Hash, nil]
+    def memory_releaser_status
+      return nil unless defined?(Lich::Util::MemoryReleaser)
+
+      status = Lich::Util::MemoryReleaser.status
+      {
+        running: status[:running],
+        enabled: status[:enabled],
+        interval: status[:interval]
+      }
+    rescue StandardError
+      nil
+    end
+
     # Creates and initializes the map window
     #
     # @param script [Script] The running script instance
@@ -496,6 +599,9 @@ module ElanthiaMap
       @_prevent_gc = []
       # Separate anchor for dynamically rebuilt submenu items (cleared on each rebuild)
       @_dynamic_menu_gc = []
+      # Separate anchor for transient dialog handlers (find, note) - released on each
+      # dialog's destroy so long-running sessions don't accumulate refs in @_prevent_gc
+      @_dialog_gc = []
 
       # Check for special modes
       @fix_mode = script.vars[1] =~ /fix/ ? true : false
@@ -639,7 +745,14 @@ module ElanthiaMap
 
             # Destroy menu before window
             if @menu && !@menu.destroyed?
-              # No need to detach - menus created with Gtk::Menu.new aren't attached
+              # popup_at_pointer implicitly attaches the menu to the event widget
+              # (@layout) on first right-click. Detach explicitly so GTK doesn't
+              # walk a stale attach_widget pointer during destroy.
+              begin
+                @menu.detach if @menu.respond_to?(:attach_widget) && @menu.attach_widget
+              rescue StandardError
+                # Ignore - menu may not be attached
+              end
               @menu.destroy
             end
             @menu = nil
@@ -663,6 +776,7 @@ module ElanthiaMap
             # Release all GC-prevention refs now that widgets are destroyed
             @_prevent_gc.clear
             @_dynamic_menu_gc.clear
+            @_dialog_gc.clear
           ensure
             completed = true
           end
@@ -966,7 +1080,7 @@ module ElanthiaMap
       # Follow mode toggle
       @menu_follow = Gtk::CheckMenuItem.new(label: 'Follow')
       @menu_follow.active = @follow_mode
-      follow_handler = proc do
+      follow_handler = gtk_safe do
         @follow_mode = @menu_follow.active?
         @temp_follow_disabled = false # User explicitly changed it, so save this state
       end
@@ -977,7 +1091,7 @@ module ElanthiaMap
       # Keep centered toggle
       menu_keep_centered = Gtk::CheckMenuItem.new(label: 'Keep Centered')
       menu_keep_centered.active = @settings[:keep_centered]
-      keep_centered_handler = proc { @settings[:keep_centered] = menu_keep_centered.active? }
+      keep_centered_handler = gtk_safe { @settings[:keep_centered] = menu_keep_centered.active? }
       @_prevent_gc << keep_centered_handler
       menu_keep_centered.signal_connect('activate', &keep_centered_handler)
       @menu.append(menu_keep_centered)
@@ -986,7 +1100,7 @@ module ElanthiaMap
       # Expanded canvas toggle
       menu_expanded_canvas = Gtk::CheckMenuItem.new(label: 'Expanded Canvas')
       menu_expanded_canvas.active = @settings[:expanded_canvas]
-      expanded_handler = proc do
+      expanded_handler = gtk_safe do
         @settings[:expanded_canvas] = menu_expanded_canvas.active?
         # Reload current map to apply new canvas size
         if @current_map
@@ -1004,7 +1118,7 @@ module ElanthiaMap
       # Keep above toggle
       menu_keep_above = Gtk::CheckMenuItem.new(label: 'Keep window on top')
       menu_keep_above.active = @settings[:keep_above]
-      keep_above_handler = proc do
+      keep_above_handler = gtk_safe do
         @settings[:keep_above] = menu_keep_above.active?
         # Apply keep_above setting (stays on top of other windows)
         Gtk.queue do
@@ -1021,7 +1135,7 @@ module ElanthiaMap
       # Dark mode toggle
       @menu_dark = Gtk::CheckMenuItem.new(label: 'Dark Mode')
       @menu_dark.active = @settings[:dark_mode]
-      dark_handler = proc do
+      dark_handler = gtk_safe do
         @settings[:dark_mode] = @menu_dark.active?
         # Clear current map from cache to force reload
         if @current_map
@@ -1052,7 +1166,7 @@ module ElanthiaMap
 
       # Find room option
       menu_find = Gtk::MenuItem.new(label: 'Find room...')
-      find_handler = proc do
+      find_handler = gtk_safe do
         Gtk.queue do
           find_window = Gtk::Window.new
           find_window.title = 'Find Room'
@@ -1062,12 +1176,11 @@ module ElanthiaMap
           find_button = Gtk::Button.new(label: 'Find')
 
           # Enter key triggers find
-          find_entry.signal_connect('activate') do
-            Gtk.queue { find_button.clicked }
-          end
+          find_enter_handler = gtk_safe { Gtk.queue { find_button.clicked } }
+          find_entry.signal_connect('activate', &find_enter_handler)
 
           # Find button handler
-          find_button.signal_connect('clicked') do
+          find_click_handler = gtk_safe do
             Gtk.queue do
               search_text = find_entry.text
 
@@ -1098,6 +1211,15 @@ module ElanthiaMap
               find_window.destroy
             end
           end
+          find_button.signal_connect('clicked', &find_click_handler)
+
+          # Anchor this dialog's handlers + widgets for its lifetime; see the note
+          # dialog and @_prevent_gc for why. Released on destroy via identity match.
+          find_refs = [find_enter_handler, find_click_handler, find_entry, find_button]
+          release_find_refs = gtk_safe { @_dialog_gc -= find_refs }
+          find_refs << release_find_refs
+          @_dialog_gc.concat(find_refs)
+          find_window.signal_connect('destroy', &release_find_refs)
 
           # Build layout
           find_box = Gtk::Box.new(:horizontal)
@@ -1115,7 +1237,7 @@ module ElanthiaMap
       # Borderless toggle
       menu_borderless = Gtk::CheckMenuItem.new(label: 'Borderless Window')
       menu_borderless.active = @settings[:borderless]
-      borderless_handler = proc do
+      borderless_handler = gtk_safe do
         @settings[:borderless] = menu_borderless.active?
         Gtk.queue do
           # Capture current window position before hiding
@@ -1140,7 +1262,7 @@ module ElanthiaMap
       # Hide scrollbars toggle
       menu_hide_scroll = Gtk::CheckMenuItem.new(label: 'Hide Scrollbars')
       menu_hide_scroll.active = @settings[:hide_scrollbars]
-      hide_scroll_handler = proc do
+      hide_scroll_handler = gtk_safe do
         @settings[:hide_scrollbars] = menu_hide_scroll.active?
         update_scrollbar_visibility
       end
@@ -1152,7 +1274,7 @@ module ElanthiaMap
       # Dynamic indicator size toggle
       menu_dynamic_indicator = Gtk::CheckMenuItem.new(label: 'Dynamic Indicator Size')
       menu_dynamic_indicator.active = @settings[:dynamic_indicator_size]
-      dynamic_indicator_handler = proc do
+      dynamic_indicator_handler = gtk_safe do
         @settings[:dynamic_indicator_size] = menu_dynamic_indicator.active?
         # Force marker redraw with new size
         update_room_marker
@@ -1163,14 +1285,16 @@ module ElanthiaMap
       @_prevent_gc << menu_dynamic_indicator
 
       # Rebuild dynamic menus when menu is about to show
-      show_handler = proc { rebuild_dynamic_menus }
+      # Wrapped with gtk_safe because rebuild_dynamic_menus returns an Array
+      # (from reject!) that would crash the strict invoker on every right-click.
+      show_handler = gtk_safe { rebuild_dynamic_menus }
       @_prevent_gc << show_handler
       @menu.signal_connect('show', &show_handler)
 
       # Map notes menu item
       @menu.append(Gtk::SeparatorMenuItem.new)
       @menu_note = Gtk::MenuItem.new(label: 'Add/Edit Note')
-      note_handler = proc do
+      note_handler = gtk_safe do
         Gtk.queue do
           map_data = @map_cache[@current_map, dark_mode: @settings[:dark_mode]]
           next unless map_data
@@ -1213,7 +1337,7 @@ module ElanthiaMap
           delete_button = Gtk::Button.new(label: 'Delete Note')
           cancel_button = Gtk::Button.new(label: 'Cancel')
 
-          save_button.signal_connect('clicked') do
+          save_click_handler = gtk_safe do
             Gtk.queue do
               note_text = text_view.buffer.text.strip
               note_text.empty? ? notes.delete(room_key) : notes[room_key] = note_text
@@ -1221,16 +1345,32 @@ module ElanthiaMap
               note_window.destroy
             end
           end
+          save_button.signal_connect('clicked', &save_click_handler)
 
-          delete_button.signal_connect('clicked') do
+          delete_click_handler = gtk_safe do
             Gtk.queue do
               notes.delete(room_key)
               persist_notes(notes, room.id, deleted: true)
               note_window.destroy
             end
           end
+          delete_button.signal_connect('clicked', &delete_click_handler)
 
-          cancel_button.signal_connect('clicked') { Gtk.queue { note_window.destroy } }
+          cancel_click_handler = gtk_safe { Gtk.queue { note_window.destroy } }
+          cancel_button.signal_connect('clicked', &cancel_click_handler)
+
+          # Anchor this dialog's handlers + buttons so Ruby's GC can't collect the
+          # wrapper Procs while the C-side GLib::Closure still references them. Without
+          # this they live only on the C side (invisible to Ruby GC), which is the
+          # "undefined method 'call' for ..." crash family documented at @_prevent_gc.
+          # Identity-based release on destroy keeps long sessions from leaking and
+          # supports multiple note dialogs open at once.
+          dialog_refs = [save_click_handler, delete_click_handler, cancel_click_handler,
+                         save_button, delete_button, cancel_button]
+          release_dialog_refs = gtk_safe { @_dialog_gc -= dialog_refs }
+          dialog_refs << release_dialog_refs
+          @_dialog_gc.concat(dialog_refs)
+          note_window.signal_connect('destroy', &release_dialog_refs)
 
           hbox.pack_start(save_button,   expand: true, fill: true, padding: 0)
           hbox.pack_start(delete_button, expand: true, fill: true, padding: 0)
@@ -1266,7 +1406,7 @@ module ElanthiaMap
 
         # Capture opacity_value in a local variable for the closure
         value_to_apply = opacity_value
-        handler = proc do
+        handler = gtk_safe do
           next unless item.active?
 
           @settings[:opacity] = value_to_apply
@@ -1300,7 +1440,7 @@ module ElanthiaMap
       # Global Scale checkbox at top
       global_scale_item = Gtk::CheckMenuItem.new(label: 'Global Scale')
       global_scale_item.active = @settings[:global_scale_enabled]
-      global_scale_handler = proc do
+      global_scale_handler = gtk_safe do
         @settings[:global_scale_enabled] = global_scale_item.active?
         # Force map reload to apply new scale mode
         if @current_map
@@ -1332,7 +1472,7 @@ module ElanthiaMap
 
         # Capture scale_value for closure
         value_to_apply = scale_value
-        handler = proc do
+        handler = gtk_safe do
           next unless item.active?
 
           if @settings[:global_scale_enabled]
@@ -1401,7 +1541,7 @@ module ElanthiaMap
 
           if map_info[:filename]
             map_path = File.join(@map_dir, map_info[:filename])
-            handler = proc { Gtk.queue { change_map(map_path); update_room_marker } }
+            handler = gtk_safe { Gtk.queue { change_map(map_path); update_room_marker } }
             @_prevent_gc << handler
             map_item.signal_connect('activate', &handler)
           end
@@ -1428,7 +1568,7 @@ module ElanthiaMap
 
           if map_info[:filename]
             map_path = File.join(@map_dir, map_info[:filename])
-            handler = proc { Gtk.queue { change_map(map_path); update_room_marker } }
+            handler = gtk_safe { Gtk.queue { change_map(map_path); update_room_marker } }
             @_prevent_gc << handler
             map_item.signal_connect('activate', &handler)
           end
@@ -1455,7 +1595,7 @@ module ElanthiaMap
 
           if map_info[:filename]
             map_path = File.join(@map_dir, map_info[:filename])
-            handler = proc { Gtk.queue { change_map(map_path); update_room_marker } }
+            handler = gtk_safe { Gtk.queue { change_map(map_path); update_room_marker } }
             @_prevent_gc << handler
             map_item.signal_connect('activate', &handler)
           end
@@ -1512,7 +1652,7 @@ module ElanthiaMap
       else
         # Add Clear option at top
         clear_item = Gtk::MenuItem.new(label: 'Clear Tag Markers')
-        clear_handler = proc { @active_tag = nil; clear_tag_markers }
+        clear_handler = gtk_safe { @active_tag = nil; clear_tag_markers }
         @_dynamic_menu_gc << clear_handler
         clear_item.signal_connect('activate', &clear_handler)
         submenu.append(clear_item)
@@ -1521,7 +1661,7 @@ module ElanthiaMap
 
         all_tags.each do |tag|
           item = Gtk::MenuItem.new(label: tag)
-          handler = proc do
+          handler = gtk_safe do
             @active_tag = tag
             rooms_with_tag = rooms_on_map.select { |r| r.tags&.include?(tag) }
             display_tag_markers(rooms_with_tag)
@@ -1576,7 +1716,7 @@ module ElanthiaMap
       else
         # Add Clear option at top
         clear_item = Gtk::MenuItem.new(label: 'Clear Location Markers')
-        clear_handler = proc { @active_location = nil; clear_location_markers }
+        clear_handler = gtk_safe { @active_location = nil; clear_location_markers }
         @_dynamic_menu_gc << clear_handler
         clear_item.signal_connect('activate', &clear_handler)
         submenu.append(clear_item)
@@ -1585,7 +1725,7 @@ module ElanthiaMap
 
         locations.each do |location|
           item = Gtk::MenuItem.new(label: location)
-          handler = proc do
+          handler = gtk_safe do
             @active_location = location
             rooms_in_location = rooms_on_map.select { |r| r.location.to_s == location }
             display_location_markers(rooms_in_location)
@@ -1603,9 +1743,12 @@ module ElanthiaMap
     # Rebuilds dynamic menus (tags, locations, scale) with current map data
     # @return [void]
     def rebuild_dynamic_menus
-      # Release old dynamic menu item refs; the .destroy calls below
-      # disconnect GTK signals before GC can collect the Procs
-      @_dynamic_menu_gc.clear
+      # Stash old refs so they remain Ruby-rooted across .destroy of the old
+      # submenu containers. Clearing @_dynamic_menu_gc *before* destroy creates
+      # a window where Ruby GC may finalize child MenuItems while their parent
+      # Gtk::Menu still holds C-side references, triggering gtk_container_remove
+      # -> g_signal_emit on a half-destroyed item. Clear at the end instead.
+      old_dynamic_refs = @_dynamic_menu_gc.dup
 
       # Rebuild scale menu only in per-map mode (global mode doesn't vary per map)
       if @menu_scale && !@settings[:global_scale_enabled]
@@ -1630,6 +1773,11 @@ module ElanthiaMap
         @menu_locations.submenu = submenu
         submenu.show_all
       end
+
+      # Now release the stashed old refs. New refs added by the build_*_submenu
+      # calls above are appended to @_dynamic_menu_gc and must not be cleared.
+      @_dynamic_menu_gc.reject! { |ref| old_dynamic_refs.include?(ref) }
+      old_dynamic_refs.clear
     end
 
     # Creates the map display area
@@ -1660,8 +1808,16 @@ module ElanthiaMap
     # @return [void]
     def setup_event_handlers
       # Window close event
-      # All signal handler Procs must be anchored on the Ruby side because
-      # signal_connect only stores them in a C-side GLib::Closure that Ruby's GC cannot see.
+      # Two invariants for ruby-gnome2 4.3.x signal handlers:
+      #   1. All signal handler Procs must be anchored on the Ruby side because
+      #      signal_connect only stores them in a C-side GLib::Closure that
+      #      Ruby's GC cannot see (handled via @_prevent_gc / @_dynamic_menu_gc).
+      #   2. Event handlers MUST return a Boolean. gobject-introspection 4.3.x
+      #      strictly validates return values and crashes the invoker on
+      #      non-Boolean returns. Wrap with gtk_safe { ... } when the body
+      #      can return Array/Thread/nil (most handlers do via start_script,
+      #      Thread.new, etc.). Leave hand-Boolean handlers (delete_handler,
+      #      scroll_handler) as plain Procs.
       delete_handler = proc do
         respond '[map: === DELETE_EVENT HANDLER CALLED ===]' if @trouble_mode
 
@@ -1699,18 +1855,32 @@ module ElanthiaMap
       @gtk_window.signal_connect('delete_event', &delete_handler)
 
       # Mouse button press
+      # Wrapped with gtk_safe because handle_button_press can return arbitrary
+      # values (Thread from start_drag, nil from popup_at_pointer) that crash
+      # gobject-introspection 4.3.x's strict invoker.
       @layout.add_events(:button_press_mask)
-      press_handler = proc { |_widget, event| handle_button_press(event) }
+      press_handler = gtk_safe { |_widget, event| handle_button_press(event) }
       @_prevent_gc << press_handler
       @layout.signal_connect('button_press_event', &press_handler)
 
+      # Pointer motion drives map panning while button 1 is held. This replaces
+      # the old per-click polling thread, keeping GTK reads/writes in GTK events.
+      @layout.add_events(:pointer_motion_mask)
+      motion_handler = gtk_safe { |_widget, event| handle_pointer_motion(event) }
+      @_prevent_gc << motion_handler
+      @layout.signal_connect('motion_notify_event', &motion_handler)
+
       # Mouse button release
+      # Wrapped with gtk_safe because handle_button_release -> handle_click can
+      # return an Array (from start_script('go2', [...])) that crashes the invoker.
       @layout.add_events(:button_release_mask)
-      release_handler = proc { |_widget, event| handle_button_release(event) }
+      release_handler = gtk_safe { |_widget, event| handle_button_release(event) }
       @_prevent_gc << release_handler
       @layout.signal_connect('button-release-event', &release_handler)
 
       # Scroll wheel with modifiers for zoom
+      # NOT wrapped: handle_scroll already returns a meaningful Boolean
+      # (true on ctrl+scroll to consume, false otherwise to let GTK propagate).
       @layout.add_events(:scroll_mask)
       scroll_handler = proc { |_widget, event| handle_scroll(event) }
       @_prevent_gc << scroll_handler
@@ -1740,21 +1910,22 @@ module ElanthiaMap
         # Check if actual dragging occurred (threshold exceeded)
         was_dragging = @drag_state.fetch(:dragging, false)
 
-        # End the drag (stops the thread)
+        # End the drag before evaluating click behavior
         end_drag
-
-        # Wait for thread to finish
-        sleep 0.05
 
         # Clear drag state
         @drag_state = nil
 
         # Only treat as click if no dragging occurred
         unless was_dragging
+          diag('click.release', source: 'drag_state', dragging: false)
           handle_click(event)
+        else
+          diag('drag.end', source: 'release')
         end
       else
         # No drag state = pure click
+        diag('click.release', source: 'no_drag_state')
         handle_click(event)
       end
     end
@@ -1782,65 +1953,43 @@ module ElanthiaMap
     def start_drag(_event)
       pointer = get_pointer_position
 
-      # Capture drag state in local variables to prevent external modification
-      start_x = pointer[0]
-      start_y = pointer[1]
-      start_hadj = @scroller.hadjustment.value.to_i
-      start_vadj = @scroller.vadjustment.value.to_i
+      @drag_state = {
+        active: true,
+        dragging: false,
+        start_x: pointer[0],
+        start_y: pointer[1],
+        start_hadj: @scroller.hadjustment.value.to_i,
+        start_vadj: @scroller.vadjustment.value.to_i
+      }
+      diag('drag.start', x: pointer[0], y: pointer[1], hadj: @drag_state[:start_hadj], vadj: @drag_state[:start_vadj])
+    end
 
-      # Track dragging state (local to thread)
-      dragging = nil
+    # Handles pointer motion during a possible drag. GTK delivers this on the
+    # main GTK event path, so there is no polling worker touching GTK objects.
+    #
+    # @param event [Gdk::EventMotion] The motion event
+    # @return [void]
+    def handle_pointer_motion(_event)
+      return unless @drag_state && @drag_state[:active]
 
-      # Set minimal instance variable for button_release to check
-      @drag_state = { dragging: false, active: true }
+      pointer = get_pointer_position
+      dx = pointer[0] - @drag_state[:start_x]
+      dy = pointer[1] - @drag_state[:start_y]
 
-      # Start drag monitoring thread with captured local variables
-      Thread.new do
-        if @current_map && File.exist?(@current_map)
+      unless @drag_state[:dragging]
+        return unless dx.abs > 10 || dy.abs > 10
 
-          # Continue while drag is active (button not released)
-          while @drag_state && @drag_state[:active]
-            sleep 0.05
-
-            # Get current pointer position
-            pointer = nil
-            Gtk.queue { pointer = get_pointer_position }
-            sleep 0.01 while pointer.nil?
-
-            # Break if drag was ended
-            break unless @drag_state && @drag_state[:active]
-
-            # Check if drag threshold exceeded
-            if dragging.nil?
-              dx = (pointer[0] - start_x).abs
-              dy = (pointer[1] - start_y).abs
-              if dx > 10 || dy > 10
-                dragging = true
-                @drag_state[:dragging] = true if @drag_state
-              end
-            end
-
-            # Update scroll position during drag
-            if dragging
-              diff_x = start_x - pointer[0]
-              diff_y = start_y - pointer[1]
-
-              new_x = start_hadj + diff_x
-              new_y = start_vadj + diff_y
-
-              if @trouble_mode
-                respond "[map drag: diff=(#{diff_x},#{diff_y}) new=(#{new_x},#{new_y}) start=(#{start_hadj},#{start_vadj})]"
-              end
-
-              Gtk.queue do
-                # Don't constrain to image size - let GTK handle the scroll limits naturally
-                @scroller.hadjustment.value = [new_x, 0].max
-                @scroller.vadjustment.value = [new_y, 0].max
-              end
-            end
-          end
-        end
+        @drag_state[:dragging] = true
+        diag('drag.threshold', dx: dx, dy: dy)
       end
+
+      new_x = @drag_state[:start_hadj] - dx
+      new_y = @drag_state[:start_vadj] - dy
+      @scroller.hadjustment.value = [new_x, 0].max
+      @scroller.vadjustment.value = [new_y, 0].max
+      diag('drag.motion', x: pointer[0], y: pointer[1], dx: dx, dy: dy, hadj: new_x, vadj: new_y)
+    rescue StandardError => e
+      diag_exception('drag.motion.error', e)
     end
 
     # Ends a drag operation
@@ -1856,32 +2005,41 @@ module ElanthiaMap
     def handle_click(event)
       pointer = get_pointer_position
       map_data = @map_cache[@current_map, dark_mode: @settings[:dark_mode]]
+      diag('click.begin', button: event.button, state: event.state.inspect, pointer: pointer, map_data: !map_data.nil?)
       return unless map_data
 
       scale = calculate_scale(map_data)
       # Account for map offset within layout
       click_x = (@scroller.hadjustment.value.to_i + pointer[0] - @map_offset_x) / scale.to_f
       click_y = (@scroller.vadjustment.value.to_i + pointer[1] - @map_offset_y) / scale.to_f
+      diag('click.coords', click_x: click_x.round(2), click_y: click_y.round(2), scale: scale, offset: [@map_offset_x, @map_offset_y])
 
       # Check for ctrl+shift click in fix mode
       if event.state.shift_mask? && event.state.control_mask? && @fix_mode
+        diag('click.branch', branch: 'fix')
         handle_fix_mode_click(click_x, click_y)
       elsif event.state.control_mask?
         # Ctrl-click: show coordinates
+        diag('click.branch', branch: 'control')
         respond "x: #{click_x.round}, y: #{click_y.round}"
       elsif event.state.shift_mask?
         # Shift-click: show room description
+        diag('click.branch', branch: 'shift')
         room = find_room_at(click_x, click_y)
         if room
+          diag('click.room.inspect', room_id: room.id)
           respond
           respond room
           respond
         else
+          diag('click.room.miss')
           respond '[map: no matching room found]'
         end
       else
         # Regular click: navigate or follow link
+        diag('click.branch', branch: 'navigate')
         if (link = find_link_at(@current_map, click_x, click_y))
+          diag('click.link', target_map: File.basename(link[:target_map].to_s), target: [link[:target_x], link[:target_y]])
           change_map(link[:target_map])
           Gtk.queue do
             scale = calculate_scale(@map_cache[@current_map, dark_mode: @settings[:dark_mode]])
@@ -1890,11 +2048,16 @@ module ElanthiaMap
             @scroller.vadjustment.value = (link[:target_y].to_i * scale) + @map_offset_y
           end
         elsif (room = find_room_at(click_x, click_y))
-          start_script('go2', [room.id.to_s, '_disable_confirm_'])
+          diag('click.room.navigate', room_id: room.id, room_title: (room.title&.first rescue nil))
+          defer_start_script('go2', [room.id.to_s, '_disable_confirm_'])
         else
+          diag('click.room.miss')
           respond '[map: no matching room found]'
         end
       end
+    rescue StandardError => e
+      diag_exception('click.error', e)
+      raise
     end
 
     # Handles fix mode clicks for setting room coordinates
@@ -1956,6 +2119,31 @@ module ElanthiaMap
       update_room_marker
     end
 
+    # Starts a script from a short-lived worker so GTK signal callbacks can
+    # return before Lich script lifecycle changes begin.
+    #
+    # @param script_name [String] Script to start
+    # @param args [Array<String>] Arguments for the script
+    # @return [void]
+    def defer_start_script(script_name, args)
+      diag('script.defer', script: script_name, args: args)
+      Thread.new do
+        begin
+          diag('script.worker.start', script: script_name, args: args)
+          start_script(script_name, args)
+          diag('script.worker.done', script: script_name)
+        rescue StandardError => e
+          diag_exception('script.worker.error', e)
+          respond "[map: error starting #{script_name}: #{e.message}]"
+        end
+      end
+      nil
+    rescue StandardError => e
+      diag_exception('script.defer.error', e)
+      respond "[map: error deferring #{script_name}: #{e.message}]"
+      nil
+    end
+
     # Gets the current pointer position relative to the layout
     # @return [Array<Integer>] Pointer position [x, y]
     def get_pointer_position
@@ -1976,8 +2164,10 @@ module ElanthiaMap
       return nil unless @current_map
 
       current_map_name = File.basename(@current_map)
+      rooms = Room.list
+      diag('room.lookup.start', map_name: current_map_name, x: x.round(2), y: y.round(2), room_count: rooms.length)
 
-      Room.list.find do |room|
+      matched_room = rooms.find do |room|
         next unless room.image
         next unless room.image == current_map_name
 
@@ -1987,6 +2177,11 @@ module ElanthiaMap
         x1, y1, x2, y2 = coords
         x.between?(x1, x2) && y.between?(y1, y2)
       end
+      diag('room.lookup.done', matched: !matched_room.nil?, room_id: (matched_room.id rescue nil))
+      matched_room
+    rescue StandardError => e
+      diag_exception('room.lookup.error', e)
+      raise
     end
 
     # Finds a map link at the given coordinates
@@ -1996,11 +2191,13 @@ module ElanthiaMap
     # @return [Hash, nil] Link data with :target_map, :target_x, :target_y
     def find_link_at(map_path, x, y)
       map_name = File.basename(map_path)
+      diag('link.lookup.start', map_name: map_name, x: x.round(2), y: y.round(2))
 
       MapData::MAP_LINKS.each do |link|
         next unless link[0] == map_name
         next unless x.between?(link[1], link[2]) && y.between?(link[3], link[4])
 
+        diag('link.lookup.done', matched: true, target_map: link[5])
         return {
           target_map: File.join(@map_dir, link[5]),
           target_x: link[6],
@@ -2008,7 +2205,11 @@ module ElanthiaMap
         }
       end
 
+      diag('link.lookup.done', matched: false)
       nil
+    rescue StandardError => e
+      diag_exception('link.lookup.error', e)
+      raise
     end
 
     # Updates the map display with new map data
