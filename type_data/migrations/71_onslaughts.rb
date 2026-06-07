@@ -10,6 +10,10 @@ migrate "ascension:jewel" do
   insert(:name, %[rough crystalline geode])
 end
 
+migrate :gem, :gemshop do
+  insert(:exclude, %{rough crystalline geode})
+end
+
 migrate "ascension:misc" do
   insert(:name, %{viscous vial of violet vodka})
 end
