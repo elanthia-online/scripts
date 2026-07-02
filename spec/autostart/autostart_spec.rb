@@ -121,33 +121,104 @@ module MockUserVars
   end
 end
 
-# -- Helper that mirrors the game-agnostic YAML autostart loop ------------
+# -- Helpers that mirror the game-agnostic YAML autostart path -----------
+#
+# The helpers below are verbatim mirrors of the same-named methods in
+# scripts/autostart.lic. As documented at the top of this file, we cannot load
+# the .lic (it runs heavy startup side effects), so the pure logic is duplicated
+# here and exercised directly. Keep these in sync with the production methods.
+
+# Mirror of autostart.lic#normalize_autostart_entry.
+#
+# @param entry [String, Hash, nil] a YAML autostart entry.
+# @return [Array(String, Array<String>)] the script name and its argument list.
+def normalize_autostart_entry(entry)
+  if entry.is_a?(Hash)
+    name = (entry[:name] || entry['name']).to_s.strip
+    args = Array(entry[:args] || entry['args']).map(&:to_s)
+    [name, args]
+  else
+    parts = entry.to_s.split
+    [parts.first.to_s, parts[1..].to_a]
+  end
+end
+
+# Mirror of autostart.lic#yaml_autostart_entries (with injectable source).
+#
+# @param yaml_autostarts [Array, nil] simulated get_settings.autostarts
+# @return [Array<Array(String, Array<String>)>] normalized [name, args] pairs
+def build_yaml_autostart_entries(yaml_autostarts: [])
+  yaml_autostarts.to_a
+                 .map { |entry| normalize_autostart_entry(entry) }
+                 .reject { |name, _args| name.nil? || name.empty? }
+                 .group_by { |name, _args| name }
+                 .map { |_name, group| group.find { |_n, args| !args.empty? } || group.first }
+end
+
+# Mirror of autostart.lic#autostart_covered_names (with injectable sources).
+#
+# @param yaml_autostarts [Array, nil] simulated get_settings.autostarts
+# @param settings_scripts [Array, nil] simulated Settings['scripts']
+# @param char_scripts [Array, nil] simulated CharSettings['scripts']
+# @return [Array<String>] unique, non-blank names already autostarted
+def build_autostart_covered_names(yaml_autostarts: [], settings_scripts: nil, char_scripts: nil)
+  names = yaml_autostarts.to_a.map { |entry| normalize_autostart_entry(entry).first }
+  [settings_scripts, char_scripts].each do |list|
+    names.concat(list.map { |info| info[:name] }) if list.is_a?(Array)
+  end
+  names.compact.map(&:to_s).reject(&:empty?).uniq
+end
+
+# Mirror of autostart.lic#migrate_legacy_uservars_autostarts.
+#
+# Compares the stale UserVars names against the covered set; pushes a quiet
+# "clearing" note when all are covered or a loud "ACTION NEEDED" notice naming
+# the gap otherwise, then clears the UserVar so the check runs only once. Never
+# re-adds or starts anything.
+#
+# @param user_vars_mod [Module] mock for UserVars (autostart_scripts)
+# @param covered [Array<String>] names already covered by YAML/DB autostarts
+# @param respond_output [Array<String>] collects notice lines
+# @return [void]
+def run_legacy_uservars_migration(user_vars_mod: MockUserVars, covered: [], respond_output: [])
+  legacy = user_vars_mod.autostart_scripts.to_a
+  return if legacy.empty?
+
+  gaps = legacy.map { |entry| normalize_autostart_entry(entry).first }
+               .reject { |name| name.nil? || name.empty? }
+               .uniq
+               .reject { |name| covered.include?(name) }
+
+  if gaps.empty?
+    respond_output << "clearing legacy UserVars.autostart_scripts (no longer used; all entries already in YAML/DB)"
+  else
+    respond_output << "ACTION NEEDED: not in YAML 'autostarts:' or ;autostart DB: #{gaps.join(', ')}"
+    respond_output << "add to the profile 'autostarts:' list or via ;autostart add <script> [args]"
+  end
+  user_vars_mod.autostart_scripts = nil
+end
 
 # Replicates the YAML autostart loop of autostart.lic.
 #
 # @param script_mod [Module] mock for Script (running?, exists?, start)
 # @param map_mod [Module] mock for Map (apply_wayto_overrides)
-# @param user_vars_mod [Module] mock for UserVars (autostart_scripts)
-# @param yaml_autostarts [Array<String>, nil] simulated get_settings.autostarts
+# @param yaml_autostarts [Array, nil] simulated get_settings.autostarts
 # @param has_get_settings [Boolean] whether get_settings is available (false on old GS lich)
 # @param respond_output [Array<String>] collects warning messages
 # @return [Array<String>, nil] list of started script names, or nil if skipped
 def run_yaml_autostart_loop(script_mod: MockScript,
                             map_mod: MockMap,
-                            user_vars_mod: MockUserVars,
                             yaml_autostarts: [],
                             has_get_settings: true,
                             respond_output: [])
   return unless has_get_settings
 
-  user_vars_mod.autostart_scripts ||= []
-  all_autostarts = (user_vars_mod.autostart_scripts.to_a +
-                    yaml_autostarts.to_a).uniq
+  entries = build_yaml_autostart_entries(yaml_autostarts: yaml_autostarts)
 
   map_mod.apply_wayto_overrides if map_mod.respond_to?(:apply_wayto_overrides)
 
   started = []
-  all_autostarts.each do |script_name|
+  entries.each do |script_name, args|
     next if script_name == 'dependency'
     next if defined?(DR_OBSOLETE_SCRIPTS) && DR_OBSOLETE_SCRIPTS.include?(script_name)
     next if script_mod.running?(script_name)
@@ -158,7 +229,7 @@ def run_yaml_autostart_loop(script_mod: MockScript,
     end
 
     started << script_name
-    script_mod.start(script_name)
+    script_mod.start(script_name, args: args)
   end
   started
 end
@@ -418,28 +489,6 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
     end
   end
 
-  describe "UserVars autostarts" do
-    it "starts scripts from UserVars.autostart_scripts" do
-      MockUserVars.autostart_scripts = ['my-script']
-      started = run_yaml_autostart_loop(yaml_autostarts: [])
-      expect(started).to eq(['my-script'])
-    end
-
-    it "initializes UserVars.autostart_scripts to empty array when nil" do
-      MockUserVars.autostart_scripts = nil
-      run_yaml_autostart_loop(yaml_autostarts: [])
-      expect(MockUserVars.autostart_scripts).to eq([])
-    end
-  end
-
-  describe "merging UserVars and YAML" do
-    it "combines and deduplicates UserVars and YAML autostarts" do
-      MockUserVars.autostart_scripts = ['shared', 'uvar-only']
-      started = run_yaml_autostart_loop(yaml_autostarts: ['shared', 'yaml-only'])
-      expect(started).to contain_exactly('shared', 'uvar-only', 'yaml-only')
-    end
-  end
-
   describe "wayto overrides" do
     it "applies Map.apply_wayto_overrides" do
       run_yaml_autostart_loop(yaml_autostarts: [])
@@ -485,14 +534,11 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
 
   describe "GS character with no YAML profiles" do
     it "handles nil autostarts from missing base.yaml and no character profile" do
-      MockUserVars.autostart_scripts = nil
       started = run_yaml_autostart_loop(yaml_autostarts: nil)
       expect(started).to eq([])
-      expect(MockUserVars.autostart_scripts).to eq([])
     end
 
     it "still applies wayto overrides even with no autostarts" do
-      MockUserVars.autostart_scripts = nil
       run_yaml_autostart_loop(yaml_autostarts: nil)
       expect(MockMap.applied).to be true
     end
@@ -504,16 +550,6 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
   end
 
   describe "adversarial inputs" do
-    it "handles nil entries in UserVars.autostart_scripts" do
-      MockUserVars.autostart_scripts = [nil, 'esp', nil]
-      allow(MockScript).to receive(:running?).and_call_original
-      allow(MockScript).to receive(:exists?).and_call_original
-      allow(MockScript).to receive(:running?).with(nil).and_return(false)
-      allow(MockScript).to receive(:exists?).with(nil).and_return(false)
-      started = run_yaml_autostart_loop(yaml_autostarts: [])
-      expect(started).to eq(['esp'])
-    end
-
     it "handles nil entries in YAML autostarts" do
       allow(MockScript).to receive(:running?).and_call_original
       allow(MockScript).to receive(:exists?).and_call_original
@@ -530,25 +566,12 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
       expect(started).to eq(['esp'])
     end
 
-    it "deduplicates across UserVars and YAML when both contain the same script" do
-      MockUserVars.autostart_scripts = ['esp', 'afk']
-      started = run_yaml_autostart_loop(yaml_autostarts: ['afk', 'esp'])
-      expect(started).to eq(['esp', 'afk'])
-    end
-
-    it "deduplicates within UserVars itself" do
-      MockUserVars.autostart_scripts = ['esp', 'esp', 'esp']
-      started = run_yaml_autostart_loop(yaml_autostarts: [])
-      expect(started).to eq(['esp'])
-    end
-
-    it "deduplicates within YAML autostarts itself" do
+    it "deduplicates within the YAML autostarts list itself" do
       started = run_yaml_autostart_loop(yaml_autostarts: ['afk', 'afk', 'afk'])
       expect(started).to eq(['afk'])
     end
 
-    it "handles both UserVars and YAML being nil simultaneously" do
-      MockUserVars.autostart_scripts = nil
+    it "handles nil YAML autostarts" do
       started = run_yaml_autostart_loop(yaml_autostarts: nil)
       expect(started).to eq([])
     end
@@ -568,9 +591,8 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
       expect(output.size).to eq(2)
     end
 
-    it "skips dependency even when it appears in both UserVars and YAML" do
-      MockUserVars.autostart_scripts = ['dependency']
-      started = run_yaml_autostart_loop(yaml_autostarts: ['dependency', 'esp'])
+    it "skips dependency even when it appears twice in the YAML list" do
+      started = run_yaml_autostart_loop(yaml_autostarts: ['dependency', 'dependency', 'esp'])
       expect(started).to eq(['esp'])
     end
   end
@@ -583,16 +605,6 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
       started = run_yaml_autostart_loop(yaml_autostarts: ['typo-script'], respond_output: output)
       expect(started).to eq([])
       expect(output).to include(a_string_matching(/typo-script.*not found/))
-    end
-
-    it "warns when a UserVars autostart script does not exist" do
-      MockUserVars.autostart_scripts = ['gone-script']
-      allow(MockScript).to receive(:exists?).and_call_original
-      allow(MockScript).to receive(:exists?).with('gone-script').and_return(false)
-      output = []
-      started = run_yaml_autostart_loop(yaml_autostarts: [], respond_output: output)
-      expect(started).to eq([])
-      expect(output).to include(a_string_matching(/gone-script.*not found/))
     end
 
     it "warns for each missing script individually" do
@@ -634,5 +646,225 @@ RSpec.describe "YAML autostart loop (game-agnostic)" do
       expect(output.size).to eq(1)
       expect(output.first).to match(/missing.*not found/)
     end
+  end
+end
+
+RSpec.describe "normalize_autostart_entry" do
+  it "normalizes a bare script name to [name, []]" do
+    expect(normalize_autostart_entry('lichbot')).to eq(['lichbot', []])
+  end
+
+  it "splits a name-with-args string on whitespace" do
+    expect(normalize_autostart_entry('lichbot start')).to eq(['lichbot', ['start']])
+  end
+
+  it "handles multiple args and collapses extra whitespace" do
+    expect(normalize_autostart_entry('  foo  a   b ')).to eq(['foo', ['a', 'b']])
+  end
+
+  it "normalizes a symbol-keyed hash" do
+    expect(normalize_autostart_entry(name: 'lichbot', args: ['start']))
+      .to eq(['lichbot', ['start']])
+  end
+
+  it "normalizes a string-keyed hash (as produced by YAML)" do
+    expect(normalize_autostart_entry('name' => 'lichbot', 'args' => ['start']))
+      .to eq(['lichbot', ['start']])
+  end
+
+  it "prefers symbol keys but falls back to string keys" do
+    expect(normalize_autostart_entry('name' => 'foo', 'args' => %w[a b]))
+      .to eq(['foo', %w[a b]])
+  end
+
+  it "coerces non-string hash args to strings" do
+    expect(normalize_autostart_entry(name: 'foo', args: [1, :two]))
+      .to eq(['foo', ['1', 'two']])
+  end
+
+  it "wraps a scalar (non-array) hash args value" do
+    expect(normalize_autostart_entry(name: 'foo', args: 'start'))
+      .to eq(['foo', ['start']])
+  end
+
+  it "returns empty args when a hash omits args" do
+    expect(normalize_autostart_entry(name: 'foo')).to eq(['foo', []])
+  end
+
+  it "yields a blank name for a nil entry (caller rejects it)" do
+    expect(normalize_autostart_entry(nil)).to eq(['', []])
+  end
+
+  it "yields a blank name for an empty string" do
+    expect(normalize_autostart_entry('')).to eq(['', []])
+  end
+
+  it "yields a blank name for a whitespace-only string" do
+    expect(normalize_autostart_entry('   ')).to eq(['', []])
+  end
+
+  it "yields a blank name for a hash with no name" do
+    expect(normalize_autostart_entry(args: ['start'])).to eq(['', ['start']])
+  end
+end
+
+RSpec.describe "YAML autostart args support" do
+  before do
+    MockScript.reset!
+    MockMap.reset!
+    MockUserVars.reset!
+  end
+
+  it "passes args from a name-with-args string to Script.start" do
+    run_yaml_autostart_loop(yaml_autostarts: ['lichbot start'])
+    expect(MockScript.started).to eq([{ name: 'lichbot', args: ['start'] }])
+  end
+
+  it "passes args from a symbol-keyed hash entry" do
+    run_yaml_autostart_loop(yaml_autostarts: [{ name: 'lichbot', args: ['start'] }])
+    expect(MockScript.started).to eq([{ name: 'lichbot', args: ['start'] }])
+  end
+
+  it "passes args from a string-keyed hash entry" do
+    run_yaml_autostart_loop(yaml_autostarts: [{ 'name' => 'lichbot', 'args' => ['start'] }])
+    expect(MockScript.started).to eq([{ name: 'lichbot', args: ['start'] }])
+  end
+
+  it "starts a bare-name entry with empty args (backward compatible)" do
+    run_yaml_autostart_loop(yaml_autostarts: ['esp'])
+    expect(MockScript.started).to eq([{ name: 'esp', args: [] }])
+  end
+
+  it "rejects nil-name and empty-name entries before starting" do
+    started = run_yaml_autostart_loop(yaml_autostarts: [nil, '', '   ', 'esp'])
+    expect(started).to eq(['esp'])
+    expect(MockScript.started).to eq([{ name: 'esp', args: [] }])
+  end
+
+  it "de-dups duplicate names in the list; when both carry args the first wins" do
+    started = run_yaml_autostart_loop(
+      yaml_autostarts: ['lichbot start', { name: 'lichbot', args: ['stop'] }]
+    )
+    expect(started).to eq(['lichbot'])
+    # Both carry args, so first occurrence ('start') wins over 'stop'.
+    expect(MockScript.started).to eq([{ name: 'lichbot', args: ['start'] }])
+  end
+
+  it "lets an args entry win over a bare duplicate regardless of order" do
+    # A bare 'lichbot' listed before 'lichbot start' must not strip the args.
+    started = run_yaml_autostart_loop(yaml_autostarts: ['lichbot', 'lnet', 'lichbot start'])
+    expect(started).to eq(['lichbot', 'lnet'])
+    expect(MockScript.started).to eq([
+                                       { name: 'lichbot', args: ['start'] },
+                                       { name: 'lnet', args: [] }
+                                     ])
+  end
+
+  it "lets an args entry win even when the bare duplicate comes later" do
+    started = run_yaml_autostart_loop(yaml_autostarts: ['lichbot start', 'lichbot'])
+    expect(started).to eq(['lichbot'])
+    expect(MockScript.started).to eq([{ name: 'lichbot', args: ['start'] }])
+  end
+
+  it "applies the dependency skip-guard to normalized entries" do
+    started = run_yaml_autostart_loop(yaml_autostarts: ['dependency start', 'esp'])
+    expect(started).to eq(['esp'])
+  end
+end
+
+RSpec.describe "autostart_covered_names" do
+  it "collects names from the YAML autostarts list" do
+    covered = build_autostart_covered_names(yaml_autostarts: ['lichbot start', 'lnet'])
+    expect(covered).to contain_exactly('lichbot', 'lnet')
+  end
+
+  it "collects names from the global and per-character DB lists" do
+    covered = build_autostart_covered_names(
+      settings_scripts: [{ name: 'alias', args: [] }],
+      char_scripts: [{ name: 'go2', args: [] }]
+    )
+    expect(covered).to contain_exactly('alias', 'go2')
+  end
+
+  it "unions and de-dups across YAML and DB, ignoring blanks" do
+    covered = build_autostart_covered_names(
+      yaml_autostarts: ['lichbot start', '', nil],
+      settings_scripts: [{ name: 'lichbot', args: [] }, { name: 'alias', args: [] }]
+    )
+    expect(covered).to contain_exactly('lichbot', 'alias')
+  end
+
+  it "tolerates non-array DB lists" do
+    covered = build_autostart_covered_names(yaml_autostarts: ['lnet'], settings_scripts: 'nope')
+    expect(covered).to eq(['lnet'])
+  end
+end
+
+RSpec.describe "legacy UserVars.autostart_scripts migration" do
+  before do
+    MockUserVars.reset!
+  end
+
+  it "does nothing when UserVars.autostart_scripts is nil" do
+    MockUserVars.autostart_scripts = nil
+    output = []
+    run_legacy_uservars_migration(respond_output: output)
+    expect(output).to be_empty
+    expect(MockUserVars.autostart_scripts).to be_nil
+  end
+
+  it "does nothing when UserVars.autostart_scripts is empty" do
+    MockUserVars.autostart_scripts = []
+    output = []
+    run_legacy_uservars_migration(respond_output: output)
+    expect(output).to be_empty
+  end
+
+  it "quietly clears when every entry is already covered by YAML/DB" do
+    # The real-world case: bare 'lichbot' in UserVars is covered by 'lichbot start'
+    # in YAML; the rest are covered too. No loud warning, just a clearing note.
+    MockUserVars.autostart_scripts = ['lichbot', 'lnet']
+    output = []
+    run_legacy_uservars_migration(covered: ['lichbot', 'lnet'], respond_output: output)
+
+    joined = output.join("\n")
+    expect(joined).to match(/clearing/i)
+    expect(joined).not_to match(/ACTION NEEDED/)
+    expect(MockUserVars.autostart_scripts).to be_nil
+  end
+
+  it "loudly warns about entries missing from both YAML and DB, then clears" do
+    MockUserVars.autostart_scripts = ['lichbot', 'orphan1', 'orphan2']
+    output = []
+    run_legacy_uservars_migration(covered: ['lichbot'], respond_output: output)
+
+    joined = output.join("\n")
+    expect(joined).to match(/ACTION NEEDED/)
+    expect(joined).to match(/orphan1, orphan2/)
+    expect(joined).not_to match(/\blichbot\b/) # covered entry is not called out as a gap
+    expect(joined).to match(/autostarts:/)
+    expect(joined).to match(/autostart add/)
+    expect(MockUserVars.autostart_scripts).to be_nil
+  end
+
+  it "treats every entry as a gap when nothing is covered" do
+    MockUserVars.autostart_scripts = ['a', 'b']
+    output = []
+    run_legacy_uservars_migration(covered: [], respond_output: output)
+    joined = output.join("\n")
+    expect(joined).to match(/ACTION NEEDED/)
+    expect(joined).to match(/a, b/)
+    expect(MockUserVars.autostart_scripts).to be_nil
+  end
+
+  it "fires only once (second run is a no-op after clearing)" do
+    MockUserVars.autostart_scripts = ['orphan']
+    first = []
+    run_legacy_uservars_migration(covered: [], respond_output: first)
+    expect(first).not_to be_empty
+
+    second = []
+    run_legacy_uservars_migration(covered: [], respond_output: second)
+    expect(second).to be_empty
   end
 end
