@@ -9,10 +9,18 @@
   contributors: Athias
           game: any
           tags: core
-       version: 0.73
+       version: 0.74
       required: Lich >= 4.6.58
 
   changelog:
+    0.74 (2026-07-03):
+      YAML autostarts (get_settings.autostarts) accept optional per-script args:
+        bare "name", "name arg1 arg2", or { name:, args: } hash forms
+      on duplicate names an args-carrying entry wins over a bare duplicate
+      retire the legacy UserVars.autostart_scripts store (superseded by YAML autostarts);
+        one-time login check clears it, quietly if every entry is already in YAML/DB,
+        or with a loud notice naming any gap and how to re-add it (never auto-migrates)
+      extract normalize_autostart_entry / yaml_autostart_entries / launch_autostart
     0.73 (2026-07-02):
       force ACCOUNT command population if subscription is not free/premium/normal
     0.72 (2026-05-27):
@@ -93,6 +101,140 @@ def gtk_version
   end
 end
 
+# Normalizes a single YAML autostart entry into a [name, args] pair.
+#
+# Autostart entries may take three forms:
+#   - a bare script name:   "lichbot"          -> ["lichbot", []]
+#   - a name with args:     "lichbot start"    -> ["lichbot", ["start"]]
+#   - a { name:, args: } hash                  -> ["lichbot", ["start"]]
+# Hash keys may be Symbols (:name / :args) or Strings ('name' / 'args'), since
+# YAML parses inline hash keys as Strings. Both forms are accepted.
+#
+# This is the single source of truth for autostart entry formats; adding a
+# future format is a localized change here.
+#
+# @param entry [String, Hash, nil] a YAML autostart entry.
+# @return [Array(String, Array<String>)] the script name and its argument list.
+#   The name is "" when the entry carries no usable name (callers guard on this).
+# @example Bare name
+#   normalize_autostart_entry('lichbot')                 # => ['lichbot', []]
+# @example Name with whitespace-separated args
+#   normalize_autostart_entry('lichbot start')           # => ['lichbot', ['start']]
+# @example Symbol-keyed hash
+#   normalize_autostart_entry(:name => 'lichbot', :args => ['start']) # => ['lichbot', ['start']]
+# @example String-keyed hash (as produced by YAML)
+#   normalize_autostart_entry('name' => 'lichbot', 'args' => ['start']) # => ['lichbot', ['start']]
+def normalize_autostart_entry(entry)
+  if entry.is_a?(Hash)
+    name = (entry[:name] || entry['name']).to_s.strip
+    args = Array(entry[:args] || entry['args']).map(&:to_s)
+    [name, args]
+  else
+    parts = entry.to_s.split
+    [parts.first.to_s, parts[1..].to_a]
+  end
+end
+
+# Collects, normalizes, and de-dups the profile's YAML autostart entries.
+#
+# Reads get_settings.autostarts, normalizes every entry to a [name, args] pair
+# via {#normalize_autostart_entry}, drops entries with a blank name, and de-dups
+# by name. On a name collision an entry that carries args wins over a bare
+# (arg-less) duplicate; if several carry args, the first wins (so a duplicate
+# bare "lichbot" won't strip the args off a "lichbot start" entry). Start order
+# follows first occurrence of a name.
+#
+# @return [Array<Array(String, Array<String>)>] normalized [name, args] pairs.
+def yaml_autostart_entries
+  get_settings.autostarts.to_a
+              .map { |entry| normalize_autostart_entry(entry) }
+              .reject { |name, _args| name.nil? || name.empty? }
+              .group_by { |name, _args| name }
+              .map { |_name, group| group.find { |_n, args| !args.empty? } || group.first }
+end
+
+# The set of script names already covered by the autostart configuration.
+#
+# Combines the profile YAML `autostarts:` list (when get_settings is available)
+# with the global and per-character DB autostart lists (Settings['scripts'] and
+# CharSettings['scripts']). Used to decide whether a legacy UserVars entry would
+# actually be lost if it were dropped.
+#
+# @return [Array<String>] unique, non-blank script names already autostarted.
+def autostart_covered_names
+  names = []
+  names.concat(get_settings.autostarts.to_a.map { |entry| normalize_autostart_entry(entry).first }) if respond_to?(:get_settings, true)
+  [Settings['scripts'], CharSettings['scripts']].each do |list|
+    names.concat(list.map { |info| info[:name] }) if list.is_a?(Array)
+  end
+  names.compact.map(&:to_s).reject(&:empty?).uniq
+end
+
+# Reads, reports on, and clears any legacy UserVars.autostart_scripts.
+#
+# UserVars.autostart_scripts was the old (now-removed) DR autostart store and is
+# no longer read as a launch source. This retires it read-only: it compares the
+# stale names against what is already covered by the YAML `autostarts:` list and
+# the ;autostart DB lists ({#autostart_covered_names}), then clears the UserVar.
+#
+# - If every stale entry is already covered, it just prints a brief note that the
+#   unused UserVar is being cleared (no action needed).
+# - If any stale entry is NOT in the YAML list or the DB, that script would stop
+#   autostarting, so it prints a loud notice naming the gap and the two ways to
+#   re-add it (profile YAML `autostarts:` list, or ;autostart add for the DB).
+#
+# Nothing is ever re-added automatically -- the user chooses where each script
+# should live. The UserVar is always cleared so the check runs only once.
+#
+# @return [void]
+def migrate_legacy_uservars_autostarts
+  legacy = UserVars.autostart_scripts.to_a
+  return if legacy.empty?
+
+  covered = autostart_covered_names
+  gaps = legacy.map { |entry| normalize_autostart_entry(entry).first }
+               .reject { |name| name.nil? || name.empty? }
+               .uniq
+               .reject { |name| covered.include?(name) }
+
+  if gaps.empty?
+    respond "\n--- autostart: clearing the legacy UserVars.autostart_scripts store -- it is no longer used and every entry is already in your YAML 'autostarts:' list or your ;autostart DB list. No action needed.\n\n"
+  else
+    plural = gaps.size == 1 ? 'script is' : 'scripts are'
+    respond "\n*** autostart: ACTION NEEDED ***"
+    respond "    The legacy UserVars.autostart_scripts store is being retired, but the following #{plural}"
+    respond "    NOT in your profile YAML 'autostarts:' list or your ;autostart DB list, so #{gaps.size == 1 ? 'it' : 'they'} will stop autostarting:"
+    respond "      #{gaps.join(', ')}"
+    respond "    To keep #{gaps.size == 1 ? 'it' : 'them'} starting at login, add each to EITHER:"
+    respond "      - your profile YAML 'autostarts:' list (args supported, e.g.  - lichbot start), or"
+    respond "      - the autostart database:  #{$clean_lich_char}autostart add <script> [args]   (or --global <script> [args])"
+    respond "    Clearing UserVars.autostart_scripts now.\n\n"
+  end
+
+  UserVars.autostart_scripts = nil
+end
+
+# Starts a single normalized YAML autostart entry, applying the shared
+# skip-guards: 'dependency', obsolete DR scripts, already-running, and
+# missing-on-disk (which emits the "not found, skipping" notice).
+#
+# @param name [String] the normalized script name to start.
+# @param args [Array<String>] arguments to pass to the script.
+# @return [Boolean] true if the script was started, false if a guard skipped it.
+def launch_autostart(name, args)
+  return false if name == 'dependency'
+  return false if defined?(DR_OBSOLETE_SCRIPTS) && DR_OBSOLETE_SCRIPTS.include?(name)
+  return false if Script.running?(name)
+
+  unless Script.exists?(name)
+    respond "\n--- autostart: '#{name}' not found, skipping\n\n"
+    return false
+  end
+
+  start_script(name, args)
+  true
+end
+
 if defined?(Lich::Common::Account) && (Lich::Common::Account.subscription.nil? || (Lich::Common::Account.subscription.is_a?(String) && Lich::Common::Account.subscription !~ /free|normal|premium/i))
   respond "Retrieving Account subscription information due to currently undetected!"
   waitrt?
@@ -166,28 +308,34 @@ if script.vars.empty?
     did_something = true
   end
 
-  # YAML-based autostarts, UserVars autostarts, and wayto overrides.
+  # One-time migration: warn about and clear the legacy UserVars.autostart_scripts
+  # store (superseded by the profile YAML `autostarts:` list and the ;autostart DB).
+  migrate_legacy_uservars_autostarts
+
+  # YAML-based autostarts (get_settings.autostarts) and wayto overrides.
   # Guarded for GS backward compatibility on lich < 5.17.
+  #
+  # Each entry in the profile's `autostarts:` list may take one of three forms:
+  #   - a bare script name          - "lichbot"
+  #   - a name with arguments       - "lichbot start"
+  #   - a { name:, args: } hash     - { name: lichbot, args: [start] }
+  # Entries are normalized to [name, args] and de-duped by name; on a name
+  # collision an entry that carries args wins over a bare duplicate (so a
+  # duplicate bare "lichbot" won't strip the args off a "lichbot start" entry).
+  # See normalize_autostart_entry / yaml_autostart_entries / launch_autostart.
+  #
+  # NOTE: the normalizer is intentionally scoped to this YAML path and not
+  # shared with the Settings/CharSettings DB loop below. That loop already
+  # stores normalized { :name, :args } hashes and carries a distinct guard set
+  # (infomon/repository skips, lich5-update skip, DR dependency removal), so
+  # reusing the normalizer there would add coupling without removing duplication.
   if respond_to?(:get_settings, true)
-    UserVars.autostart_scripts ||= []
-    all_autostarts = (UserVars.autostart_scripts.to_a +
-                      get_settings.autostarts.to_a).uniq
+    entries = yaml_autostart_entries
 
     Map.apply_wayto_overrides if Map.respond_to?(:apply_wayto_overrides)
 
-    all_autostarts.each do |script_name|
-      next if script_name == 'dependency'
-      next if defined?(DR_OBSOLETE_SCRIPTS) && DR_OBSOLETE_SCRIPTS.include?(script_name)
-      next if Script.running?(script_name)
-
-      unless Script.exists?(script_name)
-        respond "\n--- autostart: '#{script_name}' not found, skipping\n\n"
-        next
-      end
-
-      start_script(script_name)
-    end
-    did_something = true unless all_autostarts.empty?
+    entries.each { |name, args| launch_autostart(name, args) }
+    did_something = true unless entries.empty?
   end
 
   for script_list in [Settings['scripts'], CharSettings['scripts']]
