@@ -17,9 +17,9 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   # common repo layouts (spec/ alongside the script, or spec/ one level below root).
   def self.eloot_source_path
     [
-      File.expand_path('eloot.lic', __dir__),
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__)
+      File.expand_path('scripts/eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__)
     ].find { |p| File.exist?(p) }
   end
 
