@@ -13,23 +13,22 @@
 # stale copy.
 
 RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
-  # Locate eloot.lic relative to the spec: same directory first (as delivered), then
-  # common repo layouts (spec/ alongside the script, or spec/ one level below root).
-  def self.eloot_source_path
-    [
-      File.expand_path('scripts/eloot.lic', __dir__),
+  # Extract only the pure predicate from eloot.lic and eval it into an isolated module.
+  # (The full script cannot be required standalone; it needs the Lich runtime and runs a
+  # main block on load. The predicate takes only plain arguments, so it needs no runtime.)
+  # Sourcing the real method keeps this spec from drifting from the shipped code; if the
+  # source or method cannot be found, it fails loudly rather than passing on a stale copy.
+  let(:predicate) do
+    path = [
+      File.expand_path('eloot.lic', __dir__),           # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__)
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
     ].find { |p| File.exist?(p) }
-  end
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
-  # Extract only the pure predicate and eval it into an isolated module (memoized once).
-  PREDICATE = begin
-    path = eloot_source_path
-    raise "eloot.lic not found (looked in #{__dir__} and parent directories)" unless path
-
-    source = File.read(path)
-    body = source[/^ {4}def self\.pool_full_recovery\?[\s\S]*?^ {4}end$/]
+    body = File.read(path)[/^ {4}def self\.pool_full_recovery\?[\s\S]*?^ {4}end$/]
     raise "pool_full_recovery? could not be extracted from #{path}" unless body
 
     Module.new { module_eval(body) }
@@ -41,7 +40,7 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   end
 
   def recover?(**overrides)
-    PREDICATE.pool_full_recovery?(**base.merge(overrides))
+    predicate.pool_full_recovery?(**base.merge(overrides))
   end
 
   context 'at a locksmith pool with a disk, selling allowed, first attempt' do
