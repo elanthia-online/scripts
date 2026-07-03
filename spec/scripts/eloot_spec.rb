@@ -20,7 +20,7 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   # source or method cannot be found, it fails loudly rather than passing on a stale copy.
   let(:predicate) do
     path = [
-      File.expand_path('eloot.lic', __dir__),           # delivered alongside the spec
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
