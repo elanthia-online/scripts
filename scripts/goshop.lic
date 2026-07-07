@@ -1,0 +1,432 @@
+=begin
+  goshop.lic - find and travel to player shops by (partial) name.
+
+  Merges the former ;findshop and ;go2shop into one script.
+
+  Usage:
+     ;goshop go <name>      Travel to the shop matching <name>.
+     ;goshop find <name>    Open the SHOP BROWSE listing for the shop matching <name>.
+     ;goshop reset          Rebuild the cached shop directory now.
+     ;goshop                Show this usage.
+
+  The shop directory is cached to DATA_DIR/<game>/goshop.json (rebuilt when it is
+  older than 24 hours). Each shop record stores the real room id parsed from
+  SHOP BROWSE, so travel uses ;go2 u<id> directly instead of searching the map.
+
+  author: elanthia-online
+  contributors: LostRanger
+  game: GS
+  tags: utility, shop, travel
+  required: Lich >= 5.7.0
+
+  version: 1.0.0 (2026-07-07)
+
+  changelog:
+    1.0.0 (2026-07-07):
+      * Merge ;findshop and ;go2shop into ;goshop (go / find / reset subcommands).
+      * Parse the shop's real room id from SHOP BROWSE and travel via ;go2 u<id>;
+        the old room-title search has been removed.
+      * Persist the shop directory to DATA_DIR/<game>/goshop.json across sessions.
+      * Modernize: named regex captures, no script-owned globals, constant
+        re-run guards, ASCII-only source.
+=end
+
+require "json"
+require "fileutils"
+
+module GoShop
+  VERSION = "1.0.0 (2026-07-07)" unless defined?(VERSION)
+
+  # Directory lifetime, in seconds, before a rebuild is forced.
+  MAX_AGE = 24 * 60 * 60 unless defined?(MAX_AGE)
+
+  # Cache filename, stored under DATA_DIR/<game>/.
+  CACHE_FILE = "goshop.json" unless defined?(CACHE_FILE)
+
+  unless defined?(PATTERNS)
+    PATTERNS = {
+      town_list:       /^You must specify in which town.*Valid options include: (.*)$/,
+      town_list_end:   /^<prompt/,
+      town_link:       /<d cmd=['"]shop directory (.+?)['"]>(.*?)<\/d>/,
+      dir_start:       /^<output class="mono"\/>/,
+      dir_end:         /^<prompt/,
+      shop_link:       /<d cmd=['"]shop browse (.+?) (\d+)['"]>(.*?)<\/d>/,
+      shop_browse:     /^(?:(?<name>.*) is located (?:.*?)(?<room_title>\[.*?\])(?: \((?<room_uid>\d+)\))? at (?<article>a |an |the )<a exist="(?<exist_id>-?\d+)"(?:.*?)>(?<exist_name>.*?)<\/a>)|(?<err_town>Unknown town specified)|(?<err_shop>That is not a valid shop number)/,
+      shop_browse_end: /^<prompt/,
+    }.freeze
+  end
+
+  # Persisted in memory across re-runs within a single Lich process; loaded
+  # from disk on a fresh process. Left uninitialized-safe with re-run guards.
+  @db             = nil   unless defined?(@db)
+  @last_refreshed = nil   unless defined?(@last_refreshed)
+  @dirty          = false unless defined?(@dirty)
+  @stormfront     = false unless defined?(@stormfront)
+  @script         = nil   unless defined?(@script)
+
+  # ------------------------------------------------------------------- storage
+
+  # @return [String] absolute path to the game-wide shop directory cache.
+  def self.cache_path
+    File.join(DATA_DIR, XMLData.game, CACHE_FILE)
+  end
+
+  # Load the cached directory from disk into memory (best-effort). A missing or
+  # unreadable cache leaves the directory empty so that it will be rebuilt.
+  # @return [void]
+  def self.load_cache
+    @db = {}
+    @last_refreshed = nil
+    return unless File.exist?(cache_path)
+
+    raw = JSON.parse(File.read(cache_path))
+    @last_refreshed = raw["last_refreshed"] ? Time.at(raw["last_refreshed"].to_i) : nil
+    @db = deserialize(raw["db"])
+  rescue StandardError => e
+    echo "Could not read shop cache (#{e.class}); it will be rebuilt."
+    @db = {}
+    @last_refreshed = nil
+  end
+
+  # Persist the in-memory directory to disk. Failures are non-fatal: the
+  # directory can always be rebuilt from the game.
+  # @return [void]
+  def self.save_cache
+    FileUtils.mkdir_p(File.dirname(cache_path))
+    payload = { "last_refreshed" => @last_refreshed&.to_i, "db" => @db }
+    File.write(cache_path, JSON.pretty_generate(payload))
+    @dirty = false
+  rescue StandardError => e
+    echo "Could not write shop cache (#{e.class}: #{e.message}); continuing without persistence."
+  end
+
+  # Rebuild the directory from parsed JSON: restore symbol keys and integer shop
+  # ids, and drop absent (nil) enrichment so that {get_shop} re-fetches it later.
+  # @param raw_db [Hash, nil]
+  # @return [Hash]
+  def self.deserialize(raw_db)
+    result = {}
+    (raw_db || {}).each do |town_key, town|
+      shops = {}
+      (town["shops"] || {}).each do |shop_key, s|
+        shops[shop_key.to_i] = {
+          name:          s["name"],
+          id:            s["id"],
+          town:          s["town"],
+          exist:         s["exist"],
+          exist_name:    s["exist_name"],
+          exist_article: s["exist_article"],
+          room_title:    s["room_title"],
+          room_uid:      s["room_uid"],
+        }.compact
+      end
+      result[town_key] = { name: town["name"], shops: shops }
+    end
+    result
+  end
+
+  # ----------------------------------------------------------------- directory
+
+  # @return [Hash] the shop directory, rebuilding it when empty or stale.
+  def self.get_database
+    load_cache if @db.nil?
+    stale = @last_refreshed.nil? || (@last_refreshed + MAX_AGE < Time.now)
+    return reset_database if @db.nil? || @db.empty? || stale
+
+    @db
+  end
+
+  # Query the game for the full shop directory and rebuild the cache.
+  # @return [Hash]
+  def self.reset_database
+    echo "Refreshing shop directory..."
+    db = {}
+    waitrt?
+    lines = Lich::Util.issue_command("shop directory", PATTERNS[:town_list], PATTERNS[:town_list_end],
+                                     quiet: true, silent: true, usexml: true)
+    lines.each do |line|
+      line.scan(PATTERNS[:town_link]).each do |town_id, town_name|
+        db[town_id] = { name: town_name, shops: {} }
+      end
+    end
+
+    db.each_key do |town_id|
+      waitrt?
+      lines = Lich::Util.issue_command("shop directory #{town_id}", PATTERNS[:dir_start], PATTERNS[:dir_end],
+                                       quiet: true, silent: true, usexml: true)
+      lines.each do |line|
+        line.scan(PATTERNS[:shop_link]).each do |shop_town, shop_id, shop_name|
+          next unless db.key?(shop_town)
+
+          shop_id = shop_id.to_i
+          db[shop_town][:shops][shop_id] = { name: shop_name, id: shop_id, town: shop_town }
+        end
+      end
+    end
+
+    @db = db
+    @last_refreshed = Time.now
+    @dirty = true
+    save_cache
+    echo "Shop directory updated; next refresh after #{@last_refreshed + MAX_AGE}."
+    @db
+  end
+
+  # ------------------------------------------------------------------ per-shop
+
+  # Enrich a shop record with SHOP BROWSE data unless it is already present.
+  # @param shop [Hash]
+  # @return [Hash, nil] the shop, or nil when the browse produced no data.
+  def self.get_shop(shop)
+    return shop if shop[:exist]
+
+    update_shop(shop)
+  end
+
+  # Fetch and parse SHOP BROWSE for a shop, recording the exist item, article,
+  # room title, and the real room uid used for travel.
+  # @param shop [Hash]
+  # @return [Hash, nil]
+  def self.update_shop(shop)
+    waitrt?
+    lines = Lich::Util.issue_command("shop browse #{shop[:town]} #{shop[:id]}",
+                                     PATTERNS[:shop_browse], PATTERNS[:shop_browse_end],
+                                     quiet: true, silent: true, usexml: true)
+    lines.each do |line|
+      next unless (m = line.match(PATTERNS[:shop_browse]))
+
+      if (err = m[:err_town] || m[:err_shop])
+        echo "Failed to update shop (#{err}): #{shop.inspect}"
+        exit
+      end
+
+      shop[:exist]         = m[:exist_id]
+      shop[:exist_name]    = m[:exist_name]
+      shop[:exist_article] = m[:article]
+      shop[:room_title]    = m[:room_title]
+      shop[:room_uid]      = m[:room_uid]&.to_i
+      @dirty = true
+      return shop
+    end
+
+    echo "Failed to update shop (no data found): #{shop.inspect}"
+    nil
+  end
+
+  # -------------------------------------------------------------------- search
+
+  # Find the shop matching a search string, prompting when several match.
+  # @param search_string [String] already downcased.
+  # @return [Hash, nil]
+  def self.find_shop(search_string)
+    db = get_database
+    exact_matches = []
+    matches = []
+
+    db.each_value do |data|
+      data[:shops].each_value do |shop|
+        name = shop[:name].downcase
+        if name == search_string
+          exact_matches << shop
+        elsif exact_matches.empty? && name.include?(search_string)
+          matches << shop
+        end
+      end
+    end
+
+    matches = exact_matches unless exact_matches.empty?
+
+    if matches.empty?
+      echo "No shops found matching '#{search_string}'."
+      return
+    end
+    return matches.first if matches.length == 1
+
+    if matches.length > 10
+      echo "Too many matching shops; skipping in-depth data collection."
+    else
+      matches.each { |shop| get_shop(shop) }
+    end
+
+    prompt_for_match(db, matches, exact_matches.any?)
+  end
+
+  # Render the numbered match list and block for the user's selection.
+  # @param db [Hash]
+  # @param matches [Array<Hash>]
+  # @param exact [Boolean] whether the matches were exact-name matches.
+  # @return [Hash, nil] the chosen shop, or nil if cancelled.
+  def self.prompt_for_match(db, matches, exact)
+    name_padding = matches.map { |shop| shop[:name].length }.max
+
+    respond(exact ? "Multiple exact matches found" : "Multiple matching shops found")
+
+    output = @stormfront ? ['<output class="mono"/>'] : nil
+
+    matches.each_with_index do |shop, index|
+      number = index + 1
+      label = "#{number.to_s.rjust(6)}: "
+      shop_name = shop[:name].ljust(name_padding)
+      info = if shop[:room_title]
+               "(#{db[shop[:town]][:name]} shop ##{shop[:id]}, #{shop[:exist_article]}#{shop[:exist_name]} at #{shop[:room_title]})"
+             else
+               "(#{db[shop[:town]][:name]} shop ##{shop[:id]})"
+             end
+
+      if @stormfront
+        link = REXML::Element.new("d")
+        link.add_attribute("cmd", "#{$lich_char}send #{number}")
+        link.add_text(shop_name)
+        output << "#{label}#{link} #{REXML::Text.new(info)}"
+      else
+        respond "#{label}#{shop_name} #{info}"
+      end
+    end
+
+    if @stormfront
+      cancel = REXML::Element.new("d")
+      cancel.add_attribute("cmd", "#{$lich_char}send 0")
+      cancel.add_text("CANCEL")
+      output << "     0: #{cancel}"
+      output << '<output class=""/>'
+      puts output.join("\n")
+      respond "Select a shop with #{$lich_char}send <#> or by clicking it."
+    else
+      respond "     0: CANCEL"
+      respond "Select a shop with #{$lich_char}send <#>."
+    end
+
+    toggle_unique
+    begin
+      loop do
+        line = nil
+        line = get until line.strip =~ /^[0-9]+$/
+        choice = line.to_i
+        if choice.zero?
+          echo "Cancelled."
+          return
+        elsif choice > matches.length
+          echo "Value out of range (expected 0 to #{matches.length})."
+        else
+          return matches[choice - 1]
+        end
+      end
+    ensure
+      toggle_unique
+    end
+  end
+
+  # -------------------------------------------------------------------- actions
+
+  # Travel to the shop's storefront using its real room uid, then enter it.
+  # @param shop [Hash]
+  # @return [void]
+  def self.travel_to(shop)
+    uid = shop[:room_uid]
+    unless uid
+      echo "#{shop[:name]} did not report a room id, so it can't be reached directly."
+      echo "Use #{$lich_char}#{@script.name} find #{shop[:name]} to browse it instead."
+      exit
+    end
+
+    if defined?(Map.ids_from_uid) && Map.ids_from_uid(uid).empty?
+      echo "Room #{uid} for #{shop[:name]} is not in your map database, so ;go2 can't route there."
+      echo "Use #{$lich_char}#{@script.name} find #{shop[:name]} to browse it instead."
+      exit
+    end
+
+    unless at_uid?(uid)
+      Script.run("go2", "u#{uid}")
+      unless at_uid?(uid)
+        echo "go2 stopped before reaching the shop; assuming it was killed."
+        exit
+      end
+    end
+
+    enter_shop(shop)
+  end
+
+  # @param uid [Integer]
+  # @return [Boolean] whether the current room carries the given game uid.
+  def self.at_uid?(uid)
+    Array(Map.current&.uid).include?(uid)
+  end
+
+  # Step into the storefront object recorded for the shop.
+  # @param shop [Hash]
+  # @return [void]
+  def self.enter_shop(shop)
+    move "go ##{shop[:exist]}"
+    echo "Arrived at #{shop[:name]} (#{shop[:exist_article]}#{shop[:exist_name]})."
+  end
+
+  # Open the in-game SHOP BROWSE listing for the shop.
+  # @param shop [Hash]
+  # @return [void]
+  def self.browse(shop)
+    waitrt?
+    put "shop browse #{shop[:town]} #{shop[:id]}"
+  end
+
+  # ---------------------------------------------------------------------- entry
+
+  # @return [void]
+  def self.usage
+    respond [
+      "#{@script.name} version #{VERSION}",
+      "Usage: #{$lich_char}#{@script.name} go <name>     - Travel to the matching shop.",
+      "Usage: #{$lich_char}#{@script.name} find <name>   - Show the SHOP BROWSE listing for it.",
+      "Usage: #{$lich_char}#{@script.name} reset         - Rebuild the shop directory now.",
+    ]
+  end
+
+  # Resolve a shop from the search string, enrich it, persist, then yield it.
+  # @param search_string [String]
+  # @return [void]
+  def self.act_on(search_string)
+    if search_string.empty?
+      respond "Give me a shop name, for example: #{$lich_char}#{@script.name} go lorestel"
+      return
+    end
+
+    shop = find_shop(search_string.downcase)
+    return unless shop
+
+    shop = get_shop(shop)
+    return unless shop
+
+    save_cache if @dirty
+    yield shop
+  end
+
+  # @param script [Script] the running script instance.
+  # @return [void]
+  def self.run(script)
+    @script = script
+    @stormfront = ($frontend == "stormfront")
+    script.want_downstream = false
+    script.want_downstream_xml = true
+
+    args = script.vars[0].to_s.strip
+    subcommand, _, rest = args.partition(/\s+/)
+    subcommand = subcommand.downcase
+    rest = rest.strip
+
+    case subcommand
+    when ""
+      usage
+    when "reset"
+      reset_database
+      respond "Shop directory refreshed."
+    when "find", "browse"
+      act_on(rest) { |shop| browse(shop) }
+    when "go"
+      act_on(rest) { |shop| travel_to(shop) }
+    else
+      respond "Unknown subcommand: #{subcommand}"
+      usage
+    end
+  end
+end
+
+GoShop.run(Script.current)
