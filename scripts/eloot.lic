@@ -3698,7 +3698,7 @@ module ELoot # Inventory methods
     end
 
     def self.single_drag(item, phase_thing = true, on_full: :pause) # drags single item into container
-      ELoot.msg(type: "debug", text: "item: #{item.inspect}")
+      ELoot.msg(type: "debug", text: "item: #{item.inspect} | on_full: #{on_full}")
 
       stored = false
       return if item&.name == "Empty"
@@ -3757,6 +3757,7 @@ module ELoot # Inventory methods
           Sell.handle_ingot(gold_ingot)
         elsif on_full == :signal
           # Caller (box looting during a locksmith pool return) handles the recovery.
+          ELoot.msg(type: "debug", text: "single_drag: all containers full, signaling :full for #{item.respond_to?(:name) ? item.name : item.inspect}")
           return :full
         else
           if ELoot.data.sacks_full.keys.count > 1
@@ -4819,6 +4820,7 @@ module ELoot # Room looting
     end
 
     def self.box_loot(box, location = nil, data = nil, sell_recovered: false) # Loots box contents
+      ELoot.msg(type: "debug", text: "box_loot: box=#{box.respond_to?(:name) ? box.name : box.inspect} location=#{location.inspect} sell_recovered=#{sell_recovered}")
       if box.type == "box"
         line = ELoot.get_res("open ##{box.id}", /open|locked/)
         return Inventory.single_drag(box) if line =~ /locked/
@@ -4996,7 +4998,7 @@ module ELoot # Room looting
     end
 
     def self.loot_regular(objs, from_where = nil, box = nil, sell_recovered: false, location: nil, data: nil)
-      ELoot.msg(type: "debug", text: "objs: #{objs} | from_where: #{from_where}")
+      ELoot.msg(type: "debug", text: "objs: #{objs} | from_where: #{from_where} | sell_recovered: #{sell_recovered} | location: #{location.inspect} | data?: #{!data.nil?}")
 
       valid = Loot.valid_objs(objs.clone)
       invalid = Loot.invalid_objs(objs.clone)
@@ -5067,21 +5069,33 @@ module ELoot # Room looting
     # the whole box (the caller should stop iterating); nil otherwise.
     # @return [Symbol, nil]
     def self.stow_box_item(thing, box, location, data, sell_recovered)
-      return nil unless Inventory.single_drag(thing, on_full: :signal) == :full
+      item_name = thing.respond_to?(:name) ? thing.name : thing.inspect
+      ELoot.msg(type: "debug", text: "stow_box_item: #{item_name} | sell_recovered: #{sell_recovered}")
 
-      has_disk = (ELoot.data.settings[:use_disk] || ELoot.data.settings[:use_disk_group]) && ELoot.data.disk_full.value?(false)
-      if Loot.pool_full_recovery?(room_tags: Room.current.tags, has_disk: has_disk, sell_allowed: !ELoot.data.pool_command, attempted: sell_recovered)
-        return Loot.pool_sell_recovery(box, location, data)
+      unless Inventory.single_drag(thing, on_full: :signal) == :full
+        ELoot.msg(type: "debug", text: "stow_box_item: #{item_name} stored normally")
+        return nil
       end
 
+      has_disk = (ELoot.data.settings[:use_disk] || ELoot.data.settings[:use_disk_group]) && ELoot.data.disk_full.value?(false)
+      room_tags = Room.current.tags
+      sell_allowed = !ELoot.data.pool_command
+      recover = Loot.pool_full_recovery?(room_tags: room_tags, has_disk: has_disk, sell_allowed: sell_allowed, attempted: sell_recovered)
+      ELoot.msg(type: "debug", text: "stow_box_item: containers full for #{item_name} | pool_full_recovery? => #{recover} (room_tags: #{room_tags.inspect}, has_disk: #{has_disk}, sell_allowed: #{sell_allowed}, attempted: #{sell_recovered})")
+
+      return Loot.pool_sell_recovery(box, location, data) if recover
+
       # Fall back to the existing manual pause.
+      ELoot.msg(type: "debug", text: "stow_box_item: recovery not applicable for #{item_name}, falling back to manual pause")
       Inventory.single_drag(thing)
       nil
     end
 
     # Decide whether to run the sell-and-return recovery instead of pausing when a box
     # item cannot be stored and all sacks are full. Pure predicate: all state is passed
-    # as arguments so it is unit-testable without a game connection.
+    # as arguments so it is unit-testable without a game connection. It emits no debug
+    # itself (that would break the standalone spec that evals it in isolation); the
+    # decision and its inputs are logged by the caller, stow_box_item.
     # @param room_tags [Array<String>] Room.current.tags
     # @param has_disk [Boolean] whether the box can be set aside on a disk
     # @param sell_allowed [Boolean] false during a standalone ;eloot pool command
@@ -5102,23 +5116,28 @@ module ELoot # Room looting
     # @return [Symbol] :recovered
     def self.pool_sell_recovery(box, location, data)
       data ||= Hash.new(0)
+      box_name = box.respond_to?(:name) ? box.name : box.inspect
+      ELoot.msg(type: "debug", text: "pool_sell_recovery: start | box=#{box_name} location=#{location.inspect} room=#{Room.current.id}")
       ELoot.msg(type: "info", text: " Containers full. Selling to free space, then resuming the pool return.")
 
       # Put anything currently in hand (the stuck item) back into the box we are looting.
       [GameObj.right_hand, GameObj.left_hand].each do |held|
         next if held.nil? || held.name == "Empty" || held.id.nil?
         next if held.id == box.id
+        ELoot.msg(type: "debug", text: "pool_sell_recovery: returning #{held.name} to box before selling")
         ELoot.get_command("_drag ##{held.id} ##{box.id}", ELoot.data.put_regex, silent: true, quiet: true)
       end
 
       # Set the box aside on a disk (disks are not tracked in sacks_full). If it will
       # not fit on a disk we cannot free our hands to sell, so pause and re-loot after.
       unless Inventory.single_drag_box(box)
+        ELoot.msg(type: "debug", text: "pool_sell_recovery: single_drag_box failed, no disk to hold the box")
         ELoot.msg(type: "info", text: " Could not set the box on a disk. Pausing to handle it yourself.")
         ELoot.msg(type: "info", text: " ;unpause #{Script.current.name} after addressing to continue!")
         Script.current.pause
         ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0]] }
         Inventory.drag(box) unless ELoot.in_hand?(box)
+        ELoot.msg(type: "debug", text: "pool_sell_recovery: resumed after manual pause, re-looting box")
         Loot.box_loot(box, location, data, sell_recovered: true)
         return :recovered
       end
@@ -5127,11 +5146,13 @@ module ELoot # Room looting
       $sell_ignore.push(box.id) unless $sell_ignore.include?(box.id)
 
       pool_room = Room.current.id
+      ELoot.msg(type: "debug", text: "pool_sell_recovery: box parked on disk, protected in sell_ignore; running sell trip (skip_boxes) from room #{pool_room}")
       Sell.sell(skip_boxes: true)
 
       # Emptied containers must be retried, so clear the full tracking.
       ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0]] }
       ELoot.reset_disk_full
+      ELoot.msg(type: "debug", text: "pool_sell_recovery: sell trip complete, cleared sacks_full and disk_full")
 
       ELoot.go2(pool_room)
 
@@ -5139,6 +5160,7 @@ module ELoot # Room looting
       # attempt a second recovery for the same box).
       $sell_ignore.delete(box.id)
       Inventory.drag(box)
+      ELoot.msg(type: "debug", text: "pool_sell_recovery: back at pool room #{Room.current.id}, re-looting box #{box_name} (sell_recovered)")
       Loot.box_loot(box, location, data, sell_recovered: true)
       :recovered
     end
@@ -7012,6 +7034,7 @@ module ELoot # Sells the loot
     end
 
     def self.sell(skip_boxes: false) # Main sell method
+      ELoot.msg(type: "debug", text: "sell: skip_boxes=#{skip_boxes}")
       fput('unhide') if (hidden? || invisible?)
 
       Sell.box_in_hand unless skip_boxes
