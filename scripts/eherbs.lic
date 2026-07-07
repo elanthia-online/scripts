@@ -14,7 +14,10 @@
               game: Gemstone
               tags: healing, herbs
           requires: Lich >= 5.9.0
-           version: 2.1.13
+           version: 2.1.14
+  2.1.14 (2026-07-04)
+    - fix silver withdrawals failing on F2P accounts when the bank balance is below the requested amount by depositing held notes to free up silver
+    - add F2P bank balance cap handling to deposits, filling to the cap and converting overflow silver into a stowed note
   2.1.13 (2026-04-05)
     - fix for missing eating messaging
   2.1.12 (2026-03-14)
@@ -1268,6 +1271,8 @@ module EHerbs
           pause 5
         }
         fput "give banker #{silvers} silvers"
+      elsif Utility.f2p?
+        Actions.f2p_silver_deposit
       else
         fput "deposit #{silvers}"
       end
@@ -1289,6 +1294,69 @@ module EHerbs
       fput("deposit #{EHerbs.data[:note].noun}")
       EHerbs.data[:note] = nil
       Utility.go2(original_room)
+    end
+
+    def self.f2p_silver_deposit
+      # F2P bank accounts have a maximum balance (100,000 silvers). Depositing everything on hand
+      # can exceed that cap, so deposit only what fits and convert the overflow into a note that
+      # gets stowed for later. (Ported from eloot's ELoot::Bank.silver_deposit F2P handling.)
+      deposit_regex = Regexp.union(
+        /You deposit (?:[\d,]+ silvers?|your note worth [\d,]+) into your account/,
+        /That's a total of [\d,]+ silver/,
+        /You have no coins to deposit/,
+        /takes your silvers/
+      )
+
+      loop do
+        silver_balance = 0
+        silver_max = 0
+
+        lines = Utility.get_lines('bank account', /You currently have an account|you don't have access/i)
+        if lines.any? { |line| line =~ /you don't have access/i }
+          _respond Msg.monsterbold(" You don't have a bank in this town. Skipping deposit.")
+          return
+        end
+        if lines.find { |line| line.match(/in the amount of (?<silver>[\d,]+) silver/) }
+          silver_balance = Regexp.last_match[:silver].gsub(',', '').to_i
+        end
+        if lines.find { |line| line.match(/a maximum of (?<silver>[\d,]+) silvers/) }
+          silver_max = Regexp.last_match[:silver].gsub(',', '').to_i
+        end
+
+        current_silvers = Utility.check_silver
+        break unless current_silvers.positive?
+
+        # If we couldn't read the cap, don't guess - fall back to a plain deposit.
+        if silver_max <= 0
+          dothistimeout("deposit #{current_silvers}", 2, deposit_regex)
+          break
+        end
+
+        # Does everything on hand fit without exceeding the cap?
+        if (silver_balance + current_silvers) < silver_max
+          dothistimeout("deposit #{current_silvers}", 2, deposit_regex)
+          break
+        else
+          # Fill the account to the cap, then pull a note to free it back up and stow the note.
+          deposit_size = silver_max - silver_balance
+          dothistimeout("deposit #{deposit_size}", 2, deposit_regex) if deposit_size.positive?
+
+          # Pull a full note if we still have a 10,000 buffer on hand, otherwise size the note so
+          # the remaining balance + on-hand silver drops back under the cap next pass.
+          current_silvers = Utility.check_silver
+          note_size = current_silvers >= 10000 ? silver_max : (silver_max - (10000 - current_silvers))
+          dothistimeout("withdraw #{note_size} note", 2, /teller|Very well/i)
+
+          note = [GameObj.right_hand, GameObj.left_hand].find { |obj| obj.noun =~ /^(?:note|scrip|chit)$/ }
+          break if note.nil? # couldn't free up room; stop rather than loop forever
+
+          if EHerbs.data[:herb_sack].respond_to?(:id)
+            Inventory.drag_to_container(note.id, EHerbs.data[:herb_sack].id)
+          else
+            break # nowhere to stow the note; leave it in hand rather than losing track of it
+          end
+        end
+      end
     end
 
     def self.appraise_character(appraisal_line)
@@ -1909,6 +1977,22 @@ module EHerbs
           wait_until { GameObj.npcs.any? { |npc| npc.noun == 'banker' } }
           fput "ask banker for #{[EHerbs.data[:withdraw_amount].to_i, 20].max} silvers"
         end
+      elsif Utility.f2p?
+        # F2P accounts keep their balance below the 100,000 cap by holding silver as notes, so a
+        # straight withdrawal frequently exceeds the available balance. Deposit note(s) to free up
+        # enough silver, then withdraw. (Equivalent to eloot's f2p_silver_withdraw handling.)
+        silvers_before = Utility.check_silver
+        Actions.f2p_silver_withdraw(EHerbs.data[:withdraw_amount])
+
+        # Genuinely broke: nothing left in the account and no notes to deposit.
+        if Utility.check_silver <= silvers_before
+          _respond
+          _respond Msg.monsterbold('You have no coins in the bank, moving back to starting point')
+          _respond
+          sleep 2
+          Utility.go2(EHerbs.data[:start_room].id.to_s)
+          exit
+        end
       else
         result = dothistimeout "withdraw #{EHerbs.data[:withdraw_amount]} silvers", 1, /debt collector|suspicious|chuckles at you/
         case result
@@ -1926,6 +2010,79 @@ module EHerbs
       EHerbs.data[:silvers] += EHerbs.data[:withdraw_amount]
       EHerbs.data[:need_deposit] = true if EHerbs.data[:deposit_coins]
       Utility.go2(original_room)
+    end
+
+    def self.f2p_silver_withdraw(amount)
+      # F2P bank accounts have a maximum balance (100,000 silvers), so silver frequently gets
+      # converted to bank notes to keep the balance under the cap (eloot does this automatically).
+      # As a result the balance is often too low to cover a withdrawal like the 8,000 silvers
+      # eherbs pulls to buy herbs. This deposits note(s) on hand to make enough silver available,
+      # then withdraws it. (Ported from eloot's ELoot::Bank.f2p_silver_withdraw.)
+
+      balance = 0
+      lines = Utility.get_lines('check balance', /(?:The|A prim) teller/)
+      if lines.find { |line| line.match(/(?:Your balance is currently at |his temple for a moment\.  ")(?<silver>[\d,]+)/) }
+        balance = Regexp.last_match[:silver].gsub(',', '').to_i
+      end
+
+      # Enough on deposit already - just withdraw it.
+      if balance >= amount
+        dothistimeout("withdraw #{amount} silvers", 2, /teller/i)
+        return
+      end
+
+      5.times do
+        note = Actions.find_bank_note
+        break if note.nil?
+
+        # Drain the account first so there's room to deposit a note that could be as large as
+        # the F2P maximum balance.
+        if balance > 0
+          dothistimeout("withdraw #{balance} silvers", 2, /teller/i)
+          amount -= balance
+          balance = 0
+        end
+
+        # Deposit the note, then withdraw the silver we still need from the freed-up balance.
+        Inventory.drag_to_hand(note)
+        EHerbs.data[:note] = nil if EHerbs.data[:note] && EHerbs.data[:note].id == note.id
+        lines = Utility.get_lines("deposit ##{note.id}", /You (?:deposit|hand your)|takes your/)
+        break if lines.find { |line| line.match(/(?:worth|for) (?<silver>[\d,]+)/) }.nil?
+        note_amount = Regexp.last_match[:silver].gsub(',', '').to_i
+        withdraw_amount = note_amount >= amount ? amount : note_amount
+        dothistimeout("withdraw #{withdraw_amount} silvers", 2, /teller/i)
+        amount -= withdraw_amount
+        break if amount <= 0
+      end
+    end
+
+    def self.find_bank_note
+      # Prefer a note already in hand.
+      note = [GameObj.right_hand, GameObj.left_hand].find { |obj| obj.noun =~ /^(?:note|scrip|chit)$/ }
+      return note if note
+
+      # Then the herb sack, where eherbs stores the notes it manages.
+      if EHerbs.data[:herb_sack].respond_to?(:contents)
+        note = EHerbs.data[:herb_sack].contents.find { |obj| obj.noun =~ /^(?:note|scrip|chit)$/ }
+        return note if note
+      end
+
+      # Finally the default stow container, where account-management scripts like eloot stash
+      # notes on F2P accounts. Guarded so eherbs still works on setups without Lich's StowList.
+      if defined?(StowList) && StowList.respond_to?(:stow_list)
+        begin
+          StowList.check(silent: true, quiet: true) if StowList.respond_to?(:checked?) && !StowList.checked?
+          default_bag = StowList.stow_list[:default]
+          if default_bag.respond_to?(:contents)
+            note = default_bag.contents.find { |obj| obj.noun =~ /^(?:note|scrip|chit)$/ }
+            return note if note
+          end
+        rescue StandardError
+          # Ignore StowList issues and fall back to the hands / herb sack results above.
+        end
+      end
+
+      nil
     end
   end
 
@@ -2712,6 +2869,15 @@ module EHerbs
       end
 
       coins
+    end
+
+    def self.f2p?
+      # Mirrors eloot's account-type check: the test server (GST) has no F2P restrictions,
+      # otherwise fall back to Lich's stored account subscription info.
+      return false if XMLData.game == 'GST'
+      return false unless defined?(Account) && Account.respond_to?(:subscription)
+
+      !!(Account.subscription.to_s =~ /F2P|Free/i)
     end
 
     def self.check_terminal_table
