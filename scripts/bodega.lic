@@ -9,10 +9,18 @@
 
   Author: Ondreian
   Requirements: Ruby >= 2.3
-  version: 0.6
+  version: 0.8
   tags: playershops
 
   changelog:
+    v0.8 - Capture shop location from the new SHOP BROWSE preamble format
+           - Extract room_name, room_number (game's official room id), and
+             exterior as shop-level fields on every scan (full and smart)
+           - Remove shop_mapping.json load/save plumbing; location data now
+             flows through the town JSONs instead
+    v0.7 - Preserve complete item inspection details in raw data
+           - Fix issue where parsed properties were removed from raw output
+           - Raw data now contains full item inspection regardless of parsing
     v0.6 - Fix shop ID swap handling during maintenance reboots
            - Smart scan now automatically syncs room_title with preamble
            - Prevents stale room metadata when shop IDs are reassigned
@@ -160,7 +168,7 @@ module Bodega
     COMMAND  = %r[You can use the (?<command>.*?) command to browse the inventory of a particular shop.]
     NEW_ROOM = %r[^(?<room_title>.*)\s\((?<branch>\w+)\)$]
     SIGN     = %r[^Written on]
-    ITEM     = %r[^\s*(?<item_id>\d+)\).*?for\s+(?<price>[\d,]+)\s+silver]
+    ITEM     = %r[^\s*(?<item_id>\d+)\).*?for\s+(?<price>[\d,]+)\s+silver(?:\s*\((?<quantity>\d+)\s+available\))?]
   end
 end
 
@@ -177,7 +185,7 @@ module Bodega
     end
 
     def blow_up(ttl)
-      fail StandardError, "Collector(start: #{@start}, close: #{@close}) failed to complete in #{ttl} seconds"
+      fail StandardError, "Collector(start: #{@start}, close: #{@close}) failed to complete in #{ttl} seconds after #{MAX_TRIES} tries"
     end
 
     def compare(line, pattern)
@@ -201,8 +209,12 @@ module Bodega
         return result     if compare(line, @close) and not result.empty?
       end
 
-      return run(seconds, tries: tries + 1) if Time.now > ttl and tries < Collector::MAX_TRIES
-      return blow_up(seconds) if Time.now > ttl and tries > Collector::MAX_TRIES
+      # Timed out. Retry while tries remain, otherwise raise. Previously the
+      # boundary case tries == MAX_TRIES fell through both conditions and
+      # returned nil, causing confusing NoMethodError crashes at call sites
+      # instead of the intended blow_up message.
+      return run(seconds, tries: tries + 1) if tries < Collector::MAX_TRIES
+      blow_up(seconds)
     end
   end
 end
@@ -238,6 +250,17 @@ module Bodega
       not_wearable: %r[^You determine that you could not wear],
       holy: %r[^It is a holy item\.],
       is_gemstone: %r[^The jewel appears to be a powerful relic that can convey wondrous abilities on its wielder],
+      # Combat Modifiers
+      spiked: %r[It is spiked\.],
+      # Resistances
+      magic_resistant: %r[It is magic resistant\.],
+      # Special Features
+      scripted: %r[Additional scripts have been applied|has a Custom.*script|Shield Cape Collection|It is Tier \d+|Blink Weapon|briar flare weapon|has some unknown \(scripted\) benefit],
+      flourish: %r[It has the .* Flourish],
+      # Holy Fire (separate from sanctify tier)
+      holy_fire: %r[permanent Holy Fire flares],
+      # Greater Undead Bane (GUB) - appears with sanctified weapons
+      gub: %r[provides an additional \+\d+ AS bonus against the undead],
     }
 
     PROPS = {
@@ -246,6 +269,7 @@ module Bodega
       weight: %r[^It appears to weigh about (?<weight>\d+) pounds.],
       # flare: %r[^It has been infused with the power of an? (?<flare>.*?)\.],
       material: %r[^It looks like this item has been mainly crafted out of (?<material>.*?)\.],
+      material_enhanced: %r[^It is predominantly crafted of (?<material>.*?)\.\s*(?:It is (?<material_detail>(?:greater|lesser|pristine) .*?)\.)?],
       cost: %r[will cost (?<cost>\d+) coins\.$],
       worn: %r[The .*? can be worn(?:, slinging it across the |, hanging it from the |, attaching it to the | around the | in the | on the | over(?: the)? )(?<worn>[^.]+)(?=.)],
       activator: %r[^It could be activated by (?<activator>\w+) it\.$],
@@ -255,6 +279,22 @@ module Bodega
       armor_type: %r[ allows you to conclude that it is (?<armor_type>.*?)\.],
       flare: %r[It has been infused with (?<flare>.*?)\.$],
       gemstone_bound_to: %r[jewel is bound to (?<gemstone_bound_to>\w+),],
+      # TD Bonus
+      td_bonus: %r[protects against magical attacks with a bonus of (?<td_bonus>\d+)],
+      # Sanctification tier (1-5)
+      sanctify: %r[has been sanctified (?<sanctify>\d+) times?],
+      # Ensorcell tier (1-5)
+      ensorcell: %r[has been ensorcelled (?<ensorcell>\d+) times?],
+      # ARMOR: Padding (captures descriptor)
+      dmg_padding: %r[(?<dmg_padding>somewhat|fairly|heavily|very heavily|masterfully) padded to lessen the damage],
+      crit_padding: %r[(?<crit_padding>somewhat|fairly|heavily|very heavily|masterfully) padded against critical blows],
+      # WEAPON: Weighting (captures descriptor)
+      dmg_weighting: %r[(?<dmg_weighting>lightly|somewhat|fairly|heavily|very heavily|exceptionally) weighted to inflict more damage],
+      crit_weighting: %r[(?<crit_weighting>lightly|somewhat|fairly|heavily|very heavily|exceptionally) weighted to inflict more critical wounds],
+      # RANGED: Sighting (captures descriptor)
+      sighting: %r[(?<sighting>somewhat|fairly|heavily|very heavily) sighted to assist in aiming],
+      # FORGED: Quality tier from forging (captures forger name and AvD bonus, can be negative)
+      forged_by: %r[It is forged by (?<forged_by>.*?) and has (?:increased|decreased) \((?<forged_avd>[+-]?\d+)\) effectiveness in combat],
     }
 
     def self.of(details)
@@ -269,9 +309,9 @@ module Bodega
       _extract(details)
     end
 
-    def maybe_raw(line, *others)
+    def maybe_raw(line)
+      # Always add non-blacklisted lines to raw, regardless of parsing
       return if BLACKLIST.match(line)
-      return if others.any? { |identity| identity }
       @props[:raw] << line
     end
 
@@ -283,11 +323,13 @@ module Bodega
         # Try to parse gemstone properties first (multi-line blocks)
         next if _gemstone_property(details_array, index)
 
-        # Then handle single-line patterns
-        maybe_raw(line,
-                  _props(line),
-                  _bools(line),
-                  _enhancive(line.strip))
+        # Always add to raw (unless blacklisted)
+        maybe_raw(line)
+
+        # Then handle single-line patterns for extraction
+        _props(line)
+        _bools(line)
+        _enhancive(line.strip)
       end
     end
 
@@ -376,6 +418,9 @@ module Bodega
           true  # Return true to indicate a match was found
         elsif prop == :worn && line =~ /hanging it from the shoulders/i
           @props[:worn] = "cloak"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /leggings/i
+          @props[:worn] = "leggings"
           true  # Return true to indicate a match was found
         elsif prop == :worn && line =~ /on the legs/i
           @props[:worn] = "pants"
@@ -523,9 +568,12 @@ module Bodega
     end
 
     def self.safe_string(t)
+      # Kept in sync with processor.rb safe_string and data-loader.js
+      # safeString. Used here only for town/shop filenames; signatures are
+      # generated server-side in processor.rb.
       t.to_s.downcase
        .gsub("ta'", "ta_")
-       .gsub(/'|,/, "")
+       .gsub(/['",]/, "")
        .gsub(/-|\s/, "_")
     end
 
@@ -610,7 +658,8 @@ module Bodega
       result = { preamble: preamble,
                  town: town,
                  id: id,
-                 inv: parse_inv(inv.map(&:strip)) }
+                 shop_owner: extract_shop_name_from_preamble(preamble),
+                 inv: parse_inv(inv.map(&:strip)) }.merge(location_fields(preamble))
 
       result
     end
@@ -630,11 +679,14 @@ module Bodega
 
     def self.add_item(acc, row)
       match = row.match(Messages::ITEM)
-      # Store both item_id and price from browse output
-      acc.last.items.push({
+      # Store item_id, price, and quantity (if present) from browse output
+      item_data = {
         id: match[:item_id],
         browse_price: match[:price]&.gsub(',', '')&.to_i
-      })
+      }
+      # Only add quantity if it was captured
+      item_data[:quantity] = match[:quantity].to_i if match[:quantity]
+      acc.last.items.push(item_data)
     end
 
     def self.parse_inv(inv)
@@ -649,8 +701,13 @@ module Bodega
       .map do |room|
         max_item_depth = (Opts["max-item-depth"] || 100).to_i
         room.items = room.items.take(max_item_depth).map do |item_data|
-          # item_data is now a hash with {id: ..., browse_price: ...}
-          Parser.scan_item(item_data[:id] || item_data, item_data[:browse_price])
+          # item_data is now a hash with {id: ..., browse_price: ..., quantity: ... (optional)}
+          # Use raw mode if --raw-only flag is set
+          if Opts.raw_only || Opts["raw-only"]
+            Parser.scan_item_raw(item_data[:id] || item_data, item_data[:browse_price], item_data[:quantity])
+          else
+            Parser.scan_item(item_data[:id] || item_data, item_data[:browse_price], item_data[:quantity])
+          end
         end
         room
       end
@@ -658,25 +715,27 @@ module Bodega
     end
 
     def self.get_browse_ids(inv)
-      # Extract item IDs and prices from browse output without doing full inspection
-      item_prices = {}
+      # Extract item IDs, prices, and quantities from browse output without doing full inspection
+      item_data = {}
 
       inv.reduce([]) do |acc, row|
         break acc if row.include?("SHOP INSPECT")
         Parser.add_room(acc, row) if row.match(Messages::NEW_ROOM)
         Parser.add_sign(acc, row) if row.match(Messages::SIGN) or not acc.last.sign.nil?
 
-        # Extract item ID and price without full inspection
+        # Extract item ID, price, and quantity without full inspection
         if row.match(Messages::ITEM) and acc.last.sign.nil?
           match = row.match(Messages::ITEM)
           item_id = match[:item_id]
           price = match[:price]&.gsub(',', '')&.to_i
-          item_prices[item_id] = price
+          item_info = { price: price }
+          item_info[:quantity] = match[:quantity].to_i if match[:quantity]
+          item_data[item_id] = item_info
         end
         acc
       end
 
-      item_prices
+      item_data
     end
 
     def self.load_and_validate_town_json(town)
@@ -753,9 +812,6 @@ module Bodega
       @smart_stats ||= { new_items: 0, removed_items: 0, unchanged_items: 0, shops_scanned: 0 }
       @removed_items_tracker ||= {}
 
-      # Load added items tracking for smart scans (only on first shop)
-      load_added_items if @smart_stats[:shops_scanned] == 0
-
       # Step 1: Get current browse IDs from shop scan
       coll = Collector.new(
         start: %[is located in],
@@ -787,11 +843,45 @@ module Bodega
           preamble: preamble,
           town: town,
           id: shop_id,
+          shop_owner: extract_shop_name_from_preamble(preamble),
           inv: parse_inv(inv.map(&:strip))
-        }
+        }.merge(location_fields(preamble))
       end
 
-      # Step 4: Extract existing item IDs
+      # Step 4: Check if shop ID now points to a different owner (game reset reordered SHOP list)
+      current_owner = extract_shop_name_from_preamble(preamble)
+      cached_owner = existing_shop['shop_owner']
+
+      # If we cannot confirm the current owner from the preamble, we cannot
+      # trust that this shop_id still points to the same shop (IDs are
+      # reassigned on server reboots). Do a full rescan rather than merging
+      # into a possibly-wrong cached shop, which would silently corrupt it.
+      if current_owner == 'unknown'
+        Log.out("Shop ID #{shop_id} owner could not be determined from preamble — cannot verify cache identity, performing full scan.", label: :smart)
+        @smart_stats[:shops_scanned] += 1
+        @smart_stats[:new_items] += current_ids.size
+        return {
+          preamble: preamble,
+          town: town,
+          id: shop_id,
+          inv: parse_inv(inv.map(&:strip))
+        }.merge(location_fields(preamble))
+      end
+
+      if cached_owner && cached_owner.downcase != current_owner.downcase
+        Log.out("Shop ID #{shop_id} owner mismatch: cached=#{cached_owner}, current=#{current_owner} — game reset likely reordered shops. Wiping cache and doing full scan.", label: :smart)
+
+        @smart_stats[:shops_scanned] += 1
+        return {
+          preamble: preamble,
+          town: town,
+          id: shop_id,
+          shop_owner: current_owner,
+          inv: parse_inv(inv.map(&:strip))
+        }.merge(location_fields(preamble))
+      end
+
+      # Step 5: Extract existing item IDs
       existing_ids = extract_item_ids_from_shop(existing_shop)
       Log.out("Found #{existing_ids.size} items in cached shop #{shop_id}", label: :smart)
 
@@ -808,9 +898,9 @@ module Bodega
       @smart_stats[:unchanged_items] += unchanged_ids.size
       @smart_stats[:shops_scanned] += 1
 
-      # Step 6: Capture and remove deleted items from existing shop structure
+      # Step 6: Remove deleted items from existing shop structure
+      # (Tracking moved to processor.rb)
       if removed_ids.any?
-        capture_removed_items(town, existing_shop, removed_ids, name)
         remove_items_from_shop(existing_shop, removed_ids)
       end
 
@@ -823,14 +913,18 @@ module Bodega
         current_time = Time.now.utc.iso8601
         new_ids.take(max_item_depth).each do |item_id|
           begin
-            # Pass browse price to scan_item for more reliable cost tracking
-            browse_price = current_items[item_id]
-            item_data = scan_item(item_id, browse_price)
+            # Pass browse price and quantity to scan_item for more reliable cost tracking
+            item_info = current_items[item_id]
+            browse_price = item_info[:price]
+            quantity = item_info[:quantity]
+            # Use raw mode if --raw-only flag is set
+            item_data = if Opts.raw_only || Opts["raw-only"]
+              scan_item_raw(item_id, browse_price, quantity)
+            else
+              scan_item(item_id, browse_price, quantity)
+            end
             new_items << item_data
-
-            # Track in added_items.json for persistence across full scans
-            # Pass town, preamble, and item_data for hash-based tracking
-            track_added_item(item_id, current_time, town: town, preamble: preamble, item_data: item_data)
+            # Item tracking moved to processor.rb
           rescue => e
             Log.out("Failed to inspect item #{item_id}: #{e.message}", label: :smart)
           end
@@ -842,191 +936,40 @@ module Bodega
         add_items_to_shop(existing_shop, new_items)
       end
 
-      # Step 9: Update room_title to match current preamble (handles shop ID swaps during maintenance)
-      # The preamble is always fresh from the game, but room_title comes from cached inv structure
-      # Extract the shop name from the preamble and update the entry room's title
-      preamble_shop_name = extract_shop_name_from_preamble(preamble)
-      if existing_shop['inv'] && existing_shop['inv'][0] && preamble_shop_name != 'unknown'
-        # Get the current room title to determine shop type
-        current_room_title = existing_shop['inv'][0]['room_title']
-
-        # Extract shop type from current room_title (e.g., "Magic Shoppe", "Weaponry", etc.)
-        shop_type_match = current_room_title&.match(/(?:'s?\s+)?(Magic Shoppe|Weaponry|Armory|Outfitting|General Store|Combat Gear|Locksmith Shop|Shop|Boutique|Treasures|Cupboard|Pantry|Market|Tower|Stash|Castle|Eye|Claw|Kiss|Ransom|Den|Hoard|Goods|Emporium|Salon|Parlor|Boutique|Imports|Defence|Couture|Station|Things|Wares|Snack Pantry|Icemule Trade Station|Confectionery Castle|Smuggling Emporium|Arcane Antiquities|Fine Furs|Supply Center|Lost Things|Locksmith Shop|Lockpicks|Trade Station)$/i)
-        shop_type = shop_type_match ? shop_type_match[1] : nil
-
-        # Construct new room_title: "Owner's Shop Type" or just shop type for business names
-        new_room_title = if shop_type && !preamble_shop_name.match(/^(The|A)\s+/i)
-                           # Owner-possessive format: "Painz's Magic Shoppe"
-                           "#{preamble_shop_name}'s #{shop_type}"
-                         elsif shop_type
-                           # Business name format: "The Best Defence" or "Dark Tower Imports"
-                           "#{preamble_shop_name} #{shop_type}"
-                         else
-                           # Fallback: use preamble shop name as-is
-                           preamble_shop_name
-                         end
-
-        existing_shop['inv'][0]['room_title'] = new_room_title
-        Log.out("Updated room_title from '#{current_room_title}' to '#{new_room_title}'", label: :smart)
+      # Step 8.5: Update quantities for all current items from browse data
+      # This ensures quantities stay current even for unchanged items
+      existing_shop['inv']&.each do |room|
+        room['items']&.each do |item|
+          item_id = item['id'].to_s
+          if current_items[item_id]
+            item_info = current_items[item_id]
+            # Update quantity from browse data if it exists
+            if item_info[:quantity]
+              item['quantity'] = item_info[:quantity]
+            else
+              # Remove quantity field if no longer present in browse
+              item.delete('quantity')
+            end
+          end
+        end
       end
 
       # Return the updated shop structure, preserving room_id if it exists
+      # NOTE: Room titles are preserved exactly as captured from the game.
+      # The preamble owner (deed holder) may differ from room title owner (shop brand).
       result = {
         preamble: preamble,
         town: town,
         id: shop_id,
+        shop_owner: extract_shop_name_from_preamble(preamble),
         inv: existing_shop['inv']
-      }
+      }.merge(location_fields(preamble))
 
       result
     end
 
-    def self.load_removed_items
-      # Load the global removed items file with migration support
-      return @removed_items_data if @removed_items_data
-
-      file_path = Assets.local_path("removed_items.json")
-
-      if File.exist?(file_path)
-        begin
-          @removed_items_data = JSON.parse(File.read(file_path))
-          Log.out("Loaded removed_items.json", label: :smart)
-        rescue JSON::ParserError => e
-          Log.out("Failed to load removed_items.json: #{e.message}", label: :smart)
-          @removed_items_data = {}
-        end
-      else
-        # First run - migrate from existing town files if they have removed_items
-        Log.out("No removed_items.json found, checking for migration...", label: :migrate)
-        migrated_data = {}
-
-        towns.each do |town|
-          begin
-            town_data = load_and_validate_town_json(town)
-            if town_data && town_data['removed_items'] && town_data['removed_items'].any?
-              migrated_data[town] = town_data['removed_items']
-              Log.out("Migrating #{town_data['removed_items'].size} removed items from #{town}.json", label: :migrate)
-            end
-          rescue => e
-            Log.out("Error checking #{town} for migration: #{e.message}", label: :migrate)
-          end
-        end
-
-        @removed_items_data = migrated_data
-
-        if migrated_data.any?
-          save_removed_items
-          Log.out("Migration complete - saved to removed_items.json", label: :migrate)
-        else
-          Log.out("No existing removed_items to migrate", label: :migrate)
-        end
-      end
-
-      @removed_items_data ||= {}
-    end
-
-    def self.save_removed_items
-      # Save the global removed items file with server reboot safeguard
-      return if @removed_items_data.nil? || @removed_items_data.empty?
-
-      # Server reboot safeguard: check for mass additions that indicate ID reset
-      original_file_path = Assets.local_path("removed_items.json")
-      if File.exist?(original_file_path)
-        begin
-          original_data = JSON.parse(File.read(original_file_path))
-
-          # Count items added in current session only
-          new_items_count = 0
-          @removed_items_data.each do |town, items|
-            original_town_items = original_data[town] || []
-            original_ids = original_town_items.map { |item| item['id'].to_s }.to_set
-
-            new_items_count += items.count { |item| !original_ids.include?(item['id'].to_s) }
-          end
-
-          # Safeguard threshold: reject if adding more than 750 items in one session
-          # This indicates likely server reboot (all item IDs changed)
-          max_new_items = (Opts["removed-max-new"] || 750).to_i
-
-          if new_items_count > max_new_items
-            Log.out("SAFEGUARD: Rejecting #{new_items_count} new removed items (threshold: #{max_new_items})", label: :safeguard)
-            Log.out("This likely indicates a server reboot with ID reset - keeping existing data", label: :safeguard)
-            return
-          elsif new_items_count > 100
-            Log.out("Adding #{new_items_count} new removed items (threshold: #{max_new_items})", label: :safeguard)
-          end
-        rescue => e
-          Log.out("Warning: Could not check original removed_items.json: #{e.message}", label: :safeguard)
-        end
-      end
-
-      begin
-        Assets.write_local_json(@removed_items_data, "removed_items")
-        Log.out("Saved removed_items.json", label: :smart)
-      rescue => e
-        Log.out("Failed to save removed_items.json: #{e.message}", label: :smart)
-      end
-    end
-
-    def self.load_added_items
-      # Load the global added items file (only during smart scans)
-      return @added_items_data if @added_items_data
-
-      file_path = Assets.local_path("added_items.json")
-
-      if File.exist?(file_path)
-        begin
-          @added_items_data = JSON.parse(File.read(file_path))
-          Log.out("Loaded added_items.json with #{@added_items_data.size} items", label: :smart)
-        rescue JSON::ParserError => e
-          Log.out("Failed to load added_items.json: #{e.message}", label: :smart)
-          @added_items_data = {}
-        end
-      else
-        Log.out("No added_items.json found, creating new tracking", label: :smart)
-        @added_items_data = {}
-      end
-
-      @added_items_data
-    end
-
-    def self.track_added_item(item_id, timestamp, town: nil, preamble: nil, item_data: nil)
-      # Initialize added items tracking if needed
-      load_added_items
-
-      # Only store by hash signature (not by ID which can be recycled)
-      # If we don't have the data needed for hash, skip tracking
-      if town && preamble && item_data
-        signature = create_item_signature(town, preamble, item_data)
-        if signature
-          @added_items_data[signature] = timestamp
-        else
-          Log.out("Warning: Could not create signature for item #{item_id}", label: :smart)
-        end
-      else
-        Log.out("Warning: Missing data to track item #{item_id} (town: #{town.nil?}, preamble: #{preamble.nil?}, item_data: #{item_data.nil?})", label: :smart)
-      end
-    end
-
-    def self.create_item_signature(town, preamble, item_data)
-      # Create a unique signature for the item based on stable attributes
-      # This matches the JavaScript implementation in data-loader.js
-      return nil unless item_data && item_data[:name]
-
-      # Extract shop name from preamble
-      shop_name = extract_shop_name_from_preamble(preamble)
-
-      # Extract price from item details
-      price = item_data.dig(:details, :cost) || 0
-
-      # Create signature using safe_string
-      safe_town = Utils.safe_string(town)
-      safe_shop = Utils.safe_string(shop_name)
-      safe_item = item_data[:name].to_s.downcase.strip
-      safe_price = price.to_s
-
-      "#{safe_town}:#{safe_shop}:#{safe_item}:#{safe_price}"
-    end
+    # Item tracking (load/save added_items.json and removed_items.json)
+    # has been moved to processor.rb for the scrape -> process -> display architecture
 
     def self.extract_shop_name_from_preamble(preamble)
       # Extract shop name from preamble like "Starsworn's Shop is located in..."
@@ -1038,123 +981,30 @@ module Bodega
       match ? match[1].strip : 'unknown'
     end
 
-    def self.save_added_items
-      # Save added_items.json (only called during smart scans)
-      return unless @added_items_data
+    def self.extract_exterior_from_preamble(preamble)
+      # Extract exterior description from preamble
+      # Format: "... at a <exterior>, and is currently..."
+      return nil unless preamble
 
-      # Remove items with invalid timestamps only
-      @added_items_data = @added_items_data.select do |_item_id, timestamp_str|
-        begin
-          Time.parse(timestamp_str)
-          true
-        rescue
-          false # Remove items with invalid timestamps
-        end
-      end
-
-      begin
-        Assets.write_local_json(@added_items_data, "added_items")
-        Log.out("Saved added_items.json with #{@added_items_data.size} items", label: :smart)
-      rescue => e
-        Log.out("Failed to save added_items.json: #{e.message}", label: :smart)
-      end
+      match = preamble.match(/at (?:a|an) (.*?), and is currently/)
+      match ? match[1].strip : nil
     end
 
-    def self.clean_removed_items_by_size
-      # Configurable size-based cleanup
-      max_size_mb = (Opts["removed-max-size"] || 10).to_f
-      min_days = (Opts["removed-min-days"] || 14).to_i
-      max_days = (Opts["removed-max-days"] || 180).to_i
+    def self.extract_room_info_from_preamble(preamble)
+      # Extract room name and game room number from preamble
+      # Format: "... is located in [Heleconia Way] (739405) at a ..."
+      # Room number is optional (older bracket-only format lacks it)
+      return {} unless preamble
 
-      file_path = Assets.local_path("removed_items.json")
+      match = preamble.match(/is located in \[(?<room_name>[^\]]+)\](?:\s*\((?<room_number>\d+)\))?/)
+      return {} unless match
 
-      # First pass: remove anything older than max_days
-      max_cutoff = Time.now.utc - (max_days * 24 * 60 * 60)
-
-      @removed_items_data.each do |town, items|
-        @removed_items_data[town] = items.select do |item|
-          begin
-            Time.parse(item['removed_date']) >= max_cutoff
-          rescue
-            false # Remove items with invalid dates
-          end
-        end
-      end
-
-      # Remove empty town entries
-      @removed_items_data.delete_if { |_town, items| items.empty? }
-
-      # Save and check file size
-      save_removed_items
-      return unless File.exist?(file_path)
-
-      file_size_mb = File.size(file_path) / (1024.0 * 1024.0)
-
-      if file_size_mb > max_size_mb
-        Log.out("removed_items.json is #{file_size_mb.round(2)}MB, trimming to #{max_size_mb}MB", label: :cleanup)
-
-        # Second pass: trim to size while respecting min_days
-        min_cutoff = Time.now.utc - (min_days * 24 * 60 * 60)
-
-        # Get all items sorted by date (newest first)
-        all_items = []
-        @removed_items_data.each do |_town, items|
-          items.each { |item| all_items << item }
-        end
-        all_items.sort_by! { |item| item['removed_date'] }.reverse!
-
-        # Calculate how many items to keep
-        reduction_ratio = max_size_mb / file_size_mb
-        target_count = (all_items.size * reduction_ratio * 0.9).to_i # 90% of target to leave buffer
-
-        # Keep newest items that are also within min_days
-        items_to_keep = all_items.select do |item|
-          begin
-            Time.parse(item['removed_date']) >= min_cutoff
-          rescue
-            false
-          end
-        end
-
-        # If we still have too many, take only the newest
-        items_to_keep = items_to_keep.first(target_count) if items_to_keep.size > target_count
-
-        # Rebuild by town
-        @removed_items_data = {}
-        items_to_keep.each do |item|
-          town = item['town'] || item['last_seen_shop'] # fallback for old data
-          @removed_items_data[town] ||= []
-          @removed_items_data[town] << item
-        end
-
-        save_removed_items
-        new_size = File.size(file_path) / (1024.0 * 1024.0)
-        Log.out("Trimmed removed_items.json from #{file_size_mb.round(2)}MB to #{new_size.round(2)}MB", label: :cleanup)
-      end
+      { room_name: match[:room_name].strip, room_number: match[:room_number] }.compact
     end
 
-    def self.capture_removed_items(town, shop_data, item_ids_to_remove, shop_name)
-      # Capture removed items before deleting them
-      return unless shop_data && shop_data['inv']
-
-      # Load existing data if not loaded
-      load_removed_items
-
-      @removed_items_data[town] ||= []
-      current_time = Time.now.utc.iso8601
-
-      shop_data['inv'].each do |room|
-        next unless room['items']
-        room['items'].each do |item|
-          if item_ids_to_remove.include?(item['id'].to_s)
-            removed_item = item.dup
-            removed_item['removed_date'] = current_time
-            removed_item['last_seen_shop'] = shop_name
-            removed_item['town'] = town
-            @removed_items_data[town] << removed_item
-          end
-        end
-      end
+    def self.location_fields(preamble)
+      extract_room_info_from_preamble(preamble)
+        .merge({ exterior: extract_exterior_from_preamble(preamble) }.compact)
     end
 
     def self.remove_items_from_shop(shop_data, item_ids_to_remove)
@@ -1180,25 +1030,6 @@ module Bodega
       first_room = shop_data['inv'].first
       first_room['items'] ||= []
       first_room['items'].concat(new_items)
-    end
-
-    def self.get_removed_items_for_town(town)
-      # Load the global removed items data if not loaded
-      load_removed_items
-
-      # Get all removed items for this town
-      all_removed = @removed_items_data[town] || []
-
-      # Remove duplicates by item ID (keep most recent)
-      unique_removed = {}
-      all_removed.each do |item|
-        item_id = item['id'].to_s
-        if !unique_removed[item_id] || Time.parse(item['removed_date']) > Time.parse(unique_removed[item_id]['removed_date'])
-          unique_removed[item_id] = item
-        end
-      end
-
-      unique_removed.values.sort_by { |item| item['removed_date'] }.reverse
     end
 
     def self.display_smart_summary
@@ -1228,7 +1059,7 @@ module Bodega
       @smart_stats = nil
     end
 
-    def self.scan_item(id, browse_price = nil)
+    def self.scan_item(id, browse_price = nil, quantity = nil)
       coll = Collector.new(
         command: %[shop inspect #{id}],
         start: %[You request a thorough inspection of],
@@ -1241,9 +1072,39 @@ module Bodega
       # Add browse price if available (more reliable than parsing from inspect output)
       extracted_details[:cost] = browse_price if browse_price
 
-      { id: id,
+      result = {
+        id: id,
         name: details.first.gsub("You request a thorough inspection of ", "").gsub(%r[\sfrom [A-Z].*?\.$], ""),
-        details: extracted_details }
+        details: extracted_details
+      }
+
+      # Preserve quantity from browse data if it exists
+      result[:quantity] = quantity if quantity
+
+      result
+    end
+
+    # Raw capture mode - minimal processing, just stores raw INSPECT output
+    def self.scan_item_raw(id, browse_price = nil, quantity = nil)
+      coll = Collector.new(
+        command: %[shop inspect #{id}],
+        start: %[You request a thorough inspection of],
+        close: %[You can use SHOP PURCHASE #{id} to purchase]
+      )
+
+      details = coll.run()
+
+      result = {
+        id: id,
+        name: details.first.gsub("You request a thorough inspection of ", "").gsub(%r[\sfrom [A-Z].*?\.$], ""),
+        browse_price: browse_price,
+        raw_inspect: details.slice(1..-2) # Just the raw lines, no Extractor processing
+      }
+
+      # Preserve quantity from browse data if it exists
+      result[:quantity] = quantity if quantity
+
+      result
     end
 
     def self.towns_to_search()
@@ -1294,14 +1155,7 @@ module Bodega
       # Display smart parsing summary if we were in smart mode
       display_smart_summary if Opts.smart
 
-      # Save added items file after all towns are processed (smart mode only)
-      save_added_items if Opts.smart
-
-      # Clean and save the global removed items file after all towns are processed
-      if @removed_items_data && @removed_items_data.any?
-        clean_removed_items_by_size
-        save_removed_items
-      end
+      # Item tracking (added/removed) is now handled by processor.rb
 
       # Add removed_items.json to created files list for upload
       if File.exist?(Assets.local_path("removed_items.json"))
@@ -1318,6 +1172,17 @@ module Bodega
     def self.save_json(name:, data:)
       return Utils.pp(data) if Opts["dry-run"]
       filename = Utils.safe_string(Opts.to_h.fetch(:shop, name))
+
+      # Add format_version for raw mode
+      if Opts.raw_only || Opts["raw-only"]
+        data[:format_version] = "raw_v1"
+        # Prefix filename with raw/ subdirectory
+        filename = "raw/#{filename}"
+        # Ensure raw directory exists
+        raw_dir = Assets::LOCAL_FS_ROOT + "raw"
+        FileUtils.mkdir_p(raw_dir) unless File.directory?(raw_dir)
+      end
+
       Assets.write_local_json(data, filename)
       return "#{filename}.json"
     end
@@ -1736,6 +1601,9 @@ module Bodega
                                 automatically removes deleted items and adds new ones
                                 first run still full speed, subsequent runs are much faster
 
+        raw mode:
+          --raw-only            capture raw INSPECT output without local extraction
+                                processing is deferred to server-side processor.rb
 
         upload mode:
           --upload              upload existing JSON files from local filesystem
@@ -1789,14 +1657,14 @@ module Bodega
   module Parser
     def self.smart_scan
       Log.out("Starting smart scan mode", label: :automation)
-      Script.run("bodega", "--parser", "--smart", "--save")
+      Script.run("bodega", "--parser", "--smart", "--save", "--raw-only")
     end
 
     def self.full_scan
       Log.out("Starting full scan mode", label: :automation)
-      # Full scan does smart scan first, then full scan
-      Script.run("bodega", "--parser", "--smart", "--save")
-      Script.run("bodega", "--parser", "--save")
+      # Full scan does smart scan first (to catch removals), then full scan
+      Script.run("bodega", "--parser", "--smart", "--save", "--raw-only")
+      Script.run("bodega", "--parser", "--save", "--raw-only")
     end
   end
 end
