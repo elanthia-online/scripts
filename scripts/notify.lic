@@ -1,53 +1,65 @@
 =begin
-  version: 1.3.1
-
   Shows system notifications when:
     * someone messages you on lnet
     * someone whispers to you
     * someone speaks to you
+    * someone sends you a Focused ESP thought
+    * a game-wide Announcement is broadcast
     * something generally bad happens to your character
 
   supported:
-    Linux (lib-notify)
-    OSX   (display)
-
-  contributions:
-    Dalem - OSX info
+    Windows (native toast via PowerShell)
+    macOS   (osascript / Notification Center)
+    Linux   (notify-send)
 
   documentation:
-    ;notify                      turn on the notify watcher
-    ;notify sounds               list all sounds that notify can find on your system
-    ;notify sounds <substring>   list all sounds that match a substring
-    ;notify set-sound <sound>    set the sound to play when
-    ;notify mute                 turns off sound
+    ;notify                 turn on the notify watcher
+    ;notify mute            deliver notifications silently
+    ;notify unmute          restore the default notification sound
+    ;notify ignore <name>   stop notifying about messages from <name>
+    ;notify unignore <name> resume notifying about messages from <name>
 
   usage:
     # example how to add your own hooks
     unless Module.const_get("Notify").is_a?(Module)
       start_script "notify"
     end
-    # we must set a sound for this script
-    # because it is in a different thread
-    Notify::Sounds.set "zelda/email"
 
     Notify.notify(to: "Ondreian", from: "taters", body: "i'm important", type: Script.current.name)
 
   notes:
     * to be able to use Notify from another script it must be ;trusted
-      otherwise it be available the Main (global) context
+      otherwise it is only available in the Main (global) context
     * will no longer ping you about stuns while doing Dark Chamber reps
+    * notification sound follows each platform's default; use ;notify mute to silence
 
+  Required: Lich >= 5.19.0
+  Author: Ondreian
+  Tags: util
+  version: 2.0.0
+
+=end
+=begin
   changelog:
     2-15-2017 add danger notifications for low health and stun
     2-17-2017 add pattern matching to ;notify sounds command
     2-18-2017 add spinners to notifications
     2-26-2025 fix for Lich 5.11+, rubocop code
-
-  Required: Lich 4.3.12, lib-notify
-  Author: Ondreian
-  Tags: util
+    7-21-2026 modernize for Lich 5.19+ / Ruby 4.0: use the bundled `os` gem for
+              platform detection, add Windows toast support, catch the
+              Announcements pushStream from the XML stream (deduped across
+              characters via the shared notify server), deliver via safe
+              (non-shell) invocation, and retire the custom sound-file picker in
+              favor of each platform's default notification sound (this removes
+              the ;notify sounds, set-sound, and play sub-commands); also fix a
+              latent crash where fmt_message called .to_struct on a nil match, so
+              whisper, speech, GM, and OOC notifications now fire (previously only
+              lnet worked; the others raised and were swallowed by the server)
+    7-22-2026 add notifications for Focused ESP thoughts
+              (e.g. [Focused] Name thinks, "...")
 
 =end
+require "os"
 require "ostruct"
 require "socket"
 require "json"
@@ -73,35 +85,6 @@ end
 class ::Hash
   def to_struct
     OpenStruct.new self
-  end
-end
-
-module OS
-  def OS.windows?
-    (/cygwin|mswin|mingw|bccwin|wince|emx/ =~ RUBY_PLATFORM) != nil
-  end
-
-  def OS.mac?
-    (/darwin/ =~ RUBY_PLATFORM) != nil
-  end
-
-  def OS.unix?
-    !OS.windows?
-  end
-
-  def OS.linux?
-    OS.unix? and not OS.mac?
-  end
-
-  def OS.which?(cmd)
-    exts = ENV['PATHEXT'] ? ENV['PATHEXT'].split(';') : ['']
-    ENV['PATH'].split(File::PATH_SEPARATOR).each do |path|
-      exts.each { |ext|
-        exe = File.join(path, "#{cmd}#{ext}")
-        return exe if File.executable?(exe) && !File.directory?(exe)
-      }
-    end
-    return nil
   end
 end
 
@@ -136,58 +119,6 @@ module Notify
 
     def self.dump(*args)
       pp(*args)
-    end
-  end
-
-  class Sounds
-    SOUNDS_DIR = if OS.linux?
-                   ["/usr/share/sounds/"]
-                 elsif OS.mac?
-                   [File.expand_path("~/Library/Sounds/"), "/System/Library/Sounds/"]
-                 else
-                   []
-                 end
-
-    BIN = if OS.linux?
-            "paplay"
-          elsif OS.mac?
-            "afplay"
-          else
-            nil
-          end
-
-    def self.to_a
-      SOUNDS_DIR.map do |dir|
-        Dir[dir + "**/*"]
-      end.flatten
-         .select do |path|
-        path =~ /\.([a-z0-9A-Z]+)$/
-      end
-    end
-
-    def self.match(name)
-      to_a.select do |file| file =~ /#{name}/i end
-    end
-
-    def self.[](name)
-      to_a.find do |file| file =~ /#{name}/i end
-    end
-
-    def self.current
-      Settings[:sound]
-    end
-
-    def self.full_sound_path
-      self[current]
-    end
-
-    def self.set(sound)
-      Settings[:sound] = sound
-      Settings.save
-    end
-
-    def self.play(sound = full_sound_path)
-      %x{#{BIN} #{self[sound]}} if OS.which?(BIN) && sound
     end
   end
 
@@ -269,8 +200,8 @@ module Notify
   end
 
   class Server
-    PORT = 3434
-    HOST = "localhost"
+    PORT = 3434 unless defined?(Notify::Server::PORT)
+    HOST = "localhost" unless defined?(Notify::Server::HOST)
 
     @@self = nil
 
@@ -371,6 +302,7 @@ module Notify
     def schedule_notification(char, message)
       begin
         message = Notify.fmt_message(char, message)
+        return if message.nil?
         if Notify.should_notify_about?(message)
           Notify.notify(message)
           COOLDOWN.put(message.from, 1)
@@ -454,59 +386,165 @@ module Notify
   end
 
   HELP = <<-HELP
-    ;notify@1.0.0
+    ;notify@2.0.0
 
-    ;notify                      turn on the notify watcher
-    ;notify sounds               list all sounds that notify can find on your system
-    ;notify set-sound <sound>    set the sound to play when
-    ;notify play <sound>         play a sound one time without changing any settings
-    ;notify mute                 turns off sound
+    ;notify                 turn on the notify watcher
+    ;notify mute            deliver notifications silently
+    ;notify unmute          restore the default notification sound
+    ;notify ignore <name>   stop notifying about messages from <name>
+    ;notify unignore <name> resume notifying about messages from <name>
   HELP
 
-  PRIVATE_MESSAGE = /^\[Private\]\-GSIV:(?<from>.*?): "(?<body>.*?)"/
-  GM_SEND         = /^SEND\[(?<from>\w+)\]\s+(?<body>.*?)$/
-  OOC_WHISPER     = /^\(OOC\) (?<from>.*?)'s player whispers(?: to the group)?, "(?<body>.*?)"$/
-  IC_WHISPER      = /^(?<from>.*?) whispers(?: to the group)?, "(?<body>.*?)"$/
-  SPEECH          = /^Speaking (?:.*?|)to you, (?<from>.*?) (?:.*?), "(?<body>.*?)"$/
-  SPINNER         = /^(.*?) comes to a stop pointing directly at you!$/
-  LEVELED_UP      = /^You are now level (?<level>\d+)!$/
-  SHOP_SALE       = /^Your (?<item>.*?) just sold for (?<silvers>.*?) silvers from/
-  RAFFLE          = /^You\ssense\syou\shave\sjust\swon\sa\sraffle/
+  PRIVATE_MESSAGE = /^\[Private\]\-GSIV:(?<from>.*?): "(?<body>.*?)"/ unless defined?(Notify::PRIVATE_MESSAGE)
+  GM_SEND         = /^SEND\[(?<from>\w+)\]\s+(?<body>.*?)$/ unless defined?(Notify::GM_SEND)
+  OOC_WHISPER     = /^\(OOC\) (?<from>.*?)'s player whispers(?: to the group)?, "(?<body>.*?)"$/ unless defined?(Notify::OOC_WHISPER)
+  IC_WHISPER      = /^(?<from>.*?) whispers(?: to the group)?, "(?<body>.*?)"$/ unless defined?(Notify::IC_WHISPER)
+  SPEECH          = /^Speaking (?:.*?|)to you, (?<from>.*?) (?:.*?), "(?<body>.*?)"$/ unless defined?(Notify::SPEECH)
+  SPINNER         = /^(.*?) comes to a stop pointing directly at you!$/ unless defined?(Notify::SPINNER)
+  LEVELED_UP      = /^You are now level (?<level>\d+)!$/ unless defined?(Notify::LEVELED_UP)
+  SHOP_SALE       = /^Your (?<item>.*?) just sold for (?<silvers>.*?) silvers from/ unless defined?(Notify::SHOP_SALE)
+  RAFFLE          = /^You\ssense\syou\shave\sjust\swon\sa\sraffle/ unless defined?(Notify::RAFFLE)
+  ESP_THOUGHT     = /^\[Focused\] (?<from>.*?) (?:thinks|exclaims|asks), "(?<body>.*)"(?: \[\d{1,2}:\d{2}:\d{2}\])?$/ unless defined?(Notify::ESP_THOUGHT)
 
-  MESSAGE_PATTERN = Regexp.union(PRIVATE_MESSAGE, GM_SEND, IC_WHISPER, OOC_WHISPER, SPEECH, SPINNER, LEVELED_UP)
-  APP_NAME        = "gemstone"
-  ICON            = "mail-send-receive"
-  TIMEOUT         = 30 # seconds
-  COOLDOWN        = Cooldown.new
-  TRAINING_AREAS  = [16994]
+  MESSAGE_PATTERN     = Regexp.union(PRIVATE_MESSAGE, GM_SEND, IC_WHISPER, OOC_WHISPER, SPEECH, SPINNER, LEVELED_UP, SHOP_SALE, RAFFLE, ESP_THOUGHT) unless defined?(Notify::MESSAGE_PATTERN)
+  ANNOUNCEMENT_STREAM = /<pushStream id=['"]announcements['"][^>]*>(.*?)<popStream/m unless defined?(Notify::ANNOUNCEMENT_STREAM)
+  ANNOUNCEMENT_FROM   = "Announcement" unless defined?(Notify::ANNOUNCEMENT_FROM)
+  APP_NAME            = "gemstone" unless defined?(Notify::APP_NAME)
+  APP_ID_WINDOWS      = "Lich5.GemStone" unless defined?(Notify::APP_ID_WINDOWS)
+  NOTIFY_SEND         = "notify-send" unless defined?(Notify::NOTIFY_SEND)
+  ICON                = "mail-send-receive" unless defined?(Notify::ICON)
+  TIMEOUT             = 30 unless defined?(Notify::TIMEOUT) # seconds
+  COOLDOWN            = Cooldown.new unless defined(Notify::COOLDOWN)
+  TRAINING_AREAS      = [16994] unless defined?(Notify::TRAINING_AREAS)
 
-  NOTIFY = if OS.linux?
-             "notify-send"
-           elsif OS.mac?
-             "osascript"
-           else
-             nil
-           end
   ##
-  ## system messages on Linux are of a fixed interval
-  ## you cannot easily configure this
+  ## locate an executable on PATH (portable which); returns the path or nil.
+  ## relocated from the old bundled OS module now that the os gem is used.
+  ##
+  def self.which(cmd)
+    exts = ENV["PATHEXT"] ? ENV["PATHEXT"].split(";") : [""]
+    ENV["PATH"].to_s.split(File::PATH_SEPARATOR).each do |path|
+      exts.each do |ext|
+        exe = File.join(path, "#{cmd}#{ext}")
+        return exe if File.executable?(exe) && !File.directory?(exe)
+      end
+    end
+    nil
+  end
+
+  ##
+  ## can this platform deliver a notification at all? used to fail soft at
+  ## startup instead of raising when no backend is present.
+  ##
+  def self.available?
+    if OS.windows?
+      true
+    elsif OS.mac?
+      !which("osascript").nil?
+    elsif OS.linux?
+      !which(NOTIFY_SEND).nil?
+    else
+      false
+    end
+  end
+
+  ##
+  ## dispatch a desktop notification to the current platform's backend.
+  ## sound follows the platform default ("default toast audio"); when muted,
+  ## the notification is delivered silently instead.
   ##
   def self.show(message)
     message = message.to_struct if message.is_a?(Hash)
-    title = [message.from, message.to || Char.name].join(" => ")
-    if OS.linux?
-      %x{#{NOTIFY} "#{title} [#{message.type}]" "#{message.body}" --icon=#{ICON} --app-name=#{APP_NAME}}
+    title   = [message.from, message.to || Char.name].join(" => ")
+    heading = "#{title} [#{message.type}]"
+    body    = message.body.to_s
+
+    if OS.windows?
+      show_windows(heading, body)
     elsif OS.mac?
-      %x{#{NOTIFY} -e 'display notification "#{message.body}" with title "#{title} #{message.type}"'}
-    else
-      # silence is golden
+      show_mac(heading, body)
+    elsif OS.linux?
+      show_linux(heading, body)
     end
+  rescue StandardError => exception
+    Log.out(exception, label: :notify)
+  end
+
+  def self.show_mac(title, body)
+    sound  = muted? ? "" : %{ sound name "default"}
+    script = %{display notification "#{applescript_escape(body)}" with title "#{applescript_escape(title)}"#{sound}}
+    IO.popen(["osascript", "-"], "r+") do |io|
+      io.puts script
+      io.close_write
+      io.read
+    end
+  end
+
+  def self.show_linux(title, body)
+    return unless which(NOTIFY_SEND)
+    system(NOTIFY_SEND, "--icon=#{ICON}", "--app-name=#{APP_NAME}", title, body)
+  end
+
+  def self.show_windows(title, body)
+    run_hidden_powershell(windows_toast_script(title, body, silent: muted?))
+  end
+
+  ##
+  ## AppleScript string literals are double-quoted; escape backslashes and
+  ## double-quotes so an arbitrary message body cannot break out of the string.
+  ##
+  def self.applescript_escape(str)
+    str.to_s.gsub(/[\\"]/) { |char| "\\#{char}" }
+  end
+
+  ##
+  ## PowerShell single-quoted string literals escape an embedded single quote by
+  ## doubling it; collapse newlines so the toast body stays on one line.
+  ##
+  def self.sanitize_ps(str)
+    str.to_s.gsub("'", "''").tr("\r\n", "  ")
+  end
+
+  ##
+  ## build a WinRT toast driven by PowerShell. No Ruby gem drives the
+  ## Windows.UI.Notifications API directly, so we hand a script to PowerShell the
+  ## same way Lich core does for other Windows tasks. The toast plays the default
+  ## notification sound unless silent, in which case <audio silent/> is injected.
+  ## Message text goes in via CreateTextNode, which XML-escapes it for us.
+  ##
+  def self.windows_toast_script(title, body, silent:)
+    audio = silent ? '<audio silent="true"/>' : ""
+    toast = %{<toast><visual><binding template="ToastText02"><text id="1"></text><text id="2"></text></binding></visual>#{audio}</toast>}
+    [
+      "$ErrorActionPreference = 'Stop'",
+      "[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]",
+      "[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]",
+      "$doc = New-Object Windows.Data.Xml.Dom.XmlDocument",
+      "$doc.LoadXml('#{toast}')",
+      "$nodes = $doc.GetElementsByTagName('text')",
+      "[void]$nodes.Item(0).AppendChild($doc.CreateTextNode('#{sanitize_ps(title)}'))",
+      "[void]$nodes.Item(1).AppendChild($doc.CreateTextNode('#{sanitize_ps(body)}'))",
+      "$toast = [Windows.UI.Notifications.ToastNotification]::new($doc)",
+      "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('#{APP_ID_WINDOWS}').Show($toast)"
+    ].join("; ")
+  end
+
+  ##
+  ## run PowerShell with no console window. The script is passed base64-encoded
+  ## (UTF-16LE, as -EncodedCommand requires) to sidestep shell quoting entirely,
+  ## and launched hidden through WScript.Shell so nothing flashes on screen.
+  ##
+  def self.run_hidden_powershell(script)
+    require "win32ole"
+    require "base64"
+    encoded = Base64.strict_encode64(script.encode("UTF-16LE"))
+    command = "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand #{encoded}"
+    WIN32OLE.new("WScript.Shell").Run(command, 0, false)
   end
 
   def self.notify(incoming)
     incoming = incoming.to_struct if incoming.is_a?(Hash)
     Notify.show(incoming)
-    Sounds.play Sounds.current
   end
 
   def self.duration=(milliseconds)
@@ -532,18 +570,22 @@ module Notify
     Settings[:ignored] ||= []
   end
 
-  def self.play(sound)
-    Sounds.play sound
+  def self.muted?
+    Settings[:muted] == true
   end
 
-  def self.with_sound(this_sound, &block)
-    previous_sound = Notify::Sounds.current
-    Notify::Sounds.set this_sound
-    block.call
-    Notify::Sounds.set previous_sound
+  def self.mute
+    Settings[:muted] = true
+    Settings.save
+  end
+
+  def self.unmute
+    Settings[:muted] = false
+    Settings.save
   end
 
   def self.watch()
+    Script.current.want_downstream_xml = true
     Notify::Server.link()
     Notify.fork()
 
@@ -554,14 +596,62 @@ module Notify
     end
 
     while (line = get)
-      if line =~ MESSAGE_PATTERN
-        if Sink.closed?
-          Log.out("restarting tcp sink service", label: :sink)
-          Notify::Server.link()
-        end
-        Sink.cast(line)
+      if announcement?(line)
+        # drop announcements we cannot extract text from (nothing to show)
+        next if extract_announcement(line).nil?
+      elsif Lich::Util::TextStripper.strip_xml(line).strip !~ MESSAGE_PATTERN
+        # every non-announcement XML chunk is ignored so MESSAGE_PATTERN keeps
+        # seeing stripped lines only; stripped non-matches are ignored too
+        next
       end
+
+      # route everything (player messages and announcements alike) through the
+      # shared server so its per-source cooldown collapses a single broadcast to
+      # one toast even when several characters are running notify
+      if Sink.closed?
+        Log.out("restarting tcp sink service", label: :sink)
+        Notify::Server.link()
+      end
+      Sink.cast(line)
     end
+  end
+
+  ##
+  ## with want_downstream_xml enabled (see .watch) the raw XML chunk for each
+  ## server read is delivered alongside the stripped lines. we only inspect the
+  ## XML to pull Announcements out of their pushStream; stripped game lines never
+  ## contain the pushStream tag, so this cannot collide with player messages.
+  ##
+  def self.announcement?(line)
+    line.include?(%{id="announcements"}) || line.include?(%{id='announcements'})
+  end
+
+  ##
+  ## a raw XML chunk (rather than a stripped game line). skipped so that
+  ## MESSAGE_PATTERN only ever sees stripped lines, preserving prior behavior.
+  ##
+  def self.xml?(line)
+    line.lstrip.start_with?("<")
+  end
+
+  ##
+  ## pull the announcement text out of a single XML chunk: capture between the
+  ## pushStream open and the matching popStream, drop any residual tags, and
+  ## unescape XML entities. Returns nil when the chunk holds no announcement.
+  ##
+  def self.extract_announcement(chunk)
+    match = chunk.match(ANNOUNCEMENT_STREAM)
+    return nil unless match
+    text = unescape_xml(match[1].gsub(/<[^>]*>/, "")).strip
+    text.empty? ? nil : text
+  end
+
+  def self.unescape_xml(str)
+    str.gsub("&lt;", "<")
+       .gsub("&gt;", ">")
+       .gsub("&quot;", '"')
+       .gsub("&apos;", "'")
+       .gsub("&amp;", "&")
   end
 
   IGNORED_BODIES = /^Clearcheck\.|^Clear:|^Coinme$/
@@ -598,14 +688,22 @@ module Notify
   PLAYER_MESSAGES = %w(lnet speech whisper)
 
   def self.fmt_message(char, line)
-    if (incoming = line.match(PRIVATE_MESSAGE).to_struct)
+    if announcement?(line)
+      incoming = OpenStruct.new(
+        from: ANNOUNCEMENT_FROM,
+        type: "announcement",
+        body: extract_announcement(line)
+      )
+    elsif (incoming = line.match(PRIVATE_MESSAGE)&.to_struct)
       incoming[:type] = "lnet"
-    elsif (incoming = line.match(GM_SEND).to_struct)
+    elsif (incoming = line.match(GM_SEND)&.to_struct)
       incoming[:type] = "gm"
-    elsif (incoming = line.match(SPEECH).to_struct)
+    elsif (incoming = line.match(SPEECH)&.to_struct)
       incoming[:type] = "speech"
-    elsif (incoming = line.match(OOC_WHISPER).to_struct)
+    elsif (incoming = line.match(OOC_WHISPER)&.to_struct)
       incoming[:type] = "whisper"
+    elsif (incoming = line.match(ESP_THOUGHT)&.to_struct)
+      incoming[:type] = "esp"
     elsif line =~ SPINNER
       incoming = OpenStruct.new(
         from: :merchant,
@@ -618,21 +716,22 @@ module Notify
         type: :win,
         body: "#{char} won a raffle"
       )
-    elsif (data = line.match(LEVELED_UP).to_struct)
+    elsif (data = line.match(LEVELED_UP)&.to_struct)
       incoming = OpenStruct.new(
         from: :game,
         type: :level_up,
         body: "#{char} is now level #{data.level}"
       )
-    elsif line.match(SHOP_SALE).to_struct
+    elsif line.match(SHOP_SALE)&.to_struct
       incoming = OpenStruct.new(
         from: :shop,
         type: :sale,
         body: line,
       )
-    else
-      incoming = line.match(IC_WHISPER).to_struct
+    elsif (incoming = line.match(IC_WHISPER)&.to_struct)
       incoming[:type] = "whisper:ic"
+    else
+      return nil
     end
 
     incoming[:to] = char
@@ -640,9 +739,9 @@ module Notify
   end
 
   def self.should_inform_user?
-    if stunned? && !TRAINING_AREAS.include?(Room.current.id)
+    if Status.stunned? && !TRAINING_AREAS.include?(Room.current.id)
       "#{Char.name} has been stunned!"
-    elsif percenthealth < 90
+    elsif Char.percent_health < 70
       "#{Char.name}'s health is at #{percenthealth}%"
     else
       false
@@ -655,24 +754,15 @@ if Script.current.vars.first == "help"
   exit
 end
 
-if Script.current.vars.include?("sounds")
-
-  sounds = Notify::Sounds.match(Script.current.vars.last || "/").map do |file|
-    file.split("/")[-2..-1].join("/")
-  end
-  respond sounds.sort.join("\n")
-  exit
-end
-
-if Script.current.vars.include?("play")
-  respond Notify::Sounds[Script.current.vars.last]
-  Notify::Sounds.play Notify::Sounds[Script.current.vars.last]
+if Script.current.vars.include?("unmute")
+  Notify.unmute
+  respond "[notify] unmuted (notifications will play the default sound)"
   exit
 end
 
 if Script.current.vars.include?("mute")
-  Notify::Sounds.set nil
-  respond "[notify] muted"
+  Notify.mute
+  respond "[notify] muted (notifications will be silent)"
   exit
 end
 
@@ -688,24 +778,14 @@ if Script.current.vars[1] == "unignore"
   exit
 end
 
-unless OS.which?(Notify::NOTIFY)
-  raise StandardError.new "expected #{Notify::NOTIFY} exectuable (notify-send) not found in $PATH"
-end
-
-if Script.current.vars.include?("set-sound")
-  Notify::Sounds.set Script.current.vars.last
-  if Notify::Sounds.full_sound_path
-    respond "[notify] playing -> #{Notify::Sounds.full_sound_path}"
-    Notify::Sounds.play Notify::Sounds[Notify::Sounds.full_sound_path]
-  else
-    respond "[notify] muted"
-  end
-  exit
-end
-
 unless Script.current.vars.first.eql?("--debug") or Script.current.vars.empty?
   # unhandled argument
   respond Notify::HELP
+  exit
+end
+
+unless Notify.available?
+  respond "[notify] no supported notification backend is available on this platform"
   exit
 end
 
