@@ -26,6 +26,8 @@ module BigshotPrioritySpec
   end
 
   PRIORITY_SRC = extract(/^  def priority\(target\).*?^  end$/m, 'priority')
+  MATCHERS_SRC = extract(/^  def priority_matchers\n.*?^  end$/m, 'priority_matchers')
+  RANK_SRC = extract(/^  def priority_rank\(npc, matchers\).*?^  end$/m, 'priority_rank')
   SORT_NPCS_SRC = extract(/^  def sort_npcs\(\).*?^  end$/m, 'sort_npcs')
   FIND_TARGET_SRC = extract(/^  def find_target\(target, just_entered = false\).*?^  end$/m, 'find_target')
   BOONS_SRC = extract(/^  def invalid_target_with_boons\(creature, assess = true\).*?^  end$/m,
@@ -34,6 +36,7 @@ module BigshotPrioritySpec
                                  'do_hunt retarget block')
   FOLLOWER_RETARGET_SRC = extract(/^          if !\$bigshot_bandits && bs\.PRIORITY && !bs\.priority\(target\)\n.*?^          end$/m,
                                   'follower retarget block')
+  EACHTARGET_SRC = extract(/^  def cmd_eachtarget\(command, npc\).*?^  end$/m, 'cmd_eachtarget')
 
   Creature = Struct.new(:id, :name, :noun, :type, :status) do
     def to_s
@@ -65,8 +68,14 @@ module BigshotPrioritySpec
       end
     end
 
+    module XMLData
+      class << self
+        attr_accessor :current_target_id
+      end
+    end
+
     attr_accessor :PRIORITY, :TARGETS, :QUICKHUNT_TARGETS, :BOONS_IGNORE, :BOON_CACHE
-    attr_reader :check_boons_calls
+    attr_reader :check_boons_calls, :fputs, :cmd_calls
 
     def initialize
       @PRIORITY = true
@@ -75,10 +84,25 @@ module BigshotPrioritySpec
       @BOONS_IGNORE = []
       @BOON_CACHE = {}
       @check_boons_calls = []
+      @fputs = []
+      @cmd_calls = []
       @unpickable = []
       @DEBUG_COMBAT = false
+      @DEBUG_COMMANDS = false
       CharSettings.store = { 'untargetable' => [], 'targetable' => [] }
       GameObj.room_targets = []
+      XMLData.current_target_id = nil
+    end
+
+    def fput(command)
+      @fputs << command
+      XMLData.current_target_id = Regexp.last_match(1) if command =~ /\Atarget #(\d+)\z/
+    end
+
+    # Records what cmd_eachtarget asks of cmd. The other half of the contract,
+    # that cmd honours check_priority, is locked by a source expectation below.
+    def cmd(command, npc = nil, _stance_dance = true, check_priority: true)
+      @cmd_calls << { command: command, npc: npc, check_priority: check_priority }
     end
 
     def room(*creatures)
@@ -112,9 +136,12 @@ module BigshotPrioritySpec
     end
 
     eval(PRIORITY_SRC)
+    eval(MATCHERS_SRC)
+    eval(RANK_SRC)
     eval(SORT_NPCS_SRC)
     eval(FIND_TARGET_SRC)
     eval(BOONS_SRC)
+    eval(EACHTARGET_SRC)
 
     # Runs the real do_hunt retarget block with target bound as a local.
     def do_hunt_retarget(target)
@@ -146,6 +173,27 @@ module BigshotPrioritySpec
 
     def troll
       Creature.new('105', 'ice troll', 'troll', 'aggressive npc', nil)
+    end
+
+    def second_mastiff
+      Creature.new('106', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
+    end
+
+    # From the reported thrash: order was valravn, angargeist, disir
+    def valravn
+      Creature.new('280414583', 'eyeless black valravn', 'valravn', 'aggressive npc', nil)
+    end
+
+    def angargeist
+      Creature.new('280405751', 'roiling crimson angargeist', 'angargeist', 'aggressive npc', nil)
+    end
+
+    def disir
+      Creature.new('280394883', 'shining winged disir', 'disir', 'aggressive npc', nil)
+    end
+
+    def draugr
+      Creature.new('280394876', 'withered shadow-cloaked draugr', 'draugr', 'aggressive npc', nil)
     end
   end
 end
@@ -265,6 +313,65 @@ RSpec.describe 'bigshot Priority Hunt' do
     end
   end
 
+  describe 'rank comparison' do
+    # GameObj.targets is the game's target dropdown (xmlparser dDBTarget), which
+    # is cleared and rebuilt wholesale, so the current target can be missing from
+    # it for a moment. Ranking off the list rather than off dropdown membership
+    # keeps that from handing the fight to a lower ranked creature.
+    it 'keeps the current target when the target itself is missing from the dropdown' do
+      bs.room(giant)
+      expect(bs.priority(mastiff)).to be true
+    end
+
+    it 'switches when a higher ranked creature is in the dropdown and the target is not' do
+      bs.room(mystic)
+      expect(bs.priority(mastiff)).to be false
+    end
+
+    it 'prefers a listed creature over an unlisted target' do
+      bs.room(giant)
+      expect(bs.priority(troll)).to be false
+    end
+
+    it 'does not treat a second creature matching the same entry as an interrupt' do
+      bs.room(mastiff, second_mastiff)
+      expect(bs.priority(mastiff)).to be true
+      expect(bs.priority(second_mastiff)).to be true
+    end
+  end
+
+  describe 'the reported retarget thrash' do
+    before do
+      bs.TARGETS = { 'valravn' => 'a', 'angargeist' => 'b', 'disir' => 'c' }
+    end
+
+    it 'settles on the angargeist once the valravn is known to be untargetable' do
+      bs.untargetable('eyeless black valravn')
+      bs.room(angargeist, disir, valravn)
+
+      expect(bs.priority(angargeist)).to be true
+      expect(bs.do_hunt_retarget(angargeist).name).to eq('roiling crimson angargeist')
+    end
+
+    it 'does not hand the fight to the disir when the angargeist drops out of the dropdown' do
+      bs.untargetable('eyeless black valravn')
+      bs.room(disir)
+
+      expect(bs.priority(angargeist)).to be true
+      expect(bs.do_hunt_retarget(angargeist).name).to eq('roiling crimson angargeist')
+    end
+
+    it 'keeps the angargeist while the valravn is still unclassified but unpickable' do
+      bs.room(angargeist, disir, valravn)
+      bs.cannot_pick('eyeless black valravn')
+
+      # the valravn outranks everything, so the check does report an interrupt
+      expect(bs.priority(angargeist)).to be false
+      # but selection cannot pick it, so the fight stays on the angargeist
+      expect(bs.do_hunt_retarget(angargeist).name).to eq('roiling crimson angargeist')
+    end
+  end
+
   describe 'do_hunt retargeting' do
     it 'switches to the higher ranked creature when one arrives mid fight' do
       bs.room(mastiff, mystic)
@@ -301,6 +408,48 @@ RSpec.describe 'bigshot Priority Hunt' do
       bs.room(mastiff, mystic)
       bs.cannot_pick('illoke mystic')
       expect(bs.follower_retarget(mastiff).name).to eq('stone mastiff')
+    end
+  end
+
+  describe 'eachtarget sweeps' do
+    # From the reported log: routine "eachtarget wandolier guarded noreserve" in a
+    # room holding an angargeist (rank 1), a disir (rank 2) and a draugr (rank 12).
+    # Each creature was targeted and then skipped, because the per-creature cmd
+    # call hit the priority gate.
+    before do
+      bs.TARGETS = { 'valravn' => 'b', 'angargeist' => 'a', 'disir' => 'b', 'draugr' => 'a' }
+      bs.room(angargeist, draugr, disir)
+    end
+
+    it 'issues the command against every creature in the room, not only the highest ranked one' do
+      bs.cmd_eachtarget('wandolier guarded noreserve', angargeist)
+
+      expect(bs.cmd_calls.map { |call| call[:npc].name })
+        .to eq(['roiling crimson angargeist', 'withered shadow-cloaked draugr', 'shining winged disir'])
+    end
+
+    it 'asks cmd to skip the priority gate for creatures inside the sweep' do
+      bs.cmd_eachtarget('wandolier guarded noreserve', angargeist)
+
+      expect(bs.cmd_calls.map { |call| call[:check_priority] }).to all(be false)
+    end
+
+    it 'restores the original target after the sweep' do
+      bs.cmd_eachtarget('wandolier guarded noreserve', angargeist)
+
+      expect(bs.fputs.last).to eq("target ##{angargeist.id}")
+    end
+
+    it 'still skips creatures that cannot be picked' do
+      bs.cannot_pick('shining winged disir')
+      bs.cmd_eachtarget('wandolier guarded noreserve', angargeist)
+
+      expect(bs.cmd_calls.map { |call| call[:npc].name }).not_to include('shining winged disir')
+    end
+
+    it 'keeps the priority gate on every other cmd caller' do
+      expect(BigshotPrioritySpec::SOURCE).to match(/^    return if check_priority && @PRIORITY && !priority\(npc\)$/)
+      expect(BigshotPrioritySpec::SOURCE).to match(/^  def cmd\(command, npc = nil, stance_dance = true, check_priority: true\)$/)
     end
   end
 
