@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.15.1
+       version: 5.15.2
       required: Lich >= 5.17.1
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,6 +17,14 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
+  v5.15.2  (2026-07-27)
+    - fix priority hunt not retargeting when a higher priority creature arrives mid-fight
+    - compare target list rank instead of identity so a lower ranked creature never wins a check
+    - match priority targets with the same anchored name and noun rules used to select them
+    - keep the current target when a priority retarget has no replacement to offer
+    - fix eachtarget commands skipping every creature except the highest ranked one
+    - fix follower priority check reading an instance variable that was never set
+    - remove the unused room npc snapshot thread and its globals
   v5.15.1  (2026-07-23)
     - Fix cmd_force re-issuing maneuver on a passing roll (negative slice index collapses result window)
   v5.15.0  (2026-07-19)
@@ -484,12 +492,10 @@ $bigshot_unarmed_tier = 1
 $bigshot_rooted = false
 $bigshot_wand = 0
 $current_script_name = Script.current.name
-$current_room_npcs = GameObj.npcs
 $last_loot = nil
 $looting_inactive = true
 $not_hunting_reason = nil
 $rest_reason = nil
-$room_npcs_last_check = []
 $mstrike_taken = false
 $bigshot_single = false
 $bigshot_sneaky_hunt = false
@@ -3283,7 +3289,7 @@ class Bigshot
     end
   end
 
-  def cmd(command, npc = nil, stance_dance = true)
+  def cmd(command, npc = nil, stance_dance = true, check_priority: true)
     debug_msg(@DEBUG_COMMANDS, "cmd | command: #{command}")
 
     check_for_deaders_prone
@@ -3388,7 +3394,9 @@ class Bigshot
 
     # Target gone or not priority? Then return
     return unless valid_target?(npc)
-    return if @PRIORITY && !priority(npc)
+    # check_priority: false lets cmd_eachtarget sweep the room without the gate
+    # rejecting every creature that is not the highest ranked one
+    return if check_priority && @PRIORITY && !priority(npc)
 
     # Perform the command
     if (command =~ /^(incant)?\s?(\d+)\s?((?:open|closed)?\s?(?:cast|channel|evoke)?\s?(?:cast|channel|evoke)?\s?(?:open|closed)?\s?(?:acid|air|cold|earth|fire|lightning|steam|water)?)?.*$/i)
@@ -3519,7 +3527,7 @@ class Bigshot
     GameObj.targets.each { |target|
       next unless valid_target?(target)
       fput "target ##{target.id}" unless XMLData.current_target_id == target.id
-      cmd(command, target)
+      cmd(command, target, check_priority: false)
     }
     fput "target ##{current_target.id}" unless XMLData.current_target_id == current_target.id
   end
@@ -5727,15 +5735,6 @@ class Bigshot
     return npcs.size.to_i
   end
 
-  def npc_room_check()
-    Thread.new {
-      loop {
-        $current_room_npcs = GameObj.npcs
-        pause 0.5
-      }
-    }
-  end
-
   def wrack()
     debug_msg(@DEBUG_COMMANDS, "wrack")
 
@@ -5965,7 +5964,6 @@ class Bigshot
     debug_msg(@DEBUG_STATUS, "lead")
 
     monitor_interaction()
-    npc_room_check()
     @followers = my_group || Group.new()
     @leader = Char.name
 
@@ -6164,7 +6162,8 @@ class Bigshot
         debug_msg(@DEBUG_COMBAT, "inside do_hunt loop | target: #{target}")
 
         if !priority(target)
-          target = find_target(nil)
+          better_target = find_target(nil)
+          target = better_target if better_target
         end
 
         # Tell follower to attack if its a new target or its been 10 seconds
@@ -6826,11 +6825,13 @@ class Bigshot
     @BOON_CACHE[creature.id] = abilities.empty? ? nil : abilities
   end
 
-  def invalid_target_with_boons(creature)
+  def invalid_target_with_boons(creature, assess = true)
     debug_msg(@DEBUG_COMBAT, "invalid_target_with_boons | creature: #{creature.inspect}")
 
     return false if @BOONS_IGNORE.empty?
     return false unless creature.type.include?("boon")
+    # assess: false answers from @BOON_CACHE only, for callers that must not send commands
+    return false if !assess && !@BOON_CACHE.key?(creature.id)
 
     abilities = check_boons(creature)
     return false unless abilities
@@ -6970,25 +6971,34 @@ class Bigshot
     return targets
   end
 
+  # Anchored so priority uses the same matching as sort_npcs and can never rank
+  # a creature that find_target would be unable to pick
+  def priority_matchers
+    @TARGETS.keys.map { |name| /^#{name}$/i }
+  end
+
+  # Position of a creature in the ordered target list, infinity when unlisted
+  def priority_rank(npc, matchers)
+    index = matchers.index { |matcher| npc.name =~ matcher || npc.noun =~ matcher }
+    index.nil? ? Float::INFINITY : index
+  end
+
   def priority(target)
     return false if target.nil?
     return true if $bigshot_bandits
     return true if !@PRIORITY
-    return true if (!$current_room_npcs.zip($room_npcs_last_check).map { |x, y| x.id == y.id }.any? { |s| s == false })
 
-    $room_npcs_last_check = GameObj.npcs
-    priority = false
-    npcs = GameObj.targets.reject { |npc| CharSettings['untargetable'].include?(npc.name) }
+    matchers = priority_matchers
+    npcs = GameObj.targets.reject { |npc| CharSettings['untargetable'].include?(npc.name) || invalid_target_with_boons(npc, false) }
+    target_rank = priority_rank(target, matchers)
+    best_rank = npcs.map { |npc| priority_rank(npc, matchers) }.min || Float::INFINITY
 
-    @TARGETS.keys.each do |name|
-      name_regex = /#{name}/i
-      if (npc = npcs.find { |s| s.name =~ name_regex || s.noun =~ name_regex })
-        priority = (npc.name == target.name)
-        break
-      end
-    end
+    # Ranks, not identity: GameObj.targets is the game's target dropdown, which is
+    # rebuilt wholesale, so the current target can drop out of it for a moment.
+    # Only a creature that outranks the target may interrupt it.
+    priority = best_rank >= target_rank
 
-    debug_msg(@DEBUG_COMBAT, "priority check | target: #{target} | priority: #{priority}")
+    debug_msg(@DEBUG_COMBAT, "priority check | target: #{target} | priority: #{priority} | target_rank: #{target_rank} | best_rank: #{best_rank}")
     return priority
   end
 
@@ -8189,7 +8199,6 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
 
   # Participate
   bs.message("yellow", " Successfully joined group")
-  bs.npc_room_check()
   bs.groupcheck unless checkpcs.nil?
 
   # Don't announce these events
@@ -8277,8 +8286,9 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
           target ||= bs.find_target(target)
 
           # Set priority target if needed
-          if !$bigshot_bandits && @PRIORITY && !bs.priority(target)
-            target = bs.find_target(nil)
+          if !$bigshot_bandits && bs.PRIORITY && !bs.priority(target)
+            better_target = bs.find_target(nil)
+            target = better_target if better_target
           end
 
           # If no target, wait a bit and retry
