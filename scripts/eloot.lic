@@ -25,6 +25,12 @@
       the recovery, so those items still paused the script mid-pool-return. loot_specials
       now takes the box context and stows box contents through stow_box_item like
       loot_regular does. Room looting and critter bags are unchanged.
+    - fix: a completed recovery finalized the box twice. loot_regular documented a
+      :recovered return but returned nil, so box_loot ran Sell.save_trash_box after the
+      nested recovery had already trashed or stowed the box, re-issuing trash and drag
+      commands against a gone box (box_loot_ground likewise ran its inline cleanup).
+      loot_specials and loot_regular now both return :recovered and both callers stop
+      before finalizing.
   v2.11.0 (2026-07-03)
     - feature: during a locksmith pool return, when all containers are full, sell to
       free space and resume looting instead of pausing. The stuck item is returned to
@@ -4882,8 +4888,19 @@ module ELoot # Room looting
         end
 
         objs = box.contents
-        objs = Loot.loot_specials(objs, box: box, location: location, data: data, sell_recovered: sell_recovered) unless objs.empty?
-        Loot.loot_regular(objs, "Box", box, sell_recovered: sell_recovered, location: location, data: data) unless objs.empty?
+        unless objs.empty?
+          specials = Loot.loot_specials(objs, box: box, location: location, data: data, sell_recovered: sell_recovered)
+          # A recovery already re-looted and trashed/stowed this box via a nested
+          # box_loot; finalizing again would re-issue trash and drag commands.
+          return if specials == :recovered
+
+          objs = specials
+        end
+
+        unless objs.empty?
+          return if Loot.loot_regular(objs, "Box", box, sell_recovered: sell_recovered, location: location, data: data) == :recovered
+        end
+
         Sell.save_trash_box(box)
       elsif box.type == "plinite"
         ELoot.get_res("pluck ##{box.id}", /You carefully pluck/)
@@ -4927,8 +4944,18 @@ module ELoot # Room looting
 
         # Loot the rest of the stuff
         objs = box.contents
-        objs = Loot.loot_specials(objs, box: box) unless objs.empty?
-        Loot.loot_regular(objs, "Box", box) unless objs.empty?
+        unless objs.empty?
+          specials = Loot.loot_specials(objs, box: box)
+          # A recovery already re-looted and finalized this box via a nested box_loot;
+          # skip the cleanup below rather than run it against a gone box.
+          next if specials == :recovered
+
+          objs = specials
+        end
+
+        unless objs.empty?
+          next if Loot.loot_regular(objs, "Box", box) == :recovered
+        end
 
         save_box = ELoot.data.settings[:sell_loot_types].include?("box")
         valuable_box = /gold|mithril|silver/
@@ -5022,6 +5049,10 @@ module ELoot # Room looting
       end
     end
 
+    # Loot the ordinary items. In a box-looting flow a full-container stow can trigger the
+    # locksmith pool sell-and-resume recovery, which re-loots AND finalizes the whole box.
+    # @return [Symbol, nil] :recovered when that happened -- the caller must stop and must
+    #   not finalize the box again; nil otherwise.
     def self.loot_regular(objs, from_where = nil, box = nil, sell_recovered: false, location: nil, data: nil)
       ELoot.msg(type: "debug", text: "objs: #{objs} | from_where: #{from_where} | sell_recovered: #{sell_recovered} | location: #{location.inspect} | data?: #{!data.nil?}")
 
@@ -5044,7 +5075,7 @@ module ELoot # Room looting
             obj.type =~ loot_cmd_items ? Inventory.single_loot(obj) : Inventory.single_drag(obj)
           end
         elsif from_where == "Box"
-          return if valid.any? { |thing| Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered }
+          return :recovered if valid.any? { |thing| Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered }
         else
           valid.each do |thing|
             Inventory.single_drag(thing)
@@ -5066,14 +5097,14 @@ module ELoot # Room looting
             next false if item.type == 'box'
             Loot.stow_box_item(item, box, location, data, sell_recovered) == :recovered
           end
-          return if recovered
+          return :recovered if recovered
 
           # if there are still box contents the default container has filled up so just do the rest as drags
           if box.contents.length.positive?
             objs = box.contents
             remaining_valid = Loot.valid_objs(objs.clone)
 
-            return if remaining_valid.any? { |thing| Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered }
+            return :recovered if remaining_valid.any? { |thing| Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered }
           end
         else
           valid.each do |thing|
@@ -5204,8 +5235,10 @@ module ELoot # Room looting
     # @param data [Hash, nil] passed through to the recovery
     # @param sell_recovered [Boolean] true when a recovery already ran for this box.
     #   Must be threaded through so the recovery cannot re-enter for the same box.
-    # @return [Array<GameObj>] items left for loot_regular, or [] when a recovery
-    #   re-looted the whole box and there is nothing left to hand off
+    # @return [Array<GameObj>] items left for loot_regular, or
+    #   [Symbol] :recovered when a recovery re-looted AND finalized the whole box. The
+    #   caller must stop and must not finalize the box again. Only reachable when box is
+    #   given, so the no-box callers always get an Array.
     def self.loot_specials(objs, box: nil, location: nil, data: nil, sell_recovered: false)
       ELoot.msg(type: "debug", text: "objs: #{objs} | box: #{box.respond_to?(:name) ? box.name : box.inspect} | sell_recovered: #{sell_recovered}")
 
@@ -5259,8 +5292,8 @@ module ELoot # Room looting
       end
 
       if recovered
-        ELoot.msg(type: "debug", text: "loot_specials: pool recovery re-looted the box, nothing left to hand off")
-        return []
+        ELoot.msg(type: "debug", text: "loot_specials: pool recovery re-looted and finalized the box")
+        return :recovered
       end
 
       ELoot.msg(type: "debug", text: "After specials check objs: #{objs}")
