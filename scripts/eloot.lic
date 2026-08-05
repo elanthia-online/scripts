@@ -15,9 +15,16 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.15.0
-           version: 2.11.0
+           version: 2.11.1
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.11.1 (2026-08-05)
+    - fix: the v2.11.0 locksmith pool full-container recovery could not fire for items
+      handled by loot_specials (orbs, cursed items, keepers, uncommon weapons/armor).
+      box_loot drains specials before loot_regular, and only loot_regular was wired to
+      the recovery, so those items still paused the script mid-pool-return. loot_specials
+      now takes the box context and stows box contents through stow_box_item like
+      loot_regular does. Room looting and critter bags are unchanged.
   v2.11.0 (2026-07-03)
     - feature: during a locksmith pool return, when all containers are full, sell to
       free space and resume looting instead of pausing. The stuck item is returned to
@@ -4875,7 +4882,7 @@ module ELoot # Room looting
         end
 
         objs = box.contents
-        objs = Loot.loot_specials(objs) unless objs.empty?
+        objs = Loot.loot_specials(objs, box: box, location: location, data: data, sell_recovered: sell_recovered) unless objs.empty?
         Loot.loot_regular(objs, "Box", box, sell_recovered: sell_recovered, location: location, data: data) unless objs.empty?
         Sell.save_trash_box(box)
       elsif box.type == "plinite"
@@ -4920,7 +4927,7 @@ module ELoot # Room looting
 
         # Loot the rest of the stuff
         objs = box.contents
-        objs = Loot.loot_specials(objs) unless objs.empty?
+        objs = Loot.loot_specials(objs, box: box) unless objs.empty?
         Loot.loot_regular(objs, "Box", box) unless objs.empty?
 
         save_box = ELoot.data.settings[:sell_loot_types].include?("box")
@@ -5183,8 +5190,24 @@ module ELoot # Room looting
       :recovered
     end
 
-    def self.loot_specials(objs)
-      ELoot.msg(type: "debug", text: "objs: #{objs}")
+    # Loot the items that need individual handling (coins, cursed items, orbs,
+    # uncommon weapons/armor, keepers) and return whatever is left for loot_regular.
+    #
+    # When called from a box-looting flow the caller passes the box context. That makes a
+    # full-container stow eligible for the same locksmith pool sell-and-resume recovery
+    # loot_regular already uses, instead of pausing the script. Without the context (room
+    # looting, critter bags) the behavior is unchanged: stow, and pause if nothing fits.
+    #
+    # @param objs [Array<GameObj>] candidate items
+    # @param box [GameObj, nil] the box being looted; nil outside a box-looting flow
+    # @param location [String, nil] passed through to the recovery
+    # @param data [Hash, nil] passed through to the recovery
+    # @param sell_recovered [Boolean] true when a recovery already ran for this box.
+    #   Must be threaded through so the recovery cannot re-enter for the same box.
+    # @return [Array<GameObj>] items left for loot_regular, or [] when a recovery
+    #   re-looted the whole box and there is nothing left to hand off
+    def self.loot_specials(objs, box: nil, location: nil, data: nil, sell_recovered: false)
+      ELoot.msg(type: "debug", text: "objs: #{objs} | box: #{box.respond_to?(:name) ? box.name : box.inspect} | sell_recovered: #{sell_recovered}")
 
       # Open sacks for looting the room
       Inventory.open_loot_containers(objs)
@@ -5193,7 +5216,12 @@ module ELoot # Room looting
       uncommon_loot = ["stygian valravn quill", "nacreous disir feather", "silver-veined black draconic idol"]
       loot_uncommon_regex = Regexp.union(uncommon_loot)
 
+      recovered = false
+
       objs = objs.reject do |thing|
+        # A recovery re-looted the whole box already; stop touching the stale list.
+        next false if recovered
+
         result = Loot.bag_loot(thing) if thing.type =~ /clothing/
 
         next true if result == "crumbly"
@@ -5219,11 +5247,20 @@ module ELoot # Room looting
         else
           if ELoot.decurse(thing)
             Inventory.free_hand
-            Inventory.single_drag(thing)
+            if box
+              recovered = (Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered)
+            else
+              Inventory.single_drag(thing)
+            end
           end
         end
 
         next true
+      end
+
+      if recovered
+        ELoot.msg(type: "debug", text: "loot_specials: pool recovery re-looted the box, nothing left to hand off")
+        return []
       end
 
       ELoot.msg(type: "debug", text: "After specials check objs: #{objs}")
