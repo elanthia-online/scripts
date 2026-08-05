@@ -238,10 +238,16 @@ RSpec.describe 'ELoot::Loot.loot_specials' do
   context 'when a recovery re-loots the whole box' do
     let(:stow_results) { [:recovered] }
 
-    it 'returns an empty list so box_loot skips loot_regular' do
+    it 'reports :recovered rather than an empty list, which would mean "nothing left"' do
       remaining = harness.loot_specials([orb, earcuff], box: box, location: 'Icemule Trace', data: {})
 
-      expect(remaining).to eq([])
+      expect(remaining).to eq(:recovered)
+    end
+
+    it 'never reports :recovered as a bare empty list, which callers cannot distinguish' do
+      remaining = harness.loot_specials([orb, earcuff], box: box, location: 'Icemule Trace', data: {})
+
+      expect(remaining).not_to eq([])
     end
 
     it 'stops processing the stale item list instead of working items twice' do
@@ -318,5 +324,44 @@ RSpec.describe 'ELoot box-looting call sites' do
 
   it 'box_loot_ground hands the box to loot_specials, matching its loot_regular call' do
     expect(box_loot_ground).to match(/Loot\.loot_specials\([^)]*\bbox:\s*box\b/)
+  end
+
+  # A completed recovery re-loots the box through a nested box_loot, which finalizes it.
+  # Finalizing again re-issues trash and drag commands against a box that is already gone.
+  # box_loot cannot be exercised without the Lich runtime, so the guard is asserted
+  # structurally: the :recovered exits must come before the finalization call.
+  context 'double finalization after a completed recovery' do
+    it 'box_loot returns on :recovered before it reaches Sell.save_trash_box' do
+      guard = box_loot.index(/^ +return if .*== :recovered$/)
+      finalize = box_loot.index(/Sell\.save_trash_box/)
+
+      expect(guard).not_to be_nil, 'box_loot has no :recovered guard'
+      expect(finalize).not_to be_nil, 'box_loot no longer finalizes the box'
+      expect(guard).to be < finalize
+    end
+
+    it 'box_loot guards both the loot_specials and the loot_regular result' do
+      expect(box_loot.scan(/^ +return if .*== :recovered$/).length).to eq(2)
+    end
+
+    it 'box_loot_ground skips to the next box on :recovered before its inline cleanup' do
+      guard = box_loot_ground.index(/^ +next if .*== :recovered$/)
+      cleanup = box_loot_ground.index(/toss_cmd = /)
+
+      expect(guard).not_to be_nil, 'box_loot_ground has no :recovered guard'
+      expect(cleanup).not_to be_nil, 'box_loot_ground no longer cleans up the box'
+      expect(guard).to be < cleanup
+    end
+
+    it 'box_loot_ground guards both the loot_specials and the loot_regular result' do
+      expect(box_loot_ground.scan(/^ +next if .*== :recovered$/).length).to eq(2)
+    end
+
+    it 'loot_regular actually returns the :recovered it documents, not nil' do
+      loot_regular = method_body(source, 'loot_regular')
+
+      expect(loot_regular).to match(/return :recovered if/)
+      expect(loot_regular).not_to match(/^ +return if .*== :recovered$/)
+    end
   end
 end
