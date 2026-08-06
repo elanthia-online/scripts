@@ -33,7 +33,7 @@ module LedgerRollingSpec
   PARSE_BOOL_SRC = extract(/^    def self\.parse_boolean_value\(value, default_true = true\).*?^    end$/m,
                            'parse_boolean_value')
   CHART_REQUESTED_SRC = extract(/^    def self\.chart_requested\?.*?^    end$/m, 'chart_requested?')
-  BAR_CONSTANTS_SRC = extract(/^    HALF_BAR_WIDTH = \d+\n.*?^    BAR_SEGMENT = '\|'\.freeze$/m,
+  BAR_CONSTANTS_SRC = extract(/^    HALF_BAR_WIDTH = .*?^    BAR_SEGMENT = .*?$/m,
                               'bar drawing constants')
   SIGNED_BAR_SRC = extract(/^    def self\.signed_bar\(amount, max_magnitude\).*?^    end$/m, 'signed_bar')
   NO_ACTIVITY_SRC = extract(/^        max_magnitude = hours\.map.*?if max_magnitude\.zero\?$/m,
@@ -405,6 +405,47 @@ RSpec.describe 'ledger.lic rolling windows' do
       expect(cli_settings['report_fees']).to be true
       expect(cli_settings['report_character']).to be true
       expect(cli_settings['rolling']).to be false
+    end
+  end
+
+  describe 'constant redefinition guards' do
+    # Lich re-evaluates a .lic in the same process, so an unguarded constant emits
+    # "already initialized constant" on every run after the first.
+    source = LedgerRollingSpec::SOURCE
+
+    {
+      'Window' => %w[HOUR DAY MONTH_DAYS YEAR_MONTHS],
+      'chart'  => %w[HALF_BAR_WIDTH BAR_AXIS BAR_SEGMENT]
+    }.each do |group, names|
+      names.each do |name|
+        it "guards #{group} constant #{name} against redefinition" do
+          line = source.lines.find { |l| l =~ /^\s+#{name} = / }
+          expect(line).not_to be_nil
+          expect(line).to match(/unless const_defined\?\(:#{name}, false\)/)
+        end
+      end
+    end
+
+    it 'uses const_defined? with inherit false rather than defined?, which would be shadowed' do
+      # defined?(NAME) also searches enclosing scopes and Object, so a top level
+      # constant of the same name from another script would suppress the assignment
+      # and leave this module reading the foreign value.
+      expect(source).not_to match(/^\s+(?:HOUR|DAY|MONTH_DAYS|YEAR_MONTHS|HALF_BAR_WIDTH|BAR_AXIS|BAR_SEGMENT) = .*unless defined\?/)
+    end
+
+    it 're-evaluating the Window module twice emits no warning and keeps its own values' do
+      warnings = []
+      original_warn = Warning.method(:warn)
+      Warning.singleton_class.define_method(:warn) { |msg, **| warnings << msg }
+
+      begin
+        holder = Module.new
+        2.times { holder.module_eval(LedgerRollingSpec::WINDOW_SRC, LedgerRollingSpec::SOURCE_PATH) }
+        expect(warnings.grep(/already initialized constant/)).to be_empty
+        expect(holder.const_get(:Window)::DAY).to eq(86_400)
+      ensure
+        Warning.singleton_class.define_method(:warn) { |*args, **kw| original_warn.call(*args, **kw) }
+      end
     end
   end
 
