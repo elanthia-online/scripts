@@ -2,7 +2,7 @@
 
 # RSpec for ELoot::Loot.pool_full_recovery? (the sell-and-return recovery decision).
 #
-# Run: rspec eloot_spec.rb
+# Run: rspec pool_full_recovery_spec.rb
 #
 # eloot.lic cannot be required standalone -- it depends on the Lich runtime (GameObj,
 # Script, Spell, Map, ...) and executes a main block on load. Rather than copy the
@@ -363,5 +363,179 @@ RSpec.describe 'ELoot box-looting call sites' do
       expect(loot_regular).to match(/return :recovered if/)
       expect(loot_regular).not_to match(/^ +return if .*== :recovered$/)
     end
+  end
+end
+
+# RSpec for ELoot::Sell.town_openable? and the box routing that depends on it.
+#
+# "case" boxes cannot be opened by the town locksmith -- it ignores them even when the box
+# is held in hand -- so only the locksmith pool or a player locksmith can open them.
+# Routing one to town burns a silver withdrawal and a trip on every sell run and the box
+# never opens, so the predicate and the routing are pinned here.
+
+RSpec.describe 'ELoot::Sell.town_openable?' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_bodies) do
+    %w[town_openable? remember_town_refusal].map do |name|
+      body = source[/^ {4}def self\.#{Regexp.escape(name)}[\s\S]*?^ {4}end$/]
+      raise "#{name} could not be extracted from eloot.lic" unless body
+
+      body
+    end.join("\n\n")
+  end
+
+  let(:pool_only_nouns) do
+    line = source[/^ {4}POOL_ONLY_NOUNS = .*$/]
+    raise 'POOL_ONLY_NOUNS could not be extracted from eloot.lic' unless line
+
+    line
+  end
+
+  let(:obj_class) { Struct.new(:name, :noun) }
+
+  def obj(name, noun)
+    obj_class.new(name, noun)
+  end
+
+  # Fresh per example so a remembered refusal cannot leak between them.
+  let(:refused) { [] }
+
+  let(:harness) do
+    store = refused
+
+    data = Object.new
+    data.define_singleton_method(:town_refused) { store }
+    data.define_singleton_method(:town_refused=) { |v| store.replace(Array(v)) }
+
+    eloot = Module.new
+    eloot.define_singleton_method(:data) { data }
+    eloot.define_singleton_method(:msg) { |**_kw| nil }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.module_eval("#{pool_only_nouns}\n#{method_bodies}")
+    mod.const_set(:Sell, mod)
+    mod
+  end
+
+  context 'the static pool-only rule' do
+    it 'refuses "case" boxes, which the town locksmith ignores even when held' do
+      expect(harness.town_openable?(obj('a gilded delicate case', 'case'))).to be false
+      expect(harness.town_openable?(obj('a crude stained case', 'case'))).to be false
+    end
+
+    it 'still allows the box nouns the town locksmith does open' do
+      %w[box chest coffer strongbox trunk].each do |noun|
+        expect(harness.town_openable?(obj("an acid-pitted steel #{noun}", noun))).to be true
+      end
+    end
+
+    it 'does not refuse a box merely for sharing a case adjective' do
+      expect(harness.town_openable?(obj('a gilded delicate coffer', 'coffer'))).to be true
+    end
+
+    it 'treats an object with no noun as openable rather than raising' do
+      expect(harness.town_openable?(Object.new)).to be true
+    end
+  end
+
+  context 'the learned refusal safety net' do
+    it 'refuses a box name the NPC already ignored this run' do
+      box = obj('a scorched cracked trunk', 'trunk')
+      expect(harness.town_openable?(box)).to be true
+
+      harness.remember_town_refusal(box)
+
+      expect(harness.town_openable?(box)).to be false
+    end
+
+    it 'records each refused name once' do
+      box = obj('a scorched cracked trunk', 'trunk')
+
+      3.times { harness.remember_town_refusal(box) }
+
+      expect(refused).to eq(['a scorched cracked trunk'])
+    end
+
+    it 'does not refuse other boxes that happen to be present' do
+      harness.remember_town_refusal(obj('a scorched cracked trunk', 'trunk'))
+
+      expect(harness.town_openable?(obj('an acid-pitted steel chest', 'chest'))).to be true
+    end
+  end
+end
+
+RSpec.describe 'ELoot::Sell.process_boxes routing' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  def method_body(source, name)
+    body = source[/^ {4}def self\.#{Regexp.escape(name)}\b[\s\S]*?^ {4}end$/]
+    raise "#{name} could not be extracted from eloot.lic" unless body
+
+    body
+  end
+
+  let(:process_boxes) { method_body(source, 'process_boxes') }
+  let(:locksmith) { method_body(source, 'locksmith') }
+  let(:locksmith_open) { method_body(source, 'locksmith_open') }
+
+  # process_boxes cannot be exercised without the Lich runtime, so the routing invariants
+  # are asserted against the shipped source.
+  it 'never hands the raw box list to the town locksmith' do
+    expect(process_boxes).not_to match(/Sell\.locksmith\(boxes\)/)
+  end
+
+  it 'filters the town locksmith list through town_openable?' do
+    expect(process_boxes).to match(/partition \{ \|box\| Sell\.town_openable\?\(box\) \}/)
+    expect(process_boxes).to match(/Sell\.locksmith\(town_boxes\)/)
+  end
+
+  it 'pools only the pool-only boxes when the gem bounty diverts the rest to town' do
+    expect(process_boxes).to match(/Sell\.locksmith_pool\(boxes\.reject \{ \|box\| Sell\.town_openable\?\(box\) \}\)/)
+  end
+
+  it 'checks the pool is usable before routing pool-only boxes to it' do
+    expect(process_boxes).to match(/Sell\.pool_available\?/)
+  end
+
+  it 'reports boxes it is keeping when the pool was unavailable' do
+    expect(process_boxes).to match(/pool_needed\.any\?/)
+  end
+
+  it 'skips known-refused boxes inside the locksmith activator loop' do
+    expect(locksmith).to match(/next unless Sell\.town_openable\?\(box\)/)
+  end
+
+  it 'distinguishes an in-hand refusal from a timeout and remembers it' do
+    expect(locksmith_open).to match(/ignores you/)
+    expect(locksmith_open).to match(/Sell\.remember_town_refusal\(box\)/)
+    expect(locksmith_open).to match(/ELoot\.in_hand\?\(box\)/)
   end
 end
