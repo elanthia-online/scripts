@@ -11,7 +11,7 @@
    contributors: Ondreian, Tysong
            game: Gemstone
            tags: silver, bounty, ledger, bank
-        version: 1.4.3
+        version: 1.5.0
    requirements:
     - sequel gem
     - terminal-table
@@ -20,6 +20,25 @@
   Help Contribute: https://github.com/elanthia-online/scripts
   Version Control:
   Major_change.feature_addition.bugfix
+    v1.5.0 - 2026-08-06
+      - Add --rolling flag. When enabled, the report tables and the hourly chart
+        use trailing windows (hourly = last 60 minutes, daily = last 24 hours,
+        monthly = last 30 days, yearly = 12 calendar months back) instead of
+        fixed calendar buckets. Defaults to off; existing behavior is unchanged.
+      - Add --chart flag. Prints the hourly silver chart for the last 6 hours and
+        exits without starting transaction tracking. Not persisted to settings.
+      - Fix terminal-table chart raising ArgumentError (negative argument) whenever
+        a window mixed deposits with withdrawals; bar width could go negative.
+      - Fix terminal-table chart drawing no bars at all when every amount was
+        negative, and reporting "No activity" when the largest amount was 0 but
+        negative activity existed. Bars are now scaled on magnitude and drawn
+        around a zero axis: withdrawals extend left, deposits extend right.
+      - Fix hourly_chart current-hour column always reading zero (offset 0 was
+        mapped to hour 24, which matches no stored hour value).
+      - Fix hourly_chart querying the wrong day/month/year for buckets that wrap
+        past midnight (the day was pinned to the starting day, and month/year
+        were never passed at all).
+      - Add indexes on created_at to support the rolling window filters.
     v1.4.3 - 2026-05-24
       - Change estimate_loot_cap weekly window from Monday-Sunday to Sunday-Saturday (EST/EDT).
     v1.4.2 - 2026-05-11
@@ -102,6 +121,7 @@ optional_gems.each do |gem|
 end
 
 require 'yaml'
+require 'date'
 
 # The Ledger module provides comprehensive tracking of in-game financial transactions
 # including silver, bounty points, and locksmith fees for GemStone IV.
@@ -130,9 +150,11 @@ module Ledger
     @settings_file = File.join(DATA_DIR, 'ledger.yaml')
     @defaults = {
       'report_character' => false,
-      'report_fees'      => false
+      'report_fees'      => false,
+      'rolling'          => false
     }
     @settings = nil
+    @chart_requested = false
 
     # Loads settings from YAML file or creates default settings
     #
@@ -171,6 +193,8 @@ module Ledger
     # Supports flexible argument formats:
     # - --report-character, --report_character, -reportcharacter
     # - --report-fees, --report_fees, --report-fee
+    # - --rolling, --rolling=on, --rolling=off
+    # - --chart
     # - With values: --report-character=on, --report-character=off
     #
     # @param args [Array<String>] array of command-line arguments
@@ -184,6 +208,14 @@ module Ledger
         when /^-?-?report[-_]?fees?(?:=(.+))?$/i
           value = $1
           @settings['report_fees'] = parse_boolean_value(value, true)
+        when /^-?-?rolling(?:=(.+))?$/i
+          value = $1
+          @settings['rolling'] = parse_boolean_value(value, true)
+        when /^-?-?chart$/i
+          # A one-shot action, not a stored preference: kept out of @settings so
+          # save_settings cannot persist it. Were it persisted, every later run
+          # would print a chart and exit instead of tracking transactions.
+          @chart_requested = true
         when /^-?-?help$/i
           display_help
           exit
@@ -227,6 +259,10 @@ module Ledger
         Options:
           --report-character[=<on|off>]   Show per-character statistics        (default: #{@defaults['report_character']})
           --report-fees[=<on|off>]        Track and report locksmith pool fees (default: #{@defaults['report_fees']})
+          --rolling[=<on|off>]            Use trailing windows instead of      (default: #{@defaults['rolling']})
+                                          fixed calendar buckets
+          --chart                         Print the hourly silver chart for the last
+                                          6 hours, then exit without tracking
           --help                          Display this help message
 
         Examples:
@@ -234,6 +270,23 @@ module Ledger
           ;ledger --report-character=on             # Enable character reporting (explicit)
           ;ledger --report-character=off            # Disable character reporting
           ;ledger --report-fees --report-character  # Enable both options
+          ;ledger --rolling                         # Trailing windows
+          ;ledger --rolling=off                     # Back to calendar buckets
+          ;ledger --chart                           # Show the hourly chart and exit
+          ;ledger --chart --rolling                 # Chart with trailing 60 minute slots
+
+        Notes on --chart:
+          Prints a bar chart of the last 6 hours of silver activity and exits, so it
+          does not start transaction tracking. It is an action, not a saved setting,
+          so it never persists to the settings file. Withdrawals are negative and
+          draw to the left of the center axis; deposits draw to the right. Honors
+          --rolling: off gives clock-hour buckets, on gives trailing 60 minute slots.
+
+        Reporting windows:
+          rolling off (default)  hourly = since the top of the hour, daily = since
+                                 midnight, monthly = since the 1st, yearly = since Jan 1
+          rolling on             hourly = last 60 minutes, daily = last 24 hours,
+                                 monthly = last 30 days, yearly = 12 months back
 
         Settings are saved to: #{@settings_file}
         Settings persist across script runs unless overridden by CLI arguments.
@@ -241,6 +294,7 @@ module Ledger
         Current Settings:
           report_character: #{@settings['report_character']}
           report_fees:      #{@settings['report_fees']}
+          rolling:          #{@settings['rolling']}
       HELP
       respond help_text
     end
@@ -270,9 +324,78 @@ module Ledger
       @settings[key] == true
     end
 
+    # Whether --chart was passed on this run
+    #
+    # Deliberately separate from the persisted settings hash: --chart is a one-shot
+    # action that prints a chart and exits, not a mode that should survive the run.
+    #
+    # @return [Boolean] true if --chart was supplied
+    # @since 1.5.0
+    def self.chart_requested?
+      @chart_requested == true
+    end
+
     # Initialize settings on module load
     load_settings
     parse_cli_args(Script.current.vars[1..-1])
+  end
+
+  # Rolling window boundary math
+  #
+  # When the 'rolling' setting is enabled, reports cover a trailing window ending
+  # now instead of the calendar bucket the current time falls into. All boundaries
+  # are machine-local Times, matching how `created_at` is written by
+  # History.record_transaction.
+  #
+  # @since 1.5.0
+  module Window
+    # Number of seconds in an hour
+    HOUR = 3_600
+    # Number of seconds in a day
+    DAY = 86_400
+    # Days treated as a "month" for the rolling monthly window
+    MONTH_DAYS = 30
+    # Calendar months spanned by the rolling yearly window
+    YEAR_MONTHS = 12
+
+    # Whether rolling windows are currently enabled
+    #
+    # @return [Boolean] true when the 'rolling' setting is on
+    def self.rolling?
+      Ledger::Settings.enabled?('rolling')
+    end
+
+    # Computes the inclusive lower bound of a rolling window
+    #
+    # @param period [Symbol] one of :hourly, :daily, :monthly, :yearly
+    # @param from [Time] the end of the window (default: now)
+    # @return [Time] the earliest `created_at` included in the window
+    # @raise [ArgumentError] if the period is not recognized
+    # @example
+    #   Window.start_of(:hourly, from: Time.new(2026, 8, 6, 13, 35, 0))
+    #   #=> 2026-08-06 12:35:00
+    def self.start_of(period, from: Time.now)
+      case period
+      when :hourly  then from - HOUR
+      when :daily   then from - DAY
+      when :monthly then from - (MONTH_DAYS * DAY)
+      when :yearly  then months_ago(YEAR_MONTHS, from)
+      else raise ArgumentError, "unknown rolling period: #{period.inspect}"
+      end
+    end
+
+    # Shifts a Time back by whole calendar months, preserving time of day
+    #
+    # Uses Date#<< so short months clamp instead of raising: 12 months before
+    # 2028-02-29 is 2027-02-28, not an invalid date.
+    #
+    # @param count [Integer] number of calendar months to go back
+    # @param from [Time] the reference time
+    # @return [Time] the shifted local time
+    def self.months_ago(count, from = Time.now)
+      shifted = Date.new(from.year, from.month, from.day) << count
+      Time.local(shifted.year, shifted.month, shifted.day, from.hour, from.min, from.sec)
+    end
   end
 
   # Character-specific transaction queries
@@ -282,11 +405,27 @@ module Ledger
   #
   # @since 1.0.0
   module Character
+    # Sums this character's transactions inside a rolling window
+    #
+    # @param period [Symbol] one of :hourly, :daily, :monthly, :yearly
+    # @param type [String] transaction type ('silver', 'bounty', 'fee')
+    # @return [Integer] sum of transactions in the trailing window
+    # @since 1.5.0
+    def self.rolling(period, type:)
+      window_start = Ledger::Window.start_of(period)
+      Ledger::History::Transactions
+        .where(type: type, character: Char.name, game: XMLData.game)
+        .where { created_at >= window_start }
+        .sum(:amount) || 0
+    end
+
     # Gets yearly transaction sum for current character
     #
     # @param type [String] transaction type ('silver', 'bounty', 'fee')
     # @return [Integer] sum of transactions for the year
     def self.yearly(type: "silver")
+      return rolling(:yearly, type: type) if Ledger::Window.rolling?
+
       Ledger::History::Transactions
         .where(year: Time.now.year, type: type, character: Char.name, game: XMLData.game)
         .sum(:amount) || 0
@@ -297,6 +436,8 @@ module Ledger
     # @param type [String] transaction type ('silver', 'bounty', 'fee')
     # @return [Integer] sum of transactions for the month
     def self.monthly(type: "silver")
+      return rolling(:monthly, type: type) if Ledger::Window.rolling?
+
       Ledger::History::Transactions
         .where(year: Time.now.year, month: Time.now.month, type: type, character: Char.name, game: XMLData.game)
         .sum(:amount) || 0
@@ -307,6 +448,8 @@ module Ledger
     # @param type [String] transaction type ('silver', 'bounty', 'fee')
     # @return [Integer] sum of transactions for the day
     def self.daily(type: "silver")
+      return rolling(:daily, type: type) if Ledger::Window.rolling?
+
       Ledger::History::Transactions
         .where(year: Time.now.year, month: Time.now.month, day: Time.now.day, type: type, character: Char.name, game: XMLData.game)
         .sum(:amount) || 0
@@ -317,6 +460,8 @@ module Ledger
     # @param type [String] transaction type ('silver', 'bounty', 'fee')
     # @return [Integer] sum of transactions for the current hour
     def self.hourly(type: "silver")
+      return rolling(:hourly, type: type) if Ledger::Window.rolling?
+
       Ledger::History::Transactions
         .where(year: Time.now.year, month: Time.now.month, day: Time.now.day, hour: Time.now.hour, type: type, character: Char.name, game: XMLData.game)
         .sum(:amount) || 0
@@ -517,6 +662,18 @@ module Ledger
                        name: :transactions_account_type_index
       end
 
+      # Indexes for rolling window queries, which filter on created_at rather than
+      # the year/month/day/hour bucket columns (Query and Character rolling paths)
+      unless Self.indexes(:transactions).key?(:transactions_game_type_created_at_index)
+        Self.add_index :transactions, [:game, :type, :created_at],
+                       name: :transactions_game_type_created_at_index
+      end
+
+      unless Self.indexes(:transactions).key?(:transactions_character_type_created_at_index)
+        Self.add_index :transactions, [:character, :type, :created_at],
+                       name: :transactions_character_type_created_at_index
+      end
+
       # Update query optimizer statistics
       Self.run("ANALYZE transactions")
     rescue => e
@@ -552,6 +709,37 @@ module Ledger
     #
     # @since 1.0.0
     module Query
+      # Sums transactions across all characters inside a rolling window
+      #
+      # @param period [Symbol] one of :hourly, :daily, :monthly, :yearly
+      # @param type [String] transaction type ('silver', 'bounty', 'fee')
+      # @return [Integer] sum of transactions in the trailing window
+      # @since 1.5.0
+      def self.rolling_gain_loss(period, type:)
+        window_start = Ledger::Window.start_of(period)
+        Transactions
+          .where(type: type, game: XMLData.game)
+          .where { created_at >= window_start }
+          .sum(:amount) || 0
+      end
+
+      # Sums transactions across all characters inside an explicit time range
+      #
+      # Lower bound inclusive, upper bound exclusive, so adjacent ranges do not
+      # double count a transaction landing exactly on a boundary.
+      #
+      # @param type [String] transaction type ('silver', 'bounty', 'fee')
+      # @param from [Time] inclusive start of the range
+      # @param to [Time] exclusive end of the range
+      # @return [Integer] sum of transactions in the range
+      # @since 1.5.0
+      def self.range_gain_loss(type:, from:, to:)
+        Transactions
+          .where(type: type, game: XMLData.game)
+          .where { (created_at >= from) & (created_at < to) }
+          .sum(:amount) || 0
+      end
+
       # Gets yearly transaction sum across all characters
       #
       # @param year [Integer] the year to query (default: current year)
@@ -601,6 +789,29 @@ module Ledger
           .where(month: month, year: year, day: day, hour: hour, type: type, game: XMLData.game)
           .sum(:amount) || 0
       end
+
+      # Gets the transaction sum for the current period, honoring the rolling setting
+      #
+      # The *_gain_loss methods above are bucket addressed: they take explicit
+      # year/month/day/hour and always mean that calendar bucket. This method means
+      # "the current period" and so follows the 'rolling' setting.
+      #
+      # @param period [Symbol] one of :hourly, :daily, :monthly, :yearly
+      # @param type [String] transaction type ('silver', 'bounty', 'fee')
+      # @return [Integer] sum of transactions for the current period
+      # @raise [ArgumentError] if the period is not recognized
+      # @since 1.5.0
+      def self.current_gain_loss(period, type:)
+        return rolling_gain_loss(period, type: type) if Ledger::Window.rolling?
+
+        case period
+        when :hourly  then hourly_gain_loss(type: type)
+        when :daily   then daily_gain_loss(type: type)
+        when :monthly then monthly_gain_loss(type: type)
+        when :yearly  then yearly_gain_loss(type: type)
+        else raise ArgumentError, "unknown period: #{period.inspect}"
+        end
+      end
     end
 
     # Returns the allowed transaction types
@@ -648,31 +859,41 @@ module Ledger
     # @param number [Integer] number of hours to display (default: 6)
     # @return [void]
     def self.hourly_chart(type: "silver", from: Time.now, number: 6)
-      initial_hour = from.hour
-      initial_day  = from.day
+      rolling = Ledger::Window.rolling?
 
+      # Each slot is derived by subtracting whole hours from `from`, so hour 0 stays
+      # 0 and the day/month/year follow the subtraction across midnight, month and
+      # year boundaries.
       hours = (0...number).to_a.map { |offset|
-        position = initial_hour - offset
-        # handle underflow
-        hour = position < 1 ? 24 + position : position
-        [hour, Query.hourly_gain_loss(type: type, hour: hour, day: initial_day)]
+        slot_end = from - (offset * Ledger::Window::HOUR)
+        amount =
+          if rolling
+            Query.range_gain_loss(type: type, from: slot_end - Ledger::Window::HOUR, to: slot_end)
+          else
+            Query.hourly_gain_loss(type: type, hour: slot_end.hour, day: slot_end.day,
+                                   month: slot_end.month, year: slot_end.year)
+          end
+        [slot_end.hour, amount]
       }.reverse
+
+      # Calendar buckets always start on the hour; rolling slots end at `from`.
+      label_minute = rolling ? from.min : 0
 
       # Try to use ascii_charts if available
       if defined?(AsciiCharts)
         _respond AsciiCharts::Cartesian.new(hours, title: "hourly #{type}", bar: true).draw
       else
-        # Fallback to terminal-table based chart
-        max_value = hours.map(&:last).max
-        return _respond "No #{type} activity in the past #{number} hours." if max_value.zero?
+        # Fallback to terminal-table based chart.
+        # Scale on magnitude, not the raw maximum: amounts are signed (withdrawals
+        # are negative), so a plain .max both mis-detects "no activity" when the
+        # largest value is 0 and yields a negative bar width for any amount below
+        # the maximum.
+        max_magnitude = hours.map { |_hour, amount| amount.abs }.max
+        return _respond "No #{type} activity in the past #{number} hours." if max_magnitude.zero?
 
-        max_bar_width = 40
         rows = hours.map do |hour, amount|
-          bar_width = max_value > 0 ? (amount.to_f / max_value * max_bar_width).round : 0
-          bar = '|' * bar_width
-          formatted_amount = with_commas(amount)
-
-          [sprintf("%02d:00", hour), "#{bar} #{formatted_amount}"]
+          [sprintf("%02d:%02d", hour, label_minute),
+           "#{signed_bar(amount, max_magnitude)} #{with_commas(amount)}"]
         end
 
         chart = Terminal::Table.new(
@@ -682,6 +903,38 @@ module Ledger
         )
 
         _respond "<output class=\"mono\"/>\n" + chart.to_s + "\n<output class=\"\"/>"
+      end
+    end
+
+    # Half width, in characters, of each side of the zero-centered chart axis
+    HALF_BAR_WIDTH = 20
+    # Character marking the zero axis of the chart
+    BAR_AXIS = '+'.freeze
+    # Character used to draw bar segments
+    BAR_SEGMENT = '|'.freeze
+
+    # Renders one zero-centered bar for a signed amount
+    #
+    # Negative amounts extend left of the axis and positive amounts extend right.
+    # Both sides are padded to HALF_BAR_WIDTH so every row has the same total width
+    # and the trailing amounts line up in a column.
+    #
+    # @param amount [Integer] the signed amount to draw
+    # @param max_magnitude [Integer] the largest absolute amount in the chart
+    # @return [String] a fixed width bar of 2 * HALF_BAR_WIDTH + 1 characters
+    # @since 1.5.0
+    # @example
+    #   signed_bar(-500, 500) #=> "||||||||||||||||||||+                    "
+    def self.signed_bar(amount, max_magnitude)
+      return (' ' * HALF_BAR_WIDTH) + BAR_AXIS + (' ' * HALF_BAR_WIDTH) if max_magnitude.zero?
+
+      width = (amount.abs.to_f / max_magnitude * HALF_BAR_WIDTH).round
+      width = HALF_BAR_WIDTH if width > HALF_BAR_WIDTH
+
+      if amount.negative?
+        (' ' * (HALF_BAR_WIDTH - width)) + (BAR_SEGMENT * width) + BAR_AXIS + (' ' * HALF_BAR_WIDTH)
+      else
+        (' ' * HALF_BAR_WIDTH) + BAR_AXIS + (BAR_SEGMENT * width) + (' ' * (HALF_BAR_WIDTH - width))
       end
     end
 
@@ -705,10 +958,10 @@ module Ledger
     def self.table
       self.allowed_types(include_fee: Settings.enabled?('report_fees')).map { |resource|
         [resource,
-         with_commas(Query.hourly_gain_loss(type: resource)),
-         with_commas(Query.daily_gain_loss(type: resource)),
-         with_commas(Query.monthly_gain_loss(type: resource)),
-         with_commas(Query.yearly_gain_loss(type: resource))]
+         with_commas(Query.current_gain_loss(:hourly, type: resource)),
+         with_commas(Query.current_gain_loss(:daily, type: resource)),
+         with_commas(Query.current_gain_loss(:monthly, type: resource)),
+         with_commas(Query.current_gain_loss(:yearly, type: resource))]
       }
     end
 
@@ -833,7 +1086,13 @@ module Ledger
       end
     end
 
-    # Start the main event loop
-    self.main()
+    # Print the chart and exit, or start the main event loop.
+    # --chart is a one-shot report: skipping main() ends the script, since the
+    # module body is the last thing the file evaluates.
+    if Ledger::Settings.chart_requested?
+      self.hourly_chart
+    else
+      self.main()
+    end
   end
 end
