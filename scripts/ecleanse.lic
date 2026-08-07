@@ -6,9 +6,15 @@
           game: Gemstone
           tags: dispel, unpoison, undisease, disarmed, effects
       required: Lich >= 5.12.10
-       version: 2.3.0
+       version: 2.3.1
 
   Improvements:
+  v2.3.1  (2026-08-05)
+    - hive traps: bound search/disarm attempts and add a wall-clock deadline
+    - hive traps: validate room between each search, break early if moved
+    - hive traps: break early if dead or muckled
+    - hive traps: fix SEARCH start_pattern so non-rolled results terminate the loop
+    - hive traps: fix event_stack push precedence that allowed duplicate events
   v2.3.0  (2026-06-08)
     - add break runestones option for Onslaughts
   v2.2.9  (2026-04-21)
@@ -850,33 +856,112 @@ module Ecleanse
       Script.run('go2', "#{place} --disable-confirm", { quiet: true, force: true })
     end
 
+    # Hive trap tuning.  Methods rather than constants so a re-run of the script
+    # neither warns about an already initialized constant nor pins the old value.
+    def self.hive_search_attempts
+      3 # rolled SEARCH attempts before giving up
+    end
+
+    def self.hive_disarm_attempts
+      3 # DISARM attempts on a revealed apparatus
+    end
+
+    def self.hive_trap_deadline
+      20 # hard wall-clock ceiling per event, in seconds
+    end
+
+    # Lich::Util.issue_command discards every line before start_pattern and
+    # returns [] on timeout, so every outcome of the command has to be listed
+    # here.  A start_pattern of /d100: / alone means a non-rolled result comes
+    # back empty and cannot be tested for.
+    def self.hive_search_result
+      Regexp.union(
+        /d100: /,
+        /You don't find anything of interest here/,
+        /You can't see well enough to search around/
+      )
+    end
+
+    def self.hive_disarm_result
+      Regexp.union(
+        /d100: /,
+        /You want to disarm what\?/,
+        /You can't see well enough/
+      )
+    end
+
+    # SEARCH until the trap resolves, we leave the room, or we run out of
+    # attempts.  Returns a symbol so callers can decide what to do next:
+    #   :found     - rolled Success, trap revealed or disturbed
+    #   :clear     - nothing here to find
+    #   :blind     - cannot see well enough to search
+    #   :moved     - no longer in the room the trap fired in
+    #   :muckled   - dead, stunned, webbed, bound or asleep
+    #   :exhausted - out of attempts
+    #   :timeout   - hit the wall-clock ceiling
+    def self.hive_search
+      deadline = Time.now + hive_trap_deadline
+      attempts = 0
+
+      loop do
+        return :moved unless hive_trap_room?
+        return :muckled if dead? || muckled?
+        return :timeout if Time.now > deadline
+        return :exhausted if attempts >= hive_search_attempts
+
+        Util.wait_rt
+        attempts += 1
+        lines = Util.get_command("search", hive_search_result)
+
+        return :blind if lines.any? { |line| line =~ /You can't see well enough to search around/ }
+        return :clear if lines.any? { |line| line =~ /You don't find anything of interest here/ }
+        return :found if lines.any? { |line| line =~ /Success!/ }
+        # Failure! or an empty result (issue_command timed out) falls through and retries
+      end
+    end
+
+    # Guard against acting on a stale marker: an unmapped room reports nil, and
+    # nil == nil would otherwise read as a match.  Room defines no ==, so an
+    # object comparison is identity, which fails across a Map.load that rebuilds
+    # every Room instance.  Compare ids when we have them.
+    def self.hive_trap_room?
+      trap_room = Ecleanse.data.hive_trap_room
+      current = Room.current
+      return false if trap_room.nil? || current.nil?
+      return trap_room.id == current.id unless trap_room.id.nil? || current.id.nil?
+
+      trap_room == current
+    end
+
     def self.hive_traps_apparatus
       return unless Ecleanse.data.settings[:hive_traps_apparatus]
       return if Script.running?('go2')
-      return unless Ecleanse.data.hive_trap_room == Room.current
+      return unless hive_trap_room?
 
       System.scripts_pause
 
-      search_count = 0
-      loop do
-        Util.wait_rt
-        lines = Util.get_command("search", /d100: /)
-        search_count += 1
-        break if search_count >= 10
-        next if lines.any? { |l| l =~ /Failure!/ }
-        break if lines.any? { |l| l =~ /Success|You don't find anything of interest here/ }
+      result = hive_search
+
+      if result == :found
+        deadline = Time.now + hive_trap_deadline
+        attempts = 0
+
+        loop do
+          break unless hive_trap_room?
+          break if dead? || muckled?
+          break if Time.now > deadline
+          break if attempts >= hive_disarm_attempts
+
+          Util.wait_rt
+          attempts += 1
+          results = Util.get_command("disarm apparatus", hive_disarm_result)
+          break if results.any? { |line| line =~ /Success!|You want to disarm what\?/ }
+        end
       end
 
-      Util.wait_rt
-
-      search_count = 0
-      loop do
-        results = Util.get_command("disarm apparatus", /d100|You want to disarm what\?/)
-        search_count += 1
-        break if results.any? { |l| l =~ /Success|You want to disarm what\?/ }
-        return if search_count >= 10
-        Util.wait_rt
-      end
+      # Clear the marker so queued duplicate events no-op, except when we bailed
+      # for a condition that clears on its own and the trap will re-announce.
+      Ecleanse.data.hive_trap_room = nil unless [:moved, :muckled].include?(result)
 
       Util.wait_rt
     end
@@ -884,19 +969,12 @@ module Ecleanse
     def self.hive_traps_ground
       return unless Ecleanse.data.settings[:hive_traps_ground]
       return if Script.running?('go2')
-      return unless Ecleanse.data.hive_trap_room == Room.current
+      return unless hive_trap_room?
 
       System.scripts_pause
 
-      search_count = 0
-      loop do
-        Util.wait_rt
-        lines = Util.get_command("search", /d100: /)
-        search_count += 1
-        break if search_count >= 10
-        next if lines.any? { |l| l =~ /Failure!/ }
-        break if lines.any? { |l| l =~ /Success|You don't find anything of interest here/ }
-      end
+      result = hive_search
+      Ecleanse.data.hive_trap_room = nil unless [:moved, :muckled].include?(result)
 
       Util.wait_rt
     end
@@ -1475,23 +1553,23 @@ module Ecleanse
           Ecleanse.data.event_stack << :telekinetic_recover
         elsif server =~ /Striking with a serpent's unsettling quickness, (?:.*)\.  Vile (?:.*), kindling it into an unholy semblance of life.  The (?:.*) form twists and mutates, sprouting scales and cold eyes as it transforms into a <a exist="\d+" noun="([^"]+)">[^<]+<\/a>\!/
           Ecleanse.data.creature = Regexp.last_match(1)
-          Ecleanse.data.event_stack << :sanctum_recover && !Ecleanse.data.event_stack.include?(:sanctum_recover)
+          Ecleanse.data.event_stack << :sanctum_recover unless Ecleanse.data.event_stack.include?(:sanctum_recover)
         elsif server =~ /The flesh around the wound feels hot and cold at the same time, heavy with infection./
-          Ecleanse.data.event_stack << :use_vat && !Ecleanse.data.event_stack.include?(:use_vat)
+          Ecleanse.data.event_stack << :use_vat unless Ecleanse.data.event_stack.include?(:use_vat)
         elsif server =~ /The webbing entangles your <a exist=".*?" noun="(.*?)">.*?<\/a>, rendering it useless/
           next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
           Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
           Ecleanse.data.event_stack << :recover_weapon_webbing
         elsif server =~ /You notice a flickering glint in the shadows|The apparatus flickers with deadly radiance/
           Ecleanse.data.hive_trap_room = Room.current
-          Ecleanse.data.event_stack << :hive_traps_apparatus && !Ecleanse.data.event_stack.include?(:hive_traps_apparatus)
+          Ecleanse.data.event_stack << :hive_traps_apparatus unless Ecleanse.data.event_stack.include?(:hive_traps_apparatus)
         elsif server =~ /The ground churns violently as flashes of chitin jut from its depths|The ground underfoot churns violently and huge chitinous mandibles flash as the insectoid monstrosity below goes into a feeding frenzy!|Hindered by the churning terrain, you are helpless as the concealed assailant's mandibles snap at you from the safety of its pit trap!/
           Ecleanse.data.hive_trap_room = Room.current
-          Ecleanse.data.event_stack << :hive_traps_ground && !Ecleanse.data.event_stack.include?(:hive_traps_ground)
+          Ecleanse.data.event_stack << :hive_traps_ground unless Ecleanse.data.event_stack.include?(:hive_traps_ground)
         elsif server =~ /You shiver slightly as an invisible rash covers your body/
-          Ecleanse.data.event_stack << :itchy_curse && !Ecleanse.data.event_stack.include?(:itchy_curse)
+          Ecleanse.data.event_stack << :itchy_curse unless Ecleanse.data.event_stack.include?(:itchy_curse)
         elsif server =~ /^An unseen force entangles you, restricting your movement!\r?\n?$/
-          Ecleanse.data.event_stack << :remove_web_bound && !Ecleanse.data.event_stack.include?(:remove_web_bound)
+          Ecleanse.data.event_stack << :remove_web_bound unless Ecleanse.data.event_stack.include?(:remove_web_bound)
         end
         server
       }
