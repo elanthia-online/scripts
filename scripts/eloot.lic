@@ -15,9 +15,31 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.15.0
-           version: 2.11.0
+           version: 2.11.1
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.11.1 (2026-08-05)
+    - fix: the v2.11.0 locksmith pool full-container recovery could not fire for items
+      handled by loot_specials (orbs, cursed items, keepers, uncommon weapons/armor).
+      box_loot drains specials before loot_regular, and only loot_regular was wired to
+      the recovery, so those items still paused the script mid-pool-return. loot_specials
+      now takes the box context and stows box contents through stow_box_item like
+      loot_regular does. Room looting and critter bags are unchanged.
+    - fix: a completed recovery finalized the box twice. loot_regular documented a
+      :recovered return but returned nil, so box_loot ran Sell.save_trash_box after the
+      nested recovery had already trashed or stowed the box, re-issuing trash and drag
+      commands against a gone box (box_loot_ground likewise ran its inline cleanup).
+      loot_specials and loot_regular now both return :recovered and both callers stop
+      before finalizing.
+    - fix: boxes the town locksmith refuses ("case" boxes, which only the locksmith pool
+      or a player locksmith can open) were routed to it anyway, looping forever -- a
+      silver withdrawal, a trip, a refused bell and a re-stow on every sell run, with the
+      box never opening. process_boxes now keeps them out of the town locksmith list
+      entirely; when locksmith_when_gem_bounty diverts boxes to town, only the pool-only
+      ones are pooled so the rest still go to town as intended. If the pool is
+      unavailable they are left in place with a notice instead of being carried nowhere.
+      A box the NPC ignores while it is in hand is also remembered for the rest of the
+      run, so an unrecognized box type costs one attempt rather than every run.
   v2.11.0 (2026-07-03)
     - feature: during a locksmith pool return, when all containers are full, sell to
       free space and resume looting instead of pausing. The stuck item is returned to
@@ -317,7 +339,7 @@ module ELoot # Data
                   :urchin_msg, :gemshop_first, :reject_loot_names, :reject_loot_nouns, :version, :debug_logger, :details_check, :coin_bag_full,
                   :use_house_locker, :che_rooms, :che_entry, :che_exit, :towns, :gambling_kit, :gambling_kit_full, :ready_lines, :weapon_inv, :original_readylist, :blood_band,
                   :transmog_cache, :loot_exclude_regex, :critter_exclude_regex, :loot_keep_regex, :allowed_special_types, :sell_exclude_regex, :no_vib_regex, :vib_scrolls_regex,
-                  :pool_command
+                  :pool_command, :town_refused
 
     def initialize(settings)
       @settings = settings
@@ -403,6 +425,10 @@ module ELoot # Data
 
       # session-scoped cache of ANALYZE results for transmog detection: { [id, name] => true/false }
       @transmog_cache = {}
+
+      # session-scoped set of box names the town locksmith refused to work on while the
+      # box was in hand. Not persisted -- a game update could change what it accepts.
+      @town_refused = []
 
       default_crumbly = [
         # Kraken Fall
@@ -4875,8 +4901,19 @@ module ELoot # Room looting
         end
 
         objs = box.contents
-        objs = Loot.loot_specials(objs) unless objs.empty?
-        Loot.loot_regular(objs, "Box", box, sell_recovered: sell_recovered, location: location, data: data) unless objs.empty?
+        unless objs.empty?
+          specials = Loot.loot_specials(objs, box: box, location: location, data: data, sell_recovered: sell_recovered)
+          # A recovery already re-looted and trashed/stowed this box via a nested
+          # box_loot; finalizing again would re-issue trash and drag commands.
+          return if specials == :recovered
+
+          objs = specials
+        end
+
+        unless objs.empty?
+          return if Loot.loot_regular(objs, "Box", box, sell_recovered: sell_recovered, location: location, data: data) == :recovered
+        end
+
         Sell.save_trash_box(box)
       elsif box.type == "plinite"
         ELoot.get_res("pluck ##{box.id}", /You carefully pluck/)
@@ -4920,8 +4957,18 @@ module ELoot # Room looting
 
         # Loot the rest of the stuff
         objs = box.contents
-        objs = Loot.loot_specials(objs) unless objs.empty?
-        Loot.loot_regular(objs, "Box", box) unless objs.empty?
+        unless objs.empty?
+          specials = Loot.loot_specials(objs, box: box)
+          # A recovery already re-looted and finalized this box via a nested box_loot;
+          # skip the cleanup below rather than run it against a gone box.
+          next if specials == :recovered
+
+          objs = specials
+        end
+
+        unless objs.empty?
+          next if Loot.loot_regular(objs, "Box", box) == :recovered
+        end
 
         save_box = ELoot.data.settings[:sell_loot_types].include?("box")
         valuable_box = /gold|mithril|silver/
@@ -5015,6 +5062,10 @@ module ELoot # Room looting
       end
     end
 
+    # Loot the ordinary items. In a box-looting flow a full-container stow can trigger the
+    # locksmith pool sell-and-resume recovery, which re-loots AND finalizes the whole box.
+    # @return [Symbol, nil] :recovered when that happened -- the caller must stop and must
+    #   not finalize the box again; nil otherwise.
     def self.loot_regular(objs, from_where = nil, box = nil, sell_recovered: false, location: nil, data: nil)
       ELoot.msg(type: "debug", text: "objs: #{objs} | from_where: #{from_where} | sell_recovered: #{sell_recovered} | location: #{location.inspect} | data?: #{!data.nil?}")
 
@@ -5037,7 +5088,7 @@ module ELoot # Room looting
             obj.type =~ loot_cmd_items ? Inventory.single_loot(obj) : Inventory.single_drag(obj)
           end
         elsif from_where == "Box"
-          return if valid.any? { |thing| Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered }
+          return :recovered if valid.any? { |thing| Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered }
         else
           valid.each do |thing|
             Inventory.single_drag(thing)
@@ -5059,14 +5110,14 @@ module ELoot # Room looting
             next false if item.type == 'box'
             Loot.stow_box_item(item, box, location, data, sell_recovered) == :recovered
           end
-          return if recovered
+          return :recovered if recovered
 
           # if there are still box contents the default container has filled up so just do the rest as drags
           if box.contents.length.positive?
             objs = box.contents
             remaining_valid = Loot.valid_objs(objs.clone)
 
-            return if remaining_valid.any? { |thing| Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered }
+            return :recovered if remaining_valid.any? { |thing| Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered }
           end
         else
           valid.each do |thing|
@@ -5183,8 +5234,26 @@ module ELoot # Room looting
       :recovered
     end
 
-    def self.loot_specials(objs)
-      ELoot.msg(type: "debug", text: "objs: #{objs}")
+    # Loot the items that need individual handling (coins, cursed items, orbs,
+    # uncommon weapons/armor, keepers) and return whatever is left for loot_regular.
+    #
+    # When called from a box-looting flow the caller passes the box context. That makes a
+    # full-container stow eligible for the same locksmith pool sell-and-resume recovery
+    # loot_regular already uses, instead of pausing the script. Without the context (room
+    # looting, critter bags) the behavior is unchanged: stow, and pause if nothing fits.
+    #
+    # @param objs [Array<GameObj>] candidate items
+    # @param box [GameObj, nil] the box being looted; nil outside a box-looting flow
+    # @param location [String, nil] passed through to the recovery
+    # @param data [Hash, nil] passed through to the recovery
+    # @param sell_recovered [Boolean] true when a recovery already ran for this box.
+    #   Must be threaded through so the recovery cannot re-enter for the same box.
+    # @return [Array<GameObj>] items left for loot_regular, or
+    #   [Symbol] :recovered when a recovery re-looted AND finalized the whole box. The
+    #   caller must stop and must not finalize the box again. Only reachable when box is
+    #   given, so the no-box callers always get an Array.
+    def self.loot_specials(objs, box: nil, location: nil, data: nil, sell_recovered: false)
+      ELoot.msg(type: "debug", text: "objs: #{objs} | box: #{box.respond_to?(:name) ? box.name : box.inspect} | sell_recovered: #{sell_recovered}")
 
       # Open sacks for looting the room
       Inventory.open_loot_containers(objs)
@@ -5193,7 +5262,12 @@ module ELoot # Room looting
       uncommon_loot = ["stygian valravn quill", "nacreous disir feather", "silver-veined black draconic idol"]
       loot_uncommon_regex = Regexp.union(uncommon_loot)
 
+      recovered = false
+
       objs = objs.reject do |thing|
+        # A recovery re-looted the whole box already; stop touching the stale list.
+        next false if recovered
+
         result = Loot.bag_loot(thing) if thing.type =~ /clothing/
 
         next true if result == "crumbly"
@@ -5219,11 +5293,20 @@ module ELoot # Room looting
         else
           if ELoot.decurse(thing)
             Inventory.free_hand
-            Inventory.single_drag(thing)
+            if box
+              recovered = (Loot.stow_box_item(thing, box, location, data, sell_recovered) == :recovered)
+            else
+              Inventory.single_drag(thing)
+            end
           end
         end
 
         next true
+      end
+
+      if recovered
+        ELoot.msg(type: "debug", text: "loot_specials: pool recovery re-looted and finalized the box")
+        return :recovered
       end
 
       ELoot.msg(type: "debug", text: "After specials check objs: #{objs}")
@@ -6756,6 +6839,9 @@ module ELoot # Sells the loot
 
           if activator # fixme - shouldn't stow both hands just not the box
             boxes.each { |box|
+              # A refusal learned earlier in this run applies to the rest of it.
+              next unless Sell.town_openable?(box)
+
               Inventory.free_hands(both: true) unless ELoot.in_hand?(box)
               Sell.locksmith_open(box, activator)
             }
@@ -6777,7 +6863,20 @@ module ELoot # Sells the loot
         lines = ELoot.get_command("open ##{box.id}", /That is already open|You open|You throw back|It appears to be locked/, silent: true, quiet: true)
 
         if lines.any?(/locked/)
-          res = dothistimeout(activator, 2, /Gimme ([\d,]+) silvers/)
+          res = dothistimeout(activator, 2, /Gimme ([\d,]+) silvers|ignores you/)
+
+          # Ignored while the box is verifiably in hand means the NPC will not work on this
+          # box at all, which is a different failure from a timeout. Remember it so we stop
+          # carrying this box here for the rest of the run.
+          if res =~ /ignores you/ && ELoot.in_hand?(box)
+            Sell.remember_town_refusal(box)
+            ELoot.msg(type: "yellow", space: true,
+                      text: " The town locksmith will not open #{box.name}." \
+                            " Use the locksmith pool or a player locksmith.")
+            Inventory.single_drag(box, false)
+            return
+          end
+
           if res =~ /Gimme ([\d,]+) silvers/
             ELoot.data.silver_breakdown["Town Locksmith"] += -1 * $1.delete(",").to_i
             ELoot.data.silver_breakdown["Town Open"] += 1
@@ -7121,6 +7220,39 @@ module ELoot # Sells the loot
       Inventory.return_hands
     end
 
+    # The town locksmith will not work on "case" boxes -- it ignores them even when the box
+    # is held in hand, so it can only be opened by the locksmith pool or a player locksmith.
+    # Carrying one to town costs a silver withdrawal and a wasted trip every sell run.
+    POOL_ONLY_NOUNS = /\Acase\z/i.freeze unless defined?(POOL_ONLY_NOUNS)
+
+    # @param box [GameObj]
+    # @return [Boolean] false when the town locksmith cannot open this box
+    def self.town_openable?(box)
+      return true unless box.respond_to?(:noun)
+      return false if POOL_ONLY_NOUNS.match?(box.noun.to_s)
+
+      !ELoot.data.town_refused.to_a.include?(box.name)
+    end
+
+    # Safety net for box types not covered by POOL_ONLY_NOUNS. Session-scoped on purpose:
+    # a game update could change what the NPC accepts, so this is not persisted.
+    # @param box [GameObj]
+    def self.remember_town_refusal(box)
+      return unless box.respond_to?(:name)
+
+      (ELoot.data.town_refused ||= []).push(box.name).uniq!
+      ELoot.msg(type: "debug", text: "town_refused: #{ELoot.data.town_refused}")
+    end
+
+    # locksmith_pool exits the script outright when no tipping option is selected, so check
+    # before routing pool-only boxes there.
+    # @return [Boolean]
+    def self.pool_available?
+      ELoot.data.settings[:sell_locksmith_pool] &&
+        !ELoot.f2p? &&
+        (ELoot.data.settings[:use_standard_tipping] || ELoot.data.settings[:use_incremental_tipping])
+    end
+
     def self.process_boxes
       boxes = ELoot.find_boxes
       return unless boxes.any? || ELoot.data.settings[:always_check_pool]
@@ -7137,10 +7269,26 @@ module ELoot # Sells the loot
 
         # Refresh the boxes
         boxes = ELoot.find_boxes
+      elsif boxes.any? { |box| !Sell.town_openable?(box) } && Sell.pool_available?
+        # The gem bounty preference sends boxes to the town locksmith, but it cannot open
+        # these. Pool just those so the rest still go to town as the setting intends.
+        Sell.locksmith_pool(boxes.reject { |box| Sell.town_openable?(box) })
+        Sell.pool_return
+
+        boxes = ELoot.find_boxes
       end
 
-      # Go to Locksmith for remaining boxes
-      Sell.locksmith(boxes) if ELoot.data.settings[:sell_locksmith] && boxes.any?
+      # Go to Locksmith for remaining boxes. Never hand it a box it will refuse.
+      town_boxes, pool_needed = boxes.partition { |box| Sell.town_openable?(box) }
+      Sell.locksmith(town_boxes) if ELoot.data.settings[:sell_locksmith] && town_boxes.any?
+
+      # Anything still here can only be opened by the pool or a player locksmith, and the
+      # pool was unavailable this run. Leave it alone rather than carrying it nowhere.
+      if pool_needed.any?
+        ELoot.msg(type: "yellow", space: true,
+                  text: " Keeping #{pool_needed.length} box(es) the town locksmith cannot open: #{pool_needed.map(&:name).join(', ')}." \
+                        " Use the locksmith pool or a player locksmith.")
+      end
 
       # Deposit silvers if encumbered
       ELoot.silver_deposit if Char.percent_encumbrance > 80
