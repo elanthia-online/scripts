@@ -539,3 +539,362 @@ RSpec.describe 'ELoot::Sell.process_boxes routing' do
     expect(locksmith_open).to match(/ELoot\.in_hand\?\(box\)/)
   end
 end
+
+# RSpec for ELoot.marked_unsellable? and ELoot.toss (the trash/drop helper).
+#
+# box_loot_ground and Sell.save_trash_box each carried their own inline copies of the
+# same trash/drop-and-check-hand logic (once for a single item, once retried up to 4
+# times for a box), and Sell.dump_herbs_junk carried a third copy that polled instead of
+# waiting on roundtime. ELoot.toss consolidates all three into one helper, parameterized
+# on attempts/poll/notify_on_keep, with a mark-status safety check in front of every
+# attempt so a marked item is never sent to trash/drop in the first place.
+#
+# Same approach as the specs above: the real method bodies are extracted from eloot.lic
+# and evaluated into a bare module alongside named stubs for the collaborators they call
+# (ELoot.get_res, ELoot.msg, ELoot.in_hand?, ELoot.wait_rt, and the global fput). Sourcing
+# the shipped methods keeps this from drifting; if the source or a method cannot be found
+# the spec fails loudly rather than passing on a stale copy.
+
+RSpec.describe 'ELoot.marked_unsellable?' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_body) do
+    body = source[/^ {2}def self\.marked_unsellable\?[\s\S]*?^ {2}end$/]
+    raise "marked_unsellable? could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  let(:obj_class) { Struct.new(:name, :id) }
+
+  def obj(name, id = '60982408')
+    obj_class.new(name, id)
+  end
+
+  let(:calls) { [] }
+
+  # What the game sends back in response to the "mark <item> status" command, as the
+  # single matching line get_command would hand back. Each context below overrides
+  # this with one of the two real responses (or nil, for "no matching line found") to
+  # drive the branch under test.
+  let(:response) { nil }
+
+  let(:harness) do
+    recorder = calls
+    reply = response
+
+    mod = Module.new
+    mod.define_singleton_method(:get_command) do |command, _regex, **kw|
+      recorder << [:get_command, command, kw]
+      reply.nil? ? [] : [reply]
+    end
+    mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
+    mod.module_eval(method_body)
+    mod.const_set(:ELoot, mod)
+    mod
+  end
+
+  it 'asks for the item mark status by id' do
+    harness.marked_unsellable?(obj('a dark mithril lockpick', '60982408'))
+
+    expect(calls.map { |c| c[0..1] }).to include([:get_command, 'mark #60982408 status'])
+  end
+
+  it 'asks silently, without echoing the command or its response to the player' do
+    harness.marked_unsellable?(obj('a dark mithril lockpick', '60982408'))
+
+    expect(calls.find { |c| c.first == :get_command }.last).to eq(silent: true, quiet: true)
+  end
+
+  context 'when the item is not marked' do
+    let(:response) { 'Your dark mithril lockpick is not marked as unsellable.' }
+
+    it 'returns false' do
+      expect(harness.marked_unsellable?(obj('a dark mithril lockpick'))).to be false
+    end
+
+    it 'does not report anything about it' do
+      harness.marked_unsellable?(obj('a dark mithril lockpick'))
+
+      expect(calls.none? { |c| c.first == :msg }).to be true
+    end
+  end
+
+  context 'when the item has been marked as unsellable' do
+    let(:response) { 'Your sage green silk cloak has been marked as unsellable.' }
+
+    it 'returns true' do
+      expect(harness.marked_unsellable?(obj('a sage green silk cloak'))).to be true
+    end
+
+    it 'reports which item it is keeping' do
+      harness.marked_unsellable?(obj('a sage green silk cloak'))
+
+      expect(calls.last).to eq([:msg, { type: 'info', text: ' a sage green silk cloak is marked as unsellable, keeping it.' }])
+    end
+  end
+
+  context 'when no line matches (lag, an unrelated line, a timeout)' do
+    let(:response) { nil }
+
+    it 'fails open rather than blocking a legitimate toss' do
+      expect(harness.marked_unsellable?(obj('a dark mithril lockpick'))).to be false
+    end
+  end
+end
+
+RSpec.describe 'ELoot.toss' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_body) do
+    body = source[/^ {2}def self\.toss\b[\s\S]*?^ {2}end$/]
+    raise "toss could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  let(:obj_class) { Struct.new(:name, :id) }
+  let(:item) { obj_class.new('a rusty dagger', '12345') }
+
+  let(:fput_calls) { [] }
+  let(:wait_rt_calls) { [] }
+
+  # The item "leaves hand" once fput has been called `disposed_after` times. A value
+  # larger than `attempts` means it never leaves hand within the attempts under test.
+  let(:disposed_after) { 1 }
+  let(:marked) { false }
+
+  let(:harness) do
+    fputs = fput_calls
+    waits = wait_rt_calls
+    need = disposed_after
+    is_marked = marked
+
+    mod = Module.new
+    mod.define_singleton_method(:marked_unsellable?) { |_obj| is_marked }
+    mod.define_singleton_method(:fput) { |cmd| fputs << cmd }
+    mod.define_singleton_method(:in_hand?) { |_obj| fputs.length < need }
+    mod.define_singleton_method(:wait_rt) { waits << true }
+    mod.module_eval(method_body)
+    mod.const_set(:ELoot, mod)
+    mod
+  end
+
+  context 'when the item is marked as unsellable' do
+    let(:marked) { true }
+
+    it 'never attempts to toss it' do
+      harness.toss(item, 'trash')
+
+      expect(fput_calls).to be_empty
+    end
+
+    it 'returns false so the caller stows it back' do
+      expect(harness.toss(item, 'trash')).to be false
+    end
+  end
+
+  context 'when unmarked and disposed on the first attempt' do
+    it 'issues the toss command with the item id' do
+      harness.toss(item, 'trash')
+
+      expect(fput_calls).to eq(['trash #12345'])
+    end
+
+    it 'uses the given toss_cmd verbatim (drop vs trash)' do
+      harness.toss(item, 'drop')
+
+      expect(fput_calls).to eq(['drop #12345'])
+    end
+
+    it 'returns true' do
+      expect(harness.toss(item, 'trash')).to be true
+    end
+
+    it 'waits on roundtime by default' do
+      harness.toss(item, 'trash')
+
+      expect(wait_rt_calls.length).to eq(1)
+    end
+  end
+
+  context 'when unmarked but still in hand after the only attempt (attempts: 1 default)' do
+    let(:disposed_after) { 2 }
+
+    it 'returns false' do
+      expect(harness.toss(item, 'trash')).to be false
+    end
+
+    it 'only tries once' do
+      harness.toss(item, 'trash')
+
+      expect(fput_calls.length).to eq(1)
+    end
+
+    it 'stays silent by default (notify_on_keep: false)' do
+      recorder = fput_calls
+      mod = harness
+      msgs = []
+      mod.define_singleton_method(:msg) { |**kw| msgs << kw }
+
+      mod.toss(item, 'trash')
+
+      expect(msgs).to be_empty
+      expect(recorder.length).to eq(1) # sanity: the attempt still happened
+    end
+
+    it 'reports it when notify_on_keep is true' do
+      mod = harness
+      msgs = []
+      mod.define_singleton_method(:msg) { |**kw| msgs << kw }
+
+      mod.toss(item, 'trash', notify_on_keep: true)
+
+      expect(msgs).to eq([{ type: 'info', text: " #{item.name} isn't trashed so maybe its special...keeping it." }])
+    end
+  end
+
+  context 'with attempts: 4 (the box-toss retry)' do
+    context 'and it never leaves hand' do
+      let(:disposed_after) { 99 }
+
+      it 'tries exactly 4 times, no more' do
+        harness.toss(item, 'trash', attempts: 4)
+
+        expect(fput_calls.length).to eq(4)
+      end
+
+      it 'returns false' do
+        expect(harness.toss(item, 'trash', attempts: 4)).to be false
+      end
+    end
+
+    context 'and it leaves hand on the 3rd attempt' do
+      let(:disposed_after) { 3 }
+
+      it 'stops retrying once it is gone, instead of always spending all 4' do
+        harness.toss(item, 'trash', attempts: 4)
+
+        expect(fput_calls.length).to eq(3)
+      end
+
+      it 'returns true' do
+        expect(harness.toss(item, 'trash', attempts: 4)).to be true
+      end
+    end
+  end
+
+  context 'with poll: true (dump_herbs_junk\'s fast in-hand poll)' do
+    it 'never waits on roundtime' do
+      harness.toss(item, 'trash', poll: true)
+
+      expect(wait_rt_calls).to be_empty
+    end
+
+    it 'still disposes correctly' do
+      expect(harness.toss(item, 'trash', poll: true)).to be true
+    end
+
+    context 'when the item survives' do
+      let(:disposed_after) { 2 }
+
+      it 'still returns false' do
+        expect(harness.toss(item, 'trash', poll: true)).to be false
+      end
+    end
+  end
+
+  it 'checks mark status before ever attempting a toss' do
+    mark_check = method_body.index(/marked_unsellable\?/)
+    retry_loop = method_body.index(/attempts\.times/)
+
+    expect(mark_check).not_to be_nil
+    expect(retry_loop).not_to be_nil
+    expect(mark_check).to be < retry_loop
+  end
+end
+
+# RSpec for the trash/drop call-site refactor (box_loot_ground, Sell.save_trash_box,
+# Sell.dump_herbs_junk). Before this, all 5 call sites carried their own copy of the
+# fput/wait/check-hand sequence; a unit spec on ELoot.toss alone cannot catch a call site
+# drifting back to an inline copy, so the wiring is pinned here against the shipped
+# source, the same way the box-looting call sites above are pinned.
+
+RSpec.describe 'ELoot trash/drop call sites' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  # Indent-agnostic: box_loot_ground/save_trash_box/dump_herbs_junk sit at different
+  # nesting depths (Loot vs Sell vs top-level ELoot), unlike the fixed-indent helper
+  # used elsewhere in this file.
+  def method_body(source, name)
+    match = source.match(/^( +)def self\.#{Regexp.escape(name)}\b[\s\S]*?\n\1end$/)
+    raise "#{name} could not be extracted from eloot.lic" unless match
+
+    match[0]
+  end
+
+  let(:box_loot_ground) { method_body(source, 'box_loot_ground') }
+  let(:save_trash_box) { method_body(source, 'save_trash_box') }
+  let(:dump_herbs_junk) { method_body(source, 'dump_herbs_junk') }
+
+  it 'routes every trash/drop call site through the shared helper' do
+    expect(source.scan(/ELoot\.toss\(/).length).to eq(5)
+  end
+
+  it 'leaves the raw toss command in exactly one place: inside the helper itself' do
+    expect(source.scan('fput("#{toss_cmd}').length).to eq(1)
+  end
+
+  it 'box_loot_ground tosses box contents with the 1-attempt default, and the box itself with 4' do
+    expect(box_loot_ground).to match(/Inventory\.single_drag\(item\) unless ELoot\.toss\(item, toss_cmd\)/)
+    expect(box_loot_ground).to match(/ELoot\.toss\(box, toss_cmd, attempts: 4\)/)
+  end
+
+  it 'save_trash_box tosses box contents with the 1-attempt default, and the box itself with 4' do
+    expect(save_trash_box).to match(/Inventory\.single_drag\(item\) unless ELoot\.toss\(item, toss_cmd\)/)
+    expect(save_trash_box).to match(/ELoot\.toss\(box, toss_cmd, attempts: 4\)/)
+  end
+
+  it 'dump_herbs_junk keeps its fast poll and keep-notification behavior' do
+    expect(dump_herbs_junk).to match(/ELoot\.toss\(item, toss_cmd, poll: true, notify_on_keep: true\)/)
+  end
+end
