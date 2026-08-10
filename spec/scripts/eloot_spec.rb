@@ -880,8 +880,11 @@ RSpec.describe 'ELoot trash/drop call sites' do
     expect(source.scan(/ELoot\.toss\(/).length).to eq(5)
   end
 
+  # Single-quoted deliberately: this is a literal substring match against the source
+  # text, not interpolation. Double-quoting would try to interpolate a `toss_cmd`
+  # local that doesn't exist in this spec and raise NameError.
   it 'leaves the raw toss command in exactly one place: inside the helper itself' do
-    expect(source.scan('fput("#{toss_cmd}').length).to eq(1)
+    expect(source.scan('fput("#{toss_cmd}').length).to eq(1) # rubocop:disable Lint/InterpolationCheck
   end
 
   it 'box_loot_ground tosses box contents with the 1-attempt default, and the box itself with 4' do
