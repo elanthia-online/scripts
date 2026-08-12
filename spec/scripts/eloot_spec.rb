@@ -513,7 +513,7 @@ RSpec.describe 'ELoot::Sell.process_boxes routing' do
   end
 
   it 'filters the town locksmith list through town_openable?' do
-    expect(process_boxes).to match(/partition \{ \|box\| Sell\.town_openable\?\(box\) \}/)
+    expect(process_boxes).to match(/town_boxes = boxes\.select \{ \|box\| Sell\.town_openable\?\(box\) \}/)
     expect(process_boxes).to match(/Sell\.locksmith\(town_boxes\)/)
   end
 
@@ -537,6 +537,151 @@ RSpec.describe 'ELoot::Sell.process_boxes routing' do
     expect(locksmith_open).to match(/ignores you/)
     expect(locksmith_open).to match(/Sell\.remember_town_refusal\(box\)/)
     expect(locksmith_open).to match(/ELoot\.in_hand\?\(box\)/)
+  end
+end
+
+# RSpec for the "Locksmith Priority" setting (Pool First / Locksmith First), which only
+# matters when both sell_locksmith and sell_locksmith_pool are enabled. process_boxes'
+# locksmith_first gating is asserted structurally, same as the rest of process_boxes -- it
+# cannot be exercised without the Lich runtime. Sell.route_town_then_pool has no navigation
+# of its own, though, so it is exercised for real against a small stand-in for Sell/ELoot.
+
+RSpec.describe 'ELoot::Sell locksmith_priority routing' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  def method_body(source, name)
+    body = source[/^ {4}def self\.#{Regexp.escape(name)}\b[\s\S]*?^ {4}end$/]
+    raise "#{name} could not be extracted from eloot.lic" unless body
+
+    body
+  end
+
+  let(:process_boxes) { method_body(source, 'process_boxes') }
+  let(:route_town_then_pool_body) { method_body(source, 'route_town_then_pool') }
+
+  it 'defaults locksmith_priority to pool, so existing setups keep their current behavior' do
+    line = source[/^\s*locksmith_priority: \{ default: '(\w+)' \},$/, 1]
+    expect(line).to eq('pool')
+  end
+
+  context 'process_boxes locksmith_first gating' do
+    it 'only takes the locksmith-first path with both routes enabled and no gem-bounty override' do
+      expect(process_boxes).to match(/locksmith_first = !skip_for_gem_bounty && pool_enabled && town_enabled &&/)
+      expect(process_boxes).to match(/ELoot\.data\.settings\[:locksmith_priority\] == 'locksmith'/)
+    end
+
+    it 'routes through route_town_then_pool only on the locksmith-first path' do
+      expect(process_boxes).to match(/if locksmith_first\s*\n\s*boxes = Sell\.route_town_then_pool\(boxes\)/)
+    end
+
+    it 'still reports leftover boxes the same way regardless of which path ran' do
+      expect(process_boxes).to match(/pool_needed = boxes\.reject \{ \|box\| Sell\.town_openable\?\(box\) \}/)
+    end
+  end
+
+  context 'route_town_then_pool' do
+    let(:obj_class) { Struct.new(:name, :noun) }
+
+    def obj(name, noun)
+      obj_class.new(name, noun)
+    end
+
+    let(:calls) { [] }
+    let(:town_openable) { {} } # box name => bool, defaults to true
+    let(:find_boxes_queue) { [] } # successive ELoot.find_boxes return values
+    let(:pool_available) { true }
+
+    let(:harness) do
+      log = calls
+      openable = town_openable
+      queue = find_boxes_queue
+      avail = pool_available
+
+      eloot = Module.new
+      eloot.define_singleton_method(:find_boxes) { queue.shift || [] }
+
+      mod = Module.new
+      mod.const_set(:ELoot, eloot)
+      mod.define_singleton_method(:town_openable?) { |box| openable.fetch(box.name, true) }
+      mod.define_singleton_method(:locksmith) { |boxes| log << [:locksmith, boxes.map(&:name)] }
+      mod.define_singleton_method(:pool_available?) do
+        log << [:pool_available?]
+        avail
+      end
+      mod.define_singleton_method(:locksmith_pool) { |boxes| log << [:locksmith_pool, boxes.map(&:name)] }
+      mod.define_singleton_method(:pool_return) { log << [:pool_return] }
+      mod.const_set(:Sell, mod)
+      mod.module_eval(route_town_then_pool_body)
+      mod
+    end
+
+    it 'sends only town-openable boxes to the town locksmith first' do
+      openable_box = obj('a steel strongbox', 'strongbox')
+      pool_only_box = obj('a delicate case', 'case')
+      town_openable[pool_only_box.name] = false
+      find_boxes_queue.replace([[], []])
+
+      harness.route_town_then_pool([openable_box, pool_only_box])
+
+      expect(calls.first).to eq([:locksmith, ['a steel strongbox']])
+    end
+
+    it 'refreshes from the room before deciding what to pool, not the pre-town list' do
+      box = obj('a steel strongbox', 'strongbox')
+      # Still present after the town run (e.g. a mid-run refusal), gone after the pool.
+      find_boxes_queue.replace([[box], []])
+
+      harness.route_town_then_pool([box])
+
+      expect(calls).to include([:locksmith_pool, ['a steel strongbox']])
+      expect(calls).to include([:pool_return])
+    end
+
+    it 'does not visit the pool when nothing is left after town' do
+      box = obj('a steel strongbox', 'strongbox')
+      find_boxes_queue.replace([[]])
+
+      harness.route_town_then_pool([box])
+
+      expect(calls.map(&:first)).not_to include(:locksmith_pool)
+    end
+
+    context 'when the pool is unavailable' do
+      let(:pool_available) { false }
+
+      it 'does not visit the pool' do
+        box = obj('a delicate case', 'case')
+        town_openable[box.name] = false
+        find_boxes_queue.replace([[box]])
+
+        harness.route_town_then_pool([box])
+
+        expect(calls.map(&:first)).not_to include(:locksmith_pool)
+      end
+    end
+
+    it 'returns whatever is still present after both routes have run' do
+      box = obj('a steel strongbox', 'strongbox')
+      leftover = [box]
+      find_boxes_queue.replace([[box], leftover])
+
+      result = harness.route_town_then_pool([box])
+
+      expect(result).to equal(leftover)
+    end
   end
 end
 
