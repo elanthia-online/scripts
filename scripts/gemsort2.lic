@@ -1,104 +1,606 @@
 =begin
-  Rehash of gemsort.lic.
-  Usage example:
-    ;gemsort2 SOURCE DESTINATION VALUE
-    ;gemsort2 sack vest 2000
-    ;gemsort2 "black sack" pouch 3000
-    ;gemsort2 pouch "blue cloak" 2500
+  gemsort2.lic
+  Rehash of gemsort.lic with added max value, GUI setup, and chrism gem mode.
 
-  Will run through your source bag and sell gems under the stated value.
-  Will put items over value in the destination bag.
-  If no value is specified, will default to 1600.
+  Usage:
+    ;gemsort2                                    -- run with saved GUI settings
+    ;gemsort2 setup                              -- open GTK setup GUI
+    ;gemsort2 reset                              -- clear saved settings
+    ;gemsort2 SOURCE DEST MIN                    -- run with command line args (min value only)
+    ;gemsort2 SOURCE DEST MIN MAX                -- run with command line args (min and max value)
+    ;gemsort2 SOURCE DEST --chrism=RANGE[,RANGE] -- run with chrism gem range(s), CLI equivalent of GUI chrism mode
+
+  Optional flags (combinable with any of the forms above, GTK not required):
+    --chrism=Dull,Bright   -- filter by one or more chrism value ranges instead of MIN/MAX
+    --deposit               -- deposit silvers after sorting
+    --bank=local|fwi        -- bank location for deposit (default: local)
+    --noun=WORD              -- jewelry noun to turn, required when --bank=fwi
+
+  Examples:
+    ;gemsort2 sack vest 2000
+    ;gemsort2 sack vest 3000 5000
+    ;gemsort2 "black sack" pouch 3000
+    ;gemsort2 sack vest --chrism=Dull,Ordinary --deposit --bank=fwi --noun=locket
+
+  Will run through your source bag and sell gems outside the min/max value range.
+  Will put gems within range in the destination bag.
+  If no min value specified, defaults to 1600.
+  If no max value specified, no upper limit is applied.
+
+  All settings reachable through the GTK setup GUI (;gemsort2 setup) are also reachable
+  from the command line via the flags above, so non-GTK frontends have full feature parity.
 
         author: elanthia-online
-  contributors: Naamit, Zhiart
+  contributors: Naamit, Zhiart, Hexbane
           game: Gemstone
-          tags: gems, sorting
-       version: 1.0.4
+          tags: gems, sorting, chrism
+       version: 2.0.0
 
-  Help Contribute: https://github.com/elanthia-online/scripts
+  Chrism gem value ranges (based on wiki research):
+    Dull     -- 3,000 to  4,999
+    Ordinary -- 5,000 to  7,999
+    Bright   -- 8,000 to 12,999
+    Vibrant  -- 13,000 to 19,999
+    Glowing  -- 20,000+
+
   Version Control:
-    Major_change.feature_addition.bugfix
+  v2.0.0 (2026-08-09)
+    - Removed the local number_commas helper entirely; all comma-formatting now uses
+      Lich core's Numeric#with_commas (lib/common/class_exts/numeric.rb) instead of a
+      redundant reimplementation
+    - Added CLI flags (--chrism, --deposit, --bank, --noun) for full parity with the GTK setup GUI
+    - Fixed saved-settings min value silently overriding an explicit user-chosen value below 1600
+    - Fixed SetupGUI using process-wide module state; now uses per-invocation local state
+    - Regexp.escape source/destination container names before building match regex
+    - Narrowed settings-load error handling to surface a warning instead of failing silently
+    - Added YARD documentation to all public methods
+    - Added max value filter
+    - Added GTK setup GUI with chrism gem preset ranges
+    - Added YAML settings persistence
   v1.0.4 (2023-09-19)
     - Bugfix
   v1.0.3 (2023-07-26)
-    - update usage examples
-    - code cleanup
+    - update usage examples / code cleanup
   v1.0.2 (2020-09-12)
     - Comma and regex support c/o Xanlin
   v1.0.1 (2017-09-27)
-    - Change SELL_VALUE to include optional mininmum value; updated usage instructions
+    - Change SELL_VALUE to include optional minimum value
   v1.0.0 (2017-05-01)
     - Import from ;gemsort (Author: Zhairt)
-
 =end
 
+require 'yaml'
+require 'fileutils'
+
 module GemSort2
-  if Script.current.vars[3].nil?
-    @sell_value = 1600
-  else
-    @sell_value = Script.current.vars[3].to_i
+  # Default minimum gem value to keep when neither MIN nor a chrism range is specified.
+  DEFAULT_MIN_VALUE = 1600
+
+  # Preset chrism gem value ranges, keyed by display name.
+  # max: nil means "no upper limit" (Glowing).
+  CHRISM_RANGES = {
+    'Dull'     => { min: 3_000,  max: 4_999  },
+    'Ordinary' => { min: 5_000,  max: 7_999  },
+    'Bright'   => { min: 8_000,  max: 12_999 },
+    'Vibrant'  => { min: 13_000, max: 19_999 },
+    'Glowing'  => { min: 20_000, max: nil    },
+  }.freeze
+
+  # Path to this character's saved GemSort2 settings file.
+  #
+  # @return [String] absolute path under DATA_DIR, namespaced by game and character
+  def self.settings_path
+    File.join(DATA_DIR, XMLData.game, Char.name, 'gemsort2.yaml')
   end
 
-  def self.appraise_gems(source_sack, destination_sack)
-    container = GameObj.inv.find { |inv_item| inv_item.name =~ /\b#{source_sack}\b/ }
-    gem_container = GameObj.inv.find { |inv_item| inv_item.name =~ /\b#{destination_sack}\b/ }
-    kept_amount = kept_gems = sold_amount = sold_gems = 0
+  # Load this character's saved settings, if any.
+  #
+  # @return [Hash] the saved settings hash, or {} if none exist or the file is unreadable
+  def self.load_settings
+    return {} unless File.exist?(settings_path)
 
-    gems = container.contents.select { |item|
-      item.type =~ /gem/
-    }
-
-    silence_me
-    gems.each { |gem|
-      dothistimeout "take ##{gem.id} from  ##{container.id}", 5, /^You remove|You retrieve/
-      fput "appraise ##{gem.id}"
-      result = matchfind("I'll give you ? for it").delete(',').to_i
-      if result < @sell_value then
-        echo "#{result} < #{@sell_value}, selling"
-        fput "sell ##{gem.id}"
-        sold_amount += result
-        sold_gems += 1
-      else
-        dothistimeout "put ##{gem.id} in  ##{gem_container.id}", 5, /^You put/
-        kept_amount += result
-        kept_gems += 1
-      end
-    }
-    silence_me
-    respond "All gems sorted"
-    return kept_amount, kept_gems, sold_amount, sold_gems
-  end
-
-  # Go2 the gemshop and return only once there
-  def self.go_to_gemshop
-    unless Room.current.tags.include?('gemshop')
-      Script.run('go2', 'gemshop')
+    begin
+      YAML.load_file(settings_path) || {}
+    rescue StandardError => e
+      echo "WARNING: Could not read saved GemSort2 settings (#{e.class}: #{e.message}). Run ;gemsort2 reset to clear them."
+      {}
     end
   end
 
-  def self.number_commas(number)
-    return number.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  # Persist a settings hash for this character, creating the containing
+  # directory (including any missing parents) if needed.
+  #
+  # @param data [Hash] settings hash; see SetupGUI#run / .settings_from_cli for the expected shape
+  # @return [void]
+  def self.save_settings(data)
+    FileUtils.mkdir_p(File.dirname(settings_path))
+    File.write(settings_path, data.to_yaml)
   end
 
-  def self.main
+  # Resolve a settings hash (from saved YAML, the GTK GUI, or parsed CLI flags)
+  # into the concrete min/max/ranges appraise_gems needs. This is the single
+  # source of truth for that resolution so the saved-settings run path, the
+  # CLI run path, and the GUI can never define "what min value applies" three
+  # different ways.
+  #
+  # @param settings [Hash] expected keys: 'chrism_mode', 'chrism_ranges', 'min_value', 'max_value'
+  # @return [Array(Integer, nil), Array(Integer, Integer, nil), Array(nil, nil, Array<String>)]
+  #   a 3-element array: [min_value, max_value, ranges] where exactly one of
+  #   ([min_value, max_value], ranges) is meaningful -- ranges is nil unless chrism mode is active
+  def self.resolve_range(settings)
+    if settings['chrism_mode'] && Array(settings['chrism_ranges']).any?
+      [nil, nil, Array(settings['chrism_ranges'])]
+    else
+      raw_min = settings['min_value'].to_i
+      min_value = raw_min < 1 ? DEFAULT_MIN_VALUE : raw_min
+      raw_max = settings['max_value'].to_i
+      max_value = raw_max < 1 ? nil : raw_max
+      [min_value, max_value, nil]
+    end
+  end
+
+  # Parse CLI-style arguments into a settings hash with the same shape the
+  # GTK setup GUI produces, giving non-GTK frontends full feature parity.
+  #
+  # Positional form: SOURCE DEST [MIN [MAX]]
+  # Flags (any order, combinable with positionals): --chrism=RANGE[,RANGE] --deposit --bank=local|fwi --noun=WORD
+  #
+  # @param argv [Array<String>] Script.current.vars[1..] style argument list
+  # @return [Hash] settings hash suitable for GemSort2.main
+  def self.settings_from_cli(argv)
+    positional = []
+    flags = {}
+
+    argv.each do |token|
+      if token.start_with?('--')
+        key, _, value = token[2..].partition('=')
+        flags[key] = value.empty? ? true : value
+      else
+        positional << token
+      end
+    end
+
+    settings = {
+      'source'       => positional[0],
+      'destination'  => positional[1],
+      'deposit'      => flags.key?('deposit'),
+      'deposit_bank' => flags['bank'] == 'fwi' ? 'fwi' : 'local',
+      'fwi_noun'     => flags['noun'].to_s,
+    }
+
+    if flags['chrism']
+      raw = flags['chrism'].to_s.split(',').map(&:strip)
+      normalized = raw.map { |r| CHRISM_RANGES.keys.find { |k| k.casecmp?(r) } || r }
+      unknown = normalized.reject { |r| CHRISM_RANGES.key?(r) }
+      unless unknown.empty?
+        echo "ERROR: Unknown chrism range(s): #{unknown.join(', ')}. Valid ranges: #{CHRISM_RANGES.keys.join(', ')}."
+        exit
+      end
+      settings['chrism_mode']   = true
+      settings['chrism_ranges'] = normalized
+    else
+      settings['chrism_mode']   = false
+      settings['min_value']     = positional[2].to_i
+      settings['max_value']     = positional[3].to_i
+    end
+
+    settings
+  end
+
+  # ----------------------------
+  # GTK Setup GUI
+  # ----------------------------
+  module SetupGUI
+    # Open the GTK setup GUI, let the user configure source/destination,
+    # chrism ranges or a manual min/max, and deposit options, then persist
+    # the result. All state is local to this call so concurrent invocations
+    # from different sessions in the same process don't interfere with each
+    # other.
+    #
+    # @return [void]
+    def self.run
+      unless defined?(Gtk) && Gtk::Version::MAJOR == 3
+        echo "GTK3 is not available. Cannot open setup GUI -- use CLI flags instead (see ;gemsort2 for usage)."
+        exit
+      end
+
+      saved = GemSort2.load_settings
+      running = true
+      result  = nil
+      win = src_entry = dst_entry = nil
+      chrism_check = nil
+      chrism_checks = {}
+      min_entry = max_entry = nil
+      deposit_check = radio_local = radio_fwi = fwi_noun_entry = nil
+
+      Gtk.queue do
+        win = Gtk::Window.new(:toplevel)
+        win.set_title("GemSort2 Setup")
+        win.set_default_size(420, 580)
+        win.set_border_width(12)
+        win.keep_above = true
+
+        outer = Gtk::Box.new(:vertical, 8)
+        win.add(outer)
+
+        grid = Gtk::Grid.new
+        grid.set_column_spacing(12)
+        grid.set_row_spacing(8)
+        outer.pack_start(grid, expand: false, fill: false, padding: 0)
+
+        # Source container
+        lbl_src = Gtk::Label.new("Source Container:")
+        lbl_src.set_halign(:end)
+        grid.attach(lbl_src, 0, 0, 1, 1)
+        src_entry = Gtk::Entry.new
+        src_entry.set_placeholder_text("e.g. sack")
+        src_entry.set_text(saved['source'].to_s) unless saved['source'].to_s.empty?
+        src_entry.set_hexpand(true)
+        grid.attach(src_entry, 1, 0, 1, 1)
+
+        # Destination container
+        lbl_dst = Gtk::Label.new("Destination Container:")
+        lbl_dst.set_halign(:end)
+        grid.attach(lbl_dst, 0, 1, 1, 1)
+        dst_entry = Gtk::Entry.new
+        dst_entry.set_placeholder_text("e.g. vest")
+        dst_entry.set_text(saved['destination'].to_s) unless saved['destination'].to_s.empty?
+        dst_entry.set_hexpand(true)
+        grid.attach(dst_entry, 1, 1, 1, 1)
+
+        sep1 = Gtk::Separator.new(:horizontal)
+        outer.pack_start(sep1, expand: false, fill: false, padding: 4)
+
+        # Chrism mode checkbox
+        chrism_check = Gtk::CheckButton.new("Chrism Gem Mode (select a value range below)")
+        chrism_check.active = saved['chrism_mode'] == true
+        outer.pack_start(chrism_check, expand: false, fill: false, padding: 0)
+
+        # Chrism range checkboxes -- multiple selections allowed
+        chrism_frame = Gtk::Frame.new("Chrism Value Ranges (select one or more)")
+        chrism_vbox  = Gtk::Box.new(:vertical, 4)
+        chrism_vbox.set_border_width(8)
+        chrism_frame.add(chrism_vbox)
+        outer.pack_start(chrism_frame, expand: false, fill: false, padding: 0)
+
+        saved_ranges = Array(saved['chrism_ranges'])
+        GemSort2::CHRISM_RANGES.each do |name, range|
+          max_label = range[:max] ? range[:max].with_commas : "no limit"
+          label     = "#{name} (#{range[:min].with_commas} to #{max_label})"
+          checkbox = Gtk::CheckButton.new(label)
+          checkbox.active = saved_ranges.include?(name)
+          chrism_vbox.pack_start(checkbox, expand: false, fill: false, padding: 0)
+          chrism_checks[name] = checkbox
+        end
+
+        # Enable/disable chrism range based on checkbox
+        chrism_frame.sensitive = chrism_check.active?
+        chrism_check.signal_connect("toggled") do
+          chrism_frame.sensitive = chrism_check.active?
+        end
+
+        sep2 = Gtk::Separator.new(:horizontal)
+        outer.pack_start(sep2, expand: false, fill: false, padding: 4)
+
+        # Manual min/max (when not using chrism mode)
+        manual_lbl = Gtk::Label.new("Manual Value Range (used when Chrism Mode is off):")
+        manual_lbl.set_halign(:start)
+        outer.pack_start(manual_lbl, expand: false, fill: false, padding: 0)
+
+        manual_grid = Gtk::Grid.new
+        manual_grid.set_column_spacing(12)
+        manual_grid.set_row_spacing(6)
+        outer.pack_start(manual_grid, expand: false, fill: false, padding: 0)
+
+        lbl_min = Gtk::Label.new("Min Value:")
+        lbl_min.set_halign(:end)
+        manual_grid.attach(lbl_min, 0, 0, 1, 1)
+        min_entry = Gtk::Entry.new
+        min_entry.set_placeholder_text("e.g. 3000 (default #{GemSort2::DEFAULT_MIN_VALUE})")
+        min_entry.set_text(saved['min_value'].to_s) if saved['min_value'].to_i > 0
+        min_entry.set_hexpand(true)
+        manual_grid.attach(min_entry, 1, 0, 1, 1)
+
+        lbl_max = Gtk::Label.new("Max Value:")
+        lbl_max.set_halign(:end)
+        manual_grid.attach(lbl_max, 0, 1, 1, 1)
+        max_entry = Gtk::Entry.new
+        max_entry.set_placeholder_text("e.g. 5000 (blank = no limit)")
+        max_entry.set_text(saved['max_value'].to_s) if saved['max_value'].to_i > 0
+        max_entry.set_hexpand(true)
+        manual_grid.attach(max_entry, 1, 1, 1, 1)
+
+        sep3 = Gtk::Separator.new(:horizontal)
+        outer.pack_start(sep3, expand: false, fill: false, padding: 4)
+
+        # Deposit after sorting
+        deposit_check = Gtk::CheckButton.new("Deposit silvers after sorting")
+        deposit_check.active = saved['deposit'] == true
+        outer.pack_start(deposit_check, expand: false, fill: false, padding: 0)
+
+        deposit_frame = Gtk::Frame.new("Bank Location")
+        deposit_vbox  = Gtk::Box.new(:vertical, 6)
+        deposit_vbox.set_border_width(8)
+        deposit_frame.add(deposit_vbox)
+        outer.pack_start(deposit_frame, expand: false, fill: false, padding: 0)
+
+        radio_local = Gtk::RadioButton.new(label: "Local bank (go2 bank)")
+        radio_fwi   = Gtk::RadioButton.new(member: radio_local, label: "Four Winds Isle (turn jewelry)")
+        radio_fwi.active   = saved['deposit_bank'] == 'fwi'
+        radio_local.active = saved['deposit_bank'] != 'fwi'
+        deposit_vbox.pack_start(radio_local, expand: false, fill: false, padding: 0)
+        deposit_vbox.pack_start(radio_fwi,   expand: false, fill: false, padding: 0)
+
+        fwi_row = Gtk::Box.new(:horizontal, 8)
+        fwi_row.set_margin_start(20)
+        lbl_noun = Gtk::Label.new("Jewelry noun:")
+        lbl_noun.set_halign(:end)
+        fwi_row.pack_start(lbl_noun, expand: false, fill: false, padding: 0)
+        fwi_noun_entry = Gtk::Entry.new
+        fwi_noun_entry.set_placeholder_text("e.g. locket, pendant, brooch")
+        fwi_noun_entry.set_text(saved['fwi_noun'].to_s) unless saved['fwi_noun'].to_s.empty?
+        fwi_noun_entry.set_hexpand(true)
+        fwi_row.pack_start(fwi_noun_entry, expand: true, fill: true, padding: 0)
+        deposit_vbox.pack_start(fwi_row, expand: false, fill: false, padding: 0)
+
+        # Show/hide FWI noun field based on radio
+        fwi_row.sensitive = radio_fwi.active?
+        radio_fwi.signal_connect("toggled")   { fwi_row.sensitive = radio_fwi.active? }
+        radio_local.signal_connect("toggled") { fwi_row.sensitive = radio_fwi.active? }
+
+        # Enable/disable deposit frame based on checkbox
+        deposit_frame.sensitive = deposit_check.active?
+        deposit_check.signal_connect("toggled") { deposit_frame.sensitive = deposit_check.active? }
+
+        sep4 = Gtk::Separator.new(:horizontal)
+        outer.pack_start(sep4, expand: false, fill: false, padding: 4)
+
+        btn_box = Gtk::Box.new(:horizontal, 8)
+        outer.pack_start(btn_box, expand: false, fill: false, padding: 0)
+
+        save_btn = Gtk::Button.new(label: "Save")
+        save_btn.signal_connect("clicked") do
+          data = {
+            'source'        => src_entry.text.strip,
+            'destination'   => dst_entry.text.strip,
+            'chrism_mode'   => chrism_check.active?,
+            'chrism_ranges' => chrism_checks.select { |_, checkbox| checkbox.active? }.keys,
+            'min_value'     => min_entry.text.strip.to_i,
+            'max_value'     => max_entry.text.strip.empty? ? nil : max_entry.text.strip.to_i,
+            'deposit'       => deposit_check.active?,
+            'deposit_bank'  => radio_fwi.active? ? 'fwi' : 'local',
+            'fwi_noun'      => fwi_noun_entry.text.strip,
+          }
+
+          GemSort2.save_settings(data)
+          result = data
+          win.destroy
+        end
+        btn_box.pack_end(save_btn, expand: false, fill: false, padding: 0)
+
+        cancel_btn = Gtk::Button.new(label: "Cancel")
+        cancel_btn.signal_connect("clicked") { win.destroy }
+        btn_box.pack_end(cancel_btn, expand: false, fill: false, padding: 0)
+
+        win.signal_connect("destroy") { Gtk.queue { running = false } }
+        win.show_all
+      end
+
+      wait_while { running }
+
+      if result
+        echo "Setup saved."
+        if result['chrism_mode'] && Array(result['chrism_ranges']).any?
+          result['chrism_ranges'].each do |name|
+            range = GemSort2::CHRISM_RANGES[name]
+            max_label = range[:max] ? range[:max].with_commas : 'no limit'
+            echo "  Chrism range: #{name} (#{range[:min].with_commas} to #{max_label})"
+          end
+        elsif !result['chrism_mode']
+          min_v = result['min_value'].to_i
+          max_v = result['max_value']
+          echo "  Manual range: #{min_v.with_commas} to #{max_v ? max_v.with_commas : 'no limit'}"
+        end
+      else
+        echo "Setup cancelled."
+      end
+    end
+  end
+
+  # ----------------------------
+  # Core sorting logic
+  # ----------------------------
+
+  # Walk every gem in source_sack, appraise it, and either move it to
+  # destination_sack (if its value is in range) or sell it (if not).
+  # Non-gem items are put back and reported as unsellable.
+  #
+  # @param source_sack [String] name/noun fragment of the container to pull gems from
+  # @param destination_sack [String] name/noun fragment of the container to keep gems in
+  # @param min_value [Integer, nil] minimum value to keep; ignored when ranges is present
+  # @param max_value [Integer, nil] maximum value to keep, or nil for no upper limit; ignored when ranges is present
+  # @param ranges [Array<String>, nil] chrism range names (keys of CHRISM_RANGES) to keep; overrides min_value/max_value when present
+  # @return [Array(Integer, Integer, Integer, Integer, Array<String>)]
+  #   kept_amount, kept_gems, sold_amount, sold_gems, unsellable_item_names
+  def self.appraise_gems(source_sack, destination_sack, min_value, max_value, ranges: nil)
+    container     = GameObj.inv.find { |i| i.name =~ /\b#{Regexp.escape(source_sack)}\b/ }
+    gem_container = GameObj.inv.find { |i| i.name =~ /\b#{Regexp.escape(destination_sack)}\b/ }
+
+    unless container
+      echo "ERROR: Could not find source container '#{source_sack}'."
+      exit
+    end
+    unless gem_container
+      echo "ERROR: Could not find destination container '#{destination_sack}'."
+      exit
+    end
+
+    kept_amount = kept_gems = sold_amount = sold_gems = 0
+    unsellable = []
+
+    gems = container.contents.select { |item| item.type =~ /gem/ }
+    echo "Found #{gems.length} gem(s) in #{source_sack}."
+
+    if ranges && ranges.any?
+      echo "Keeping gems matching chrism ranges: #{ranges.join(', ')}"
+    else
+      echo "Keeping gems valued #{min_value.with_commas} to #{max_value ? max_value.with_commas : 'no limit'}."
+    end
+
+    silence_me
+    gems.each do |gem|
+      dothistimeout "take ##{gem.id} from ##{container.id}", 5, /^You remove|You retrieve/
+      result_line = dothistimeout("appraise ##{gem.id}", 5, /I'll give you|not quite my field|only deal in/)
+      if result_line.nil?
+        echo "#{gem.name} -- no appraisal response (timed out), putting back."
+        dothistimeout "put ##{gem.id} in ##{container.id}", 5, /^You put/
+        unsellable << gem.name
+        next
+      end
+      if result_line =~ /not quite my field|only deal in/i
+        echo "#{gem.name} -- not a gem, putting back."
+        dothistimeout "put ##{gem.id} in ##{container.id}", 5, /^You put/
+        unsellable << gem.name
+        next
+      end
+      result = result_line.to_s.delete(',').scan(/\d+/).first.to_i
+
+      in_range = if ranges && ranges.any?
+                   ranges.any? do |r|
+                     rng = GemSort2::CHRISM_RANGES[r]
+                     next false unless rng
+
+                     result >= rng[:min] && (rng[:max].nil? || result <= rng[:max])
+                   end
+                 else
+                   result >= min_value && (max_value.nil? || result <= max_value)
+                 end
+
+      if in_range
+        dothistimeout "put ##{gem.id} in ##{gem_container.id}", 5, /^You put/
+        kept_amount += result
+        kept_gems   += 1
+        echo "#{result.with_commas} -- keeping"
+      else
+        echo "#{result.with_commas} -- selling (outside range)"
+        fput "sell ##{gem.id}"
+        sold_amount += result
+        sold_gems   += 1
+      end
+    end
+    silence_me
+
+    [kept_amount, kept_gems, sold_amount, sold_gems, unsellable]
+  end
+
+  # Deposit silvers at the configured bank location, optionally traveling to
+  # Four Winds Isle by turning a piece of jewelry first.
+  #
+  # @param settings [Hash] expects 'deposit_bank' ('local' or 'fwi') and, when 'fwi', 'fwi_noun'
+  # @return [void]
+  def self.do_deposit(settings)
+    bank = settings['deposit_bank']
+    fwi_noun = settings['fwi_noun'].to_s.strip
+
+    if bank == 'fwi'
+      if fwi_noun.empty?
+        echo "FWI deposit selected but no jewelry noun set. Skipping deposit."
+        return
+      end
+      echo "Turning #{fwi_noun} to travel to Four Winds Isle..."
+      fput "turn my #{fwi_noun}"
+      pause 3
+      waitrt?
+      Script.run('go2', 'bank')
+      waitrt?
+      fput "deposit all"
+      waitrt?
+      echo "Returning via #{fwi_noun}..."
+      fput "turn my #{fwi_noun}"
+      pause 3
+      waitrt?
+    else
+      echo "Traveling to local bank..."
+      Script.run('go2', 'bank')
+      waitrt?
+      fput "deposit all"
+      waitrt?
+    end
+    echo "Deposit complete."
+  end
+
+  # Travel to the gemshop unless already there.
+  #
+  # @return [void]
+  def self.go_to_gemshop
+    Script.run('go2', 'gemshop') unless Room.current.tags.include?('gemshop')
+  end
+
+  # Run a full sort using a settings hash (the common shape produced by the
+  # GTK GUI, saved YAML, and .settings_from_cli), so every entry point
+  # resolves min/max/ranges identically.
+  #
+  # @param settings [Hash] must include 'source', 'destination'; see .resolve_range for the rest
+  # @return [void]
+  def self.main(settings)
+    start_room = Room.current.id
     go_to_gemshop
-    kept_amount, kept_gems, sold_amount, sold_gems = appraise_gems(Script.current.vars[1], Script.current.vars[2])
-    respond "Kept #{kept_gems} gems worth a total of #{number_commas(kept_amount)}."
-    respond "Sold #{sold_gems} gems worth a total of #{number_commas(sold_amount)}."
+    min_value, max_value, ranges = resolve_range(settings)
+    kept_amount, kept_gems, sold_amount, sold_gems, unsellable =
+      appraise_gems(settings['source'], settings['destination'], min_value, max_value, ranges: ranges)
+
+    do_deposit(settings) if settings['deposit']
+
+    if start_room && start_room != Room.current.id
+      Script.run('go2', start_room.to_s)
+    end
+
+    respond ""
+    respond "All gems sorted."
+    respond "Kept #{kept_gems} gem(s) worth a total of #{kept_amount.with_commas}."
+    respond "Sold #{sold_gems} gem(s) worth a total of #{sold_amount.with_commas}."
+    if unsellable.any?
+      respond "Unsellable items returned: #{unsellable.length}."
+      unsellable.each { |name| respond "  -- #{name}" }
+    end
+    respond ""
   end
 end
 
-# Start code in main()
-if Script.current.vars[1].nil? || Script.current.vars[2].nil?
-  respond "You didn't specify the proper settings!"
-  respond "Usage: ;gemsort2 <SOURCESACK> <DESTINATION> <VALUE>"
-  respond ""
-  respond "Examples:"
-  respond "   ;gemsort2 sack vest 2000"
-  respond "   ;gemsort2 \"black sack\" pouch 3000"
-  respond "   ;gemsort2 pouch \"blue cloak\" 2500"
-  respond ""
-  exit
+# ----------------------------
+# Entry point
+# ----------------------------
+cmd = Script.current.vars[1].to_s.strip.downcase
+
+case cmd
+when 'setup'
+  GemSort2::SetupGUI.run
+when 'reset'
+  File.delete(GemSort2.settings_path) if File.exist?(GemSort2.settings_path)
+  echo "Settings cleared."
+when ''
+  # Run from saved settings (GTK GUI or a prior CLI run with --save, if ever added)
+  saved = GemSort2.load_settings
+  if saved.empty? || saved['source'].to_s.empty? || saved['destination'].to_s.empty?
+    respond "No settings saved. Run: ;gemsort2 setup, or pass arguments directly -- see ;gemsort2 help."
+    exit
+  end
+
+  GemSort2.main(saved)
+else
+  # Command line args: SOURCE DEST [MIN [MAX]] plus optional --chrism/--deposit/--bank/--noun flags
+  settings = GemSort2.settings_from_cli(Script.current.vars[1..-1])
+
+  if settings['source'].nil? || settings['destination'].nil?
+    respond "Usage: ;gemsort2 <SOURCE> <DESTINATION> <MIN> [MAX]"
+    respond "       ;gemsort2 <SOURCE> <DESTINATION> --chrism=RANGE[,RANGE] [--deposit --bank=local|fwi --noun=WORD]"
+    respond "       ;gemsort2 setup"
+    respond "Examples:"
+    respond "   ;gemsort2 sack vest 3000"
+    respond "   ;gemsort2 sack vest 3000 5000"
+    respond "   ;gemsort2 sack vest --chrism=Dull,Ordinary --deposit --bank=fwi --noun=locket"
+    exit
+  end
+
+  GemSort2.main(settings)
 end
-GemSort2.main
