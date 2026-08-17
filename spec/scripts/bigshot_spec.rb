@@ -555,9 +555,10 @@ end
 # separate Harness: this section exercises a different slice of bigshot -
 # the BigshotCreature adapter boundary and the helpers that read
 # Combat::Tracker data (dead_or_gone?, gone?, creature_backed?,
-# leader_target?) - rather than targeting/ranking. Kept independent of
-# BigshotPrioritySpec's Harness so neither section's stub state can leak
-# into the other.
+# npc_has_status?, npc_crtr_flag?, npc_low_hp?, npc_fatal_crit?,
+# npc_smote?, npc_ucs_position, npc_ucs_tierup, leader_target?) - rather
+# than targeting/ranking. Kept independent of BigshotPrioritySpec's Harness
+# so neither section's stub state can leak into the other.
 module BigshotCreatureAdapterSpec
   SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
@@ -573,6 +574,16 @@ module BigshotCreatureAdapterSpec
   CREATURE_BACKED_SRC = extract(/^  def creature_backed\?\(npc\).*?^  end$/m, 'creature_backed?')
   DEAD_OR_GONE_SRC = extract(/^  def dead_or_gone\?\(npc\).*?^  end$/m, 'dead_or_gone?')
   GONE_SRC = extract(/^  def gone\?\(npc\).*?^  end$/m, 'gone?')
+  NPC_HAS_STATUS_SRC = extract(/^  def npc_has_status\?\(npc, status_name\).*?^  end$/m, 'npc_has_status?')
+  NPC_CRTR_FLAG_SRC = extract(/^  def npc_crtr_flag\?\(npc, flag\).*?^  end$/m, 'npc_crtr_flag?')
+  NPC_FROZEN_SRC = extract(/^  def npc_frozen\?\(npc\).*?^  end$/m, 'npc_frozen?')
+  NPC_PRONE_SRC = extract(/^  def npc_prone\?\(npc\).*?^  end$/m, 'npc_prone?')
+  PRONE_CONSTS_SRC = extract(/^  PRONE \|\|=.*?^  PRONE_STATUSES \|\|=.*?$/m, 'PRONE constants')
+  NPC_LOW_HP_SRC = extract(/^  def npc_low_hp\?\(npc, threshold = 25\).*?^  end$/m, 'npc_low_hp?')
+  NPC_FATAL_CRIT_SRC = extract(/^  def npc_fatal_crit\?\(npc\).*?^  end$/m, 'npc_fatal_crit?')
+  NPC_SMOTE_SRC = extract(/^  def npc_smote\?\(npc\).*?^  end$/m, 'npc_smote?')
+  NPC_UCS_POSITION_SRC = extract(/^  def npc_ucs_position\(npc\).*?^  end$/m, 'npc_ucs_position')
+  NPC_UCS_TIERUP_SRC = extract(/^  def npc_ucs_tierup\(npc\).*?^  end$/m, 'npc_ucs_tierup')
   LEADER_TARGET_SRC = extract(/^  def leader_target\?\n.*?^  end$/m, 'leader_target?')
 
   # Configurable double for CreatureInstance. statuses/flags start empty so
@@ -694,6 +705,16 @@ module BigshotCreatureAdapterSpec
     eval(CREATURE_BACKED_SRC)
     eval(DEAD_OR_GONE_SRC)
     eval(GONE_SRC)
+    eval(NPC_HAS_STATUS_SRC)
+    eval(NPC_CRTR_FLAG_SRC)
+    eval(PRONE_CONSTS_SRC)
+    eval(NPC_FROZEN_SRC)
+    eval(NPC_PRONE_SRC)
+    eval(NPC_LOW_HP_SRC)
+    eval(NPC_FATAL_CRIT_SRC)
+    eval(NPC_SMOTE_SRC)
+    eval(NPC_UCS_POSITION_SRC)
+    eval(NPC_UCS_TIERUP_SRC)
     eval(LEADER_TARGET_SRC)
   end
 
@@ -816,25 +837,210 @@ module BigshotCreatureAdapterSpec
       end
     end
 
+    describe '#npc_has_status?' do
+      it 'reads the live status list' do
+        goblin.statuses << 'stunned'
+
+        expect(bs.npc_has_status?(bs.wrap(goblin), 'stunned')).to be true
+        expect(bs.npc_has_status?(bs.wrap(goblin), 'webbed')).to be false
+      end
+
+      it 'degrades to false rather than raising for a non-creature-backed npc' do
+        raw = RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, nil)
+        expect { bs.npc_has_status?(raw, 'stunned') }.not_to raise_error
+        expect(bs.npc_has_status?(raw, 'stunned')).to be false
+      end
+    end
+
+    describe '#npc_crtr_flag?' do
+      it 'reads the live classification flags' do
+        goblin.flags[:mini_boss] = true
+
+        expect(bs.npc_crtr_flag?(bs.wrap(goblin), :mini_boss)).to be true
+        expect(bs.npc_crtr_flag?(bs.wrap(goblin), :ascended)).to be false
+      end
+    end
+
+    describe '#npc_frozen? ("frozen" is the immobilized status)' do
+      it 'reads the native immobilized status, which the legacy string match misses' do
+        # The room text renders this as "(immobile)", so GameObj's status
+        # string never contains "frozen" for an XML-driven immobilize.
+        goblin.statuses << 'immobilized'
+        bs.room(goblin)
+        Harness::GameObj.registry = { '201' => RawGameObj.new('201', 'goblin', 'a snarling goblin', 'immobile', nil) }
+
+        expect(bs.npc_frozen?(bs.wrap(goblin))).to be true
+      end
+
+      it 'still honours the legacy GameObj "frozen" string as a fallback' do
+        bs.room(goblin) # no immobilized status set
+        Harness::GameObj.registry = { '201' => RawGameObj.new('201', 'goblin', 'a snarling goblin', 'frozen', nil) }
+
+        expect(bs.npc_frozen?(bs.wrap(goblin))).to be true
+      end
+
+      it 'is false when the creature is neither' do
+        bs.room(goblin)
+
+        expect(bs.npc_frozen?(bs.wrap(goblin))).to be false
+      end
+
+      it 'is false for a nil npc rather than raising' do
+        expect(bs.npc_frozen?(nil)).to be false
+      end
+    end
+
+    describe '#npc_prone? (crtrStatus carries several statuses; GameObj.status carries one)' do
+      it 'sees prone on a creature whose room text advertises a different status' do
+        # Straight from a real feed line:
+        #   <crtrStatus exist="153281570" hostile="1" stunned="1" prone="1" inferior="1"/>
+        #   ...<a exist="153281570" noun="dybbuk">dybbuk</a> that appears stunned.
+        # The parser assigns a single capture, so GameObj.status is "stunned"
+        # even though the creature is also prone. The old regex also returned
+        # true here (because "stunned" is itself in PRONE); this asserts the
+        # native read reaches the same answer from the accurate source.
+        dybbuk = FakeCreatureInstance.new(153281570, 'dybbuk', 'a dybbuk')
+        dybbuk.flags[:hostile] = true
+        dybbuk.flags[:inferior] = true
+        dybbuk.statuses.push('stunned', 'prone')
+        bs.room(dybbuk)
+        Harness::GameObj.registry = {
+          '153281570' => RawGameObj.new('153281570', 'dybbuk', 'a dybbuk', 'stunned', nil)
+        }
+
+        expect(bs.npc_prone?(bs.wrap(dybbuk))).to be true
+      end
+
+      it 'catches a prone creature whose single status annotation is NOT in the PRONE regex' do
+        # The case the string match misses outright rather than by luck.
+        creature = FakeCreatureInstance.new(501, 'dybbuk', 'a dybbuk')
+        creature.statuses << 'prone'
+        bs.room(creature)
+        Harness::GameObj.registry = {
+          '501' => RawGameObj.new('501', 'dybbuk', 'a dybbuk', 'disoriented', nil)
+        }
+
+        expect(bs.npc_prone?(bs.wrap(creature))).to be true
+      end
+
+      it 'treats immobilized as prone, covering frozen/entangled/held in place' do
+        creature = FakeCreatureInstance.new(502, 'goblin', 'a snarling goblin')
+        creature.statuses << 'immobilized'
+        bs.room(creature)
+
+        expect(bs.npc_prone?(bs.wrap(creature))).to be true
+      end
+
+      it 'agrees with the old regex on a prone-only creature, which really renders "lying down"' do
+        # Measured from real GS4 logs: prone alone renders
+        # "that is lying down.", so GameObj.status is "lying down" and the
+        # old ^lying regex matched it too. Both paths must say true - this
+        # guards against anyone "fixing" one of them apart from the other.
+        creature = FakeCreatureInstance.new(503, 'worm', 'a carrion worm')
+        creature.statuses << 'prone'
+        bs.room(creature)
+        Harness::GameObj.registry = {
+          '503' => RawGameObj.new('503', 'worm', 'a carrion worm', 'lying down', nil)
+        }
+
+        expect(bs.npc_prone?(bs.wrap(creature))).to be true
+      end
+
+      it 'sees prone that the status string masks behind "dead"' do
+        # The one masking case the string cannot express, from real logs:
+        #   <crtrStatus ... hostile="1" dead="1" prone="1"/> ... "that appears dead."
+        # dead_or_gone? gates before this matters, but the native read is
+        # the only path that can see it.
+        corpse = FakeCreatureInstance.new(504, 'fanatic', 'a triton fanatic')
+        corpse.statuses << 'prone'
+        corpse.flags[:dead] = true
+        bs.room(corpse)
+        Harness::GameObj.registry = {
+          '504' => RawGameObj.new('504', 'fanatic', 'a triton fanatic', 'dead', nil)
+        }
+
+        wrapped = bs.wrap(corpse)
+        expect(wrapped.status =~ described_class_prone_regex).to be_nil # string cannot see it
+        expect(bs.npc_prone?(wrapped)).to be true
+      end
+
+      it 'falls back to the regex for an npc with no CreatureInstance behind it' do
+        # Bridged bandits and leader_target?'s fallback have no statuses to
+        # read, so the status string is all there is. "lying down" is the
+        # room-players phrasing for the same state crtrStatus calls prone.
+        raw = RawGameObj.new('88802', 'bandit', 'a grizzled bandit', 'lying down', nil)
+
+        expect(bs.creature_backed?(raw)).to be false
+        expect(bs.npc_prone?(raw)).to be true
+      end
+
+      it 'is false for an upright creature, and nil-safe' do
+        bs.room(goblin)
+
+        expect(bs.npc_prone?(bs.wrap(goblin))).to be false
+        expect(bs.npc_prone?(nil)).to be false
+      end
+    end
+
+    describe 'HP/UCS readers' do
+      it 'npc_low_hp? reads the tracked low-HP state' do
+        goblin.low_hp = true
+        expect(bs.npc_low_hp?(bs.wrap(goblin))).to be true
+      end
+
+      it 'npc_fatal_crit? reads the tracked fatal-crit flag' do
+        goblin.fatal_crit = true
+        expect(bs.npc_fatal_crit?(bs.wrap(goblin))).to be true
+      end
+
+      it 'npc_smote? reads the tracked smite state' do
+        goblin.smote = true
+        expect(bs.npc_smote?(bs.wrap(goblin))).to be true
+      end
+
+      it 'npc_ucs_position/npc_ucs_tierup read the tracked UCS state' do
+        goblin.ucs_pos = 2
+        goblin.ucs_tierup = 'kick'
+
+        wrapped = bs.wrap(goblin)
+        expect(bs.npc_ucs_position(wrapped)).to eq(2)
+        expect(bs.npc_ucs_tierup(wrapped)).to eq('kick')
+      end
+
+      it 'all degrade to a safe default rather than raising for a non-creature-backed npc' do
+        raw = RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, nil)
+
+        expect(bs.npc_low_hp?(raw)).to be false
+        expect(bs.npc_fatal_crit?(raw)).to be false
+        expect(bs.npc_smote?(raw)).to be false
+        expect(bs.npc_ucs_position(raw)).to be_nil
+        expect(bs.npc_ucs_tierup(raw)).to be_nil
+      end
+    end
+
     describe '#leader_target?' do
-      # As of this PR, leader_target? still returns GameObj.target verbatim -
-      # the single client-selected target has no Creature-module equivalent,
-      # and nothing in this PR calls .creature on it unguarded (dead_or_gone?/
-      # gone?/still_targetable? already degrade safely for a non-creature-
-      # backed npc). Wrapping this consistently becomes necessary once native
-      # crtrStatus reads land - see the crtrStatus command checks PR, which
-      # revises this method and its spec.
       it 'returns nil when the client has no selected target' do
         Harness::GameObj.target = nil
         expect(bs.leader_target?).to be_nil
       end
 
-      it "returns the client's selected target as-is" do
-        raw = RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, nil)
+      it 'wraps the selected target in BigshotCreature when a Creature registry entry exists' do
+        bs.room(goblin)
+        Harness::GameObj.target = RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, nil)
+
+        result = bs.leader_target?
+        expect(bs.creature_backed?(result)).to be true
+        expect(result.name).to eq('a snarling goblin')
+      end
+
+      it 'falls back to the raw GameObj when no Creature registry entry exists yet' do
+        raw = RawGameObj.new('999', 'orc', 'a hulking orc', nil, nil)
         bs.room # instantiates bs (which resets GameObj.target) before we set it below
         Harness::GameObj.target = raw
 
-        expect(bs.leader_target?).to equal(raw)
+        result = bs.leader_target?
+        expect(bs.creature_backed?(result)).to be false
+        expect(result).to equal(raw)
       end
     end
 
@@ -923,10 +1129,7 @@ module BigshotCreatureAdapterSpec
         expect(bs.bs_targets.map(&:id)).to include('88801')
       end
 
-      it 'hands the bridged GameObj through unwrapped, so it degrades safely' do
-        # The actual native-read degradation (npc_has_status?, etc.) is
-        # exercised once those readers exist - see the crtrStatus command
-        # checks spec.
+      it 'hands the bridged GameObj through unwrapped, and it degrades safely' do
         bs.room
         Harness::GameObj.target_list = [bandit]
 
@@ -934,6 +1137,8 @@ module BigshotCreatureAdapterSpec
         expect(picked).not_to be_nil # else the assertions below pass vacuously
         expect(picked).to equal(bandit) # handed through, not wrapped
         expect(bs.creature_backed?(picked)).to be false
+        expect { bs.npc_has_status?(picked, 'stunned') }.not_to raise_error
+        expect(bs.npc_has_status?(picked, 'stunned')).to be false
       end
 
       it 'does not double-list a creature Creature already knows about' do
