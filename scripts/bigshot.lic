@@ -17,6 +17,26 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
+  v5.16.0  (2026-08-13)
+    - migrate room-creature targeting from GameObj.targets/.npcs to the Lich::Gemstone::Creature / Combat::Tracker APIs (Lich >= 5.19.0). GameObj.targets is built from XMLData.current_target_ids (the client's target dropdown), which can go stale after a kill or a room change; Creature reads the room roster instead
+    - add BigshotCreature, an adapter wrapping a CreatureInstance so the cmd_* methods keep their GameObj-shaped .id/.status/.type. The Integer creature id is normalized to String at the boundary
+    - replace the npc.status =~ /dead|gone/ idiom across ~40 call sites with dead_or_gone?, reading the <crtrStatus> dead flag plus GameObj's status string
+    - enable Combat::Tracker at startup (persists per character; enable! is a no-op when already on)
+    - add command checks for crtrStatus statuses: calm, disoriented, hovering, immobilized, kneeling, sitting, sleeping, stunned, webbed
+    - add command checks for crtrStatus classification flags: ascended, ascension_boss, challenging, disengaged, inferior, mini_boss, mount, rider, sympathetic
+    - add command checks for Combat::Tracker data: wounded, fatalcrit, smote, ucsdecent, ucsgood, ucsexcellent, ucstierup. These are additive and do not alter $bigshot_unarmed_tier or any existing tier/targeting logic
+    - migrate flying and rooted from status-string regex to native has_status? reads
+
+    Deliberate limits on the migration, verified against lich-5 source:
+    - targets come from bs_hostile_creatures (room roster filtered on hostile and not dead), NOT Creature.targets. Creature.targets selects on CreatureInstance#valid_target?, which is false once #dead? is true - and #dead? means max_hp - damage_taken <= 0, not the game's <crtrStatus> dead flag. damage_taken accumulates from every damage number Combat::Tracker parses and is never reset (Creature#reset_damage exists but nothing in lich-5 calls it), and max_hp falls back to Tracker.fallback_hp or a hardcoded 400 for the 131 of 611 bundled templates carrying max_hp: nil. Since this release both enables the tracker and makes this the only source of targets, trusting #dead? would drop a live creature from the target list once its estimated damage crossed a guessed ceiling - and group hunting over-attributes damage, because every member's damage on a shared target is parsed from every member's own feed
+    - bs_hostile_creatures reimplements valid_target?'s other two exclusions (animated decoys, appendage nouns) rather than inheriting them, mirroring lib/gemstone/creature.rb. If that upstream regex gains a case, mirror it here
+    - bs_hostile_creatures also bridges in GameObj.targets entries that Creature has no instance for. bandit_track manufactures its quarry with GameObj.new_npc after scraping a manual look, because bandits never appear in the room feed, so Creature.register is never called for them and they could not carry crtr_flag?(:hostile) regardless. Scoped to ids Creature has never seen, so ordinary creatures still come from the fresh roster
+    - the frozen command check reads the immobilized status natively. "frozen" is the same state the feed calls immobilized: lich-5 maps <crtrStatus immobile="1"> to the canonical immobilized status, and the message parser reaches it from the entangling/restricting-force messages. No immobile="1" appears in the GS4 logs sampled here, so the room-text rendering is unverified; reading it natively removes the dependency on that rendering. The /frozen/i string match is retained as a fallback, so the check is a strict superset of the old one; polarity is unchanged
+    - read creature statuses from <crtrStatus> rather than the GameObj status string. A creature can hold several statuses at once, but GameObj.status is single-valued - the parser assigns one capture from the room annotation - and the game renders only the highest-precedence one. Measured over ~1000 creature observations from real GS4 logs: prone alone renders "that is lying down.", prone + stunned renders "that appears stunned.", prone + dead renders "that appears dead.". This masking is why the new individual status modifiers (stunned, sleeping, sitting, calm) read natively; a creature holding two statuses only ever advertises one
+    - npc_prone? likewise reads sleeping/webbed/stunned/kneeling/sitting/prone/immobilized natively, keeping the PRONE regex as a fallback for npcs with no CreatureInstance behind them. Note this is a robustness change, not a bug fix: across those same logs the old regex and the native read agree on every live creature, because each masking status observed is itself in PRONE and "lying down" matches ^lying. The one case the string cannot see is dead + prone, which dead_or_gone? gates first. Polarity is unchanged
+    - .type stays GameObj-backed permanently: GameObj#type (undead, noncorporeal, aggressive npc, companion, familiar, boon, escort) comes from the static @@type_data lookup table with no <crtrStatus> equivalent, so the undead and noncorporeal command checks are unchanged
+    - room-presence checks stay on GameObj.npcs (loot/need_to_loot?, should_flee?'s ALWAYS_FLEE_FROM, the bounty child-rescue check). Creature only registers a room object when a live <crtrStatus> arrives or its id is in the target dropdown, and clear_room fires on every room-objs refresh, so a corpse or a named-but-not-hostile NPC can be present while absent from Creature.in_room
+    - leader_target? still sources the id from GameObj.target (the client's single selected target has no Creature equivalent) but wraps the result, falling back to the raw GameObj when no registry entry exists
   v5.15.4  (2026-08-05)
     - add additional messaging for cmd_unravel
   v5.15.3  (2026-07-29)
@@ -457,9 +477,10 @@ Combat   = Lich::Gemstone::Combat   unless defined?(Combat)
 #     table (lib/common/gameobj.rb), a static noun/name regex lookup with
 #     no connection to the live <crtrStatus> feed at all. There is no
 #     Creature-module equivalent to migrate to.
-#   - .status is still the source of truth for "frozen"/"prone" and every
-#     other free-text state a regex against the room annotation can catch;
-#     nothing here reads those natively yet.
+#   - .status is still consulted as a fallback by npc_prone?/npc_frozen? for
+#     npcs with no CreatureInstance behind them (bridged bandits,
+#     leader_target?'s fallback), but every state those checks care about now
+#     reads natively when a creature is available.
 class BigshotCreature
   attr_reader :creature
 
@@ -2423,6 +2444,20 @@ class Bigshot
 
   PRONE ||= /sleeping|webbed|stunned|kneeling|sitting|^lying|prone|frozen|held in place|entangled/
 
+  # The native <crtrStatus> statuses covering everything the PRONE regex
+  # matches. Every token maps: "frozen", "entangled" and "held in place" all
+  # reconcile to immobilized (see npc_frozen?), and "^lying" is the same state
+  # crtrStatus calls prone - real logs render prone as "that is lying down.".
+  PRONE_STATUSES ||= %w[sleeping webbed stunned kneeling sitting prone immobilized].freeze
+
+  # Starts or stops the ambush/interference downstream monitor.
+  #
+  # Watches the feed for creatures leaping from hiding and for other players
+  # acting in the room, setting the globals the hunting loop consults. Group
+  # members are excluded so a companion's arrival is not mistaken for an ambush.
+  #
+  # @param cur_action [String] +'start'+ or +'stop'+
+  # @return [void]
   def hunt_monitor(cur_action)
     bigshot_monitor = proc { |server_string|
       if !$bigshot_bandits && server_string =~ /<a exist="\d+" noun="([a-zA-Z]*?)">[a-zA-Z]*?<\/a> leaps from hiding to attack!/i
@@ -2734,8 +2769,13 @@ class Bigshot
     end
   end
 
+  # Compiles the command-modifier regexes used to parse command definitions.
+  #
+  # @return [void]
+  # @note The modifier whitelist is a single alternation; a new modifier must be
+  #   added here as well as to {#check_state_condition}, or it will never parse.
   def initialize_command_data
-    @COMMAND_MODIFIER_REGEX = /\((.*?(?:!?506|!?ancient|!?animate|!?barrage|!?bearhug|buff|!?burst|!?celerity|censer|!?coupdegrace|!?disease|!?EB"[^"]*"|!?EC"[^"]*"|!?ED"[^"]*"|!?ES"[^"]*"|!?e|!?essence|!?frozen|!?flurry|!?flying|!?fury|!?garrote|!?h|!?hidden|!?holler|!?justice|!?k|!?m|!?mob|!?momentum|!?noncorporeal|once|!?outside|!?pcs|!?poison|!?prone|!?pummel|!?rapid|!?rebuke|!?reflex|repeatdelay|room|!?rooted|!?s|!?scourge|!?shout|!?splashy|!?surge|!?tailwind|!?tier|!?tier1|!?tier2|!?tier3|!?thrash|!?undead|!?v|!?valid|!?vigor|!?voidweaver|!?yowlp).*?)\)$/i.freeze
+    @COMMAND_MODIFIER_REGEX = /\((.*?(?:!?506|!?ancient|!?animate|!?ascended|!?ascension_boss|!?barrage|!?bearhug|buff|!?burst|!?calm|!?celerity|censer|!?challenging|!?coupdegrace|!?disease|!?disengaged|!?disoriented|!?EB"[^"]*"|!?EC"[^"]*"|!?ED"[^"]*"|!?ES"[^"]*"|!?e|!?essence|!?fatalcrit|!?frozen|!?flurry|!?flying|!?fury|!?garrote|!?h|!?hidden|!?holler|!?hovering|!?immobilized|!?inferior|!?justice|!?k|!?kneeling|!?m|!?mini_boss|!?mob|!?momentum|!?mount|!?noncorporeal|once|!?outside|!?pcs|!?poison|!?prone|!?pummel|!?rapid|!?rebuke|!?reflex|repeatdelay|!?rider|room|!?rooted|!?s|!?scourge|!?shout|!?sitting|!?sleeping|!?smote|!?splashy|!?stunned|!?surge|!?sympathetic|!?tailwind|!?tier|!?tier1|!?tier2|!?tier3|!?thrash|!?ucsdecent|!?ucsexcellent|!?ucsgood|!?ucstierup|!?undead|!?v|!?valid|!?vigor|!?voidweaver|!?webbed|!?wounded|!?yowlp).*?)\)$/i.freeze
 
     @COMMAND_AMOUNT_REGEX = /((?:!?e|!?essence|!?h|!?k|!?m|!?mob|!?s|!?tier|!?v|!?valid))(\d+)/i.freeze
 
@@ -3787,18 +3827,93 @@ class Bigshot
     # NPC-specific checks
     when 'ancient'    then npc.name !~ /^(?:grizzled|ancient) / || npc.name == 'ancient ghoul master'
     when '!ancient'   then npc.name =~ /^(?:grizzled|ancient) / && npc.name != 'ancient ghoul master'
-    when 'flying'     then !npc.status.include?("flying")
-    when '!flying'    then npc.status.include?("flying")
-    when 'frozen'     then npc.status =~ /frozen/i
-    when '!frozen'    then npc.status !~ /frozen/i
+    when 'flying'     then !npc_has_status?(npc, "flying")
+    when '!flying'    then npc_has_status?(npc, "flying")
+    # "frozen" is the same game state the feed calls immobilized: lich-5 maps
+    # the <crtrStatus immobile="1"> attribute to the canonical 'immobilized'
+    # status (CRTR_STATUS_FLAGS in lib/common/creature/creature_base.rb), and
+    # the message parser reaches it too (defs/statuses.rb :immobilized, from
+    # the entangling/restricting-force messages). No immobile="1" appears in
+    # the GS4 logs sampled for this change, so how the room text renders it
+    # is unverified - reading it natively removes the dependency on that
+    # rendering either way. The string match is retained as a fallback so
+    # nothing the old check caught is lost. Polarity is unchanged: as with
+    # prone/rooted, (frozen) skips the command when the target IS frozen.
+    when 'frozen'     then npc_frozen?(npc)
+    when '!frozen'    then !npc_frozen?(npc)
+    # noncorporeal/undead classification comes from GameObj's own
+    # @@type_data static lookup table (lib/common/gameobj.rb), matched by
+    # regex against noun/name - a completely separate system from the live
+    # <crtrStatus> feed, with no Creature-module equivalent. These stay on
+    # npc.type (GameObj-backed via the adapter) permanently.
     when 'noncorporeal' then !npc.type.split(',').any? { |a| a == "noncorporeal" }
     when '!noncorporeal' then npc.type.split(',').any? { |a| a == "noncorporeal" }
-    when 'prone'      then npc.status =~ PRONE
-    when '!prone'     then npc.status !~ PRONE
-    when 'rooted'     then npc.status =~ /rooted/i
-    when '!rooted'    then npc.status !~ /rooted/i
+    # Polarity unchanged: (prone) skips the command when the target IS prone.
+    when 'prone'      then npc_prone?(npc)
+    when '!prone'     then !npc_prone?(npc)
+    when 'rooted'     then npc_has_status?(npc, "rooted")
+    when '!rooted'    then !npc_has_status?(npc, "rooted")
     when 'undead'     then !npc.type.split(',').any? { |a| a == "undead" }
     when '!undead'    then npc.type.split(',').any? { |a| a == "undead" }
+
+    # crtrStatus status checks (message-driven statuses need Combat::Tracker
+    # enabled to populate - see initialize, which enables it at startup)
+    when 'calm'         then !npc_has_status?(npc, "calm")
+    when '!calm'        then npc_has_status?(npc, "calm")
+    when 'disoriented'  then !npc_has_status?(npc, "disoriented")
+    when '!disoriented' then npc_has_status?(npc, "disoriented")
+    when 'hovering'     then !npc_has_status?(npc, "hovering")
+    when '!hovering'    then npc_has_status?(npc, "hovering")
+    when 'immobilized'  then !npc_has_status?(npc, "immobilized")
+    when '!immobilized' then npc_has_status?(npc, "immobilized")
+    when 'kneeling'     then !npc_has_status?(npc, "kneeling")
+    when '!kneeling'    then npc_has_status?(npc, "kneeling")
+    when 'sitting'      then !npc_has_status?(npc, "sitting")
+    when '!sitting'     then npc_has_status?(npc, "sitting")
+    when 'sleeping'     then !npc_has_status?(npc, "sleeping")
+    when '!sleeping'    then npc_has_status?(npc, "sleeping")
+    when 'stunned'      then !npc_has_status?(npc, "stunned")
+    when '!stunned'     then npc_has_status?(npc, "stunned")
+    when 'webbed'       then !npc_has_status?(npc, "webbed")
+    when '!webbed'      then npc_has_status?(npc, "webbed")
+
+    # crtrStatus classification-flag checks
+    when 'ascended'       then !npc_crtr_flag?(npc, :ascended)
+    when '!ascended'      then npc_crtr_flag?(npc, :ascended)
+    when 'ascension_boss' then !npc_crtr_flag?(npc, :ascension_boss)
+    when '!ascension_boss' then npc_crtr_flag?(npc, :ascension_boss)
+    when 'challenging'    then !npc_crtr_flag?(npc, :challenging)
+    when '!challenging'   then npc_crtr_flag?(npc, :challenging)
+    when 'disengaged'     then !npc_crtr_flag?(npc, :disengaged)
+    when '!disengaged'    then npc_crtr_flag?(npc, :disengaged)
+    when 'inferior'       then !npc_crtr_flag?(npc, :inferior)
+    when '!inferior'      then npc_crtr_flag?(npc, :inferior)
+    when 'mini_boss'      then !npc_crtr_flag?(npc, :mini_boss)
+    when '!mini_boss'     then npc_crtr_flag?(npc, :mini_boss)
+    when 'mount'          then !npc_crtr_flag?(npc, :mount)
+    when '!mount'         then npc_crtr_flag?(npc, :mount)
+    when 'rider'          then !npc_crtr_flag?(npc, :rider)
+    when '!rider'         then npc_crtr_flag?(npc, :rider)
+    when 'sympathetic'    then !npc_crtr_flag?(npc, :sympathetic)
+    when '!sympathetic'   then npc_crtr_flag?(npc, :sympathetic)
+
+    # crtrStatus/Combat::Tracker HP, wound, and UCS checks (additive - none
+    # of these replace $bigshot_unarmed_tier or any other existing tier/
+    # targeting logic, they're new opt-in signals for command definitions)
+    when 'wounded'      then !npc_low_hp?(npc)
+    when '!wounded'     then npc_low_hp?(npc)
+    when 'fatalcrit'    then !npc_fatal_crit?(npc)
+    when '!fatalcrit'   then npc_fatal_crit?(npc)
+    when 'smote'        then !npc_smote?(npc)
+    when '!smote'       then npc_smote?(npc)
+    when 'ucsdecent'    then npc_ucs_position(npc) != 1
+    when '!ucsdecent'   then npc_ucs_position(npc) == 1
+    when 'ucsgood'      then npc_ucs_position(npc) != 2
+    when '!ucsgood'     then npc_ucs_position(npc) == 2
+    when 'ucsexcellent' then npc_ucs_position(npc) != 3
+    when '!ucsexcellent' then npc_ucs_position(npc) == 3
+    when 'ucstierup'    then npc_ucs_tierup(npc).nil?
+    when '!ucstierup'   then !npc_ucs_tierup(npc).nil?
 
     # Tier checks
     when 'tier1'      then $bigshot_unarmed_tier != 1
@@ -6012,18 +6127,22 @@ class Bigshot
     ExecScript.start(wait_for_swing_exec, :quiet => true)
 
     loop do
-      change_stance(@WANDER_STANCE, false) unless target && target.status =~ PRONE
+      change_stance(@WANDER_STANCE, false) unless target && npc_prone?(target)
       stand() if !standing?
       break if $stop_wait
-      break if GameObj.targets.size.nil? || gameobj_npc_check.zero?
+      break if bs_hostile_creatures.empty? || gameobj_npc_check.zero?
       break if should_flee?
-      break if target && target.status =~ PRONE
+      break if target && npc_prone?(target)
       break if (Time.now - start) > seconds
 
       sleep(0.25)
     end
   end
 
+  # Reports a fatal problem and exits the script.
+  #
+  # @param message [String] reason to display
+  # @return [void] does not return; terminates the script
   def croak(message)
     debug_msg(@DEBUG_SYSTEM, "croak | message: #{message}")
 
@@ -7226,12 +7345,134 @@ class Bigshot
     !!(npc.status =~ /gone/)
   end
 
+  # Guarded npc.creature.has_status?/crtr_flag? readers for the crtrStatus
+  # command checks in check_state_condition. Degrade to false rather than
+  # raising for the rare non-creature-backed npc (see creature_backed?) - a
+  # status/flag check failing safe matches how these modifiers behave for
+  # any other unrecognized/unavailable state (the `else false` branch).
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
+  # @param status_name [String, Symbol] canonical crtrStatus status name
+  # @return [Boolean] false rather than raising when npc is not creature-backed
+  def npc_has_status?(npc, status_name)
+    creature_backed?(npc) && npc.creature.has_status?(status_name)
+  end
+
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
+  # @param flag [Symbol] classification flag key
+  # @return [Boolean] false rather than raising when npc is not creature-backed
+  def npc_crtr_flag?(npc, flag)
+    creature_backed?(npc) && npc.creature.crtr_flag?(flag)
+  end
+
+  # "frozen" and "immobilized" are the same state under two names - see the
+  # 'frozen' branch in check_state_condition. Native read first, legacy
+  # GameObj string as a fallback so this is a strict superset of the old
+  # check.
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to test
+  # @return [Boolean]
+  def npc_frozen?(npc)
+    return false if npc.nil?
+
+    npc_has_status?(npc, "immobilized") || !!(npc.status =~ /frozen/i)
+  end
+
+  # A creature can hold several <crtrStatus> statuses at once, but GameObj's
+  # status string holds exactly one - the parser assigns a single capture from
+  # the room annotation (@last_npc&.status = $1 in xmlparser.rb). A real feed
+  # line makes the gap concrete:
+  #
+  #   <crtrStatus exist="153281570" hostile="1" stunned="1" prone="1" inferior="1"/>
+  #   ...<a exist="153281570" noun="dybbuk">dybbuk</a> that appears stunned.
+  #
+  # The creature is stunned AND prone; the annotation carries only "stunned",
+  # so GameObj.status is "stunned".
+  #
+  # Measured against ~1000 creature observations from real GS4 logs, the
+  # renderings are:
+  #
+  #   prone (alone)      -> "that is lying down."   -> "lying down"
+  #   prone + stunned    -> "that appears stunned." -> "stunned"
+  #   prone + sleeping   -> "that is sleeping,"     -> "sleeping"
+  #   prone + dead       -> "that appears dead."    -> "dead"
+  #   sitting            -> "that is sitting."      -> "sitting"
+  #   calmed             -> "that appears rather calm." -> "rather calm"
+  #
+  # So GameObj.status is single-valued with a precedence order, and a lower
+  # status is masked whenever a higher one co-occurs. For PRONE specifically
+  # that turns out to be harmless on live creatures - every masking status
+  # observed (stunned, sleeping) is itself in the regex, and "lying down"
+  # matches ^lying - so this native read is NOT fixing an observed miss. It
+  # is the more direct source, and it does see through the one masking case
+  # that the string cannot: dead + prone, where GameObj reports only "dead".
+  # That case is academic here since dead_or_gone? gates first.
+  #
+  # The masking does matter for the individual status modifiers (stunned,
+  # sleeping, sitting, calm), which read natively for exactly this reason: a
+  # creature holding two statuses only ever advertises one of them.
+  #
+  # The regex is kept as a fallback for npcs with no CreatureInstance behind
+  # them - the GameObj entries bridged in by bs_hostile_creatures for bandits,
+  # and leader_target?'s fallback - where npc_has_status? has nothing to read
+  # and the status string is all there is.
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to test
+  # @return [Boolean]
+  def npc_prone?(npc)
+    return false if npc.nil?
+    return true if PRONE_STATUSES.any? { |status| npc_has_status?(npc, status) }
+
+    !!(npc.status =~ PRONE)
+  end
+
+  # HP/wound/UCS readers backing the additive command checks below (wounded,
+  # fatalcrit, smote, ucsdecent/ucsgood/ucsexcellent, ucstierup). Populated by
+  # Combat::Tracker, enabled once at startup in initialize. All degrade to a
+  # safe default (false/nil) rather than raising for a non-creature-backed
+  # npc, same as npc_has_status?/npc_crtr_flag? above.
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
+  # @param threshold [Integer] percentage at or below which the creature counts
+  #   as wounded
+  # @return [Boolean]
+  def npc_low_hp?(npc, threshold = 25)
+    creature_backed?(npc) && npc.creature.low_hp?(threshold)
+  end
+
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
+  # @return [Boolean]
+  def npc_fatal_crit?(npc)
+    creature_backed?(npc) && npc.creature.fatal_crit?
+  end
+
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
+  # @return [Boolean]
+  def npc_smote?(npc)
+    creature_backed?(npc) && npc.creature.smote?
+  end
+
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
+  # @return [Integer, nil] UCS position tier, or nil if unavailable
+  def npc_ucs_position(npc)
+    return nil unless creature_backed?(npc)
+
+    npc.creature.ucs_position
+  end
+
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
+  # @return [String, nil] the tier-up maneuver, or nil if unavailable
+  def npc_ucs_tierup(npc)
+    return nil unless creature_backed?(npc)
+
+    npc.creature.ucs_tierup
+  end
+
+  # Whether any creature in the room carries a boon the character flees from.
+  #
+  # @return [Boolean]
   def should_flee_from_boons?
     debug_msg(@DEBUG_COMBAT, "should_flee_from_boons?")
 
     return false if @BOONS_FLEE.empty?
 
-    GameObj.targets.each do |creature|
+    bs_targets.each do |creature|
       next unless creature.type.include?("boon")
 
       # Convert adjectives -> trait names
@@ -7429,18 +7670,37 @@ class Bigshot
     return nil
   end
 
+  # GameObj.target (the client's single currently-selected target) has no
+  # Creature-module equivalent - Creature.targets/in_room deliberately don't
+  # model "the selected one," only room membership/hostility - so the id
+  # itself still has to come from GameObj. Wrapping the lookup result in
+  # BigshotCreature (rather than returning the raw GameObj) keeps this
+  # consistent with every other npc/target object flowing through bigshot, so
+  # it doesn't crash the native crtr_flag?/has_status? checks.
+  # Falls back to the raw GameObj only in the rare case the id has no
+  # matching Creature registry entry yet; dead_or_gone?/check_state_condition
+  # degrade gracefully for that case rather than assuming it can't happen.
+  # @return [BigshotCreature, Lich::Common::GameObj, nil] the client's selected
+  #   target, wrapped when a Creature registry entry exists
   def leader_target?
-    GameObj.target
+    go = GameObj.target
+    return nil if go.nil?
+
+    creature = Creature[go.id]
+    creature ? BigshotCreature.new(creature) : go
   end
 
+  # @return [Integer] remaining roundtime in seconds
   def rt?()
     return checkrt()
   end
 
+  # @return [Boolean] whether rest preparation has completed
   def rest_prep_done?
     @REST_PREP || false
   end
 
+  # @return [Boolean] whether field experience is too saturated to keep hunting
   def fried?()
     debug_msg(@DEBUG_STATUS, "fried? | @CORRECT_PERCENT_MIND: #{@CORRECT_PERCENT_MIND} | @FRIED: #{@FRIED}")
 
