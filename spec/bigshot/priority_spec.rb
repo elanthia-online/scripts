@@ -13,6 +13,13 @@
 # return nil (lich-5 lib/common/class_exts/nilclass.rb), which is what let the
 # removed room-composition cache paper over nil comparisons. This code must not
 # depend on that.
+#
+# Phase 1 of the GameObj -> Creature/Combat migration moved the room-creature
+# source of truth from GameObj.targets to Lich::Gemstone::Creature.targets,
+# behind a BigshotCreature adapter that still exposes GameObj-shaped
+# .status/.type (by delegating to the matching GameObj entry). This harness
+# models both halves: a Creature stub standing in for the room roster, and a
+# GameObj stub standing in for the matching entries the adapter falls back to.
 
 module BigshotPrioritySpec
   SOURCE_PATH = File.expand_path('../../scripts/bigshot.lic', __dir__)
@@ -25,6 +32,10 @@ module BigshotPrioritySpec
     found
   end
 
+  BIGSHOT_CREATURE_SRC = extract(/^class BigshotCreature\n.*?^end$/m, 'BigshotCreature')
+  BS_TARGETS_SRC = extract(/^  def bs_targets\(\*filters\).*?^  end$/m, 'bs_targets')
+  BS_HOSTILE_SRC = extract(/^  def bs_hostile_creatures\(\*filters\).*?^  end$/m, 'bs_hostile_creatures')
+  BS_ROOM_CREATURES_SRC = extract(/^  def bs_room_creatures\(\*filters\).*?^  end$/m, 'bs_room_creatures')
   PRIORITY_SRC = extract(/^  def priority\(target\).*?^  end$/m, 'priority')
   MATCHERS_SRC = extract(/^  def priority_matchers\n.*?^  end$/m, 'priority_matchers')
   RANK_SRC = extract(/^  def priority_rank\(npc, matchers\).*?^  end$/m, 'priority_rank')
@@ -38,7 +49,12 @@ module BigshotPrioritySpec
                                   'follower retarget block')
   EACHTARGET_SRC = extract(/^  def cmd_eachtarget\(command, npc\).*?^  end$/m, 'cmd_eachtarget')
 
-  Creature = Struct.new(:id, :name, :noun, :type, :status) do
+  # GameObj-shaped fixture data (id/name/noun/type/status). Registered both as
+  # the GameObj stub's lookup-by-id entry (what BigshotCreature#status/#type
+  # fall back to) and as the source for the Creature stub's room roster, so a
+  # single fixture describes "the same creature" the way both real systems
+  # would report it.
+  NpcFixture = Struct.new(:id, :name, :noun, :type, :status) do
     def to_s
       name
     end
@@ -48,12 +64,62 @@ module BigshotPrioritySpec
     # Stubs for the Lich globals the extracted bodies reach for. Nested here so
     # constant lookup inside the eval'd method bodies finds these, not the real
     # classes other specs load.
-    module GameObj
+
+    # Minimal double for Lich::Gemstone::Creature::CreatureInstance. Only the
+    # members id/noun/name are used by the method bodies extracted in this
+    # file; crtr_flag?/has_status?/valid_target?/template are stubbed to
+    # sensible defaults since nothing here reaches them (check_state_condition,
+    # which does use them for the crtrStatus command checks, is not extracted
+    # in this spec).
+    FakeCreatureInstance = Struct.new(:id, :noun, :name, :flags) do
+      def crtr_flag?(key)
+        !!(flags || {})[key.to_sym]
+      end
+
+      def has_status?(_name)
+        false
+      end
+
+      def valid_target?
+        true
+      end
+
+      def template
+        nil
+      end
+    end
+
+    module Creature
       class << self
         attr_writer :room_targets
 
-        def targets
+        def targets(*_filters)
           (@room_targets || []).dup
+        end
+
+        def in_room(*_filters)
+          (@room_targets || []).dup
+        end
+
+        def [](id)
+          (@room_targets || []).find { |c| c.id.to_i == id.to_i }
+        end
+      end
+    end
+
+    module GameObj
+      class << self
+        attr_writer :registry
+
+        # Every fixture here is also a Creature instance, so the
+        # bs_hostile_creatures GameObj bridge finds nothing to add - which is
+        # what we want for the ranking tests.
+        def targets
+          []
+        end
+
+        def [](id)
+          (@registry || {})[id]
         end
       end
     end
@@ -90,7 +156,8 @@ module BigshotPrioritySpec
       @DEBUG_COMBAT = false
       @DEBUG_COMMANDS = false
       CharSettings.store = { 'untargetable' => [], 'targetable' => [] }
-      GameObj.room_targets = []
+      GameObj.registry = {}
+      Creature.room_targets = []
       XMLData.current_target_id = nil
     end
 
@@ -105,8 +172,16 @@ module BigshotPrioritySpec
       @cmd_calls << { command: command, npc: npc, check_priority: check_priority }
     end
 
-    def room(*creatures)
-      GameObj.room_targets = creatures
+    # Registers each fixture as both a GameObj entry (what the BigshotCreature
+    # adapter's .status/.type fall back to) and a Creature room-roster entry
+    # (what bs_targets/bs_room_creatures/Creature.targets iterate).
+    def room(*fixtures)
+      GameObj.registry = fixtures.each_with_object({}) { |f, h| h[f.id] = f }
+      # hostile so bs_hostile_creatures keeps them; these fixtures stand in for
+      # live attackable creatures.
+      Creature.room_targets = fixtures.map do |f|
+        FakeCreatureInstance.new(f.id.to_i, f.noun, f.name, { hostile: true })
+      end
     end
 
     def untargetable(*names)
@@ -135,6 +210,10 @@ module BigshotPrioritySpec
       !@unpickable.include?(target.name)
     end
 
+    eval(BIGSHOT_CREATURE_SRC)
+    eval(BS_TARGETS_SRC)
+    eval(BS_HOSTILE_SRC)
+    eval(BS_ROOM_CREATURES_SRC)
     eval(PRIORITY_SRC)
     eval(MATCHERS_SRC)
     eval(RANK_SRC)
@@ -156,44 +235,44 @@ module BigshotPrioritySpec
 
   module Creatures
     def mastiff
-      Creature.new('101', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
+      NpcFixture.new('101', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
     end
 
     def mystic
-      Creature.new('102', 'illoke mystic', 'mystic', 'aggressive npc', nil)
+      NpcFixture.new('102', 'illoke mystic', 'mystic', 'aggressive npc', nil)
     end
 
     def giant
-      Creature.new('103', 'stone giant', 'giant', 'aggressive npc', nil)
+      NpcFixture.new('103', 'stone giant', 'giant', 'aggressive npc', nil)
     end
 
     def shaman
-      Creature.new('104', 'illoke shaman', 'shaman', 'aggressive npc boon', nil)
+      NpcFixture.new('104', 'illoke shaman', 'shaman', 'aggressive npc boon', nil)
     end
 
     def troll
-      Creature.new('105', 'ice troll', 'troll', 'aggressive npc', nil)
+      NpcFixture.new('105', 'ice troll', 'troll', 'aggressive npc', nil)
     end
 
     def second_mastiff
-      Creature.new('106', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
+      NpcFixture.new('106', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
     end
 
     # From the reported thrash: order was valravn, angargeist, disir
     def valravn
-      Creature.new('280414583', 'eyeless black valravn', 'valravn', 'aggressive npc', nil)
+      NpcFixture.new('280414583', 'eyeless black valravn', 'valravn', 'aggressive npc', nil)
     end
 
     def angargeist
-      Creature.new('280405751', 'roiling crimson angargeist', 'angargeist', 'aggressive npc', nil)
+      NpcFixture.new('280405751', 'roiling crimson angargeist', 'angargeist', 'aggressive npc', nil)
     end
 
     def disir
-      Creature.new('280394883', 'shining winged disir', 'disir', 'aggressive npc', nil)
+      NpcFixture.new('280394883', 'shining winged disir', 'disir', 'aggressive npc', nil)
     end
 
     def draugr
-      Creature.new('280394876', 'withered shadow-cloaked draugr', 'draugr', 'aggressive npc', nil)
+      NpcFixture.new('280394876', 'withered shadow-cloaked draugr', 'draugr', 'aggressive npc', nil)
     end
   end
 end
@@ -314,16 +393,16 @@ RSpec.describe 'bigshot Priority Hunt' do
   end
 
   describe 'rank comparison' do
-    # GameObj.targets is the game's target dropdown (xmlparser dDBTarget), which
-    # is cleared and rebuilt wholesale, so the current target can be missing from
-    # it for a moment. Ranking off the list rather than off dropdown membership
-    # keeps that from handing the fight to a lower ranked creature.
-    it 'keeps the current target when the target itself is missing from the dropdown' do
+    # Creature.targets is rebuilt from the room roster on every call, so the
+    # current target can be momentarily missing from it (e.g. between XML
+    # updates). Ranking off the list rather than off list membership keeps
+    # that from handing the fight to a lower ranked creature.
+    it 'keeps the current target when the target itself is missing from the roster' do
       bs.room(giant)
       expect(bs.priority(mastiff)).to be true
     end
 
-    it 'switches when a higher ranked creature is in the dropdown and the target is not' do
+    it 'switches when a higher ranked creature is in the roster and the target is not' do
       bs.room(mystic)
       expect(bs.priority(mastiff)).to be false
     end
@@ -353,7 +432,7 @@ RSpec.describe 'bigshot Priority Hunt' do
       expect(bs.do_hunt_retarget(angargeist).name).to eq('roiling crimson angargeist')
     end
 
-    it 'does not hand the fight to the disir when the angargeist drops out of the dropdown' do
+    it 'does not hand the fight to the disir when the angargeist drops out of the roster' do
       bs.untargetable('eyeless black valravn')
       bs.room(disir)
 
