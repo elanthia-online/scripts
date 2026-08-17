@@ -571,6 +571,9 @@ if UserVars
   UserVars.save
 end
 
+# Reads this script's version from its own Lich script header.
+#
+# @return [String, nil] semantic version, or nil if the header is unreadable
 def get_script_version
   data = Script.list.find { |x| x.name == Script.current.name }.inspect
   return data[/version: (\d+\.\d+\.\d+)/i, 1]
@@ -631,9 +634,24 @@ $bigshot_sneaky_hunt = false
 
 # debug file logger
 class Bigshot
+  # Writes the raw upstream/downstream game feed to a per-character log file.
+  #
+  # Instantiated only when the +debug_file+ setting is on. Installs upstream and
+  # downstream hooks that push every line onto a queue drained by a writer
+  # thread, and registers a +before_dying+ block that removes the hooks and
+  # closes the log so the feed is not left mirrored after the script exits.
+  #
+  # @see Bigshot.debug_update
   class DebugLogger
     attr_accessor :logger, :log_file, :script_name
 
+    # Creates the log directory, configures the logger, and begins logging.
+    #
+    # The log lands in +LOG_DIR/debug/<game>-<character>/<script>.log+ and rotates
+    # daily. {#start_logging} is invoked automatically, so constructing a
+    # DebugLogger is enough to start mirroring the feed.
+    #
+    # @return [void]
     def initialize
       @script_name = Script.current.name
       # Ensure the debug folder exists
@@ -653,6 +671,14 @@ class Bigshot
       start_logging
     end
 
+    # Installs the feed hooks and starts the queue-draining threads.
+    #
+    # Also registers the +before_dying+ teardown and echoes a reminder that file
+    # debugging is on, both at startup and at exit, since a forgotten debug log
+    # grows unbounded.
+    #
+    # @return [void]
+    # @note Called by {#initialize}; not normally invoked directly.
     def start_logging
       # Startup Message
       log("Starting up! Character: #{Char.name} | Version: #{get_script_version}")
@@ -710,6 +736,10 @@ class Bigshot
     end
 
     # Method to log a custom message
+    # Queues an arbitrary message for the log file.
+    #
+    # @param message [String] text to write
+    # @return [void]
     def log(message)
       @log_writer << message
     end
@@ -718,6 +748,14 @@ end
 
 # Event class for grouping
 class Bigshot
+  # A single instruction broadcast from the group leader to its followers.
+  #
+  # Events are pushed onto each follower's queue over DRb and consumed in the
+  # follower loop. They carry the room they were raised in and when, so a
+  # follower that has since moved on or fallen behind can discard them
+  # ({#stale?}) rather than acting on an instruction that no longer applies.
+  #
+  # @see Bigshot::Group#add_event
   class Event
     attr_accessor :type, :created_at, :room_id, :cmd_input
 
@@ -727,6 +765,12 @@ class Bigshot
                     :PUBLIC_SEND, :GO2_WAYPOINTS, :GO2_RESTING_ROOM, :GO2_RALLY_ROOM, :GO2_HUNTING_ROOM, :CHECK_MIND, :FOG_RETURN, :CHECK_SNEAKY,
                     :LEAVE_GROUP, :HUNT_MONITOR_START, :HUNT_MONITOR_STOP, :UNHIDE]
 
+    # @param type [Symbol] one of the recognized event types
+    # @param time_stamp [Integer] creation time as a Unix timestamp
+    # @param room_id [Integer] room the event was raised in
+    # @param c_in [String, nil] optional command payload, for event types that
+    #   carry one (+:CUSTOM_PUT+, +:PUBLIC_SEND+, and similar)
+    # @raise [RuntimeError] if +type+ is not in the recognized list
     def initialize(type, time_stamp, room_id, c_in = nil)
       raise "Event type not recognized" unless @@RECOGNIZED.include?(type)
 
@@ -736,6 +780,12 @@ class Bigshot
       @cmd_input  = c_in
     end
 
+    # Whether this event should be discarded rather than acted on.
+    #
+    # True once the character has left the room the event was raised in, or more
+    # than 15 seconds have passed.
+    #
+    # @return [Boolean]
     def stale?
       Room.current.id != @room_id || (Time.now.to_i - @created_at) > 15
     end
@@ -744,9 +794,18 @@ end
 
 # Check inside boundary class
 class Bigshot
+  # The set of rooms reachable from a hunting room without crossing a boundary.
+  #
+  # Built by breadth-first search from the starting room, refusing to expand
+  # through any room in the configured boundary list. {#valid?} then answers
+  # whether the character is still inside the hunting area, which is what keeps
+  # wandering from drifting into a neighbouring one.
   class BSAreaRooms
     attr_reader :start_room, :boundaries, :area_rooms
 
+    # @param hunting_room_id [Integer, String] room to expand outward from
+    # @param hunting_boundaries [Array<Integer, String>] room ids that must not
+    #   be entered or expanded through
     def initialize(hunting_room_id, hunting_boundaries)
       @start_room  = hunting_room_id.to_i
       @boundaries  = hunting_boundaries.map(&:to_i).to_set
@@ -755,6 +814,14 @@ class Bigshot
       @last_location = Room[@start_room]&.location
     end
 
+    # Neighbouring rooms reachable from +room_id+ that are not boundaries.
+    #
+    # Filters out any exit whose travel time is non-numeric. A +StringProc+ time
+    # is evaluated first, so conditional exits count only when they currently
+    # resolve to a number.
+    #
+    # @param room_id [Integer] room to inspect
+    # @return [Set<Integer>] reachable neighbour ids; empty if the room is unmapped
     def get_valid_neighbors(room_id)
       room = Room[room_id]
       return Set[] unless room
@@ -774,6 +841,12 @@ class Bigshot
       end.to_set
     end
 
+    # Expands the area outward from the start room until nothing new is reachable.
+    #
+    # @return [void]
+    # @note Calls {#boundary_break} - which reports and exits the script - if the
+    #   area exceeds 200 rooms, on the assumption that the boundaries are wrong
+    #   rather than that the area is genuinely that large.
     def build
       frontier = Set[@start_room]
       visited  = Set[@start_room]
@@ -804,10 +877,21 @@ class Bigshot
       end
     end
 
+    # Whether a room is inside the built hunting area.
+    #
+    # @param room_id [Integer, String] room to test; defaults to the current room
+    # @return [Boolean]
     def valid?(room_id = Room.current.id)
       @area_rooms.include?(room_id.to_i)
     end
 
+    # Records the first three map-location changes seen while expanding.
+    #
+    # Used only to make {#boundary_break}'s report actionable, by naming where the
+    # search escaped into.
+    #
+    # @param room_id [Integer] room being expanded
+    # @return [void]
     def track_location_change(room_id)
       room = Room[room_id]
       return unless room
@@ -823,6 +907,9 @@ class Bigshot
       end
     end
 
+    # Reports a suspected missing boundary and exits the script.
+    #
+    # @return [void] does not return; terminates the script
     def boundary_break
       rows = @location_changes.map do |change|
         [change[:id], change[:location]]
@@ -844,15 +931,34 @@ end
 
 # Group class for head/tail
 class Bigshot
+  # The leader-side view of a Bigshot hunting group, served over DRb.
+  #
+  # The leader instantiates one of these and publishes it; each follower attaches
+  # and registers itself via {#add_member}. Every method here is therefore a
+  # remote call fanning out to the followers, which is why nearly all of them go
+  # through {#member_online} - a follower that has crashed or disconnected must
+  # be dropped from the group rather than being allowed to raise into the
+  # leader's hunting loop.
   class Group
     include DRbUndumped
     attr_accessor :leader, :members
 
+    # @return [void]
     def initialize
       @members = Hash.new
     end
 
     # Helper method to check for offline members
+    # Yields each member, removing any that raise.
+    #
+    # Every remote call funnels through here: a follower whose Lich has exited
+    # will raise +DRb::DRbConnError+ on access, and the group must survive that.
+    # The offending member is named (using the caller's method for context) and
+    # deleted.
+    #
+    # @yieldparam name [String] the member's character name
+    # @yieldparam member [DRbObject] the member's remote Bigshot instance
+    # @return [void]
     def member_online
       @members.each do |name, member|
         begin
@@ -866,46 +972,62 @@ class Bigshot
       end
     end
 
+    # @param leader [Bigshot] the leader's own instance
+    # @return [Bigshot]
     def set_leader(leader)
       @leader = leader
     end
 
+    # @return [String] the leader's character name
     def leader_name
       @leader.name
     end
 
+    # @return [BigshotCreature, Lich::Common::GameObj, nil] the leader's current target
+    # @see Bigshot#leader_target?
     def leader_target
       @leader.leader_target?
     end
 
+    # @param member [DRbObject] a follower's remote Bigshot instance
+    # @return [DRbObject]
     def add_member(member)
       @members[member.name] = member
     end
 
+    # @return [Integer] group size including the leader
     def size
       return @members.size + 1
     end
 
+    # @return [Integer] number of followers, excluding the leader
     def group_size
       return @members.size
     end
 
+    # @return [Array<String>] every character name in the group
     def get_names
       return @members.keys + [@leader.name]
     end
 
+    # @return [Integer] the leader's current room id
     def room_id
       return @leader.room_id
     end
 
+    # @param kwargs [Hash] forwarded to the leader's claim check
+    # @return [Boolean] whether the leader holds the room claim
     def leader_claim?(**kwargs)
       @leader.bigclaim?(**kwargs)
     end
 
+    # @param name [String] character name
+    # @return [Boolean] whether that character is a follower
     def in_group?(name)
       @members.keys.include?(name)
     end
 
+    # @return [Boolean] true once no member is still looting
     def looting_done
       member_online do |_, member|
         return false if !member.looting_inactive?
@@ -914,14 +1036,24 @@ class Bigshot
       return true
     end
 
+    # Marks the designated looter as actively looting.
+    #
+    # @return [void]
     def set_group_looting_active
       @members[@leader.designated_looter].set_looting_active
     end
 
+    # @return [String] the character name designated to loot
     def looter
       return @leader.designated_looter
     end
 
+    # Broadcasts an event to every follower.
+    #
+    # @param type [Symbol] event type
+    # @param room [Integer] room the event applies to; defaults to the current room
+    # @return [void]
+    # @see Bigshot::Event
     def add_event(type, room = Room.current.id)
       member_online do |_, member|
         member.add_event(type, Time.now.to_i, room)
@@ -929,6 +1061,11 @@ class Bigshot
     end
 
     # Fixme: this won't work. bounty? returns a string. See def cur_bounty
+    # Whether any member holds a bounty matching the pattern.
+    #
+    # @param bounty_regex [Regexp] pattern to match against each member's bounty
+    # @return [Boolean]
+    # @note Kills the script if handed a non-Regexp.
     def has_bounty?(bounty_regex)
       if !bounty_regex.is_a? Regexp
         @leader.message("yellow", "That's not a Regexp.  Killing Bigshot")
@@ -947,32 +1084,45 @@ class Bigshot
       return false
     end
 
+    # Enables or disables group-assist attacking for every member.
+    #
+    # @param should_attack [Boolean]
+    # @return [void]
     def group_assist(should_attack)
       member_online do |_, member|
         member.set_help_group(should_attack)
       end
     end
 
+    # Queues an event on the leader itself, unless its stack is backed up.
+    #
+    # @param event [Symbol] event type
+    # @return [void]
     def add_leader_event(event)
       @leader.add_event(Event.new(event)) unless @leader.event_stack.size > 5
     end
 
+    # @return [Array<Integer>] the leader's return waypoint room ids
     def return_waypoints_ids
       return @leader.RETURN_WAYPOINT_IDS
     end
 
+    # @return [Integer] the leader's resting room id
     def resting_id
       return @leader.RESTING_ROOM_ID
     end
 
+    # @return [Integer] the leader's hunting room id
     def hunting_id
       return @leader.HUNTING_ROOM_ID
     end
 
+    # @return [Array<Integer>] the leader's rally point room ids
     def rally_ids
       return @leader.RALLYPOINT_ROOM_IDS
     end
 
+    # @return [Boolean] true if any member is in roundtime
     def roundtime?
       member_online do |_, member|
         return true if member.rt? > 0
@@ -982,6 +1132,10 @@ class Bigshot
     end
 
     # Use this to perform combat actions
+    # Broadcasts a combat command to every follower.
+    #
+    # @param command_input [String] command to run
+    # @return [void]
     def do_command(command_input)
       member_online do |_, member|
         member.add_event(:CUSTOM_CMD, Time.now.to_i, Room.current.id, command_input)
@@ -989,6 +1143,10 @@ class Bigshot
     end
 
     # Use this to perform non-combat actions
+    # Broadcasts a non-combat command to every follower.
+    #
+    # @param command_input [String] command to run
+    # @return [void]
     def do_put(command_input)
       member_online do |_, member|
         member.add_event(:CUSTOM_PUT, Time.now.to_i, Room.current.id, command_input)
@@ -996,6 +1154,10 @@ class Bigshot
     end
 
     # Use this to perform actions as if they were typed through the client
+    # Broadcasts a command to be run as though typed into the client.
+    #
+    # @param command_input [String] command to run
+    # @return [void]
     def client_do(command_input)
       member_online do |_, member|
         member.add_event(:CUSTOM_DO_CLIENT, Time.now.to_i, Room.current.id, command_input)
@@ -1003,18 +1165,31 @@ class Bigshot
     end
 
     # Use this to perform actions as if they were typed through the client
+    # Broadcasts a method name for each follower to +public_send+.
+    #
+    # @param command_input [String, Symbol] method to invoke on each follower
+    # @return [void]
     def pub_send(command_input)
       member_online do |_, member|
         member.add_event(:PUBLIC_SEND, Time.now.to_i, Room.current.id, command_input)
       end
     end
 
+    # Clears every follower's pending event queue.
+    #
+    # @return [void]
     def clear_group_events()
       member_online do |_, member|
         member.clear_events()
       end
     end
 
+    # Whether the group is collectively ready to hunt.
+    #
+    # Populates +$bigshot_group_status+ with a reason for each member that is not
+    # ready, so the leader can report why the group is waiting.
+    #
+    # @return [Boolean] true only when every member reports ready
     def group_should_hunt?
       if @leader.event_stack.shift
         @leader.clear_events
@@ -1030,12 +1205,21 @@ class Bigshot
       $bigshot_group_status.empty? ? ($bigshot_status = :ready; true) : false
     end
 
+    # Enables or disables bandit hunting for every member.
+    #
+    # @param kill_bandits [Boolean]
+    # @return [void]
     def group_bandit_hunting(kill_bandits)
       member_online do |_, member|
         member.set_bandit_hunting(kill_bandits)
       end
     end
 
+    # Whether any member needs to rest.
+    #
+    # Populates +$bigshot_group_status+ with each member's reason.
+    #
+    # @return [Boolean] true if at least one member wants to rest
     def group_should_rest?
       $bigshot_group_status = {}
 
@@ -1048,6 +1232,7 @@ class Bigshot
       return !$bigshot_group_status.empty?
     end
 
+    # @return [Boolean] true if any member's mind is saturated
     def any_saturated?
       member_online do |_, member|
         return true if member.saturated?
@@ -1056,6 +1241,10 @@ class Bigshot
       return false
     end
 
+    # Remaining carry capacity for each member.
+    #
+    # @return [Hash{String=>Integer}] character name to weight still available
+    #   before hitting that member's configured encumbrance limit
     def group_encumbrance
       group_weight = {}
 
@@ -1067,6 +1256,7 @@ class Bigshot
       return group_weight
     end
 
+    # @return [Boolean] true if any member hunts hidden but is not currently hidden
     def need_sneaky?
       member_online do |_, member|
         return true if member.sneaky_hunt? && !member.player_hidden?
@@ -1075,6 +1265,12 @@ class Bigshot
       return false
     end
 
+    # Whether every member is present in the room and in the game group.
+    #
+    # Waits out any in-flight Claim lock first, so the room roster is settled
+    # before it is checked.
+    #
+    # @return [Boolean]
     def all_present?
       sleep(0.1) while Lich::Gemstone::Claim::Lock.locked?
 
@@ -1087,6 +1283,7 @@ class Bigshot
       return true
     end
 
+    # @return [Boolean] true once every member has finished its rest preparation
     def rest_prep_complete?
       member_online do |_, member|
         return false if !member.rest_prep_done?
@@ -1095,6 +1292,7 @@ class Bigshot
       return true
     end
 
+    # @return [Boolean] true if any member is wounded badly enough to need rest
     def emergency_rest?
       member_online do |_, member|
         return true if member.wounded?
@@ -1251,11 +1449,19 @@ class Bigshot
       }
     }
 
+    # Finds which settings category a key belongs to.
+    #
+    # @param key [Symbol, String] setting key
+    # @return [Symbol, nil] the owning category, or nil if the key is unknown
     def self.get_category(key)
       @@categories.each { |category, data| return category unless data[key].nil? }
       nil
     end
 
+    # Looks up a single setting's metadata across all categories.
+    #
+    # @param key [Symbol, String] setting key
+    # @return [Hash, nil] the setting definition, or nil if the key is unknown
     def self.get_setting(key)
       cat = Setup.get_category(key)
       return nil if cat.nil?
@@ -1264,6 +1470,7 @@ class Bigshot
       nil
     end
 
+    # @param settings [Hash{Symbol=>Object}] current settings, keyed by widget name
     def initialize(settings)
       super()
       @settings = settings
@@ -1302,6 +1509,13 @@ class Bigshot
       end
     end
 
+    # Opens the settings window.
+    #
+    # Copies +UserVars.op+ into a symbol-keyed hash for the widgets to bind
+    # against; nothing is written back until the window is closed via
+    # {#on_close_clicked}.
+    #
+    # @return [void]
     def self.setup
       settings = UserVars.op.dup
 
@@ -1312,6 +1526,9 @@ class Bigshot
       Setup.new(settings).start
     end
 
+    # The Glade/GtkBuilder XML describing the settings window.
+    #
+    # @return [String] interface definition consumed by +Gtk::Builder+
     def self.ui
       '<?xml version="1.0" encoding="UTF-8"?><!-- Generated with glade 3.38.2 --><interface><requires lib="gtk+" version="3.20"/><object class="GtkAdjustment" id="creeping_dread_adjustment"><property name="upper">100</property><property name="step-increment">1</property><property name="page-increment">10</property>
       </object><object class="GtkAdjustment" id="crushing_dread_adjustment"><property name="upper">100</property><property name="step-increment">1</property><property name="page-increment">10</property></object><object class="GtkAdjustment" id="encumbered_adjustment"><property name="upper">101</property><property name="step-increment">1</property><property name="page-increment">10</property></object><object class="GtkAdjustment" id="flee_count_adjustment"><property name="upper">100</property><property name="step-increment">1</property><property name="page-increment">10</property>
@@ -1627,6 +1844,11 @@ class Bigshot
     end
 
     # This is connected to automatically during load_settings and syncs data back to CharSettings.
+    # Signal handler: a widget changed, so mirror it into the settings hash.
+    #
+    # @param obj [Gtk::Widget] the widget that fired; its +builder_name+ is the
+    #   setting key
+    # @return [void]
     def on_update(obj)
       self['no_current_profile'].hide
       self['test_label'].hide
@@ -1699,6 +1921,9 @@ class Bigshot
       end
     end
 
+    # Signal handler: load the profile named in the profile dropdown.
+    #
+    # @return [void] no-op when no profile name is selected
     def on_profile_load
       if @settings[:profile_name].empty?
         return
@@ -1716,6 +1941,9 @@ class Bigshot
       load_settings(false)
     end
 
+    # Signal handler: repopulate the profile dropdown from disk.
+    #
+    # @return [void]
     def on_drop_load
       dir = File.join($data_dir, XMLData.game, Char.name, "bigshot_profiles")
 
@@ -1729,6 +1957,9 @@ class Bigshot
       }
     end
 
+    # Attaches tooltip text to every widget in the window.
+    #
+    # @return [void]
     def set_tooltips
       # Profile Tab
 
@@ -1999,6 +2230,13 @@ class Bigshot
       self['monitor_safe_strings'].tooltip_text = ''
     end
 
+    # Rebuilds the boon settings from the current state of the boon checkboxes.
+    #
+    # The boon tab is a grid of per-mode toggles rather than plain key/value
+    # widgets, so it cannot round-trip through {#on_update} and is recomputed
+    # wholesale before saving.
+    #
+    # @return [void]
     def refresh_boon_settings
       # Reset all settings
       (@groups.keys + [:boons_all, :boons_ignore, :boons_flee]).each { |k| @settings[k] = [] }
@@ -2025,6 +2263,12 @@ class Bigshot
       end
     end
 
+    # Normalizes the settings hash immediately before it is persisted.
+    #
+    # Drops the transient widget keys that back the profile controls themselves,
+    # so they are never written into a saved profile.
+    #
+    # @return [void]
     def pre_save
       refresh_boon_settings
 
@@ -2041,6 +2285,9 @@ class Bigshot
       @settings = @settings.transform_keys(&:to_s)
     end
 
+    # Signal handler: close the window, saving settings.
+    #
+    # @return [void]
     def on_close_clicked
       pre_save
       UserVars.op = @settings
@@ -2051,6 +2298,12 @@ class Bigshot
       self['main'].destroy
     end
 
+    # Signal handler: the window was destroyed.
+    #
+    # Reports that changes were discarded unless the close came through
+    # {#on_close_clicked}, which sets the silent-exit flag.
+    #
+    # @return [void]
     def on_destroy
       Gtk.queue {
         Lich::Messaging.msg('plain', " Bigshot UI closed WITHOUT saving any changes") unless @silent_exit
@@ -2060,6 +2313,11 @@ class Bigshot
     end
 
     # iterate all objects and for any that match a setting name directly we set the default
+    # Populates every widget from the settings hash.
+    #
+    # @param connect [Boolean] whether to also wire up the change signal handlers;
+    #   false when refreshing widget values without rebinding
+    # @return [void]
     def load_settings(connect = true)
       Gtk.queue do
         # echo @settings
@@ -2194,6 +2452,11 @@ class Bigshot
       end
     end
 
+    # Keeps the boon group checkboxes consistent with their children.
+    #
+    # @param key [Symbol] the group being toggled
+    # @param value [String] the boon mode column
+    # @return [void]
     def check_group(key, value)
       return unless @all_modes.include?(value)
 
@@ -2217,6 +2480,15 @@ class Bigshot
       end
     end
 
+    # Signal handler: a boon checkbox changed.
+    #
+    # Guarded by an updating flag so the cascade into {#check_group} cannot
+    # recurse back through this handler.
+    #
+    # @param obj [Gtk::CheckButton] the toggled widget
+    # @param key [Symbol] the group it belongs to
+    # @param value [String] the boon mode column
+    # @return [void]
     def update_boon(obj, key, value)
       return if @updating
 
@@ -2281,6 +2553,9 @@ class Bigshot
       end
     end
 
+    # Signal handler: save the current settings as a new named profile.
+    #
+    # @return [void]
     def save_profile
       self['test_label'].hide
       @filename = ''
@@ -2315,6 +2590,9 @@ class Bigshot
       self['test_label'].show
     end
 
+    # Signal handler: overwrite the currently loaded profile.
+    #
+    # @return [void]
     def save_profile_changes
       self['no_current_profile'].hide
       @filename = ''
@@ -2334,6 +2612,9 @@ class Bigshot
       self['no_current_profile'].show
     end
 
+    # Shows the window and runs until it is closed.
+    #
+    # @return [void]
     def start
       @running = true
       Gtk.queue {
@@ -2347,6 +2628,10 @@ class Bigshot
       wait_while { @running }
     end
 
+    # Prints settings to the game window.
+    #
+    # @param cat_to_list [String] category to print, or +'all'+
+    # @return [void]
     def list(cat_to_list: 'all')
       indent_size = 2
       print_array =
@@ -2377,6 +2662,14 @@ class Bigshot
       end
     end
 
+    # Applies a single setting change from the command line.
+    #
+    # A value prefixed with +\++ or +-+ appends to or removes from a list setting
+    # rather than replacing it.
+    #
+    # @param key [Symbol, String] setting to change
+    # @param value [String] new value, optionally +\++/+-+ prefixed
+    # @return [void]
     def self.update_setting(key, value)
       setting = Setup.get_setting(key)
       echo "** Setting #{key.inspect} does not exist" if setting.nil?
@@ -2572,6 +2865,18 @@ class Bigshot
     end
   end
 
+  # Queues an event for this character to act on.
+  #
+  # Called remotely by the group leader. +:ATTACK+ is dropped once the stack is
+  # backed up, so a follower that has fallen behind does not accumulate stale
+  # attack orders; +:FOLLOWER_OVERKILL+ is de-duplicated.
+  #
+  # @param type [Symbol] event type
+  # @param time_stamp [Integer] creation time as a Unix timestamp
+  # @param room_id [Integer] room the event applies to
+  # @param c_in [String, nil] optional command payload
+  # @return [void]
+  # @see Bigshot::Event
   def add_event(type, time_stamp, room_id, c_in = nil)
     debug_msg(@DEBUG_SYSTEM, "add_event | type: #{type}")
     unless (@event_stack.size > 5 && type == :ATTACK)
@@ -2752,6 +3057,14 @@ class Bigshot
     end
   end
 
+  # Applies debug-flag changes from the command line.
+  #
+  # Accepts one or more category names plus a boolean, or the meta-options
+  # +help+, +check+, +all+ and +file+.
+  #
+  # @param updates [String] the raw argument string
+  #
+  # @return [void]
   def self.debug_update(updates)
     categories = ['debug_combat', 'debug_commands', 'debug_status', 'debug_system', 'debug_file']
     debug_array = updates.split(/[\s,|]+/)
@@ -2802,6 +3115,10 @@ class Bigshot
     end
   end
 
+  # Describes a frame from the call stack, for debug output.
+  #
+  # @param depth [Integer] how many frames up to look
+  # @return [String, nil] +"method_name(line)"+, or nil if the frame is unparsable
   def caller_method(depth = 1)
     c = caller(depth..depth).first
 
@@ -2812,6 +3129,12 @@ class Bigshot
     end
   end
 
+  # Writes a debug line, to file or to the game window.
+  #
+  # @param type [Boolean] the category flag for this message (+@DEBUG_COMBAT+ and
+  #   friends); the message is suppressed when false
+  # @param msg [String] text to log; the calling frame is appended automatically
+  # @return [void]
   def debug_msg(type, msg)
     return unless $bigshot_debug && type
 
@@ -2822,6 +3145,13 @@ class Bigshot
     @DEBUG_FILE ? @debug_logger.log(full_msg) : echo(full_msg)
   end
 
+  # Builds the creature-boon lookup tables.
+  #
+  # Maps each boon type to the adjectives that identify it in a creature's name,
+  # which is how boons are detected at all - the feed exposes them only through
+  # the name.
+  #
+  # @return [void]
   def initialize_boon_data
     boon_type = {
       "blink"              => ["flickering", "wavering"],
@@ -2919,6 +3249,11 @@ class Bigshot
     }.freeze
   end
 
+  # Builds a Bigshot instance from the command line and saved settings.
+  #
+  # @param options [Array<String>, nil] +Script.current.vars+; element 0 is the
+  #   raw argument string, from which the Ranger tracking creature is derived
+  # @param group [DRbObject, nil] the leader's group when joining as a follower
   def initialize(options = nil, group = nil)
     $bigshot = self
 
@@ -3037,6 +3372,13 @@ class Bigshot
     }
   end
 
+  # Invokes a single method with debug forced on, for development.
+  #
+  # Backs the +;bigshot test <method> [args]+ command line.
+  #
+  # @param method_name [Symbol] method to call
+  # @param args [Array] arguments to forward
+  # @return [Object] whatever the method returns
   def test_method(method_name, *args)
     # Turn on debug
     $bigshot_debug = true
@@ -3063,6 +3405,11 @@ class Bigshot
     end
   end
 
+  # Rate-limiter: whether enough time has passed to run something again.
+  #
+  # @param method_name [Symbol, String] key identifying the throttled action
+  # @param gap [Numeric] minimum seconds between runs
+  # @return [Boolean] true when the action may run, false while throttled
   def time_between(method_name, gap)
     current_time = Time.now
 
@@ -3076,6 +3423,9 @@ class Bigshot
     return true # Return true if either it's the first call or enough time has passed
   end
 
+  # The settings schema: every key, its type conversion, and its default.
+  #
+  # @return [Hash] key to +[conversion, default]+, consumed by {#set_value}
   def load_settings()
     {
       # Resting Tab - Where to Rest
@@ -3215,6 +3565,12 @@ class Bigshot
     }
   end
 
+  # Coerces a raw setting string into its configured type.
+  #
+  # @param clean [String] conversion to apply (+'to_i'+, +'to_f'+, +'split'+,
+  #   +'split_xx'+, and similar)
+  # @param value [String] raw setting value
+  # @return [Object] the converted value
   def clean_value(clean, value)
     if (clean == 'to_i')
       return value.to_i
@@ -3259,6 +3615,12 @@ class Bigshot
     end
   end
 
+  # Assigns one setting to its instance variable, or a default.
+  #
+  # @param key [String, Symbol] setting name; the ivar is its upcased form
+  # @param clean [String] conversion to apply, per {#clean_value}
+  # @param default [Object] value to use when the setting is unset or blank
+  # @return [void]
   def set_value(key, clean, default)
     if (!UserVars.op[key].nil? && UserVars.op[key].to_s !~ /^\s*$/)
       cleaned = clean_value(clean, UserVars.op[key])
@@ -3268,6 +3630,9 @@ class Bigshot
     end
   end
 
+  # Resolves any configured room UIDs into map room ids.
+  #
+  # @return [void] no-op in quick mode, which does not travel
   def convert_from_uid
     # provide support for uid's
     return if $bigshot_quick
@@ -3299,6 +3664,11 @@ class Bigshot
     debug_msg(@DEBUG_SYSTEM, "convert_from_uid | @HUNTING_BOUNDARIES: #{@HUNTING_BOUNDARIES}")
   end
 
+  # Resolves a single +uNNNN+ UID to a map room id.
+  #
+  # @param room [String] room id or +uNNNN+ UID
+  # @return [String, Integer] the resolved room id
+  # @note Exits the script if the UID is not in the map database.
   def uid_match(room)
     uid_pattern = /u(?<uid>\d+)/
     if (m = uid_pattern.match(room))
@@ -3314,6 +3684,11 @@ class Bigshot
     return room.to_i
   end
 
+  # Wraps text in front-end colour markup when messaging is available.
+  #
+  # @param color [String] colour name
+  # @param msg [String] text to wrap
+  # @return [String] the formatted string, or +msg+ unchanged
   def color(color, msg)
     if defined?(Lich::Messaging)
       Lich::Messaging.msg_format(color, msg)
@@ -3322,6 +3697,9 @@ class Bigshot
     end
   end
 
+  # Verifies the settings needed to hunt are present, exiting if not.
+  #
+  # @return [void] returns early in quick mode, which needs only quick_commands
   def check_required_values
     if $bigshot_quick && !UserVars.op["quick_commands"].to_s.empty?
       return
@@ -3430,6 +3808,14 @@ class Bigshot
     Script.self.kill
   end
 
+  # Builds the expression that decides when the current bounty is finished.
+  #
+  # The result is stored as a string and later +eval+'d, so it can reference
+  # live state at check time. Also detects bandit bounties and flips the script
+  # into bandit hunting.
+  #
+  # @return [void]
+  # @see #bounty_check?
   def set_bounty_eval()
     set_bandit_hunting(true) if checkbounty =~ /suppress bandit activity/
     return unless @BOUNTY_EVAL.to_s.empty?
@@ -3474,6 +3860,11 @@ class Bigshot
     @BOUNTY_EVAL = bounty_eval
   end
 
+  # Issues a command and returns its output lines, waiting out roundtime.
+  #
+  # @param command [String] command to send
+  # @param regex [Regexp] pattern marking the end of the response
+  # @return [Array<String>] the captured lines
   def get_lines(command, regex)
     lines = []
     regex = Regexp.union(regex, /(?:Roundtime:|\.\.\.wait) (\d+) [Ss]ec(?:onds)?\./)
@@ -3489,6 +3880,11 @@ class Bigshot
     return lines
   end
 
+  # Issues a command and returns the single matching response line.
+  #
+  # @param command [String] command to send
+  # @param regex [Regexp, nil] pattern to match; any line when nil
+  # @return [String, nil] the matched line
   def get_res(command, regex = nil)
     rt_regex = /(?:Roundtime:|\.\.\.wait|Wait) (\d+) [Ss]ec(?:onds?)?\.?/
     regex = regex.nil? ? Regexp.union(/.*?/, rt_regex) : Regexp.union(regex, rt_regex)
@@ -3545,6 +3941,18 @@ class Bigshot
     end
   end
 
+  # Runs one configured command against a target.
+  #
+  # The central dispatcher: parses the command's modifiers, evaluates them via
+  # {#command_check}, and routes to the matching +cmd_*+ implementation.
+  #
+  # @param command [String, Array<String>] command definition, or a list to run
+  #   in order
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature, or nil for commands with no target
+  # @param stance_dance [Boolean] whether the command may change stance
+  # @param check_priority [Boolean] whether a higher-priority creature may
+  #   interrupt; false inside an eachtarget sweep
+  # @return [void]
   def cmd(command, npc = nil, stance_dance = true, check_priority: true)
     debug_msg(@DEBUG_COMMANDS, "cmd | command: #{command}")
 
@@ -3758,6 +4166,11 @@ class Bigshot
     once_commands_register(npc, original_command)
   end
 
+  # Records that a +once+-modified command has run against a creature.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param command [String] the command that ran
+  # @return [void]
   def once_commands_register(npc, command)
     debug_msg(@DEBUG_COMMANDS, "once_commands_register | npc.id: #{npc.id} | command: #{command}")
 
@@ -3769,6 +4182,11 @@ class Bigshot
   # than +seconds+ ago. Registry values are per-NPC hashes of command => Time and
   # the registry is cleared on room change (see bs_wander), making this a
   # per-room throttle. Never-run commands (no recorded time) return false.
+  # Whether a +repeatdelay+-modified command is still within its cooldown.
+  #
+  # @param command [String] the command definition
+  # @param seconds [Integer] configured delay
+  # @return [Boolean]
   def repeatdelay_blocked?(command, seconds)
     last = @COMMANDS_REGISTRY.values.filter_map { |cmds| cmds[command] if cmds.is_a?(Hash) }.max
     return false if last.nil?
@@ -3794,6 +4212,12 @@ class Bigshot
     fput "target ##{current_target.id}" unless XMLData.current_target_id == current_target.id
   end
 
+  # Evaluates a command's modifiers to decide whether to skip it.
+  #
+  # @param command [String] full command definition, modifiers included
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [Boolean] true when the command should be SKIPPED
+  # @see #check_state_condition
   def command_check(command, npc)
     original_command = command
     match = command.match(@COMMAND_MODIFIER_REGEX)
@@ -3844,6 +4268,15 @@ class Bigshot
     return false
   end
 
+  # Evaluates a single command modifier.
+  #
+  # @param modifier [String] one modifier token, optionally +!+-negated
+  # @param command [String] the command being evaluated
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param original_command [String] the definition before modifier stripping
+  # @return [Boolean] true when this modifier means SKIP the command
+  # @note A new modifier must also be added to the whitelist alternation in
+  #   {#initialize_command_data}, or it will never reach this method.
   def check_state_condition(modifier, command, npc, original_command)
     # Generic Effects checks: ES"text", EB"text", EC"text", ED"text" (and negated !ES, !EB, !EC, !ED)
     if (effects_match = modifier.match(/^(!?E[SBCD])"(.+)"$/i))
@@ -4042,6 +4475,10 @@ class Bigshot
     end
   end
 
+  # Ensures a censer is lit and affordable before a spell that needs one.
+  #
+  # @param command [String] the spell command, used to derive the total cost
+  # @return [Boolean] whether the spell may proceed
   def handle_censer(command)
     spell_cost = if command =~ /^(incant)?\s?(\d+)\s?(?:(?:open|closed)?\s?(?:cast|channel|evoke)?\s?){0,2}(?:air|earth|fire|lightning|water|cold)?/i
                    Spell[$2.to_i].cost.to_i + Spell[320].cost.to_i
@@ -4056,6 +4493,11 @@ class Bigshot
     return false
   end
 
+  # Wields an item, storing whatever currently occupies the hand.
+  #
+  # @param noun [String] noun of the item to wield
+  # @param hand [String] +'right'+, +'left'+, or empty for right
+  # @return [void] no-op when the item is already held
   def cmd_wield(noun, hand)
     debug_msg(@DEBUG_COMMANDS, "cmd_wield | noun: #{noun} | hand: #{hand}")
 
@@ -4073,6 +4515,10 @@ class Bigshot
     end
   end
 
+  # Stores whatever is in hand.
+  #
+  # @param hand [String] +'right'+, +'left'+, or +'both'+
+  # @return [void] no-op when the hand is already empty
   def cmd_store(hand = 'both')
     debug_msg(@DEBUG_COMMANDS, "cmd_store | hand: #{hand}")
 
@@ -4089,6 +4535,11 @@ class Bigshot
     end
   end
 
+  # Performs an Assault-family maneuver.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param cmd [String] the maneuver name
+  # @return [void]
   def cmd_assault(npc, cmd)
     debug_msg(@DEBUG_COMMANDS, "cmd_assault | npc: #{npc} | cmd: #{cmd}")
 
@@ -4272,6 +4723,11 @@ class Bigshot
     }
   end
 
+  # Performs a shield combat maneuver.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param cmd [String] the maneuver name
+  # @return [void]
   def cmd_shields(npc, cmd)
     debug_msg(@DEBUG_COMMANDS, "cmd_shields | npc: #{npc} | cmd: #{cmd}")
 
@@ -4452,6 +4908,11 @@ class Bigshot
     end
   end
 
+  # Performs a general combat maneuver (CMAN).
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param cmd [String] the maneuver name
+  # @return [void]
   def cmd_cmans(npc, cmd)
     debug_msg(@DEBUG_COMMANDS, "cmd_cmans | npc: #{npc} | cmd: #{cmd}")
 
@@ -4573,6 +5034,11 @@ class Bigshot
     }
   end
 
+  # Performs a combat feat.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param cmd [String] the feat name
+  # @return [void]
   def cmd_feats(npc, cmd)
     debug_msg(@DEBUG_COMMANDS, "cmd_feats | npc: #{npc} | cmd: #{cmd}")
 
@@ -4614,6 +5080,10 @@ class Bigshot
     }
   end
 
+  # Invokes a Gemstone (jewel) property.
+  #
+  # @param mnemonic [String] the property mnemonic to invoke
+  # @return [void]
   def cmd_jewel(mnemonic)
     debug_msg(@DEBUG_COMMANDS, "cmd_jewel")
 
@@ -4690,6 +5160,11 @@ class Bigshot
     end
   end
 
+  # Performs the Bearhug maneuver.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param cmd [String] the maneuver variant
+  # @return [void]
   def cmd_bearhug(npc, cmd)
     debug_msg(@DEBUG_COMMANDS, "cmd_bearhug | npc: #{npc} | cmd: #{cmd}")
 
@@ -4741,6 +5216,11 @@ class Bigshot
     }
   end
 
+  # Performs a rogue-specific combat maneuver.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param cmd [String] the maneuver name
+  # @return [void]
   def cmd_rogue_cmans(npc, cmd)
     debug_msg(@DEBUG_COMMANDS, "cmd_rogue_cmans | npc: #{npc} | cmd: #{cmd}")
 
@@ -4817,6 +5297,11 @@ class Bigshot
     }
   end
 
+  # Performs a warrior shout (Warcry).
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param cmd [String] the shout name
+  # @return [void]
   def cmd_warrior_shouts(npc, cmd)
     debug_msg(@DEBUG_COMMANDS, "cmd_warrior_shouts | npc: #{npc} | cmd: #{cmd}")
 
@@ -4886,6 +5371,9 @@ class Bigshot
     end
   end
 
+  # Reads the recent server buffer for a UCS follow-up opening.
+  #
+  # @return [String, nil] the advertised follow-up maneuver, if any
   def assess_followup
     follow_up_results = $_SERVERBUFFER_.dup.join("\n")
     follow_up_results = follow_up_results.split("\n").delete_if { |line| line.nil? or line.empty? or line =~ /^[\r\n\s\t]*$/ }
@@ -5000,6 +5488,9 @@ class Bigshot
     $mstrike_taken = false
   end
 
+  # Blesses the queued items in +$bigshot_bless+.
+  #
+  # @return [void]
   def cmd_bless()
     debug_msg(@DEBUG_COMMANDS, "cmd_bless")
     while $bigshot_bless.count > 0
@@ -5027,6 +5518,11 @@ class Bigshot
     end
   end
 
+  # Assumes a Paladin aspect (650).
+  #
+  # @param aspect [String] aspect to assume
+  # @param extra [String, nil] extra arguments
+  # @return [void]
   def cmd_assume(aspect, extra)
     debug_msg(@DEBUG_COMMANDS, "cmd_assume | aspect: #{aspect} | extra: #{extra}")
 
@@ -5085,6 +5581,10 @@ class Bigshot
     end
   end
 
+  # Applies Briar (9105) to a weapon.
+  #
+  # @param weapon [Lich::Common::GameObj, nil] weapon to enchant
+  # @return [void]
   def cmd_briar(weapon)
     debug_msg(@DEBUG_COMMANDS, "cmd_briar | weapon: #{weapon.inspect}")
 
@@ -5110,6 +5610,11 @@ class Bigshot
     }
   end
 
+  # Throws a downed creature.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
+  # @note Only acts on a creature whose status reads as lying down.
   def cmd_throw(npc)
     debug_msg(@DEBUG_COMMANDS, "cmd_throw | npc: #{npc}")
 
@@ -5121,6 +5626,13 @@ class Bigshot
     end
   end
 
+  # Repeats a command until the target reaches a desired state.
+  #
+  # @param force_this [String] command to repeat
+  # @param goal [String] state to drive the target into
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param stance_dance [Boolean] whether stance may be changed
+  # @return [void]
   def cmd_force(force_this, goal, npc, stance_dance)
     debug_msg(@DEBUG_COMMANDS, "cmd_force | force_this: #{force_this} | npc: #{npc} | goal: #{goal}")
 
@@ -5189,6 +5701,10 @@ class Bigshot
     waitcastrt?
   end
 
+  # Whether a spell targets the caster rather than a creature.
+  #
+  # @param spell_id [Integer] spell number
+  # @return [Boolean]
   def spell_is_selfcast?(spell_id) # used in cmd_spell
     [
       106, 109, 115, 117, 120, 130, 140,
@@ -5206,6 +5722,14 @@ class Bigshot
     ].include?(spell_id)
   end
 
+  # Casts a spell, retrying on recoverable failures.
+  #
+  # @param spell_id [Integer, nil] spell number
+  # @param target [BigshotCreature, Lich::Common::GameObj, nil] target creature
+  # @param extra [String, nil] extra cast arguments
+  # @param force [Boolean] cast even when the usual guards would skip it
+  # @param max_attempts [Integer] retry ceiling
+  # @return [void]
   def cast_spell(spell_id: nil, target: nil, extra: nil, force: false, max_attempts: 3)
     attempts = 0
 
@@ -5243,6 +5767,13 @@ class Bigshot
     end
   end
 
+  # Casts or incants a spell, resolving self-cast versus targeted form.
+  #
+  # @param incant [String, nil] literal incant command, when given
+  # @param id [Integer, nil] spell number
+  # @param extra [String, nil] extra cast arguments
+  # @param target [BigshotCreature, Lich::Common::GameObj, nil] target creature
+  # @return [void]
   def cmd_spell(incant: nil, id: nil, extra: nil, target: nil)
     debug_msg(@DEBUG_COMMANDS, "cmd_spell | incant: #{incant} | id: #{id} | extra: #{extra} | target: #{target}")
 
@@ -5316,6 +5847,11 @@ class Bigshot
     end
   end
 
+  # Fires Resonance Bolt, rotating through the configured spell ids.
+  #
+  # @param ids [Array<Integer>] spell ids to cycle
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_resonance_bolt(ids, npc)
     @last ||= nil
     debug_msg(@DEBUG_COMMANDS, "cmd_resonance_bolt | ids: #{ids} | last: #{@last}")
@@ -5330,6 +5866,10 @@ class Bigshot
     @last = selected_spell
   end
 
+  # Attacks with a wand from the configured container.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_wand(target)
     debug_msg(@DEBUG_COMMANDS, "cmd_wand | target: #{target}")
 
@@ -5370,6 +5910,11 @@ class Bigshot
     end
   end
 
+  # Attacks with a wand drawn from a wandolier.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param args [String] wandolier selection arguments
+  # @return [void]
   def cmd_wandolier(target, args)
     debug_msg(@DEBUG_COMMANDS, "cmd_wandolier | target: #{target} | args: #{args}")
     tokens    = args.to_s.downcase.split(/\s+/).reject(&:empty?)
@@ -5413,6 +5958,9 @@ class Bigshot
     end
   end
 
+  # Casts Tremor (909).
+  #
+  # @return [void]
   def cmd_stomp()
     debug_msg(@DEBUG_COMMANDS, "cmd_stomp")
 
@@ -5429,6 +5977,9 @@ class Bigshot
     end
   end
 
+  # Casts Mana Leech (516).
+  #
+  # @return [void]
   def cmd_leech()
     debug_msg(@DEBUG_COMMANDS, "cmd_leech")
 
@@ -5441,6 +5992,10 @@ class Bigshot
     end
   end
 
+  # Casts Rapid Fire (515).
+  #
+  # @param ignore [String] tokens to skip
+  # @return [void]
   def cmd_rapid(ignore = "")
     debug_msg(@DEBUG_COMMANDS, "cmd_rapid | ignore: #{ignore}")
 
@@ -5519,6 +6074,9 @@ class Bigshot
     end
   end
 
+  # Casts the buffs that should precede an MStrike, for professions that have them.
+  #
+  # @return [void]
   def mstrike_spell_check()
     debug_msg(@DEBUG_COMMANDS, "mstrike_spell_check")
 
@@ -5547,6 +6105,11 @@ class Bigshot
     end
   end
 
+  # Performs an MStrike.
+  #
+  # @param command [String] the command definition
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_mstrike(command, target)
     debug_msg(@DEBUG_COMMANDS, "cmd_mstrike | target: #{target} | command: #{command}")
 
@@ -5585,6 +6148,12 @@ class Bigshot
     end
   end
 
+  # Reads a target's wounds from the feed to decide whether to keep attacking.
+  #
+  # @param command [String] the command definition
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param ranged [Boolean] whether the attack is ranged
+  # @return [Boolean] whether the target still warrants attacking
   def check_target_vitals(command, target, ranged = false)
     debug_msg(@DEBUG_COMBAT, "check_target_vitals | target: #{target} | command: #{command} | ranged: #{ranged}")
 
@@ -5618,6 +6187,10 @@ class Bigshot
     end
   end
 
+  # Casts Web (1040).
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_1040(target)
     debug_msg(@DEBUG_COMMANDS, "cmd_1040 | target: #{target}")
 
@@ -5686,6 +6259,10 @@ class Bigshot
     end
   end
 
+  # Recovers a thrown or dropped weapon.
+  #
+  # @param weapon_lost [Boolean] whether a weapon is known to be missing
+  # @return [void]
   def cmd_recover(weapon_lost = true)
     debug_msg(@DEBUG_COMMANDS, "cmd_recover | weapon_lost: #{weapon_lost}")
 
@@ -5768,6 +6345,11 @@ class Bigshot
     end
   end
 
+  # Dislodges an embedded projectile from a creature.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param location [String] body location to dislodge from
+  # @return [void]
   def cmd_dislodge(npc, location)
     debug_msg(@DEBUG_COMMANDS, "cmd_dislodge | npc: #{npc} | location: #{location}")
 
@@ -5799,6 +6381,9 @@ class Bigshot
     end
   end
 
+  # Uses Burst of Swiftness.
+  #
+  # @return [void]
   def cmd_burst()
     debug_msg(@DEBUG_COMMANDS, "cmd_burst")
 
@@ -5819,6 +6404,9 @@ class Bigshot
     end
   end
 
+  # Uses Surge of Strength.
+  #
+  # @return [void]
   def cmd_surge()
     debug_msg(@DEBUG_COMMANDS, "cmd_surge")
 
@@ -5839,6 +6427,9 @@ class Bigshot
     end
   end
 
+  # Goes berserk, if stamina allows.
+  #
+  # @return [void]
   def cmd_berserk()
     debug_msg(@DEBUG_COMMANDS, "cmd_berserk")
 
@@ -5852,6 +6443,11 @@ class Bigshot
     end
   end
 
+  # Runs another Lich script as a command action.
+  #
+  # @param name [String] script name
+  # @param args [String, nil] arguments to pass
+  # @return [void]
   def cmd_run_script(name, args)
     debug_msg(@DEBUG_SYSTEM, "cmd_run_script | name: #{name} | args: #{args}")
 
@@ -5862,6 +6458,12 @@ class Bigshot
     end
   end
 
+  # Pauses for a fixed interval mid-combat.
+  #
+  # @param time [Numeric] seconds to sleep
+  # @param nostance [Boolean] skip the stance change when true
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_sleep(time, nostance, npc)
     debug_msg(@DEBUG_COMMANDS, "cmd_sleep | npc: #{npc} | time: #{time}")
 
@@ -5907,6 +6509,9 @@ class Bigshot
     end
   end
 
+  # Nudges weapons blocking the room's exits.
+  #
+  # @return [void]
   def cmd_nudge_weapons()
     debug_msg(@DEBUG_COMMANDS, "cmd_nudge_weapons")
 
@@ -5937,6 +6542,10 @@ class Bigshot
     }
   end
 
+  # Sacrifices a corpse for Voln favor.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_sacrifice(target)
     debug_msg(@DEBUG_COMMANDS, "cmd_sacrifice")
     return unless Char.spirit >= 2
@@ -5950,6 +6559,12 @@ class Bigshot
     end
   end
 
+  # Casts Tether and follows the damage-over-time if it transfers.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param recast_on_transfer [Boolean] whether to recast on the new creature
+  #   when the effect jumps targets
+  # @return [void]
   def cmd_tether(npc, recast_on_transfer = false)
     debug_msg(@DEBUG_COMMANDS, "cmd_tether")
 
@@ -6034,6 +6649,9 @@ class Bigshot
     end
   end
 
+  # Whether a group member is incapacitated and needs help.
+  #
+  # @return [Boolean]
   def group_member_stunned?
     stunned = false
     if webbed? || sleeping? || stunned? || frozen?
@@ -6049,6 +6667,11 @@ class Bigshot
     return stunned
   end
 
+  # Prints a formatted message to the game window.
+  #
+  # @param type [String] colour or style name
+  # @param text [String] message body
+  # @return [void]
   def message(type = "info", text)
     # color options - set type to use
     # yellow, orange, teal, green, plain
@@ -6066,6 +6689,9 @@ class Bigshot
     Lich::Messaging.msg(type, text)
   end
 
+  # Stops the script if the character appears to have died or gone unresponsive.
+  #
+  # @return [void]
   def dead_man_switch()
     debug_msg(@DEBUG_SYSTEM, "dead_man_switch")
 
@@ -6103,6 +6729,9 @@ class Bigshot
     end
   end
 
+  # Starts the monitor that watches for other players interacting with the hunt.
+  #
+  # @return [void]
   def monitor_interaction()
     debug_msg(@DEBUG_SYSTEM, "monitor_interaction")
 
@@ -6111,6 +6740,10 @@ class Bigshot
         watch_list = /#{@monitor_strings.gsub("||", "|")}/io
         safe_strings = /#{@monitor_safe_strings.gsub("||", "|")}/io
 
+        # Opens a titled GTK window for status display.
+        #
+        # @param line [String] text to append to the window title
+        # @return [void]
         def show_window(line)
           window_title = Char.name + ':' + line
           Gtk.queue do
@@ -6151,6 +6784,9 @@ class Bigshot
     return npcs.size.to_i
   end
 
+  # Wracks for spirit, when the Wrack spell is known and affordable.
+  #
+  # @return [void]
   def wrack()
     debug_msg(@DEBUG_COMMANDS, "wrack")
 
@@ -6163,15 +6799,26 @@ class Bigshot
     end
   end
 
+  # @return [String] the character's current bounty text
   def cur_bounty()
     return bounty?
   end
 
+  # Enables or disables bandit hunting, relaxing anti-poach protections.
+  #
+  # @param kill_bandits [Boolean]
+  # @return [void]
   def set_bandit_hunting(kill_bandits)
     # Need to circumvent anti-poach and protections some to hunt bandits
     $bigshot_bandits = kill_bandits
   end
 
+  # Changes combat stance.
+  #
+  # @param new_stance [String] stance to adopt
+  # @param force [Boolean] change even when a command asked not to
+  # @return [void]
+  # @note No-op while Spell 216 is active or the character is dead.
   def change_stance(new_stance, force = true)
     debug_msg(@DEBUG_COMMANDS, "change_stance | new_stance: #{new_stance} | force: #{force}")
     return if Spell[216].active? || dead?
@@ -6202,6 +6849,11 @@ class Bigshot
     end
   end
 
+  # Waits for the next weapon swing, or until the target goes down.
+  #
+  # @param seconds [Numeric] maximum time to wait
+  # @param target [BigshotCreature, Lich::Common::GameObj, nil] target to watch
+  # @return [void]
   def wait_for_swing(seconds, target = nil)
     debug_msg(@DEBUG_COMBAT, "wait_for_swing | target: #{target} | seconds: #{seconds}")
 
@@ -6247,6 +6899,13 @@ class Bigshot
     croak_scripts(["#{$current_script_name}"])
   end
 
+  # Starts another Lich script, optionally pausing bigshot while it runs.
+  #
+  # @param name [String] script name
+  # @param pause_bigshot [Boolean] pause this script until it finishes
+  # @param args [String, nil] arguments to pass
+  # @param looting [Boolean] whether this run is a looting pass
+  # @return [void]
   def run_script(name, pause_bigshot = false, args = nil, looting: false)
     debug_msg(@DEBUG_SYSTEM, "run_script | name: #{name} | pause_bigshot: #{pause_bigshot} | args: #{args} | looting: #{looting}")
 
@@ -6267,6 +6926,11 @@ class Bigshot
     end
   end
 
+  # Starts several scripts in order.
+  #
+  # @param scripts [Array<String>] script names
+  # @param pause_bigshot [Boolean] pause this script until each finishes
+  # @return [void]
   def run_scripts(scripts, pause_bigshot = false)
     debug_msg(@DEBUG_SYSTEM, "run_scripts | scripts: #{scripts} | pause_bigshot: #{pause_bigshot}")
 
@@ -6280,6 +6944,10 @@ class Bigshot
     end
   end
 
+  # Stops a running script, matching on name with or without arguments.
+  #
+  # @param name [String] script name
+  # @return [void]
   def croak_script(name)
     debug_msg(@DEBUG_SYSTEM, "croak_script | script: #{name}")
 
@@ -6288,20 +6956,34 @@ class Bigshot
     kill_script(name) if running?(name)
   end
 
+  # Stops several scripts.
+  #
+  # @param scripts [Array<String>] script names
+  # @return [void]
   def croak_scripts(scripts)
     debug_msg(@DEBUG_SYSTEM, "croak_script | scripts: #{scripts}")
 
     scripts.each { |i| croak_script(i) }
   end
 
+  # Runs the configured pre-hunt commands.
+  #
+  # @return [void]
   def hunting_prep
     prep_and_rest_commands(@HUNTING_PREP_COMMANDS)
   end
 
+  # Runs the configured pre-rest commands.
+  #
+  # @return [void]
   def resting_prep
     prep_and_rest_commands(@RESTING_COMMANDS)
   end
 
+  # Runs a list of prep commands, dispatching +script ...+ entries to scripts.
+  #
+  # @param commands [Array<String>] command definitions
+  # @return [void]
   def prep_and_rest_commands(commands)
     commands.each do |cmd|
       if cmd =~ /^script\s+(.*?)(\s|$)(.*)/i
@@ -6313,6 +6995,10 @@ class Bigshot
     end
   end
 
+  # Stands up, unless a command explicitly wants the character down.
+  #
+  # @param stand_command [String, Array<String>, nil] command context
+  # @return [void]
   def stand(stand_command = nil)
     debug_msg(@DEBUG_COMMANDS, "stand | stand_command: #{stand_command}")
 
@@ -6328,11 +7014,18 @@ class Bigshot
     change_stance(original_stance)
   end
 
+  # Refreshes the game-side group roster.
+  #
+  # @return [void]
   def groupcheck()
     Lich::Gemstone::Group.check unless Lich::Gemstone::Group.checked? && !Lich::Gemstone::Group.broken?
     debug_msg(@DEBUG_STATUS, "groupcheck | Group.members.map(&:noun): #{Lich::Gemstone::Group.members.map(&:noun)}")
   end
 
+  # Whether this character holds the claim on the current room.
+  #
+  # @param check_disks [Boolean] also treat another player's disk as a conflict
+  # @return [Boolean]
   def bigclaim?(check_disks: true)
     debug_msg(@DEBUG_STATUS, "bigclaim? | $bigshot_quick: #{$bigshot_quick} | Claim.mine?: #{Lich::Gemstone::Claim.mine?} | Disks: #{(Lich::Gemstone::Disk.all - Lich::Gemstone::Group.disks)}")
 
@@ -6343,6 +7036,9 @@ class Bigshot
     return true
   end
 
+  # Resolves which character should loot, for Mechanical Assist hunting.
+  #
+  # @return [String] the looting character's name
   def ma_looter
     # Solo: the player is always the looter
     return Char.name if solo?
@@ -6376,10 +7072,15 @@ class Bigshot
     return looter
   end
 
+  # @return [String] the character designated to loot
   def designated_looter
     @DESIGNATED_LOOTER
   end
 
+  # Entry point: runs the hunting loop until the script exits.
+  #
+  # @param my_group [DRbObject, nil] the group object when leading
+  # @return [void]
   def lead(my_group = nil)
     debug_msg(@DEBUG_STATUS, "lead")
 
@@ -6392,6 +7093,10 @@ class Bigshot
     should_rest? && !$bigshot_quick ? rest : hunt
   end
 
+  # Selects the command routine to run against a target.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the creature
+  # @return [Array<String>] the command definitions to execute
   def find_routine(target)
     debug_msg(@DEBUG_COMBAT, "find_routine | target: #{target} | @DISABLE_COMMANDS.size: #{@DISABLE_COMMANDS.size}")
 
@@ -6428,19 +7133,23 @@ class Bigshot
     return @HUNTING_COMMANDS
   end
 
+  # @return [Boolean] true when hunting without followers
   def solo?
     # tails wont have followers
     return @followers && @followers.size == 1
   end
 
+  # @return [Boolean] true when this character leads the group
   def leading?
     return !following?
   end
 
+  # @return [Boolean] true when this character follows a leader
   def following?
     return @followers.nil?
   end
 
+  # @return [Boolean] whether hunting may proceed with no other players present
   def no_players_hunt()
     debug_msg(@DEBUG_COMBAT, "no_players_hunt")
     return true if $bigshot_quick
@@ -6449,6 +7158,10 @@ class Bigshot
     return true
   end
 
+  # Prepares the group and character before engaging.
+  #
+  # @param manually_walking [Boolean] whether the player is moving by hand
+  # @return [void]
   def pre_hunt(manually_walking = false)
     debug_msg(@DEBUG_COMBAT, "pre_hunt")
 
@@ -6558,6 +7271,9 @@ class Bigshot
     end
   end
 
+  # Finds a target and runs the attack cycle against it.
+  #
+  # @return [void]
   def do_hunt() # Finds target and calls attack block
     debug_msg(@DEBUG_COMBAT, "do_hunt")
 
@@ -6630,6 +7346,9 @@ class Bigshot
   end
 
   # this is a leader method
+  # One full hunting iteration: prepare, then hunt.
+  #
+  # @return [void]
   def hunt()
     debug_msg(@DEBUG_COMBAT, "hunt")
     pre_hunt()
@@ -6638,6 +7357,9 @@ class Bigshot
   end
 
   # this is a leader method
+  # Rests until the configured recovery thresholds are met.
+  #
+  # @return [void]
   def rest()
     debug_msg(@DEBUG_COMBAT, "rest")
 
@@ -6815,6 +7537,10 @@ class Bigshot
     hunt()
   end
 
+  # Pulses mana until a spell becomes affordable.
+  #
+  # @param spell_id [Integer] spell to afford
+  # @return [void]
   def mana_pulse(spell_id)
     debug_msg(@DEBUG_COMMANDS, "mana_pulse | spell_id: #{spell_id}")
 
@@ -6831,6 +7557,10 @@ class Bigshot
     sleep 0.2
   end
 
+  # Returns to the hunting room via Spirit Guide (130).
+  #
+  # @param from_voln [Boolean] whether Voln fog was already tried
+  # @return [Boolean]
   def fog_return_spirit(from_voln = false)
     debug_msg(@DEBUG_COMBAT, "fog_return_spirit | from_voln: #{from_voln}")
 
@@ -6855,6 +7585,10 @@ class Bigshot
     end
   end
 
+  # Returns to the hunting room via Voln fog.
+  #
+  # @param from_130 [Boolean] whether Spirit Guide was already tried
+  # @return [Boolean]
   def fog_return_voln(from_130 = false)
     debug_msg(@DEBUG_COMBAT, "fog_return_voln | from_130: #{from_130}")
 
@@ -6875,6 +7609,9 @@ class Bigshot
     end
   end
 
+  # Returns to the hunting room by whichever fog method is configured.
+  #
+  # @return [void]
   def fog_return
     debug_msg(@DEBUG_COMBAT, "fog_return")
 
@@ -6924,6 +7661,10 @@ class Bigshot
     end
   end
 
+  # Whether the attack cycle should stop early.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the current target
+  # @return [Boolean]
   def attack_break(target)
     break_conditions = {
       "No Claim"                  => -> { !bigclaim?(check_disks: false) },
@@ -6945,6 +7686,10 @@ class Bigshot
     false
   end
 
+  # Runs the full command routine against a target until it dies or breaks off.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the creature to attack
+  # @return [void]
   def attack(target) # Starts the process when a target is found
     commands = find_routine(target)
     debug_msg(@DEBUG_COMBAT, "attack | commands #{commands}")
@@ -6990,6 +7735,10 @@ class Bigshot
     need_to_loot?
   end
 
+  # Whether there is anything worth looting.
+  #
+  # @param final_loot [Boolean] whether this is the end-of-hunt sweep
+  # @return [Boolean]
   def need_to_loot?(final_loot = false)
     return unless bigclaim?(check_disks: false)
     return unless leading?
@@ -6999,6 +7748,13 @@ class Bigshot
     return unless @followers.looting_done
 
     # if no deaders and valid targets just return
+    # Deliberately GameObj.npcs, not bs_room_creatures/Creature.in_room:
+    # Creature only registers a room object when a live <crtrStatus> tag
+    # arrives for it or it's in the client's target dropdown (see
+    # lib/common/xmlparser.rb's text() handler) - neither is guaranteed for
+    # a corpse still lying in the room post-mortem, so relying on Creature
+    # here risked silently missing lootable corpses. GameObj.npcs tracks
+    # every bolded room object unconditionally.
     dead_npcs = GameObj.npcs.find_all { |i| i.status == 'dead' && i.type !~ /escort/i }
     valid_targets = sort_npcs.any? { |s| valid_target?(s) }
     return if dead_npcs.length.to_i.zero? && valid_targets
@@ -7032,10 +7788,14 @@ class Bigshot
     end
   end
 
+  # Loots and skins the corpses in the room.
+  #
+  # @return [void]
   def loot()
     debug_msg(@DEBUG_COMBAT, "loot")
 
-    # get a list of dead npcs
+    # get a list of dead npcs (GameObj.npcs, not Creature - see need_to_loot?
+    # for why: corpses aren't reliably re-registered into Creature.in_room)
     dead_npcs = GameObj.npcs.find_all { |i| i.status == 'dead' && i.type !~ /escort/i }
 
     if gameobj_npc_check.positive? && @LOOT_STANCE
@@ -7069,6 +7829,10 @@ class Bigshot
     end
   end
 
+  # Blocks until a looting script finishes or the hunt must resume.
+  #
+  # @param script_ran [Script] the looting script to watch
+  # @return [void]
   def looting_watch(script_ran)
     loop do
       break if Script.paused?(script_ran.name)
@@ -7085,6 +7849,10 @@ class Bigshot
     end
   end
 
+  # Travels to a destination with go2.
+  #
+  # @param place [String, Integer] go2 destination
+  # @return [void]
   def go2(place)
     debug_msg(@DEBUG_COMMANDS, "go2 | place: #{place}")
 
@@ -7093,6 +7861,11 @@ class Bigshot
     Script.run('go2', "#{place} --disable-confirm", { quiet: true })
   end
 
+  # Moves to a room id, preparing signs and stance first.
+  #
+  # @param id [Integer, String] destination room id
+  # @param cast_signs_moving [Boolean] whether to refresh signs before moving
+  # @return [void]
   def goto(id, cast_signs_moving = true)
     debug_msg(@DEBUG_COMMANDS, "goto | id: #{id} | cast_signs_moving: #{cast_signs_moving}")
 
@@ -7108,6 +7881,9 @@ class Bigshot
     $rest_reason = "Could not reach #{id}"
   end
 
+  # Starts the hunt timer and records baseline experience.
+  #
+  # @return [void]
   def start_watch()
     debug_msg(@DEBUG_SYSTEM, "start_watch")
 
@@ -7115,6 +7891,9 @@ class Bigshot
     @followers.add_event(:START_WATCH)
   end
 
+  # Stops the hunt timer.
+  #
+  # @return [void]
   def stop_watch()
     debug_msg(@DEBUG_SYSTEM, "stop_watch")
 
@@ -7125,6 +7904,9 @@ class Bigshot
     @START_TIME = 0
   end
 
+  # Prints elapsed time and experience earned for the session.
+  #
+  # @return [void]
   def display_watch()
     debug_msg(@DEBUG_SYSTEM, "display_watch")
 
@@ -7153,6 +7935,9 @@ class Bigshot
     message("yellow", sprintf("Bigshot: Total Time Running: %d min.  %0.2f secs.", total / 60, total % 60))
   end
 
+  # Lists the items queued for blessing.
+  #
+  # @return [void]
   def display_items_for_blessing()
     debug_msg(@DEBUG_STATUS, "display_items_for_blessing")
 
@@ -7173,6 +7958,9 @@ class Bigshot
     bless_bundles = false
   end
 
+  # Ends a single-loop hunt cleanly.
+  #
+  # @return [void]
   def single_stop()
     debug_msg(@DEBUG_SYSTEM, "single_stop")
 
@@ -7181,14 +7969,19 @@ class Bigshot
     sleep 0.5
   end
 
+  # @return [Integer] the current room id
   def room_id()
     return Room.current.id()
   end
 
+  # @return [String] this character's name
   def name()
     return Char.name
   end
 
+  # Performs a queued weapon reaction, restoring stance afterward.
+  #
+  # @return [void]
   def perform_reaction()
     debug_msg(@DEBUG_COMBAT, "performing weapon reaction | $bigshot_reaction: #{$bigshot_reaction}")
     original_stance = Char.stance
@@ -7198,12 +7991,17 @@ class Bigshot
     $bigshot_reaction = nil
   end
 
+  # @return [Array<String>] nouns of the current game group members
   def get_grouplist()
     debug_msg(@DEBUG_STATUS, "get_grouplist | Group.members.map(&:noun): #{Lich::Gemstone::Group.members.map(&:noun)}")
 
     return Lich::Gemstone::Group.members.map(&:noun)
   end
 
+  # Identifies which boons a creature carries.
+  #
+  # @param creature [BigshotCreature, Lich::Common::GameObj] the creature
+  # @return [Array<String>, nil] boon names, or nil if the creature has none
   def check_boons(creature)
     debug_msg(@DEBUG_COMBAT, "check_boons | creature: #{creature.inspect}")
 
@@ -7245,6 +8043,11 @@ class Bigshot
     @BOON_CACHE[creature.id] = abilities.empty? ? nil : abilities
   end
 
+  # Whether a creature should be skipped because of its boons.
+  #
+  # @param creature [BigshotCreature, Lich::Common::GameObj] the creature
+  # @param assess [Boolean] whether to ASSESS the creature to confirm its boons
+  # @return [Boolean]
   def invalid_target_with_boons(creature, assess = true)
     debug_msg(@DEBUG_COMBAT, "invalid_target_with_boons | creature: #{creature.inspect}")
 
@@ -7583,6 +8386,11 @@ class Bigshot
     return false
   end
 
+  # Whether the character should leave rather than fight.
+  #
+  # @param just_entered [Boolean] true on first entering a room, which applies
+  #   the lone-target rule instead of the usual flee count
+  # @return [Boolean]
   def should_flee?(just_entered = false)
     debug_msg(@DEBUG_COMBAT, "should_flee | just_entered: #{just_entered}")
 
@@ -7682,6 +8490,9 @@ class Bigshot
     end
   end
 
+  # The attackable creatures in the room, ordered by configured priority.
+  #
+  # @return [Array<BigshotCreature, Lich::Common::GameObj>]
   def sort_npcs()
     if $bigshot_quick || $bigshot_bandits
       # Initialize hashs if needed
@@ -7753,6 +8564,11 @@ class Bigshot
     return priority
   end
 
+  # Picks the creature to attack next.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj, nil] current target
+  # @param just_entered [Boolean] forwarded to the validity checks
+  # @return [BigshotCreature, Lich::Common::GameObj, nil] the chosen creature
   def find_target(target, just_entered = false)
     debug_msg(@DEBUG_COMBAT, "find_target | target: #{target} | just_entered: #{just_entered}")
 
@@ -7805,6 +8621,7 @@ class Bigshot
     @CORRECT_PERCENT_MIND >= @FRIED
   end
 
+  # @return [Boolean] whether mana has fallen below the configured floor
   def oom?()
     debug_msg(@DEBUG_STATUS, "oom? | Char.percent_mana: #{Char.percent_mana} | @OOM: #{@OOM}")
 
@@ -7812,39 +8629,52 @@ class Bigshot
     Char.percent_mana < @OOM
   end
 
+  # @return [Boolean] whether the character is currently hidden
   def player_hidden?
     return hidden?
   end
 
+  # @return [Boolean] whether this character hunts from hiding
   def sneaky_hunt?
     return @SNEAKY_SNEAKY
   end
 
+  # @return [Array(Integer, Integer)] current encumbrance and configured limit
   def encumbrance?
     debug_msg(@DEBUG_STATUS, "encumbrance? | [Char.percent_encumbrance, @ENCUMBERED]: #{[Char.percent_encumbrance, @ENCUMBERED]}")
     return [Char.percent_encumbrance, @ENCUMBERED]
   end
 
+  # @return [Boolean] whether the mind is saturated
   def saturated?()
     debug_msg(@DEBUG_STATUS, "saturated? | checkmind =~ /saturated/: #{checkmind =~ /saturated/}")
     checkmind =~ /saturated/
   end
 
+  # @return [Boolean] whether the overkill threshold has been reached
   def overkill?()
     debug_msg(@DEBUG_STATUS, "overkill?")
     $bigshot_overkill_counter >= @OVERKILL && lte_boost?
   end
 
+  # Enables or disables assisting the group's kills.
+  #
+  # @param keep_attacking [Boolean]
+  # @return [void]
   def set_help_group(keep_attacking)
     debug_msg(@DEBUG_COMBAT, "set_help_group | keep_attacking: #{keep_attacking}")
     @HELP_GROUP_KILL = keep_attacking
   end
 
+  # @return [Boolean] whether the LTE boost threshold has been reached
   def lte_boost?()
     debug_msg(@DEBUG_STATUS, "lte_boost?")
     $bigshot_lte_boost_counter >= @LTE_BOOST
   end
 
+  # Consumes an LTE boost when experience is saturated.
+  #
+  # @return [void]
   def use_lte_boost()
     debug_msg(@DEBUG_COMMANDS, "use_lte_boost")
 
@@ -7862,11 +8692,18 @@ class Bigshot
     end
   end
 
+  # Refreshes the cached field-experience percentage.
+  #
+  # @return [void]
   def check_mind
     @followers.add_event(:CHECK_MIND)
     @CORRECT_PERCENT_MIND = Lich::Gemstone::Experience.percent_fxp
   end
 
+  # Clears per-room and per-target state.
+  #
+  # @param moved [Boolean] whether the character changed rooms
+  # @return [void]
   def reset_variables(moved = true)
     debug_msg(@DEBUG_SYSTEM, "reset_variables | moved: #{moved}")
 
@@ -7887,6 +8724,7 @@ class Bigshot
     $bigshot_reaction = nil
   end
 
+  # @return [Boolean] whether wounds are severe enough to stop hunting
   def wounded?()
     debug_msg(@DEBUG_STATUS, "wounded?")
 
@@ -7895,6 +8733,7 @@ class Bigshot
     return false
   end
 
+  # @return [Boolean] whether Creeping Dread has passed its threshold
   def creeping_dread?
     debug_msg(@DEBUG_STATUS, "creeping_dread?")
 
@@ -7906,6 +8745,7 @@ class Bigshot
     key.to_s[/\((\d+)\)/, 1].to_i >= @CREEPING_DREAD
   end
 
+  # @return [Boolean] whether Crushing Dread has passed its threshold
   def crushing_dread?
     debug_msg(@DEBUG_STATUS, "crushing_dread?")
 
@@ -7917,6 +8757,7 @@ class Bigshot
     key.to_s[/\((\d+)\)/, 1].to_i >= @CRUSHING_DREAD
   end
 
+  # @return [Boolean] whether the character is suffering Wall of Thorns poison
   def wot_poison?
     debug_msg(@DEBUG_STATUS, "wot_poison?")
 
@@ -7945,6 +8786,9 @@ class Bigshot
     return result
   end
 
+  # Whether this character is ready for the group to start hunting.
+  #
+  # @return [String] +'ready'+, or the reason it is not
   def ready_to_hunt?
     debug_msg(@DEBUG_STATUS, "ready_to_hunt?")
     $not_hunting_reason = nil
@@ -7974,6 +8818,9 @@ class Bigshot
     return "ready"
   end
 
+  # Whether hunting should continue.
+  #
+  # @return [Boolean]
   def should_hunt?()
     debug_msg(@DEBUG_STATUS, "should_hunt?")
 
@@ -7999,6 +8846,9 @@ class Bigshot
     end
   end
 
+  # Whether this character needs the group to rest.
+  #
+  # @return [String, false] the reason to rest, or false
   def ready_to_rest?
     debug_msg(@DEBUG_STATUS, "ready_to_rest?")
     return false if $bigshot_quick
@@ -8035,6 +8885,9 @@ class Bigshot
     return false
   end
 
+  # Whether the group should stop and rest.
+  #
+  # @return [Boolean]
   def should_rest?()
     debug_msg(@DEBUG_STATUS, "should_rest?")
 
@@ -8068,6 +8921,9 @@ class Bigshot
     return true
   end
 
+  # Increments the overkill counter after a kill.
+  #
+  # @return [void]
   def add_overkill()
     debug_msg(@DEBUG_COMBAT, "add_overkill")
 
@@ -8081,6 +8937,9 @@ class Bigshot
     end
   end
 
+  # Renews Bard songs when they are close to expiring.
+  #
+  # @return [void]
   def bard_renewal()
     $bard_renewal_cost ||= 0
     $bard_renewal_check ||= (Time.now - 61)
@@ -8096,6 +8955,9 @@ class Bigshot
     return $bard_renewal_cost
   end
 
+  # Casts Spirit Strike (902) if known and affordable.
+  #
+  # @return [void]
   def cast902()
     if Spell[902].known? && Spell[902].affordable?
       waitrt?
@@ -8106,6 +8968,9 @@ class Bigshot
     end
   end
 
+  # Casts Elemental Strike (411) if known and affordable.
+  #
+  # @return [void]
   def cast411()
     if Spell[411].known? && Spell[411].affordable?
       waitrt?
@@ -8116,6 +8981,9 @@ class Bigshot
     end
   end
 
+  # Checks whether the held weapon still carries the 902/411 enchantment.
+  #
+  # @return [void]
   def check_902_411()
     lines = Lich::Util.quiet_command_xml("look at ##{GameObj.right_hand.id}", /You see nothing unusual.|I could not find|The <a exist="(.*?)" noun=".*?">.*?<\/a>/).join(" ")
 
@@ -8123,6 +8991,10 @@ class Bigshot
     $bigshot_cast411 = !lines&.match?(/is surrounded by a scintillating/)
   end
 
+  # Casts the configured Voln/Sign buffs.
+  #
+  # @param single_cast [Boolean] cast each sign once rather than maintaining them
+  # @return [void]
   def cast_signs(single_cast = false)
     debug_msg(@DEBUG_COMMANDS, "cast_signs | single_cast: #{single_cast}")
 
@@ -8260,14 +9132,22 @@ class Bigshot
     end
   end
 
+  # @return [Boolean] whether looting has finished
   def looting_inactive?
     return $looting_inactive
   end
 
+  # Marks looting as in progress.
+  #
+  # @return [void]
   def set_looting_active
     $looting_inactive = false
   end
 
+  # Stands, refreshes signs, and clears per-room state before moving.
+  #
+  # @param move_signs [Boolean] whether to refresh signs first
+  # @return [void]
   def prepare_for_movement(move_signs = true)
     debug_msg(@DEBUG_COMBAT, "prepare_for_movement| move_signs: #{move_signs}")
 
@@ -8284,6 +9164,9 @@ class Bigshot
     cast_signs if move_signs
   end
 
+  # Waits out roundtime and cast roundtime.
+  #
+  # @return [void]
   def wait_rt
     sleep 0.2
     waitcastrt?
@@ -8291,6 +9174,9 @@ class Bigshot
     sleep 0.2
   end
 
+  # Gathers followers to the leader's room.
+  #
+  # @return [void]
   def group_all_followers
     until checkpcs.include?(@leader)
       go2(@group.room_id)
@@ -8305,6 +9191,9 @@ class Bigshot
     end
   end
 
+  # Moves one room, avoiding configured boundaries.
+  #
+  # @return [void]
   def bs_move
     room = Room.current
     next_room_options = room.wayto.keys - @HUNTING_BOUNDARIES
@@ -8328,6 +9217,10 @@ class Bigshot
     cast_signs(true)
   end
 
+  # Wanders the hunting area looking for creatures.
+  #
+  # @param new_room [Boolean] whether to prefer a room not recently visited
+  # @return [void]
   def bs_wander(new_room: true)
     debug_msg(@DEBUG_COMBAT, "bs_wander?")
 
@@ -8425,6 +9318,19 @@ class Bigshot
     end
   end
 
+  # Stays on GameObj/XMLData rather than Creature, even though
+  # Lich::Gemstone::Creature.register(name, id, noun) does exist for manual
+  # registration. Registering the bandit into Creature would not make it
+  # attackable there, because Creature.targets additionally
+  # requires crtr_flag?(:hostile), and that flag is only ever set from a real
+  # <crtrStatus> XML tag inside sync_crtr_status - there is no public setter.
+  # Bandits are deliberately absent from the normal feed (that's why this
+  # method exists at all, scraping a manual "look" instead), so no
+  # <crtrStatus> tag will arrive to flip that flag. GameObj.new_npc has no
+  # such restriction, so it remains the only way to make a bandit targetable.
+  # Finds bandits by scraping a manual LOOK and registering them with GameObj.
+  #
+  # @return [void]
   def bandit_track()
     lines = Lich::Util.quiet_command_xml("look", /<resource picture/)
     debug_msg(@DEBUG_COMBAT, "bandit_track | quiet look: #{lines}")
@@ -8451,6 +9357,9 @@ class Bigshot
     debug_msg(@DEBUG_COMBAT, "GameObj.targets: #{GameObj.targets}")
   end
 
+  # Rangers: TRACKs toward the configured creature when off cooldown.
+  #
+  # @return [void]
   def ranger_track # track bounty targets on cooldown
     debug_msg(@DEBUG_COMBAT, "ranger_track")
 
@@ -8497,6 +9406,9 @@ class Bigshot
     return
   end
 
+  # Escapes rooms the character can be swallowed into.
+  #
+  # @return [void]
   def escape_rooms
     # Used to escape from Roa'ter swallowing
     unless checkroom("The Belly of the Beast").nil?
@@ -8514,6 +9426,10 @@ class Bigshot
     end
   end
 
+  # Finds a weapon suitable for cutting free of a creature.
+  #
+  # @param creature [BigshotCreature, Lich::Common::GameObj] the creature
+  # @return [Lich::Common::GameObj, nil] the weapon, if one was found
   def find_escape_weapon(creature)
     weapon = nil
     weapon_container = nil
@@ -8560,6 +9476,10 @@ class Bigshot
     [weapon, weapon_container]
   end
 
+  # Cuts free after being swallowed or engulfed.
+  #
+  # @param creature [BigshotCreature, Lich::Common::GameObj] the creature
+  # @return [void]
   def creature_escape(creature)
     debug_msg(@DEBUG_COMBAT, "creature_escape | #{creature}")
 
@@ -8628,6 +9548,9 @@ class Bigshot
     end
   end
 
+  # Escapes a Temporal Rift.
+  #
+  # @return [void]
   def temporal_escape()
     debug_msg(@DEBUG_COMBAT, "temporal_escape")
 
@@ -8637,6 +9560,10 @@ class Bigshot
     end
   end
 
+  # Sends a command to the game, respecting script pause state.
+  #
+  # @param message [String] command to send
+  # @return [void]
   def bs_put(message)
     debug_msg(@DEBUG_SYSTEM, "bs_put | message: #{message}")
 
@@ -8685,21 +9612,38 @@ class Bigshot
     end
   end
 
+  # Sends a command on behalf of the group.
+  #
+  # @param message [String] command to send
+  # @return [void]
   def group_put(message)
     debug_msg(@DEBUG_SYSTEM, "group_put | message: #{message}")
     bs_put(message)
   end
 
+  # Runs a command definition on behalf of the group.
+  #
+  # @param message [String] command definition
+  # @return [void]
   def group_cmd(message)
     debug_msg(@DEBUG_SYSTEM, "group_cmd | message: #{message}")
     cmd(message)
   end
 
+  # Runs a client-side command on behalf of the group.
+  #
+  # @param message [String] command to run
+  # @return [void]
   def group_do(message)
     debug_msg(@DEBUG_SYSTEM, "group_do | message: #{message}")
     do_client(message)
   end
 
+  # Loads or saves a settings profile from the command line.
+  #
+  # @param vars [Array<String>] +Script.current.vars+; element 2 is the
+  #   action and element 3 the profile name
+  # @return [void]
   def self.profile(vars)
     if vars[2] =~ /load/i
       if vars[3] != nil
