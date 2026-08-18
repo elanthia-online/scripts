@@ -603,15 +603,18 @@ RSpec.describe 'ELoot::Sell locksmith_priority routing' do
     let(:town_openable) { {} } # box name => bool, defaults to true
     let(:find_boxes_queue) { [] } # successive ELoot.find_boxes return values
     let(:pool_available) { true }
+    let(:always_check_pool) { false } # ELoot.data.settings[:always_check_pool]
 
     let(:harness) do
       log = calls
       openable = town_openable
       queue = find_boxes_queue
       avail = pool_available
+      always_check = always_check_pool
 
       eloot = Module.new
       eloot.define_singleton_method(:find_boxes) { queue.shift || [] }
+      eloot.define_singleton_method(:data) { Struct.new(:settings).new({ always_check_pool: always_check }) }
 
       mod = Module.new
       mod.const_set(:ELoot, eloot)
@@ -657,6 +660,31 @@ RSpec.describe 'ELoot::Sell locksmith_priority routing' do
       harness.route_town_then_pool([box])
 
       expect(calls.map(&:first)).not_to include(:locksmith_pool)
+    end
+
+    context 'when always_check_pool is set and nothing is left to drop off' do
+      let(:always_check_pool) { true }
+
+      it 'still checks the pool for returns, without a drop-off attempt' do
+        box = obj('a steel strongbox', 'strongbox')
+        find_boxes_queue.replace([[]])
+
+        harness.route_town_then_pool([box])
+
+        expect(calls.map(&:first)).not_to include(:locksmith_pool)
+        expect(calls).to include([:pool_return])
+      end
+    end
+
+    context 'when always_check_pool is not set and nothing is left to drop off' do
+      it 'does not check the pool for returns' do
+        box = obj('a steel strongbox', 'strongbox')
+        find_boxes_queue.replace([[]])
+
+        harness.route_town_then_pool([box])
+
+        expect(calls.map(&:first)).not_to include(:pool_return)
+      end
     end
 
     context 'when the pool is unavailable' do
