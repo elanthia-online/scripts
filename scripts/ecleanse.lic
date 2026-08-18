@@ -6,9 +6,29 @@
           game: Gemstone
           tags: dispel, unpoison, undisease, disarmed, effects
       required: Lich >= 5.12.10
-       version: 2.3.2
+       version: 2.3.3
 
   Improvements:
+  v2.3.3  (2026-08-18)
+    - bugfix in weapon recovery: recover_stuff entries were fetched via
+      .first with no link back to the disarm that triggered the dispatch,
+      so an entry orphaned by an early-return guard (or a since-removed
+      known_ids dedup false-positive) could be silently claimed by a later,
+      unrelated disarm - reporting/recovering the wrong weapon while the
+      one actually just disarmed was left on the ground
+    - each disarm now queues its own recover_stuff key directly
+      (event_stack entries are now { event:, key: } instead of a bare
+      symbol), so recovery always processes the exact entry it was
+      dispatched for
+    - record_disarm now gates on the Recover Disarmed Weapons setting at
+      creation time, so nothing is tracked (and nothing can be orphaned)
+      when the feature is disabled
+    - removed the known_ids-based cross-entry dedup added in 2.3.2: in
+      two-weapon combat known_ids for a "one hand emptied" disarm is just
+      the surviving weapon's id, and that id is often identical across
+      multiple, unrelated disarms of its partner over a session - the
+      comparison could match by coincidence and silently drop a genuine
+      new disarm. No longer needed now that entries are individually keyed.
   v2.3.2  (2026-08-17)
     - bugfix in weapon recovery: two-weapon combat with matching-noun weapons
       (e.g. dual handaxes) could report false recovery, since tracking keyed
@@ -32,6 +52,8 @@
     - hive traps: fix event_stack push precedence that allowed duplicate events
   v2.3.0  (2026-06-08)
     - add break runestones option for Onslaughts
+=end
+=begin
   v2.2.9  (2026-04-21)
     - fix to support dispelling cloud of acidic mist
   v2.2.8  (2026-01-03)
@@ -114,8 +136,6 @@
     - added check for silvery blue globe and spiraling ghostly rift in Moonsedge
     - added check for disarm maneuver in Moonsedge and Sanctum
     - added check for Sanctum disease needing the vat
-=end
-=begin
   v1.0.15 (2023-08-23)
     - Bugfix for cman retreat if current target != creature that caused grounded debuff
   v1.0.14 (2023-04-13)
@@ -1063,31 +1083,39 @@ module Ecleanse
 
     # Snapshots the ids currently held in both hands at the moment a disarm
     # is detected and files it under recover_stuff. Returns the new entry's
-    # key, or nil if an entry with an identical hand snapshot is already
-    # pending (duplicate line match for the same event).
+    # key, or nil if the recovery feature is disabled - in which case
+    # nothing is tracked and no :recover event should be queued.
+    #
+    # Note: this intentionally does NOT dedupe against other pending entries
+    # by known_ids. In two-weapon combat, known_ids for a "one hand emptied"
+    # disarm is just the surviving weapon's id - and the same weapon is
+    # routinely the survivor across multiple, unrelated disarms of its
+    # partner over a session. Comparing known_ids across entries can match
+    # by coincidence and silently drop a genuine new disarm. Each entry is
+    # independently keyed and consumed by its own dispatch (see recover),
+    # so cross-entry dedup isn't needed for correctness.
     def self.record_disarm(noun)
-      known_ids = [GameObj.right_hand.id, GameObj.left_hand.id].reject { |id| id.nil? || id.to_s.empty? }
-      return nil if Ecleanse.data.recover_stuff.values.any? { |v| v[:known_ids] == known_ids }
+      return nil unless Ecleanse.data.settings[:recover_disarmed]
 
+      known_ids = [GameObj.right_hand.id, GameObj.left_hand.id].reject { |id| id.nil? || id.to_s.empty? }
       key = Ecleanse.data.recover_stuff_seq
       Ecleanse.data.recover_stuff_seq += 1
       Ecleanse.data.recover_stuff[key] = { room: Room.current, noun: noun, known_ids: known_ids }
       key
     end
 
-    def self.recover
+    def self.recover(key)
       # standard disarm mechanics
-      return unless Ecleanse.data.settings[:recover_disarmed]
+      details = Ecleanse.data.recover_stuff[key]
+      return if details.nil? # already handled or never recorded (e.g. feature was off)
+
+      Ecleanse.data.recover_stuff.delete(key)
       System.scripts_pause
 
-      details = Ecleanse.data.recover_stuff.first
-
-      Ecleanse.data.recover_stuff.delete(details[0])
-
-      known_ids = details[1][:known_ids]
-      item = details[1][:noun]
-      room_id = details[1][:room].id
-      title = details[1][:room].title
+      known_ids = details[:known_ids]
+      item = details[:noun]
+      room_id = details[:room].id
+      title = details[:room].title
 
       stop_213 = false
       stop_1011 = false
@@ -1213,14 +1241,14 @@ module Ecleanse
       fput "stop 1011" if stop_1011
     end
 
-    def self.recover_weapon_webbing
-      return unless Ecleanse.data.settings[:recover_disarmed]
+    def self.recover_weapon_webbing(key)
+      details = Ecleanse.data.recover_stuff[key]
+      return if details.nil?
+
+      Ecleanse.data.recover_stuff.delete(key)
       System.scripts_pause
 
-      details = Ecleanse.data.recover_stuff.first
-      Ecleanse.data.recover_stuff.delete(details[0])
-
-      item_noun = details[1][:noun]
+      item_noun = details[:noun]
 
       stop_213 = false
       stop_1011 = false
@@ -1521,17 +1549,16 @@ module Ecleanse
       end
     end
 
-    def self.telekinetic_recover
+    def self.telekinetic_recover(key)
       # Telekinetic Disarm is cast in Moonsedge - Savant spell 1406
-      return unless Ecleanse.data.settings[:recover_disarmed]
+      details = Ecleanse.data.recover_stuff[key]
+      return if details.nil?
+
+      Ecleanse.data.recover_stuff.delete(key)
       System.scripts_pause
 
-      details = Ecleanse.data.recover_stuff.first
-
-      Ecleanse.data.recover_stuff.delete(details[0])
-
-      known_ids = details[1][:known_ids]
-      item = details[1][:noun]
+      known_ids = details[:known_ids]
+      item = details[:noun]
 
       # Make the room safer.
       Action.settle_room
@@ -1595,28 +1622,28 @@ module Ecleanse
     def self.set_hooks
       ecleanse_status = proc { |server|
         if server =~ /Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> is knocked from your grasp/
-          next if Action.record_disarm(Regexp.last_match(1)).nil?
-          Ecleanse.data.event_stack << :recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> at .+?\.  The weapon rebounds off of the hardened .+? and is wrenched from your hand\.  It slides along the ground and disappears into the shadows!\r?\n?$/
-          next if Action.record_disarm(Regexp.last_match(1)).nil?
-          Ecleanse.data.event_stack << :recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /^Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> strikes one of the bony protrusions on <pushBold\/>an? <a exist="\d+" noun="[^"]+">[^<]+<\/a><popBold\/> \w+ and it is wrenched out of your grasp!\r?\n?$/
-          next if Action.record_disarm(Regexp.last_match(1)).nil?
-          Ecleanse.data.event_stack << :recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /^You swing your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> at <pushBold\/>(?:an?|the) <a exist="[^"]+" noun="[^"]+">[^<]+<\/a><popBold\/>\.  The weapon strikes one of the bony protrusions on the <pushBold\/><a exist="[^"]+" noun="[^"]+">[^<]+<\/a><popBold\/> \w+ and it is wrenched out of your grasp!\r?\n?$/
-          next if Action.record_disarm(Regexp.last_match(1)).nil?
-          Ecleanse.data.event_stack << :recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> tears free from your hands and floats/
-          next if Action.record_disarm(Regexp.last_match(1)).nil?
-          Ecleanse.data.event_stack << :telekinetic_recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :telekinetic_recover, key: key } unless key.nil?
         elsif server =~ /Striking with a serpent's unsettling quickness, (?:.*)\.  Vile (?:.*), kindling it into an unholy semblance of life.  The (?:.*) form twists and mutates, sprouting scales and cold eyes as it transforms into a <a exist="\d+" noun="([^"]+)">[^<]+<\/a>\!/
           Ecleanse.data.creature = Regexp.last_match(1)
           Ecleanse.data.event_stack << :sanctum_recover unless Ecleanse.data.event_stack.include?(:sanctum_recover)
         elsif server =~ /The flesh around the wound feels hot and cold at the same time, heavy with infection./
           Ecleanse.data.event_stack << :use_vat unless Ecleanse.data.event_stack.include?(:use_vat)
         elsif server =~ /The webbing entangles your <a exist=".*?" noun="(.*?)">.*?<\/a>, rendering it useless/
-          next if Action.record_disarm(Regexp.last_match(1)).nil?
-          Ecleanse.data.event_stack << :recover_weapon_webbing
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover_weapon_webbing, key: key } unless key.nil?
         elsif server =~ /You notice a flickering glint in the shadows|The apparatus flickers with deadly radiance/
           Ecleanse.data.hive_trap_room = Room.current
           Ecleanse.data.event_stack << :hive_traps_apparatus unless Ecleanse.data.event_stack.include?(:hive_traps_apparatus)
@@ -1812,7 +1839,15 @@ module Ecleanse
     loop do
       while Ecleanse.data.event_stack.any?
         current_event = Ecleanse.data.event_stack.shift
-        Action.send(current_event)
+        # recover-type events are queued as { event:, key: } so they're
+        # dispatched against the exact recover_stuff entry they belong to,
+        # rather than a bare symbol that would fall back to picking
+        # whatever's oldest in recover_stuff.
+        if current_event.is_a?(Hash)
+          Action.send(current_event[:event], current_event[:key])
+        else
+          Action.send(current_event)
+        end
       end
 
       debuffs = Effects::Debuffs.to_h.keys.map(&:to_s)
