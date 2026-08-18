@@ -6,9 +6,24 @@
           game: Gemstone
           tags: dispel, unpoison, undisease, disarmed, effects
       required: Lich >= 5.12.10
-       version: 2.3.1
+       version: 2.3.2
 
   Improvements:
+  v2.3.2  (2026-08-17)
+    - bugfix in weapon recovery: two-weapon combat with matching-noun weapons
+      (e.g. dual handaxes) could report false recovery, since tracking keyed
+      off the weapon noun couldn't distinguish the disarmed weapon from its
+      identical twin still in the other hand
+    - bugfix in weapon recovery: id-based tracking also failed since a
+      recovered weapon can come back under a new game object id (ground
+      pickup, bonded return, pry-from-webbing); recovery is now detected via
+      a hand-occupancy snapshot taken at disarm time instead
+    - bugfix in weapon recovery: hand-swaps from movement/nav sequences
+      between disarm and recovery no longer cause false-positive recovery
+    - recovery detection now prefers the game's own confirmation text
+      ("You spy ... and recover it!") where available, falling back to
+      hand-state inference only for paths with no such text (bonded-weapon
+      auto-return, telekinetic retrieval)
   v2.3.1  (2026-08-05)
     - hive traps: bound search/disarm attempts and add a wall-clock deadline
     - hive traps: validate room between each search, break early if moved
@@ -196,7 +211,7 @@ end
 module Ecleanse
   class Data
     attr_accessor :settings, :did_something, :event_stack, :disease, :dispel, :poison, :webs, :injury_locations, :cloud, :globe, :web, :debuffs, :magic_globes,
-                  :recover_stuff, :creature, :target_regex, :bad_targets, :escape_artist_available, :hive_trap_room, :invalid_clouds, :breeze_wind, :runestones,
+                  :recover_stuff, :recover_stuff_seq, :creature, :target_regex, :bad_targets, :escape_artist_available, :hive_trap_room, :invalid_clouds, :breeze_wind, :runestones,
                   :runestone
 
     def initialize(settings)
@@ -246,6 +261,7 @@ module Ecleanse
 
       # hook_variables
       @recover_stuff = {}
+      @recover_stuff_seq = 0
       @creature = nil
       @hive_trap_room = nil
     end
@@ -1027,6 +1043,38 @@ module Ecleanse
       sleep 0.2
     end
 
+    # Returns true only when a hand holds an item whose id was NOT already
+    # accounted for at the moment of disarm. This is resilient to:
+    #   - identical nouns on both weapons (two-weapon combat, matching pair)
+    #   - the recovered item coming back under a brand-new game object id
+    #     (ground pickup / bonded return / pry-from-webbing routinely do this)
+    #   - the surviving weapon getting shuffled between hands by nav
+    # It is NOT resilient to an unrelated item being wielded into the empty
+    # hand before genuine recovery happens - that's a real gap with any
+    # hand-occupancy-only signal. Callers that have an explicit in-game
+    # confirmation string available (e.g. "You spy ... and recover it!")
+    # should treat that text as authoritative and only fall back to this
+    # check when no such text exists (e.g. bonded-weapon auto-return).
+    def self.recovered?(known_ids)
+      [GameObj.right_hand, GameObj.left_hand].any? do |hand|
+        hand.name != "Empty" && !known_ids.include?(hand.id)
+      end
+    end
+
+    # Snapshots the ids currently held in both hands at the moment a disarm
+    # is detected and files it under recover_stuff. Returns the new entry's
+    # key, or nil if an entry with an identical hand snapshot is already
+    # pending (duplicate line match for the same event).
+    def self.record_disarm(noun)
+      known_ids = [GameObj.right_hand.id, GameObj.left_hand.id].reject { |id| id.nil? || id.to_s.empty? }
+      return nil if Ecleanse.data.recover_stuff.values.any? { |v| v[:known_ids] == known_ids }
+
+      key = Ecleanse.data.recover_stuff_seq
+      Ecleanse.data.recover_stuff_seq += 1
+      Ecleanse.data.recover_stuff[key] = { room: Room.current, noun: noun, known_ids: known_ids }
+      key
+    end
+
     def self.recover
       # standard disarm mechanics
       return unless Ecleanse.data.settings[:recover_disarmed]
@@ -1036,9 +1084,10 @@ module Ecleanse
 
       Ecleanse.data.recover_stuff.delete(details[0])
 
-      item = details[0]
-      room_id = details[1].id
-      title = details[1].title
+      known_ids = details[1][:known_ids]
+      item = details[1][:noun]
+      room_id = details[1][:room].id
+      title = details[1][:room].title
 
       stop_213 = false
       stop_1011 = false
@@ -1100,15 +1149,18 @@ module Ecleanse
       # Change to defensive stance
       Action.change_stance(100)
 
-      # It might be a bonded weapon
+      # It might be a bonded weapon. Bonded return has no distinct in-game
+      # confirmation text to key off of, so hand-occupancy is the only signal
+      # available here - accept the residual risk of a false positive if
+      # something else gets wielded into the empty hand during this window.
       if Feat.weapon_bonding == 5 || Spell[1625].known? # Fixme: Making an assumption you'd be using the bonded weapon
         wait_time = Time.now + 10
-        until [GameObj.right_hand.noun, GameObj.left_hand.noun].include?(item) || wait_time < Time.now
+        until Action.recovered?(known_ids) || wait_time < Time.now
           Util.wait_rt
         end
       end
 
-      unless [GameObj.right_hand.noun, GameObj.left_hand.noun].include?(item)
+      unless Action.recovered?(known_ids)
         empty_hands
 
         search_count = 0
@@ -1122,7 +1174,15 @@ module Ecleanse
 
           lines = Util.get_command("recover item", /<dialogData|You spy|You continue to intently search the area|In order to recover something|You find nothing recoverable/)
 
-          if lines.grep(/You spy (?:an|a) (?:.*) and recover it\!/).any? || [GameObj.right_hand.noun, GameObj.left_hand.noun].include?(item)
+          # Trust the game's own confirmation text first - it's tied directly
+          # to this command and can't be fooled by an unrelated item landing
+          # in a hand. Only fall back to the hand-occupancy check when that
+          # text is absent, and log it since it's an inferred (not confirmed)
+          # recovery.
+          if lines.grep(/You spy (?:an|a) (?:.*) and recover it\!/).any?
+            break
+          elsif Action.recovered?(known_ids)
+            Util.msg("yellow", " No recovery message seen, but hand state changed - treating #{item} as recovered.")
             break
           end
 
@@ -1160,7 +1220,7 @@ module Ecleanse
       details = Ecleanse.data.recover_stuff.first
       Ecleanse.data.recover_stuff.delete(details[0])
 
-      item_noun = details[0]
+      item_noun = details[1][:noun]
 
       stop_213 = false
       stop_1011 = false
@@ -1470,7 +1530,8 @@ module Ecleanse
 
       Ecleanse.data.recover_stuff.delete(details[0])
 
-      item = details[0]
+      known_ids = details[1][:known_ids]
+      item = details[1][:noun]
 
       # Make the room safer.
       Action.settle_room
@@ -1481,7 +1542,9 @@ module Ecleanse
       # Change to defensive stance
       Action.change_stance(100)
 
-      until [GameObj.right_hand.noun, GameObj.left_hand.noun].include?(item)
+      # No reliable in-game confirmation text exists for telekinetic
+      # retrieval, so hand-occupancy (recovered?) is the primary signal here.
+      until Action.recovered?(known_ids)
         if Ecleanse.data.dispel.nil?
           fput "get #{item}"
         else
@@ -1532,24 +1595,19 @@ module Ecleanse
     def self.set_hooks
       ecleanse_status = proc { |server|
         if server =~ /Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> is knocked from your grasp/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
+          next if Action.record_disarm(Regexp.last_match(1)).nil?
           Ecleanse.data.event_stack << :recover
         elsif server =~ /your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> at .+?\.  The weapon rebounds off of the hardened .+? and is wrenched from your hand\.  It slides along the ground and disappears into the shadows!\r?\n?$/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
+          next if Action.record_disarm(Regexp.last_match(1)).nil?
           Ecleanse.data.event_stack << :recover
         elsif server =~ /^Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> strikes one of the bony protrusions on <pushBold\/>an? <a exist="\d+" noun="[^"]+">[^<]+<\/a><popBold\/> \w+ and it is wrenched out of your grasp!\r?\n?$/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
+          next if Action.record_disarm(Regexp.last_match(1)).nil?
           Ecleanse.data.event_stack << :recover
         elsif server =~ /^You swing your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> at <pushBold\/>(?:an?|the) <a exist="[^"]+" noun="[^"]+">[^<]+<\/a><popBold\/>\.  The weapon strikes one of the bony protrusions on the <pushBold\/><a exist="[^"]+" noun="[^"]+">[^<]+<\/a><popBold\/> \w+ and it is wrenched out of your grasp!\r?\n?$/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
+          next if Action.record_disarm(Regexp.last_match(1)).nil?
           Ecleanse.data.event_stack << :recover
         elsif server =~ /Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> tears free from your hands and floats/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
+          next if Action.record_disarm(Regexp.last_match(1)).nil?
           Ecleanse.data.event_stack << :telekinetic_recover
         elsif server =~ /Striking with a serpent's unsettling quickness, (?:.*)\.  Vile (?:.*), kindling it into an unholy semblance of life.  The (?:.*) form twists and mutates, sprouting scales and cold eyes as it transforms into a <a exist="\d+" noun="([^"]+)">[^<]+<\/a>\!/
           Ecleanse.data.creature = Regexp.last_match(1)
@@ -1557,8 +1615,7 @@ module Ecleanse
         elsif server =~ /The flesh around the wound feels hot and cold at the same time, heavy with infection./
           Ecleanse.data.event_stack << :use_vat unless Ecleanse.data.event_stack.include?(:use_vat)
         elsif server =~ /The webbing entangles your <a exist=".*?" noun="(.*?)">.*?<\/a>, rendering it useless/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
+          next if Action.record_disarm(Regexp.last_match(1)).nil?
           Ecleanse.data.event_stack << :recover_weapon_webbing
         elsif server =~ /You notice a flickering glint in the shadows|The apparatus flickers with deadly radiance/
           Ecleanse.data.hive_trap_room = Room.current
