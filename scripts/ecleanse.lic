@@ -6,44 +6,21 @@
           game: Gemstone
           tags: dispel, unpoison, undisease, disarmed, effects
       required: Lich >= 5.12.10
-       version: 2.3.3
+       version: 2.3.4
 
   Improvements:
+  v2.3.4  (2026-08-18)
+    - fixed a case where the script could wrongly think a disarmed weapon
+      was already back in hand (if another script, like eloot, briefly put
+      something else in that hand right after the disarm) and skip trying
+      to recover it at all
   v2.3.3  (2026-08-18)
-    - bugfix in weapon recovery: recover_stuff entries were fetched via
-      .first with no link back to the disarm that triggered the dispatch,
-      so an entry orphaned by an early-return guard (or a since-removed
-      known_ids dedup false-positive) could be silently claimed by a later,
-      unrelated disarm - reporting/recovering the wrong weapon while the
-      one actually just disarmed was left on the ground
-    - each disarm now queues its own recover_stuff key directly
-      (event_stack entries are now { event:, key: } instead of a bare
-      symbol), so recovery always processes the exact entry it was
-      dispatched for
-    - record_disarm now gates on the Recover Disarmed Weapons setting at
-      creation time, so nothing is tracked (and nothing can be orphaned)
-      when the feature is disabled
-    - removed the known_ids-based cross-entry dedup added in 2.3.2: in
-      two-weapon combat known_ids for a "one hand emptied" disarm is just
-      the surviving weapon's id, and that id is often identical across
-      multiple, unrelated disarms of its partner over a session - the
-      comparison could match by coincidence and silently drop a genuine
-      new disarm. No longer needed now that entries are individually keyed.
+    - fixed a bug where recovering a disarmed weapon could occasionally
+      grab an older, previously-dropped weapon instead of the one that was
+      just knocked away
   v2.3.2  (2026-08-17)
-    - bugfix in weapon recovery: two-weapon combat with matching-noun weapons
-      (e.g. dual handaxes) could report false recovery, since tracking keyed
-      off the weapon noun couldn't distinguish the disarmed weapon from its
-      identical twin still in the other hand
-    - bugfix in weapon recovery: id-based tracking also failed since a
-      recovered weapon can come back under a new game object id (ground
-      pickup, bonded return, pry-from-webbing); recovery is now detected via
-      a hand-occupancy snapshot taken at disarm time instead
-    - bugfix in weapon recovery: hand-swaps from movement/nav sequences
-      between disarm and recovery no longer cause false-positive recovery
-    - recovery detection now prefers the game's own confirmation text
-      ("You spy ... and recover it!") where available, falling back to
-      hand-state inference only for paths with no such text (bonded-weapon
-      auto-return, telekinetic retrieval)
+    - fixed weapon recovery not working correctly when dual-wielding two
+      weapons of the same type (e.g. two handaxes)
   v2.3.1  (2026-08-05)
     - hive traps: bound search/disarm attempts and add a wall-clock deadline
     - hive traps: validate room between each search, break early if moved
@@ -52,8 +29,6 @@
     - hive traps: fix event_stack push precedence that allowed duplicate events
   v2.3.0  (2026-06-08)
     - add break runestones option for Onslaughts
-=end
-=begin
   v2.2.9  (2026-04-21)
     - fix to support dispelling cloud of acidic mist
   v2.2.8  (2026-01-03)
@@ -136,6 +111,8 @@
     - added check for silvery blue globe and spiraling ghostly rift in Moonsedge
     - added check for disarm maneuver in Moonsedge and Sanctum
     - added check for Sanctum disease needing the vat
+=end
+=begin
   v1.0.15 (2023-08-23)
     - Bugfix for cman retreat if current target != creature that caused grounded debuff
   v1.0.14 (2023-04-13)
@@ -1064,20 +1041,26 @@ module Ecleanse
     end
 
     # Returns true only when a hand holds an item whose id was NOT already
-    # accounted for at the moment of disarm. This is resilient to:
+    # accounted for at the moment of disarm, AND (when expected_noun is
+    # given) whose noun plausibly matches what was disarmed. This is
+    # resilient to:
     #   - identical nouns on both weapons (two-weapon combat, matching pair)
     #   - the recovered item coming back under a brand-new game object id
     #     (ground pickup / bonded return / pry-from-webbing routinely do this)
     #   - the surviving weapon getting shuffled between hands by nav
-    # It is NOT resilient to an unrelated item being wielded into the empty
-    # hand before genuine recovery happens - that's a real gap with any
-    # hand-occupancy-only signal. Callers that have an explicit in-game
+    #   - an unrelated item type (e.g. a dagger another script drags into a
+    #     hand for its own purposes) being mistaken for the recovered weapon
+    # It is NOT resilient to an unrelated item of the SAME noun ending up in
+    # hand before genuine recovery - a narrower, much less likely version of
+    # the same class of gap. Callers that have an explicit in-game
     # confirmation string available (e.g. "You spy ... and recover it!")
-    # should treat that text as authoritative and only fall back to this
-    # check when no such text exists (e.g. bonded-weapon auto-return).
-    def self.recovered?(known_ids)
+    # should still treat that text as authoritative and only fall back to
+    # this check when no such text exists (e.g. bonded-weapon auto-return).
+    def self.recovered?(known_ids, expected_noun = nil)
       [GameObj.right_hand, GameObj.left_hand].any? do |hand|
-        hand.name != "Empty" && !known_ids.include?(hand.id)
+        next false if hand.name == "Empty" || known_ids.include?(hand.id)
+
+        expected_noun.nil? || hand.noun.to_s.casecmp?(expected_noun.to_s)
       end
     end
 
@@ -1181,14 +1164,26 @@ module Ecleanse
       # confirmation text to key off of, so hand-occupancy is the only signal
       # available here - accept the residual risk of a false positive if
       # something else gets wielded into the empty hand during this window.
+      #
+      # This wait (and the resulting already_recovered check) is only
+      # meaningful for bonded weapons: that's the only mechanism by which
+      # the weapon could legitimately already be back in hand before we've
+      # even issued a "recover item" command. For everyone else, checking
+      # recovered? here has no legitimate case to catch and only exposed a
+      # real false-positive: a same-tick kill can trigger another script
+      # (e.g. an eloot variant) to drag an unrelated item into the
+      # just-emptied hand before this method's own scripts_pause takes
+      # effect, which used to skip the entire search loop below outright.
+      already_recovered = false
       if Feat.weapon_bonding == 5 || Spell[1625].known? # Fixme: Making an assumption you'd be using the bonded weapon
         wait_time = Time.now + 10
-        until Action.recovered?(known_ids) || wait_time < Time.now
+        until Action.recovered?(known_ids, item) || wait_time < Time.now
           Util.wait_rt
         end
+        already_recovered = Action.recovered?(known_ids, item)
       end
 
-      unless Action.recovered?(known_ids)
+      unless already_recovered
         empty_hands
 
         search_count = 0
@@ -1209,7 +1204,7 @@ module Ecleanse
           # recovery.
           if lines.grep(/You spy (?:an|a) (?:.*) and recover it\!/).any?
             break
-          elsif Action.recovered?(known_ids)
+          elsif Action.recovered?(known_ids, item)
             Util.msg("yellow", " No recovery message seen, but hand state changed - treating #{item} as recovered.")
             break
           end
@@ -1571,7 +1566,7 @@ module Ecleanse
 
       # No reliable in-game confirmation text exists for telekinetic
       # retrieval, so hand-occupancy (recovered?) is the primary signal here.
-      until Action.recovered?(known_ids)
+      until Action.recovered?(known_ids, item)
         if Ecleanse.data.dispel.nil?
           fput "get #{item}"
         else
