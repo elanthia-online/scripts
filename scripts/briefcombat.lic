@@ -26,9 +26,18 @@
   contributors: Tysong, Ragz, Gemini AI
           name: briefcombat
           tags: brief, briefcombat, condensing, condense, combat, squelch
-       version: 1.0.3
+       version: 1.0.4
 
     changelog:
+      1.0.4 (2026-08-20)
+        - Fix squelched lines silently dropping frontend formatting tags (pushBold/popBold, mono),
+          which could leave bold or mono formatting stuck on screen until an unrelated later
+          message happened to clear it (rare, frontend-dependent)
+        - Fix a related regression from an early version of that same fix: forwarding every
+          formatting tag instead of just the net imbalance was producing a blank line for nearly
+          every squelched combat message, since most squelch balanced pushBold/popBold in the
+          same line
+        - Fix multi-part compressed summaries joining with inconsistent line breaks
       1.0.3 (2026-02-02)
         - Added --flares and --no-flares options
         - Added --numbers and -no-numbers options
@@ -90,6 +99,90 @@
 module BriefCombat
   class Engine
     attr_accessor :extreme_mode, :excluded_players
+
+    # Self-closing tags that toggle persistent client display state. The
+    # DownstreamHook proc below (registered as 'brief2') receives the raw,
+    # unsplit socket-read chunk for each line -- not a guaranteed-clean
+    # single line -- so the game server is free to bundle one of these onto
+    # the same chunk as text this script is about to squelch via `return
+    # nil`. Dropping that whole chunk drops the tag with it: since this
+    # script turns MonsterBold on (see `fput('set MonsterBold On')` below)
+    # and matches targets via <pushBold/>...<popBold/> wrapping, squelched
+    # combat/search lines routinely carry exactly these tags. Losing one
+    # leaves the frontend stuck in that formatting state until an unrelated
+    # later tag happens to close it -- this is the same root cause as
+    # https://github.com/elanthia-online/lich-5/pull/1530, confirmed via a
+    # visible stray marker character on Saga sessions.
+    #
+    # Kept as a script-local helper rather than depending on
+    # Lich::Util::QUIET_STATE_TAGS: that list is an internal implementation
+    # detail of issue_command's quiet: true filtering (currently scoped to
+    # just the mono <output> tag), not a stable public API, and this script
+    # needs pushBold/popBold specifically, which isn't in it.
+    #
+    # IMPORTANT: pushBold/popBold almost always arrive as a *balanced pair*
+    # within the very same squelched line -- this script's own target
+    # matching wraps monster names in them, so nearly every squelched
+    # combat line carries an open immediately followed by a close. A
+    # balanced pair has zero net effect on client formatting state, so it's
+    # exactly as safe to drop as any other squelched text; forwarding it
+    # anyway (an early version of this fix did) sends a newline-terminated
+    # chunk with no visible text for every single squelched line, which
+    # renders as a blank line -- one per squelched combat message. Only a
+    # *genuine* imbalance within a chunk (an open with no matching close in
+    # that same chunk, or vice versa) is the actual risk this guards
+    # against, so only the net imbalance gets forwarded, never every literal
+    # occurrence.
+    STATE_TAG_PAIRS = [
+      # [open pattern, close pattern, open text, close text]
+      [/<pushBold\/>/, /<popBold\/>/, '<pushBold/>', '<popBold/>']
+    ].freeze
+
+    # The mono/formatting <output> tag isn't a fixed open/close pair -- its
+    # state is encoded in the class attribute -- so it's tracked separately:
+    # class="mono" turns it on, class="" turns it off. Same net-imbalance
+    # treatment applies for the same reason.
+    MONO_ON_PATTERN  = /<output class="mono"\s*\/>/.freeze
+    MONO_OFF_PATTERN = /<output class=""\s*\/>/.freeze
+
+    # Computes the net formatting-state imbalance in a line this script is
+    # about to squelch, so the DownstreamHook proc can forward just that
+    # imbalance instead of dropping the whole chunk (and instead of
+    # forwarding every literal tag occurrence, which is safe but produces a
+    # visible blank line for the common case of a balanced pair).
+    #
+    # @param line [String] the raw chunk being squelched.
+    # @return [String, nil] the net-unbalanced tags, newline-terminated
+    #   (every other chunk in this pipeline is newline-terminated; a bare
+    #   tag with no terminator is not a line shape the client expects and
+    #   can itself cause corruption -- see the PR above); or nil if the
+    #   chunk carries no tags, or only balanced pairs that cancel out --
+    #   both cases drop the chunk exactly as before this existed.
+    def preserve_state_tags(line)
+      return nil unless line
+
+      parts = []
+
+      STATE_TAG_PAIRS.each do |open_pattern, close_pattern, open_text, close_text|
+        net = line.scan(open_pattern).length - line.scan(close_pattern).length
+        if net > 0
+          parts << (open_text * net)
+        elsif net < 0
+          parts << (close_text * -net)
+        end
+      end
+
+      mono_net = line.scan(MONO_ON_PATTERN).length - line.scan(MONO_OFF_PATTERN).length
+      if mono_net > 0
+        parts << ('<output class="mono"/>' * mono_net)
+      elsif mono_net < 0
+        parts << ('<output class=""/>' * -mono_net)
+      end
+
+      return nil if parts.empty?
+
+      "#{parts.join}\n"
+    end
 
     def initialize(script_vars)
       args = script_vars[1..-1] || []
@@ -720,7 +813,15 @@ module BriefCombat
       @compressed.push(line)
       @compressed.push(@bounty_message) unless @bounty_message.nil?
       @compressed.push('')
-      result = @compressed.join("\n")
+      # \r\n, not bare \n: @compressed is several independently-built
+      # strings, some of which embed their own <pushBold/>...<popBold/>
+      # pairs (see the KILLED/target-name lines above). Every other chunk
+      # in this pipeline is newline/CRLF-terminated as part of the game
+      # server's line-oriented stream; joining with bare \n sends a
+      # multi-segment blob with inconsistent internal framing, which is the
+      # same root cause as https://github.com/elanthia-online/lich-5/pull/1530
+      # at a larger scale (several joined segments instead of one bare tag).
+      result = @compressed.join("\r\n")
       return result
     end
 
@@ -832,12 +933,12 @@ module BriefCombat
         return Regexp.last_match[0]
       end
 
-      return nil if line =~ @filter_self_spells_msg
+      return preserve_state_tags(line) if line =~ @filter_self_spells_msg
       line
     end
 
     def filter_self_search(line)
-      return nil if line =~ @filter_self_search
+      return preserve_state_tags(line) if line =~ @filter_self_search
       line
     end
 
@@ -845,7 +946,7 @@ module BriefCombat
       if line =~ @filter_other_search
         @shortening_search = true
         return line unless @extreme_mode
-        return nil
+        return preserve_state_tags(line)
       end
       line
     end
@@ -854,9 +955,9 @@ module BriefCombat
       if @shortening_search
         if line =~ /<prompt/
           @shortening_search = false
-          return nil
+          return line
         else
-          return nil
+          return preserve_state_tags(line)
         end
       end
 
@@ -866,7 +967,7 @@ module BriefCombat
         return end_compress(line) if line =~ /<prompt/
 
         compress(line)
-        return nil
+        return preserve_state_tags(line)
       end
 
       if !@excluded_players.nil? && @excluded_players.any? { |player| line.include?(player) }
@@ -874,7 +975,7 @@ module BriefCombat
         return line
       end
 
-      @simple_filters.each { |regex| return nil if line =~ regex }
+      @simple_filters.each { |regex| return preserve_state_tags(line) if line =~ regex }
 
       # Try compress_combat
       echo "DEBUG: Calling compress_combat for: #{line}" if @debug
