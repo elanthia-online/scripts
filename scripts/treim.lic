@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 =begin
     REIM Reactive Script
     Will do one round of attack per spawned wave of creatures.
@@ -11,18 +13,19 @@
     ATTACKOPTION Selections Include:
          <SPELLNUMBER> - use a spell to cast once per wave/boss IE. 908 Major Fire
          SLEEP         - symbol of voln sleep
-   ATTACK	       - single-target attack
-   FIRE	       - single-target ranged attack
+         ATTACK        - single-target attack
+         FIRE          - single-target ranged attack
          MSTRIKE       - mstrike attack (works for ranged if you set FIRE as default)
          UAC           - mstrike punch and punch boss for all your UAC needs
-         JAB	       - single-target jab
-   PUNCH	       - single-target punch
-   GRAPPLE       - single-target grapple
-   KICK	       - single-target kick
-   SCRUB         - combination mstrike and 435 cast routine
-   BARDASS       - combination mstrike and 1030 cast routine
-   DREDD         - combination mstrike and 1630 cast routine
+         JAB           - single-target jab
+         PUNCH         - single-target punch
+         GRAPPLE       - single-target grapple
+         KICK          - single-target kick
+         SCRUB         - combination mstrike and 435 cast routine
+         BARDASS       - combination mstrike and 1030 cast routine
+         DREDD         - combination mstrike and 1630 cast routine
          NONE          - won't attack, useful if manually wish to attack
+         <SCRIPTNAME>.lic - starts a custom attack script instead
 
     Running Commands
          ;send reimcount   - shows current group leader, group count, and previous group count
@@ -37,14 +40,20 @@
          Add scripts to be auto-started and killed with TREIM, default is NONE
          ;e echo UserVars.treim[:activescripts] = ["stand", "symbolz"]
 
-         Enable auto-clearing of Reim titles upon complition, default is FALSE
+         Add script arguments to use at launch of an activescript or spam_script
+         ;e UserVars.treim[:script_args] = { "scriptname1" => "args", "scriptname2" => "args" }
+
+         Enable auto-clearing of Reim titles upon completion, default is FALSE
          ;e echo UserVars.treim[:clear_title] = true
 
          Enable SPAM filtering scripts, default is TRUE
          ;e echo UserVars.treim[:spam_control] = false
 
-         Enable killing of known lag enducing scripts, default is FALSE
+         Enable killing of known lag inducing scripts, default is FALSE
          ;e echo UserVars.treim[:lag_control] = TRUE
+
+         Enable announcing of rares on wave spawn, default is FALSE for most characters
+         ;e echo UserVars.treim[:announce_rares] = TRUE
 
          Enable toggling of FLAG NoAmbientMsg, default is FALSE
          ;e echo UserVars.treim[:toggle_ambients] = TRUE
@@ -53,11 +62,45 @@
      author: Tysong (horibu on PC)
        name: treim
        tags: reim
-    version: 2.24.2
+    version: 3.0.0
 
   To help contribute or open an issue: https://github.com/elanthia-online/scripts
 
     changelog:
+      3.0.0 (2026-08-21)
+        Modernized for Ruby 4.0 / current Lich5 conventions:
+        - Namespaced everything under `Treim`; all constants guarded with
+          `unless const_defined?` so repeated `;treim` invocations in the same
+          Lich process never warn/redefine.
+        - Replaced manual `GROUP` command parsing with the native `Group` API
+          (lib/gemstone/group.rb), which tracks membership/leader passively.
+        - Replaced the hand-rolled `silence` proc + DownstreamHook add/remove
+          pairs with `Lich::Util.issue_command` for REIM INFO and title-show
+          parsing; this also removed the last need for the old silence proc
+          entirely, since neither replacement leaves anything to suppress.
+        - Replaced the `$frontend =~ /stormfront|profanity/` check with
+          `Lich::Common::Frontend.supports_xml?`.
+        - Boss-wave stage progression (Village -> Road -> ... -> Royal) is now
+          data-driven (Treim::Geography::STAGES) instead of five copy-pasted
+          `elsif` branches.
+        - The ~10 near-identical stance-dance/attack blocks in the old
+          attack_routine collapsed into a handful of shared helpers behind a
+          `case` dispatch in Treim::Attack.
+        - Bugfix: `variable[2].downcase == "leader"` raised NoMethodError on
+          every invocation that didn't pass a second argument (i.e. almost
+          always) because `variable[2]` is nil, not "". Now uses `&.downcase`.
+        - Bugfix: the help-vs-reuse-last-attack-type check raised the same
+          NoMethodError when re-running `;treim` with no arguments after an
+          attack type had already been configured. Rewritten as an explicit,
+          non-crashing branch.
+        - Removed a room-marker check in the main loop that could never take
+          its "already visited" branch (the branch that would have updated
+          the marker was unreachable), so the wave/whisper handling block ran
+          unconditionally on every line anyway; the dead branch is gone and
+          behavior is unchanged.
+        - Removed a redundant second re-scan of "unseen bosses" during the
+          stage-hold path; the ids were already marked seen immediately above
+          it, so the second scan was always a no-op.
       2.24.2 (2023-05-19)
       Fix for new GROUP output
       Rubocop cleanup
@@ -152,637 +195,1069 @@
         Tgo01 as I canabalized his silence routine from ;dreavening.
         Ragz for his assistance with physical attacking and hold hands idea.
 =end
-=begin
-;e echo GameObj.npcs.each { |npc| echo "Name: #{npc.name} - Type: #{npc.type}" }
-;e echo GameObj.npcs.select{|npc| ((npc.type !~ /familiar|companion|passive|skin/) && (npc.noun !~ /arm|arms/))}.each { |npc| echo "Name: #{npc.name} - Type: #{npc.type}" }
-;e echo GameObj.type_data['aggressive npc']
-;e echo GameObj.npcs.count { |npc| ((npc.name !~ /arm}/) && !(npc.type !~ /companion|familiar|passive/)) }
 
-scripts to kill: rnum, duskruin_watch, prettiernum, killcounter, title, sorter, inspectweight, inspectarmor, uberbounty, autovote, chatfail, enchantnotes
-=end
+module Treim
+  # REIM room ids grouped by stage, and the order stages clear in.
+  #
+  # Drives boss-wave "hold or fight" decisions: when the group's reported
+  # clear-to progress has already moved past the stage the character is
+  # physically standing in, {stage_holding} tells the caller to hold rather
+  # than re-fight a boss the group already cleared.
+  module Geography
+    # One area of REIM (e.g. "village") and where it leads next.
+    #
+    # @!attribute [r] name
+    #   @return [String] lowercase stage identifier, matches the "clearto"
+    #     value REIM INFO reports (e.g. "village", "road")
+    # @!attribute [r] rooms
+    #   @return [Array<Integer>] room ids that belong to this stage
+    # @!attribute [r] next_stage
+    #   @return [String] the stage name that follows this one
+    # @!attribute [r] pause_before_next
+    #   @return [Boolean] whether to `pause 2` before continuing when
+    #     holding at this stage; true for every stage except village, which
+    #     is legacy-inconsistent with the rest but preserved verbatim from
+    #     the original per-stage elsif chain rather than "fixed" silently
+    Stage = Data.define(:name, :rooms, :next_stage, :pause_before_next) unless const_defined?(:Stage)
 
-Village         = Array[24888, 24900, 24904, 24909, 24935, 24936, 24912, 24919, 24946, 24945, 24952, 24964, 24971, 24972, 24958, 24959, 24931, 24932, 24966, 24953, 25300, 24901, 24930, 23484, 24941, 23650]
-Road            = Array[24977, 24978, 24989, 24990, 24991, 24994, 24995, 24996, 24998, 25003, 25004, 25020, 25019, 25021, 24997, 25022, 25029, 25030, 25035, 25042, 25047, 25046, 25043, 25041, 25048, 25049, 25050, 25051, 25052, 25053, 25054, 25056, 25057, 25058, 25059, 25064, 25055, 25060, 25061, 25062, 25063]
-Courtyard       = Array[25104, 25103, 25101, 25100, 25105, 25102, 25106, 25107, 25108, 25099, 25098, 25097, 25069, 25068, 25070, 25071, 25072, 25082, 25084, 25083, 25081, 25078, 25085, 25086, 25087, 25088, 25096, 25095, 25094, 25093, 25092, 25091, 25090, 25089, 25080, 25079, 25077, 25075, 25073, 25076, 25074, 25067, 25066, 25065]
-Servant         = Array[25113, 25114, 25115, 25119, 25118, 25117, 25116, 25112, 25111, 25110, 25109]
-Visitor         = Array[25125, 25124, 25123, 25129, 25128, 25127, 25126, 25122, 25121, 25120]
-Royal           = Array[25141, 25140, 25132, 25134, 25136, 25135, 25137, 25138, 25139, 25133, 25131, 25130]
-MiscAreas       = Array[24965]
-AreaReim        = (Village | Road | Courtyard | Servant | Visitor | Royal | MiscAreas).sort
-ReimBosses      = Array["The Shopkeeper", "The Innkeeper", "The Bartender", "The Patrol Leader", "The Bandit Lord", "The Bandit Lady", "The Gypsy Queen", "The Gypsy King", "The Guard Captain", "The Wall Captain", "The The Drill Sergeant", "The Stable Hostler", "The Dungeon Master", "The Master Torturer", "The Butler", "The Cook", "The Knight Captain", "The Foreign Dignitary", "The Royal Prince", "The Royal Princess", "The Royal Jester", "The Emperor", "The Empress"]
-ReimBossSearch  = Regexp.union(ReimBosses)
-reim_npcs       = "ethereal (?:commoner|denizen|guard|guardsman|guardswoman|inmate|lunatic|madman|madwoman|peasant|prisoner|squire|swordsman|swordswoman|traveller|townsman|townswoman|villager)|ghostly (?:bandit|highwayman|highwaywoman|marauder|waylayer)|unworldly (?:guest|maid|noble|royal guard|royal knight|servant|slave|steward|visitor)|celestial (?:dancer|juggler|nomad|traveller)|Shopkeeper|Innkeeper|Bartender|Patrol Leader|Bandit Lord|Bandit Lady|Gypsy Queen|Gypsy King|Guard Captain|Wall Captain|Drill Sergeant|Stable Hostler|Dungeon Master|Master Torturer|Butler|Cook|Knight Captain|Foreign Dignitary|Royal Prince|Royal Princess|Royal Jester|Royal Emperor|Royal Empress"
-npc_commons     = ["commoner", "denizen", "guard", "guardsman", "guardswoman", "inmate", "lunatic", "madman", "madwoman", "peasant", "prisoner", "squire", "swordsman", "swordswoman", "traveller", "townsman", "townswoman", "villager", "bandit", "highwayman", "highwaywoma", "marauder", "waylayer", "guest", "maid", "noble", "guard", "knight", "servant", "slave", "steward", "visitor", "dancer", "juggler", "nomad", "traveller"]
-npc_bosses      = ["Cook", "Shopkeeper", "Innkeeper", "Bartender", "Leader", "Lord", "Lady", "Queen", "King", "Captain", "Captain", "Sergeant", "Hostler", "Master", "Torturer", "Butler", "ook", "Captain", "Dignitary", "Prince", "Princess", "Jester", "Emperor", "Empress"]
-bossname        = ""
-leader          = ""
-title_prename   = nil
-members         = 0
-previousmembers = 0
-reim_current_room = 0
-lag_scripts    = Array["rnum", "duskruin_watch", "prettiernum", "killcounter", "title", "sorter", "inspectweight", "inspectarmor", "uberbounty", "autovote", "chatfail", "enchantnotes"]
-spam_scripts   = Array["briefcombat", "spellmerge"]
+    # @return [Array<Integer>] room ids for the Village stage
+    VILLAGE   = [24888, 24900, 24904, 24909, 24935, 24936, 24912, 24919, 24946, 24945, 24952, 24964, 24971, 24972, 24958, 24959, 24931, 24932, 24966, 24953, 25300, 24901, 24930, 23484, 24941, 23650].freeze unless const_defined?(:VILLAGE)
+    # @return [Array<Integer>] room ids for the Road stage
+    ROAD      = [24977, 24978, 24989, 24990, 24991, 24994, 24995, 24996, 24998, 25003, 25004, 25020, 25019, 25021, 24997, 25022, 25029, 25030, 25035, 25042, 25047, 25046, 25043, 25041, 25048, 25049, 25050, 25051, 25052, 25053, 25054, 25056, 25057, 25058, 25059, 25064, 25055, 25060, 25061, 25062, 25063].freeze unless const_defined?(:ROAD)
+    # @return [Array<Integer>] room ids for the Courtyard stage
+    COURTYARD = [25104, 25103, 25101, 25100, 25105, 25102, 25106, 25107, 25108, 25099, 25098, 25097, 25069, 25068, 25070, 25071, 25072, 25082, 25084, 25083, 25081, 25078, 25085, 25086, 25087, 25088, 25096, 25095, 25094, 25093, 25092, 25091, 25090, 25089, 25080, 25079, 25077, 25075, 25073, 25076, 25074, 25067, 25066, 25065].freeze unless const_defined?(:COURTYARD)
+    # @return [Array<Integer>] room ids for the Servant Quarters stage
+    SERVANT   = [25113, 25114, 25115, 25119, 25118, 25117, 25116, 25112, 25111, 25110, 25109].freeze unless const_defined?(:SERVANT)
+    # @return [Array<Integer>] room ids for the Visitor's Quarters stage
+    VISITOR   = [25125, 25124, 25123, 25129, 25128, 25127, 25126, 25122, 25121, 25120].freeze unless const_defined?(:VISITOR)
+    # @return [Array<Integer>] room ids for the Royal Quarters stage
+    ROYAL     = [25141, 25140, 25132, 25134, 25136, 25135, 25137, 25138, 25139, 25133, 25131, 25130].freeze unless const_defined?(:ROYAL)
+    # @return [Array<Integer>] room ids outside the main stage progression
+    #   that are still considered "in REIM" (e.g. the entry room)
+    MISC_AREAS = [24965].freeze unless const_defined?(:MISC_AREAS)
 
-UserVars.treim                    ||= {}
-UserVars.treim[:stance_dance]       = true	if UserVars.treim[:stance_dance].nil?
-UserVars.treim[:attack_type]	= ""	if UserVars.treim[:attack_type].nil?
-UserVars.treim[:activescripts]	= Array[]	if UserVars.treim[:activescripts].nil?
-UserVars.treim[:clear_title]	= false		if UserVars.treim[:clear_title].nil?
-UserVars.treim[:spam_control]	= true		if UserVars.treim[:spam_control].nil?
-UserVars.treim[:script_args]		= {}	if UserVars.treim[:script_args].nil?
-UserVars.treim[:lag_control]		= false	if UserVars.treim[:lag_control].nil?
-UserVars.treim[:toggle_ambients]	= false	if UserVars.treim[:toggle_ambients].nil?
+    # @return [Integer] room id of the throne room, where the script idles
+    #   between runs
+    THRONE_ROOM_ID = 25142 unless const_defined?(:THRONE_ROOM_ID)
+    # @return [Integer] room id the character lands in when REIM ends,
+    #   which triggers {Treim::Runner#finish}
+    EXIT_ROOM_ID   = 25143 unless const_defined?(:EXIT_ROOM_ID)
 
-UserVars.treim[:script_args].default = ""
+    # @return [Array<Stage>] every stage in clear-order, village through royal
+    STAGES = [
+      Stage.new(name: "village",   rooms: VILLAGE,   next_stage: "road", pause_before_next: false),
+      Stage.new(name: "road",      rooms: ROAD,      next_stage: "courtyard", pause_before_next: true),
+      Stage.new(name: "courtyard", rooms: COURTYARD, next_stage: "servant",   pause_before_next: true),
+      Stage.new(name: "servant",   rooms: SERVANT,   next_stage: "visitor",   pause_before_next: true),
+      Stage.new(name: "visitor",   rooms: VISITOR,   next_stage: "royal",     pause_before_next: true),
+      Stage.new(name: "royal",     rooms: ROYAL,     next_stage: "throne",    pause_before_next: true)
+    ].freeze unless const_defined?(:STAGES)
 
-if UserVars.treim[:announce_rares].nil?
-  if Char.name =~ /Tysong|Durakar|Siierra|Ragz|Nairdin|Ylandra|Gharr|Ordim/
-    UserVars.treim[:announce_rares] = true
-  else
-    UserVars.treim[:announce_rares] = false
-  end
-end
+    # @return [Array<Integer>] every room id considered "in REIM", sorted;
+    #   the union of every stage's rooms plus {MISC_AREAS}
+    ALL_ROOMS = (STAGES.flat_map(&:rooms) | MISC_AREAS).sort.freeze unless const_defined?(:ALL_ROOMS)
 
-KillNouns = Array['Murder', 'Kill', 'Slaughter', 'Abolish', 'Exterminate', 'Wreck', 'Demolish', 'Massacre', 'Obliterate', 'Crush', 'Tickley tickle', 'Kiss', 'Hug']
+    module_function
 
-if $frontend =~ /stormfront|profanity/
-  fam_window_begin = "<pushStream id=\"familiar\" ifClosedStyle=\"watching\"/>"
-  fam_window_end   = "<popStream/>\r\n"
-else
-  fam_window_begin = "\034GSe\r\n"
-  fam_window_end   = "\034GSf\r\n"
-end
+    # Whether a room is inside the REIM instance (any stage, or a misc area).
+    #
+    # @param room_id [Integer] room id to check; defaults to the character's
+    #   current room
+    # @return [Boolean]
+    def in_reim?(room_id = Room.current.id)
+      ALL_ROOMS.include?(room_id)
+    end
 
-class CappedCollection
-  MAX_SIZE = 200
-  attr_accessor :list, :max_size
-
-  def initialize(max_size = MAX_SIZE)
-    @list = []
-    @max_size = max_size
-  end
-
-  def <<(id)
-    @list << id
-    while @list.size > @max_size
-      @list.shift
+    # Finds the stage that should be held at, if any.
+    #
+    # Returns the Stage whose rooms include room_id when clear_to names that
+    # stage's next_stage -- i.e. "we're still in this stage but the group has
+    # already cleared past it, so hold rather than re-fight the boss."
+    #
+    # @param room_id [Integer] the character's current room id
+    # @param clear_to [String, nil] the group's reported clear-to stage name,
+    #   as returned by {Treim::ClearProgress::Result#clear_to}
+    # @return [Stage, nil] the stage to hold at, or nil if the character
+    #   should proceed with fighting the current wave
+    def stage_holding(room_id, clear_to)
+      STAGES.find { |stage| stage.rooms.include?(room_id) && stage.next_stage == clear_to }
     end
   end
 
-  def include?(id)
-    @list.include?(id)
+  # Name/noun lookups used to classify spawned REIM NPCs as common trash,
+  # bosses/rares, or neither.
+  module Bosses
+    # @return [Array<String>] `GameObj#noun` values for ordinary (non-boss)
+    #   REIM trash mobs
+    COMMON_NOUNS = %w[
+      commoner denizen guard guardsman guardswoman inmate lunatic madman madwoman peasant prisoner
+      squire swordsman swordswoman traveller townsman townswoman villager bandit highwayman
+      highwaywoma marauder waylayer guest maid noble knight servant slave steward visitor dancer
+      juggler nomad traveller
+    ].freeze unless const_defined?(:COMMON_NOUNS)
+
+    # @return [Array<String>] `GameObj#noun` values for rare/boss REIM NPCs
+    BOSS_NOUNS = %w[
+      Cook Shopkeeper Innkeeper Bartender Leader Lord Lady Queen King Captain Captain Sergeant
+      Hostler Master Torturer Butler ook Captain Dignitary Prince Princess Jester Emperor Empress
+    ].freeze unless const_defined?(:BOSS_NOUNS)
+
+    # @return [Regexp] matches the full `GameObj#name` (ethereal-flavor
+    #   prefix plus noun, or a bare boss name) of any REIM NPC, common or
+    #   boss; used to count total spawned mobs for status messages
+    NPC_NAME_REGEX = /
+      ethereal\ (?:commoner|denizen|guard|guardsman|guardswoman|inmate|lunatic|madman|madwoman|peasant|prisoner|squire|swordsman|swordswoman|traveller|townsman|townswoman|villager)|
+      ghostly\ (?:bandit|highwayman|highwaywoman|marauder|waylayer)|
+      unworldly\ (?:guest|maid|noble|royal\ guard|royal\ knight|servant|slave|steward|visitor)|
+      celestial\ (?:dancer|juggler|nomad|traveller)|
+      Shopkeeper|Innkeeper|Bartender|Patrol\ Leader|Bandit\ Lord|Bandit\ Lady|Gypsy\ Queen|Gypsy\ King|
+      Guard\ Captain|Wall\ Captain|Drill\ Sergeant|Stable\ Hostler|Dungeon\ Master|Master\ Torturer|
+      Butler|Cook|Knight\ Captain|Foreign\ Dignitary|Royal\ Prince|Royal\ Princess|Royal\ Jester|
+      Royal\ Emperor|Royal\ Empress
+    /x unless const_defined?(:NPC_NAME_REGEX)
   end
-end
 
-npc_ids	= CappedCollection.new
+  # Fixed-size ring buffer of already-seen NPC ids, so a wave's mobs are
+  # only announced/attacked once even as GameObj.npcs gets rescanned.
+  class SeenIds
+    # @return [Integer] default capacity when none is given to {#initialize}
+    DEFAULT_MAX_SIZE = 200 unless const_defined?(:DEFAULT_MAX_SIZE)
 
-def attack_routine(_attack_target)
-  if UserVars.treim[:attack_type] =~ /\.lic$/i
-    Script.start(UserVars.treim[:attack_type].gsub('.lic', ''))
-  elsif UserVars.treim[:attack_type] == "sleep"
-    waitcastrt?
-    fput "symbol of sleep"
-  elsif UserVars.treim[:attack_type] =~ /physical|mstrike/
-    waitrt?
-    if UserVars.treim[:stance_dance]
+    # @param max_size [Integer] how many ids to retain before the oldest
+    #   are evicted
+    def initialize(max_size: DEFAULT_MAX_SIZE)
+      @max_size = max_size
+      @ids = []
+    end
+
+    # Records an id as seen, evicting the oldest entries past max_size.
+    #
+    # @param id [String, Integer] the NPC id (`GameObj#id`) to record
+    # @return [SeenIds] self, so calls can be chained
+    def <<(id)
+      @ids << id
+      @ids.shift while @ids.size > @max_size
+      self
+    end
+
+    # @param id [String, Integer] the NPC id (`GameObj#id`) to check
+    # @return [Boolean] whether id has already been recorded
+    def include?(id)
+      @ids.include?(id)
+    end
+  end
+
+  # Thin, named wrapper around the `UserVars.treim` settings hash, so the
+  # rest of the script reads `Config.stance_dance?` instead of reaching
+  # into `UserVars.treim[:stance_dance]` directly everywhere.
+  #
+  # Persistence and defaulting both live in {UserVars.treim}, which Lich
+  # saves per-character; {.setup!} only fills in keys that are still nil.
+  module Config
+    # @return [Regexp] characters that get rares announced by default when
+    #   {UserVars.treim}[:announce_rares] hasn't been set yet
+    DEFAULT_ANNOUNCER_NAMES = /Tysong|Durakar|Siierra|Ragz|Nairdin|Ylandra|Gharr|Ordim/ unless const_defined?(:DEFAULT_ANNOUNCER_NAMES)
+
+    module_function
+
+    # Fills in any unset `UserVars.treim` keys with their defaults.
+    # Idempotent: safe to call on every run, only touches nil keys.
+    #
+    # @return [void]
+    def setup!
+      UserVars.treim ||= {}
+      store = UserVars.treim
+
+      store[:stance_dance]    = true  if store[:stance_dance].nil?
+      store[:attack_type]     = ""    if store[:attack_type].nil?
+      store[:activescripts]   = []    if store[:activescripts].nil?
+      store[:clear_title]     = false if store[:clear_title].nil?
+      store[:spam_control]    = true  if store[:spam_control].nil?
+      store[:script_args]     = {}    if store[:script_args].nil?
+      store[:lag_control]     = false if store[:lag_control].nil?
+      store[:toggle_ambients] = false if store[:toggle_ambients].nil?
+      store[:announce_rares]  = !!(Char.name =~ DEFAULT_ANNOUNCER_NAMES) if store[:announce_rares].nil?
+
+      store[:script_args].default = ""
+    end
+
+    # @return [Boolean] whether to switch to offensive stance before
+    #   attacking and back to defensive afterward
+    def stance_dance? = UserVars.treim[:stance_dance]
+
+    # @return [String] the configured attack type (a spell number, a named
+    #   routine like "mstrike", or a "*.lic" custom script name)
+    def attack_type = UserVars.treim[:attack_type]
+
+    # @param value [String] the new attack type to persist
+    # @return [void]
+    def attack_type=(value)
+      UserVars.treim[:attack_type] = value
+    end
+
+    # @return [Array<String>] names of scripts to start alongside Treim and
+    #   kill when it stops
+    def active_scripts = UserVars.treim[:activescripts]
+
+    # @return [Boolean] whether to restore/clear the character's prename
+    #   title when REIM finishes
+    def clear_title? = UserVars.treim[:clear_title]
+
+    # @return [Boolean] whether to auto-manage the built-in spam-filter
+    #   scripts ({Treim::SPAM_SCRIPTS})
+    def spam_control? = UserVars.treim[:spam_control]
+
+    # @return [Boolean] whether to kill known lag-inducing scripts
+    #   ({Treim::LAG_SCRIPTS}) and enable brief/no-numbers combat flags
+    def lag_control? = UserVars.treim[:lag_control]
+
+    # @return [Boolean] whether to toggle `FLAG NOAMBIENTMSG` on for the
+    #   duration of the run
+    def toggle_ambients? = UserVars.treim[:toggle_ambients]
+
+    # @return [Boolean] whether to announce rare/boss spawns to the room via
+    #   a `'` speech command
+    def announce_rares? = UserVars.treim[:announce_rares]
+
+    # @param name [String] the script name to look up
+    # @return [String, Object] the configured CLI args for name, or `""`
+    #   (the hash default) if none were configured
+    def script_args_for(name) = UserVars.treim[:script_args][name]
+  end
+
+  # Performs one round of whatever attack_type is configured.
+  # Every branch returns a truthy value once its round completes, so
+  # callers can drive it with `until Treim::Attack.perform; end`.
+  module Attack
+    module_function
+
+    # Dispatches to the handler for the currently configured
+    # {Config.attack_type} and performs one attack round.
+    #
+    # @return [true] always truthy once a round completes, so callers can
+    #   loop `until Attack.perform`
+    def perform
+      type = Config.attack_type
+      case type
+      when /\.lic$/i               then run_custom_script(type)
+      when "sleep"                 then cast_sleep
+      when /physical|mstrike/      then physical("mstrike")
+      when "attack"                then physical("attack")
+      when /fire|ranged/           then physical("fire")
+      when /jab|punch|grapple|kick/ then physical(type)
+      when "uac"                   then physical("mstrike punch")
+      when "scrub"                 then spell_then_mstrike(435, "435")
+      when "bardass"                then spell_then_mstrike(1030, "1030 open")
+      when "dredd"                  then spell_then_mstrike(1630, "1630 open")
+      when "none"                   then true
+      when "1030"                   then cast_only(1030, "1030 open", pause_before: 2)
+      when "709"                    then cast_and_release(709, "stop 709")
+      when /435|635/                then cast_only(type, type, pause_before: 2)
+      else                          cast_generic(type)
+      end
+    end
+
+    # Starts a custom attack script named by attack_type (e.g. "duskattack.lic")
+    # in place of a built-in routine, if it isn't already running.
+    #
+    # @param script_name [String] attack_type value ending in ".lic"
+    # @return [true]
+    def run_custom_script(script_name)
+      name = script_name.sub(/\.lic\z/i, '')
+      Script.start(name) unless Script.running?(name)
+      true
+    end
+
+    # Casts Symbol of Voln's sleep.
+    #
+    # @return [true]
+    def cast_sleep
+      waitcastrt?
+      fput "symbol of sleep"
+      true
+    end
+
+    # Performs a single melee/ranged command (attack, mstrike, fire, jab,
+    # punch, grapple, kick, or "mstrike punch" for UAC), stance-dancing to
+    # offensive first and back to defensive after if configured.
+    #
+    # @param command [String] the game command to send, e.g. "mstrike"
+    # @return [true]
+    def physical(command)
+      waitrt?
+      offensive_stance! if Config.stance_dance?
+      fput command
+      defensive_stance! if Config.stance_dance?
+      true
+    end
+
+    # Casts a setup spell (if affordable) and follows it with an mstrike;
+    # falls back to a plain mstrike when the spell can't be cast. Used for
+    # the "scrub" (435), "bardass" (1030), and "dredd" (1630) combo routines.
+    #
+    # @param spell_number [Integer] the spell to check affordability/cast
+    # @param incant [String] the incant argument, e.g. "1030 open"
+    # @return [true]
+    def spell_then_mstrike(spell_number, incant)
+      return physical("mstrike") unless Spell[spell_number].affordable?
+
+      waitrt?
+      waitcastrt?
+      put "incant #{incant}"
+      pause 1
+      waitcastrt?
+      offensive_stance! if Config.stance_dance?
+      fput "mstrike"
+      true
+    end
+
+    # Casts a spell with no follow-up attack and no stance dancing. Used
+    # for the bare "1030" and "435"/"635" attack types.
+    #
+    # @param spell_number [Integer, String] the spell to check
+    #   affordability/cast
+    # @param incant [String] the incant argument
+    # @param pause_before [Numeric] seconds to pause before casting, once
+    #   roundtime/cast-roundtime have cleared
+    # @return [true]
+    def cast_only(spell_number, incant, pause_before: 0)
+      return true unless Spell[spell_number].affordable?
+
+      waitrt?
+      waitcastrt?
+      pause pause_before if pause_before.positive?
+      put "incant #{incant}"
+      true
+    end
+
+    # Casts a spell and immediately sends a release/stop command. Used for
+    # the "709" attack type (cast then `stop 709`).
+    #
+    # @param spell_number [Integer] the spell to check affordability/cast
+    # @param release_command [String] the follow-up command, e.g. "stop 709"
+    # @return [true]
+    def cast_and_release(spell_number, release_command)
+      return true unless Spell[spell_number].affordable?
+
+      waitrt?
+      waitcastrt?
+      put "incant #{spell_number}"
+      put release_command
+      true
+    end
+
+    # Casts any other spell number directly, stance-dancing around it if
+    # configured. This is the fallback for attack types that don't match
+    # any of the named routines.
+    #
+    # @param spell_number [String] the spell number to check
+    #   affordability/cast
+    # @return [true]
+    def cast_generic(spell_number)
+      return true unless Spell[spell_number].affordable?
+
+      waitrt?
+      waitcastrt?
+      offensive_stance! if Config.stance_dance?
+      put "incant #{spell_number}"
+      defensive_stance! if Config.stance_dance?
+      true
+    end
+
+    # Switches to offensive stance if not already there.
+    #
+    # @return [void]
+    def offensive_stance!
       fput "stance offensive" if checkstance != "offensive"
     end
-    fput "mstrike"
-    if UserVars.treim[:stance_dance]
+
+    # Waits out roundtime and switches back to defensive stance.
+    #
+    # @return [void]
+    def defensive_stance!
       pause 1
       waitrt?
       fput "stance defensive"
     end
-    return 1
-  elsif UserVars.treim[:attack_type] == "attack"
-    waitrt?
-    if UserVars.treim[:stance_dance]
-      fput "stance offensive" if checkstance != "offensive"
-    end
-    fput "attack"
-    if UserVars.treim[:stance_dance]
-      pause 1
-      waitrt?
-      fput "stance defensive"
-    end
-    return 1
-  elsif UserVars.treim[:attack_type] =~ /fire|ranged/
-    waitrt?
-    if UserVars.treim[:stance_dance]
-      fput "stance offensive" if checkstance != "offensive"
-    end
-    fput "fire"
-    if UserVars.treim[:stance_dance]
-      pause 1
-      waitrt?
-      fput "stance defensive"
-    end
-    return 1
-  elsif UserVars.treim[:attack_type] =~ /jab|punch|grapple|kick/
-    waitrt?
-    if UserVars.treim[:stance_dance]
-      fput "stance offensive" if checkstance != "offensive"
-    end
-    fput "#{UserVars.treim[:attack_type]}"
-    if UserVars.treim[:stance_dance]
-      pause 1
-      waitrt?
-      fput "stance defensive"
-    end
-    return 1
-  elsif UserVars.treim[:attack_type] == "uac"
-    waitrt?
-    if UserVars.treim[:stance_dance]
-      fput "stance offensive" if checkstance != "offensive"
-    end
-    fput "mstrike punch"
-    if UserVars.treim[:stance_dance]
-      pause 1
-      waitrt?
-      fput "stance defensive"
-    end
-    return 1
-  elsif UserVars.treim[:attack_type] == "scrub"
-    if Spell[435].affordable?
-      waitrt?
-      waitcastrt?
-      put "incant 435"
-      pause 1
-      waitcastrt?
-      if UserVars.treim[:stance_dance]
-        fput "stance offensive" if checkstance != "offensive"
-      end
-      fput "mstrike"
-      return 1
-    else
-      waitrt?
-      if UserVars.treim[:stance_dance]
-        fput "stance offensive" if checkstance != "offensive"
-      end
-      fput "mstrike"
-      if UserVars.treim[:stance_dance]
-        pause 1
-        waitrt?
-        fput "stance defensive"
-      end
-      return 1
-    end
-  elsif UserVars.treim[:attack_type] == "bardass"
-    if Spell[1030].affordable?
-      waitrt?
-      waitcastrt?
-      put "incant 1030 open"
-      pause 1
-      waitcastrt?
-      if UserVars.treim[:stance_dance]
-        fput "stance offensive" if checkstance != "offensive"
-      end
-      fput "mstrike"
-      return 1
-    else
-      waitrt?
-      if UserVars.treim[:stance_dance]
-        fput "stance offensive" if checkstance != "offensive"
-      end
-      fput "mstrike"
-      if UserVars.treim[:stance_dance]
-        pause 1
-        waitrt?
-        fput "stance defensive"
-      end
-      return 1
-    end
-  elsif UserVars.treim[:attack_type] == "dredd"
-    if Spell[1630].affordable?
-      waitrt?
-      waitcastrt?
-      put "incant 1630 open"
-      pause 1
-      waitcastrt?
-      if UserVars.treim[:stance_dance]
-        fput "stance offensive" if checkstance != "offensive"
-      end
-      fput "mstrike"
-      return 1
-    else
-      waitrt?
-      if UserVars.treim[:stance_dance]
-        fput "stance offensive" if checkstance != "offensive"
-      end
-      fput "mstrike"
-      if UserVars.treim[:stance_dance]
-        pause 1
-        waitrt?
-        fput "stance defensive"
-      end
-      return 1
-    end
-  elsif UserVars.treim[:attack_type] == "none"
-    return 1
-  elsif UserVars.treim[:attack_type] == "1030"
-    if Spell[1030].affordable?
-      waitrt?
-      waitcastrt?
-      pause 2
-      put "incant 1030 open"
-    end
-    return 1
-  elsif UserVars.treim[:attack_type] == "709"
-    if Spell[709].affordable?
-      waitrt?
-      waitcastrt?
-      put "incant 709"
-      put "stop 709"
-    end
-    return 1
-  elsif UserVars.treim[:attack_type] =~ /435|635/
-    if Spell[UserVars.treim[:attack_type]].affordable?
-      waitrt?
-      waitcastrt?
-      pause 2
-      put "incant #{UserVars.treim[:attack_type]}"
-    end
-    return 1
-  else
-    if Spell[UserVars.treim[:attack_type]].affordable?
-      waitrt?
-      waitcastrt?
-      if UserVars.treim[:stance_dance]
-        fput "stance offensive" if checkstance != "offensive"
-      end
-      put "incant #{UserVars.treim[:attack_type]}"
-      if UserVars.treim[:stance_dance]
-        pause 1
-        waitrt?
-        fput "stance defensive"
-      end
-    end
-    return 1
   end
-end
 
-def checkclear(bossname)
-  # GameObj.npcs.select{ |npc| npc.id == bossname.id }.count
-  while GameObj.npcs.select { |npc| npc.id == bossname && !npc.status.include?("dead") }.count > 0 do
-    pause 0.5
-  end
-  waitrt?
-  pause 0.5
-  waitrt?
-  fput "REIM INFO"
-  line = get
-  until line =~ /You have slain a total of (.*) creatures within Reim./
-    if line =~ /currently flagged for entry for up to the(.*)./
-      clearto = $1.split.first
-    elsif line =~ /Total Ethereal Scrip for this run: (.*)\/./
-      scrip = $1.to_i
-    elsif line =~ /You have (.*) hour and (.*) minutes? remaining/
-      timeleft = "#{$1}H #{$2}M"
-    elsif line =~ /You have ([0-9]{1,2}) minutes? remaining./
-      timeleft = "#{$1}M"
-    end
-    line = get
-  end
-  return clearto, scrip, timeleft
-end
+  # Parses `REIM INFO` via Lich::Util.issue_command instead of a hand-rolled
+  # DownstreamHook + silence proc.
+  module ClearProgress
+    # @return [Regexp] matches the first line of the REIM INFO response, so
+    #   `issue_command` starts capturing immediately
+    START_PATTERN = /\S/ unless const_defined?(:START_PATTERN)
+    # @return [Regexp] matches the final line of the REIM INFO response,
+    #   ending capture
+    END_PATTERN   = /You have slain a total of/ unless const_defined?(:END_PATTERN)
 
-def checkgroup()
-  group_count = 1
-  group_members = []
-  group_leader = nil
-  group_members.push(Char.name)
-  fput 'GROUP'
-  line = get
-  until line =~ /for a list of other options./
-    if line =~ /You are (?:leading|grouped with) (.*)\./
-      last_match = Regexp.last_match(1)
-      last_match.split(/,(?:\s+and)?| and /).map { |x| x.gsub(/ (?:who is \w+|\(\w+\))/, '').strip }.each { |member|
-        group_members.push(member)
-        group_count += 1
-      }
-      if (leader = last_match.split(/,(?:\s+and)?| and /).find { |x| x =~ /who is leading|\(leading\)/ })
-        group_leader = leader.gsub(/ (?:who is \w+|\(\w+\))/, '').strip
-      else
-        group_leader = Char.name
-      end
-    end
-    group_leader = Char.name if line =~ /^You are not currently in a group\.$/
-    line = get
-  end
-  return group_leader, group_members
-end
+    # @return [Regexp] captures the stage name the group is cleared through
+    CLEAR_TO_PATTERN = /currently flagged for entry for up to the(.*)\./ unless const_defined?(:CLEAR_TO_PATTERN)
+    # @return [Regexp] captures the ethereal scrip earned this run
+    SCRIP_PATTERN    = %r{Total Ethereal Scrip for this run: (.*)/} unless const_defined?(:SCRIP_PATTERN)
+    # @return [Regexp] captures "H hour(s) and M minute(s) remaining"
+    HOURS_PATTERN    = /You have (.*) hour and (.*) minutes? remaining/ unless const_defined?(:HOURS_PATTERN)
+    # @return [Regexp] captures "M minute(s) remaining" (under an hour left)
+    MINUTES_PATTERN  = /You have ([0-9]{1,2}) minutes? remaining\./ unless const_defined?(:MINUTES_PATTERN)
 
-silence = proc {
-  action = proc { |server_string|
-    if server_string.strip.length == 0
-      next
-    end
-    #		if server_string =~ /Current quest status\:|Time until next premium entry\:|Your reputation rank with the Reim Base Camp|Total Reputation|Total Quest Energy|Total Ethereal Scrip|Total Ethereal Scrip for this run|You are currently questing in the Settlement of Reim.|You are currently flagged for entry for up to the|You have slain a total of|REIM INFO|Your group status is currently|for a list of other options|is following you|is also a member of your group|is the leader of your group/
-    if server_string =~ /Current quest status\:|Time until next premium entry\:|Your reputation rank with the Reim Base Camp|Total Reputation|Total Quest Energy|Total Ethereal Scrip|Total Ethereal Scrip for this run|You are currently questing in the Settlement of Reim.|You are currently flagged for entry for up to the|You have slain a total of|REIM INFO|Your group status is currently|for a list of other options|is following you|is also a member of your group|is the leader of your group|Reim Fortress Defense|Current quest status|Times Defended|Times Failed|Highest Round Completed|Highest Score|Total Contribution|General Information|The Settlement of Reim/
-      nil
-    else
-      server_string
-    end
-  }
-  DownstreamHook.add("#{script.name}_silence", action)
-}
+    # @!attribute [r] clear_to
+    #   @return [String, nil] stage name the group is cleared through
+    #     (e.g. "road"), or nil if REIM INFO didn't report one
+    # @!attribute [r] scrip
+    #   @return [Integer, nil] ethereal scrip earned this run
+    # @!attribute [r] time_left
+    #   @return [String, nil] remaining time as "XH YM" or "YM"
+    Result = Data.define(:clear_to, :scrip, :time_left) unless const_defined?(:Result)
 
-before_dying {
-  DownstreamHook.remove("#{script.name}_silence")
-  if variable[2] == "leader"
-    kill_script "holdhands"
-  end
-  UserVars.treim[:activescripts].each { |script|
-    kill_script script if Script.running?(script)
-  }
-  Script.kill("tspam") if Script.running?("tspam")
-  Script.kill("tkill") if Script.running?("tkill")
-  Script.kill("looploot") if Script.running?("looploot")
-  if UserVars.treim[:spam_control]
-    spam_scripts.each { |script|
-      Script.kill(script) if Script.running?(script)
-    }
-  end
-  fput "FLAG NOAMBIENTMSG OFF" if UserVars.treim[:toggle_ambients]
-}
+    module_function
 
-blacklist = Array[]
-if blacklist.include? Char.name
-  exit
-end
+    # Waits for an optional target to die, then issues `REIM INFO` and
+    # parses the clear-to stage, scrip total, and time remaining from it.
+    #
+    # @param target_id [String, Integer, nil] id of an NPC to wait on
+    #   dying before checking, or nil to check immediately
+    # @return [Result] the parsed REIM INFO status
+    def check(target_id: nil)
+      wait_for_death(target_id) if target_id
+      waitrt?
+      pause 0.5
+      waitrt?
 
-if variable[1] && variable[1].downcase != "help"
-  UserVars.treim[:attack_type] = variable[1].downcase
-elsif ((variable[1] == nil || variable[1].downcase == "help") && UserVars.treim[:attack_type] == "") || variable[1].downcase == "help"
-  _respond "\n
-  SYNTAX - ;treim <ATTACKOPTION>
-  Will remember last used attack option if none given.
+      clear_to = nil
+      scrip = nil
+      time_left = nil
 
-  ATTACKOPTION Selections Include:
-      <SPELLNUMBER> - use a spell to cast once per wave/boss IE. 908 Major Fire
-      SLEEP         - symbol of voln sleep
-      PHYSICAL      - mstrike and attack boss for all you physical attackers
-      UAC           - mstrike punch and punch boss for all your UAC needs
-      RANGED        - ranged attack
-      NONE          - won't attack, useful if manually wish to attack
-
-  Running Commands
-     ;send reimcount   - shows current group leader, group count, and previos group count
-     whisper ooc group clearcheck - if group members are running script,
-                    reports back clear and scrip status
-                    MUST BE LEADER TO HAVE GROUP MEMBERS RESPOND
-
-
-  Variables to set:
-     Stance dance back to defensive after attack, default is TRUE
-     ;e echo UserVars.treim[:stance_dance] = FALSE
-
-     Add scripts to be auto-started and killed with TREIM, default is NONE
-     ;e echo UserVars.treim[:activescripts] = [\"stand\", \"symbolz\"]
-
-     Add script arguments to use at launch of of an activescript or spam_script
-     ;e UserVars.treim[:script_args] = { \"scriptname1\" => \"args\", \"scriptname2\" => \"args\" }
-
-     Enable auto-clearing of Reim titles upon complition, default is FALSE
-     ;e echo UserVars.treim[:clear_title] = true
-
-     Enable SPAM filtering scripts, default is TRUE
-     ;e echo UserVars.treim[:spam_control] = false
-
-     Enable killing of known lag enducing scripts, default is FALSE
-     ;e echo UserVars.treim[:lag_control] = TRUE
-
-     Enable announcing of rares on wave spawn, default is FALSE
-     ; echo UserVars.treim[:announce_rares] = TRUE
-
-     Enable toggling of FLAG NoAmbientMsg, default is FALSE
-     ;e echo UserVars.treim[:toggle_ambients] = TRUE"
-  exit
-end
-
-if variable[2].downcase == "leader"
-  start_script "holdhands", ["reim"]
-end
-
-fput "FLAG NOAMBIENTMSG ON" if UserVars.treim[:toggle_ambients]
-
-if UserVars.treim[:lag_control]
-  lag_scripts.each { |script|
-    if Script.running?(script)
-      Script.kill(script)
-    end
-  }
-  put "FLAG COMBATBRIEF ON"
-  put "FLAG COMBATNONUMBERS ON"
-end
-if UserVars.treim[:spam_control]
-  spam_scripts.each { |script|
-    if Script.exists?(script)
-      Script.start(script, UserVars.treim[:script_args][script]) if !Script.running?(script)
-    else
-      echo "You should strongly consider downloading ;repo download #{script} to help with spam/lag while here"
-    end
-  }
-end
-if UserVars.treim[:clear_title]
-  result = dothistimeout "title show", 5, /(.*?)#{Char.name}/
-  if result =~ /(.*?) #{Char.name}/
-    title_prename = $1
-  end
-end
-
-loop {
-  if AreaReim.include? Room.current.id
-    respond "You're in REIM, lets get to work!!!!"
-    silence.call
-    clearto, scrip, _timeleft = checkclear(bossname)
-    echo scrip if Char.name =~ /Tysong/
-    DownstreamHook.remove("#{script.name}_silence")
-    # Script.unpause("tspam") if Script.running?("tspam")
-    # Script.unpause("tkill") if Script.running?("tkill")
-    Script.unpause("looploot") if Script.running?("looploot")
-    UserVars.treim[:activescripts].each { |script|
-      Script.start(script, UserVars.treim[:script_args][script])
-    }
-    while AreaReim.include? Room.current.id do
-      line = get
-      if reim_current_room != Room.current.id
-        if line =~ /(?:strides|rushes|leaps|strolls) toward/
-          counter_time = Time.now
-          sleep 0.1 until (GameObj.npcs.count { |npc| ((npc_commons.include? npc.noun) && !(npc_ids.include? npc.id)) } > 0 || Time.now - counter_time > 2.5)
-          # sleep 0.1 until (GameObj.npcs.count{ |npc| ((npc_commons.include? npc.noun) && !(npc_ids.include? npc.id)) } > 0)
-          if GameObj.npcs.count { |npc| ((npc.name =~ /#{reim_npcs}/) && !(npc_ids.include? npc.id)) } > 30 && Char.name =~ /Tysong/
-            _respond("#{fam_window_begin}Mob Count: #{GameObj.npcs.count { |npc| (npc.name =~ /#{reim_npcs}/ && !(npc_ids.include? npc.id)) }} \r\n#{fam_window_end}") if Char.name =~ /Tysong|Gharr|Rasko/
-            put "incant 435"
-            # put "stance offensive"
-            # put "incant 950 413 512 512 510 510 510"
-            # pause 0.5
-            # put "stance defensive"
-            GameObj.npcs.each { |npc| npc_ids << npc.id if !(npc_ids.include? npc.id) }
-          elsif GameObj.npcs.count { |npc| ((npc_bosses.include? npc.noun) && (npc.status !~ /dead|gone/) && !(npc_ids.include? npc.id)) } > 0
-            _respond("#{fam_window_begin}Mob Count: #{GameObj.npcs.count { |npc| npc.name =~ /#{reim_npcs}/ }} \r\n#{fam_window_end}") if Char.name =~ /Tysong|Gharr|Rasko/
-            bossname = GameObj.npcs.select { |npc| ((npc_bosses.include? npc.noun) && (npc.status !~ /dead|gone/) && !(npc_ids.include? npc.id)) }.sample
-            bosses_found = GameObj.npcs.select { |npc| ((npc_bosses.include? npc.noun) && (npc.status !~ /dead|gone/) && !(npc_ids.include? npc.id)) }
-            bosses_found.each { |boss|
-              put "'#{KillNouns.sample} the #{boss.name}" if UserVars.treim[:announce_rares]
-              npc_ids << boss.id
-            }
-            if Village.include? Room.current.id and clearto == "road"
-              GameObj.npcs.each { |npc| npc_ids << npc.id if !(npc_ids.include? npc.id) && (npc_bosses.include? npc.noun) }
-              next
-              # until attack_routine(""); end
-            elsif Road.include? Room.current.id and clearto == "courtyard"
-              GameObj.npcs.each { |npc| npc_ids << npc.id if !(npc_ids.include? npc.id) && (npc_bosses.include? npc.noun) }
-              pause 2
-              next # if UserVars.treim[:attack_type] !~ /410|909|709|512|sleep/
-              # until attack_routine(""); end
-            elsif Courtyard.include? Room.current.id and clearto == "servant"
-              GameObj.npcs.each { |npc| npc_ids << npc.id if !(npc_ids.include? npc.id) && (npc_bosses.include? npc.noun) }
-              pause 2
-              next # if UserVars.treim[:attack_type] !~ /410|909|709|512|sleep/
-              # until attack_routine(""); end
-            elsif Servant.include? Room.current.id and clearto == "visitor"
-              GameObj.npcs.each { |npc| npc_ids << npc.id if !(npc_ids.include? npc.id) && (npc_bosses.include? npc.noun) }
-              pause 2
-              next # if UserVars.treim[:attack_type] !~ /410|909|709|512|sleep/
-              # until attack_routine(""); end
-            elsif Visitor.include? Room.current.id and clearto == "royal"
-              GameObj.npcs.each { |npc| npc_ids << npc.id if !(npc_ids.include? npc.id) && (npc_bosses.include? npc.noun) }
-              pause 2
-              next # if UserVars.treim[:attack_type] !~ /410|909|709|512|sleep/
-              # until attack_routine(""); end
-            elsif Royal.include? Room.current.id and clearto == "throne"
-              GameObj.npcs.each { |npc| npc_ids << npc.id if !(npc_ids.include? npc.id) && (npc_bosses.include? npc.noun) }
-              pause 2
-              next # if UserVars.treim[:attack_type] !~ /410|909|709|512|sleep/
-              # until attack_routine(""); end
-            else
-              echo bossname.noun if Char.name =~ /Tysong/
-              until attack_routine("#{bossname.noun}"); end
-              silence.call
-              clearto, scrip, timeleft = checkclear(bossname.id)
-              _respond "\nCleared Through: #{clearto}
-							Total Scrip: #{scrip}"
-              DownstreamHook.remove("#{script.name}_silence")
-            end
-          elsif GameObj.npcs.count { |npc| ((npc_commons.include? npc.noun) && (npc.status !~ /dead|gone/) && !(npc_ids.include? npc.id)) } > 0
-            total_mobs = GameObj.npcs.count { |npc| npc.name =~ /#{reim_npcs}/ }
-            _respond("#{fam_window_begin}Mob Count: #{total_mobs} - Players: #{checkpcs.count.to_i + 1} \r\n#{fam_window_end}") if Char.name =~ /Tysong|Gharr|Rasko/
-            GameObj.npcs.each { |npc| npc_ids << npc.id if !(npc_ids.include? npc.id) }
-            until attack_routine(""); end
-          end
-        elsif line =~ /reimcount/
-          silence.call
-          leader, members = checkgroup
-          DownstreamHook.remove("#{script.name}_silence")
-          respond "Group Leader:    #{leader}"
-          respond "Group Members:   #{members}"
-          respond "Previous Check:  #{previousmembers}"
-          previousmembers = members
-        elsif line =~ /\(OOC\) (.*)'s player whispers to the group, "Clearcheck."/
-          whisperperson = $1.split.first
-          silence.call if Char.name !~ /Tysong|Rasko/
-          echo "Current Leader: #{leader}" if Char.name =~ /Tysong/
-          leader, members = checkgroup
-          echo "Current Leader: #{leader}" if Char.name =~ /Tysong/
-          # echo leader
-          # echo members
-          # echo whisperperson
-          if whisperperson == leader
-            clearto, scrip, timeleft = checkclear(bossname)
-            fput "whisper ooc #{leader} Clear: #{clearto}, Scrip: #{scrip}, Timeleft: #{timeleft}"
-          else
-            put "whisper ooc #{whisperperson} You're not the leader, #{whisperperson}!"
-          end
-          DownstreamHook.remove("#{script.name}_silence") if Char.name !~ /Tysong|Rasko/
-        elsif line =~ /\(OOC\) (.*)'s player whispers to the group, "Pause attack."/
-          whisperperson = $1.split.first
-          silence.call
-          leader, members = checkgroup
-          DownstreamHook.remove("#{script.name}_silence")
-          if whisperperson == leader
-            echo "PAUSING TREIM UNTIL RESUMED BY LEADER"
-            while line !~ /\(OOC\) (.*)#{whisperperson}'s player whispers to the group, "Resume attack."/ do
-              line = get
-            end
-            echo "RESUMING TREIM"
-          else
-            put "whisper ooc #{whisperperson} You're not the leader, #{whisperperson}!"
-          end
-        elsif line =~ /\(OOC\) (.*)'s player whispers to the group, "Cease fire."/ || line =~ /\(OOC\) (.*)'s player whispers to the group, ".*KILL THY SCRIPTS/i
-          whisperperson = $1.split.first
-          silence.call
-          leader, members = checkgroup
-          DownstreamHook.remove("#{script.name}_silence")
-          if whisperperson == leader
-            while line !~ /\(OOC\) (.*)#{whisperperson}'s player whispers to the group, "Resume fire."/
-              break unless AreaReim.include?(Room.current.id)
-              line = get
-            end
-          end
-        elsif line =~ /You realize that (.*) (?:were|was) left behind./
-          _respond "#{monsterbold_start}You left #{$1} behind#{monsterbold_end}"
-          fput "say We left #{$1} behind"
-          send_to_script('lnet', "chat to #{Char.name} You left #{$1} behind") if Script.running?("lnet")
-          send_to_script('0net', "chat to #{Char.name} You left #{$1} behind") if Script.running?("0net")
+      Lich::Util.issue_command("REIM INFO", START_PATTERN, END_PATTERN, silent: true, quiet: true).each do |line|
+        case line
+        when CLEAR_TO_PATTERN then clear_to = Regexp.last_match(1).split.first
+        when SCRIP_PATTERN    then scrip = Regexp.last_match(1).to_i
+        when HOURS_PATTERN    then time_left = "#{Regexp.last_match(1)}H #{Regexp.last_match(2)}M"
+        when MINUTES_PATTERN  then time_left = "#{Regexp.last_match(1)}M"
         end
-      else
-        reim_current_room = Room.current.id
-        echo "Setting reim_current_room(#{reim_current_room}) = Room.current.id(#{Room.current.id})" if Char.name =~ /Tysong/
       end
-      # TRAP Stuff
-      if line == "A slender ethereal blowgun appears from the shadows nearby, aimed right for you!"
-        waitrt?
-        fput "lean"
-      elsif line == "An ethereal bow appears from the shadows nearby, aimed right for you!"
-        waitrt?
-        fput "lean"
-      elsif line == "A pair of ethereal hands shoot up from the ground, straight for your legs!"
-        waitrt?
-        fput "jump"
-      elsif line == "An ethereal chain lashes out from the shadows straight for your head!"
-        waitrt?
-        fput "duck"
-      elsif line == "An ethereal chain lashes out from the shadows straight for your legs!"
-        waitrt?
-        fput "jump"
-      end
-      XMLData.reset
+
+      Result.new(clear_to: clear_to, scrip: scrip, time_left: time_left)
     end
-  elsif Room.current.id == 25142
-    _respond "\n
-		###############################################################
-		##                                                           ##
-		##               You're in the throne room                   ##
-		##                  IDLING TREIM SCRIPT                      ##
-		##                                                           ##
-		###############################################################\n\n\n"
-    kill_script "tkill" if Script.running?("tkill")
-    kill_script "tspam" if Script.running?("tspam")
-    kill_script "looploot" if Script.running?("looploot")
-    until (Room.current.id != 25142) do
-      XMLData.reset
-      sleep(1)
-    end
-  elsif Room.current.id == 25143
-    respond "DONE WITH REIM, EXITING"
-    if UserVars.treim[:clear_title]
-      if title_prename.length > 0
-        multifput "title set prename #{title_prename}"
-      else
-        multifput "title set prename Lord", "title clear Lord"
-      end
-    end
-    exit
-  else
-    _respond "\nScript will only run in creature only REIM rooms.
-		The script will wait until you get your arse inside REIM!!!"
-    Script.pause("tspam") if Script.running?("tspam")
-    Script.pause("tkill") if Script.running?("tkill")
-    Script.pause("looploot") if Script.running?("looploot")
-    until (AreaReim.include? Room.current.id) do
-      XMLData.reset
-      sleep(1)
+
+    # Blocks until the given NPC is confirmed dead (or was never alive).
+    #
+    # @param target_id [String, Integer] id of the NPC to wait on
+    # @return [void]
+    def wait_for_death(target_id)
+      pause 0.5 while GameObj.npcs.any? { |npc| npc.id == target_id && !npc.status.include?("dead") }
     end
   end
-}
+
+  # Thin wrapper over the native Group API (lib/gemstone/group.rb),
+  # replacing manual `fput 'GROUP'` + text parsing entirely.
+  module Party
+    module_function
+
+    # Forces a synchronous group-status refresh from the game.
+    #
+    # @return [void]
+    def refresh!
+      ::Group.check
+    end
+
+    # @return [String, nil] the group leader's name; the character's own
+    #   name if leading, the leader's noun otherwise (nil if unknown)
+    def leader_name
+      ::Group.leader? ? Char.name : ::Group.leader&.noun
+    end
+
+    # @return [Array<String>] every group member's name, including the
+    #   character's own
+    def member_names
+      ([Char.name] + ::Group.members.map(&:noun)).uniq
+    end
+  end
+
+  # Pushes status text to the familiar/thoughts stream on frontends that
+  # support it, falling back to the legacy GSe/GSf tags.
+  module FamiliarWindow
+    # @return [String] opening tag for the modern pushStream-based familiar window
+    STREAM_BEGIN = "<pushStream id=\"familiar\" ifClosedStyle=\"watching\"/>" unless const_defined?(:STREAM_BEGIN)
+    # @return [String] closing tag for the modern pushStream-based familiar window
+    STREAM_END   = "<popStream/>\r\n" unless const_defined?(:STREAM_END)
+    # @return [String] opening escape sequence for the legacy familiar window
+    LEGACY_BEGIN = "\034GSe\r\n" unless const_defined?(:LEGACY_BEGIN)
+    # @return [String] closing escape sequence for the legacy familiar window
+    LEGACY_END   = "\034GSf\r\n" unless const_defined?(:LEGACY_END)
+
+    module_function
+
+    # Wraps message in the appropriate familiar-window tags for the
+    # current frontend.
+    #
+    # @param message [String] the status text to display
+    # @return [String] message wrapped in stream or legacy escape tags,
+    #   ready to pass to `_respond`
+    def wrap(message)
+      if Lich::Common::Frontend.supports_xml?
+        "#{STREAM_BEGIN}#{message} \r\n#{STREAM_END}"
+      else
+        "#{LEGACY_BEGIN}#{message} \r\n#{LEGACY_END}"
+      end
+    end
+  end
+
+  # @return [Array<String>] verbs sampled for the `'<verb> the <boss>` room
+  #   announcement when {Treim::Config.announce_rares?} is enabled
+  KILL_NOUNS = [
+    "Murder", "Kill", "Slaughter", "Abolish", "Exterminate", "Wreck", "Demolish", "Massacre",
+    "Obliterate", "Crush", "Tickley tickle", "Kiss", "Hug"
+  ].freeze unless const_defined?(:KILL_NOUNS)
+
+  # @return [Array<String>] script names killed when
+  #   {Treim::Config.lag_control?} is enabled, before combat brief/no-numbers
+  #   flags are turned on
+  LAG_SCRIPTS = %w[
+    rnum duskruin_watch prettiernum killcounter title sorter inspectweight inspectarmor uberbounty
+    autovote chatfail enchantnotes
+  ].freeze unless const_defined?(:LAG_SCRIPTS)
+
+  # @return [Array<String>] spam-filter script names auto-started (if
+  #   installed) when {Treim::Config.spam_control?} is enabled, and killed
+  #   on shutdown
+  SPAM_SCRIPTS = %w[briefcombat spellmerge].freeze unless const_defined?(:SPAM_SCRIPTS)
+
+  # @return [Array<String>] characters excluded from running this script.
+  #   Empty by default; edit locally if you need to keep a specific
+  #   character off of it.
+  BLACKLIST = [].freeze unless const_defined?(:BLACKLIST)
+
+  # @return [Hash{String => String}] exact REIM trap warning lines mapped
+  #   to the command that dodges them
+  TRAP_RESPONSES = {
+    "A slender ethereal blowgun appears from the shadows nearby, aimed right for you!" => "lean",
+    "An ethereal bow appears from the shadows nearby, aimed right for you!"            => "lean",
+    "A pair of ethereal hands shoot up from the ground, straight for your legs!"       => "jump",
+    "An ethereal chain lashes out from the shadows straight for your head!"            => "duck",
+    "An ethereal chain lashes out from the shadows straight for your legs!"            => "jump"
+  }.freeze unless const_defined?(:TRAP_RESPONSES)
+
+  # @return [String] the `;treim help` / no-argument-and-unconfigured usage text
+  HELP_TEXT = <<~HELP unless const_defined?(:HELP_TEXT)
+    SYNTAX - ;treim <ATTACKOPTION>
+    Will remember last used attack option if none given.
+
+    ATTACKOPTION Selections Include:
+        <SPELLNUMBER> - use a spell to cast once per wave/boss IE. 908 Major Fire
+        SLEEP         - symbol of voln sleep
+        ATTACK        - single-target attack
+        FIRE          - single-target ranged attack
+        MSTRIKE       - mstrike attack (works for ranged if you set FIRE as default)
+        UAC           - mstrike punch and punch boss for all your UAC needs
+        JAB           - single-target jab
+        PUNCH         - single-target punch
+        GRAPPLE       - single-target grapple
+        KICK          - single-target kick
+        SCRUB         - combination mstrike and 435 cast routine
+        BARDASS       - combination mstrike and 1030 cast routine
+        DREDD         - combination mstrike and 1630 cast routine
+        NONE          - won't attack, useful if manually wish to attack
+        <SCRIPTNAME>.lic - starts a custom attack script instead
+
+    Running Commands
+       ;send reimcount   - shows current group leader, group count, and previous group count
+       whisper ooc group clearcheck - if group members are running script,
+                      reports back clear and scrip status
+                      MUST BE LEADER TO HAVE GROUP MEMBERS RESPOND
+
+    Variables to set:
+       Stance dance back to defensive after attack, default is TRUE
+       ;e echo UserVars.treim[:stance_dance] = FALSE
+
+       Add scripts to be auto-started and killed with TREIM, default is NONE
+       ;e echo UserVars.treim[:activescripts] = ["stand", "symbolz"]
+
+       Add script arguments to use at launch of an activescript or spam_script
+       ;e UserVars.treim[:script_args] = { "scriptname1" => "args", "scriptname2" => "args" }
+
+       Enable auto-clearing of Reim titles upon completion, default is FALSE
+       ;e echo UserVars.treim[:clear_title] = true
+
+       Enable SPAM filtering scripts, default is TRUE
+       ;e echo UserVars.treim[:spam_control] = false
+
+       Enable killing of known lag inducing scripts, default is FALSE
+       ;e echo UserVars.treim[:lag_control] = TRUE
+
+       Enable announcing of rares on wave spawn, default is FALSE
+       ;e echo UserVars.treim[:announce_rares] = TRUE
+
+       Enable toggling of FLAG NoAmbientMsg, default is FALSE
+       ;e echo UserVars.treim[:toggle_ambients] = TRUE
+  HELP
+
+  # The main reactive loop, once setup/config is done.
+  #
+  # Dispatches on the character's current room: fights waves while inside
+  # REIM proper ({#run_wave_room}), idles in the throne room between runs
+  # ({#idle_in_throne_room}), wraps up on exit ({#finish}), or waits outside
+  # REIM entirely ({#await_entry}).
+  class Runner
+    # @param title_prename [String, nil] the prename captured before
+    #   entering REIM (via {Treim.capture_title_prename}), restored by
+    #   {#finish} if {Config.clear_title?} is enabled
+    def initialize(title_prename: nil)
+      @seen_ids = SeenIds.new
+      @previous_members = []
+      @current_boss_id = nil
+      @title_prename = title_prename
+    end
+
+    # Runs forever, dispatching on the character's current room. Only
+    # returns via {#finish} calling `exit`.
+    #
+    # @return [void]
+    def run
+      loop do
+        if Geography.in_reim?
+          run_wave_room
+        elsif Room.current.id == Geography::THRONE_ROOM_ID
+          idle_in_throne_room
+        elsif Room.current.id == Geography::EXIT_ROOM_ID
+          finish
+        else
+          await_entry
+        end
+      end
+    end
+
+    private
+
+    # Checks current clear progress, starts configured helper scripts, then
+    # processes game lines (wave spawns, whispered commands, traps) for as
+    # long as the character stays inside REIM.
+    #
+    # @return [void]
+    def run_wave_room
+      respond "You're in REIM, lets get to work!!!!"
+
+      progress = ClearProgress.check
+      echo progress.scrip if Char.name =~ /Tysong/
+      Script.unpause("looploot") if Script.running?("looploot")
+      Config.active_scripts.each { |name| Script.start(name, Config.script_args_for(name)) }
+
+      clear_to = progress.clear_to
+
+      while Geography.in_reim?
+        line = get
+        clear_to = handle_wave_line(line, clear_to)
+        handle_trap_line(line)
+        XMLData.reset
+      end
+    end
+
+    # Routes one game line to the matching wave/whisper/trap handler.
+    #
+    # @param line [String] a single line of game output
+    # @param clear_to [String, nil] the current known clear-to stage name
+    # @return [String, nil] the (possibly updated) clear-to stage name
+    def handle_wave_line(line, clear_to)
+      case line
+      when /(?:strides|rushes|leaps|strolls) toward/
+        clear_to = handle_wave_spawn(clear_to)
+      when /reimcount/
+        report_group_status
+      when /\(OOC\) (.*)'s player whispers to the group, "Clearcheck\."/
+        handle_clearcheck(Regexp.last_match(1).split.first)
+      when /\(OOC\) (.*)'s player whispers to the group, "Pause attack\."/
+        handle_pause_attack(Regexp.last_match(1).split.first)
+      when /\(OOC\) (.*)'s player whispers to the group, "Cease fire\."/, /\(OOC\) (.*)'s player whispers to the group, ".*KILL THY SCRIPTS/i
+        handle_cease_fire(Regexp.last_match(1).split.first)
+      when /You realize that (.*) (?:were|was) left behind\./
+        announce_left_behind(Regexp.last_match(1))
+      end
+      clear_to
+    end
+
+    # Dodges a REIM trap if line is an exact trap-warning match.
+    #
+    # @param line [String] a single line of game output
+    # @return [void]
+    def handle_trap_line(line)
+      dodge = TRAP_RESPONSES[line]
+      return unless dodge
+
+      waitrt?
+      fput dodge
+    end
+
+    # Handles a "creature strides/rushes/leaps/strolls toward you" spawn
+    # line: waits for the room to populate, then routes to the flood, boss,
+    # or common-wave handler based on what spawned.
+    #
+    # @param clear_to [String, nil] the current known clear-to stage name
+    # @return [String, nil] the (possibly updated) clear-to stage name
+    def handle_wave_spawn(clear_to)
+      wait_for_npc_population
+
+      if flood_wave?
+        handle_flood_wave
+        clear_to
+      elsif (bosses = unseen_bosses).any?
+        handle_boss_wave(bosses, clear_to)
+      elsif unseen_commons.any?
+        handle_common_wave
+        clear_to
+      else
+        clear_to
+      end
+    end
+
+    # Blocks briefly for GameObj.npcs to populate after a room change,
+    # since the XML feed can lag behind the room-window update.
+    #
+    # @return [void]
+    def wait_for_npc_population
+      deadline = Time.now + 2.5
+      sleep 0.1 until unseen_common_npc_count.positive? || Time.now > deadline
+    end
+
+    # Whether this spawn is a mob flood needing an AoE response instead of
+    # normal single-target handling. Gated to a specific character.
+    #
+    # @return [Boolean]
+    def flood_wave?
+      Char.name =~ /Tysong/ && unseen_named_npc_count > 30
+    end
+
+    # Responds to a flood wave by casting an AoE spell and marking every
+    # visible NPC seen.
+    #
+    # @return [void]
+    def handle_flood_wave
+      announce_mob_count("Mob Count: #{unseen_named_npc_count}")
+      put "incant 435"
+      mark_all_seen
+    end
+
+    # Announces and marks any newly-spawned bosses/rares seen, then either
+    # holds (if the group has already cleared past this stage) or fights
+    # one sampled boss and rechecks clear progress afterward.
+    #
+    # @param bosses [Array<GameObj>] unseen boss/rare NPCs from this spawn
+    # @param clear_to [String, nil] the current known clear-to stage name
+    # @return [String, nil] the (possibly updated) clear-to stage name
+    def handle_boss_wave(bosses, clear_to)
+      announce_mob_count("Mob Count: #{named_npc_count}")
+      bosses.each do |boss|
+        put "'#{KILL_NOUNS.sample} the #{boss.name}" if Config.announce_rares?
+        @seen_ids << boss.id
+      end
+
+      boss = bosses.sample
+      @current_boss_id = boss.id
+
+      stage = Geography.stage_holding(Room.current.id, clear_to)
+      if stage
+        pause 2 if stage.pause_before_next
+        return clear_to
+      end
+
+      echo boss.noun if Char.name =~ /Tysong/
+      until Attack.perform; end
+
+      progress = ClearProgress.check(target_id: boss.id)
+      _respond "\nCleared Through: #{progress.clear_to}\nTotal Scrip: #{progress.scrip}"
+      progress.clear_to
+    end
+
+    # Responds to an ordinary (non-boss) wave: marks everything visible
+    # seen and attacks until the round completes.
+    #
+    # @return [void]
+    def handle_common_wave
+      announce_mob_count("Mob Count: #{named_npc_count} - Players: #{checkpcs.count.to_i + 1}")
+      mark_all_seen
+      until Attack.perform; end
+    end
+
+    # @return [Integer] count of common NPCs not yet marked seen
+    def unseen_common_npc_count
+      GameObj.npcs.count { |npc| Bosses::COMMON_NOUNS.include?(npc.noun) && !@seen_ids.include?(npc.id) }
+    end
+
+    # @return [Integer] count of any REIM NPCs (common or boss) not yet
+    #   marked seen
+    def unseen_named_npc_count
+      GameObj.npcs.count { |npc| npc.name =~ Bosses::NPC_NAME_REGEX && !@seen_ids.include?(npc.id) }
+    end
+
+    # @return [Integer] total count of visible REIM NPCs, seen or not
+    def named_npc_count
+      GameObj.npcs.count { |npc| npc.name =~ Bosses::NPC_NAME_REGEX }
+    end
+
+    # @return [Array<GameObj>] living boss/rare NPCs not yet marked seen
+    def unseen_bosses
+      GameObj.npcs.select { |npc| Bosses::BOSS_NOUNS.include?(npc.noun) && npc.status !~ /dead|gone/ && !@seen_ids.include?(npc.id) }
+    end
+
+    # @return [Array<GameObj>] living common NPCs not yet marked seen
+    def unseen_commons
+      GameObj.npcs.select { |npc| Bosses::COMMON_NOUNS.include?(npc.noun) && npc.status !~ /dead|gone/ && !@seen_ids.include?(npc.id) }
+    end
+
+    # Marks every currently-visible NPC as seen in {#@seen_ids}.
+    #
+    # @return [void]
+    def mark_all_seen
+      GameObj.npcs.each { |npc| @seen_ids << npc.id unless @seen_ids.include?(npc.id) }
+    end
+
+    # Sends message to the familiar window, gated to a set of characters
+    # who want the extra status chatter.
+    #
+    # @param message [String] the status text to display
+    # @return [void]
+    def announce_mob_count(message)
+      return unless Char.name =~ /Tysong|Gharr|Rasko/
+
+      _respond FamiliarWindow.wrap(message)
+    end
+
+    # Handles the `;send reimcount` trigger: reports the current group
+    # leader/members and the previous check's member list.
+    #
+    # @return [void]
+    def report_group_status
+      Party.refresh!
+      leader = Party.leader_name
+      members = Party.member_names
+      respond "Group Leader:    #{leader}"
+      respond "Group Members:   #{members}"
+      respond "Previous Check:  #{@previous_members}"
+      @previous_members = members
+    end
+
+    # Refreshes group status and checks whether whisperperson is the group
+    # leader, whispering a rejection back to them if not.
+    #
+    # @param whisperperson [String] first name parsed from the whisper line
+    # @return [Boolean] whether whisperperson is the group leader
+    def leader?(whisperperson)
+      Party.refresh!
+      return true if whisperperson == Party.leader_name
+
+      put "whisper ooc #{whisperperson} You're not the leader, #{whisperperson}!"
+      false
+    end
+
+    # Handles a whispered "Clearcheck" OOC command: if whisperperson is the
+    # group leader, reports clear progress/scrip/time remaining back to them.
+    #
+    # @param whisperperson [String] first name parsed from the whisper line
+    # @return [void]
+    def handle_clearcheck(whisperperson)
+      return unless leader?(whisperperson)
+
+      progress = ClearProgress.check(target_id: @current_boss_id)
+      fput "whisper ooc #{whisperperson} Clear: #{progress.clear_to}, Scrip: #{progress.scrip}, Timeleft: #{progress.time_left}"
+    end
+
+    # Handles a whispered "Pause attack" OOC command: if whisperperson is
+    # the group leader, blocks until they whisper "Resume attack".
+    #
+    # @param whisperperson [String] first name parsed from the whisper line
+    # @return [void]
+    def handle_pause_attack(whisperperson)
+      return unless leader?(whisperperson)
+
+      echo "PAUSING TREIM UNTIL RESUMED BY LEADER"
+      resume_pattern = /\(OOC\) (.*)#{Regexp.escape(whisperperson)}'s player whispers to the group, "Resume attack\."/
+      loop do
+        break if get =~ resume_pattern
+      end
+      echo "RESUMING TREIM"
+    end
+
+    # Handles a whispered "Cease fire" (or "KILL THY SCRIPTS") OOC command:
+    # if whisperperson is the group leader, blocks until they whisper
+    # "Resume fire" or the character leaves REIM.
+    #
+    # @param whisperperson [String] first name parsed from the whisper line
+    # @return [void]
+    def handle_cease_fire(whisperperson)
+      Party.refresh!
+      return unless whisperperson == Party.leader_name
+
+      resume_pattern = /\(OOC\) (.*)#{Regexp.escape(whisperperson)}'s player whispers to the group, "Resume fire\."/
+      loop do
+        break unless Geography.in_reim?
+        break if get =~ resume_pattern
+      end
+    end
+
+    # Announces a group member left behind and relays it over lnet/0net if
+    # those scripts are running.
+    #
+    # @param name [String] the name of the member left behind
+    # @return [void]
+    def announce_left_behind(name)
+      _respond "#{monsterbold_start}You left #{name} behind#{monsterbold_end}"
+      fput "say We left #{name} behind"
+      send_to_script('lnet', "chat to #{Char.name} You left #{name} behind") if Script.running?("lnet")
+      send_to_script('0net', "chat to #{Char.name} You left #{name} behind") if Script.running?("0net")
+    end
+
+    # Displays the idling banner, stops helper scripts that shouldn't run
+    # outside a wave, and blocks until the character leaves the throne room.
+    #
+    # @return [void]
+    def idle_in_throne_room
+      _respond "\n\t\t###############################################################\n" \
+               "\t\t##                                                           ##\n" \
+               "\t\t##               You're in the throne room                   ##\n" \
+               "\t\t##                  IDLING TREIM SCRIPT                      ##\n" \
+               "\t\t##                                                           ##\n" \
+               "\t\t###############################################################\n\n\n"
+      %w[tkill tspam looploot].each { |name| kill_script name if Script.running?(name) }
+      until Room.current.id != Geography::THRONE_ROOM_ID
+        XMLData.reset
+        sleep 1
+      end
+    end
+
+    # Pauses helper scripts and blocks until the character enters REIM.
+    #
+    # @return [void]
+    def await_entry
+      _respond "\nScript will only run in creature only REIM rooms.\n" \
+               "\t\tThe script will wait until you get your arse inside REIM!!!"
+      %w[tspam tkill looploot].each { |name| Script.pause(name) if Script.running?(name) }
+      until Geography.in_reim?
+        XMLData.reset
+        sleep 1
+      end
+    end
+
+    # Restores/clears the character's prename title if configured, then
+    # ends the script.
+    #
+    # @return [void]
+    def finish
+      respond "DONE WITH REIM, EXITING"
+      if Config.clear_title?
+        if @title_prename && !@title_prename.empty?
+          multifput "title set prename #{@title_prename}"
+        else
+          multifput "title set prename Lord", "title clear Lord"
+        end
+      end
+      exit
+    end
+  end
+
+  module_function
+
+  # Script entry point: validates the blacklist, applies configuration and
+  # CLI arguments, wires up lag/spam control and the shutdown hook, then
+  # hands off to {Runner#run}.
+  #
+  # @return [void]
+  def start
+    return if BLACKLIST.include?(Char.name)
+
+    Config.setup!
+    return unless handle_arguments
+
+    Script.start("holdhands", "reim") if leader_flag?
+
+    register_shutdown_hook
+
+    fput "FLAG NOAMBIENTMSG ON" if Config.toggle_ambients?
+    apply_lag_control
+    apply_spam_control
+
+    title_prename = capture_title_prename if Config.clear_title?
+
+    Runner.new(title_prename: title_prename).run
+  end
+
+  # @return [Boolean] whether the script was invoked with "leader" as its
+  #   second CLI argument (`;treim <attack> leader`)
+  def leader_flag?
+    Script.current.vars[2]&.downcase == "leader"
+  end
+
+  # Sets the attack type from args if given; otherwise reuses the last
+  # configured attack type. Shows help (and signals "stop") when asked, or
+  # when there's no argument and nothing configured yet.
+  #
+  # @return [Boolean] true if the script should proceed, false if help was
+  #   shown and the caller should stop
+  def handle_arguments
+    requested = Script.current.vars[1]
+
+    if requested && requested.downcase != "help"
+      Config.attack_type = requested.downcase
+      return true
+    end
+
+    return true if requested.nil? && !Config.attack_type.empty?
+
+    _respond "\n#{HELP_TEXT}"
+    false
+  end
+
+  # Registers cleanup to run when the script dies: kills holdhands (if
+  # leading), configured active scripts, known helper scripts, and spam
+  # scripts (if enabled), and restores the ambient-message flag.
+  #
+  # @return [void]
+  def register_shutdown_hook
+    before_dying do
+      kill_script "holdhands" if leader_flag?
+      Config.active_scripts.each { |name| kill_script name if Script.running?(name) }
+      %w[tspam tkill looploot].each { |name| Script.kill(name) if Script.running?(name) }
+      SPAM_SCRIPTS.each { |name| Script.kill(name) if Script.running?(name) } if Config.spam_control?
+      fput "FLAG NOAMBIENTMSG OFF" if Config.toggle_ambients?
+    end
+  end
+
+  # Kills known lag-inducing scripts and enables brief/no-numbers combat
+  # flags, if {Config.lag_control?} is enabled.
+  #
+  # @return [void]
+  def apply_lag_control
+    return unless Config.lag_control?
+
+    LAG_SCRIPTS.each { |name| Script.kill(name) if Script.running?(name) }
+    put "FLAG COMBATBRIEF ON"
+    put "FLAG COMBATNONUMBERS ON"
+  end
+
+  # Starts each configured spam-filter script (if installed and not
+  # already running), or nudges the user to install it, if
+  # {Config.spam_control?} is enabled.
+  #
+  # @return [void]
+  def apply_spam_control
+    return unless Config.spam_control?
+
+    SPAM_SCRIPTS.each do |name|
+      unless Script.exists?(name)
+        echo "You should strongly consider downloading ;repo download #{name} to help with spam/lag while here"
+        next
+      end
+      Script.start(name, Config.script_args_for(name)) unless Script.running?(name)
+    end
+  end
+
+  # Captures the character's current prename title (if any) so
+  # {Runner#finish} can restore it after REIM clears titles.
+  #
+  # @return [String, nil] the prename text before the character's name, or
+  #   nil if there wasn't one
+  def capture_title_prename
+    lines = Lich::Util.issue_command("title show", /#{Regexp.escape(Char.name)}/, silent: true, quiet: true, timeout: 5)
+    match = lines.first&.match(/(.*?) #{Regexp.escape(Char.name)}/)
+    match && match[1]
+  end
+end
+
+Treim.start
