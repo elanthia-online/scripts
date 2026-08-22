@@ -1067,6 +1067,21 @@ RSpec.describe 'ELoot::Sell.locksmith insufficient-silver retry' do
     expect(locksmith_open).not_to match(/return Sell\.locksmith_open\(box, activator\)/)
     expect(locksmith_open).to match(/return Sell\.locksmith\(\[box\], withdraw_amount: withdraw_amount, retries: retries \+ 1\)/)
   end
+
+  it 'only records the town-locksmith fee and open once payment is accepted, not merely quoted' do
+    expect(locksmith_open).to match(/if result =~ \/accepts\/ && quoted_fee/)
+    expect(locksmith_open).to match(/ELoot\.data\.silver_breakdown\["Town Locksmith"\] -= quoted_fee/)
+    expect(locksmith_open).to match(/ELoot\.data\.silver_breakdown\["Town Open"\] \+= 1/)
+  end
+
+  it 'checks the payment result before touching the silver breakdown, so a successful retry cannot double-count' do
+    pay_call_pos = locksmith_open.index("result = dothistimeout('pay'")
+    breakdown_pos = locksmith_open.index('ELoot.data.silver_breakdown["Town Locksmith"]')
+
+    expect(pay_call_pos).not_to be_nil
+    expect(breakdown_pos).not_to be_nil
+    expect(breakdown_pos).to be > pay_call_pos
+  end
 end
 
 # RSpec for the gem_bounty_override? dedup: process_boxes must go through the same
