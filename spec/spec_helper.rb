@@ -169,9 +169,14 @@ module LichStub
 
   class Spell
     class << self
-      attr_accessor :affordable
+      attr_accessor :affordable, :known
 
+      # @param number [Integer, String]
+      # @return [Spell, nil] nil simulates an unrecognized spell number, the
+      #   same as the real Spell[] for a number matching no known spell
       def [](number)
+        return nil if known == false
+
         new(number)
       end
     end
@@ -230,8 +235,10 @@ module LichStub
 
   def self.reset_all!
     UserVars.reset!
+    Char.name = nil
     Script.reset!
     Spell.affordable = nil
+    Spell.known = nil
     ::Group.leader = nil
     ::Group.members = []
     Lich::Util.issue_command_result = nil
