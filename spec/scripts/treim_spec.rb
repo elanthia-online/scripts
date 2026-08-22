@@ -225,6 +225,28 @@ RSpec.describe 'Treim' do
       expect(TreimSpec::Harness::Config.announce_rares?).to be false
     end
 
+    it 'defaults debug_echo to true for a known debug name, false otherwise' do
+      TreimSpec::Harness::Char.name = 'Tysong'
+      TreimSpec::Harness::Config.setup!
+      expect(TreimSpec::Harness::Config.debug_echo?).to be true
+
+      TreimSpec::Harness::UserVars.reset!
+      TreimSpec::Harness::Char.name = 'SomeoneElse'
+      TreimSpec::Harness::Config.setup!
+      expect(TreimSpec::Harness::Config.debug_echo?).to be false
+    end
+
+    it 'defaults mob_count_window to true for a known name, false otherwise' do
+      TreimSpec::Harness::Char.name = 'Rasko'
+      TreimSpec::Harness::Config.setup!
+      expect(TreimSpec::Harness::Config.mob_count_window?).to be true
+
+      TreimSpec::Harness::UserVars.reset!
+      TreimSpec::Harness::Char.name = 'SomeoneElse'
+      TreimSpec::Harness::Config.setup!
+      expect(TreimSpec::Harness::Config.mob_count_window?).to be false
+    end
+
     it 'does not overwrite an already-configured value on a later setup! call' do
       TreimSpec::Harness::Config.setup!
       TreimSpec::Harness::Config.attack_type = 'mstrike'
@@ -514,6 +536,11 @@ RSpec.describe 'Treim' do
       Group.members = [TreimSpec::FakeNpc.new('1', 'Durakar', nil, nil)]
 
       expect(TreimSpec::Harness::Party.member_names).to contain_exactly('Tysong', 'Durakar')
+    end
+
+    it 'refresh! forces a synchronous Group.check' do
+      TreimSpec::Harness::Party.refresh!
+      expect(Group.check_count).to eq(1)
     end
   end
 

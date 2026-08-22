@@ -23,8 +23,7 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   # source or method cannot be found, it fails loudly rather than passing on a stale copy.
   let(:predicate) do
     path = find_lic_source('eloot.lic', from: __dir__)
-    body = extract_from_source(File.read(path), /^ {4}def self\.pool_full_recovery\?[\s\S]*?^ {4}end$/,
-                               label: 'pool_full_recovery?', source_path: path)
+    body = extract_lic_method(File.read(path), 'pool_full_recovery?', source_path: path)
 
     Module.new { module_eval(body) }
   end
@@ -102,10 +101,7 @@ end
 RSpec.describe 'ELoot::Loot.loot_specials' do
   let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
-  let(:method_body) do
-    extract_from_source(File.read(eloot_path), /^ {4}def self\.loot_specials\b[\s\S]*?^ {4}end$/,
-                        label: 'loot_specials', source_path: eloot_path)
-  end
+  let(:method_body) { extract_lic_method(File.read(eloot_path), 'loot_specials', source_path: eloot_path) }
 
   # A minimal GameObj stand-in -- only the readers loot_specials touches.
   let(:obj_class) { Struct.new(:name, :type, :id) }
@@ -266,30 +262,12 @@ end
 # the shipped source.
 
 RSpec.describe 'ELoot box-looting call sites' do
-  let(:eloot_path) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    path
-  end
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
   let(:source) { File.read(eloot_path) }
 
-  def method_body(source, name)
-    body = source[/^ {4}def self\.#{Regexp.escape(name)}\b[\s\S]*?^ {4}end$/]
-    raise "#{name} could not be extracted from eloot.lic" unless body
-
-    body
-  end
-
-  let(:box_loot) { method_body(source, 'box_loot') }
-  let(:box_loot_ground) { method_body(source, 'box_loot_ground') }
+  let(:box_loot) { extract_lic_method(source, 'box_loot', source_path: eloot_path) }
+  let(:box_loot_ground) { extract_lic_method(source, 'box_loot_ground', source_path: eloot_path) }
 
   it 'box_loot hands the box to loot_specials so a full-container stow can recover' do
     expect(box_loot).to match(/Loot\.loot_specials\([^)]*\bbox:\s*box\b/)
@@ -340,7 +318,7 @@ RSpec.describe 'ELoot box-looting call sites' do
     end
 
     it 'loot_regular actually returns the :recovered it documents, not nil' do
-      loot_regular = method_body(source, 'loot_regular')
+      loot_regular = extract_lic_method(source, 'loot_regular', source_path: eloot_path)
 
       expect(loot_regular).to match(/return :recovered if/)
       expect(loot_regular).not_to match(/^ +return if .*== :recovered$/)
@@ -356,18 +334,7 @@ end
 # never opens, so the predicate and the routing are pinned here.
 
 RSpec.describe 'ELoot::Sell.town_openable?' do
-  let(:eloot_path) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    path
-  end
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -462,31 +429,13 @@ RSpec.describe 'ELoot::Sell.town_openable?' do
 end
 
 RSpec.describe 'ELoot::Sell.process_boxes routing' do
-  let(:eloot_path) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    path
-  end
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
   let(:source) { File.read(eloot_path) }
 
-  def method_body(source, name)
-    body = source[/^ {4}def self\.#{Regexp.escape(name)}\b[\s\S]*?^ {4}end$/]
-    raise "#{name} could not be extracted from eloot.lic" unless body
-
-    body
-  end
-
-  let(:process_boxes) { method_body(source, 'process_boxes') }
-  let(:locksmith) { method_body(source, 'locksmith') }
-  let(:locksmith_open) { method_body(source, 'locksmith_open') }
+  let(:process_boxes) { extract_lic_method(source, 'process_boxes', source_path: eloot_path) }
+  let(:locksmith) { extract_lic_method(source, 'locksmith', source_path: eloot_path) }
+  let(:locksmith_open) { extract_lic_method(source, 'locksmith_open', source_path: eloot_path) }
 
   # process_boxes cannot be exercised without the Lich runtime, so the routing invariants
   # are asserted against the shipped source.
@@ -529,30 +478,12 @@ end
 # of its own, though, so it is exercised for real against a small stand-in for Sell/ELoot.
 
 RSpec.describe 'ELoot::Sell locksmith_priority routing' do
-  let(:eloot_path) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    path
-  end
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
   let(:source) { File.read(eloot_path) }
 
-  def method_body(source, name)
-    body = source[/^ {4}def self\.#{Regexp.escape(name)}\b[\s\S]*?^ {4}end$/]
-    raise "#{name} could not be extracted from eloot.lic" unless body
-
-    body
-  end
-
-  let(:process_boxes) { method_body(source, 'process_boxes') }
-  let(:route_town_then_pool_body) { method_body(source, 'route_town_then_pool') }
+  let(:process_boxes) { extract_lic_method(source, 'process_boxes', source_path: eloot_path) }
+  let(:route_town_then_pool_body) { extract_lic_method(source, 'route_town_then_pool', source_path: eloot_path) }
 
   it 'defaults locksmith_priority to pool, so existing setups keep their current behavior' do
     line = source[/^\s*locksmith_priority: \{ default: '(\w+)' \},$/, 1]
@@ -711,27 +642,11 @@ end
 # the spec fails loudly rather than passing on a stale copy.
 
 RSpec.describe 'ELoot.marked_unsellable?' do
-  let(:eloot_path) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    path
-  end
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
   let(:source) { File.read(eloot_path) }
 
-  let(:method_body) do
-    body = source[/^ {2}def self\.marked_unsellable\?[\s\S]*?^ {2}end$/]
-    raise "marked_unsellable? could not be extracted from #{eloot_path}" unless body
-
-    body
-  end
+  let(:method_body) { extract_lic_method(source, 'marked_unsellable?', source_path: eloot_path) }
 
   let(:obj_class) { Struct.new(:name, :id) }
 
@@ -812,27 +727,11 @@ RSpec.describe 'ELoot.marked_unsellable?' do
 end
 
 RSpec.describe 'ELoot.toss' do
-  let(:eloot_path) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    path
-  end
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
   let(:source) { File.read(eloot_path) }
 
-  let(:method_body) do
-    body = source[/^ {2}def self\.toss\b[\s\S]*?^ {2}end$/]
-    raise "toss could not be extracted from #{eloot_path}" unless body
-
-    body
-  end
+  let(:method_body) { extract_lic_method(source, 'toss', source_path: eloot_path) }
 
   let(:obj_class) { Struct.new(:name, :id) }
   let(:item) { obj_class.new('a rusty dagger', '12345') }
@@ -1002,34 +901,16 @@ end
 # source, the same way the box-looting call sites above are pinned.
 
 RSpec.describe 'ELoot trash/drop call sites' do
-  let(:eloot_path) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    path
-  end
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
   let(:source) { File.read(eloot_path) }
 
-  # Indent-agnostic: box_loot_ground/save_trash_box/dump_herbs_junk sit at different
-  # nesting depths (Loot vs Sell vs top-level ELoot), unlike the fixed-indent helper
-  # used elsewhere in this file.
-  def method_body(source, name)
-    match = source.match(/^( +)def self\.#{Regexp.escape(name)}\b[\s\S]*?\n\1end$/)
-    raise "#{name} could not be extracted from eloot.lic" unless match
-
-    match[0]
-  end
-
-  let(:box_loot_ground) { method_body(source, 'box_loot_ground') }
-  let(:save_trash_box) { method_body(source, 'save_trash_box') }
-  let(:dump_herbs_junk) { method_body(source, 'dump_herbs_junk') }
+  # box_loot_ground/save_trash_box/dump_herbs_junk sit at different nesting
+  # depths (Loot vs Sell vs top-level ELoot); extract_lic_method matches
+  # whatever indentation each is actually written at.
+  let(:box_loot_ground) { extract_lic_method(source, 'box_loot_ground', source_path: eloot_path) }
+  let(:save_trash_box) { extract_lic_method(source, 'save_trash_box', source_path: eloot_path) }
+  let(:dump_herbs_junk) { extract_lic_method(source, 'dump_herbs_junk', source_path: eloot_path) }
 
   it 'routes every trash/drop call site through the shared helper' do
     expect(source.scan(/ELoot\.toss\(/).length).to eq(5)

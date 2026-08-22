@@ -92,7 +92,50 @@ end
 # @return [String] the extracted source, including the module/class wrapper
 # @raise [RuntimeError] if no matching, two-space-indented body is found
 def extract_lic_module(source, name, kind: 'module', source_path: nil)
-  extract_from_source(source, /^  #{kind} #{name}\n.*?\n  end\n/m, label: "#{kind} #{name}", source_path: source_path)
+  body = extract_from_source(source, /^  #{kind} #{name}\n.*?\n  end\n/m, label: "#{kind} #{name}", source_path: source_path)
+  assert_parses!(body, label: "#{kind} #{name}", source_path: source_path)
+  body
+end
+
+# Extracts a `def self.name ... end` method body, matching whatever
+# indentation depth it's actually written at (unlike extract_lic_module,
+# which assumes a fixed two-space module/class nesting level) -- so it works
+# for methods nested at different depths within the same `.lic` file.
+#
+# @param source [String] full `.lic` file contents
+# @param name [String] the method name, e.g. "box_loot"
+# @param source_path [String, nil] used only in the raised error message
+# @return [String] the extracted method body, including `def`/`end`
+# @raise [RuntimeError] if no `def self.name ... end` is found, or if what
+#   was found isn't complete, parseable Ruby (a truncated extraction)
+def extract_lic_method(source, name, source_path: nil)
+  # (?![\w?!]) rather than \b: name may itself end in ?/! (pool_full_recovery?),
+  # and \b does not match between two non-word characters (e.g. "?" then "("),
+  # so it would fail to find methods whose signature has no space before "(".
+  match = source.match(/^( +)def self\.#{Regexp.escape(name)}(?![\w?!])[\s\S]*?\n\1end$/)
+  raise "could not extract #{name} from #{source_path || 'source'}" unless match
+
+  assert_parses!(match[0], label: name, source_path: source_path)
+  match[0]
+end
+
+# Guards every generic .lic extraction helper above against a regex that
+# matched too little (or too much): a non-greedy `.*?end` can stop at the
+# first same-indent `end` it finds, which is usually the real boundary but
+# would silently return a truncated, invalid body if a nested construct or
+# heredoc ever produced a same-indent `end` of its own. Parsing catches that
+# case loudly instead of handing a spec broken Ruby to module_eval.
+#
+# @param body [String] extracted source expected to be complete Ruby
+# @param label [String] used only in the raised error message
+# @param source_path [String, nil] used only in the raised error message
+# @return [void]
+# @raise [RuntimeError] if body is not syntactically complete Ruby
+def assert_parses!(body, label:, source_path: nil)
+  RubyVM::AbstractSyntaxTree.parse(body)
+rescue SyntaxError => e
+  raise "extracted #{label} from #{source_path || 'source'} is not valid, complete Ruby " \
+        "(likely truncated by the extraction regex): #{e.message}"
 end
 
 # -- Generic Lich runtime stand-ins --------------------------------------
@@ -241,6 +284,7 @@ module LichStub
     Spell.known = nil
     ::Group.leader = nil
     ::Group.members = []
+    ::Group.instance_variable_set(:@check_count, 0)
     Lich::Util.issue_command_result = nil
     Lich::Common::Frontend.xml_supported = nil
     GameStub.reset!
@@ -301,6 +345,17 @@ module Group
 
     def leader?
       leader == :self
+    end
+
+    # No-op stand-in for the real Group.check (which sends the GROUP
+    # command and blocks for a response); just counts calls so a spec can
+    # confirm something like Party.refresh! actually reaches for it.
+    def check
+      @check_count = (@check_count || 0) + 1
+    end
+
+    def check_count
+      @check_count || 0
     end
   end
 end
