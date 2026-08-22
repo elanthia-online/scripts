@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative '../spec_helper'
+
 # RSpec for ELoot::Loot.pool_full_recovery? (the sell-and-return recovery decision).
 #
 # Run: rspec pool_full_recovery_spec.rb
@@ -10,7 +12,8 @@
 # the real method body from eloot.lic and evaluates it into a bare module. The predicate
 # is pure -- all state is passed as arguments -- so it needs no Lich runtime to exercise.
 # If the source or method cannot be found, the spec fails loudly instead of passing on a
-# stale copy.
+# stale copy. Path lookup and extraction use the shared helpers in spec/spec_helper.rb;
+# nothing else from there is needed since this predicate takes no Lich globals at all.
 
 RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   # Extract only the pure predicate from eloot.lic and eval it into an isolated module.
@@ -19,17 +22,9 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   # Sourcing the real method keeps this spec from drifting from the shipped code; if the
   # source or method cannot be found, it fails loudly rather than passing on a stale copy.
   let(:predicate) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    body = File.read(path)[/^ {4}def self\.pool_full_recovery\?[\s\S]*?^ {4}end$/]
-    raise "pool_full_recovery? could not be extracted from #{path}" unless body
+    path = find_lic_source('eloot.lic', from: __dir__)
+    body = extract_from_source(File.read(path), /^ {4}def self\.pool_full_recovery\?[\s\S]*?^ {4}end$/,
+                               label: 'pool_full_recovery?', source_path: path)
 
     Module.new { module_eval(body) }
   end
@@ -105,24 +100,11 @@ end
 # or method cannot be found the spec fails loudly rather than passing on a stale copy.
 
 RSpec.describe 'ELoot::Loot.loot_specials' do
-  let(:eloot_path) do
-    path = [
-      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
-      File.expand_path('../eloot.lic', __dir__),
-      File.expand_path('../../eloot.lic', __dir__),
-      File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
-    ].find { |p| File.exist?(p) }
-    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
-
-    path
-  end
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
 
   let(:method_body) do
-    body = File.read(eloot_path)[/^ {4}def self\.loot_specials\b[\s\S]*?^ {4}end$/]
-    raise "loot_specials could not be extracted from #{eloot_path}" unless body
-
-    body
+    extract_from_source(File.read(eloot_path), /^ {4}def self\.loot_specials\b[\s\S]*?^ {4}end$/,
+                        label: 'loot_specials', source_path: eloot_path)
   end
 
   # A minimal GameObj stand-in -- only the readers loot_specials touches.
