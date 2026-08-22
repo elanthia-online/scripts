@@ -713,6 +713,409 @@ RSpec.describe 'ELoot::Sell locksmith_priority routing' do
   end
 end
 
+# RSpec for ELoot::Sell.gem_bounty_override? (extracted so process_boxes and box_in_hand
+# cannot drift out of sync on what counts as the gem-bounty override).
+
+RSpec.describe 'ELoot::Sell.gem_bounty_override?' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_body) do
+    body = source[/^ {4}def self\.gem_bounty_override\?[\s\S]*?^ {4}end$/]
+    raise "gem_bounty_override? could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  let(:gem_task) { true }
+  let(:setting) { true }
+
+  let(:harness) do
+    task_gem = gem_task
+    setting_val = setting
+
+    data = Object.new
+    data.define_singleton_method(:settings) { { locksmith_when_gem_bounty: setting_val } }
+
+    eloot = Module.new
+    eloot.define_singleton_method(:data) { data }
+
+    task = Object.new
+    task.define_singleton_method(:gem?) { task_gem }
+
+    bounty = Module.new
+    bounty.define_singleton_method(:task) { task }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:Bounty, bounty)
+    mod.module_eval(method_body)
+    mod
+  end
+
+  it 'is true when a gem bounty is active and the override setting is on' do
+    expect(harness.gem_bounty_override?).to be true
+  end
+
+  context 'gem bounty active, override setting off' do
+    let(:setting) { false }
+
+    it 'returns false' do
+      expect(harness.gem_bounty_override?).to be false
+    end
+  end
+
+  context 'override setting on, no gem bounty active' do
+    let(:gem_task) { false }
+
+    it 'returns false' do
+      expect(harness.gem_bounty_override?).to be false
+    end
+  end
+
+  context 'neither condition holds' do
+    let(:gem_task) { false }
+    let(:setting) { false }
+
+    it 'returns false' do
+      expect(harness.gem_bounty_override?).to be false
+    end
+  end
+end
+
+# RSpec for ELoot::Sell.box_in_hand's Locksmith Priority handling (v2.11.3/v2.11.4).
+#
+# box_in_hand previously always tried the locksmith pool first, ignoring the
+# Locksmith Priority setting entirely, and could walk a pool-only box to the town
+# locksmith on the final fallback. This exercises the real method body -- unlike
+# locksmith/locksmith_open, box_in_hand's own collaborators (GameObj, ELoot::Inventory,
+# Sell.locksmith/locksmith_pool/town_openable?/gem_bounty_override?) are all easily
+# stubbed, with no direct Lich-runtime primitives (dothistimeout, fput, move) in its
+# own body, so it does not need to fall back to structural-only assertions.
+
+RSpec.describe 'ELoot::Sell.box_in_hand' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_body) do
+    body = source[/^ {4}def self\.box_in_hand\b[\s\S]*?^ {4}end$/]
+    raise "box_in_hand could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  let(:hand_class) { Struct.new(:type, :noun, :id) }
+
+  def hand(type, noun = 'strongbox', id = '111')
+    hand_class.new(type, noun, id)
+  end
+
+  let(:empty_hand) { hand('Empty', nil, nil) }
+
+  # Mutable hand state: the fake GameObj reads these, and the fake Sell.locksmith
+  # (never Sell.locksmith_pool -- see note below) can clear whichever hand holds the
+  # box under test, simulating a successful town open.
+  let(:right) { hand('box') }
+  let(:left) { empty_hand }
+
+  let(:calls) { [] }
+  let(:pool_enabled) { true }
+  let(:town_enabled) { true }
+  let(:priority) { 'pool' }
+  let(:gem_bounty_override) { false }
+  let(:town_openable) { true }
+
+  # What Sell.locksmith_pool does to the hand it's given: :clear removes the box
+  # (accepted), :noop leaves it (declined/full). Only :noop is used below -- whether
+  # a single-box pool give-away leaves both hands truly empty afterward is a
+  # pre-existing, unrelated question this spec does not need to settle; every
+  # scenario here either never reaches the pool call or treats it as a decline,
+  # which is exactly what "pool is full" already covers.
+  let(:pool_result) { :noop }
+
+  let(:harness) do
+    r = right
+    l = left
+    log = calls
+    settings_hash = {
+      sell_locksmith_pool: pool_enabled,
+      sell_locksmith: town_enabled,
+      locksmith_priority: priority
+    }
+    override = gem_bounty_override
+    openable = town_openable
+    pool_res = pool_result
+    empty = empty_hand
+
+    gameobj = Module.new
+    gameobj.define_singleton_method(:right_hand) { r }
+    gameobj.define_singleton_method(:left_hand) { l }
+
+    data = Object.new
+    data.define_singleton_method(:settings) { settings_hash }
+
+    eloot = Module.new
+    eloot.define_singleton_method(:data) { data }
+    eloot.define_singleton_method(:msg) { |**kw| log << [:msg, kw] }
+
+    inventory = Module.new
+    inventory.define_singleton_method(:free_hands) { |**kw| log << [:free_hands, kw] }
+    eloot.const_set(:Inventory, inventory)
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:GameObj, gameobj)
+    mod.define_singleton_method(:town_openable?) { |_item| openable }
+    mod.define_singleton_method(:gem_bounty_override?) { override }
+    mod.define_singleton_method(:locksmith) do |items|
+      log << [:locksmith, items.map(&:noun)]
+      items.each do |it|
+        l = empty if l.equal?(it)
+        r = empty if r.equal?(it)
+      end
+    end
+    mod.define_singleton_method(:locksmith_pool) do |items, dep|
+      log << [:locksmith_pool, items.map(&:noun), dep]
+      next unless pool_res == :clear
+
+      items.each do |it|
+        l = empty if l.equal?(it)
+        r = empty if r.equal?(it)
+      end
+    end
+    mod.define_singleton_method(:exit) { raise 'exit called' }
+    mod.const_set(:Sell, mod)
+    mod.module_eval(method_body)
+    mod
+  end
+
+  # Only entries relevant to routing order/coverage; free_hands/msg noise filtered out.
+  def routing_calls(calls)
+    calls.select { |c| %i[locksmith locksmith_pool].include?(c.first) }
+  end
+
+  context 'default priority (pool), both routes enabled, box is town-openable' do
+    it 'tries the pool before the town locksmith' do
+      harness.box_in_hand
+
+      expect(routing_calls(calls).first).to eq([:locksmith_pool, ['strongbox'], true])
+    end
+
+    it 'falls through to town once the pool declines it' do
+      harness.box_in_hand
+
+      expect(routing_calls(calls).map(&:first)).to eq(%i[locksmith_pool locksmith])
+    end
+  end
+
+  context 'Locksmith Priority set to town first, both routes enabled' do
+    let(:priority) { 'locksmith' }
+
+    it 'tries the town locksmith before ever touching the pool' do
+      harness.box_in_hand
+
+      expect(routing_calls(calls)).to eq([[:locksmith, ['strongbox']]])
+    end
+  end
+
+  context 'gem-bounty override active, even with default Locksmith Priority (pool)' do
+    let(:priority) { 'pool' }
+    let(:gem_bounty_override) { true }
+
+    it 'still tries the town locksmith first -- this is the bug this override fixes' do
+      harness.box_in_hand
+
+      expect(routing_calls(calls)).to eq([[:locksmith, ['strongbox']]])
+    end
+  end
+
+  context 'Locksmith Priority set to town first, but the box is pool-only (e.g. a case)' do
+    let(:priority) { 'locksmith' }
+    let(:town_openable) { false }
+
+    it 'never sends a pool-only box to town, even with town-first priority' do
+      expect { harness.box_in_hand }.to raise_error('exit called')
+
+      expect(routing_calls(calls).map(&:first)).not_to include(:locksmith)
+      expect(routing_calls(calls).map(&:first)).to include(:locksmith_pool)
+    end
+  end
+
+  context 'only the pool is enabled (sell_locksmith is off)' do
+    let(:town_enabled) { false }
+    let(:priority) { 'locksmith' } # should have no effect with only one route enabled
+    let(:gem_bounty_override) { true } # same -- neither can turn on a disabled route
+
+    it 'never calls the town locksmith at all' do
+      expect { harness.box_in_hand }.to raise_error('exit called')
+
+      expect(routing_calls(calls).map(&:first)).not_to include(:locksmith)
+    end
+  end
+
+  context 'the pool is full and the box is pool-only, so nothing can process it' do
+    let(:town_openable) { false }
+
+    it 'does not walk it to town as a last resort' do
+      expect { harness.box_in_hand }.to raise_error('exit called')
+
+      expect(routing_calls(calls).map(&:first)).not_to include(:locksmith)
+    end
+
+    it 'reports it instead of silently giving up' do
+      begin
+        harness.box_in_hand
+      rescue RuntimeError
+        nil
+      end
+
+      expect(calls).to include([:msg, { text: ' Not able to process the box in your hand. Exiting...', space: true }])
+    end
+  end
+
+  it 'threads the deposit flag through to the pool' do
+    harness.box_in_hand(false)
+
+    expect(calls).to include([:locksmith_pool, ['strongbox'], false])
+  end
+end
+
+# RSpec for the insufficient-silver retry in Sell.locksmith/locksmith_open (v2.11.4).
+#
+# The retry previously recursed with the configured locksmith_withdraw_amount every
+# time, which withdraws-and-fails forever if that setting is smaller than the box's
+# actual fee. locksmith/locksmith_open cannot be exercised without the Lich runtime
+# (dothistimeout, ELoot.get_command, Room, move, ...), so -- same as the rest of
+# process_boxes' routing above -- this is pinned structurally against the shipped
+# source rather than executed.
+
+RSpec.describe 'ELoot::Sell.locksmith insufficient-silver retry' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  def method_body(source, name)
+    body = source[/^ {4}def self\.#{Regexp.escape(name)}\b[\s\S]*?^ {4}end$/]
+    raise "#{name} could not be extracted from eloot.lic" unless body
+
+    body
+  end
+
+  let(:locksmith) { method_body(source, 'locksmith') }
+  let(:locksmith_open) { method_body(source, 'locksmith_open') }
+
+  it 'accepts a withdraw_amount/retries override and threads retries into locksmith_open' do
+    expect(locksmith).to match(/def self\.locksmith\(boxes, withdraw_amount: .*, retries: 0\)/)
+    expect(locksmith).to match(/Sell\.locksmith_open\(box, activator, retries: retries\)/)
+  end
+
+  it 'gives up after exactly one retry instead of withdrawing forever' do
+    expect(locksmith_open).to match(/def self\.locksmith_open\(box, activator, retries: 0\)/)
+    expect(locksmith_open).to match(/if retries\.positive\?/)
+  end
+
+  it 'leaves the box for the pool or a player locksmith when the retry is exhausted' do
+    give_up = locksmith_open[/if retries\.positive\?[\s\S]*?^ {12}end$/]
+    expect(give_up).not_to be_nil, 'could not find the retries-exhausted branch'
+    expect(give_up).to match(/Leaving it for the pool or a player locksmith/)
+    expect(give_up).not_to match(/Sell\.locksmith/)
+  end
+
+  it 'withdraws at least the quoted fee, not just the (possibly too small) configured amount' do
+    expect(locksmith_open).to match(/quoted_fee = res\[\/Gimme \(\[\\d,\]\+\) silvers\/, 1\]/)
+    expect(locksmith_open).to match(
+      /withdraw_amount = \[quoted_fee, ELoot\.data\.settings\[:locksmith_withdraw_amount\]\]\.compact\.max/
+    )
+  end
+
+  it 'retries through Sell.locksmith rather than recursing into locksmith_open directly' do
+    expect(locksmith_open).not_to match(/return Sell\.locksmith_open\(box, activator\)/)
+    expect(locksmith_open).to match(/return Sell\.locksmith\(\[box\], withdraw_amount: withdraw_amount, retries: retries \+ 1\)/)
+  end
+
+  it 'only records the town-locksmith fee and open once payment is accepted, not merely quoted' do
+    expect(locksmith_open).to match(/if result =~ \/accepts\/ && quoted_fee/)
+    expect(locksmith_open).to match(/ELoot\.data\.silver_breakdown\["Town Locksmith"\] -= quoted_fee/)
+    expect(locksmith_open).to match(/ELoot\.data\.silver_breakdown\["Town Open"\] \+= 1/)
+  end
+
+  it 'checks the payment result before touching the silver breakdown, so a successful retry cannot double-count' do
+    pay_call_pos = locksmith_open.index("result = dothistimeout('pay'")
+    breakdown_pos = locksmith_open.index('ELoot.data.silver_breakdown["Town Locksmith"]')
+
+    expect(pay_call_pos).not_to be_nil
+    expect(breakdown_pos).not_to be_nil
+    expect(breakdown_pos).to be > pay_call_pos
+  end
+end
+
+# RSpec for the gem_bounty_override? dedup: process_boxes must go through the same
+# predicate as box_in_hand rather than keeping its own inline copy, or the two can
+# silently drift apart again the way box_in_hand's did before v2.11.4.
+
+RSpec.describe 'ELoot::Sell.process_boxes gem-bounty predicate reuse' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:process_boxes) do
+    body = source[/^ {4}def self\.process_boxes\b[\s\S]*?^ {4}end$/]
+    raise "process_boxes could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  it 'computes skip_for_gem_bounty from the shared predicate' do
+    expect(process_boxes).to match(/skip_for_gem_bounty = Sell\.gem_bounty_override\? && town_enabled && boxes\.any\?/)
+  end
+end
+
 # RSpec for ELoot.marked_unsellable? and ELoot.toss (the trash/drop helper).
 #
 # box_loot_ground and Sell.save_trash_box each carried their own inline copies of the
