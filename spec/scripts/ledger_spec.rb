@@ -4,24 +4,24 @@
 # needs the whole Lich runtime (Settings, XMLData, Char, Script, DATA_DIR ...).
 # Instead the real method bodies are extracted from scripts/ledger.lic and
 # evaluated against stubs, so these specs exercise production code and fail if
-# that code changes shape.
+# that code changes shape. Path lookup and extraction use the shared helpers
+# in spec/spec_helper.rb; the stubs below are ledger-specific (Ledger::Settings,
+# Query, ...) rather than generic Lich globals, so they stay local here.
 #
 # Every stub lives inside LedgerRollingSpec::Harness rather than at top level, so
 # running the whole suite in one process cannot collide with constants other
 # specs define. In particular Harness::Ledger shadows any top level Ledger, which
 # is what the extracted bodies resolve when they say Ledger::Settings.
 
+require_relative '../spec_helper'
 require 'date'
 
 module LedgerRollingSpec
-  SOURCE_PATH = File.expand_path('../../scripts/ledger.lic', __dir__)
+  SOURCE_PATH = find_lic_source('ledger.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
 
   def self.extract(pattern, label)
-    found = SOURCE[pattern]
-    raise "could not extract #{label} from ledger.lic" unless found
-
-    found
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
   end
 
   WINDOW_SRC = extract(/^  module Window\n.*?^  end$/m, 'Window module')
@@ -336,10 +336,10 @@ RSpec.describe 'ledger.lic rolling windows' do
       before { rolling_setting.rolling = false }
 
       {
-        hourly:  :hourly_gain_loss,
-        daily:   :daily_gain_loss,
+        hourly: :hourly_gain_loss,
+        daily: :daily_gain_loss,
         monthly: :monthly_gain_loss,
-        yearly:  :yearly_gain_loss
+        yearly: :yearly_gain_loss
       }.each do |period, expected|
         it "routes #{period} to #{expected}" do
           query.current_gain_loss(period, type: 'silver')
