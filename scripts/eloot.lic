@@ -15,9 +15,18 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.15.0
-           version: 2.11.2
+           version: 2.11.3
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.11.3 (2026-08-21)
+    - fix: boxes that ran out of silver mid-open at the town locksmith could end up
+      getting sent to the locksmith pool instead of actually being opened. This is fixed.
+    - fix: a box already in hand when eloot starts always went to the locksmith pool
+      first, even with Locksmith Priority set to town locksmith first, and could get
+      walked to the town locksmith even on boxes it always refuses. Both are fixed.
+    - fix: a successful insufficient-silver retry double-counted the town locksmith fee
+      and open in the end-of-run silver breakdown, since the fee was recorded as soon as
+      it was quoted rather than once payment was actually accepted. Now recorded once.
   v2.11.2 (2026-08-18)
     - fix: "Locksmith First" priority ignored "always check pool" -- route_town_then_pool
       only visited the pool when boxes were left over after the town run, so an empty-handed
@@ -5838,9 +5847,21 @@ module ELoot # Sells the loot
         exit
       end
 
+      # locksmith_priority only means anything with both routes enabled -- same gate
+      # used in process_boxes/route_town_then_pool. The gem-bounty override also sends
+      # boxes to town first regardless of that setting, same as process_boxes.
+      pool_enabled = ELoot.data.settings[:sell_locksmith_pool]
+      town_enabled = ELoot.data.settings[:sell_locksmith]
+      locksmith_first = pool_enabled && town_enabled &&
+                        (Sell.gem_bounty_override? || ELoot.data.settings[:locksmith_priority] == 'locksmith')
+
+      if locksmith_first && (item = [GameObj.right_hand, GameObj.left_hand].find { |i| i.type == "box" }) && Sell.town_openable?(item)
+        Sell.locksmith([item])
+      end
+
       loop do
         item = [GameObj.right_hand, GameObj.left_hand].find { |i| i.type == "box" }
-        break unless item && ELoot.data.settings[:sell_locksmith_pool]
+        break unless item && pool_enabled
 
         Sell.locksmith_pool([item], deposit)
 
@@ -5848,7 +5869,7 @@ module ELoot # Sells the loot
         break if item.id == [GameObj.right_hand, GameObj.left_hand].find { |i| i.type == "box" }.id
       end
 
-      if (item = [GameObj.right_hand, GameObj.left_hand].find { |i| i.type == "box" }) && ELoot.data.settings[:sell_locksmith]
+      if (item = [GameObj.right_hand, GameObj.left_hand].find { |i| i.type == "box" }) && town_enabled && Sell.town_openable?(item)
         Sell.locksmith([item])
       end
 
@@ -6894,12 +6915,12 @@ module ELoot # Sells the loot
       end
     end
 
-    def self.locksmith(boxes)
+    def self.locksmith(boxes, withdraw_amount: ELoot.data.settings[:locksmith_withdraw_amount], retries: 0)
       ELoot.msg(type: "debug", text: "boxes: #{boxes}")
       # if we're here, assume we emptied out the disk some
       ELoot.reset_disk_full
 
-      ELoot.silver_withdraw(ELoot.data.settings[:locksmith_withdraw_amount])
+      ELoot.silver_withdraw(withdraw_amount)
 
       ELoot.go2('locksmith')
       move "east" if Room.current.uid.include?(7118381)
@@ -6926,7 +6947,7 @@ module ELoot # Sells the loot
               next unless Sell.town_openable?(box)
 
               Inventory.free_hands(both: true) unless ELoot.in_hand?(box)
-              Sell.locksmith_open(box, activator)
+              Sell.locksmith_open(box, activator, retries: retries)
             }
           else
             ELoot.msg(type: "error", text: " Failed to find a bell, keys, or chime on the table", space: true)
@@ -6937,7 +6958,7 @@ module ELoot # Sells the loot
       end
     end
 
-    def self.locksmith_open(box, activator)
+    def self.locksmith_open(box, activator, retries: 0)
       lines = ELoot.get_command("look in ##{box.id}", /<container|That is closed|You see the shifting form/, silent: true, quiet: true)
       if lines.any? { |line| line =~ /That is closed|You see the shifting form/i }
         Inventory.drag(box) unless ELoot.in_hand?(box)
@@ -6960,24 +6981,47 @@ module ELoot # Sells the loot
             return
           end
 
-          if res =~ /Gimme ([\d,]+) silvers/
-            ELoot.data.silver_breakdown["Town Locksmith"] += -1 * $1.delete(",").to_i
-            ELoot.data.silver_breakdown["Town Open"] += 1
-          end
-
           unless res
             ELoot.msg(type: "error", text: ' Unknown locksmith response.')
             Inventory.single_drag(box, false)
             return
           end
 
+          quoted_fee = res[/Gimme ([\d,]+) silvers/, 1]&.delete(",")&.to_i
+
           result = dothistimeout('pay', 2, /accepts|have enough/)
+
+          # Record the fee only once payment actually succeeds -- a quote alone doesn't
+          # spend anything, and recording it here too would double-count both the silver
+          # and the open on a retry that succeeds the second time around.
+          if result =~ /accepts/ && quoted_fee
+            ELoot.data.silver_breakdown["Town Locksmith"] -= quoted_fee
+            ELoot.data.silver_breakdown["Town Open"] += 1
+          end
+
           if result =~ /have enough/
             Inventory.single_drag(box, false)
-            ELoot.silver_withdraw(ELoot.data.settings[:locksmith_withdraw_amount])
-            ELoot.go2('locksmith')
 
-            return Sell.locksmith_open(box, activator)
+            # Bound to a single retry -- a locksmith_withdraw_amount smaller than the
+            # quoted fee would otherwise withdraw-and-fail forever. Withdraw at least
+            # what was actually quoted rather than the configured amount so the retry
+            # has a real chance of succeeding.
+            if retries.positive?
+              ELoot.msg(type: "yellow", space: true,
+                        text: " Still couldn't afford to open #{box.name} after a second" \
+                              " withdrawal. Leaving it for the pool or a player locksmith.")
+              return
+            end
+
+            withdraw_amount = [quoted_fee, ELoot.data.settings[:locksmith_withdraw_amount]].compact.max
+
+            # Route back through Sell.locksmith rather than recursing into
+            # locksmith_open directly with the room/activator state captured before
+            # the bank trip. Sell.locksmith re-withdraws, re-navigates (including any
+            # town-specific room hop, e.g. Kraken's Fall's outer-wagon-to-Smithing-room
+            # step), and re-derives the table/activator fresh for whatever room and
+            # town we land in, instead of assuming that state is still valid.
+            return Sell.locksmith([box], withdraw_amount: withdraw_amount, retries: retries + 1)
           end
         end
       end
@@ -7336,6 +7380,13 @@ module ELoot # Sells the loot
         (ELoot.data.settings[:use_standard_tipping] || ELoot.data.settings[:use_incremental_tipping])
     end
 
+    # Shared with process_boxes so the gem-bounty override can't drift out of sync
+    # between the batch flow and the box-in-hand flow.
+    # @return [Boolean]
+    def self.gem_bounty_override?
+      Bounty.task.gem? && ELoot.data.settings[:locksmith_when_gem_bounty]
+    end
+
     def self.process_boxes
       boxes = ELoot.find_boxes
       return unless boxes.any? || ELoot.data.settings[:always_check_pool]
@@ -7344,7 +7395,7 @@ module ELoot # Sells the loot
 
       pool_enabled = ELoot.data.settings[:sell_locksmith_pool]
       town_enabled = ELoot.data.settings[:sell_locksmith]
-      skip_for_gem_bounty = Bounty.task.gem? && town_enabled && ELoot.data.settings[:locksmith_when_gem_bounty] && boxes.any?
+      skip_for_gem_bounty = Sell.gem_bounty_override? && town_enabled && boxes.any?
 
       # locksmith_priority only has an effect with both routes enabled, and only for the
       # general case -- the gem bounty setting is a narrower override and keeps its
