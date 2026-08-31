@@ -348,6 +348,16 @@ RSpec.describe 'ELogin (elogin.lic)' do
           .to eq(command: :delete_entry, char_name: 'Iaconelli', game_code: 'GS3', frontend: 'saga')
       end
 
+      it 'accepts the disambiguator as a --frontend= flag, matching add/modify syntax' do
+        expect(harness.parse_arguments(['delete', 'Iaconelli', 'GS3', '--frontend=saga']))
+          .to eq(command: :delete_entry, char_name: 'Iaconelli', game_code: 'GS3', frontend: 'saga')
+      end
+
+      it 'accepts the disambiguator as a bare --saga flag' do
+        expect(harness.parse_arguments(['delete', 'Iaconelli', 'GS3', '--saga']))
+          .to eq(command: :delete_entry, char_name: 'Iaconelli', game_code: 'GS3', frontend: 'saga')
+      end
+
       it 'falls back to help with fewer than char+game_code' do
         expect(harness.parse_arguments(%w[delete Iaconelli])).to eq(command: :help)
       end
@@ -386,6 +396,13 @@ RSpec.describe 'ELogin (elogin.lic)' do
         result = harness.parse_arguments(['Iaconelli', '--GS3'])
 
         expect(result[:instance_flag]).to eq('GS3')
+      end
+
+      it 'strips a lowercase instance flag from the script list instead of leaking it through' do
+        result = harness.parse_arguments(['Iaconelli', '--gst'])
+
+        expect(result[:instance_flag]).to eq('GST')
+        expect(result[:scripts]).to eq([])
       end
 
       it 'parses --custom-launch=' do
