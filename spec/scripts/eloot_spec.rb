@@ -86,6 +86,110 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   end
 end
 
+RSpec.describe 'ELoot disk-backed box routing' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+
+  let(:source) { File.read(eloot_path) }
+
+  it 'seeds the current run disk even when the persistent hook already exists' do
+    disk_obj = Struct.new(:id).new('disk-1')
+    data = Struct.new(:settings, :disk).new({ use_disk: true }, nil)
+
+    disk = Module.new
+    disk.define_singleton_method(:mine) { disk_obj }
+
+    game_obj = Module.new
+    game_obj.define_singleton_method(:[]) { |_id| disk_obj }
+
+    downstream_hook = Module.new
+    downstream_hook.define_singleton_method(:list) { ['eloot_diskintegration'] }
+
+    eloot = Module.new
+    eloot.const_set(:ELoot, eloot)
+    eloot.const_set(:Disk, disk)
+    eloot.const_set(:GameObj, game_obj)
+    eloot.const_set(:DownstreamHook, downstream_hook)
+    eloot.define_singleton_method(:data) { data }
+    eloot.module_eval(extract_lic_method(source, 'disk_usage', source_path: eloot_path))
+
+    eloot.disk_usage
+
+    expect(data.disk).to equal(disk_obj)
+  end
+
+  it 'rescans boxes after the disk arrives at the locksmith pool' do
+    item_class = Struct.new(:id, :type, :name)
+    box = item_class.new('box-1', 'box', 'a waterlogged coffer')
+    empty = item_class.new(nil, '', 'Empty')
+
+    game_obj = Module.new
+    game_obj.singleton_class.attr_accessor :right_hand, :left_hand
+    game_obj.right_hand = empty
+    game_obj.left_hand = empty
+
+    inventory = Module.new
+    inventory.singleton_class.attr_accessor :dragged
+    inventory.define_singleton_method(:free_hands) do |both: false|
+      next unless both
+
+      game_obj.right_hand = empty
+      game_obj.left_hand = empty
+    end
+    inventory.define_singleton_method(:drag) do |item|
+      self.dragged = item
+      game_obj.right_hand = item
+    end
+    inventory.define_singleton_method(:single_drag) { |_item| nil }
+
+    loot = Module.new
+    loot.define_singleton_method(:box_loot) { |*| nil }
+
+    data = Struct.new(:settings, :silver_breakdown).new(
+      {
+        use_standard_tipping: true,
+        use_incremental_tipping: false,
+        sell_locksmith_pool_tip_percent: true,
+        sell_locksmith_pool_tip: 15
+      },
+      Hash.new(0)
+    )
+
+    eloot = Module.new
+    eloot.singleton_class.attr_accessor :find_boxes_calls
+    eloot.find_boxes_calls = 0
+    disk_ready = false
+    eloot.define_singleton_method(:data) { data }
+    eloot.define_singleton_method(:f2p?) { false }
+    eloot.define_singleton_method(:msg) { |**| nil }
+    eloot.define_singleton_method(:reset_disk_full) { nil }
+    eloot.define_singleton_method(:go2) { |_destination| nil }
+    eloot.define_singleton_method(:find_worker) { Struct.new(:id).new('worker-1') }
+    eloot.define_singleton_method(:wait_for_disk) { disk_ready = true }
+    eloot.define_singleton_method(:wait_rt) { nil }
+    eloot.define_singleton_method(:box_unphase) { |item| item }
+    eloot.define_singleton_method(:find_boxes) do
+      self.find_boxes_calls += 1
+      disk_ready ? [box] : []
+    end
+
+    sell = Module.new
+    sell.const_set(:Sell, sell)
+    sell.const_set(:ELoot, eloot)
+    sell.const_set(:GameObj, game_obj)
+    sell.const_set(:Inventory, inventory)
+    sell.const_set(:Loot, loot)
+    sell.define_singleton_method(:dothistimeout) do |_command, _timeout, _match|
+      'takes your box, totaling 150 silvers'
+    end
+    sell.module_eval(extract_lic_method(source, 'locksmith_pool', source_path: eloot_path))
+
+    sell.locksmith_pool([])
+
+    expect(eloot.find_boxes_calls).to eq(1)
+    expect(inventory.dragged).to equal(box)
+  end
+end
+
 # RSpec for ELoot::Loot.loot_specials (box-context stow routing).
 #
 # box_loot drains loot_specials before loot_regular, so items that loot_specials handles
@@ -1338,5 +1442,71 @@ RSpec.describe 'ELoot trash/drop call sites' do
 
   it 'dump_herbs_junk keeps its fast poll and keep-notification behavior' do
     expect(dump_herbs_junk).to match(/ELoot\.toss\(item, toss_cmd, poll: true, notify_on_keep: true\)/)
+  end
+end
+
+RSpec.describe 'ELoot unskinnable-list management' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:source) { File.read(eloot_path) }
+  let(:settings) { { unskinnable: ['massive troll king', 'greater earth elemental'] } }
+  let(:data) { Struct.new(:settings).new(settings) }
+  let(:messages) { [] }
+
+  let(:eloot) do
+    data_object = data
+    message_log = messages
+    method_body = extract_lic_method(source, 'manage_unskinnable', source_path: eloot_path)
+
+    Module.new do
+      singleton_class.attr_accessor :save_count
+      self.save_count = 0
+
+      const_set(:ELoot, self)
+      define_singleton_method(:data) { data_object }
+      define_singleton_method(:save_profile) { |**| self.save_count += 1 }
+      define_singleton_method(:msg) { |**message| message_log << message }
+      module_eval(method_body)
+    end
+  end
+
+  it 'clears the learned list and persists once' do
+    eloot.manage_unskinnable('')
+
+    expect(settings[:unskinnable]).to be_empty
+    expect(eloot.save_count).to eq(1)
+    expect(messages.last[:text]).to include('Cleared 2 creatures')
+  end
+
+  it 'does not rewrite an already-empty list' do
+    settings[:unskinnable].clear
+
+    eloot.manage_unskinnable('')
+
+    expect(eloot.save_count).to eq(0)
+    expect(messages.last[:text]).to include('already empty')
+  end
+
+  it 'removes one exact creature case-insensitively and preserves the rest' do
+    eloot.manage_unskinnable('Massive Troll King')
+
+    expect(settings[:unskinnable]).to eq(['greater earth elemental'])
+    expect(eloot.save_count).to eq(1)
+    expect(messages.last[:text]).to include('Massive Troll King')
+  end
+
+  it 'does not persist when the requested creature is absent' do
+    eloot.manage_unskinnable('stone giant')
+
+    expect(settings[:unskinnable]).to contain_exactly('massive troll king', 'greater earth elemental')
+    expect(eloot.save_count).to eq(0)
+    expect(messages.last[:type]).to eq('error')
+  end
+
+  it 'strips surrounding whitespace from the requested creature' do
+    eloot.manage_unskinnable('  greater earth elemental  ')
+
+    expect(settings[:unskinnable]).to eq(['massive troll king'])
+    expect(eloot.save_count).to eq(1)
+    expect(messages.last[:text]).to include('greater earth elemental')
   end
 end
