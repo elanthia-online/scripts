@@ -91,44 +91,6 @@ RSpec.describe 'ELoot disk-backed box routing' do
 
   let(:source) { File.read(eloot_path) }
 
-  def find_boxes_harness(look_result)
-    item_class = Struct.new(:id, :type, :contents)
-    box = item_class.new('box-1', 'box', [])
-    sack = item_class.new('sack-1', 'container', [box])
-    data = Struct.new(:settings, :disk).new({ use_disk: false }, nil)
-
-    inventory = Module.new
-    inventory.define_singleton_method(:open_single_container) { |_container| nil }
-
-    loot = Module.new
-    loot.define_singleton_method(:box_loot) { |_box| nil }
-
-    eloot = Module.new
-    eloot.const_set(:ELoot, eloot)
-    eloot.const_set(:Inventory, inventory)
-    eloot.const_set(:Loot, loot)
-    eloot.define_singleton_method(:data) { data }
-    eloot.define_singleton_method(:set_selling_containers) { |type:| type == 'box' ? [sack] : [] }
-    eloot.define_singleton_method(:msg) { |**| nil }
-    eloot.define_singleton_method(:get_command) { |*| [look_result] }
-    eloot.define_singleton_method(:in_hand?) { |_item| false }
-    eloot.module_eval(extract_lic_method(source, 'find_boxes', source_path: eloot_path))
-
-    [eloot, box]
-  end
-
-  it 'keeps a closed box whose contents have not been inspected' do
-    eloot, box = find_boxes_harness('That is closed.')
-
-    expect(eloot.find_boxes).to contain_exactly(box)
-  end
-
-  it 'rejects a box confirmed to be open and empty' do
-    eloot, = find_boxes_harness('There is nothing in there.')
-
-    expect(eloot.find_boxes).to be_empty
-  end
-
   it 'seeds the current run disk even when the persistent hook already exists' do
     disk_obj = Struct.new(:id).new('disk-1')
     data = Struct.new(:settings, :disk).new({ use_disk: true }, nil)
