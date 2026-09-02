@@ -86,6 +86,147 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   end
 end
 
+RSpec.describe 'ELoot disk-backed box routing' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+
+  let(:source) { File.read(eloot_path) }
+
+  def find_boxes_harness(look_result)
+    item_class = Struct.new(:id, :type, :contents)
+    box = item_class.new('box-1', 'box', [])
+    sack = item_class.new('sack-1', 'container', [box])
+    data = Struct.new(:settings, :disk).new({ use_disk: false }, nil)
+
+    inventory = Module.new
+    inventory.define_singleton_method(:open_single_container) { |_container| nil }
+
+    loot = Module.new
+    loot.define_singleton_method(:box_loot) { |_box| nil }
+
+    eloot = Module.new
+    eloot.const_set(:ELoot, eloot)
+    eloot.const_set(:Inventory, inventory)
+    eloot.const_set(:Loot, loot)
+    eloot.define_singleton_method(:data) { data }
+    eloot.define_singleton_method(:set_selling_containers) { |type:| type == 'box' ? [sack] : [] }
+    eloot.define_singleton_method(:msg) { |**| nil }
+    eloot.define_singleton_method(:get_command) { |*| [look_result] }
+    eloot.define_singleton_method(:in_hand?) { |_item| false }
+    eloot.module_eval(extract_lic_method(source, 'find_boxes', source_path: eloot_path))
+
+    [eloot, box]
+  end
+
+  it 'keeps a closed box whose contents have not been inspected' do
+    eloot, box = find_boxes_harness('That is closed.')
+
+    expect(eloot.find_boxes).to contain_exactly(box)
+  end
+
+  it 'rejects a box confirmed to be open and empty' do
+    eloot, = find_boxes_harness('There is nothing in there.')
+
+    expect(eloot.find_boxes).to be_empty
+  end
+
+  it 'seeds the current run disk even when the persistent hook already exists' do
+    disk_obj = Struct.new(:id).new('disk-1')
+    data = Struct.new(:settings, :disk).new({ use_disk: true }, nil)
+
+    disk = Module.new
+    disk.define_singleton_method(:mine) { disk_obj }
+
+    game_obj = Module.new
+    game_obj.define_singleton_method(:[]) { |_id| disk_obj }
+
+    downstream_hook = Module.new
+    downstream_hook.define_singleton_method(:list) { ['eloot_diskintegration'] }
+
+    eloot = Module.new
+    eloot.const_set(:ELoot, eloot)
+    eloot.const_set(:Disk, disk)
+    eloot.const_set(:GameObj, game_obj)
+    eloot.const_set(:DownstreamHook, downstream_hook)
+    eloot.define_singleton_method(:data) { data }
+    eloot.module_eval(extract_lic_method(source, 'disk_usage', source_path: eloot_path))
+
+    eloot.disk_usage
+
+    expect(data.disk).to equal(disk_obj)
+  end
+
+  it 'rescans boxes after the disk arrives at the locksmith pool' do
+    item_class = Struct.new(:id, :type, :name)
+    box = item_class.new('box-1', 'box', 'a waterlogged coffer')
+    empty = item_class.new(nil, '', 'Empty')
+
+    game_obj = Module.new
+    game_obj.singleton_class.attr_accessor :right_hand, :left_hand
+    game_obj.right_hand = empty
+    game_obj.left_hand = empty
+
+    inventory = Module.new
+    inventory.singleton_class.attr_accessor :dragged
+    inventory.define_singleton_method(:free_hands) do |both: false|
+      next unless both
+
+      game_obj.right_hand = empty
+      game_obj.left_hand = empty
+    end
+    inventory.define_singleton_method(:drag) do |item|
+      self.dragged = item
+      game_obj.right_hand = item
+    end
+    inventory.define_singleton_method(:single_drag) { |_item| nil }
+
+    loot = Module.new
+    loot.define_singleton_method(:box_loot) { |*| nil }
+
+    data = Struct.new(:settings, :silver_breakdown).new(
+      {
+        use_standard_tipping: true,
+        use_incremental_tipping: false,
+        sell_locksmith_pool_tip_percent: true,
+        sell_locksmith_pool_tip: 15
+      },
+      Hash.new(0)
+    )
+
+    eloot = Module.new
+    eloot.singleton_class.attr_accessor :find_boxes_calls
+    eloot.find_boxes_calls = 0
+    eloot.define_singleton_method(:data) { data }
+    eloot.define_singleton_method(:f2p?) { false }
+    eloot.define_singleton_method(:msg) { |**| nil }
+    eloot.define_singleton_method(:reset_disk_full) { nil }
+    eloot.define_singleton_method(:go2) { |_destination| nil }
+    eloot.define_singleton_method(:find_worker) { Struct.new(:id).new('worker-1') }
+    eloot.define_singleton_method(:wait_for_disk) { nil }
+    eloot.define_singleton_method(:wait_rt) { nil }
+    eloot.define_singleton_method(:box_unphase) { |item| item }
+    eloot.define_singleton_method(:find_boxes) do
+      self.find_boxes_calls += 1
+      [box]
+    end
+
+    sell = Module.new
+    sell.const_set(:Sell, sell)
+    sell.const_set(:ELoot, eloot)
+    sell.const_set(:GameObj, game_obj)
+    sell.const_set(:Inventory, inventory)
+    sell.const_set(:Loot, loot)
+    sell.define_singleton_method(:dothistimeout) do |_command, _timeout, _match|
+      'takes your box, totaling 150 silvers'
+    end
+    sell.module_eval(extract_lic_method(source, 'locksmith_pool', source_path: eloot_path))
+
+    sell.locksmith_pool([])
+
+    expect(eloot.find_boxes_calls).to eq(1)
+    expect(inventory.dragged).to equal(box)
+  end
+end
+
 # RSpec for ELoot::Loot.loot_specials (box-context stow routing).
 #
 # box_loot drains loot_specials before loot_regular, so items that loot_specials handles
