@@ -27,7 +27,7 @@ RSpec.describe 'ELoot unskinnable-list management' do
   end
 
   it 'clears the learned list and persists once' do
-    eloot.manage_unskinnable('reset')
+    eloot.manage_unskinnable('')
 
     expect(settings[:unskinnable]).to be_empty
     expect(eloot.save_count).to eq(1)
@@ -37,14 +37,14 @@ RSpec.describe 'ELoot unskinnable-list management' do
   it 'does not rewrite an already-empty list' do
     settings[:unskinnable].clear
 
-    eloot.manage_unskinnable('flush')
+    eloot.manage_unskinnable('')
 
     expect(eloot.save_count).to eq(0)
     expect(messages.last[:text]).to include('already empty')
   end
 
   it 'removes one exact creature case-insensitively and preserves the rest' do
-    eloot.manage_unskinnable('remove', 'Massive Troll King')
+    eloot.manage_unskinnable('Massive Troll King')
 
     expect(settings[:unskinnable]).to eq(['greater earth elemental'])
     expect(eloot.save_count).to eq(1)
@@ -52,24 +52,18 @@ RSpec.describe 'ELoot unskinnable-list management' do
   end
 
   it 'does not persist when the requested creature is absent' do
-    eloot.manage_unskinnable('remove', 'stone giant')
+    eloot.manage_unskinnable('stone giant')
 
     expect(settings[:unskinnable]).to contain_exactly('massive troll king', 'greater earth elemental')
     expect(eloot.save_count).to eq(0)
     expect(messages.last[:type]).to eq('error')
   end
 
-  it 'reports usage when remove has no creature name' do
-    previous_lich_char = $lich_char
-    $lich_char = ';'
-    script = Struct.new(:name).new('eloot')
-    stub_const('Script', Struct.new(:current).new(script))
+  it 'strips surrounding whitespace from the requested creature' do
+    eloot.manage_unskinnable('  greater earth elemental  ')
 
-    eloot.manage_unskinnable('remove')
-
-    expect(eloot.save_count).to eq(0)
-    expect(messages.last[:text]).to include(';eloot remove unskinnable <creature name>')
-  ensure
-    $lich_char = previous_lich_char
+    expect(settings[:unskinnable]).to eq(['massive troll king'])
+    expect(eloot.save_count).to eq(1)
+    expect(messages.last[:text]).to include('greater earth elemental')
   end
 end
