@@ -138,6 +138,49 @@ rescue SyntaxError => e
         "(likely truncated by the extraction regex): #{e.message}"
 end
 
+# -- Pinned lich-5 checkout helpers ---------------------------------------
+#
+# A few specs need to test against real lich-5 API surface (small pure
+# logic, constants) pinned to a specific release, rather than hand-mirror it
+# and risk silently drifting from what that release actually implements.
+# See .github/workflows/rspec_tests.yaml for the pinned release CI checks
+# out into LICH5_PATH -- extract from it with extract_from_source above,
+# same as any other source string.
+
+# Locates a local lich-5 checkout, checked in order:
+#
+# 1. The LICH5_PATH env var -- set by CI after checking out the pinned
+#    lich-5 release (see .github/workflows/rspec_tests.yaml).
+# 2. A sibling `lich-5` checkout next to this repo's own checkout -- this
+#    project's normal local multi-repo dev layout (lich-5, dr-scripts,
+#    scripts, and ProfanityFE as sibling directories).
+#
+# @return [String, nil] absolute path to the lich-5 checkout root, or nil if
+#   neither is available -- callers should skip gracefully rather than fail
+#   a contributor who hasn't cloned lich-5 locally
+def lich5_path
+  return ENV['LICH5_PATH'] if ENV['LICH5_PATH'] && Dir.exist?(ENV['LICH5_PATH'])
+
+  sibling = File.expand_path('../lich-5', REPO_ROOT)
+  Dir.exist?(sibling) ? sibling : nil
+end
+
+# Reads a file's source from the located lich-5 checkout (see #lich5_path).
+#
+# @param relative_path [String] path under the lich-5 checkout root, e.g.
+#   "lib/common/authentication/login_helpers.rb"
+# @return [String, nil] the source with line endings normalized, or nil if
+#   no checkout is available or the file does not exist within it
+def read_lich5_source(relative_path)
+  root = lich5_path
+  return nil unless root
+
+  path = File.join(root, relative_path)
+  return nil unless File.exist?(path)
+
+  File.read(path).gsub("\r\n", "\n")
+end
+
 # -- Generic Lich runtime stand-ins --------------------------------------
 #
 # Every constant here is a bare-bones stand-in for a real Lich global,
