@@ -46,6 +46,7 @@ module PilePullRewardsSpec
   LABEL_FOR_KEY_SRC = extract_lic_method(SOURCE, 'label_for_key', source_path: SOURCE_PATH)
   RECORD_ITEM_SRC = extract_lic_method(SOURCE, 'record_item', source_path: SOURCE_PATH)
   HANDLE_LOOT_SRC = extract_lic_method(SOURCE, 'handle_loot', source_path: SOURCE_PATH)
+  SEARCH_PILE_SRC = extract_lic_method(SOURCE, 'search_pile', source_path: SOURCE_PATH)
 
   # Real tier/canonicalization/event-bucketing logic under test, evaluated so
   # bare XMLData and PilePull references resolve to the stand-ins nested here.
@@ -121,13 +122,14 @@ module PilePullRewardsSpec
     end
 
     class << self
-      attr_accessor :keep_spoon, :keep_nexus, :stuck
+      attr_accessor :keep_spoon, :keep_nexus, :stuck, :last_pull_name
       attr_reader :fput_calls, :sleep_count, :exited, :echoed
 
       def reset!
         @keep_spoon = false
         @keep_nexus = false
         @stuck = false
+        @last_pull_name = nil
         @fput_calls = []
         @sleep_count = 0
         @exited = false
@@ -172,6 +174,82 @@ module PilePullRewardsSpec
       catch(:handle_loot_exit) { handle_loot }
     end
   end
+
+  # Real search_pile control flow under test. The point of this harness is
+  # the @last_pull_name it captures for handle_loot to consume: the search
+  # response text spells out a pulled item's full name, unlike
+  # GameObj.right_hand.name in handle_loot, which truncates a swirling and a
+  # potent yellow-green potion to the exact same ambiguous fragment.
+  class SearchPile
+    Pile = Struct.new(:id)
+
+    module Rewards
+      class << self
+        attr_reader :calls
+
+        def reset!
+          @calls = []
+        end
+
+        def record_search_cost(amount)
+          (@calls ||= []) << amount
+        end
+      end
+    end
+
+    class << self
+      attr_accessor :max_inventory, :last_pull_name
+      attr_reader :dothistimeout_calls, :echoed, :exited, :sleep_calls
+
+      def reset!
+        @prize_pile = Pile.new('50993552')
+        @max_inventory = false
+        @last_pull_name = nil
+        @dothistimeout_calls = []
+        @next_results = []
+        @echoed = []
+        @exited = false
+        @sleep_calls = []
+      end
+
+      # Queues a value dothistimeout should return on its next call --
+      # search_pile's `next`-driven retries can call it more than once in a
+      # single example (e.g. a "search again" retry before it succeeds).
+      def queue_result(value)
+        (@next_results ||= []) << value
+      end
+
+      def dothistimeout(command, _timeout, _pattern)
+        @dothistimeout_calls << command
+        @next_results.shift
+      end
+
+      def dbg(_msg); end
+
+      def echo(msg)
+        @echoed << msg
+      end
+
+      def exit(*)
+        @exited = true
+        throw :search_pile_exit
+      end
+
+      def sleep(seconds)
+        @sleep_calls << seconds
+      end
+
+      def waitrt?
+        false
+      end
+    end
+
+    module_eval(SEARCH_PILE_SRC, SOURCE_PATH)
+
+    def self.run
+      catch(:search_pile_exit) { search_pile }
+    end
+  end
 end
 
 RSpec.describe 'pilepull.lic reward tracking' do
@@ -185,6 +263,10 @@ RSpec.describe 'pilepull.lic reward tracking' do
 
   def fake_hand
     PilePullRewardsSpec::HandleLoot::FakeHand
+  end
+
+  def search_pile
+    PilePullRewardsSpec::SearchPile
   end
 
   describe 'Rewards.canonical_name_for' do
@@ -391,6 +473,127 @@ RSpec.describe 'pilepull.lic reward tracking' do
       handle_loot.run
       expect(handle_loot.exited).to be false
       expect(handle_loot.echoed).to be_empty
+    end
+
+    # GameObj.right_hand.name truncates a swirling and a potent yellow-green
+    # potion to the exact same "yellow-green potion" fragment -- genuinely
+    # ambiguous, and previously always landed as "unknown" tier. search_pile
+    # parses the full name out of the search response text and stashes it in
+    # @last_pull_name for handle_loot to prefer.
+    it 'prefers the full name captured by search_pile over an ambiguous truncated hand name' do
+      handle_loot.last_pull_name = 'swirling yellow-green potion'
+      handle_loot::GameObj.right_hand = fake_hand.new('999', 'yellow-green potion')
+      handle_loot.run
+      expect(handle_loot::Rewards.recorded).to eq([['swirling yellow-green potion', 1]])
+    end
+
+    it 'clears last_pull_name after using it, so a later item cannot inherit a stale name' do
+      handle_loot.last_pull_name = 'swirling yellow-green potion'
+      handle_loot::GameObj.right_hand = fake_hand.new('999', 'yellow-green potion')
+      handle_loot.run
+      expect(handle_loot.last_pull_name).to be_nil
+    end
+
+    it 'falls back to the hand name when search_pile did not capture anything' do
+      handle_loot::GameObj.right_hand = fake_hand.new('999', 'a locker runner contract')
+      handle_loot.run
+      expect(handle_loot::Rewards.recorded).to eq([['a locker runner contract', 1]])
+    end
+  end
+
+  describe 'search_pile' do
+    before do
+      search_pile.reset!
+      search_pile::Rewards.reset!
+    end
+
+    it 'records 1,000,000 silver spent on a successful search' do
+      search_pile.queue_result(
+        'You hand over 1,000,000 silver and search through a pile of mania prizes.  ' \
+        'You pull a locker runner contract from within!'
+      )
+      expect(search_pile.run).to be true
+      expect(search_pile::Rewards.calls).to eq([1_000_000])
+    end
+
+    {
+      'swirling yellow-green potion'    => 'a',
+      'potent yellow-green potion'      => 'a',
+      'glowing orb'                     => 'a',
+      'creased stamped voucher booklet' => 'a',
+      "Adventurer's Guild voucher pack" => 'an',
+      'Elanthian Guilds voucher pack'   => 'an'
+    }.each do |pulled, article|
+      it "captures the full pulled item name for #{pulled.inspect} from the search text" do
+        search_pile.queue_result(
+          "You hand over 1,000,000 silver and search through a pile of mania prizes.  " \
+          "You pull #{article} #{pulled} from within!"
+        )
+        search_pile.run
+        expect(search_pile.last_pull_name).to eq(pulled)
+      end
+    end
+
+    # This is the actual bug this whole harness exists to catch: a truncated
+    # GameObj.right_hand.name cannot tell these two apart, but the search
+    # result text always spells out which one it was.
+    it 'tells a swirling yellow-green potion apart from a potent one' do
+      search_pile.queue_result(
+        'You hand over 1,000,000 silver and search through a pile of mania prizes.  ' \
+        'You pull a swirling yellow-green potion from within!'
+      )
+      search_pile.run
+      swirling_name = search_pile.last_pull_name
+
+      search_pile.reset!
+      search_pile::Rewards.reset!
+      search_pile.queue_result(
+        'You hand over 1,000,000 silver and search through a pile of mania prizes.  ' \
+        'You pull a potent yellow-green potion from within!'
+      )
+      search_pile.run
+      potent_name = search_pile.last_pull_name
+
+      expect([swirling_name, potent_name]).to eq(['swirling yellow-green potion', 'potent yellow-green potion'])
+    end
+
+    it 'clears any previous last_pull_name rather than raising when the text does not match the expected shape' do
+      search_pile.last_pull_name = 'stale'
+      search_pile.queue_result('You hand over 1,000,000 silver and search through a pile of mania prizes.')
+      search_pile.run
+      expect(search_pile.last_pull_name).to be_nil
+    end
+
+    it 'retries once told to search again within 30 seconds' do
+      search_pile.queue_result(
+        'In order to search through a pile of mania prizes, it will cost 1,000,000 silver.  ' \
+        'If you want to give it a try SEARCH again within 30 seconds!'
+      )
+      search_pile.queue_result(
+        'You hand over 1,000,000 silver and search through a pile of mania prizes.  ' \
+        'You pull a larger locker contract from within!'
+      )
+      expect(search_pile.run).to be true
+      expect(search_pile.dothistimeout_calls.length).to eq(2)
+    end
+
+    it 'returns false when out of silver, recording nothing' do
+      search_pile.queue_result('You do not have enough silver to SEARCH through a pile of mania prizes.  You need 1,000,000 silver.')
+      expect(search_pile.run).to be false
+      expect(search_pile::Rewards.calls).to be_empty
+    end
+
+    it 'returns false the first time too many items blocks the search, to trigger cleanup once' do
+      search_pile.queue_result('You have too many items to search.')
+      expect(search_pile.run).to be false
+      expect(search_pile.max_inventory).to be true
+    end
+
+    it 'gives up instead of looping forever if still too many items on the very next search' do
+      search_pile.max_inventory = true
+      search_pile.queue_result('You have too many items to search.')
+      search_pile.run
+      expect(search_pile.exited).to be true
     end
   end
 end
