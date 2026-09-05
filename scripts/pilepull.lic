@@ -58,6 +58,9 @@
       every run on record.
     - Fix cleanup skipping a single leftover flexing arm token or potion.
     - Fix cleanup sometimes waiting the full timeout on an already-populated container.
+    - Fix reward tracking occasionally recording a truncated item name (and
+      corrects any already saved); unrecognized ";pilepull" arguments now show
+      usage instead of starting a search.
   v1.1.0 (2026-09-04)
     - ad logic to try to run cleanup if hit too many items
   v1.0.1 (2026-03-01)
@@ -132,6 +135,23 @@ module PilePull
     # Display order for tier breakdowns; also doubles as the set of valid tiers.
     TIER_ORDER = %w(legendary epic rare uncommon common unknown).freeze unless const_defined?(:TIER_ORDER, false)
 
+    # GameObj.right_hand/left_hand can occasionally report a partial/truncated
+    # name for an item before its data has fully settled (see handle_loot,
+    # which now re-reads the name via GameObj[id] after the item leaves your
+    # hands instead of trusting the hand object's name in the moment). These
+    # patterns recover the full item name from a handful of truncated
+    # fragments actually seen in the wild, so both new and already-recorded
+    # rows land in the right tier. Ambiguous fragments (e.g. a bare
+    # "yellow-green potion", which could be the uncommon swirling or the rare
+    # potent variant) are deliberately left unmapped rather than guessed at.
+    FALLBACK_ITEM_FIXUPS = [
+      [/\brunner contract\b/i,     'a locker runner contract'],
+      [/\bGuild voucher pack\b/i,  "an Adventurer's Guild voucher pack"],
+      [/\bGuilds voucher pack\b/i, 'an Elanthian Guilds voucher pack'],
+      [/\bnexus orb\b/i,           'a swirling nexus orb'],
+      [/\bblue orb\b/i,            'a shimmering blue orb'],
+    ].freeze unless const_defined?(:FALLBACK_ITEM_FIXUPS, false)
+
     Self.create_table?(:rewards) do
       primary_key :id
       String  :character
@@ -148,6 +168,12 @@ module PilePull
       Integer :month
       Integer :day
       Integer :hour
+    end
+
+    def self.canonical_name_for(item_name)
+      return item_name if item_name.nil?
+      _pattern, canonical = FALLBACK_ITEM_FIXUPS.find { |pattern, _canonical| item_name =~ pattern }
+      canonical || item_name
     end
 
     def self.tier_for(item_name)
@@ -203,6 +229,20 @@ module PilePull
       echo "Note: Could not migrate pilepull rewards database: #{e.message}"
     end
 
+    # Re-canonicalize and re-tier any rows recorded with one of the truncated
+    # names FALLBACK_ITEM_FIXUPS knows how to resolve. Scoped to tier =
+    # 'unknown' so it's cheap and self-limiting: once a row is fixed it no
+    # longer matches this filter, so this becomes a no-op on later runs.
+    begin
+      Self[:rewards].where(type: 'item', tier: 'unknown').each do |row|
+        canonical = canonical_name_for(row[:item_name])
+        next if canonical == row[:item_name]
+        Self[:rewards].where(id: row[:id]).update(item_name: canonical, tier: tier_for(canonical))
+      end
+    rescue => e
+      echo "Note: Could not canonicalize pilepull rewards item names: #{e.message}"
+    end
+
     begin
       unless Self.indexes(:rewards).key?(:pilepull_rewards_character_type_index)
         Self.add_index :rewards, [:character, :type], name: :pilepull_rewards_character_type_index
@@ -247,7 +287,8 @@ module PilePull
 
     def self.record_item(item_name, quantity: 1)
       return if item_name.nil? || item_name.to_s.empty?
-      record(type: 'item', item_name: item_name, tier: tier_for(item_name), quantity: quantity)
+      canonical = canonical_name_for(item_name)
+      record(type: 'item', item_name: canonical, tier: tier_for(canonical), quantity: quantity)
     end
 
     def self.record_search_cost(amount)
@@ -389,11 +430,6 @@ module PilePull
       hand = GameObj.right_hand
       item_name = hand.name
 
-      if hand.id && hand.id != recorded_id
-        Rewards.record_item(item_name)
-        recorded_id = hand.id
-      end
-
       case item_name
       when /booklet/
         fput('redeem booklet')
@@ -417,6 +453,15 @@ module PilePull
         return if GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
         sleep(0.1)
       }
+
+      # Read the name back via GameObj[id] rather than trusting the hand
+      # object's name at the moment the item arrived: GameObj.right_hand/
+      # left_hand can occasionally report a partial/truncated name for the
+      # same item before its data has fully settled.
+      if hand.id && hand.id != recorded_id
+        Rewards.record_item(GameObj[hand.id].name)
+        recorded_id = hand.id
+      end
     end
 
     echo("Couldn't handle item received, likely full containers, exiting!")
@@ -611,6 +656,32 @@ when "rewards"
     all_characters: rewards_args.include?("all"),
     all_events: rewards_args.include?("history") || rewards_args.include?("years")
   )
-else
+when nil
   PilePull.main
+else
+  respond <<-TEXT
+  Usage:
+
+      ;pilepull           - will run the normal SEARCH of the pile
+      ;pilepull cleanup   - will attempt to cleanup bundlable items, which include:
+                              * glowing orbs
+                              * potent yellow-green potion
+                              * swirling yellow-green potion
+                              * Elanthian Guilds voucher pack
+                              * Adventurer's Guild voucher pack
+      ;pilepull rewards   - print a summary of items received this character has
+                            gotten during the current/most recent Duskruin event
+                            (broken down by reward tier: common/uncommon/rare/
+                            epic/legendary) and silver spent searching, tracked
+                            in a shared local database so it works correctly
+                            across multiple characters. Duskruin runs twice a
+                            year (Feb/Mar and Aug/Sep); each reward is tagged
+                            with the event it was earned in.
+      ;pilepull rewards all       - same, but combined across every character
+                                    that has used this database (not just you)
+      ;pilepull rewards history   - same, but shows every Duskruin event on
+                                    record instead of just the current one
+      ;pilepull rewards all history  - combine "all" and "history": every
+                                        character, every event
+  TEXT
 end
