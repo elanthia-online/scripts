@@ -33,6 +33,10 @@
       ;pilepull rewards all history  - combine "all" and "history": every
                                         character, every event
 
+  Add --debug to any of the above (in any position) for verbose logging of
+  search results, item name capture, and reward tier/canonicalization
+  decisions, e.g. ";pilepull --debug" or ";pilepull rewards all --debug".
+
   There's also some variables in the script you can set to true/false
   All default to false to throw away
     * @withdraw_amount
@@ -63,6 +67,9 @@
       usage instead of starting a search.
     - Fix reward tracking leaking a database connection every time the script
       ran, which could leave the database file locked.
+    - Add a "--debug" flag (usable with any command, e.g. ";pilepull --debug"
+      or ";pilepull rewards --debug") for verbose logging of search results,
+      item name capture, and reward tier/canonicalization decisions.
   v1.1.0 (2026-09-04)
     - ad logic to try to run cleanup if hit too many items
   v1.0.1 (2026-03-01)
@@ -103,6 +110,25 @@ module PilePull
   @keep_spoon = false
   @keep_wisp  = false # not yet implemented
   @keep_nexus = false
+
+  # --debug can appear anywhere after ";pilepull" (";pilepull --debug",
+  # ";pilepull cleanup --debug", ";pilepull rewards --debug", etc.) and turns
+  # on verbose logging. This is computed here, before Rewards is defined
+  # below, so debug output is available during Rewards' own module-load-time
+  # database migrations too.
+  @debug = (Script.current.vars[1..-1] || []).any? { |arg| arg.to_s.casecmp("--debug").zero? }
+
+  def self.debug?
+    @debug == true
+  end
+
+  # Prints a message only when --debug was passed, prefixed so it's easy to
+  # spot/filter in the game window.
+  def self.dbg(msg)
+    echo("[pilepull-debug] #{msg}") if debug?
+  end
+
+  dbg("debug mode enabled")
 
   # Tracks rewards (items received) and silver spent searching, persisted to a
   # local Sequel/SQLite database. Several characters may run this script at the
@@ -182,16 +208,31 @@ module PilePull
 
     def self.canonical_name_for(item_name)
       return item_name if item_name.nil?
-      _pattern, canonical = FALLBACK_ITEM_FIXUPS.find { |pattern, _canonical| item_name =~ pattern }
-      canonical || item_name
+      pattern, canonical = FALLBACK_ITEM_FIXUPS.find { |candidate, _canonical| item_name =~ candidate }
+      if canonical
+        PilePull.dbg("Rewards.canonical_name_for: #{item_name.inspect} matched fallback #{pattern.inspect} -> #{canonical.inspect}")
+        canonical
+      else
+        item_name
+      end
     end
 
     def self.tier_for(item_name)
       return 'unknown' if item_name.nil?
-      return 'rare' if XMLData.game.eql?("GSF") && item_name =~ /creased stamped voucher booklet/i
 
-      _pattern, tier = TIER_PATTERNS.find { |pattern, _tier| item_name =~ pattern }
-      tier || 'unknown'
+      if XMLData.game.eql?("GSF") && item_name =~ /creased stamped voucher booklet/i
+        PilePull.dbg("Rewards.tier_for: #{item_name.inspect} -> rare (GSF booklet override)")
+        return 'rare'
+      end
+
+      pattern, tier = TIER_PATTERNS.find { |candidate, _tier| item_name =~ candidate }
+      if tier
+        PilePull.dbg("Rewards.tier_for: #{item_name.inspect} matched #{pattern.inspect} -> #{tier}")
+        tier
+      else
+        PilePull.dbg("Rewards.tier_for: #{item_name.inspect} matched no pattern -> unknown")
+        'unknown'
+      end
     end
 
     # Duskruin runs twice a year: Feb/Mar and Aug/Sep. Bucketed by calendar half
@@ -247,6 +288,7 @@ module PilePull
       Self[:rewards].where(type: 'item', tier: 'unknown').each do |row|
         canonical = canonical_name_for(row[:item_name])
         next if canonical == row[:item_name]
+        PilePull.dbg("Rewards migration: row id=#{row[:id]} item_name=#{row[:item_name].inspect} -> #{canonical.inspect}")
         Self[:rewards].where(id: row[:id]).update(item_name: canonical, tier: tier_for(canonical))
       end
     rescue => e
@@ -277,6 +319,7 @@ module PilePull
     def self.record(type:, item_name: nil, tier: nil, quantity: 1)
       now = Time.now
       event_key = event_key_for(now.year, now.month)
+      PilePull.dbg("Rewards.record: type=#{type} item_name=#{item_name.inspect} tier=#{tier.inspect} quantity=#{quantity} event_key=#{event_key} character=#{Char.name}")
       Transactions.insert(
         character: Char.name,
         account: account_name,
@@ -296,12 +339,18 @@ module PilePull
     end
 
     def self.record_item(item_name, quantity: 1)
-      return if item_name.nil? || item_name.to_s.empty?
+      if item_name.nil? || item_name.to_s.empty?
+        PilePull.dbg("Rewards.record_item: ignoring blank/nil item_name (#{item_name.inspect})")
+        return
+      end
       canonical = canonical_name_for(item_name)
-      record(type: 'item', item_name: canonical, tier: tier_for(canonical), quantity: quantity)
+      tier = tier_for(canonical)
+      PilePull.dbg("Rewards.record_item: raw=#{item_name.inspect} canonical=#{canonical.inspect} tier=#{tier}")
+      record(type: 'item', item_name: canonical, tier: tier, quantity: quantity)
     end
 
     def self.record_search_cost(amount)
+      PilePull.dbg("Rewards.record_search_cost: #{amount}")
       record(type: 'search', quantity: amount)
     end
 
@@ -378,12 +427,16 @@ module PilePull
   def self.detect_pile
     ['pile', 'prizes'].each do |thing|
       if (found_thing = GameObj.loot.find { |item| item.noun == thing })
+        dbg("detect_pile: checking noun=#{thing.inspect} id=#{found_thing.id}")
         result = dothistimeout("look ##{found_thing.id}", 2, /SEARCH the \w+ to get something from the \w+!/)
+        dbg("detect_pile: look result=#{result.inspect}")
         if result =~ /SEARCH the \w+ to get something from the \w+!/
+          dbg("detect_pile: using id=#{found_thing.id} as the prize pile")
           return @prize_pile = found_thing
         end
       end
     end
+    dbg("detect_pile: no pile/prizes noun matched in GameObj.loot (#{GameObj.loot.map { |i| "#{i.id}:#{i.noun}" }.join(', ')})")
     echo("Could not find a prize pile, be sure to start script in front of a treasure pile! Exiting!")
     exit
   end
@@ -394,19 +447,23 @@ module PilePull
 
   def self.bank_run
     current_location = Room.current.id
+    dbg("bank_run: leaving room #{current_location} for the bank")
     Script.run("go2", "u8213023")
     fput("deposit all")
     result = dothistimeout("withdraw #{@withdraw_amount} silver", 2, /you don't seem to have that much|hands you [\d,]+ silvers/)
+    dbg("bank_run: withdraw result=#{result.inspect}")
     if result =~ /you don't seem to have that much/
       echo("Not enough silver, exiting!")
       exit
     end
+    dbg("bank_run: returning to room #{current_location}")
     Script.run("go2", "#{current_location}")
   end
 
   def self.search_pile
     loop {
       result = dothistimeout("search ##{@prize_pile.id}", 2, /In order to search through a pile of mania prizes|You do not have enough silver to SEARCH|You hand over 1,000,000|You've recently searched through|You have too many items to search./)
+      dbg("search_pile: result=#{result.inspect}")
       case result
       when /In order to search through/
         next
@@ -414,17 +471,20 @@ module PilePull
         sleep(0.3)
         next
       when /You do not have enough silver to SEARCH/
+        dbg("search_pile: out of silver")
         return false
       when /You have too many items to search./
         if @max_inventory
           echo("You have too many items! Handle that!")
           exit
         else
+          dbg("search_pile: too many items, will attempt cleanup once")
           @max_inventory = true
           return false
         end
       when /You hand over 1,000,000/
         @max_inventory = false
+        dbg("search_pile: search succeeded, recording 1,000,000 silver spent")
         Rewards.record_search_cost(1_000_000)
         sleep(1)
         waitrt?
@@ -435,27 +495,34 @@ module PilePull
 
   def self.handle_loot
     recorded_id = nil
+    attempt = 0
     2.times do
+      attempt += 1
       waitrt?
       hand = GameObj.right_hand
       item_name = hand.name
+      dbg("handle_loot[#{attempt}]: right_hand id=#{hand.id.inspect} name=#{item_name.inspect} left_hand id=#{GameObj.left_hand.id.inspect} name=#{GameObj.left_hand.name.inspect}")
 
       case item_name
       when /booklet/
+        dbg("handle_loot[#{attempt}]: matched booklet -> redeem")
         fput('redeem booklet')
       when /steel spoon/
+        dbg("handle_loot[#{attempt}]: matched steel spoon -> keep_spoon=#{@keep_spoon}")
         if @keep_spoon
           fput('stow all')
         else
           fput('trash my spoon')
         end
       when /nexus orb/
+        dbg("handle_loot[#{attempt}]: matched nexus orb -> keep_nexus=#{@keep_nexus}")
         if @keep_nexus
           fput('stow all')
         else
           fput('trash my orb')
         end
       else
+        dbg("handle_loot[#{attempt}]: no special case matched -> stow all")
         fput('stow all')
       end
 
@@ -469,8 +536,12 @@ module PilePull
       # left_hand can occasionally report a partial/truncated name for the
       # same item before its data has fully settled.
       if hand.id && hand.id != recorded_id
-        Rewards.record_item(GameObj[hand.id].name)
+        resolved_name = GameObj[hand.id].name
+        dbg("handle_loot[#{attempt}]: recording id=#{hand.id} pre-action name=#{item_name.inspect} resolved name=#{resolved_name.inspect}")
+        Rewards.record_item(resolved_name)
         recorded_id = hand.id
+      else
+        dbg("handle_loot[#{attempt}]: not recording (hand.id=#{hand.id.inspect}, already recorded=#{recorded_id.inspect})")
       end
     end
 
@@ -483,12 +554,14 @@ module PilePull
     result = dothistimeout("inventory quantity", 3, /You are carrying ([\d,]+) items\./)
     if result =~ /You are carrying ([\d,]+) items\./
       @inventory_quantity = $1.to_i
+      dbg("check_inventory_count: carrying #{@inventory_quantity} items")
       if @inventory_quantity >= 400
         echo("You have to many items on you, preventing run as you should empty some stuff off your person")
         echo("Item cap is 500 and you have #{@inventory_quantity}.")
         exit
       end
     else
+      dbg("check_inventory_count: result did not match, got #{result.inspect}")
       echo("Couldn't detect current inventory quantity, exiting for safety reasons!")
       exit
     end
@@ -500,6 +573,8 @@ module PilePull
       next if GameObj.containers.keys.include?(item.id.to_s) && item.contents.is_a?(Array)
       next if item.type =~ /jewelry|weapon|armor|uncommon/
       next if item.type.nil?
+
+      dbg("populate_inventory: inspecting container id=#{item.id} name=#{item.name.inspect}")
 
       # check out whats inside
       lines = Lich::Util.issue_command("look in ##{item.id}", /<exposeContainer|<dialogData|<container|you glance|There is nothing|appears to be a very sturdy and spacious container despite its seemingly small size/i, usexml: true, silent: true, quiet: true)
@@ -533,6 +608,7 @@ module PilePull
         end
       }
     end
+    dbg("find_items: pattern=#{item_name.inspect} matched #{all_items.length} item(s): #{all_items.map(&:name).join(', ')}")
     return all_items
   end
 
@@ -657,11 +733,16 @@ module PilePull
   end
 end
 
-case Script.current.vars[1]
+# --debug is stripped out here (rather than being matched as a subcommand)
+# so it can be combined with any of the below, in any position: ";pilepull
+# --debug", ";pilepull cleanup --debug", ";pilepull rewards all --debug", etc.
+pilepull_args = (Script.current.vars[1..-1] || []).reject { |arg| arg.to_s.casecmp("--debug").zero? }
+
+case pilepull_args[0]
 when "cleanup"
   PilePull.cleanup
 when "rewards"
-  rewards_args = (Script.current.vars[2..-1] || []).map { |arg| arg.to_s.downcase }
+  rewards_args = pilepull_args[1..-1].map { |arg| arg.to_s.downcase }
   PilePull::Rewards.print_summary(
     all_characters: rewards_args.include?("all"),
     all_events: rewards_args.include?("history") || rewards_args.include?("years")
@@ -693,5 +774,8 @@ else
                                     record instead of just the current one
       ;pilepull rewards all history  - combine "all" and "history": every
                                         character, every event
+      --debug             - add to any of the above for verbose logging of
+                            search results, item name capture, and reward
+                            tier/canonicalization decisions
   TEXT
 end
