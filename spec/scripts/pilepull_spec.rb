@@ -47,6 +47,9 @@ module PilePullRewardsSpec
   RECORD_ITEM_SRC = extract_lic_method(SOURCE, 'record_item', source_path: SOURCE_PATH)
   HANDLE_LOOT_SRC = extract_lic_method(SOURCE, 'handle_loot', source_path: SOURCE_PATH)
   SEARCH_PILE_SRC = extract_lic_method(SOURCE, 'search_pile', source_path: SOURCE_PATH)
+  PERSISTED_DEFAULT_SRC = extract_lic_method(SOURCE, 'persisted_default', source_path: SOURCE_PATH)
+  PARSE_BOOLEAN_FLAG_SRC = extract_lic_method(SOURCE, 'parse_boolean_flag', source_path: SOURCE_PATH)
+  PARSE_CONFIG_ARGS_SRC = extract_lic_method(SOURCE, 'parse_config_args', source_path: SOURCE_PATH)
 
   # Real tier/canonicalization/event-bucketing logic under test, evaluated so
   # bare XMLData and PilePull references resolve to the stand-ins nested here.
@@ -122,12 +125,14 @@ module PilePullRewardsSpec
     end
 
     class << self
-      attr_accessor :keep_spoon, :keep_nexus, :stuck, :last_pull_name
+      attr_accessor :keep_spoon, :keep_nexus, :keep_runner_contract, :keep_locker_contract, :stuck, :last_pull_name
       attr_reader :fput_calls, :sleep_count, :exited, :echoed
 
       def reset!
         @keep_spoon = false
         @keep_nexus = false
+        @keep_runner_contract = true
+        @keep_locker_contract = true
         @stuck = false
         @last_pull_name = nil
         @fput_calls = []
@@ -250,6 +255,49 @@ module PilePullRewardsSpec
       catch(:search_pile_exit) { search_pile }
     end
   end
+
+  # Real config-flag parsing/persistence under test, with CharSettings
+  # stubbed as a plain in-memory hash nested here (never at top level).
+  class ConfigFlags
+    module CharSettings
+      class << self
+        def reset!
+          @store = {}
+        end
+
+        def [](key)
+          (@store ||= {})[key]
+        end
+
+        def []=(key, value)
+          (@store ||= {})[key] = value
+        end
+      end
+    end
+
+    class << self
+      attr_accessor :withdraw_amount, :keep_spoon, :keep_nexus, :keep_runner_contract, :keep_locker_contract
+      attr_reader :echoed
+
+      def reset!
+        @withdraw_amount = 100_000_000
+        @keep_spoon = false
+        @keep_nexus = false
+        @keep_runner_contract = true
+        @keep_locker_contract = true
+        @echoed = []
+        CharSettings.reset!
+      end
+
+      def echo(msg)
+        @echoed << msg
+      end
+    end
+
+    module_eval(PERSISTED_DEFAULT_SRC, SOURCE_PATH)
+    module_eval(PARSE_BOOLEAN_FLAG_SRC, SOURCE_PATH)
+    module_eval(PARSE_CONFIG_ARGS_SRC, SOURCE_PATH)
+  end
 end
 
 RSpec.describe 'pilepull.lic reward tracking' do
@@ -267,6 +315,10 @@ RSpec.describe 'pilepull.lic reward tracking' do
 
   def search_pile
     PilePullRewardsSpec::SearchPile
+  end
+
+  def config
+    PilePullRewardsSpec::ConfigFlags
   end
 
   describe 'Rewards.canonical_name_for' do
@@ -448,9 +500,45 @@ RSpec.describe 'pilepull.lic reward tracking' do
     end
 
     it 'stows anything else that has no special handling' do
-      handle_loot::GameObj.right_hand = fake_hand.new('555', 'a locker runner contract')
+      handle_loot::GameObj.right_hand = fake_hand.new('555', 'an Elanthian Guilds voucher pack')
       handle_loot.run
       expect(handle_loot.fput_calls).to eq(['stow all'])
+    end
+
+    it 'keeps (stows) a locker runner contract by default' do
+      handle_loot::GameObj.right_hand = fake_hand.new('556', 'a locker runner contract')
+      handle_loot.run
+      expect(handle_loot.fput_calls).to eq(['stow all'])
+    end
+
+    it 'trashes a locker runner contract when keep_runner_contract is turned off' do
+      handle_loot.keep_runner_contract = false
+      handle_loot::GameObj.right_hand = fake_hand.new('557', 'a locker runner contract')
+      handle_loot.run
+      expect(handle_loot.fput_calls).to eq(['trash my contract'])
+    end
+
+    # GameObj.right_hand.name can truncate "a locker runner contract" down
+    # to just "runner contract" (see canonical_name_for) -- the dispatch
+    # here has to match on the truncated form too, not just the full name.
+    it 'trashes a truncated "runner contract" hand name the same as the full name' do
+      handle_loot.keep_runner_contract = false
+      handle_loot::GameObj.right_hand = fake_hand.new('558', 'runner contract')
+      handle_loot.run
+      expect(handle_loot.fput_calls).to eq(['trash my contract'])
+    end
+
+    it 'keeps (stows) a larger locker contract by default' do
+      handle_loot::GameObj.right_hand = fake_hand.new('559', 'a larger locker contract')
+      handle_loot.run
+      expect(handle_loot.fput_calls).to eq(['stow all'])
+    end
+
+    it 'trashes a larger locker contract when keep_locker_contract is turned off' do
+      handle_loot.keep_locker_contract = false
+      handle_loot::GameObj.right_hand = fake_hand.new('560', 'a larger locker contract')
+      handle_loot.run
+      expect(handle_loot.fput_calls).to eq(['trash my contract'])
     end
 
     it 'does not record the same item id twice' do
@@ -594,6 +682,106 @@ RSpec.describe 'pilepull.lic reward tracking' do
       search_pile.queue_result('You have too many items to search.')
       search_pile.run
       expect(search_pile.exited).to be true
+    end
+  end
+
+  describe 'config flag parsing' do
+    before { config.reset! }
+
+    describe 'parse_boolean_flag' do
+      it 'defaults to true when no value is given' do
+        expect(config.parse_boolean_flag(nil)).to be true
+      end
+
+      it 'honors an explicit default_true: false for a bare flag' do
+        expect(config.parse_boolean_flag(nil, default_true: false)).to be false
+      end
+
+      %w[true on 1 yes y TRUE ON YES].each do |value|
+        it "parses #{value.inspect} as true" do
+          expect(config.parse_boolean_flag(value)).to be true
+        end
+      end
+
+      %w[false off 0 no n FALSE OFF NO].each do |value|
+        it "parses #{value.inspect} as false" do
+          expect(config.parse_boolean_flag(value)).to be false
+        end
+      end
+
+      it 'falls back to the default and warns for an unrecognized value' do
+        expect(config.parse_boolean_flag('maybe', default_true: false)).to be false
+        expect(config.echoed.join).to match(/unrecognized value/)
+      end
+    end
+
+    describe 'parse_config_args' do
+      it 'sets and persists the withdraw amount' do
+        remaining = config.parse_config_args(['--withdraw=50000000'])
+        expect(config.withdraw_amount).to eq(50_000_000)
+        expect(config::CharSettings['withdraw_amount']).to eq(50_000_000)
+        expect(remaining).to be_empty
+      end
+
+      it 'accepts --withdraw-amount as an alias and strips commas from the amount' do
+        config.parse_config_args(['--withdraw-amount=50,000,000'])
+        expect(config.withdraw_amount).to eq(50_000_000)
+      end
+
+      it 'turns keep_nexus on and persists it' do
+        config.parse_config_args(['--keep-nexus=on'])
+        expect(config.keep_nexus).to be true
+        expect(config::CharSettings['keep_nexus']).to be true
+      end
+
+      it 'turns keep_runner_contract off and persists it' do
+        config.parse_config_args(['--keep-runner-contract=off'])
+        expect(config.keep_runner_contract).to be false
+        expect(config::CharSettings['keep_runner_contract']).to be false
+      end
+
+      it 'turns keep_locker_contract off and persists it' do
+        config.parse_config_args(['--keep-locker-contract=off'])
+        expect(config.keep_locker_contract).to be false
+      end
+
+      it 'defaults a bare flag with no =value to true' do
+        config.parse_config_args(['--keep-spoon'])
+        expect(config.keep_spoon).to be true
+      end
+
+      it 'leaves an unrelated argument alone' do
+        remaining = config.parse_config_args(['cleanup', '--keep-nexus=on'])
+        expect(remaining).to eq(['cleanup'])
+      end
+
+      it 'combines multiple flags given in one call' do
+        config.parse_config_args(['--withdraw=25000000', '--keep-spoon=on', '--keep-nexus=on'])
+        expect(config.withdraw_amount).to eq(25_000_000)
+        expect(config.keep_spoon).to be true
+        expect(config.keep_nexus).to be true
+      end
+    end
+
+    describe 'persisted_default' do
+      it 'seeds and returns the default the first time a key is read' do
+        expect(config.persisted_default('foo', 42)).to eq(42)
+        expect(config::CharSettings['foo']).to eq(42)
+      end
+
+      # The whole reason this helper exists instead of a bare
+      # `CharSettings[key] ||= default`: `||=` treats a stored `false` as
+      # unset and would keep overwriting it with a truthy default.
+      it 'returns a stored false rather than overwriting it with a truthy default' do
+        config::CharSettings['bar'] = false
+        expect(config.persisted_default('bar', true)).to be false
+        expect(config::CharSettings['bar']).to be false
+      end
+
+      it 'returns an already-stored value as-is without touching it' do
+        config::CharSettings['baz'] = 999
+        expect(config.persisted_default('baz', 1)).to eq(999)
+      end
     end
   end
 end
