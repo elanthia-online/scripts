@@ -73,6 +73,9 @@
       item name capture, and reward tier/canonicalization decisions.
     - Fix reward tracking never actually recording an item on the normal
       (success) path; it only ever recorded silver spent searching.
+    - Fix reward tracking undercounting items (silver spent searching no
+      longer matches items received); a booklet or trashed nexus orb could
+      silently vanish from tracking, and add a booklet name fix-up.
     - Render ";pilepull rewards" as a table instead of plain text lines.
   v1.1.0 (2026-09-04)
     - ad logic to try to run cleanup if hit too many items
@@ -175,21 +178,24 @@ module PilePull
     # Display order for tier breakdowns; also doubles as the set of valid tiers.
     TIER_ORDER = %w(legendary epic rare uncommon common unknown).freeze unless const_defined?(:TIER_ORDER, false)
 
-    # GameObj.right_hand/left_hand can occasionally report a partial/truncated
-    # name for an item before its data has fully settled (see handle_loot,
-    # which now re-reads the name via GameObj[id] after the item leaves your
-    # hands instead of trusting the hand object's name in the moment). These
-    # patterns recover the full item name from a handful of truncated
-    # fragments actually seen in the wild, so both new and already-recorded
-    # rows land in the right tier. Ambiguous fragments (e.g. a bare
-    # "yellow-green potion", which could be the uncommon swirling or the rare
-    # potent variant) are deliberately left unmapped rather than guessed at.
+    # GameObj.right_hand/left_hand can report a partial/truncated name for an
+    # item before its data has fully settled. handle_loot records this
+    # truncated name as-is (attempting to re-resolve it afterward via
+    # GameObj[id] turned out to be worse: that lookup frequently returns nil
+    # once the item has been redeemed/trashed/stowed, which silently dropped
+    # the reward instead of just mis-tiering it). These patterns recover the
+    # full item name from every truncated fragment actually seen in the
+    # wild, so both new and already-recorded rows land in the right tier.
+    # Ambiguous fragments (e.g. a bare "yellow-green potion", which could be
+    # the uncommon swirling or the rare potent variant) are deliberately
+    # left unmapped rather than guessed at.
     FALLBACK_ITEM_FIXUPS = [
-      [/\brunner contract\b/i,     'locker runner contract'],
-      [/\bGuild voucher pack\b/i,  "Adventurer's Guild voucher pack"],
-      [/\bGuilds voucher pack\b/i, 'Elanthian Guilds voucher pack'],
-      [/\bnexus orb\b/i,           'swirling nexus orb'],
-      [/\bblue orb\b/i,            'shimmering blue orb'],
+      [/\brunner contract\b/i,          'locker runner contract'],
+      [/\bGuild voucher pack\b/i,       "Adventurer's Guild voucher pack"],
+      [/\bGuilds voucher pack\b/i,      'Elanthian Guilds voucher pack'],
+      [/\bnexus orb\b/i,                'swirling nexus orb'],
+      [/\bblue orb\b/i,                 'shimmering blue orb'],
+      [/\bstamped voucher booklet\b/i,  'creased stamped voucher booklet'],
     ].freeze unless const_defined?(:FALLBACK_ITEM_FIXUPS, false)
 
     Self.create_table?(:rewards) do
@@ -517,6 +523,24 @@ module PilePull
       item_name = hand.name
       dbg("handle_loot[#{attempt}]: right_hand id=#{hand.id.inspect} name=#{item_name.inspect} left_hand id=#{GameObj.left_hand.id.inspect} name=#{GameObj.left_hand.name.inspect}")
 
+      # Record from the name captured here, before the item is redeemed/
+      # trashed/stowed. A prior version tried re-reading the name via
+      # GameObj[id] after the item left your hands, on the theory that the
+      # hand object's name could be a truncated fragment; in practice
+      # GameObj[id] frequently returns nil afterward instead (always for a
+      # redeemed booklet or trashed orb, since that id no longer exists;
+      # sometimes for an ordinary stowed item too), which silently dropped
+      # the reward entirely rather than just mis-tiering it. The pre-action
+      # name is always present, and canonical_name_for/tier_for (below)
+      # already handle every truncated fragment seen in the wild.
+      if hand.id && hand.id != recorded_id
+        dbg("handle_loot[#{attempt}]: recording id=#{hand.id} name=#{item_name.inspect}")
+        Rewards.record_item(item_name)
+        recorded_id = hand.id
+      else
+        dbg("handle_loot[#{attempt}]: not recording (hand.id=#{hand.id.inspect}, already recorded=#{recorded_id.inspect})")
+      end
+
       case item_name
       when /booklet/
         dbg("handle_loot[#{attempt}]: matched booklet -> redeem")
@@ -540,35 +564,10 @@ module PilePull
         fput('stow all')
       end
 
-      hands_cleared = false
       30.times {
-        if GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
-          hands_cleared = true
-          break
-        end
+        return if GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
         sleep(0.1)
       }
-      dbg("handle_loot[#{attempt}]: hands_cleared=#{hands_cleared}")
-
-      # Read the name back via GameObj[id] rather than trusting the hand
-      # object's name at the moment the item arrived: GameObj.right_hand/
-      # left_hand can occasionally report a partial/truncated name for the
-      # same item before its data has fully settled.
-      #
-      # This has to happen before the `return` below rather than inside the
-      # 30.times block above: `return` inside a block unwinds the enclosing
-      # method (handle_loot), not just the block, so putting it in the wait
-      # loop would skip this recording step entirely the moment hands clear.
-      if hand.id && hand.id != recorded_id
-        resolved_name = GameObj[hand.id].name
-        dbg("handle_loot[#{attempt}]: recording id=#{hand.id} pre-action name=#{item_name.inspect} resolved name=#{resolved_name.inspect}")
-        Rewards.record_item(resolved_name)
-        recorded_id = hand.id
-      else
-        dbg("handle_loot[#{attempt}]: not recording (hand.id=#{hand.id.inspect}, already recorded=#{recorded_id.inspect})")
-      end
-
-      return if hands_cleared
     end
 
     echo("Couldn't handle item received, likely full containers, exiting!")
