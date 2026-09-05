@@ -1,0 +1,624 @@
+=begin
+
+  This is for Shattered!
+
+  ;pilepull
+  For use with the treasure pile put out for 1,000,000 silvers per search.
+
+  Start in front of a treasure pile to search.
+  Currently will withdraw 100,000,000 silvers per go (configurable manually in the script)
+  and continue doing so until you have no more room in your STOW container or you are item capped.
+
+  Usage:
+
+      ;pilepull           - will run the normal SEARCH of the pile
+      ;pilepull cleanup   - will attempt to cleanup bundlable items, which include:
+                              * glowing orbs
+                              * potent yellow-green potion
+                              * swirling yellow-green potion
+                              * Elanthian Guilds voucher pack
+                              * Adventurer's Guild voucher pack
+      ;pilepull rewards   - print a summary of items received this character has
+                            gotten during the current/most recent Duskruin event
+                            (broken down by reward tier: common/uncommon/rare/
+                            epic/legendary) and silver spent searching, tracked
+                            in a shared local database so it works correctly
+                            across multiple characters. Duskruin runs twice a
+                            year (Feb/Mar and Aug/Sep); each reward is tagged
+                            with the event it was earned in.
+      ;pilepull rewards all       - same, but combined across every character
+                                    that has used this database (not just you)
+      ;pilepull rewards history   - same, but shows every Duskruin event on
+                                    record instead of just the current one
+      ;pilepull rewards all history  - combine "all" and "history": every
+                                        character, every event
+
+  There's also some variables in the script you can set to true/false
+  All default to false to throw away
+    * @withdraw_amount
+    * @keep_spoon
+    * @keep_wisp  (not yet implemented)
+    * @keep_nexus
+
+            author: Tysong
+      contributors: everyone in shattered!
+              game: Gemstone
+              tags: loot, mania, treasure, pile, shattered
+          required: Lich >= 5.12.4
+       requirements:
+        - sequel gem
+           version: 1.3.0
+
+  Improvements:
+  Major_change.feature_addition.bugfix
+  v1.3.0 (2026-09-05)
+    - Add ";pilepull rewards all" to combine reward totals across every character
+      that has run this script, instead of just the current one.
+    - Tag every recorded reward with the Duskruin event it was earned in (Feb/Mar
+      or Aug/Sep of that year). ";pilepull rewards" now shows only the current/most
+      recent event by default; add "history" (";pilepull rewards history") to see
+      every event on record, and combine with "all" for every character across
+      every event.
+  v1.2.0 (2026-09-05)
+    - Add reward tracking: items received and silver spent searching are now saved
+      to a local database so they survive between runs. Use ";pilepull rewards" to
+      see a summary broken down by reward tier (common/uncommon/rare/epic/legendary).
+      Safe to run on multiple characters at the same time.
+    - Fix cleanup skipping a single leftover flexing arm token or potion; it only
+      ever cleaned those up when you had two or more.
+    - Fix cleanup sometimes waiting the full timeout to notice a container had
+      already finished being inspected.
+  v1.1.0 (2026-09-04)
+    - ad logic to try to run cleanup if hit too many items
+  v1.0.1 (2026-03-01)
+    - slight fix to retry item handling after prize pulling
+  v1.0.0 (2025-08-31)
+    - initial release
+=end
+
+# Load required gems with safety checks
+gems_to_load = ["sequel"]
+failed_to_load = []
+
+gems_to_load.each do |gem|
+  unless Gem::Dependency.new(gem).matching_specs.max_by(&:version).nil?
+    require gem
+  else
+    failed_to_load.push(gem)
+  end
+end
+
+unless failed_to_load.empty?
+  echo "Requires Ruby gems: #{failed_to_load.join(", ")}"
+  echo "Please install the above gem(s) to run ;pilepull"
+  exit
+end
+
+require 'date'
+
+module PilePull
+  @prize_pile = nil
+  @inventory_quantity = nil
+  @max_inventory = false
+
+  # Set the amount to withdraw each time it goes to the bank
+  @withdraw_amount = 100_000_000
+
+  # Set the following on whether to TRASH them on receiving them
+  @keep_spoon = false
+  @keep_wisp  = false # not yet implemented
+  @keep_nexus = false
+
+  # Tracks rewards (items received) and silver spent searching, persisted to a
+  # local Sequel/SQLite database. Several characters may run this script at the
+  # same time, so a shared YAML/JSON file would risk read/write clobbering;
+  # SQLite handles concurrent inserts from multiple processes safely, and every
+  # row is tagged by character/account/game so totals can be sliced per-character
+  # or across the account. Mirrors the pattern used by ledger.lic.
+  module Rewards
+    @file = File.join(DATA_DIR, "pilepull.db")
+    Self = Sequel.sqlite(@file)
+
+    # Known reward tiers, keyed by the item name pattern the game hands you.
+    # Based on player-observed drop rates: 65% common / 22% uncommon / 10% rare /
+    # 2% epic / 1% legendary, with an even chance for each item inside its tier.
+    # Order matters: checked top to bottom, first match wins.
+    TIER_PATTERNS = [
+      [/larger locker contract/i, 'common'],
+      [/Chronomage rush ticket/i,           'common'],
+      [/locker runner contract/i,           'common'],
+      [/swirling yellow-green potion/i,     'uncommon'],
+      [/Adventurer's Guild voucher pack/i,  'uncommon'],
+      [/Elanthian Guilds voucher pack/i,    'uncommon'],
+      [/\bglowing orb\b/i,                  'rare'],
+      [/swirling nexus orb/i,               'rare'],
+      [/potent yellow-green potion/i,       'rare'],
+      [/creased stamped voucher booklet/i,  'epic'],
+      [/shimmering blue orb/i,              'epic'],
+      [/small locker expansion contract/i,  'epic'],
+      [/shimmering violet orb/i,            'legendary'],
+    ].freeze unless const_defined?(:TIER_PATTERNS, false)
+
+    # Display order for tier breakdowns; also doubles as the set of valid tiers.
+    TIER_ORDER = %w(legendary epic rare uncommon common unknown).freeze unless const_defined?(:TIER_ORDER, false)
+
+    Self.create_table?(:rewards) do
+      primary_key :id
+      String  :character
+      String  :account
+      String  :game
+      String  :type       # 'item' or 'search'
+      String  :item_name  # populated for 'item' rows, nil for 'search' rows
+      String  :tier       # 'common'/'uncommon'/'rare'/'epic'/'legendary'/'unknown', nil for 'search' rows
+      Integer :quantity   # item count for 'item' rows, silver spent for 'search' rows
+      String  :event      # display label for the Duskruin event, e.g. "2026 Duskruin (Aug/Sep)"
+      Integer :event_key  # sortable/filterable form of `event`: year * 10 + (1 for Feb/Mar, 2 for Aug/Sep)
+      Date    :created_at
+      Integer :year
+      Integer :month
+      Integer :day
+      Integer :hour
+    end
+
+    def self.tier_for(item_name)
+      return 'unknown' if item_name.nil?
+      _pattern, tier = TIER_PATTERNS.find { |pattern, _tier| item_name =~ pattern }
+      tier || 'unknown'
+    end
+
+    # Duskruin runs twice a year: Feb/Mar and Aug/Sep. Bucketed by calendar half
+    # (Jan-Jun => Feb/Mar, Jul-Dec => Aug/Sep) since the script is only ever run
+    # during an actual event window, so the half a reward falls in always matches
+    # the event it was earned in.
+    def self.event_half(month)
+      month <= 6 ? 1 : 2
+    end
+
+    def self.event_key_for(year, month)
+      (year * 10) + event_half(month)
+    end
+
+    def self.label_for_key(key)
+      return 'unknown event' if key.nil?
+      year = key / 10
+      half = key % 10
+      "#{year} Duskruin (#{half == 1 ? 'Feb/Mar' : 'Aug/Sep'})"
+    end
+
+    # One-time migration: add `tier`/`event`/`event_key` columns to existing
+    # databases, backfilling from each row's own item_name/year/month.
+    begin
+      existing_columns = Self.schema(:rewards).map(&:first)
+
+      unless existing_columns.include?(:tier)
+        Self.alter_table(:rewards) { add_column :tier, String }
+        Self[:rewards].where(type: 'item').each do |row|
+          Self[:rewards].where(id: row[:id]).update(tier: tier_for(row[:item_name]))
+        end
+      end
+
+      unless existing_columns.include?(:event_key)
+        Self.alter_table(:rewards) do
+          add_column :event, String
+          add_column :event_key, Integer
+        end
+        Self[:rewards].each do |row|
+          key = event_key_for(row[:year], row[:month])
+          Self[:rewards].where(id: row[:id]).update(event: label_for_key(key), event_key: key)
+        end
+      end
+    rescue => e
+      echo "Note: Could not migrate pilepull rewards database: #{e.message}"
+    end
+
+    begin
+      unless Self.indexes(:rewards).key?(:pilepull_rewards_character_type_index)
+        Self.add_index :rewards, [:character, :type], name: :pilepull_rewards_character_type_index
+      end
+      unless Self.indexes(:rewards).key?(:pilepull_rewards_character_tier_index)
+        Self.add_index :rewards, [:character, :tier], name: :pilepull_rewards_character_tier_index
+      end
+      unless Self.indexes(:rewards).key?(:pilepull_rewards_event_key_index)
+        Self.add_index :rewards, [:event_key], name: :pilepull_rewards_event_key_index
+      end
+    rescue => e
+      echo "Note: Could not add pilepull rewards index: #{e.message}"
+    end
+
+    Transactions = Self[:rewards]
+
+    def self.account_name
+      return nil unless Object.const_defined?(:Account)
+      Account.name if Account.name && !Account.name.to_s.empty?
+    end
+
+    def self.record(type:, item_name: nil, tier: nil, quantity: 1)
+      now = Time.now
+      event_key = event_key_for(now.year, now.month)
+      Transactions.insert(
+        character: Char.name,
+        account: account_name,
+        game: XMLData.game,
+        type: type,
+        item_name: item_name,
+        tier: tier,
+        quantity: quantity,
+        event: label_for_key(event_key),
+        event_key: event_key,
+        created_at: now,
+        year: now.year,
+        month: now.month,
+        day: now.day,
+        hour: now.hour
+      )
+    end
+
+    def self.record_item(item_name, quantity: 1)
+      return if item_name.nil? || item_name.to_s.empty?
+      record(type: 'item', item_name: item_name, tier: tier_for(item_name), quantity: quantity)
+    end
+
+    def self.record_search_cost(amount)
+      record(type: 'search', quantity: amount)
+    end
+
+    def self.with_commas(num)
+      num.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+    end
+
+    # @param character [String] restrict to this character; ignored when all_characters is true
+    # @param all_characters [Boolean] combine every character in the database instead of just one
+    # @param all_events [Boolean] show every Duskruin event on record instead of just the latest
+    def self.print_summary(character: Char.name, all_characters: false, all_events: false)
+      scope = all_characters ? Transactions : Transactions.where(character: character)
+      scope_desc = all_characters ? "ALL characters" : character
+
+      if all_events
+        event_keys = (scope.select_map(:event_key)).compact.uniq.sort.reverse
+
+        if event_keys.empty?
+          echo("=== PilePull rewards for #{scope_desc} ===")
+          echo("  No rewards recorded yet.")
+          return
+        end
+
+        event_keys.each { |key| print_event_block(scope, key, scope_desc) }
+      else
+        key = scope.max(:event_key) || event_key_for(Time.now.year, Time.now.month)
+        print_event_block(scope, key, scope_desc)
+      end
+    end
+
+    # Prints the tier breakdown and silver spent for a single Duskruin event.
+    #
+    # @param scope [Sequel::Dataset] the character/all-characters filtered dataset to report on
+    # @param key [Integer] the event_key identifying which Duskruin event to report
+    # @param scope_desc [String] human-readable label for who this report covers
+    def self.print_event_block(scope, key, scope_desc)
+      echo("=== PilePull rewards for #{scope_desc} - #{label_for_key(key)} ===")
+
+      event_scope = scope.where(event_key: key)
+
+      rows = event_scope
+             .where(type: 'item')
+             .group_and_count(:tier, :item_name)
+             .order(Sequel.desc(:count))
+             .all
+
+      total_items = rows.sum { |row| row[:count] }
+
+      if rows.empty?
+        echo("  No items recorded yet.")
+      else
+        by_tier = rows.group_by { |row| row[:tier] || 'unknown' }
+
+        TIER_ORDER.each do |tier|
+          tier_rows = by_tier[tier]
+          next if tier_rows.nil? || tier_rows.empty?
+
+          tier_count = tier_rows.sum { |row| row[:count] }
+          tier_pct = total_items.zero? ? 0 : (tier_count * 100.0 / total_items)
+          echo("#{tier.upcase} (#{tier_count}, #{'%.1f' % tier_pct}%)")
+          tier_rows.each do |row|
+            echo("  #{row[:item_name]}: #{row[:count]}")
+          end
+        end
+      end
+
+      total_spent = event_scope.where(type: 'search').sum(:quantity) || 0
+      echo("Total items: #{total_items}")
+      echo("Total silver spent searching: #{with_commas(total_spent)}")
+      echo("")
+    end
+  end
+
+  def self.detect_pile
+    ['pile', 'prizes'].each do |thing|
+      if (found_thing = GameObj.loot.find { |item| item.noun == thing })
+        result = dothistimeout("look ##{found_thing.id}", 2, /SEARCH the \w+ to get something from the \w+!/)
+        if result =~ /SEARCH the \w+ to get something from the \w+!/
+          return @prize_pile = found_thing
+        end
+      end
+    end
+    echo("Could not find a prize pile, be sure to start script in front of a treasure pile! Exiting!")
+    exit
+  end
+
+  def self.silver_check
+    return Lich::Util.silver_count
+  end
+
+  def self.bank_run
+    current_location = Room.current.id
+    Script.run("go2", "u8213023")
+    fput("deposit all")
+    result = dothistimeout("withdraw #{@withdraw_amount} silver", 2, /you don't seem to have that much|hands you [\d,]+ silvers/)
+    if result =~ /you don't seem to have that much/
+      echo("Not enough silver, exiting!")
+      exit
+    end
+    Script.run("go2", "#{current_location}")
+  end
+
+  def self.search_pile
+    loop {
+      result = dothistimeout("search ##{@prize_pile.id}", 2, /In order to search through a pile of mania prizes|You do not have enough silver to SEARCH|You hand over 1,000,000|You've recently searched through|You have too many items to search./)
+      case result
+      when /In order to search through/
+        next
+      when /You've recently searched through/
+        sleep(0.3)
+        next
+      when /You do not have enough silver to SEARCH/
+        return false
+      when /You have too many items to search./
+        if @max_inventory
+          echo("You have too many items! Handle that!")
+          exit
+        else
+          @max_inventory = true
+          return false
+        end
+      when /You hand over 1,000,000/
+        @max_inventory = false
+        Rewards.record_search_cost(1_000_000)
+        sleep(1)
+        waitrt?
+        return true
+      end
+    }
+  end
+
+  def self.handle_loot
+    recorded_id = nil
+    2.times do
+      waitrt?
+      hand = GameObj.right_hand
+      item_name = hand.name
+
+      if hand.id && hand.id != recorded_id
+        Rewards.record_item(item_name)
+        recorded_id = hand.id
+      end
+
+      case item_name
+      when /booklet/
+        fput('redeem booklet')
+      when /steel spoon/
+        if @keep_spoon
+          fput('stow all')
+        else
+          fput('trash my spoon')
+        end
+      when /nexus orb/
+        if @keep_nexus
+          fput('stow all')
+        else
+          fput('trash my orb')
+        end
+      else
+        fput('stow all')
+      end
+
+      30.times {
+        return if GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+        sleep(0.1)
+      }
+    end
+
+    echo("Couldn't handle item received, likely full containers, exiting!")
+    exit
+  end
+
+  def self.check_inventory_count
+    waitrt?
+    result = dothistimeout("inventory quantity", 3, /You are carrying ([\d,]+) items\./)
+    if result =~ /You are carrying ([\d,]+) items\./
+      @inventory_quantity = $1.to_i
+      if @inventory_quantity >= 400
+        echo("You have to many items on you, preventing run as you should empty some stuff off your person")
+        echo("Item cap is 500 and you have #{@inventory_quantity}.")
+        exit
+      end
+    else
+      echo("Couldn't detect current inventory quantity, exiting for safety reasons!")
+      exit
+    end
+  end
+
+  def self.populate_inventory
+    GameObj.inv.each do |item|
+      # echo "item: #{item.name} | type: #{item.type}"
+      next if GameObj.containers.keys.include?(item.id.to_s) && item.contents.is_a?(Array)
+      next if item.type =~ /jewelry|weapon|armor|uncommon/
+      next if item.type.nil?
+
+      # check out whats inside
+      lines = Lich::Util.issue_command("look in ##{item.id}", /<exposeContainer|<dialogData|<container|you glance|There is nothing|appears to be a very sturdy and spacious container despite its seemingly small size/i, usexml: true, silent: true, quiet: true)
+      next if lines.any? { |l| l =~ /You glance|There is nothing|appears to be a very sturdy and spacious container despite its seemingly small size/i }
+
+      20.times {
+        break if GameObj.containers.keys.include?(item.id.to_s) && item.contents.is_a?(Array)
+        sleep 0.1
+      }
+    end
+  end
+
+  def self.find_items(item_name)
+    all_items = []
+
+    if StowList.default
+      StowList.default.contents.each do |thing|
+        if thing.name =~ item_name
+          all_items.push(thing)
+        end
+      end
+    else
+      GameObj.inv.each { |container|
+        next unless GameObj.containers.keys.include?(container.id.to_s)
+        next unless container.contents.is_a?(Array)
+
+        container.contents.each do |thing|
+          if thing.name =~ item_name
+            all_items.push(thing)
+          end
+        end
+      }
+    end
+    return all_items
+  end
+
+  def self.cleanup
+    populate_inventory
+
+    # glowing orbs - REIM stuff
+    found_items = find_items(/\bglowing orb\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      multifput("bundle ##{item.id}", "bundle ##{item.id}")
+      fput('stow left') unless GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    } if found_items.count > 1
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+    # blue feather-shaped charm - Encumbrance reducing (1 use)
+    found_items = find_items(/\bblue feather-shaped charm\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      multifput("bundle ##{item.id}")
+      fput('stow left') unless GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    } if found_items.count > 1
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+    # flexing arm token - Enhancive Pause (15 uses)
+    found_items = find_items(/\bflexing arm token\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      fput("trash ##{item.id}")
+      fput("trash ##{item.id}") unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+    } if found_items.count > 0
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+=begin
+    # urchin guide contract - 30 days (1 use)
+    found_items = find_items(/\burchin guide contract\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      fput("trash ##{item.id}")
+      fput("trash ##{item.id}") unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+    } if found_items.count > 1
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+=end
+
+    # potent blue-green potion - SKE enhancive 30min recharge
+    found_items = find_items(/\bpotent blue-green potion\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      multifput("pour ##{item.id} in my second potion")
+      fput('stow left') unless GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    } if found_items.count > 0
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+    # potent yellow-green potions - SKE enhancive 30day recharge
+    found_items = find_items(/\bpotent yellow-green potion\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      multifput("pour ##{item.id} in my second potion")
+      fput('stow left') unless GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    } if found_items.count > 0
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+    # swirling yellow-green potions - regular enhancive 30day recharge
+    found_items = find_items(/\bswirling yellow-green potion\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      multifput("pour ##{item.id} in my second potion")
+      fput('stow left') unless GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    } if found_items.count > 0
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+    # Elanthian Guilds voucher pack - Professional Guild task reassigning
+    found_items = find_items(/\bElanthian Guilds voucher pack\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      multifput("bundle ##{item.id}")
+      fput('stow left') unless GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    } if found_items.count > 1
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+    # Adventurer's Guild voucher pack - Adv Guild task reassigning
+    found_items = find_items(/\bAdventurer's Guild voucher pack\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      multifput("bundle ##{item.id}")
+      fput('stow left') unless GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    } if found_items.count > 1
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+    # Adventurer's Guild task waiver - 30 days of being exempt from a task in the Adv Guild
+    found_items = find_items(/\bAdventurer's Guild task waiver\b/)
+    found_items.each { |item|
+      fput("get ##{item.id}")
+      multifput("bundle ##{item.id}")
+      fput('stow left') unless GameObj.right_hand.id.nil? || GameObj.left_hand.id.nil?
+    } if found_items.count > 1
+    fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+
+    20.times do
+      waitrt?
+      fput('stow all') unless GameObj.right_hand.id.nil? && GameObj.left_hand.id.nil?
+      sleep(0.1)
+    end
+  end
+
+  def self.main
+    detect_pile
+
+    check_inventory_count
+    unless silver_check >= 1_000_000
+      bank_run
+    end
+    loop do
+      if search_pile
+        handle_loot
+      else
+        cleanup
+        check_inventory_count
+        bank_run
+      end
+    end
+  end
+end
+
+case Script.current.vars[1]
+when "cleanup"
+  PilePull.cleanup
+when "rewards"
+  rewards_args = (Script.current.vars[2..-1] || []).map { |arg| arg.to_s.downcase }
+  PilePull::Rewards.print_summary(
+    all_characters: rewards_args.include?("all"),
+    all_events: rewards_args.include?("history") || rewards_args.include?("years")
+  )
+else
+  PilePull.main
+end
