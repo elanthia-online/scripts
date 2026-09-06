@@ -18,6 +18,9 @@
   Version Control:
   Major_change.feature_addition.bugfix
   v5.16.0  (2026-08-13)
+    - add empowered<N> command check: skip when an Empowered buff of +N or more is already active (!empowered<N> = skip unless). Guards a strong coup de grace endroll ((endroll - 100) / 5) from being overwritten by a weaker recast; the plain coupdegrace modifier only tests presence
+    - add thp<N> command check: target HP percentage at or below N (!thp<N> = above N). Reads CreatureInstance#hp_percent - bestiary template max_hp minus Combat::Tracker-parsed damage. 589 of 628 bundled templates (Lich >= 5.21) carry a measured max_hp; the remaining 39 fall back to a guessed 400. Residual drift: regeneration/healing never credit damage back (regenerators read more wounded than reality) and damage with uncatalogued messaging is silently missed (reads less wounded)
+    - fix buff<N> modifier lookup: resolve the buff from the command being run; the old lookup keyed on the paren content and could never match a bare-name key, making buff<N> a silent no-op
     - migrate room-creature targeting from GameObj.targets/.npcs to the Lich::Gemstone::Creature / Combat::Tracker APIs (Lich >= 5.19.0). GameObj.targets is built from XMLData.current_target_ids (the client's target dropdown), which can go stale after a kill or a room change; Creature reads the room roster instead
     - add BigshotCreature, an adapter wrapping a CreatureInstance so the cmd_* methods keep their GameObj-shaped .id/.status/.type. The Integer creature id is normalized to String at the boundary
     - replace the npc.status =~ /dead|gone/ idiom across ~40 call sites with dead_or_gone?, reading the <crtrStatus> dead flag plus GameObj's status string
@@ -2775,7 +2778,7 @@ class Bigshot
   # @note The modifier whitelist is a single alternation; a new modifier must be
   #   added here as well as to {#check_state_condition}, or it will never parse.
   def initialize_command_data
-    @COMMAND_MODIFIER_REGEX = /\((.*?(?:!?506|!?ancient|!?animate|!?ascended|!?ascension_boss|!?barrage|!?bearhug|buff|!?burst|!?calm|!?celerity|censer|!?challenging|!?coupdegrace|!?disease|!?disengaged|!?disoriented|!?EB"[^"]*"|!?EC"[^"]*"|!?ED"[^"]*"|!?ES"[^"]*"|!?e|!?essence|!?fatalcrit|!?frozen|!?flurry|!?flying|!?fury|!?garrote|!?h|!?hidden|!?holler|!?hovering|!?immobilized|!?inferior|!?justice|!?k|!?kneeling|!?m|!?mini_boss|!?mob|!?momentum|!?mount|!?noncorporeal|once|!?outside|!?pcs|!?poison|!?prone|!?pummel|!?rapid|!?rebuke|!?reflex|repeatdelay|!?rider|room|!?rooted|!?s|!?scourge|!?shout|!?sitting|!?sleeping|!?smote|!?splashy|!?stunned|!?surge|!?sympathetic|!?tailwind|!?tier|!?tier1|!?tier2|!?tier3|!?thrash|!?ucsdecent|!?ucsexcellent|!?ucsgood|!?ucstierup|!?undead|!?v|!?valid|!?vigor|!?voidweaver|!?webbed|!?wounded|!?yowlp).*?)\)$/i.freeze
+    @COMMAND_MODIFIER_REGEX = /\((.*?(?:!?506|!?ancient|!?animate|!?ascended|!?ascension_boss|!?barrage|!?bearhug|buff|!?burst|!?calm|!?celerity|censer|!?challenging|!?coupdegrace|!?disease|!?disengaged|!?disoriented|!?EB"[^"]*"|!?EC"[^"]*"|!?ED"[^"]*"|!?ES"[^"]*"|!?empowered|!?e|!?essence|!?fatalcrit|!?frozen|!?flurry|!?flying|!?fury|!?garrote|!?h|!?hidden|!?holler|!?hovering|!?immobilized|!?inferior|!?justice|!?k|!?kneeling|!?m|!?mini_boss|!?mob|!?momentum|!?mount|!?noncorporeal|once|!?outside|!?pcs|!?poison|!?prone|!?pummel|!?rapid|!?rebuke|!?reflex|repeatdelay|!?rider|room|!?rooted|!?s|!?scourge|!?shout|!?sitting|!?sleeping|!?smote|!?splashy|!?stunned|!?surge|!?sympathetic|!?tailwind|!?tier|!?tier1|!?tier2|!?tier3|!?thp|!?thrash|!?ucsdecent|!?ucsexcellent|!?ucsgood|!?ucstierup|!?undead|!?v|!?valid|!?vigor|!?voidweaver|!?webbed|!?wounded|!?yowlp).*?)\)$/i.freeze
 
     @COMMAND_AMOUNT_REGEX = /((?:!?e|!?essence|!?h|!?k|!?m|!?mob|!?s|!?tier|!?v|!?valid))(\d+)/i.freeze
 
@@ -3722,7 +3725,13 @@ class Bigshot
       # Check buff time conditions (e.g., buff60 with command 'barrage')
       if (buff_match = modifier.match(@COMMAND_BUFF_REGEX))
         amount = buff_match[2].to_i
-        buff_name = @COMMAND_BUFF_CHECKS[command]
+        # Resolve the buff from the command being run (e.g. "cman barrage
+        # (buff60)" -> barrage). The old lookup keyed on the paren content
+        # itself, which can never equal a bare-name key once a digit-bearing
+        # modifier is present - buff_name was always nil and buffN a silent
+        # no-op.
+        buff_key = @COMMAND_BUFF_CHECKS.keys.find { |k| original_command =~ /\b#{Regexp.escape(k)}\b/i }
+        buff_name = buff_key && @COMMAND_BUFF_CHECKS[buff_key]
 
         if buff_name && Effects::Buffs.time_left(buff_name) <= (amount / 60.0)
           debug_msg(@DEBUG_COMMANDS, "command_check buff | command: #{command} | amount: #{amount} | result: true")
@@ -3763,6 +3772,36 @@ class Bigshot
       when 'ED'  then return !Effects::Debuffs.active?(pattern)
       when '!ED' then return Effects::Debuffs.active?(pattern)
       end
+    end
+
+    # Empowered strength guard: (empowered30) skips when an Empowered buff
+    # of +30 or more is already up - protects a strong coup-de-grace
+    # endroll ((endroll - 100) / 5) from being overwritten by a weaker one.
+    # (!empowered30) inverts: skips unless already at +30 or more. Compare
+    # with the plain coupdegrace modifier, which only tests presence.
+    if (emp_match = modifier.match(/^(!?)empowered(\d+)$/i))
+      bonus = Effects::Buffs.to_h.keys.filter_map { |k| k.to_s[/^Empowered \(\+(\d+)\)/, 1]&.to_i }.max
+      strong = !bonus.nil? && bonus >= emp_match[2].to_i
+      return emp_match[1].empty? ? strong : !strong
+    end
+
+    # Target HP percentage: (thp20) runs the command only when the target is
+    # at or below 20% of its estimated max HP; (!thp20) only above. Reads
+    # CreatureInstance#hp_percent - template max_hp minus damage parsed by
+    # Combat::Tracker. Most bundled templates (589/628 as of Lich 5.21)
+    # carry a measured max_hp, so the percentage is usually grounded. Every
+    # parsed damage line counts once - yours and other group members' alike,
+    # which is correct for a shared HP pool. Residual drift: regeneration
+    # and healing are never credited back (regenerators read MORE wounded
+    # than reality), and damage whose messaging no def covers is silently
+    # missed (reads LESS wounded). Skips when the npc has no
+    # CreatureInstance behind it.
+    if (hp_match = modifier.match(/^(!?)thp(\d+)$/i))
+      pct = npc_hp_percent(npc)
+      return true if pct.nil?
+
+      threshold = hp_match[2].to_i
+      return hp_match[1].empty? ? pct > threshold : pct <= threshold
     end
 
     case modifier.downcase
@@ -7355,6 +7394,15 @@ class Bigshot
   # @return [Boolean] false rather than raising when npc is not creature-backed
   def npc_has_status?(npc, status_name)
     creature_backed?(npc) && npc.creature.has_status?(status_name)
+  end
+
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
+  # @return [Float, nil] estimated HP percentage (0-100), or nil when npc is
+  #   not creature-backed or carries no usable max HP
+  def npc_hp_percent(npc)
+    return nil unless creature_backed?(npc)
+
+    npc.creature.hp_percent
   end
 
   # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to read
