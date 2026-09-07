@@ -130,6 +130,7 @@ module ELoginSpec
         @debug_messaging = false
         @persisted_entries = []
         @on_pause = nil
+        Script.reset!
       end
 
       def echo(*msgs)
@@ -183,11 +184,32 @@ module ELoginSpec
       end
     end
 
+    # Mirrors the real Lich::Common::Script.current/pause split precisely,
+    # because getting it wrong here would hide exactly the class of bug it
+    # exists to catch: in the real implementation, .pause only *sets* a
+    # paused flag and returns immediately -- the actual blocking-until-
+    # unpause wait happens on the *next* call to Script.current, which
+    # sleeps while the flag is set. So `Script.current.pause` alone never
+    # blocks at all: Script.current is evaluated (unblocked, since not yet
+    # paused) before .pause sets the flag. Code that wants to actually wait
+    # for the player's unpause has to call Script.current again afterward.
     module Script
       NAME = 'elogin'
 
       class << self
+        def paused?
+          @paused ||= false
+        end
+
         def current
+          if paused?
+            @paused = false
+            Harness.calls << [:resumed]
+            # Stands in for "whatever happened while we were actually
+            # parked here" -- the real wait is a sleep loop with no
+            # comparable hook point of its own.
+            Harness.on_pause&.call
+          end
           self
         end
 
@@ -197,7 +219,11 @@ module ELoginSpec
 
         def pause
           Harness.calls << [:pause]
-          Harness.on_pause&.call
+          @paused = true
+        end
+
+        def reset!
+          @paused = false
         end
       end
     end
@@ -716,6 +742,29 @@ RSpec.describe 'ELogin (elogin.lic)' do
 
         expect(echoes).to include(match(/old-secret/))
         expect(echoes.none? { |e| e.include?('new-secret') }).to be true
+      end
+
+      # Script.current.pause only sets a flag and returns -- it does not
+      # itself block (Script.current, called just before .pause runs, isn't
+      # paused yet). The real wait for the player's unpause only happens on
+      # a *subsequent* Script.current call, which blocks while paused (see
+      # the Script stand-in's own comment above). Without that explicit
+      # checkpoint after .pause, everything past it -- including the F2
+      # reload -- would run immediately instead of after confirmation.
+      it 'actually waits for the resume checkpoint before doing anything else, not just calling .pause' do
+        entry_data = [entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'wrayth',
+                            password: 'old')]
+        seed_store(entry_data)
+
+        harness.modify_login_entry(entry_data, char_name: 'Iaconelli', user_id: 'myaccount', password: 'new',
+                                                show_password: true)
+
+        pause_index = calls.index { |c| c.first == :pause }
+        resumed_index = calls.index { |c| c.first == :resumed }
+
+        expect(pause_index).not_to be_nil
+        expect(resumed_index).not_to be_nil, 'expected a Script.current checkpoint after .pause to actually block for the unpause'
+        expect(pause_index).to be < resumed_index
       end
 
       # F2: the pause can wait indefinitely on the player, so entry.yaml can
