@@ -15,9 +15,12 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.15.0
-           version: 2.11.6
+           version: 2.11.7
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.11.7 (2026-09-07)
+    - fix: jewelry-tagged items the gemshop won't handle (like some headbands) now get
+      sold at the pawnshop instead of being put back in your loot untouched
   v2.11.6 (2026-09-04)
     - fix: gem/reagent hoard reset could come back empty when run before eloot had looted
       anything yet this session
@@ -353,7 +356,7 @@ module ELoot # Data
   class Data
     attr_accessor :disk, :disk_full, :sacks_full, :ready_method, :settings, :skinners, :skinsheath, :silent_open, :checked_bags,
                   :close_regex, :look_regex, :sacks_closed, :all_loot_categories, :regex_gold_rings, :right_hand, :left_hand, :skin_edged, :skin_blunt,
-                  :coin_hand, :coin_container, :silver_breakdown, :over_max, :pawn_recheck, :get_regex, :put_regex, :alchemy_mode, :sell_containers, :local_gemshop, :local_furrier, :log_unlootables,
+                  :coin_hand, :coin_container, :silver_breakdown, :over_max, :pawn_recheck, :jewelry_wrong_shop, :get_regex, :put_regex, :alchemy_mode, :sell_containers, :local_gemshop, :local_furrier, :log_unlootables,
                   :charm, :gauntlet, :coin_bag, :account_type, :locker, :container_settings, :everything_list, :everything,
                   :only_list, :only, :inventory, :gem_inventory, :alchemy_inventory, :hoard_type, :cache, :locker_city, :use_hoarding, :stash,
                   :items_to_hoard, :hoard_deposit, :inv_save, :deposit_regex, :withdraw_regex, :disk_nouns_regex, :sigil_determination_on_fail, :start_room, :last_called,
@@ -439,6 +442,7 @@ module ELoot # Data
       @silver_breakdown = Hash.new(0)
       @over_max = []
       @pawn_recheck = []
+      @jewelry_wrong_shop = []
       @inv_save = true
 
       $sell_ignore = []
@@ -5760,8 +5764,8 @@ module ELoot # Sells the loot
       { raw: raw, amount: raw.delete(',').to_i }
     end
 
-    def self.appraise(item, location, _data = nil)
-      return if item.type =~ /jewelry/ && location == "Pawnshop"
+    def self.appraise(item, location, _data = nil, skip_jewelry_guard: false, note: nil)
+      return if item.type =~ /jewelry/ && location == "Pawnshop" && !skip_jewelry_guard
 
       amount = 0
       raw = nil
@@ -5776,6 +5780,12 @@ module ELoot # Sells the loot
       end
 
       gemshop_refused = location =~ /gemshop/i && lines.any? { |l| l =~ /not buying anything this valuable today/ }
+
+      # The jeweler doesn't consider this item real jewelry ("That's not quite
+      # my field... I only deal in gems and jewelry"), as opposed to refusing
+      # it for being too valuable. Distinct case: the gemshop is simply the
+      # wrong shop for it.
+      wrong_specialty_refused = location =~ /gemshop/i && lines.any? { |l| l =~ /not quite my field|only deal in gems and jewelry/ }
 
       if amount > limit.to_i || lines.any? { |l| l =~ /not buying anything this valuable today/ }
         message = amount > limit.to_i ? " The #{item} appraises for #{raw}. That's above your settings." : " The #{item} appraises as too valuable to sell."
@@ -5794,8 +5804,9 @@ module ELoot # Sells the loot
             value: amount,
             raw: raw,
             shop: location,
-            stowed: (container.to_s.empty? ? nil : container)
-          }
+            stowed: (container.to_s.empty? ? nil : container),
+            note: note
+          }.compact
         end
 
         # The gemshop wouldn't even quote a price ("not buying anything this
@@ -5810,6 +5821,13 @@ module ELoot # Sells the loot
         else
           Inventory.store_item(container, item)
         end
+      elsif wrong_specialty_refused
+        # The loot data may still list the pawnshop as a valid market for this
+        # item even though the jeweler won't touch it -- queue it for a real
+        # sell attempt there instead of leaving it stuck in your loot forever.
+        (ELoot.data.jewelry_wrong_shop ||= []) << item if item.sellable.include?("pawnshop")
+
+        Inventory.single_drag(item)
       elsif amount.positive? && amount <= limit.to_i
         Sell.sell_item(item, location, ELoot.data.silver_breakdown)
       else
@@ -5870,11 +5888,49 @@ module ELoot # Sells the loot
       ELoot.data.pawn_recheck = []
     end
 
+    # Items the jeweler declined as not being their specialty ("That's not
+    # quite my field... I only deal in gems and jewelry") get a genuine sell
+    # attempt at the pawnshop, since the loot data already lists it as a valid
+    # market for them. Unlike recheck_refused_at_pawnshop (an opt-in,
+    # appraise-only second opinion for items the gemshop found too valuable),
+    # this always runs and always tries to sell -- the gemshop's refusal here
+    # is an unambiguous signal that the pawnshop is the correct shop, not a
+    # fallback. Anything still over the pawnshop limit lands in the over_max
+    # breakdown, same as any other appraisal.
+    def self.retry_wrong_shop_jewelry_at_pawnshop
+      items = Array(ELoot.data.jewelry_wrong_shop).compact
+      return if items.empty?
+
+      ELoot.msg(type: "info", text: " Selling #{items.length} gemshop-declined item(s) at the pawnshop...", space: true)
+
+      pawn = Room.current.find_nearest_by_tag("pawnshop")
+      if pawn.nil?
+        ELoot.msg(type: "info", text: " No pawnshop found nearby; leaving the declined items with your loot.")
+        return
+      end
+      ELoot.go2("pawnshop")
+
+      items.each do |item|
+        next if item.nil?
+
+        # Bring it back to hand (drag reopens containers and refinds by id).
+        Inventory.drag(item)
+        obj = [GameObj.right_hand, GameObj.left_hand].find { |h| h && !h.id.nil? && h.id == item.id }
+        next if obj.nil?
+
+        Sell.appraise(obj, "Pawnshop", ELoot.data.silver_breakdown, skip_jewelry_guard: true, note: "gemshop declined (not jewelry), over pawnshop limit")
+      end
+
+      ELoot.data.jewelry_wrong_shop = []
+    end
+
     # Shared tail for every sell flow: drain any gemshop-refused items to the
-    # pawnshop (no-op unless sell_pawn_recheck is on and something was queued),
+    # pawnshop (no-op unless sell_pawn_recheck is on and something was queued,
+    # or a gemshop-declined non-jewelry item needs a real sell attempt there),
     # then deposit. Keeps the custom entrypoints in step with the main flow.
     def self.finish_sell_run
       Sell.recheck_refused_at_pawnshop
+      Sell.retry_wrong_shop_jewelry_at_pawnshop
       ELoot.silver_deposit(true)
     end
 
@@ -5925,13 +5981,22 @@ module ELoot # Sells the loot
     # Build Terminal::Table rows for items that appraised above the user's
     # gemshop/pawnshop limit (captured during Sell.appraise). Pure and testable:
     # takes the over_max record array, returns rows (arrays / :separator / header
-    # hashes), most valuable first. Items the gemshop refused (re-appraised at the
-    # pawnshop, flagged with :note) are grouped under their own subheading.
+    # hashes), most valuable first. Items flagged with a :note (gemshop refused
+    # or gemshop declined as not real jewelry) are grouped under their own
+    # subheadings, each following its own :note text.
     def self.over_max_rows(records)
       return [] if records.nil? || records.empty?
 
-      refused = records.select { |r| r[:note] }
-      normal  = records - refused
+      # Headings for the distinct :note values that can land in over_max --
+      # keyed on the exact note text set where the record is built
+      # (Sell.appraise, recheck_refused_at_pawnshop, retry_wrong_shop_jewelry_at_pawnshop).
+      note_headings = {
+        "gemshop refused, pawn appraisal"                     => "Gemshop refused, pawn appraisals:",
+        "gemshop declined (not jewelry), over pawnshop limit" => "Gemshop declined (not jewelry), over pawnshop limit:"
+      }
+
+      grouped = records.group_by { |r| r[:note] }
+      normal  = grouped.delete(nil) || []
       by_value = ->(list) { list.sort_by { |r| -r[:value].to_i } }
       item_row = ->(r) { [ELoot.capitalize_words(r[:item].to_s), "   " + (r[:raw] || ELoot.format_number(r[:value])).to_s] }
 
@@ -5949,11 +6014,13 @@ module ELoot # Sells the loot
 
       by_value.call(normal).each { |r| rows << item_row.call(r) }
 
-      if refused.any?
-        rows << :separator if normal.any?
+      section_added = normal.any?
+      grouped.each do |note, items|
+        rows << :separator if section_added
         # Two-cell (not colspan) so the column separator pipe still renders.
-        rows << ['Gemshop refused, pawn appraisals:', '']
-        by_value.call(refused).each { |r| rows << item_row.call(r) }
+        rows << [note_headings.fetch(note, "#{note.capitalize}:"), '']
+        by_value.call(items).each { |r| rows << item_row.call(r) }
+        section_added = true
       end
 
       rows
@@ -7698,6 +7765,7 @@ module ELoot # Starts the script
   ELoot.data.silver_breakdown = Hash.new(0)
   ELoot.data.over_max = []
   ELoot.data.pawn_recheck = []
+  ELoot.data.jewelry_wrong_shop = []
 
   case Script.current.vars[0]
   when /debug/
