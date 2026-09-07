@@ -30,6 +30,8 @@ module ELoginSpec
   ENSURE_ENTRY_DATA_SRC = extract('ensure_entry_data!')
   EXTRACT_FRONTEND_FLAG_SRC = extract('extract_frontend_flag')
   EXTRACT_CUSTOM_LAUNCH_FLAG_SRC = extract('extract_custom_launch_flag')
+  CANONICAL_FRONTEND_SRC = extract('canonical_frontend')
+  SELECT_FRONTEND_ENTRY_SRC = extract('select_frontend_entry')
   ADD_LOGIN_ENTRY_SRC = extract('add_login_entry')
   MODIFY_LOGIN_ENTRY_SRC = extract('modify_login_entry')
   DELETE_LOGIN_ENTRY_SRC = extract('delete_login_entry')
@@ -67,15 +69,23 @@ module ELoginSpec
     )
   end
 
-  # Mirrors lich-5's Frontend.canonical_name closely enough for the frontend
-  # names these specs use (none of which have aliases). Kept as a small
-  # hand-written stand-in rather than pulled from the pinned checkout: the
-  # real implementation depends on a private alias registry populated by a
-  # large, unrelated frontend-definition table, which would add real setup
-  # cost here for no coverage value.
+  # Mirrors lich-5's Frontend.canonical_name for the frontend names these
+  # specs use. Kept as a small hand-written stand-in rather than pulled from
+  # the pinned checkout wholesale: the real implementation lives behind a
+  # large, unrelated frontend-definition/discovery table (executables,
+  # Windows registry keys, mac bundle ids) that would add real setup cost
+  # here for no coverage value. The one alias below is not invented, though
+  # -- it is copied from lich-5's actual
+  # register(:stormfront, ..., aliases: %w[wrayth]) call (front-end.rb),
+  # verified directly against the pinned checkout, because elogin's own
+  # frontend-identity bug (see canonical_frontend/select_frontend_entry)
+  # specifically depends on that exact alias being honored.
   module Frontend
+    ALIASES = { 'wrayth' => 'stormfront' }.freeze
+
     def self.canonical_name(name)
-      name.to_s.downcase
+      key = name.to_s.downcase
+      ALIASES.fetch(key, key)
     end
   end
 
@@ -92,14 +102,34 @@ module ELoginSpec
   module Harness
     class << self
       attr_accessor :debug_messaging
+      # Invoked (if set) whenever Script.current.pause is called, so a spec
+      # can simulate a concurrent writer acting exactly at the pause point --
+      # e.g. saving a different change to "entry.yaml" -- before this
+      # (paused) script resumes.
+      attr_accessor :on_pause
 
       def calls
         @calls ||= []
       end
 
+      # Stands in for the on-disk entry.yaml this harness's
+      # load_entry_data/save_entry_data read from and write to, so a spec
+      # can seed what's "currently saved" and later assert on what a fresh
+      # read would see -- independent of whatever local entry_data array a
+      # method under test happens to be holding.
+      def persisted_entries
+        @persisted_entries ||= []
+      end
+
+      def persisted_entries=(entries)
+        @persisted_entries = entries.map(&:dup)
+      end
+
       def reset!
         @calls = []
         @debug_messaging = false
+        @persisted_entries = []
+        @on_pause = nil
       end
 
       def echo(*msgs)
@@ -112,6 +142,11 @@ module ELoginSpec
 
       def save_entry_data(entry_data)
         calls << [:save, entry_data.dup]
+        self.persisted_entries = entry_data
+      end
+
+      def load_entry_data
+        persisted_entries.map(&:dup)
       end
     end
 
@@ -162,6 +197,7 @@ module ELoginSpec
 
         def pause
           Harness.calls << [:pause]
+          Harness.on_pause&.call
         end
       end
     end
@@ -174,6 +210,8 @@ module ELoginSpec
     module_eval(ELoginSpec::ENSURE_ENTRY_DATA_SRC, ELoginSpec::SOURCE_PATH)
     module_eval(ELoginSpec::EXTRACT_FRONTEND_FLAG_SRC, ELoginSpec::SOURCE_PATH)
     module_eval(ELoginSpec::EXTRACT_CUSTOM_LAUNCH_FLAG_SRC, ELoginSpec::SOURCE_PATH)
+    module_eval(ELoginSpec::CANONICAL_FRONTEND_SRC, ELoginSpec::SOURCE_PATH)
+    module_eval(ELoginSpec::SELECT_FRONTEND_ENTRY_SRC, ELoginSpec::SOURCE_PATH)
     module_eval(ELoginSpec::ADD_LOGIN_ENTRY_SRC, ELoginSpec::SOURCE_PATH)
     module_eval(ELoginSpec::MODIFY_LOGIN_ENTRY_SRC, ELoginSpec::SOURCE_PATH)
     module_eval(ELoginSpec::DELETE_LOGIN_ENTRY_SRC, ELoginSpec::SOURCE_PATH)
@@ -297,6 +335,16 @@ RSpec.describe 'ELogin (elogin.lic)' do
         result = harness.parse_arguments(['add', 'Iaconelli', 'MyAccount', 'hunter2', '--frontend=saga'])
 
         expect(result).to include(password: 'hunter2', frontend: 'saga')
+      end
+
+      # F3: a password that happens to start with "--" but matches no
+      # recognized flag must still be read literally -- treating every
+      # dash-leading argument as "no password" would make such passwords
+      # impossible to supply at all.
+      it 'reads a dash-leading password literally when it matches no recognized flag' do
+        result = harness.parse_arguments(['add', 'Iaconelli', 'MyAccount', '--synthetic-password'])
+
+        expect(result).to include(password: '--synthetic-password')
       end
 
       it 'extracts --custom-launch= alongside --frontend=' do
@@ -445,8 +493,11 @@ RSpec.describe 'ELogin (elogin.lic)' do
                                            game_code: 'GS3', frontend: 'wrayth')
 
       expect(entry_data.length).to eq(1)
+      # frontend is stored canonicalized (wrayth -> stormfront, its real
+      # registered alias) -- see the F1 tests below for the dedicated
+      # coverage of why this matters.
       expect(entry_data.first).to include(char_name: 'Iaconelli', user_id: 'myaccount',
-                                          password: 'hunter2', frontend: 'wrayth')
+                                          password: 'hunter2', frontend: 'stormfront')
       expect(saved_entries.length).to eq(1)
     end
 
@@ -492,6 +543,22 @@ RSpec.describe 'ELogin (elogin.lic)' do
 
       expect(echoes.last).to match(/saga.*custom-launch/i)
       expect(entry_data).to be_empty
+    end
+
+    # F1: wrayth and stormfront are the same registered frontend in lich-5
+    # (wrayth is literally an alias of :stormfront -- see ELoginSpec::Frontend
+    # above), so the duplicate check has to canonicalize both sides or it
+    # lets a logically identical entry back in under the other spelling.
+    it "treats an alias as the same frontend as its canonical name for the duplicate check" do
+      entry_data = [entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'stormfront')]
+
+      expect do
+        harness.add_login_entry(entry_data, char_name: 'Iaconelli', user_id: 'myaccount', password: 'pw',
+                                             game_code: 'GS3', frontend: 'wrayth')
+      end.to raise_error(ELoginSpec::ExitCalled)
+
+      expect(echoes.last).to match(/already exists/i)
+      expect(entry_data.length).to eq(1)
     end
   end
 
@@ -555,6 +622,22 @@ RSpec.describe 'ELogin (elogin.lic)' do
       expect(saga[:frontend]).to eq('saga')
     end
 
+    # F1: wrayth is a real registered alias of stormfront in lich-5 (see
+    # ELoginSpec::Frontend above), so requesting one has to find an entry
+    # saved under the other, not report "no entry found".
+    it "finds an entry saved under a frontend's canonical name when asked for its alias" do
+      stormfront = entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'stormfront',
+                         password: 'sf-pw')
+      saga = entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'saga',
+                   password: 'saga-pw')
+      entry_data = [stormfront, saga]
+
+      harness.modify_login_entry(entry_data, char_name: 'Iaconelli', user_id: 'myaccount', password: 'new-pw',
+                                              frontend: 'wrayth')
+
+      expect(echoes).not_to include(match(/No entry found/))
+    end
+
     it 'updates every saved entry for the account, even ones for a different character' do
       iaconelli = entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'wrayth',
                         password: 'old')
@@ -599,9 +682,18 @@ RSpec.describe 'ELogin (elogin.lic)' do
     end
 
     context 'with show_password: true' do
+      # modify_login_entry re-reads the store after the pause (see F2 below),
+      # so these need the store to actually contain what entry_data holds --
+      # otherwise the reload finds nothing and the example fails for the
+      # wrong reason.
+      def seed_store(entry_data)
+        harness.persisted_entries = entry_data
+      end
+
       it 'pauses before revealing the old password, and only echoes it after' do
         entry_data = [entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'wrayth',
                             password: 'super-secret')]
+        seed_store(entry_data)
 
         harness.modify_login_entry(entry_data, char_name: 'Iaconelli', user_id: 'myaccount', password: 'new',
                                                 show_password: true)
@@ -617,12 +709,69 @@ RSpec.describe 'ELogin (elogin.lic)' do
       it 'reveals the old password, not the new one being saved' do
         entry_data = [entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'wrayth',
                             password: 'old-secret')]
+        seed_store(entry_data)
 
         harness.modify_login_entry(entry_data, char_name: 'Iaconelli', user_id: 'myaccount', password: 'new-secret',
                                                 show_password: true)
 
         expect(echoes).to include(match(/old-secret/))
         expect(echoes.none? { |e| e.include?('new-secret') }).to be true
+      end
+
+      # F2: the pause can wait indefinitely on the player, so entry.yaml can
+      # legitimately change underneath this script while it waits. Verified
+      # against the real, pinned EntryStore-shaped data (a plain Array of
+      # entry hashes here, matching what load_entry_data/save_entry_data
+      # actually hand back and expect).
+      context 'when another writer changes the store during the pause' do
+        it 'applies the update on top of the concurrent change instead of overwriting it with the stale snapshot' do
+          entry_data = [entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'wrayth',
+                              password: 'old-secret')]
+          seed_store(entry_data)
+
+          other_writer_entry = entry(char_name: 'OtherChar', game_code: 'DR', user_id: 'otheraccount',
+                                     frontend: 'saga', password: 'other-pw')
+          harness.on_pause = -> { harness.persisted_entries = harness.persisted_entries + [other_writer_entry] }
+
+          harness.modify_login_entry(entry_data, char_name: 'Iaconelli', user_id: 'myaccount', password: 'new-secret',
+                                                  show_password: true)
+
+          saved = saved_entries.last
+          expect(saved).to include(other_writer_entry)
+          updated = saved.find { |e| e[:char_name] == 'Iaconelli' }
+          expect(updated[:password]).to eq('new-secret')
+        end
+
+        it 'reveals the password from the fresh read, not the stale pre-pause snapshot' do
+          entry_data = [entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'wrayth',
+                              password: 'stale-secret')]
+          seed_store(entry_data)
+
+          fresh_entry = entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'wrayth',
+                              password: 'fresh-secret')
+          harness.on_pause = -> { harness.persisted_entries = [fresh_entry] }
+
+          harness.modify_login_entry(entry_data, char_name: 'Iaconelli', user_id: 'myaccount', password: 'new',
+                                                  show_password: true)
+
+          expect(echoes).to include(match(/fresh-secret/))
+          expect(echoes.none? { |e| e.include?('stale-secret') }).to be true
+        end
+
+        it 'fails clearly instead of resurrecting a deleted entry when the target vanished during the pause' do
+          entry_data = [entry(char_name: 'Iaconelli', game_code: 'GS3', user_id: 'myaccount', frontend: 'wrayth',
+                              password: 'old')]
+          seed_store(entry_data)
+          harness.on_pause = -> { harness.persisted_entries = [] }
+
+          expect do
+            harness.modify_login_entry(entry_data, char_name: 'Iaconelli', user_id: 'myaccount', password: 'new',
+                                                    show_password: true)
+          end.to raise_error(ELoginSpec::ExitCalled)
+
+          expect(echoes.last).to match(/changed or was removed/i)
+          expect(saved_entries).to be_empty
+        end
       end
     end
 
@@ -694,6 +843,20 @@ RSpec.describe 'ELogin (elogin.lic)' do
 
       expect(result).to be true
       expect(entry_data).to eq([wrayth])
+    end
+
+    # F1: wrayth is a real registered alias of stormfront in lich-5 (see
+    # ELoginSpec::Frontend above); deleting "wrayth" has to find and remove
+    # an entry saved as "stormfront", not report a failed delete.
+    it 'deletes an entry saved under a frontend when asked for its alias' do
+      stormfront = entry(char_name: 'Iaconelli', game_code: 'GS3', frontend: 'stormfront')
+      saga = entry(char_name: 'Iaconelli', game_code: 'GS3', frontend: 'saga')
+      entry_data = [stormfront, saga]
+
+      result = harness.delete_login_entry(entry_data, char_name: 'Iaconelli', game_code: 'GS3', frontend: 'wrayth')
+
+      expect(result).to be true
+      expect(entry_data).to eq([saga])
     end
   end
 

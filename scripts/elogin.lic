@@ -46,6 +46,13 @@
       quietly failing in the launched window
     - Fix a couple of small argument-parsing bugs (a lowercase instance
       flag, or `--frontend=` on `delete`, weren't always recognized)
+    - Fix: Wrayth and Stormfront are the same frontend, but `add`/`modify`/
+      `delete` sometimes treated them as different logins -- they're now
+      recognized as the same
+    - Fix: waiting on the --show-password confirmation could overwrite a
+      change saved elsewhere in the meantime; it now re-checks before saving
+    - Fix a bug where a password starting with two dashes could get dropped
+      when adding a new account
     - Now works with Lich 5.20.0 and up (previously required 5.20.1)
     - Internal cleanup and documentation
   2.0.4 (2026-03-31)
@@ -142,6 +149,34 @@ module ELogin
       return $1 if arg =~ /^--custom-launch=(.+)$/i
     end
     nil
+  end
+
+  # Canonicalizes a frontend name through Lich's own alias table (e.g.
+  # "wrayth" and "stormfront" are the same registered frontend) so entry
+  # matching/the duplicate check treat aliases as identical instead of two
+  # different strings. Leaves elogin's own "no frontend restriction"
+  # sentinels (+nil+/+:__unset+) untouched.
+  # @param value [String, Symbol, nil]
+  # @return [String, Symbol, nil]
+  def self.canonical_frontend(value)
+    return value if value.nil? || value == :__unset
+
+    Lich::Common::Frontend.canonical_name(value)
+  end
+
+  # From a set of entries already filtered to one character/account (or one
+  # character/game_code), picks the entry matching +frontend+ (canonicalized
+  # via {canonical_frontend}), or the sole/first entry when no frontend was
+  # given.
+  # @param matching_entries [Array<Hash>]
+  # @param frontend [String, Symbol, nil]
+  # @return [Hash, nil]
+  def self.select_frontend_entry(matching_entries, frontend)
+    if frontend.nil? || frontend == :__unset
+      matching_entries.first
+    else
+      matching_entries.find { |d| canonical_frontend(d[:frontend]).to_s.casecmp?(canonical_frontend(frontend).to_s) }
+    end
   end
 
   # Loads saved login entries from entry.yaml and converts to legacy entry hashes.
@@ -303,8 +338,10 @@ module ELogin
                   else 'GS3'
                   end
 
+    canonical_new_frontend = canonical_frontend(frontend)
     existing = entry_data.find do |d|
-      d[:char_name].casecmp?(char_name) && d[:game_code] == game_code && d[:frontend].to_s.casecmp?(frontend.to_s)
+      d[:char_name].casecmp?(char_name) && d[:game_code] == game_code &&
+        canonical_frontend(d[:frontend]).to_s.casecmp?(canonical_new_frontend.to_s)
     end
     if existing
       handle_error("Error: Add failed. Character already exists for #{char_name} (#{game_code}, #{frontend}). Use `modify` to update or `delete` to remove existing entry.")
@@ -317,7 +354,7 @@ module ELogin
       :game_name         => game_name,
       :user_id           => user_id.downcase,
       :password          => password,
-      :frontend          => frontend,
+      :frontend          => canonical_new_frontend,
       :custom_launch     => custom_launch,
       :custom_launch_dir => custom_launch_dir
     }
@@ -339,7 +376,11 @@ module ELogin
   # by frontend), +frontend:+ is required to pick which one to validate
   # against; otherwise this exits via {handle_error}.
   #
-  # @param entry_data [Array<Hash>] loaded via {load_entry_data}, mutated in place
+  # @param entry_data [Array<Hash>] loaded via {load_entry_data}; mutated in
+  #   place, except that when +show_password+ pauses the script, this local
+  #   reference is replaced with a fresh {load_entry_data} read taken after
+  #   the pause resolves, so a concurrent writer's change during the wait
+  #   isn't silently overwritten
   # @param char_name [String]
   # @param user_id [String] account name identifying the entry to update
   # @param password [String] new password to store
@@ -367,7 +408,7 @@ module ELogin
       handle_error("Modify failed. Multiple entries exist for #{char_name} (#{user_id}). Specify --frontend=<name> to update a precise record.")
     end
 
-    existing = frontend.nil? || frontend == :__unset ? matching_entries.first : matching_entries.find { |d| d[:frontend].to_s.casecmp?(frontend.to_s) }
+    existing = select_frontend_entry(matching_entries, frontend)
     handle_error("Modify failed. No entry found for #{char_name} (#{user_id}) with frontend #{frontend}.") unless existing
 
     # Never interpolate `existing` wholesale here -- it contains the plaintext password.
@@ -377,6 +418,19 @@ module ELogin
       echo "WARNING: this will display the CURRENT saved password for #{existing[:char_name]} (#{existing[:user_id]}) in plain text in this window/log."
       echo "Unpause this script (;unpause #{Script.current.name}) to reveal it, or kill the script now to cancel."
       Script.current.pause
+
+      # The pause above can wait indefinitely on the player; another writer
+      # (another elogin session, the Lich GUI's login editor) may have saved
+      # a different change to entry.yaml in the meantime. Re-read the store
+      # now, before revealing anything or applying the update, instead of
+      # silently clobbering that change with our stale pre-pause snapshot.
+      entry_data = load_entry_data
+      matching_entries = entry_data.select { |d| d[:char_name].casecmp?(char_name) && d[:user_id].casecmp?(user_id) }
+      existing = select_frontend_entry(matching_entries, frontend)
+      unless existing
+        handle_error("Modify failed. The saved entry for #{char_name} (#{user_id}) changed or was removed while waiting for confirmation. Please re-run the command.")
+      end
+
       echo "Saved password for #{existing[:char_name]} (#{existing[:user_id]}): #{existing[:password]}"
     end
 
@@ -439,11 +493,7 @@ module ELogin
       return false
     end
 
-    target = if frontend.nil? || frontend == :__unset
-               matching_entries.first
-             else
-               matching_entries.find { |entry| entry[:frontend].to_s.casecmp?(frontend.to_s) }
-             end
+    target = select_frontend_entry(matching_entries, frontend)
 
     unless target
       handle_error("Delete failed. No entry for #{char_name} (#{game_code}) with frontend #{frontend}.", should_exit: false)
@@ -493,9 +543,12 @@ module ELogin
     when 'add'
       if args.length >= 3
         # Password is optional when adding another character to an
-        # already-saved account, so args[3] is only a password if it's not
-        # itself a flag (e.g. `;elogin add Char account --frontend=saga`).
-        if args[3] && !args[3].start_with?('--')
+        # already-saved account, so args[3] is only treated as a flag (not a
+        # literal password) when it actually matches a recognized one -- not
+        # merely for starting with "--", which would otherwise misclassify a
+        # genuine password like "--synthetic-password" as an omitted one.
+        if args[3] && args[3] !~ Lich::Common::Authentication::LoginHelpers::FRONTEND_PATTERN &&
+           args[3] !~ /^--custom-launch=/i
           password = args[3]
           extra_args = args[4..] || []
         else
