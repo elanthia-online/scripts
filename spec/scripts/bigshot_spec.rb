@@ -1,5 +1,3 @@
-# Spec for bigshot.lic Priority Hunt retargeting.
-#
 # We do NOT load the .lic file: it needs the whole Lich runtime (Settings,
 # XMLData, Spell, GTK, DRb ...). Instead the real method bodies are extracted
 # from scripts/bigshot.lic and evaluated against stubs, so these specs exercise
