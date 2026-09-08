@@ -1510,3 +1510,299 @@ RSpec.describe 'ELoot unskinnable-list management' do
     expect(messages.last[:text]).to include('greater earth elemental')
   end
 end
+
+# Regression coverage for a jewelry-typed item (e.g. "plain velvet headband") whose
+# `sellable` still lists the pawnshop, but the gemshop's jeweler declines it as not
+# their specialty ("That's not quite my field... I only deal in gems and jewelry"),
+# rather than quoting a too-high price. Before this fix Sell.appraise treated that as
+# an ordinary "no offer" and just stowed the item back, with no way to ever attempt
+# the pawnshop -- the item would cycle through every future sell run untouched. This
+# also covers the `skip_jewelry_guard:` escape hatch Sell.appraise now takes so the
+# pawnshop retry pass can actually appraise/sell an item its own jewelry/Pawnshop
+# early-return would otherwise unconditionally block.
+#
+# Same extraction approach as the rest of this file: real method bodies pulled from
+# eloot.lic and module_eval'd into a bare harness alongside named stubs for their
+# collaborators (ELoot.get_command/msg/ensure_items/data, StowList, Inventory,
+# Sell.sell_item), so the spec fails loudly instead of silently drifting if the
+# shipped logic changes shape.
+RSpec.describe 'ELoot::Sell.appraise' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:source) { File.read(eloot_path) }
+
+  let(:item_class) { Struct.new(:id, :name, :type, :sellable) }
+  let(:data_class) { Struct.new(:settings, :over_max, :pawn_recheck, :jewelry_wrong_shop) }
+
+  let(:settings) { { sell_appraise_gemshop: 14_999, sell_appraise_pawnshop: 4_999, sell_pawn_recheck: false } }
+  let(:data) { data_class.new(settings, [], [], []) }
+
+  # What the game sends back in response to the "appraise <item>" command, as the
+  # single matching line get_command would hand back. Each context overrides this
+  # with one of the real merchant responses to drive the branch under test.
+  let(:response) { nil }
+
+  let(:calls) { [] }
+
+  let(:harness) do
+    recorder = calls
+    reply = response
+    data_obj = data
+
+    mod = Module.new
+    mod.define_singleton_method(:get_command) do |command, _regex, **kw|
+      recorder << [:get_command, command, kw]
+      reply.nil? ? [] : [reply]
+    end
+    mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
+    mod.define_singleton_method(:ensure_items) { |**kw| recorder << [:ensure_items, kw] }
+    mod.define_singleton_method(:data) { data_obj }
+    mod.const_set(:ELoot, mod)
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { Hash.new('') }
+    mod.const_set(:StowList, stow_list)
+
+    inventory = Module.new
+    inventory.define_singleton_method(:single_drag) { |item| recorder << [:single_drag, item.name] }
+    inventory.define_singleton_method(:store_item) { |container, item| recorder << [:store_item, container, item.name] }
+    mod.const_set(:Inventory, inventory)
+
+    mod.module_eval(extract_lic_method(source, 'parse_appraisal', source_path: eloot_path))
+    mod.define_singleton_method(:sell_item) { |item, place, _data| recorder << [:sell_item, item.name, place] }
+    mod.module_eval(extract_lic_method(source, 'appraise', source_path: eloot_path))
+    mod.const_set(:Sell, mod)
+    mod
+  end
+
+  context 'the gemshop declines an item as not its specialty' do
+    let(:response) { 'The jeweler Etaenia says, "That\'s not quite my field, Renian.  I only deal in gems and jewelry."' }
+    let(:headband) { item_class.new('112890498', 'a plain velvet headband', 'jewelry', 'gemshop,pawnshop') }
+
+    it 'queues the item for a pawnshop sell attempt' do
+      harness.appraise(headband, 'Gemshop')
+
+      expect(data.jewelry_wrong_shop).to eq([headband])
+    end
+
+    it 'stows the item back rather than leaving it in hand' do
+      harness.appraise(headband, 'Gemshop')
+
+      expect(calls).to include([:single_drag, 'a plain velvet headband'])
+    end
+
+    it 'does not record it as over_max or queue it for the appraise-only pawn recheck' do
+      harness.appraise(headband, 'Gemshop')
+
+      expect(data.over_max).to be_empty
+      expect(data.pawn_recheck).to be_empty
+    end
+
+    context 'when the item is not declared sellable at the pawnshop' do
+      let(:headband) { item_class.new('112890498', 'a plain velvet headband', 'jewelry', 'gemshop') }
+
+      it 'does not queue it (nowhere else to sell it)' do
+        harness.appraise(headband, 'Gemshop')
+
+        expect(data.jewelry_wrong_shop).to be_empty
+      end
+    end
+  end
+
+  context 'the gemshop refuses an item as too valuable (distinct from "not my field")' do
+    let(:response) { 'The jeweler says, "I\'m not buying anything this valuable today."' }
+    let(:ring) { item_class.new('1', 'a platinum ring', 'jewelry', 'gemshop,pawnshop') }
+
+    it 'does not queue it for the wrong-shop pawnshop retry' do
+      harness.appraise(ring, 'Gemshop')
+
+      expect(data.jewelry_wrong_shop).to be_empty
+    end
+  end
+
+  context 'the jewelry/Pawnshop early-return guard' do
+    let(:necklace) { item_class.new('1', 'a gold necklace', 'jewelry', 'gemshop,pawnshop') }
+
+    it 'blocks appraisal at the pawnshop by default' do
+      harness.appraise(necklace, 'Pawnshop')
+
+      expect(calls).to be_empty
+    end
+
+    it 'is bypassed with skip_jewelry_guard: true, so the pawnshop retry pass can still appraise it' do
+      harness.appraise(necklace, 'Pawnshop', skip_jewelry_guard: true)
+
+      expect(calls.map(&:first)).to include(:get_command)
+    end
+  end
+
+  context 'a sold item still tags over_max with the note it was appraised with' do
+    let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+    let(:necklace) { item_class.new('1', 'a gold necklace', 'jewelry', 'gemshop,pawnshop') }
+
+    it 'carries the note through into the over_max record when over limit' do
+      harness.appraise(necklace, 'Pawnshop', skip_jewelry_guard: true, note: 'gemshop declined (not jewelry), over pawnshop limit')
+
+      expect(data.over_max.first[:note]).to eq('gemshop declined (not jewelry), over pawnshop limit')
+    end
+  end
+end
+
+# retry_wrong_shop_jewelry_at_pawnshop's whole purpose (its second commit, added after
+# review) is the start_silvers/silver_check wrapper that folds ordinary per-item pawnshop
+# sale proceeds into the breakdown -- Sell.sell_item only records proceeds itself when a
+# bulk-sale note is produced, so without this wrapper silvers earned here would silently
+# vanish from the final report. Exercised directly (Sell.appraise stubbed out) so a future
+# edit that drops or misplaces the wrapper fails a test instead of only showing up as a
+# short breakdown total in a live session.
+RSpec.describe 'ELoot::Sell.retry_wrong_shop_jewelry_at_pawnshop' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:source) { File.read(eloot_path) }
+
+  let(:item_class) { Struct.new(:id, :name, :type, :sellable) }
+  let(:hand_class) { Struct.new(:id) }
+  let(:data_class) { Struct.new(:settings, :over_max, :pawn_recheck, :jewelry_wrong_shop, :silver_breakdown) }
+
+  let(:headband) { item_class.new('1', 'a plain velvet headband', 'jewelry', 'gemshop,pawnshop') }
+  let(:queued) { [headband] }
+  let(:pawn_found) { true }
+  # [before, after] ELoot.silver_check readings the wrapper diffs -- a 250 silver gain.
+  let(:silver_sequence) { [1000, 1250] }
+  let(:calls) { [] }
+
+  let(:data) { data_class.new({}, [], [], queued, Hash.new(0)) }
+
+  let(:harness) do
+    recorder = calls
+    data_obj = data
+    silvers = silver_sequence.dup
+    found = pawn_found
+    hand_item = headband
+    hand_struct = hand_class
+
+    mod = Module.new
+    mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
+    mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
+    mod.define_singleton_method(:silver_check) { silvers.shift }
+    mod.define_singleton_method(:data) { data_obj }
+    mod.const_set(:ELoot, mod)
+
+    room = Module.new
+    current = Module.new
+    current.define_singleton_method(:find_nearest_by_tag) { |_tag| found ? 'pawnshop-room' : nil }
+    room.define_singleton_method(:current) { current }
+    mod.const_set(:Room, room)
+
+    inventory = Module.new
+    inventory.define_singleton_method(:drag) { |item| recorder << [:drag, item.name] }
+    mod.const_set(:Inventory, inventory)
+
+    game_obj = Module.new
+    game_obj.define_singleton_method(:right_hand) { hand_struct.new(hand_item.id) }
+    game_obj.define_singleton_method(:left_hand) { hand_struct.new(nil) }
+    mod.const_set(:GameObj, game_obj)
+
+    mod.define_singleton_method(:appraise) { |item, place, _data, **kw| recorder << [:appraise, item.id, place, kw] }
+    mod.module_eval(extract_lic_method(source, 'retry_wrong_shop_jewelry_at_pawnshop', source_path: eloot_path))
+    mod.const_set(:Sell, mod)
+    mod
+  end
+
+  it 'does nothing when the queue is empty' do
+    mod = harness
+    empty_data = data_class.new({}, [], [], [], Hash.new(0))
+    mod.define_singleton_method(:data) { empty_data }
+
+    mod.retry_wrong_shop_jewelry_at_pawnshop
+
+    expect(calls).to be_empty
+  end
+
+  context 'when no pawnshop is nearby' do
+    let(:pawn_found) { false }
+
+    it 'reports it and leaves the queue untouched, without ever reading silver_check' do
+      harness.retry_wrong_shop_jewelry_at_pawnshop
+
+      expect(data.jewelry_wrong_shop).to eq([headband])
+      expect(calls.map(&:first)).not_to include(:go2, :appraise)
+    end
+  end
+
+  it 'adds the pawnshop silver delta to the breakdown' do
+    harness.retry_wrong_shop_jewelry_at_pawnshop
+
+    expect(data.silver_breakdown['Pawnshop']).to eq(250)
+  end
+
+  it 'clears the retry queue after processing' do
+    harness.retry_wrong_shop_jewelry_at_pawnshop
+
+    expect(data.jewelry_wrong_shop).to eq([])
+  end
+
+  it 'drags each item and re-appraises it at the pawnshop with the guard bypassed' do
+    harness.retry_wrong_shop_jewelry_at_pawnshop
+
+    expect(calls).to include([:drag, 'a plain velvet headband'])
+    expect(calls).to include([:appraise, '1', 'Pawnshop', { skip_jewelry_guard: true, note: 'gemshop declined (not jewelry), over pawnshop limit' }])
+  end
+end
+
+# Sell.over_max_rows renders the "Over Max Value" breakdown table. It groups records
+# with no :note together, then groups notes into their own subheadings -- originally
+# just the one "Gemshop refused, pawn appraisals:" case, now generalized so a second,
+# distinct note (added for the gemshop-declined-as-not-jewelry case above) gets its
+# own heading instead of being merged into the first one under a misleading label.
+RSpec.describe 'ELoot::Sell.over_max_rows' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:source) { File.read(eloot_path) }
+
+  let(:harness) do
+    mod = Module.new
+    eloot = Module.new
+    eloot.define_singleton_method(:capitalize_words) { |s| s.split.map(&:capitalize).join(' ') }
+    eloot.define_singleton_method(:format_number) { |n| n.to_s }
+    mod.const_set(:ELoot, eloot)
+    mod.module_eval(extract_lic_method(source, 'over_max_rows', source_path: eloot_path))
+    mod
+  end
+
+  it 'returns an empty array for no records' do
+    expect(harness.over_max_rows([])).to eq([])
+    expect(harness.over_max_rows(nil)).to eq([])
+  end
+
+  it 'lists un-noted records under the plain header, most valuable first' do
+    records = [
+      { item: 'a small gem', value: 100, raw: '100', stowed: nil },
+      { item: 'a large gem', value: 500, raw: '500', stowed: nil }
+    ]
+
+    rows = harness.over_max_rows(records)
+
+    expect(rows).to include(['A Large Gem', '   500'])
+    expect(rows.index(['A Large Gem', '   500'])).to be < rows.index(['A Small Gem', '   100'])
+  end
+
+  it 'gives each distinct note its own subheading, not a shared one' do
+    records = [
+      { item: 'a heavy diamond', value: 900_000, raw: '900,000', stowed: nil, note: 'gemshop refused, pawn appraisal' },
+      { item: 'a plain velvet headband', value: 200, raw: '200', stowed: nil, note: 'gemshop declined (not jewelry), over pawnshop limit' }
+    ]
+
+    rows = harness.over_max_rows(records)
+
+    expect(rows).to include(['Gemshop refused, pawn appraisals:', ''])
+    expect(rows).to include(['Gemshop declined (not jewelry), over pawnshop limit:', ''])
+    expect(rows).to include(['A Heavy Diamond', '   900,000'])
+    expect(rows).to include(['A Plain Velvet Headband', '   200'])
+  end
+
+  it 'falls back to a capitalized version of the note text for an unmapped note' do
+    records = [{ item: 'a mystery item', value: 10, raw: '10', stowed: nil, note: 'some future refusal reason' }]
+
+    rows = harness.over_max_rows(records)
+
+    expect(rows).to include(['Some future refusal reason:', ''])
+  end
+end
