@@ -1647,6 +1647,107 @@ RSpec.describe 'ELoot::Sell.appraise' do
   end
 end
 
+# retry_wrong_shop_jewelry_at_pawnshop's whole purpose (its second commit, added after
+# review) is the start_silvers/silver_check wrapper that folds ordinary per-item pawnshop
+# sale proceeds into the breakdown -- Sell.sell_item only records proceeds itself when a
+# bulk-sale note is produced, so without this wrapper silvers earned here would silently
+# vanish from the final report. Exercised directly (Sell.appraise stubbed out) so a future
+# edit that drops or misplaces the wrapper fails a test instead of only showing up as a
+# short breakdown total in a live session.
+RSpec.describe 'ELoot::Sell.retry_wrong_shop_jewelry_at_pawnshop' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:source) { File.read(eloot_path) }
+
+  let(:item_class) { Struct.new(:id, :name, :type, :sellable) }
+  let(:hand_class) { Struct.new(:id) }
+  let(:data_class) { Struct.new(:settings, :over_max, :pawn_recheck, :jewelry_wrong_shop, :silver_breakdown) }
+
+  let(:headband) { item_class.new('1', 'a plain velvet headband', 'jewelry', 'gemshop,pawnshop') }
+  let(:queued) { [headband] }
+  let(:pawn_found) { true }
+  # [before, after] ELoot.silver_check readings the wrapper diffs -- a 250 silver gain.
+  let(:silver_sequence) { [1000, 1250] }
+  let(:calls) { [] }
+
+  let(:data) { data_class.new({}, [], [], queued, Hash.new(0)) }
+
+  let(:harness) do
+    recorder = calls
+    data_obj = data
+    silvers = silver_sequence.dup
+    found = pawn_found
+    hand_item = headband
+    hand_struct = hand_class
+
+    mod = Module.new
+    mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
+    mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
+    mod.define_singleton_method(:silver_check) { silvers.shift }
+    mod.define_singleton_method(:data) { data_obj }
+    mod.const_set(:ELoot, mod)
+
+    room = Module.new
+    current = Module.new
+    current.define_singleton_method(:find_nearest_by_tag) { |_tag| found ? 'pawnshop-room' : nil }
+    room.define_singleton_method(:current) { current }
+    mod.const_set(:Room, room)
+
+    inventory = Module.new
+    inventory.define_singleton_method(:drag) { |item| recorder << [:drag, item.name] }
+    mod.const_set(:Inventory, inventory)
+
+    game_obj = Module.new
+    game_obj.define_singleton_method(:right_hand) { hand_struct.new(hand_item.id) }
+    game_obj.define_singleton_method(:left_hand) { hand_struct.new(nil) }
+    mod.const_set(:GameObj, game_obj)
+
+    mod.define_singleton_method(:appraise) { |item, place, _data, **kw| recorder << [:appraise, item.id, place, kw] }
+    mod.module_eval(extract_lic_method(source, 'retry_wrong_shop_jewelry_at_pawnshop', source_path: eloot_path))
+    mod.const_set(:Sell, mod)
+    mod
+  end
+
+  it 'does nothing when the queue is empty' do
+    mod = harness
+    empty_data = data_class.new({}, [], [], [], Hash.new(0))
+    mod.define_singleton_method(:data) { empty_data }
+
+    mod.retry_wrong_shop_jewelry_at_pawnshop
+
+    expect(calls).to be_empty
+  end
+
+  context 'when no pawnshop is nearby' do
+    let(:pawn_found) { false }
+
+    it 'reports it and leaves the queue untouched, without ever reading silver_check' do
+      harness.retry_wrong_shop_jewelry_at_pawnshop
+
+      expect(data.jewelry_wrong_shop).to eq([headband])
+      expect(calls.map(&:first)).not_to include(:go2, :appraise)
+    end
+  end
+
+  it 'adds the pawnshop silver delta to the breakdown' do
+    harness.retry_wrong_shop_jewelry_at_pawnshop
+
+    expect(data.silver_breakdown['Pawnshop']).to eq(250)
+  end
+
+  it 'clears the retry queue after processing' do
+    harness.retry_wrong_shop_jewelry_at_pawnshop
+
+    expect(data.jewelry_wrong_shop).to eq([])
+  end
+
+  it 'drags each item and re-appraises it at the pawnshop with the guard bypassed' do
+    harness.retry_wrong_shop_jewelry_at_pawnshop
+
+    expect(calls).to include([:drag, 'a plain velvet headband'])
+    expect(calls).to include([:appraise, '1', 'Pawnshop', { skip_jewelry_guard: true, note: 'gemshop declined (not jewelry), over pawnshop limit' }])
+  end
+end
+
 # Sell.over_max_rows renders the "Over Max Value" breakdown table. It groups records
 # with no :note together, then groups notes into their own subheadings -- originally
 # just the one "Gemshop refused, pawn appraisals:" case, now generalized so a second,
