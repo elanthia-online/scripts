@@ -919,11 +919,11 @@ RSpec.describe 'ELogin (elogin.lic)' do
     let(:run_body) { ELoginSpec::RUN_SRC }
 
     it 'only checks for a saga-tagged entry when saga was actually requested' do
-      expect(run_body).to match(/if frontend_override\.to_s\.casecmp\?\('saga'\)/)
+      expect(run_body).to match(/if canonical_frontend\(frontend_override\)\.to_s\.casecmp\?\('saga'\)/)
     end
 
     it 'requires an entry tagged frontend: saga for the exact character/instance' do
-      expect(run_body).to match(/d\[:frontend\]\.to_s\.casecmp\?\('saga'\)/)
+      expect(run_body).to match(/canonical_frontend\(d\[:frontend\]\)\.to_s\.casecmp\?\('saga'\)/)
       expect(run_body).to match(/d\[:game_code\]\.to_s\.casecmp\?\(login_game_code\)/)
     end
 
