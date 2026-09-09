@@ -20,7 +20,7 @@ RSpec.describe 'eLoot guarded room API' do
       class << self
         attr_accessor :current, :list
       end
-    end
+    end.tap { |value| value.const_set(:EXECUTION_GUARD_PROTOCOL, 1) }
   end
   let(:harness) do
     namespace = Module.new
@@ -271,6 +271,12 @@ RSpec.describe 'eLoot guarded room API' do
     expect { run_room(owner: Object.new) }.to raise_error(api::RoomScopeError, /current guarded/)
     allow(owner).to receive(:execution_guard_active?).and_return(false)
     expect { run_room }.to raise_error(api::RoomScopeError, /current guarded/)
+    expect(api.data).to be_nil
+  end
+
+  it 'requires the native Lich execution-guard protocol before initialization' do
+    script_class.send(:remove_const, :EXECUTION_GUARD_PROTOCOL)
+    expect { run_room }.to raise_error(api::RoomScopeError, /execution guard protocol/)
     expect(api.data).to be_nil
   end
 
