@@ -1,8 +1,10 @@
 module BigshotQuickSafetySpec
   source = File.read(File.expand_path('../../scripts/bigshot.lic', __dir__)).gsub("\r\n", "\n")
   safety = source[/^  def quick_safety_reason\(.*?^  end$/m]
-  safety += "\n" + source[/^  def quick_environment_reason\n.*?^  end$/m]
   raise 'could not extract quick_safety_reason' unless safety
+  environment = source[/^  def quick_environment_reason\n.*?^  end$/m]
+  raise 'could not extract quick_environment_reason' unless environment
+  safety += "\n" + environment
 
   Creature = Struct.new(:id, :name, :noun, :type, :status)
 

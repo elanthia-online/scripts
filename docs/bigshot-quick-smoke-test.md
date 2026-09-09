@@ -222,7 +222,8 @@ including native execution guards and real GTK save/load/layout checks. The
 matching LAB development worktree passed 718 Python tests and 132 focused Ruby
 tests (789 assertions). These results do not establish a live area pass.
 
-Player-authorized acceptance on 2026-09-10 completed one no-loot seek outing:
+Player-authorized acceptance on 2026-09-10 ICT (2026-09-09 UTC) completed one
+no-loot seek outing:
 28 rooms outbound, four attributed attacks confirmed as four kills, 28 rooms
 back to the configured refuge, original equipment and standing restored, owners
 released, full health, and no alerts. A separate ordinary-stop outing returned

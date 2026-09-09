@@ -8,12 +8,15 @@ module BigshotQuickOutcomeSpec
 end
 
 RSpec.describe BigshotQuickOutcomeSpec::QuickOutcomeEvidence do
-  let(:context) { { connection_id: 7, game: 'GSIV', character: 'Fixture', room_epoch: 8, sequence: 10 } }
+  let(:context) do
+    { connection_id: 7, game: 'GSIV', character: String.new('Fixture'), room_epoch: 8, sequence: 10 }
+  end
   let(:now) { [100.0] }
   let(:capacity) { 32 }
   let(:collector) { described_class.new(context: context, target_id: '123', capacity: capacity, clock: -> { now[0] }) }
   let(:event) do
-    { source: context.merge(sequence: 11, received_at: 100.1), observation_batch: { id: 1, index: 0, size: 1 },
+    { source: context.merge(character: String.new(context[:character]), sequence: 11, received_at: 100.1),
+      observation_batch: { id: 1, index: 0, size: 1 },
       _uid: 0, root_uid: 0, parent_uid: nil, _attack_born: true, attacker: nil, target: { id: 123 },
       hits: [], statuses: [], outcomes: [:miss], flares: [] }
   end
@@ -133,7 +136,7 @@ RSpec.describe BigshotQuickOutcomeSpec::QuickOutcomeEvidence do
   it 'copies only evidence facts so caller mutation cannot alter an admitted miss' do
     observe
     event[:outcomes].replace([:hit])
-    event[:source][:character].replace('Changed') unless event[:source][:character].frozen?
+    event[:source][:character].replace('Changed')
     expect(collector.result(context: context)).to eq(outcome: :ineffective, reason: :native_failure_observed)
   end
 

@@ -30,7 +30,7 @@ Player-side verification follows the [supervised smoke-test checklist](bigshot-q
 
 ## Local combat commands
 
-```
+```text
 ;bigshot quick clear
 ;bigshot quick watch --profile "Combat profile"
 ;bigshot quick watch --profile "Combat profile" --area profile
@@ -82,7 +82,8 @@ step/send counts and limits, separately from combat and loot usage. A clean
 field handoff does not prove a kill, loot award, or safe-town arrival.
 
 This requires the development seek-capable Bigshot build. A player-authorized
-acceptance run traversed 28 rooms to the configured profile area, made four
+acceptance run on 2026-09-10 ICT (2026-09-09 UTC) traversed 28 rooms to the
+configured profile area, made four
 game-confirmed attributed kills, and returned 28 rooms to its refuge. That proves
 the tested route/profile only; other seek paths and failure modes remain pending.
 
@@ -142,7 +143,7 @@ because following a transferred tether would need new target authorization.
 
 ## Controls
 
-```
+```text
 ;bigshot quick status
 ;bigshot quick hold
 ;bigshot quick resume

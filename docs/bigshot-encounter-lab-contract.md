@@ -72,7 +72,12 @@ LAB retains its manifest, ActionBroker, independent Ruby validation, and
 one-operation-per-character policy. There is no new listener, credential, model
 combat loop, arbitrary Ruby control, or script-argument bypass.
 
-An explicitly authorized, locally registered example uses:
+An explicitly authorized, locally registered example uses the commands below.
+The private `controller.quick-trial` registration—not these user-supplied CLI
+arguments—must resolve a reviewed `quick_refuge` entry and launch Bigshot with
+`--area profile`, `--supervised-start-v1 WORK,CLEANUP`, and
+`--supervised-refuge-v1 ROOM,RETURN`. Registration admission fails when any of
+those values is absent or invalid.
 
 ```text
 labctl perform Testmage controller.quick-trial --arg 'sequence="probe-sequence"' --arg 'target_id=12345' --expected-generation GENERATION --operation-timeout 90
@@ -230,7 +235,8 @@ includes misses, hits, warding, another actor/target, flares, stale queue receip
 room transitions, disabled tracking, and a controller holding after two misses.
 The real GTK save/discard handlers also have virtual-display coverage.
 
-Supervised client/game verification is partial. On 2026-09-10, a player-authorized
+Supervised client/game verification is partial. On 2026-09-10 ICT
+(2026-09-09 UTC), a player-authorized
 run traveled 28 rooms from its refuge, produced four attributed attacks confirmed
 as four kills, returned 28 rooms, and verified original hands, standing, health,
 released ownership, and no alerts. A separate ordinary-stop run returned safely.

@@ -88,8 +88,8 @@ RSpec.describe 'Quick selector-bound production incant path' do
 
   it 'rechecks the selector after the fresh execution snapshot before transport' do
     change_during_snapshot = false
-    allow(guard).to receive(:checkpoint!).and_wrap_original do |original|
-      result = original.call
+    allow(guard).to receive(:checkpoint!).and_wrap_original do |original, *args, **options|
+      result = original.call(*args, **options)
       xml.current_target_id = '999' if change_during_snapshot
       result
     end
