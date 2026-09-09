@@ -434,6 +434,24 @@ module BSProfiles
     @map_names[image] = name || File.basename(image.to_s, '.*')
   end
 
+  # ;map's dark-mode preference. It lives in map.lic's own script settings,
+  # so read it by script name; anything goes wrong, default to light.
+  def map_dark_default
+    !!Settings.get_scoped_setting(':', 'dark_mode', script_name: 'map')
+  rescue StandardError
+    false
+  end
+
+  # Path for a map image, preferring the maps-dark sibling of MAP_DIR the
+  # way ;map does when dark mode is on and that file exists.
+  def map_image_path(image, dark)
+    light = File.join(MAP_DIR, image)
+    return light unless dark
+
+    dark_path = File.join(MAP_DIR.sub(/maps\z/, 'maps-dark'), image)
+    File.exist?(dark_path) ? dark_path : light
+  end
+
   # A marker image the way ;map draws its tag markers: Cairo onto an ARGB
   # surface, then wrapped in a pixbuf. Cairo's ARGB32 comes out BGRA in
   # memory while the pixbuf reads RGBA, so red and blue are swapped on the
@@ -553,7 +571,17 @@ module BSProfiles
       end
       data ||= BSProfiles.defaults
       BSProfiles.templates # warm the creature cache off the GTK thread
-      new(data.transform_keys(&:to_sym), name).start
+      new(stamp_profile(data.transform_keys(&:to_sym), name), name).start
+    end
+
+    # The file the window represents is authoritative over whatever
+    # profile_current a copied or renamed file still carries inside it.
+    # load_settings pours @settings into the widgets, profile_current entry
+    # included, so this has to be set in the hash before any load.
+    def self.stamp_profile(settings, name)
+      settings[:profile_current] = name.to_s
+      settings[:save_profile_name] = ''
+      settings
     end
 
     # Widgets on the Profiles tab whose changes are bookkeeping, not edits.
@@ -591,6 +619,14 @@ module BSProfiles
       end
     end
 
+    # Boon checkboxes bypass on_update: bigshot wires them straight to
+    # update_boon. Count those as edits too, except while a profile is being
+    # poured into the widgets.
+    def update_boon(obj, key, value)
+      super
+      mark_dirty unless @loading
+    end
+
     # Load Profile button: same as bigshot, but fills in defaults for keys an
     # older profile lacks, and tracks which file the editor now represents.
     def on_profile_load
@@ -618,8 +654,18 @@ module BSProfiles
     end
 
     # Bigshot blanks the Profiles-tab tooltips; give them real ones here.
+    #
+    # Bigshot's own set_tooltips still names a widget its window no longer
+    # has (boon_flee_from). Inside Lich that is silent, because Lich makes
+    # nil swallow unknown methods; anywhere else it raises and would abort
+    # the initializer before the window's signals are connected. Contain it
+    # so a missing tooltip is all that is lost either way.
     def set_tooltips
-      super
+      begin
+        super
+      rescue NoMethodError => e
+        respond "bsprofiles: bigshot's tooltip setup stopped early (#{e.message}); continuing." if $bigshot_debug
+      end
       self['profile_name'].tooltip_text = 'Saved profiles for this character. Pick one and click Load Profile.'
       self['profile_button'].tooltip_text = "Load the chosen profile into the editor, replacing what is here.\nUnsaved edits are lost."
       self['profile_current'].tooltip_text = 'The profile file this window represents. Update Profile writes to it.'
@@ -905,6 +951,7 @@ module BSProfiles
         defs.each { |key, meta| @settings[key] = meta[:default] if @settings[key].nil? }
       end
       @settings.delete_if { |key, _| Bigshot::Setup.get_category(key).nil? }
+      Editor.stamp_profile(@settings, choice)
       self['profile_current'].text = choice
       @loading = true
       load_settings(false)
@@ -1148,8 +1195,8 @@ module BSProfiles
       @cr_name.signal_connect('changed') { guard { refresh_creature_list } }
       @cr_area_filter.signal_connect('changed') { guard { refresh_creature_list } }
       @cr_undead.signal_connect('changed') { guard { refresh_creature_list } }
-      @cr_room.signal_connect('activate') { guard { refresh_creature_list } }
-      here_btn.signal_connect('clicked') { guard { refresh_creature_list } }
+      @cr_room.signal_connect('activate') { guard { creatures_at_room } }
+      here_btn.signal_connect('clicked') { guard { creatures_at_room } }
       reset_btn.signal_connect('clicked') { guard { reset_filters } }
       @cr_tv.selection.signal_connect('changed') { |sel| guard { creature_row_selected(sel.selected) } }
       @area_combo.signal_connect('changed') { guard { select_area(@area_combo.active) } }
@@ -1177,6 +1224,19 @@ module BSProfiles
       @cr_undead.set_active(0)
       @lvl_min.value = lo
       @lvl_max.value = hi
+      refresh_creature_list
+    end
+
+    # Enter in the room box or the Creatures at room button. A blank box
+    # falls back to the profile's hunting room; the room is written into the
+    # box so the filter in force is visible, and Reset clears it as usual.
+    def creatures_at_room
+      if @cr_room.text.to_s.strip.empty?
+        fallback = self['hunting_room_id'].text.to_s.strip
+        return status('type a room, or set a hunting room on the Hunting tab first') if fallback.empty?
+
+        @cr_room.text = fallback
+      end
       refresh_creature_list
     end
 
@@ -1223,10 +1283,26 @@ module BSProfiles
     end
 
     def creature_row_selected(iter)
-      return if iter.nil?
+      t = iter && BSProfiles.templates[iter[3]]
+      if t
+        show_creature(t)
+      else
+        clear_creature
+      end
+    end
 
-      t = BSProfiles.templates[iter[3]] or return
-      show_creature(t)
+    # No creature selected (filters matched nothing, or the list was
+    # rebuilt): drop the stale creature so the send-to-profile buttons have
+    # nothing to act on.
+    def clear_creature
+      @template = nil
+      @cr_detail.set_markup('<i>Select a creature.</i>')
+      @area_combo.remove_all
+      @room_store.clear
+      @cos_store.clear
+      @unmapped_count = 0
+      refresh_room_summary
+      refresh_map_tab
     end
 
     # Point the detail, area and room panels at +t+.
@@ -1352,8 +1428,11 @@ module BSProfiles
 
     # Room ids of the highlighted rows, in list order, unmapped rows skipped.
     def selected_room_ids(tv)
-      rows = tv.selection.selected_rows.map { |path| @room_store.get_iter(path) }.compact
-      rows.map { |row| row[4].to_i }.select(&:positive?).uniq
+      ids = []
+      # selected_each hands over iters directly; selected_rows returns
+      # [paths, model] on current bindings and would need unpacking.
+      tv.selection.selected_each { |_model, _path, iter| ids << iter[4].to_i }
+      ids.select(&:positive?).uniq
     end
 
     # Single-room setting: first highlighted row.
@@ -1454,6 +1533,10 @@ module BSProfiles
       @map_show_perimeter.active = true
       @map_show_perimeter.tooltip_text = "Show the rooms that \"Boundaries <- perimeter\" would set right now: the ring just outside the ticked rooms.\nPurple X. Changes as you tick and untick."
       bar.pack_start(@map_show_perimeter, false, false, 0)
+      @map_dark = Gtk::CheckButton.new('Dark')
+      @map_dark.active = BSProfiles.map_dark_default
+      @map_dark.tooltip_text = "Use the dark map images from the maps-dark folder when they exist, as ;map does.\nStarts from ;map's own dark mode setting."
+      bar.pack_start(@map_dark, false, false, 0)
       outer.pack_start(bar, false, false, 0)
 
       legend = Gtk::Label.new
@@ -1490,6 +1573,7 @@ module BSProfiles
       anchor = lambda { |p| @map_gc << p; p }
       @map_combo.signal_connect('changed', &anchor.call(proc { guard { map_combo_changed }; false }))
       @map_show_perimeter.signal_connect('toggled', &anchor.call(proc { guard { refresh_map_markers }; false }))
+      @map_dark.signal_connect('toggled', &anchor.call(proc { guard { show_map(@map_current) }; false }))
       zoom_out.signal_connect('clicked', &anchor.call(proc { guard { map_zoom(@map_scale / 1.25) }; false }))
       zoom_in.signal_connect('clicked', &anchor.call(proc { guard { map_zoom(@map_scale * 1.25) }; false }))
       zoom_fit.signal_connect('clicked', &anchor.call(proc { guard { map_zoom_fit }; false }))
@@ -1583,7 +1667,8 @@ module BSProfiles
     # ---- drawing ----
 
     def map_pixbuf(image)
-      @map_pixbufs[image] ||= GdkPixbuf::Pixbuf.new(file: File.join(MAP_DIR, image))
+      path = BSProfiles.map_image_path(image, @map_dark&.active?)
+      @map_pixbufs[path] ||= GdkPixbuf::Pixbuf.new(file: path)
     end
 
     def show_map(image, center_on: nil)
