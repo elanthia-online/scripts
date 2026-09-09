@@ -298,7 +298,7 @@ RSpec.describe 'eLoot guarded room API' do
   end
 
   it 'rejects malformed corpse IDs and nonboolean floor choices' do
-    [[], ['0'].freeze, ['#123'].freeze, ['1;look'].freeze, [Object.new].freeze].each do |ids|
+    [[].freeze, ['0'].freeze, ['#123'].freeze, ['1;look'].freeze, [Object.new].freeze].each do |ids|
       expect { run_room(corpse_ids: ids) }.to raise_error(ArgumentError)
     end
     expect { run_room(floor: 'yes') }.to raise_error(ArgumentError)
