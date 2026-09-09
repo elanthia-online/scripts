@@ -9,6 +9,9 @@ see the smoke-test checklist for scope and remaining checks. LAB's shipped contr
 registry remains empty. This document describes inspected interfaces, not
 capabilities guaranteed by an installed version. See the
 [user guide](bigshot-quick-combat.md) and [implementation plan](bigshot-encounters-plan.md).
+The independently reviewable eLoot and go2 integration seams are proposed in
+[EO Scripts #2457](https://github.com/elanthia-online/scripts/pull/2457) and
+[EO Scripts #2458](https://github.com/elanthia-online/scripts/pull/2458).
 
 ## Public commands and registration boundary
 

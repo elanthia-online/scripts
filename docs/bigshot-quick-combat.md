@@ -10,6 +10,10 @@ script metadata must name the assigned minimum version. Startup checks the APIs 
 issuing commands. Ordinary `;bigshot quick`, `quick once` and `quick single`
 retain their existing behavior when no expanded Quick run owns Bigshot.
 
+Room cleanup and supervised travel also depend on the separately scoped
+[eLoot PR #2457](https://github.com/elanthia-online/scripts/pull/2457) and
+[go2 PR #2458](https://github.com/elanthia-online/scripts/pull/2458).
+
 Registered supervisors may use the private `--supervised-start-v1 WORK,CLEANUP`
 launch selector after verifying the script's `SUPERVISED_START_PROTOCOL = 1`
 declaration. Those absolute monotonic deadlines restrict this run only. Quick
