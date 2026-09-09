@@ -249,7 +249,7 @@ passing fixtures. No script or registration was deployed by this work.
 
 Source paths are relative to their repositories:
 
-- Bigshot: `scripts/bigshot.lic`, `spec/scripts/bigshot_quick_*_spec.rb`, and
+- Bigshot: `scripts/bigshot.lic`, `spec/scripts/bigshot/*_spec.rb`, and
   [the current user guide](bigshot-quick-combat.md).
 - Companion Lich: `lib/common/script_execution_guard.rb`, `lib/games.rb`,
   `lib/gemstone/combat/`, `docs/script-execution-guard.md`, and
