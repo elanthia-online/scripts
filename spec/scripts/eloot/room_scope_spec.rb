@@ -1,11 +1,11 @@
 # frozen_string_literal: true
 
-require_relative '../spec_helper'
+require_relative '../../spec_helper'
 require 'ostruct'
 require 'tmpdir'
 
 RSpec.describe 'eLoot guarded room API' do
-  let(:source_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:source_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(source_path) }
   let(:owner) do
     Object.new.tap do |value|

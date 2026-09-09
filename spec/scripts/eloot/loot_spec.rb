@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require_relative '../spec_helper'
+require_relative '../../spec_helper'
 
 # RSpec for ELoot::Loot.pool_full_recovery? (the sell-and-return recovery decision).
 #
@@ -22,7 +22,7 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   # Sourcing the real method keeps this spec from drifting from the shipped code; if the
   # source or method cannot be found, it fails loudly rather than passing on a stale copy.
   let(:predicate) do
-    path = find_lic_source('eloot.lic', from: __dir__)
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
     body = extract_lic_method(File.read(path), 'pool_full_recovery?', source_path: path)
 
     Module.new { module_eval(body) }
@@ -87,7 +87,7 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
 end
 
 RSpec.describe 'ELoot disk-backed box routing' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -203,7 +203,7 @@ end
 # or method cannot be found the spec fails loudly rather than passing on a stale copy.
 
 RSpec.describe 'ELoot::Loot.loot_specials' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:method_body) { extract_lic_method(File.read(eloot_path), 'loot_specials', source_path: eloot_path) }
 
@@ -366,7 +366,7 @@ end
 # the shipped source.
 
 RSpec.describe 'ELoot box-looting call sites' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -438,7 +438,7 @@ end
 # never opens, so the predicate and the routing are pinned here.
 
 RSpec.describe 'ELoot::Sell.town_openable?' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -533,7 +533,7 @@ RSpec.describe 'ELoot::Sell.town_openable?' do
 end
 
 RSpec.describe 'ELoot::Sell.process_boxes routing' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -582,7 +582,7 @@ end
 # of its own, though, so it is exercised for real against a small stand-in for Sell/ELoot.
 
 RSpec.describe 'ELoot::Sell locksmith_priority routing' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -740,7 +740,7 @@ RSpec.describe 'ELoot::Sell.gem_bounty_override?' do
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
     ].find { |p| File.exist?(p) }
     raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
@@ -829,7 +829,7 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
     ].find { |p| File.exist?(p) }
     raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
@@ -1037,7 +1037,7 @@ RSpec.describe 'ELoot::Sell.locksmith insufficient-silver retry' do
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
     ].find { |p| File.exist?(p) }
     raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
@@ -1112,7 +1112,7 @@ RSpec.describe 'ELoot::Sell.process_boxes gem-bounty predicate reuse' do
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
     ].find { |p| File.exist?(p) }
     raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
@@ -1149,7 +1149,7 @@ end
 # the spec fails loudly rather than passing on a stale copy.
 
 RSpec.describe 'ELoot.marked_unsellable?' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -1234,7 +1234,7 @@ RSpec.describe 'ELoot.marked_unsellable?' do
 end
 
 RSpec.describe 'ELoot.toss' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -1408,7 +1408,7 @@ end
 # source, the same way the box-looting call sites above are pinned.
 
 RSpec.describe 'ELoot trash/drop call sites' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -1446,7 +1446,7 @@ RSpec.describe 'ELoot trash/drop call sites' do
 end
 
 RSpec.describe 'ELoot unskinnable-list management' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
   let(:settings) { { unskinnable: ['massive troll king', 'greater earth elemental'] } }
   let(:data) { Struct.new(:settings).new(settings) }
@@ -1527,7 +1527,7 @@ end
 # Sell.sell_item), so the spec fails loudly instead of silently drifting if the
 # shipped logic changes shape.
 RSpec.describe 'ELoot::Sell.appraise' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
   let(:item_class) { Struct.new(:id, :name, :type, :sellable) }
@@ -1655,7 +1655,7 @@ end
 # edit that drops or misplaces the wrapper fails a test instead of only showing up as a
 # short breakdown total in a live session.
 RSpec.describe 'ELoot::Sell.retry_wrong_shop_jewelry_at_pawnshop' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
   let(:item_class) { Struct.new(:id, :name, :type, :sellable) }
@@ -1754,7 +1754,7 @@ end
 # distinct note (added for the gemshop-declined-as-not-jewelry case above) gets its
 # own heading instead of being merged into the first one under a misleading label.
 RSpec.describe 'ELoot::Sell.over_max_rows' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
   let(:harness) do
