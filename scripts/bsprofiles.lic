@@ -47,16 +47,25 @@
       creature shows its full template (attacks, defenses, TDs, treasure,
       tips), its areas, the rooms in the chosen area with checkboxes, and the
       other creatures that spawn there. The "Send to profile" box pushes the
-      result into hunting room / rest room / boundaries / targets.
+      result into hunting room / rally points / boundaries / targets.
       "Boundaries <- perimeter" computes the ring of rooms just outside the
       checked rooms, which is what bigshot's hunting_boundaries expects.
+    - Map tab: the same map images ;map uses, showing the chosen area's rooms
+      (green X ticked, grey X not) plus the profile's start room, rally points
+      and boundaries, so you can see the fence. Click a room to tick or untick
+      it, drag to pan, Ctrl+wheel or the buttons to zoom.
 
   author: Nisugi
   game: gs
   tags: bigshot, profiles, hunting, gui
-  version: 1.0.0
+  version: 1.1.0
 
   changelog:
+    1.1.0 (2026-09-09)
+      - Map tab: area rooms, ticks, start/rally/boundary overlays, click to tick
+      - Creatures tab rebuilt: level band, area and undead filters, full
+        template detail, co-spawns, multi-select rooms, rally points
+      - tooltips everywhere, live footer
     1.0.0 (2026-09-09)
       - initial release
 =end
@@ -378,6 +387,62 @@ module BSProfiles
     text.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
   end
 
+  # ------------------------------------------------------------------ map --
+
+  # Display name for a map image, from the mapdb's meta:mapname tag when a
+  # room on that map carries one, else the file name.
+  def map_display_name(image)
+    @map_names ||= {}
+    return @map_names[image] if @map_names.key?(image)
+
+    name = nil
+    Map.list.compact.each do |r|
+      next unless r.image == image
+
+      tag = Array(r.tags).find { |t| t.to_s.start_with?('meta:mapname:') }
+      next unless tag
+
+      name = tag.to_s.sub('meta:mapname:', '')
+      break
+    end
+    @map_names[image] = name || File.basename(image.to_s, '.*')
+  end
+
+  # A marker image the way ;map draws its tag markers: Cairo onto an ARGB
+  # surface, then wrapped in a pixbuf. Cairo's ARGB32 comes out BGRA in
+  # memory while the pixbuf reads RGBA, so red and blue are swapped on the
+  # way in.
+  #
+  # @param shape [Symbol] :x, :box or :circle
+  def marker_pixbuf(width, height, rgb, shape, line = 2)
+    width = [width, 10].max
+    height = [height, 10].max
+    surface = Cairo::ImageSurface.new(Cairo::FORMAT_ARGB32, width, height)
+    ctx = Cairo::Context.new(surface)
+    ctx.set_source_rgba(rgb[2], rgb[1], rgb[0], 0.85)
+    ctx.set_line_width(line)
+    half = line / 2.0
+    case shape
+    when :x
+      ctx.move_to(half, half)
+      ctx.line_to(width - half, height - half)
+      ctx.stroke
+      ctx.move_to(width - half, half)
+      ctx.line_to(half, height - half)
+      ctx.stroke
+    when :box
+      ctx.rectangle(half, half, width - line, height - line)
+      ctx.stroke
+    when :circle
+      ctx.arc(width / 2.0, height / 2.0, [width, height].min / 2.0 - half, 0, 2 * Math::PI)
+      ctx.stroke
+    end
+    GdkPixbuf::Pixbuf.new(
+      data: surface.data, colorspace: GdkPixbuf::Colorspace::RGB, has_alpha: true,
+      bits_per_sample: 8, width: width, height: height, rowstride: surface.stride
+    )
+  end
+
   # ------------------------------------------------------------------ cli --
 
   def print_compare(name_a, name_b)
@@ -606,8 +671,11 @@ module BSProfiles
       Lich::Messaging.msg('plain', " bsprofiles: editor settings applied to bigshot (UserVars.op)#{@dirty ? ' - remember they are not saved to a profile yet' : ''}.")
     end
 
+    MAP_ENTRIES = %w[hunting_room_id rallypoint_room_ids hunting_boundaries].freeze
+
     def set_entry(id, text)
       self[id].text = text.to_s
+      refresh_map_markers if MAP_ENTRIES.include?(id.to_s)
     end
 
     def append_list_entry(id, item)
@@ -662,7 +730,14 @@ module BSProfiles
 
       notebook.append_page(build_compare_page, Gtk::Label.new('Compare'))
       notebook.append_page(build_creature_page, Gtk::Label.new('Creatures'))
+      map_page = build_map_page
+      @map_page_index = notebook.append_page(map_page, Gtk::Label.new('Map'))
+      # Entries on the Hunting tab can change by hand, so rebuild the map
+      # whenever its tab comes to the front.
+      @map_gc << proc { |_, _, num| guard { refresh_map_tab } if num == @map_page_index; false }
+      notebook.signal_connect('switch-page', &@map_gc.last)
       notebook.show_all
+      refresh_map_tab
     end
 
     def guard
@@ -911,6 +986,7 @@ module BSProfiles
 
       @room_store = Gtk::ListStore.new(TrueClass, String, String, String, Integer)
       room_tv = Gtk::TreeView.new(@room_store)
+      room_tv.selection.mode = :multiple
       toggle = Gtk::CellRendererToggle.new
       toggle.signal_connect('toggled') do |_, tpath|
         iter = @room_store.get_iter(tpath)
@@ -923,7 +999,7 @@ module BSProfiles
         col.resizable = true
         room_tv.append_column(col)
       end
-      room_tv.tooltip_text = "Mapped rooms in the chosen area. Tick the rooms you want the fence to enclose,\nselect a row to use it as the start or rest room."
+      room_tv.tooltip_text = "Mapped rooms in the chosen area. Tick the rooms you want the fence to enclose,\nhighlight rows (Ctrl+click for several) to use as the start room or rally points."
       room_sw = Gtk::ScrolledWindow.new
       room_sw.set_policy(:automatic, :automatic)
       room_sw.shadow_type = :in
@@ -977,9 +1053,12 @@ module BSProfiles
       send_box.border_width = 6
       row1 = Gtk::Box.new(:horizontal, 4)
       start_btn = Gtk::Button.new(label: 'Start room <- row')
-      start_btn.tooltip_text = "Set the profile's hunting start room (hunting_room_id) to the highlighted room in the list."
-      rest_btn = Gtk::Button.new(label: 'Rest room <- row')
-      rest_btn.tooltip_text = "Set the profile's resting room (resting_room_id) to the highlighted room in the list."
+      start_btn.tooltip_text = "Set the profile's hunting start room (hunting_room_id) to the highlighted room.\nIf several rows are highlighted the first one is used."
+      rest_btn = Gtk::Button.new(label: 'Rally points <- rows')
+      rest_btn.tooltip_text = "Replace the profile's rally points (rallypoint_room_ids) with the highlighted rooms.\n" \
+                              "Ctrl+click or Shift+click to highlight more than one row.\n" \
+                              "Bigshot stops at a rally point before the start room to cast hunting spells and start hunting scripts, and a group leader waits there for the group.\n" \
+                              "Blank means bigshot uses the start room."
       row1.pack_start(start_btn, true, true, 0)
       row1.pack_start(rest_btn, true, true, 0)
       row2 = Gtk::Box.new(:horizontal, 4)
@@ -987,12 +1066,9 @@ module BSProfiles
       perim_btn.tooltip_text = "Replace hunting_boundaries with the ring of rooms just outside the ticked rooms.\n" \
                                "This is how bigshot's boundaries work: it hunts every room it can reach from the start room without stepping into a boundary room.\n" \
                                "Tick the rooms you want to hunt, and this builds the fence around them."
-      fence_btn = Gtk::Button.new(label: 'Boundaries <- checked')
-      fence_btn.tooltip_text = "Replace hunting_boundaries with the ticked rooms themselves.\nUse this when you tick the fence rooms rather than the rooms inside it."
-      fence_add_btn = Gtk::Button.new(label: '+= checked')
-      fence_add_btn.tooltip_text = 'Add the ticked rooms to hunting_boundaries, keeping what is already there.'
+      fence_add_btn = Gtk::Button.new(label: 'Boundaries += perimeter')
+      fence_add_btn.tooltip_text = "Add the perimeter of the ticked rooms to hunting_boundaries, keeping what is already there.\nUse this to fence a second area into the same profile."
       row2.pack_start(perim_btn, true, true, 0)
-      row2.pack_start(fence_btn, true, true, 0)
       row2.pack_start(fence_add_btn, true, true, 0)
       row3 = Gtk::Box.new(:horizontal, 4)
       target_btn = Gtk::Button.new(label: 'Targets += creature')
@@ -1042,10 +1118,9 @@ module BSProfiles
       check_all.signal_connect('clicked') { guard { set_all_rooms(true) } }
       uncheck_all.signal_connect('clicked') { guard { set_all_rooms(false) } }
       start_btn.signal_connect('clicked') { guard { room_to_entry(room_tv, 'hunting_room_id') } }
-      rest_btn.signal_connect('clicked') { guard { room_to_entry(room_tv, 'resting_room_id') } }
+      rest_btn.signal_connect('clicked') { guard { rooms_to_entry(room_tv, 'rallypoint_room_ids') } }
       perim_btn.signal_connect('clicked') { guard { boundaries_from(BSProfiles.perimeter(checked_rooms), replace: true, what: 'perimeter') } }
-      fence_btn.signal_connect('clicked') { guard { boundaries_from(checked_rooms, replace: true, what: 'checked rooms') } }
-      fence_add_btn.signal_connect('clicked') { guard { boundaries_from(checked_rooms, replace: false, what: 'checked rooms') } }
+      fence_add_btn.signal_connect('clicked') { guard { boundaries_from(BSProfiles.perimeter(checked_rooms), replace: false, what: 'perimeter') } }
       target_btn.signal_connect('clicked') { guard { noun_to_entry('targets') } }
       quick_btn.signal_connect('clicked') { guard { noun_to_entry('quickhunt_targets') } }
       cos_target_btn.signal_connect('clicked') { guard { cospawns_to_entry('targets') } }
@@ -1163,6 +1238,7 @@ module BSProfiles
         row[1] = o.level.to_i
         row[2] = o.name.to_s
       end
+      refresh_map_tab
     end
 
     def refresh_room_summary
@@ -1174,6 +1250,7 @@ module BSProfiles
       end
       extra = @unmapped_count.to_i.positive? ? ", #{@unmapped_count} uid(s) not in the map database" : ''
       @room_summary.text = "#{checked} of #{total} mapped room(s) checked#{extra}"
+      refresh_map_markers
     end
 
     def cospawn_activated(tpath)
@@ -1234,12 +1311,28 @@ module BSProfiles
       names
     end
 
-    def room_to_entry(tv, id)
-      row = tv.selection.selected
-      return status('select a room row first') if row.nil? || row[4].to_i.zero?
+    # Room ids of the highlighted rows, in list order, unmapped rows skipped.
+    def selected_room_ids(tv)
+      rows = tv.selection.selected_rows.map { |path| @room_store.get_iter(path) }.compact
+      rows.map { |row| row[4].to_i }.select(&:positive?).uniq
+    end
 
-      set_entry(id, row[4].to_s)
-      status("#{id} set to #{row[4]}")
+    # Single-room setting: first highlighted row.
+    def room_to_entry(tv, id)
+      ids = selected_room_ids(tv)
+      return status('select a room row first') if ids.empty?
+
+      set_entry(id, ids.first.to_s)
+      status("#{id} set to #{ids.first}")
+    end
+
+    # List setting: replaced with every highlighted row.
+    def rooms_to_entry(tv, id)
+      ids = selected_room_ids(tv)
+      return status('select one or more room rows first') if ids.empty?
+
+      set_entry(id, ids.join(', '))
+      status("#{id} set to #{ids.join(', ')}")
     end
 
     def boundaries_from(ids, replace:, what:)
@@ -1269,6 +1362,409 @@ module BSProfiles
       nouns = names.map { |n| n.split.last.to_s }.uniq
       nouns.each { |n| append_list_entry(id, n) }
       status("#{id}: added #{nouns.join(', ')}")
+    end
+
+    # ----------------------------------------------------------------- map --
+    #
+    # The same map images ;map uses (MAP_DIR, room.image / room.image_coords),
+    # drawn into a Gtk::Layout with marker overlays the way ;map draws its tag
+    # markers. Shows the rooms of the area chosen on the Creatures tab and the
+    # profile's own rooms, and lets you tick rooms by clicking them.
+
+    MAP_MIN_SCALE = 0.2
+    MAP_MAX_SCALE = 6.0
+    MAP_COLORS = {
+      checked: [0.0, 0.6, 0.0],
+      area: [0.55, 0.55, 0.55],
+      start: [0.85, 0.0, 0.0],
+      rally: [0.0, 0.3, 0.9],
+      boundary: [0.95, 0.5, 0.0],
+      perimeter: [0.7, 0.0, 0.8]
+    }.freeze
+
+    def build_map_page
+      @map_gc = [] # anchors handler procs so GC cannot collect them
+      @map_pixbufs = {}
+      @map_markers = []
+      @map_scale = 1.0
+      @map_current = nil
+      @map_drag = nil
+
+      outer = Gtk::Box.new(:vertical, 6)
+      outer.border_width = 8
+
+      bar = Gtk::Box.new(:horizontal, 6)
+      bar.pack_start(Gtk::Label.new('Map'), false, false, 0)
+      @map_combo = Gtk::ComboBoxText.new
+      @map_combo.tooltip_text = "Maps that contain rooms from the chosen area or the profile.\nThe count is how many of those rooms are on that map."
+      bar.pack_start(@map_combo, true, true, 0)
+      zoom_out = Gtk::Button.new(label: '-')
+      zoom_in = Gtk::Button.new(label: '+')
+      zoom_fit = Gtk::Button.new(label: 'Fit')
+      zoom_100 = Gtk::Button.new(label: '100%')
+      zoom_out.tooltip_text = 'Zoom out. Ctrl + mouse wheel also zooms.'
+      zoom_in.tooltip_text = 'Zoom in. Ctrl + mouse wheel also zooms.'
+      zoom_fit.tooltip_text = 'Zoom so the whole map fits in the window.'
+      zoom_100.tooltip_text = 'Show the map at its natural size.'
+      [zoom_out, zoom_in, zoom_fit, zoom_100].each { |b| bar.pack_start(b, false, false, 0) }
+      @map_click_toggles = Gtk::CheckButton.new('Click toggles room')
+      @map_click_toggles.active = true
+      @map_click_toggles.tooltip_text = "When on, clicking a room on the map ticks or unticks it in the Creatures tab room list.\nDrag to pan either way."
+      bar.pack_start(@map_click_toggles, false, false, 6)
+      @map_show_perimeter = Gtk::CheckButton.new('Preview perimeter')
+      @map_show_perimeter.active = true
+      @map_show_perimeter.tooltip_text = "Show the rooms that \"Boundaries <- perimeter\" would set right now: the ring just outside the ticked rooms.\nPurple X. Changes as you tick and untick."
+      bar.pack_start(@map_show_perimeter, false, false, 0)
+      outer.pack_start(bar, false, false, 0)
+
+      legend = Gtk::Label.new
+      legend.xalign = 0
+      legend.set_markup(
+        "<span foreground=\"#009900\"><b>X</b></span> ticked room   " \
+        "<span foreground=\"#8c8c8c\"><b>X</b></span> area room, not ticked   " \
+        "<span foreground=\"#d90000\"><b>O</b></span> start room   " \
+        "<span foreground=\"#004ce6\"><b>O</b></span> rally point   " \
+        "<span foreground=\"#f28000\"><b>[]</b></span> boundary   " \
+        "<span foreground=\"#b300cc\"><b>X</b></span> perimeter preview"
+      )
+      legend.tooltip_text = 'Start room, rally points and boundaries come from the profile being edited, so this shows the fence as bigshot will see it.'
+      outer.pack_start(legend, false, false, 0)
+
+      @map_scroller = Gtk::ScrolledWindow.new
+      @map_scroller.set_policy(:automatic, :automatic)
+      @map_scroller.shadow_type = :in
+      @map_layout = Gtk::Layout.new
+      @map_layout.can_focus = true
+      @map_image = Gtk::Image.new
+      @map_layout.put(@map_image, 0, 0)
+      @map_layout.add_events(Gdk::EventMask::BUTTON_PRESS_MASK | Gdk::EventMask::BUTTON_RELEASE_MASK |
+                             Gdk::EventMask::POINTER_MOTION_MASK | Gdk::EventMask::SCROLL_MASK)
+      @map_scroller.add(@map_layout)
+      outer.pack_start(@map_scroller, true, true, 0)
+
+      @map_status = Gtk::Label.new('')
+      @map_status.xalign = 0
+      @map_status.tooltip_text = 'Which map is shown and how many of the rooms of interest are on it.'
+      outer.pack_start(@map_status, false, false, 0)
+
+      # Signals. Each handler is anchored in @map_gc.
+      anchor = lambda { |p| @map_gc << p; p }
+      @map_combo.signal_connect('changed', &anchor.call(proc { guard { map_combo_changed }; false }))
+      @map_show_perimeter.signal_connect('toggled', &anchor.call(proc { guard { refresh_map_markers }; false }))
+      zoom_out.signal_connect('clicked', &anchor.call(proc { guard { map_zoom(@map_scale / 1.25) }; false }))
+      zoom_in.signal_connect('clicked', &anchor.call(proc { guard { map_zoom(@map_scale * 1.25) }; false }))
+      zoom_fit.signal_connect('clicked', &anchor.call(proc { guard { map_zoom_fit }; false }))
+      zoom_100.signal_connect('clicked', &anchor.call(proc { guard { map_zoom(1.0) }; false }))
+      @map_layout.signal_connect('button-press-event', &anchor.call(proc { |_, ev| guard { map_press(ev) }; false }))
+      @map_layout.signal_connect('motion-notify-event', &anchor.call(proc { |_, ev| guard { map_motion(ev) }; false }))
+      @map_layout.signal_connect('button-release-event', &anchor.call(proc { |_, ev| guard { map_release(ev) }; false }))
+      @map_layout.signal_connect('scroll-event', &anchor.call(proc { |_, ev| guard { map_scroll(ev) } == true }))
+
+      outer
+    end
+
+    # ---- what to draw ----
+
+    # Room ids from a comma-separated profile entry.
+    def entry_room_ids(id)
+      self[id].text.to_s.split(/\s*,\s*/).map { |s| BSProfiles.resolve_room(s)&.id }.compact
+    end
+
+    # {room_id => [kinds]} for every room the map should show.
+    def map_rooms_of_interest
+      rooms = Hash.new { |h, k| h[k] = [] }
+      each_room_row do |row|
+        id = row[4].to_i
+        next unless id.positive?
+
+        rooms[id] << (row[0] ? :checked : :area)
+      end
+      entry_room_ids('hunting_room_id').each { |id| rooms[id] << :start }
+      entry_room_ids('rallypoint_room_ids').each { |id| rooms[id] << :rally }
+      entry_room_ids('hunting_boundaries').each { |id| rooms[id] << :boundary }
+      if @map_show_perimeter&.active?
+        BSProfiles.perimeter(checked_rooms).each { |id| rooms[id] << :perimeter }
+      end
+      rooms
+    end
+
+    # Rebuild the map dropdown from the rooms of interest. Keeps the current
+    # map selected when it is still relevant, otherwise picks the map with
+    # the most area rooms.
+    def refresh_map_tab
+      return unless @map_combo
+
+      interest = map_rooms_of_interest
+      counts = Hash.new(0)
+      area_counts = Hash.new(0)
+      interest.each do |id, kinds|
+        room = Map[id]
+        next if room.nil? || room.image.to_s.empty?
+        next unless File.exist?(File.join(MAP_DIR, room.image))
+
+        counts[room.image] += 1
+        area_counts[room.image] += 1 if kinds.include?(:checked) || kinds.include?(:area)
+      end
+      maps = counts.keys.sort_by { |img| [-area_counts[img], -counts[img], img] }
+      @map_list = maps
+
+      @map_refreshing = true
+      @map_combo.remove_all
+      maps.each { |img| @map_combo.append_text("#{BSProfiles.map_display_name(img)}  (#{counts[img]} rooms)") }
+      idx = maps.index(@map_current) || 0
+      @map_combo.set_active(idx) if maps.any?
+      @map_refreshing = false
+
+      if maps.empty?
+        @map_current = nil
+        @map_image.pixbuf = nil
+        clear_map_markers
+        @map_status.text = 'No map images for these rooms. Pick an area on the Creatures tab, or set rooms on the Hunting tab.'
+      else
+        show_map(maps[idx])
+      end
+    end
+
+    def map_combo_changed
+      return if @map_refreshing
+
+      i = @map_combo.active
+      return if i.nil? || i.negative? || @map_list.nil?
+
+      show_map(@map_list[i])
+    end
+
+    # Redraw the markers only (a tick changed, an entry changed).
+    def refresh_map_markers
+      return unless @map_combo && @map_current
+
+      draw_map_markers
+    end
+
+    # ---- drawing ----
+
+    def map_pixbuf(image)
+      @map_pixbufs[image] ||= GdkPixbuf::Pixbuf.new(file: File.join(MAP_DIR, image))
+    end
+
+    def show_map(image, center_on: nil)
+      return if image.nil?
+
+      changed = image != @map_current
+      @map_current = image
+      base = map_pixbuf(image)
+      w = [(base.width * @map_scale).to_i, 1].max
+      h = [(base.height * @map_scale).to_i, 1].max
+      @map_image.pixbuf = base.scale_simple(w, h, GdkPixbuf::InterpType::BILINEAR)
+      @map_layout.set_size(w, h)
+      @map_layout.move(@map_image, 0, 0)
+      draw_map_markers
+      if center_on
+        map_center_on_room(center_on)
+      elsif changed
+        map_center_on_interest
+      end
+    rescue StandardError => e
+      @map_status.text = "Could not load #{image}: #{e.message}"
+    end
+
+    def clear_map_markers
+      @map_markers.each { |m| m.destroy unless m.destroyed? }
+      @map_markers.clear
+    end
+
+    def draw_map_markers
+      clear_map_markers
+      return if @map_current.nil?
+
+      interest = map_rooms_of_interest
+      shown = 0
+      interest.each do |id, kinds|
+        room = Map[id]
+        next if room.nil? || room.image != @map_current
+        next unless (coords = room.image_coords)
+
+        x1, y1, x2, y2 = coords
+        x = (x1 * @map_scale).to_i
+        y = (y1 * @map_scale).to_i
+        w = [((x2 - x1) * @map_scale).to_i, 10].max
+        h = [((y2 - y1) * @map_scale).to_i, 10].max
+        shown += 1
+
+        # Base mark: ticked (green X), unticked area room (grey X)
+        if kinds.include?(:checked)
+          put_marker(BSProfiles.marker_pixbuf(w, h, MAP_COLORS[:checked], :x, 3), x, y)
+        elsif kinds.include?(:area)
+          put_marker(BSProfiles.marker_pixbuf(w, h, MAP_COLORS[:area], :x, 1), x, y)
+        end
+        put_marker(BSProfiles.marker_pixbuf(w, h, MAP_COLORS[:perimeter], :x, 2), x, y) if kinds.include?(:perimeter)
+        # Profile marks layered on top
+        put_marker(BSProfiles.marker_pixbuf(w + 6, h + 6, MAP_COLORS[:boundary], :box, 3), x - 3, y - 3) if kinds.include?(:boundary)
+        put_marker(BSProfiles.marker_pixbuf(w + 10, h + 10, MAP_COLORS[:rally], :circle, 3), x - 5, y - 5) if kinds.include?(:rally)
+        put_marker(BSProfiles.marker_pixbuf(w + 10, h + 10, MAP_COLORS[:start], :circle, 3), x - 5, y - 5) if kinds.include?(:start)
+      end
+      checked = interest.count { |_, k| k.include?(:checked) }
+      @map_status.text = "#{BSProfiles.map_display_name(@map_current)}: #{shown} of #{interest.size} room(s) of interest are on this map, #{checked} ticked. Zoom #{(@map_scale * 100).round}%."
+    end
+
+    def put_marker(pixbuf, x, y)
+      img = Gtk::Image.new(pixbuf: pixbuf)
+      @map_layout.put(img, x, y)
+      img.show
+      @map_markers << img
+    end
+
+    # ---- zoom and pan ----
+
+    def map_zoom(scale)
+      return if @map_current.nil?
+
+      # keep the viewport centre fixed while zooming
+      hadj = @map_scroller.hadjustment
+      vadj = @map_scroller.vadjustment
+      cx = (hadj.value + hadj.page_size / 2) / @map_scale
+      cy = (vadj.value + vadj.page_size / 2) / @map_scale
+      @map_scale = [[scale, MAP_MIN_SCALE].max, MAP_MAX_SCALE].min
+      show_map(@map_current)
+      map_scroll_to(cx * @map_scale, cy * @map_scale)
+    end
+
+    def map_zoom_fit
+      return if @map_current.nil?
+
+      base = map_pixbuf(@map_current)
+      alloc = @map_scroller.allocation
+      return if alloc.width < 10 || alloc.height < 10
+
+      @map_scale = [[(alloc.width - 4).to_f / base.width, (alloc.height - 4).to_f / base.height].min, MAP_MIN_SCALE].max
+      show_map(@map_current)
+    end
+
+    # Scroll so that layout point (x, y) sits in the middle of the viewport.
+    # Deferred a tick so the layout has taken its new size first.
+    def map_scroll_to(x, y)
+      @map_timeout_proc = proc do
+        begin
+          hadj = @map_scroller.hadjustment
+          vadj = @map_scroller.vadjustment
+          hadj.value = [[x - hadj.page_size / 2, 0].max, hadj.upper - hadj.page_size].min
+          vadj.value = [[y - vadj.page_size / 2, 0].max, vadj.upper - vadj.page_size].min
+        rescue StandardError
+          nil
+        end
+        @map_timeout_proc = nil
+        false
+      end
+      GLib::Timeout.add(30, &@map_timeout_proc)
+    end
+
+    # Pointer position inside the layout's scrolled content, like ;map does it.
+    def map_pointer
+      win = @map_layout.window
+      return nil unless win
+
+      p = win.pointer
+      [@map_scroller.hadjustment.value + p[1], @map_scroller.vadjustment.value + p[2]]
+    end
+
+    def map_center_on_room(id)
+      room = Map[id]
+      return unless room && room.image == @map_current && room.image_coords
+
+      x1, y1, x2, y2 = room.image_coords
+      map_scroll_to((x1 + x2) / 2.0 * @map_scale, (y1 + y2) / 2.0 * @map_scale)
+    end
+
+    # Centre on the ticked rooms (or all rooms of interest) on this map.
+    def map_center_on_interest
+      pts = []
+      map_rooms_of_interest.each do |id, kinds|
+        room = Map[id]
+        next if room.nil? || room.image != @map_current || room.image_coords.nil?
+        next if kinds == [:area] && pts.any?
+
+        x1, y1, x2, y2 = room.image_coords
+        pts << [(x1 + x2) / 2.0, (y1 + y2) / 2.0]
+      end
+      return if pts.empty?
+
+      cx = pts.sum { |p| p[0] } / pts.size
+      cy = pts.sum { |p| p[1] } / pts.size
+      map_scroll_to(cx * @map_scale, cy * @map_scale)
+    end
+
+    def map_press(ev)
+      return unless ev.button == 1
+
+      click = map_pointer or return
+      @map_drag = {
+        x: ev.x_root, y: ev.y_root, moved: false,
+        hadj: @map_scroller.hadjustment.value, vadj: @map_scroller.vadjustment.value,
+        click_x: click[0], click_y: click[1]
+      }
+    end
+
+    def map_motion(ev)
+      return unless @map_drag
+
+      dx = ev.x_root - @map_drag[:x]
+      dy = ev.y_root - @map_drag[:y]
+      @map_drag[:moved] = true if dx.abs > 5 || dy.abs > 5
+      return unless @map_drag[:moved]
+
+      @map_scroller.hadjustment.value = [@map_drag[:hadj] - dx, 0].max
+      @map_scroller.vadjustment.value = [@map_drag[:vadj] - dy, 0].max
+    end
+
+    def map_release(ev)
+      drag = @map_drag
+      @map_drag = nil
+      return unless drag && ev.button == 1 && !drag[:moved]
+
+      map_click(drag[:click_x] / @map_scale, drag[:click_y] / @map_scale)
+    end
+
+    def map_scroll(ev)
+      return false unless ev.state.control_mask?
+
+      case ev.direction
+      when Gdk::ScrollDirection::UP then map_zoom(@map_scale * 1.15)
+      when Gdk::ScrollDirection::DOWN then map_zoom(@map_scale / 1.15)
+      end
+      true
+    end
+
+    # A click at unscaled map coordinates: toggle the room's tick in the
+    # Creatures tab room list, or just report the room if toggling is off.
+    def map_click(x, y)
+      return if @map_current.nil?
+
+      room = Map.list.compact.find do |r|
+        next false unless r.image == @map_current && r.image_coords
+
+        x1, y1, x2, y2 = r.image_coords
+        x.between?(x1, x2) && y.between?(y1, y2)
+      end
+      return if room.nil?
+
+      title = Array(room.title).first.to_s.gsub(/[\[\]]/, '')
+      unless @map_click_toggles.active?
+        @map_status.text = "Room #{room.id}: #{title}"
+        return
+      end
+
+      hit = false
+      each_room_row do |row|
+        next unless row[4].to_i == room.id
+
+        row[0] = !row[0]
+        hit = true
+      end
+      if hit
+        refresh_room_summary # also redraws the markers
+      else
+        @map_status.text = "Room #{room.id} (#{title}) is not in the chosen area's room list, so it cannot be ticked here."
+      end
     end
   end
 end
