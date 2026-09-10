@@ -49,11 +49,22 @@ RSpec.describe 'eLoot guarded room API' do
                    right_hand: nil, left_hand: nil, pool_command: true)
   end
 
+  def set_harness_const(name, value)
+    harness.send(:remove_const, name) if harness.const_defined?(name, false)
+    harness.const_set(name, value)
+  end
+
   def prepare_world
     harness.const_set(:Status, Object.new.tap { |value| value.define_singleton_method(:dead?) { false } })
     harness.const_set(:Spell, Object.new.tap { |value| value.define_singleton_method(:[]) { |_| Struct.new(:active?).new(false) } })
     harness.const_set(:Group, Object.new.tap { |value| value.define_singleton_method(:checked?) { true } })
-    harness.const_set(:GameObj, OpenStruct.new(dead: [corpse, Struct.new(:id).new('999')], right_hand: :sword, left_hand: :shield))
+    right = Struct.new(:id).new('10')
+    left = Struct.new(:id).new('20')
+    harness.const_set(:GameObj, OpenStruct.new(dead: [corpse, Struct.new(:id).new('999')], right_hand: right, left_hand: left))
+    harness.const_set(:Room, OpenStruct.new(current: OpenStruct.new(id: 100)))
+    harness.const_set(:XMLData, OpenStruct.new(room_count: 1))
+    harness.const_set(:ReadyList, OpenStruct.new(ready_list: {}))
+    harness.const_set(:StowList, OpenStruct.new(stow_list: {}))
     api.class_variable_set(:@@data, data)
     api.instance_variable_set(:@room_inventory_ready, true)
     api.define_singleton_method(:disk_usage) {}
@@ -65,6 +76,7 @@ RSpec.describe 'eLoot guarded room API' do
     api::Loot.define_singleton_method(:room) { log << :floor }
     api::Inventory.define_singleton_method(:return_hands) { log << :hands }
     api::Inventory.define_singleton_method(:close_sell_containers) { log << :close }
+    allow(api).to receive(:standing?).and_return(true)
   end
 
   def run_room(**overrides)
@@ -84,8 +96,17 @@ RSpec.describe 'eLoot guarded room API' do
     expect(result).to eq(outcome: :complete)
     expect(result).to be_frozen
     expect(calls).to eq([[:skin, ['123']], [:search, ['123']], :coins, :hands, :close])
-    expect([data.right_hand, data.left_hand]).to eq([:sword, :shield])
+    expect([data.right_hand, data.left_hand]).to eq([harness::GameObj.right_hand, harness::GameObj.left_hand])
     expect(api.room_scope?).to be_falsey
+  end
+
+  it 'verifies hand and posture restoration before default calls report completion' do
+    prepare_world
+    replacement = Struct.new(:id).new('99')
+    world = harness::GameObj
+    api::Inventory.define_singleton_method(:return_hands) { world.right_hand = replacement }
+    expect { run_room }.to raise_error(api::RoomScopeError, /restoration was not verified/)
+    expect(api.instance_variable_get(:@room_recovery)).to be_nil
   end
 
   it 'uses the same room pickup routine when floor cleanup is requested' do
@@ -102,10 +123,10 @@ RSpec.describe 'eLoot guarded room API' do
     sheath = Struct.new(:id).new('12')
     harness::GameObj.right_hand = sword
     harness::GameObj.left_hand = empty
-    harness.const_set(:Room, OpenStruct.new(current: OpenStruct.new(id: 100)))
-    harness.const_set(:XMLData, OpenStruct.new(room_count: 1))
-    harness.const_set(:ReadyList, OpenStruct.new(ready_list: { skin_weapon: knife, skin_sheath: sheath }))
-    harness.const_set(:StowList, OpenStruct.new(stow_list: { default: sheath }))
+    set_harness_const(:Room, OpenStruct.new(current: OpenStruct.new(id: 100)))
+    set_harness_const(:XMLData, OpenStruct.new(room_count: 1))
+    set_harness_const(:ReadyList, OpenStruct.new(ready_list: { skin_weapon: knife, skin_sheath: sheath }))
+    set_harness_const(:StowList, OpenStruct.new(stow_list: { default: sheath }))
     allow(api).to receive(:standing?).and_return(true)
     world = harness::GameObj
     api::Loot.define_singleton_method(:skin) do |_items|
@@ -120,10 +141,26 @@ RSpec.describe 'eLoot guarded room API' do
     expect { api.restore_room_hands(owner: owner) }.to raise_error(api::RoomScopeError, /recovery/)
   end
 
+  it 'requires pending recoverable equipment state to be resolved before another room pass' do
+    prepare_world
+    set_harness_const(:Room, OpenStruct.new(current: OpenStruct.new(id: 100)))
+    set_harness_const(:XMLData, OpenStruct.new(room_count: 1))
+    set_harness_const(:ReadyList, OpenStruct.new(ready_list: {}))
+    set_harness_const(:StowList, OpenStruct.new(stow_list: {}))
+    allow(api::Loot).to receive(:search).and_raise('interrupted pass')
+    expect { run_room(recoverable: true) }.to raise_error('interrupted pass')
+    recovery = api.instance_variable_get(:@room_recovery)
+    expect(recovery).not_to be_nil
+
+    allow(api::Loot).to receive(:search)
+    expect { run_room(recoverable: true) }.to raise_error(api::RoomScopeError, /recovery is pending/)
+    expect(api.instance_variable_get(:@room_recovery)).to equal(recovery)
+  end
+
   it 'refuses recovery after displacement or for a different owner before any inventory helper' do
     prepare_world
-    harness.const_set(:Room, OpenStruct.new(current: OpenStruct.new(id: 101)))
-    harness.const_set(:XMLData, OpenStruct.new(room_count: 2))
+    set_harness_const(:Room, OpenStruct.new(current: OpenStruct.new(id: 101)))
+    set_harness_const(:XMLData, OpenStruct.new(room_count: 2))
     api.instance_variable_set(:@room_recovery, { owner: owner, data: data, room: 100, epoch: 1 })
     expect { api.restore_room_hands(owner: owner) }.to raise_error(api::RoomScopeError, /context changed/)
     expect { api.restore_room_hands(owner: Object.new) }.to raise_error(api::RoomScopeError, /recovery/)
@@ -139,10 +176,10 @@ RSpec.describe 'eLoot guarded room API' do
       sheath = Struct.new(:id, :name, :contents).new('12', 'test sheath', [])
       world = harness::GameObj
       world.right_hand, world.left_hand = sword, empty
-      harness.const_set(:Room, OpenStruct.new(current: OpenStruct.new(id: 100)))
-      harness.const_set(:XMLData, OpenStruct.new(room_count: 1))
-      harness.const_set(:ReadyList, OpenStruct.new(ready_list: { skin_weapon: knife, skin_sheath: sheath }))
-      harness.const_set(:StowList, OpenStruct.new(stow_list: { default: sheath }))
+      set_harness_const(:Room, OpenStruct.new(current: OpenStruct.new(id: 100)))
+      set_harness_const(:XMLData, OpenStruct.new(room_count: 1))
+      set_harness_const(:ReadyList, OpenStruct.new(ready_list: { skin_weapon: knife, skin_sheath: sheath }))
+      set_harness_const(:StowList, OpenStruct.new(stow_list: { default: sheath }))
       allow(api).to receive(:standing?).and_return(true)
       allow(api).to receive(:msg)
       wires = []
@@ -193,16 +230,18 @@ RSpec.describe 'eLoot guarded room API' do
 
   it 'does not stow an unrelated new item held during recovery' do
     prepare_world
-    harness.const_set(:Room, OpenStruct.new(current: OpenStruct.new(id: 100)))
-    harness.const_set(:XMLData, OpenStruct.new(room_count: 1))
+    set_harness_const(:Room, OpenStruct.new(current: OpenStruct.new(id: 100)))
+    set_harness_const(:XMLData, OpenStruct.new(room_count: 1))
     empty = Struct.new(:id).new(nil)
     sword = Struct.new(:id).new('10')
     harness::GameObj.right_hand = sword
     harness::GameObj.left_hand = Struct.new(:id).new('99')
     api.instance_variable_set(:@room_recovery, { owner: owner, data: data, room: 100, epoch: 1,
                                                scope: { owner: owner }, right: sword, left: empty, tools: [] })
+    recovery = api.instance_variable_get(:@room_recovery)
     expect(api::Inventory).not_to receive(:store_item)
     expect { api.restore_room_hands(owner: owner) }.to raise_error(api::RoomScopeError, /Unexpected held item/)
+    expect(api.instance_variable_get(:@room_recovery)).to equal(recovery)
     expect(calls).to be_empty
     expect(api.room_scope?).to be_falsey
   end
@@ -250,7 +289,7 @@ RSpec.describe 'eLoot guarded room API' do
     prepare_world
     api.class_variable_set(:@@data, nil)
     harness.const_set(:Char, OpenStruct.new(name: 'OfflineFixture'))
-    harness.const_set(:XMLData, OpenStruct.new(game: 'GSIV'))
+    set_harness_const(:XMLData, OpenStruct.new(game: 'GSIV'))
     lich = Module.new
     messaging = Module.new
     messaging.define_singleton_method(:msg) { |*_| }
@@ -366,7 +405,7 @@ RSpec.describe 'eLoot guarded room API' do
 
   it 'does not swallow sticky cancellation in inventory retries' do
     prepare_world
-    harness.const_set(:StowList, OpenStruct.new(stow_list: { default: :bag }))
+    set_harness_const(:StowList, OpenStruct.new(stow_list: { default: :bag }))
     data.sacks_full = {}
     item = OpenStruct.new(name: 'ruby', type: 'gem')
     allow(api).to receive(:msg)
@@ -433,7 +472,7 @@ RSpec.describe 'eLoot guarded room API' do
   it 'turns full containers into an actionable error without pausing or selling ingots' do
     prepare_world
     bag = OpenStruct.new(name: 'bag')
-    harness.const_set(:StowList, OpenStruct.new(stow_list: { default: bag }))
+    set_harness_const(:StowList, OpenStruct.new(stow_list: { default: bag }))
     data.sacks_full = {}
     item = OpenStruct.new(name: 'gold ingot', type: 'gem')
     allow(api).to receive(:msg)
@@ -454,7 +493,7 @@ RSpec.describe 'eLoot guarded room API' do
     left = OpenStruct.new(id: '71', name: 'topaz')
     harness::GameObj.right_hand = right
     harness::GameObj.left_hand = left
-    harness.const_set(:ReadyList, OpenStruct.new(ready_list: {}))
+    set_harness_const(:ReadyList, OpenStruct.new(ready_list: {}))
     data.original_readylist = []
     allow(api::Inventory).to receive(:checkright).and_return(true)
     allow(api::Inventory).to receive(:checkleft).and_return(true)
@@ -462,8 +501,8 @@ RSpec.describe 'eLoot guarded room API' do
     expect(api::Inventory).not_to receive(:return_ready_list)
     expect(api::Inventory).to receive(:single_drag).with(right)
     expect(api::Inventory).to receive(:single_drag).with(left)
-    expect(api::Inventory).to receive(:drag).with(right, 'right')
-    expect(api::Inventory).to receive(:drag).with(left, 'left')
+    expect(api::Inventory).to receive(:drag).with(right, 'right') { harness::GameObj.right_hand = right }
+    expect(api::Inventory).to receive(:drag).with(left, 'left') { harness::GameObj.left_hand = left }
     allow(api::Loot).to receive(:search) do
       api::Inventory.free_hands(both: true)
       harness::GameObj.right_hand = OpenStruct.new(id: nil)

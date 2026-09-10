@@ -2507,6 +2507,106 @@ module ELoot # Main methods
     @@data
   end
 
+  # Capture the exact state a room-only pass must restore before success.
+  # The nested tool journal remains mutable so an interrupted sheath command
+  # can be reconciled without guessing whether it reached the game.
+  def self.build_room_recovery(owner)
+    { owner: owner, room: Room.current.id, epoch: XMLData.room_count,
+      scope: @room_scope, data: data, right: GameObj.right_hand, left: GameObj.left_hand, tool_stows: {},
+      tools: [[:skin_weapon, :skin_sheath], [:skin_weapon_blunt, :skin_sheath_blunt]].map { |weapon, sheath|
+        [ReadyList.ready_list[weapon], ReadyList.ready_list[sheath] || StowList.stow_list[:default]].freeze
+      }.freeze }.freeze
+  end
+  private_class_method :build_room_recovery
+
+  # Reject stale, displaced, or cross-owner recovery attempts before inventory
+  # helpers can issue a command.
+  def self.validate_room_recovery_context!(recovery, owner:)
+    unless recovery && recovery[:owner].equal?(owner) && owner.equal?(Script.current) && owner.execution_guard_active?
+      raise RoomScopeError, 'No matching guarded eLoot recovery is available'
+    end
+    unless recovery[:data].equal?(data) && Room.current.id == recovery[:room] && XMLData.room_count == recovery[:epoch]
+      raise RoomScopeError, 'eLoot recovery context changed'
+    end
+
+    true
+  end
+  private_class_method :validate_room_recovery_context!
+
+  # Confirm both original hands and standing posture from live state.
+  def self.verify_room_restoration!(recovery)
+    originals = recovery.values_at(:right, :left).map { |item| item&.id }
+    current = [GameObj.right_hand, GameObj.left_hand].map { |item| item&.id }
+    raise RoomScopeError, 'eLoot equipment restoration was not verified' unless current == originals && standing?
+
+    true
+  end
+  private_class_method :verify_room_restoration!
+
+  # Prepare the ordinary eLoot profile and transient room-loot state without
+  # enabling any standalone travel, selling, or background work.
+  def self.prepare_room_inventory!(version)
+    if Status.dead? || Spell['Berserk'].active?
+      raise RoomScopeError, 'Cannot clean up while dead or berserking'
+    end
+    unless data && data.respond_to?(:version) && data.version == version && @room_inventory_ready
+      @room_inventory_ready = false
+      waitrt?
+      ELoot.load(ELoot.load_profile)
+      ELoot.set_inventory
+    end
+    unless Group.checked?
+      Lich::Util.issue_command('group', /^You are (?:grouped|leading|not currently)/, /GROUP HELP for a list of other options\./, usexml: false, quiet: true, silent: true)
+      raise RoomScopeError, 'eLoot group inventory is unverified; run GROUP and retry' unless Group.checked?
+    end
+    unless data.settings[:track_full_sacks]
+      data.sacks_full = { 'last cleared' => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, 'room cleanup'] }
+    end
+    ELoot.disk_usage
+    ELoot.reset_disk_full(rebuild: !data.settings[:track_full_sacks])
+    data.pool_command = false
+  end
+  private_class_method :prepare_room_inventory!
+
+  # Observe delayed sheath updates from an interrupted command. Never resend an
+  # uncertain stow: absence of the hand update is a recovery failure.
+  def self.reconcile_room_tool_stows!(recovery, owner)
+    recovery.fetch(:tool_stows, {}).each_value do |attempt|
+      next if attempt[:settled]
+
+      20.times do
+        owner.check_execution_guard!
+        validate_room_recovery_context!(recovery, owner: owner)
+        break unless ELoot.in_hand?(attempt[:item])
+
+        owner.execution_sleep(0.1)
+      end
+      owner.check_execution_guard!
+      validate_room_recovery_context!(recovery, owner: owner)
+      raise RoomScopeError, 'Previous skinning tool stow is unconfirmed; refusing duplicate command' if ELoot.in_hand?(attempt[:item])
+    end
+  end
+  private_class_method :reconcile_room_tool_stows!
+
+  # Stow only known borrowed tools, then restore the exact original hands and
+  # standing posture through eLoot's ordinary inventory machinery.
+  def self.restore_room_equipment!(recovery)
+    originals = [recovery[:right], recovery[:left]].map { |item| item&.id }
+    [GameObj.right_hand, GameObj.left_hand].each do |held|
+      next if held&.id.nil? || originals.include?(held.id)
+
+      tool, bag = recovery[:tools].find { |candidate, _| candidate && candidate.id == held.id }
+      raise RoomScopeError, 'Unexpected held item prevents eLoot recovery' unless tool && bag
+
+      Inventory.store_item(bag, tool, true)
+      raise RoomScopeError, 'Skinning tool restoration was not observed' if ELoot.in_hand?(tool)
+    end
+    data.right_hand, data.left_hand = recovery.values_at(:right, :left)
+    Inventory.return_hands
+    dothistimeout('stand', 3, /You stand|You quickly roll|You are already standing/) unless standing?
+  end
+  private_class_method :restore_room_equipment!
+
   # Reuse the ordinary eLoot inventory/filter/stow routines on the guarded caller.
   # This is room cleanup only: no selling, travel, sorter or background readers.
   # @param corpse_ids [Array<String, Integer>] frozen array of positive exact IDs
@@ -2535,49 +2635,27 @@ module ELoot # Main methods
 
     ids = corpse_ids.map { |id| id.to_s.dup.freeze }.freeze
     token = Object.new
+    recovery = nil
     acquire_room_lease(token)
     begin
-      @room_recovery = nil
+      raise RoomScopeError, 'eLoot equipment recovery is pending; restore it before another room cleanup' if @room_recovery
+
       @room_scope = { owner: owner, script_name: script_name, version: version }.freeze
       owner.check_execution_guard!
-      if Status.dead? || Spell['Berserk'].active?
-        raise RoomScopeError, 'Cannot clean up while dead or berserking'
-      end
-      unless data && data.respond_to?(:version) && data.version == version && @room_inventory_ready
-        @room_inventory_ready = false
-        waitrt?
-        ELoot.load(ELoot.load_profile)
-        ELoot.set_inventory
-      end
-      unless Group.checked?
-        Lich::Util.issue_command('group', /^You are (?:grouped|leading|not currently)/, /GROUP HELP for a list of other options\./, usexml: false, quiet: true, silent: true)
-        raise RoomScopeError, 'eLoot group inventory is unverified; run GROUP and retry' unless Group.checked?
-      end
-      unless data.settings[:track_full_sacks]
-        data.sacks_full = { 'last cleared' => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, 'room cleanup'] }
-      end
-      ELoot.disk_usage
-      ELoot.reset_disk_full(rebuild: !data.settings[:track_full_sacks])
-      data.pool_command = false
-      if recoverable
-        @room_recovery = { owner: owner, room: Room.current.id, epoch: XMLData.room_count,
-                           scope: @room_scope, data: data, right: GameObj.right_hand, left: GameObj.left_hand, tool_stows: {},
-                           tools: [[:skin_weapon, :skin_sheath], [:skin_weapon_blunt, :skin_sheath_blunt]].map { |weapon, sheath|
-                             [ReadyList.ready_list[weapon], ReadyList.ready_list[sheath] || StowList.stow_list[:default]].freeze
-                           }.freeze }.freeze
-      end
+      prepare_room_inventory!(version)
+      recovery = build_room_recovery(owner)
+      @room_recovery = recovery
       corpses = GameObj.dead.to_a.select { |corpse| ids.include?(corpse.id.to_s) }
       ELoot.loot(corpses: corpses, floor: floor)
       Inventory.close_sell_containers if data.settings[:keep_closed]
       owner.check_execution_guard!
-      if @room_recovery && ([GameObj.right_hand, GameObj.left_hand].map { |item| item&.id } != @room_recovery.values_at(:right, :left).map { |item| item&.id } || !standing?)
-        raise RoomScopeError, 'eLoot equipment restoration was not verified'
-      end
+      verify_room_restoration!(recovery)
       @room_recovery = nil
       { outcome: :complete }.freeze
     rescue SystemExit
       raise RoomScopeError, 'eLoot could not finish room cleanup; check its preceding inventory message'
     ensure
+      @room_recovery = nil if recovery && !recoverable && @room_recovery.equal?(recovery)
       @@data = nil unless @room_inventory_ready
       @room_scope = nil
       release_room_lease(token)
@@ -2590,53 +2668,17 @@ module ELoot # Main methods
   # @return [Hash] completion only after original hands and standing are observed
   def self.restore_room_hands(owner:)
     recovery = @room_recovery
-    unless recovery && recovery[:owner].equal?(owner) && owner.equal?(Script.current) && owner.execution_guard_active?
-      raise RoomScopeError, 'No matching guarded eLoot recovery is available'
-    end
-    unless recovery[:data].equal?(data) && Room.current.id == recovery[:room] && XMLData.room_count == recovery[:epoch]
-      raise RoomScopeError, 'eLoot recovery context changed'
-    end
+    validate_room_recovery_context!(recovery, owner: owner)
     token = Object.new
     acquire_room_lease(token)
     begin
-      @room_recovery = nil
       @room_scope = recovery[:scope]
       owner.check_execution_guard!
-      # An interrupted wait is not proof that a sheath command was unsent.
-      # Observe its delayed hand update before selecting any recovery commands.
-      recovery.fetch(:tool_stows, {}).each_value do |attempt|
-        next if attempt[:settled]
-
-        20.times do
-          owner.check_execution_guard!
-          unless recovery[:data].equal?(data) && Room.current.id == recovery[:room] && XMLData.room_count == recovery[:epoch]
-            raise RoomScopeError, 'eLoot recovery context changed'
-          end
-          break unless ELoot.in_hand?(attempt[:item])
-
-          owner.execution_sleep(0.1)
-        end
-        owner.check_execution_guard!
-        unless recovery[:data].equal?(data) && Room.current.id == recovery[:room] && XMLData.room_count == recovery[:epoch]
-          raise RoomScopeError, 'eLoot recovery context changed'
-        end
-        raise RoomScopeError, 'Previous skinning tool stow is unconfirmed; refusing duplicate command' if ELoot.in_hand?(attempt[:item])
-      end
-      originals = [recovery[:right], recovery[:left]].map { |item| item&.id }
-      [GameObj.right_hand, GameObj.left_hand].each do |held|
-        next if held&.id.nil? || originals.include?(held.id)
-        tool, bag = recovery[:tools].find { |candidate, _| candidate && candidate.id == held.id }
-        raise RoomScopeError, 'Unexpected held item prevents eLoot recovery' unless tool && bag
-        Inventory.store_item(bag, tool, true)
-        raise RoomScopeError, 'Skinning tool restoration was not observed' if ELoot.in_hand?(tool)
-      end
-      data.right_hand, data.left_hand = recovery.values_at(:right, :left)
-      Inventory.return_hands
-      dothistimeout('stand', 3, /You stand|You quickly roll|You are already standing/) unless standing?
+      reconcile_room_tool_stows!(recovery, owner)
+      restore_room_equipment!(recovery)
       owner.check_execution_guard!
-      unless [GameObj.right_hand, GameObj.left_hand].map { |item| item&.id } == originals && standing?
-        raise RoomScopeError, 'eLoot equipment restoration was not verified'
-      end
+      verify_room_restoration!(recovery)
+      @room_recovery = nil if @room_recovery.equal?(recovery)
       { outcome: :complete }.freeze
     rescue SystemExit
       raise RoomScopeError, 'eLoot equipment recovery could not finish'
@@ -3823,6 +3865,15 @@ end
 
 module ELoot # Inventory methods
   module Inventory
+    # Room-scoped callers may begin with ordinary held items that are absent
+    # from READY. Preserve legacy standalone failure behavior outside that API.
+    def self.ready_item_key(item)
+      match = ReadyList.ready_list.find { |key, value| ELoot.data.original_readylist.include?(key) && value.id == item.id }
+      return match&.first if ELoot.room_scope?
+
+      match[0]
+    end
+
     def self.container_contents(container, time: 3)
       ELoot.msg(type: "debug", text: "container: #{container.inspect}")
 
@@ -4002,7 +4053,7 @@ module ELoot # Inventory methods
     def self.free_hands(right: false, left: false, both: false)
       if (right || both) && checkright
         # Are we holding a ready_list weapon? If so put it into its sheath
-        if !GameObj.right_hand.id.nil? && (ready_item = ReadyList.ready_list.find { |k, v| ELoot.data.original_readylist.include?(k) && v.id == GameObj.right_hand.id }&.first)
+        if !GameObj.right_hand.id.nil? && (ready_item = Inventory.ready_item_key(GameObj.right_hand))
           Inventory.stow_ready_list(ready_item, GameObj.right_hand)
         end
         if checkright
@@ -4011,7 +4062,7 @@ module ELoot # Inventory methods
       end
 
       if (left || both) && checkleft
-        if !GameObj.left_hand.id.nil? && (ready_item = ReadyList.ready_list.find { |k, v| ELoot.data.original_readylist.include?(k) && v.id == GameObj.left_hand.id }&.first)
+        if !GameObj.left_hand.id.nil? && (ready_item = Inventory.ready_item_key(GameObj.left_hand))
           Inventory.stow_ready_list(ready_item, GameObj.left_hand)
         end
         if checkleft
@@ -4089,7 +4140,7 @@ module ELoot # Inventory methods
 
       # Check Right Hand
       unless ELoot.data.right_hand.id.nil? || ELoot.data.right_hand.id == GameObj.right_hand.id
-        if (ready_item = ReadyList.ready_list.find { |k, v| ELoot.data.original_readylist.include?(k) && v.id == ELoot.data.right_hand.id }&.first)
+        if (ready_item = Inventory.ready_item_key(ELoot.data.right_hand))
           Inventory.return_ready_list(ready_item, ELoot.data.right_hand)
         else
           Inventory.drag(ELoot.data.right_hand, 'right')
@@ -4098,7 +4149,7 @@ module ELoot # Inventory methods
 
       # Check Left Hand
       unless ELoot.data.left_hand.id.nil? || ELoot.data.left_hand.id == GameObj.left_hand.id
-        if (ready_item = ReadyList.ready_list.find { |k, v| ELoot.data.original_readylist.include?(k) && v.id == ELoot.data.left_hand.id }&.first)
+        if (ready_item = Inventory.ready_item_key(ELoot.data.left_hand))
           Inventory.return_ready_list(ready_item, ELoot.data.left_hand)
         else
           Inventory.drag(ELoot.data.left_hand, 'left')
