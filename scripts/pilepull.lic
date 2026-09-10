@@ -14,6 +14,12 @@
       ;pilepull rewards [all] [history] - tier breakdown of items received + silver spent.
                                            "all" = every character, "history" = every
                                            Duskruin event on record (both combine)
+      ;pilepull logs [all|character]     - same tier breakdown, but derived from raw session
+                                           logs instead of pilepull's own tracking, so it
+                                           covers Duskruin events from before reward tracking
+                                           existed. Defaults to the current character's own
+                                           logs; "all" combines every LOG_DIR/<game>-<character>
+                                           directory found, or name one specific character
 
   Flags (combine with any command above, in any position; all but --debug are
   saved to CharSettings and remembered on your next run):
@@ -36,10 +42,29 @@
        requirements:
         - sequel gem
         - terminal-table gem
-           version: 1.2.0
+           version: 1.3.3
 
   Improvements:
   Major_change.feature_addition.bugfix
+  v1.3.3 (2026-09-10)
+    - Fix ";pilepull logs" counting every search twice for any session that
+      was run with --debug: the debug output itself was getting picked up
+      as a second, duplicate search result.
+  v1.3.2 (2026-09-10)
+    - Fix ";pilepull logs" defaulting to every character's logs combined,
+      which skewed the odds shown -- it now defaults to just the current
+      character; use ";pilepull logs all" to combine everyone on purpose.
+    - Fix a crash on the very first real run of ";pilepull logs"
+      ("undefined method 'tier_for'").
+  v1.3.1 (2026-09-10)
+    - ";pilepull logs" now only scans log files dated within a Duskruin
+      event window (last week of Feb through first week of March, and last
+      week of Aug through first week of Sept), instead of every log a
+      character has, and prints periodic progress while it scans.
+  v1.3.0 (2026-09-10)
+    - Add ";pilepull logs [character]", a tier breakdown derived from raw
+      session logs instead of pilepull's own tracking, so you can see what
+      dropped in Duskruin events from before reward tracking existed.
   v1.2.0 (2026-09-05)
     - Add reward tracking: see what you've pulled from the pile and how much
       silver you've spent with ";pilepull rewards" (shown as a table).
@@ -487,6 +512,275 @@ module PilePull
       echo("Total silver spent searching: #{with_commas(total_spent)}")
       echo("")
     end
+
+    # Rewards' own DB only has rows going back to whenever a character first
+    # ran ";pilepull" with reward tracking (v1.2.0+) -- it can't say what
+    # dropped in older Duskruin events. LogScan re-derives the same tier
+    # breakdown for those older events by scanning raw Lich session logs for
+    # the pile's own search response text, which is the exact line
+    # search_pile (above) already parses live via @last_pull_name. Logs are
+    # read-only input here -- nothing is written back to pilepull.db, so
+    # this is safe to re-run against the same logs any number of times.
+    module LogScan
+      # Matches the exact search response text search_pile (above) parses
+      # live off the game stream ("You hand over 1,000,000 silver and search
+      # through a pile of mania prizes.  You pull a/an <item> from
+      # within!"), so a log-derived item name is exactly as unambiguous as a
+      # live one -- see search_pile's comment on why this text, not
+      # GameObj.right_hand.name, is the reliable source of truth.
+      PULL_LINE = /You pull (?:a|an) (.+) from within!/i unless const_defined?(:PULL_LINE, false)
+
+      # When a session was run with ";pilepull --debug", search_pile's own
+      # dbg("search_pile: result=#{result.inspect}") echoes the raw search
+      # response text -- including the "You pull a/an ... from within!"
+      # phrase -- right back into the log as a second line. Left unfiltered,
+      # that debug echo also matches PULL_LINE, so every search done under
+      # --debug got counted twice (confirmed against a real log: 4086 raw
+      # PULL_LINE matches for one character/event, of which 1993 were
+      # "[pilepull-debug]" echoes of the other 2093 real ones -- almost
+      # exactly double the character's actual ~2.1 billion silver spent).
+      # dbg's own "[pilepull-debug] " prefix (see PilePull.dbg above) is a
+      # reliable, deliberate marker for these echoed lines, so skip any line
+      # containing it before ever checking PULL_LINE.
+      DEBUG_ECHO = '[pilepull-debug]' unless const_defined?(:DEBUG_ECHO, false)
+
+      # Every log line is prefixed "HH:MM:SS: "; the calendar date only
+      # appears in the filename and in the occasional full-date header line
+      # Lich writes ("2026-03-01 15:47:17.514 -05:00") at session start and
+      # again on any day rollover mid-session. Filename seeds the date for
+      # the whole file; the header line updates it if the session crosses
+      # midnight, so a pull logged after midnight still lands in the right
+      # date/event bucket.
+      DATE_HEADER = /^(\d{4})-(\d{2})-(\d{2})[ T]\d{2}:\d{2}:\d{2}/ unless const_defined?(:DATE_HEADER, false)
+      FILENAME_DATE = /^(\d{4})-(\d{2})-(\d{2})_/ unless const_defined?(:FILENAME_DATE, false)
+
+      # The treasure pile is only ever out for the last stretch of a
+      # Duskruin event -- last week of Feb into the first week of March, and
+      # last week of Aug into the first week of September -- so a log file
+      # dated well outside either window can never contain a pull. Skipping
+      # those files (most of a character's log history, e.g. all of
+      # Jan/Apr-Jul/Oct-Dec) before opening any of them is what actually
+      # makes ";pilepull logs" fast on a real multi-GB log history. Each
+      # window is padded a day past its nominal edge (Feb 21/Aug 24 instead
+      # of 22/25, Mar 8/Sep 8 instead of 7) so a session that starts the
+      # evening before the nominal start, or one that starts inside the
+      # window and crosses past midnight the day after, is never excluded --
+      # scan_file's own DATE_HEADER handling still buckets individual pulls
+      # by their exact date once a file is opened, so this padding only
+      # costs a couple of extra (cheap, likely pull-free) files per event.
+      DUSKRUIN_WINDOWS = [
+        [[2, 21], [3, 8]],
+        [[8, 24], [9, 8]],
+      ].freeze unless const_defined?(:DUSKRUIN_WINDOWS, false)
+
+      def self.in_duskruin_window?(month, day)
+        DUSKRUIN_WINDOWS.any? do |(start_month, start_day), (end_month, end_day)|
+          if start_month == end_month
+            month == start_month && day.between?(start_day, end_day)
+          else
+            (month == start_month && day >= start_day) || (month == end_month && day <= end_day)
+          end
+        end
+      end
+
+      # @return [Array<String>] this root's log files whose filename date falls in a Duskruin window, sorted
+      def self.relevant_log_paths(root)
+        Dir.glob(File.join(root, '**', '*.log')).sort.select do |path|
+          match = File.basename(path).match(FILENAME_DATE)
+          match && in_duskruin_window?(match[2].to_i, match[3].to_i)
+        end
+      end
+
+      # Lich writes one session log directory per character, named
+      # "<Game>-<CharacterName>" directly under LOG_DIR (e.g.
+      # "GSF-Pickasso" for a Shattered character named Pickasso), with
+      # per-session log files nested under that as
+      # "<Game>-<CharacterName>/<year>/<month>/<timestamp>.log". Rather than
+      # hardcode which characters to scan, discover whichever
+      # "<current game>-*" directories actually exist, so ";pilepull logs"
+      # automatically covers every character that has played this game on
+      # this machine.
+      #
+      # @return [Hash] { character_name (String, as it appears on disk) => full directory path }
+      def self.discover_roots(game: XMLData.game)
+        return {} if game.nil? || game.to_s.empty?
+
+        prefix = "#{game}-"
+        Dir.glob(File.join(LOG_DIR, "#{prefix}*")).each_with_object({}) do |path, roots|
+          next unless File.directory?(path)
+          roots[File.basename(path).delete_prefix(prefix)] = path
+        end
+      end
+
+      # @return [Hash] { [character, event_key] => { pulls: Integer, items: Hash{[tier, item_name] => count} } }
+      def self.scan(roots: discover_roots)
+        totals = Hash.new { |h, k| h[k] = { pulls: 0, items: Hash.new(0) } }
+
+        file_lists = roots.transform_values { |root| relevant_log_paths(root) }
+        total_files = file_lists.each_value.sum(&:length)
+        if total_files.zero?
+          echo("pilepull: no log files found in the Duskruin date window for #{roots.keys.join(', ')}.")
+          return totals
+        end
+        echo("pilepull: scanning #{total_files} log file(s) across #{roots.length} character(s) " \
+             "(narrowed to the Duskruin date windows)...")
+
+        # A character's full log history can be years of session
+        # transcripts (multiple GB on a real account), and even narrowed to
+        # the Duskruin windows this can take a while over a
+        # network/virtual-disk mount -- echo periodic progress rather than
+        # leaving the player staring at a silent script that looks hung.
+        # Reported roughly every 10% instead of per file so it doesn't spam
+        # the window regardless of how many files there are.
+        report_every = [total_files / 10, 1].max
+        scanned = 0
+
+        file_lists.each do |character, paths|
+          paths.each do |path|
+            scan_file(path, character, totals)
+            scanned += 1
+            if (scanned % report_every).zero? || scanned == total_files
+              echo("pilepull: scanned #{scanned}/#{total_files} log files (#{(scanned * 100.0 / total_files).round}%)...")
+            end
+          end
+        end
+
+        totals
+      end
+
+      def self.scan_file(path, character, totals)
+        basename = File.basename(path)
+        match = basename.match(FILENAME_DATE)
+        unless match
+          PilePull.dbg("LogScan.scan_file: #{basename} doesn't match the expected date-prefixed filename, skipping")
+          return
+        end
+        year, month = match[1].to_i, match[2].to_i
+
+        File.foreach(path) do |line|
+          if (header = line.match(DATE_HEADER))
+            year, month = header[1].to_i, header[2].to_i
+            next
+          end
+
+          next if line.include?(DEBUG_ECHO)
+          next unless (pulled = line.match(PULL_LINE))
+
+          item_name = pulled[1].strip
+          # Explicit Rewards. receiver: tier_for/event_key_for are defined
+          # on the enclosing Rewards module, and a bare call here would
+          # resolve against LogScan's own (empty) method set instead --
+          # nesting a module inside another gives it access to the outer
+          # module's constants via lexical scoping, but NOT its methods,
+          # which are looked up on the actual receiver (self == LogScan
+          # here), not the lexical nesting chain.
+          tier = Rewards.tier_for(item_name)
+          event_key = Rewards.event_key_for(year, month)
+          PilePull.dbg("LogScan.scan_file: #{File.basename(path)} character=#{character} #{year}-#{month} item=#{item_name.inspect} tier=#{tier}")
+
+          bucket = totals[[character, event_key]]
+          bucket[:pulls] += 1
+          bucket[:items][[tier, item_name]] += 1
+        end
+      rescue Errno::ENOENT, Errno::EACCES => e
+        echo("Note: could not read log #{path}: #{e.message}")
+      end
+
+      # Narrows a discover_roots result down to what a caller actually asked
+      # to see. Split out from print_summary (as a pure filter over an
+      # already-discovered roots hash, not another Dir.glob) so the two
+      # Duskruin-mixed-into-odds bugs this guards against -- defaulting to
+      # everyone instead of just the current character, and silently
+      # returning nothing for a typo'd character name -- can be tested
+      # without going through Terminal::Table.
+      #
+      # @param all_roots [Hash] a discover_roots result to filter
+      # @param character [String] restrict to this character's own logs; ignored when all_characters is true
+      # @param all_characters [Boolean] combine every discovered character's logs instead of just one
+      # @return [Hash] the subset of all_roots selected
+      def self.select_roots(all_roots, character:, all_characters:)
+        # Defaults to just the current character -- an "all characters"
+        # blend mixes drop rates and search counts across everyone whose
+        # logs happen to exist on this machine, which isn't what a single
+        # character's odds actually looked like (and is why
+        # ";pilepull logs" combining everyone by default was wrong: it
+        # silently skewed every percentage in the table).
+        all_characters ? all_roots : all_roots.select { |name, _path| name.casecmp?(character.to_s) }
+      end
+
+      # @param character [String] restrict to this character's own logs; ignored when all_characters is true
+      # @param all_characters [Boolean] combine every discovered character's logs instead of just one
+      def self.print_summary(character: Char.name, all_characters: false)
+        all_roots = discover_roots
+        roots = select_roots(all_roots, character: character, all_characters: all_characters)
+
+        if roots.empty?
+          if all_roots.empty?
+            echo("pilepull: no log directories found under #{LOG_DIR} matching #{XMLData.game}-*.")
+          else
+            echo("pilepull: no log directory found for #{character.inspect}. Available: #{all_roots.keys.join(', ')}. " \
+                 "Use \";pilepull logs all\" to combine every character.")
+          end
+          return
+        end
+
+        characters = roots.keys
+        totals = scan(roots: roots)
+
+        if totals.empty?
+          echo("No pile-pull history found in logs for #{characters.join(', ')}.")
+          return
+        end
+
+        event_keys = totals.keys.map { |(_character, event_key)| event_key }.uniq.sort.reverse
+        event_keys.each { |key| print_event_block(totals, key, characters) }
+      end
+
+      def self.print_event_block(totals, event_key, characters)
+        merged = Hash.new(0)
+        total_pulls = 0
+
+        characters.each do |character|
+          bucket = totals[[character, event_key]]
+          next if bucket.nil?
+          total_pulls += bucket[:pulls]
+          bucket[:items].each { |key, count| merged[key] += count }
+        end
+        return if total_pulls.zero?
+
+        total_items = merged.values.sum
+
+        table = Terminal::Table.new(
+          title: "PilePull log history for #{characters.join(', ')} - #{Rewards.label_for_key(event_key)}",
+          headings: ['Item', 'Count', '% of Items']
+        )
+
+        by_tier = merged.group_by { |(tier, _item_name), _count| tier }
+
+        TIER_ORDER.each do |tier|
+          tier_rows = by_tier[tier]
+          next if tier_rows.nil? || tier_rows.empty?
+
+          tier_count = tier_rows.sum { |_key, count| count }
+          tier_pct = total_items.zero? ? 0 : (tier_count * 100.0 / total_items)
+          table << [{ value: "#{tier.upcase}  -  #{tier_count} (#{'%.1f' % tier_pct}%)", colspan: 3, alignment: :center }]
+          table.add_separator
+
+          tier_rows.sort_by { |(_tier, _item_name), count| -count }.each do |(_tier, item_name), count|
+            item_pct = total_items.zero? ? 0 : (count * 100.0 / total_items)
+            label = tier == 'unknown' ? "#{item_name} (not in current tier list)" : item_name
+            table << [label, count, "#{'%.1f' % item_pct}%"]
+          end
+          table.add_separator
+        end
+
+        table << [{ value: 'Total', colspan: 2 }, total_items]
+
+        _respond "<output class=\"mono\"/>\n#{table}\n<output class=\"\"/>"
+        echo("Total silver spent searching (from logs): #{Rewards.with_commas(total_pulls * 1_000_000)}")
+        echo("")
+      end
+    end
   end
 
   def self.detect_pile
@@ -860,6 +1154,12 @@ when "rewards"
     all_characters: rewards_args.include?("all"),
     all_events: rewards_args.include?("history") || rewards_args.include?("years")
   )
+when "logs"
+  log_args = pilepull_args[1..-1].map { |arg| arg.to_s.downcase }
+  PilePull::Rewards::LogScan.print_summary(
+    character: (log_args - ["all"]).first || Char.name,
+    all_characters: log_args.include?("all")
+  )
 when nil
   PilePull.main
 else
@@ -873,6 +1173,12 @@ else
       ;pilepull rewards [all] [history] - tier breakdown of items received + silver spent.
                                            "all" = every character, "history" = every
                                            Duskruin event on record (both combine)
+      ;pilepull logs [all|character]     - same tier breakdown, but derived from raw session
+                                           logs instead of pilepull's own tracking, so it
+                                           covers Duskruin events from before reward tracking
+                                           existed. Defaults to the current character's own
+                                           logs; "all" combines every LOG_DIR/<game>-<character>
+                                           directory found, or name one specific character
 
   Flags (combine with any command above, in any position; all but --debug are
   saved to CharSettings and remembered on your next run):
