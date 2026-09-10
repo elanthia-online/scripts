@@ -23,6 +23,11 @@
       loot, and verify restoration of borrowed skinning tools and original hands
     - safety: reject overlapping runs, selling, travel, sorters, and other
       operations outside the admitted room-cleanup scope
+  v2.11.8 (2026-09-09)
+    - fix: eloot could pause and wait for you to clear space by hand when the locksmith
+      pool handed back a box and your containers were already full. It now sells off
+      whatever's in the box directly (no need to stow it first) and clears out the rest
+      of your loot too before going back for the next box, instead of getting stuck.
   v2.11.7 (2026-09-07)
     - fix: jewelry-tagged items the gemshop won't handle (like some headbands) now get
       sold at the pawnshop instead of being put back in your loot untouched
@@ -5562,10 +5567,10 @@ module ELoot # Room looting
       ELoot.msg(type: "debug", text: "End of method")
     end
 
-    # Stow a single box item during looting. In the locksmith pool return context,
-    # when all containers are full, recover by selling to free space and resuming
-    # instead of pausing. Returns :recovered when a sell-and-return recovery re-looted
-    # the whole box (the caller should stop iterating); nil otherwise.
+    # Stow a single box item during looting. In the locksmith pool return context, when
+    # all containers are full, recover with the sell-in-place recovery instead of
+    # pausing. Returns :recovered when a recovery re-looted the whole box (the caller
+    # should stop iterating); nil otherwise.
     # @return [Symbol, nil]
     def self.stow_box_item(thing, box, location, data, sell_recovered)
       item_name = thing.respond_to?(:name) ? thing.name : thing.inspect
@@ -5576,13 +5581,12 @@ module ELoot # Room looting
         return nil
       end
 
-      has_disk = (ELoot.data.settings[:use_disk] || ELoot.data.settings[:use_disk_group]) && ELoot.data.disk_full.value?(false)
       room_tags = Room.current.tags
       sell_allowed = !ELoot.data.pool_command
-      recover = Loot.pool_full_recovery?(room_tags: room_tags, has_disk: has_disk, sell_allowed: sell_allowed, attempted: sell_recovered)
-      ELoot.msg(type: "debug", text: "stow_box_item: containers full for #{item_name} | pool_full_recovery? => #{recover} (room_tags: #{room_tags.inspect}, has_disk: #{has_disk}, sell_allowed: #{sell_allowed}, attempted: #{sell_recovered})")
+      recover = Loot.pool_full_recovery?(room_tags: room_tags, sell_allowed: sell_allowed, attempted: sell_recovered)
+      ELoot.msg(type: "debug", text: "stow_box_item: containers full for #{item_name} | pool_full_recovery? => #{recover} (room_tags: #{room_tags.inspect}, sell_allowed: #{sell_allowed}, attempted: #{sell_recovered})")
 
-      return Loot.pool_sell_recovery(box, location, data) if recover
+      return Loot.pool_direct_sell_recovery(box, location, data) if recover
 
       # Fall back to the existing manual pause.
       ELoot.msg(type: "debug", text: "stow_box_item: recovery not applicable for #{item_name}, falling back to manual pause")
@@ -5590,25 +5594,127 @@ module ELoot # Room looting
       nil
     end
 
-    # Decide whether to run the sell-and-return recovery instead of pausing when a box
+    # Decide whether to run the sell-in-place recovery instead of pausing when a box
     # item cannot be stored and all sacks are full. Pure predicate: all state is passed
     # as arguments so it is unit-testable without a game connection. It emits no debug
     # itself (that would break the standalone spec that evals it in isolation); the
     # decision and its inputs are logged by the caller, stow_box_item.
     # @param room_tags [Array<String>] Room.current.tags
-    # @param has_disk [Boolean] whether the box can be set aside on a disk
     # @param sell_allowed [Boolean] false during a standalone ;eloot pool command
     # @param attempted [Boolean] true if recovery already ran for this box
     # @return [Boolean]
-    def self.pool_full_recovery?(room_tags:, has_disk:, sell_allowed:, attempted:)
+    def self.pool_full_recovery?(room_tags:, sell_allowed:, attempted:)
       return false unless sell_allowed
       return false if attempted
-      return false unless has_disk
       room_tags.any? { |t| t =~ /locksmith/i }
     end
 
-    # Sell-and-return recovery for a full inventory during a locksmith pool return.
-    # Returns the stuck item to the box, sets the box aside on a disk, runs a
+    # Sells everything left in `box` that has somewhere to sell it, one trip per shop
+    # needed rather than one trip per item -- so a box with several unstowable items
+    # does not send the pool return back and forth to town once per item. Routes each
+    # remaining item through Sell.check_items (the same eligibility/exclusion rules --
+    # sell_loot_types, sell_exclude, cursed/bound guards, alchemy-mode reagent keeps,
+    # ... -- the normal sell trip already applies) instead of re-deriving them here, so
+    # this only ever sells an item the normal sell trip would have sold too. The box
+    # stays held in the other hand throughout: each item is dragged into hand, sold, and
+    # the next is dragged in, without ever calling anything that frees both hands.
+    # @param box [GameObj] the box being looted, held in one hand
+    # @param data [Hash] silver breakdown ledger, forwarded to appraise/sell_item
+    # @return [void]
+    def self.sell_box_contents(box, data)
+      routed = box.contents.to_a.filter_map do |item|
+        next if $sell_ignore.include?(item.id)
+
+        locations = Sell.check_items(items: [item])
+        next if locations.empty?
+
+        shop = locations.include?("gemshop") ? "gemshop" : locations.first
+        [item, shop]
+      end
+      return if routed.empty?
+
+      rooms = routed.map(&:last).uniq.filter_map { |shop| Room.current.find_nearest_by_tag(shop) }.uniq
+      return if rooms.empty?
+
+      _prev, distances = Room.current.dijkstra
+      rooms.sort_by! { |room| distances[room] }
+
+      rooms.each do |room_id|
+        shop_tags = Room[room_id].tags
+        items_here = routed.select { |_item, shop| shop_tags.include?(shop) }
+        next if items_here.empty?
+
+        ELoot.go2(room_id)
+
+        items_here.each do |item, shop|
+          next unless box.contents.to_a.include?(item)
+          next if $sell_ignore.include?(item.id)
+
+          Inventory.drag(item)
+
+          case shop
+          when "gemshop"
+            Sell.appraise(item, "Gemshop", data)
+          when "pawnshop"
+            Sell.appraise(item, "Pawnshop", data)
+          else
+            Sell.sell_item(item, shop, data)
+          end
+        end
+      end
+    end
+
+    # Sell-in-place recovery for a full inventory during a locksmith pool return.
+    # Sells everything left in the box that's sellable directly out of hand (see
+    # sell_box_contents) instead of setting the box aside, so no disk is required. If
+    # that empties the box, it is trashed on the spot -- no hand conflict, since it is
+    # now empty -- and a normal skip_boxes sell trip clears whatever else is clogging
+    # the sacks before the pool return resumes. If a genuine keeper (something with
+    # nowhere to sell) is still in there, this hands off to the disk-park recovery,
+    # which parks the box, runs the same kind of sell trip, and finishes looting it with
+    # real free space -- or, without a disk, pauses with a clear message.
+    # @return [Symbol] :recovered
+    def self.pool_direct_sell_recovery(box, location, data)
+      data ||= Hash.new(0)
+      box_name = box.respond_to?(:name) ? box.name : box.inspect
+      ELoot.msg(type: "debug", text: "pool_direct_sell_recovery: start | box=#{box_name} location=#{location.inspect} room=#{Room.current.id}")
+      ELoot.msg(type: "info", text: " Containers full. Selling the box's sellable contents directly, then resuming the pool return.")
+
+      # Put anything currently in hand (the stuck item) back into the box before selling.
+      [GameObj.right_hand, GameObj.left_hand].each do |held|
+        next if held.nil? || held.name == "Empty" || held.id.nil?
+        next if held.id == box.id
+        ELoot.msg(type: "debug", text: "pool_direct_sell_recovery: returning #{held.name} to box before selling")
+        ELoot.get_command("_drag ##{held.id} ##{box.id}", ELoot.data.put_regex, silent: true, quiet: true)
+      end
+
+      pool_room = Room.current.id
+      Loot.sell_box_contents(box, data)
+
+      ELoot.go2(pool_room)
+      Inventory.drag(box) unless ELoot.in_hand?(box)
+
+      unless box.contents.to_a.empty?
+        ELoot.msg(type: "debug", text: "pool_direct_sell_recovery: #{box.contents.to_a.length} item(s) left in #{box_name} with nowhere to sell; handing off to the disk-park recovery")
+        return Loot.pool_sell_recovery(box, location, data)
+      end
+
+      # The box drained completely -- trash it now, while it is still in hand and
+      # empty, then clear whatever else is clogging the sacks before going back for
+      # the rest of the pool.
+      ELoot.msg(type: "debug", text: "pool_direct_sell_recovery: #{box_name} emptied by direct sale; trashing it and running a general sell trip")
+      Sell.save_trash_box(box)
+      Sell.sell(skip_boxes: true)
+      ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0]] }
+      ELoot.reset_disk_full
+      ELoot.go2(pool_room)
+
+      :recovered
+    end
+
+    # Sell-and-return recovery for a full inventory during a locksmith pool return,
+    # used when sell-in-place could not fully drain the box (a genuine keeper is still
+    # in there). Returns the stuck item to the box, sets the box aside on a disk, runs a
     # box-skipping sell trip to free container space, then returns to the pool and
     # re-loots the box. Falls back to the existing manual pause when the box cannot be
     # set aside on a disk.
@@ -5617,7 +5723,7 @@ module ELoot # Room looting
       data ||= Hash.new(0)
       box_name = box.respond_to?(:name) ? box.name : box.inspect
       ELoot.msg(type: "debug", text: "pool_sell_recovery: start | box=#{box_name} location=#{location.inspect} room=#{Room.current.id}")
-      ELoot.msg(type: "info", text: " Containers full. Selling to free space, then resuming the pool return.")
+      ELoot.msg(type: "info", text: " #{box.contents.to_a.length} item(s) left with nowhere to sell. Parking the box, selling off the rest, then resuming the pool return.")
 
       # Put anything currently in hand (the stuck item) back into the box we are looting.
       [GameObj.right_hand, GameObj.left_hand].each do |held|

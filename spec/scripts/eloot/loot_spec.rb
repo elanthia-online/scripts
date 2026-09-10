@@ -2,9 +2,7 @@
 
 require_relative '../../spec_helper'
 
-# RSpec for ELoot::Loot.pool_full_recovery? (the sell-and-return recovery decision).
-#
-# Run: rspec pool_full_recovery_spec.rb
+# RSpec for ELoot::Loot.pool_full_recovery? (the sell-in-place recovery decision).
 #
 # eloot.lic cannot be required standalone -- it depends on the Lich runtime (GameObj,
 # Script, Spell, Map, ...) and executes a main block on load. Rather than copy the
@@ -30,14 +28,14 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
 
   # Fully-passing baseline; each example overrides only the field under test.
   let(:base) do
-    { room_tags: ['locksmith pool', 'town'], has_disk: true, sell_allowed: true, attempted: false }
+    { room_tags: ['locksmith pool', 'town'], sell_allowed: true, attempted: false }
   end
 
   def recover?(**overrides)
     predicate.pool_full_recovery?(**base.merge(overrides))
   end
 
-  context 'at a locksmith pool with a disk, selling allowed, first attempt' do
+  context 'at a locksmith pool, selling allowed, first attempt' do
     it 'runs the recovery' do
       expect(recover?).to be true
     end
@@ -66,10 +64,6 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
       expect(recover?(sell_allowed: false)).to be false
     end
 
-    it 'does not recover with no disk to set the box aside' do
-      expect(recover?(has_disk: false)).to be false
-    end
-
     it 'does not recover if recovery already ran for this box' do
       expect(recover?(attempted: true)).to be false
     end
@@ -77,11 +71,266 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
 
   context 'guard precedence (a failing guard wins even at a locksmith pool)' do
     it 'sell_allowed:false overrides an otherwise-eligible state' do
-      expect(recover?(sell_allowed: false, has_disk: true, attempted: false)).to be false
+      expect(recover?(sell_allowed: false, attempted: false)).to be false
     end
 
     it 'attempted:true overrides an otherwise-eligible state' do
-      expect(recover?(attempted: true, has_disk: true, sell_allowed: true)).to be false
+      expect(recover?(attempted: true, sell_allowed: true)).to be false
+    end
+  end
+end
+
+# RSpec for ELoot::Loot.sell_box_contents -- the batching step of the sell-in-place
+# recovery. Routes every remaining box item through Sell.check_items (stubbed here to
+# the same per-item eligibility contract the real method has: an array of shop tags, or
+# empty when nothing there sells it) and visits each distinct shop once, not once per
+# item -- the whole point of selling in a batch instead of one item at a time.
+RSpec.describe 'ELoot::Loot.sell_box_contents' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
+  let(:source) { File.read(eloot_path) }
+
+  let(:item_class) { Struct.new(:id, :name) }
+  let(:calls) { [] }
+
+  # item name => Sell.check_items(items: [item]) result, so each context only has to
+  # say where an item sells rather than restub the whole method.
+  let(:routing) { {} }
+
+  let(:box_contents) { [] }
+  let(:box) { Struct.new(:id, :name, :contents).new('box-1', 'a strongbox', box_contents) }
+
+  let(:harness) do
+    recorder = calls
+    routes = routing
+
+    mod = Module.new
+    mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
+    mod.const_set(:ELoot, mod)
+
+    room = Module.new
+    current = Module.new
+    current.define_singleton_method(:find_nearest_by_tag) { |shop| "#{shop}-room" }
+    current.define_singleton_method(:dijkstra) { [nil, Hash.new(0)] }
+    room.define_singleton_method(:current) { current }
+    room.define_singleton_method(:[]) do |room_id|
+      Struct.new(:tags).new([room_id.to_s.sub(/-room\z/, '')])
+    end
+    mod.const_set(:Room, room)
+
+    inventory = Module.new
+    inventory.define_singleton_method(:drag) { |item| recorder << [:drag, item.name] }
+    mod.const_set(:Inventory, inventory)
+
+    mod.define_singleton_method(:check_items) { |items:| routes[items.first.name] || [] }
+    mod.define_singleton_method(:appraise) { |item, place, _data| recorder << [:appraise, item.name, place] }
+    mod.define_singleton_method(:sell_item) { |item, place, _data| recorder << [:sell_item, item.name, place] }
+    mod.const_set(:Sell, mod)
+
+    mod.module_eval(extract_lic_method(source, 'sell_box_contents', source_path: eloot_path))
+    mod
+  end
+
+  let(:data) { Hash.new(0) }
+
+  before { $sell_ignore = [] }
+
+  context 'nothing in the box sells anywhere' do
+    let(:box_contents) { [item_class.new('1', 'a marble-lined runic codex')] }
+    let(:routing) { { 'a marble-lined runic codex' => [] } }
+
+    it 'never travels' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).to be_empty
+    end
+  end
+
+  context 'several items split across two shops' do
+    let(:nugget) { item_class.new('1', 'a gold nugget') }
+    let(:bracer) { item_class.new('2', 'a platinum bracer') }
+    let(:ingot) { item_class.new('3', 'a gold ingot') }
+    let(:box_contents) { [nugget, bracer, ingot] }
+    let(:routing) do
+      {
+        'a gold nugget'     => ['gemshop'],
+        'a platinum bracer' => ['gemshop', 'pawnshop'],
+        'a gold ingot'      => ['gemshop']
+      }
+    end
+
+    it 'visits the gemshop exactly once for every item routed there' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls.count { |c| c.first == :go2 }).to eq(1)
+      expect(calls).to include(
+        [:drag, 'a gold nugget'], [:appraise, 'a gold nugget', 'Gemshop'],
+        [:drag, 'a platinum bracer'], [:appraise, 'a platinum bracer', 'Gemshop'],
+        [:drag, 'a gold ingot'], [:appraise, 'a gold ingot', 'Gemshop']
+      )
+    end
+  end
+
+  context 'an item sellable only at the pawnshop, alongside a gemshop-only item' do
+    let(:spur) { item_class.new('1', 'a drake yierka-spur') }
+    let(:orb) { item_class.new('2', 'a shimmering blue orb') }
+    let(:box_contents) { [spur, orb] }
+    let(:routing) do
+      { 'a drake yierka-spur' => ['pawnshop'], 'a shimmering blue orb' => ['gemshop'] }
+    end
+
+    it 'makes one trip per distinct shop, not one per item' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls.select { |c| c.first == :go2 }).to contain_exactly([:go2, 'pawnshop-room'], [:go2, 'gemshop-room'])
+    end
+  end
+
+  context 'sellable somewhere other than the two appraisal shops' do
+    let(:crate) { item_class.new('1', 'a battered antique faewood crate') }
+    let(:box_contents) { [crate] }
+    let(:routing) { { 'a battered antique faewood crate' => ['consignment'] } }
+
+    it 'sells it directly rather than appraising it' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).to include([:go2, 'consignment-room'], [:sell_item, 'a battered antique faewood crate', 'consignment'])
+    end
+  end
+
+  context 'an item already queued elsewhere ($sell_ignore)' do
+    let(:ring) { item_class.new('1', 'a gold ring') }
+    let(:box_contents) { [ring] }
+    let(:routing) { { 'a gold ring' => ['gemshop'] } }
+
+    before { $sell_ignore = ['1'] }
+
+    it 'is skipped entirely' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).to be_empty
+    end
+  end
+end
+
+# RSpec for ELoot::Loot.pool_direct_sell_recovery -- the sell-in-place recovery itself.
+# stow_box_item runs this once per box (see pool_full_recovery? above), not once per
+# item, so it has to settle the whole box's remaining contents in one pass: sell
+# whatever sell_box_contents can, then either the box is empty (trash it and clear the
+# rest of the run's backlog) or something is left with nowhere to sell it (hand off to
+# the existing disk-park recovery instead of pausing outright).
+RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
+  let(:source) { File.read(eloot_path) }
+
+  let(:hand_class) { Struct.new(:id, :name) }
+  let(:empty_hand) { hand_class.new(nil, 'Empty') }
+  let(:box_contents) { [] }
+  let(:box) { Struct.new(:id, :name, :contents).new('box-1', 'a strongbox', box_contents) }
+  let(:calls) { [] }
+  let(:data) { Hash.new(0) }
+
+  # sell_box_contents removes whatever it sold from the box; the spec controls the
+  # outcome directly by handing sell_box_contents a block that mutates box_contents.
+  let(:drains_box) { true }
+
+  let(:harness) do
+    recorder = calls
+    drains = drains_box
+    contents = box_contents
+    the_box = box
+    empty = empty_hand
+
+    mod = Module.new
+    mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
+    mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
+    mod.define_singleton_method(:get_command) { |cmd, _regex, **kw| recorder << [:get_command, cmd, kw]; [] }
+    mod.define_singleton_method(:in_hand?) { |item| item.id == the_box.id }
+    data_obj = Object.new
+    data_obj.define_singleton_method(:put_regex) { /put/ }
+    data_obj.define_singleton_method(:sacks_full=) { |val| recorder << [:sacks_full=, val] }
+    mod.define_singleton_method(:data) { data_obj }
+    mod.define_singleton_method(:reset_disk_full) { recorder << [:reset_disk_full] }
+    mod.const_set(:ELoot, mod)
+
+    room = Module.new
+    current = Module.new
+    current.define_singleton_method(:id) { 'pool-room' }
+    room.define_singleton_method(:current) { current }
+    mod.const_set(:Room, room)
+
+    gameobj = Module.new
+    gameobj.define_singleton_method(:right_hand) { empty }
+    gameobj.define_singleton_method(:left_hand) { empty }
+    mod.const_set(:GameObj, gameobj)
+
+    inventory = Module.new
+    inventory.define_singleton_method(:drag) { |item| recorder << [:drag, item.name] }
+    mod.const_set(:Inventory, inventory)
+
+    script = Module.new
+    current_script = Object.new
+    current_script.define_singleton_method(:name) { 'eloot' }
+    current_script.define_singleton_method(:vars) { ['start'] }
+    script.define_singleton_method(:current) { current_script }
+    mod.const_set(:Script, script)
+
+    mod.define_singleton_method(:sell_box_contents) do |b, _data|
+      recorder << [:sell_box_contents, b.name]
+      contents.clear if drains
+    end
+    mod.define_singleton_method(:pool_sell_recovery) do |b, location, _data|
+      recorder << [:pool_sell_recovery, b.name, location]
+      :recovered
+    end
+    mod.define_singleton_method(:box_loot) { |*args| recorder << [:box_loot, *args] }
+    mod.const_set(:Loot, mod)
+
+    sell = Module.new
+    sell.define_singleton_method(:save_trash_box) { |b| recorder << [:save_trash_box, b.name] }
+    sell.define_singleton_method(:sell) { |**kw| recorder << [:sell, kw] }
+    mod.const_set(:Sell, sell)
+
+    mod.module_eval(extract_lic_method(source, 'pool_direct_sell_recovery', source_path: eloot_path))
+    mod
+  end
+
+  context 'sell_box_contents drains the box completely' do
+    let(:box_contents) { [] }
+    let(:drains_box) { true }
+
+    it 'trashes the box, runs a general sell trip, and returns to the pool room' do
+      result = harness.pool_direct_sell_recovery(box, 'Icemule Trace', data)
+
+      expect(result).to eq(:recovered)
+      expect(calls).to include(
+        [:sell_box_contents, 'a strongbox'],
+        [:save_trash_box, 'a strongbox'],
+        [:sell, { skip_boxes: true }],
+        [:reset_disk_full]
+      )
+      expect(calls.map(&:first)).not_to include(:pool_sell_recovery, :box_loot)
+
+      # sell_box_contents (freeing the box) must happen before it's trashed, which
+      # must happen before the general sell trip clears the rest of the backlog.
+      order = calls.map(&:first)
+      expect(order.index(:sell_box_contents)).to be < order.index(:save_trash_box)
+      expect(order.index(:save_trash_box)).to be < order.index(:sell)
+
+      # Ends back at the pool room, ready for pool_return's loop to continue.
+      expect(calls.select { |c| c.first == :go2 }.last).to eq([:go2, 'pool-room'])
+    end
+  end
+
+  context 'sell_box_contents leaves something with nowhere to sell it' do
+    let(:box_contents) { [Struct.new(:id, :name).new('99', 'an ascension jewel')] }
+    let(:drains_box) { false }
+
+    it 'hands off to the disk-park recovery instead of trashing the box' do
+      result = harness.pool_direct_sell_recovery(box, 'Icemule Trace', data)
+
+      expect(result).to eq(:recovered)
+      expect(calls).to include([:pool_sell_recovery, 'a strongbox', 'Icemule Trace'])
+      expect(calls.map(&:first)).not_to include(:save_trash_box, :sell)
     end
   end
 end

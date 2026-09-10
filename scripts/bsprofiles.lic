@@ -1,0 +1,2007 @@
+=begin
+  bsprofiles - standalone editor and manager for bigshot profiles
+
+  Bigshot profiles are YAML snapshots of UserVars.op stored one-per-file under
+    <data>/<game>/<character>/bigshot_profiles/<name>.yaml
+  This script lets you create, edit, compare and manage those files without
+  running bigshot, and without touching bigshot's live settings unless you ask.
+
+  The editor window IS bigshot's own setup window. The Bigshot::Setup class is
+  pulled out of bigshot.lic at runtime, so every tab, widget and tooltip stays
+  identical to whatever version of bigshot you have installed. Two tabs are
+  added on top: Compare (two profiles side by side) and Creatures (pick a
+  creature from the bundled creature templates, see where it spawns, and push
+  rooms, boundaries and targets straight into the profile being edited).
+
+  GUI
+    ;bsprofiles                     open the editor on a blank profile
+    ;bsprofiles edit <name>         open the editor on a saved profile
+    ;bsprofiles new <name>          create <name> from defaults, then open it
+
+  Command line (no GUI needed)
+    ;bsprofiles list                list saved profiles
+    ;bsprofiles show <name>         print a profile's non-empty settings
+    ;bsprofiles compare <a> | <b>   print the settings that differ
+    ;bsprofiles copy <a> | <b>      copy profile a to a new profile b
+    ;bsprofiles rename <a> | <b>    rename profile a to b
+    ;bsprofiles delete <name> confirm
+    ;bsprofiles apply <name>        load <name> into bigshot's live settings
+                                    (same as ;bigshot profile load <name>)
+    ;bsprofiles help
+
+  Names may contain spaces. When a command takes two names, separate them
+  with a pipe: ;bsprofiles compare Boreal Forest | atoll_path
+  A single-name command takes the rest of the line as the name.
+
+  In the editor
+    - The Profiles tab works as it does in bigshot: Load Profile, Update
+      Profile, Save Current Settings as...
+    - Close does NOT write anything. Save first.
+    - "Apply to Bigshot" (bottom right) copies the editor's settings into
+      UserVars.op, which is what bigshot reads when it starts.
+    - Compare tab: pick two profiles (or "<editor>" for the unsaved state of
+      the window) and see every setting side by side, differences in red.
+    - Creatures tab: the list opens on creatures from 5 levels below to 10
+      above your character (adjust the band, 1-120 shows everything), with
+      name and area filters and a "creatures at room" lookup. Selecting a
+      creature shows its full template (attacks, defenses, TDs, treasure,
+      tips), its areas, the rooms in the chosen area with checkboxes, and the
+      other creatures that spawn there. The "Send to profile" box pushes the
+      result into hunting room / rally points / boundaries / targets.
+      "Boundaries <- perimeter" computes the ring of rooms just outside the
+      checked rooms, which is what bigshot's hunting_boundaries expects.
+    - Map tab: the same map images ;map uses, showing the chosen area's rooms
+      (green X ticked, grey X not) plus the profile's start room, rally points
+      and boundaries, so you can see the fence. Click a room to tick or untick
+      it, drag to pan, Ctrl+wheel or the buttons to zoom.
+
+  author: Nisugi
+  game: gs
+  tags: bigshot, profiles, hunting, gui
+  version: 1.1.1
+
+  changelog:
+    1.1.1 (2026-09-09)
+      - profile names are validated everywhere a file is touched (no path
+        separators, dots-only or hidden names); the GUI refuses them too
+      - compare merges bigshot's defaults first, so an older file that
+        omits a key no longer differs from one that stores the default
+      - review fixes: copied profiles keep their own name, boon edits mark
+        the window dirty, multi-select room buttons, empty creature results
+        clear the panels, creatures-at-room falls back to the hunting room
+      - Map tab: Dark checkbox, seeded from ;map's dark_mode setting
+    1.1.0 (2026-09-09)
+      - Map tab: area rooms, ticks, start/rally/boundary overlays, click to tick
+      - Creatures tab rebuilt: level band, area and undead filters, full
+        template detail, co-spawns, multi-select rooms, rally points
+      - tooltips everywhere, live footer
+    1.0.0 (2026-09-09)
+      - initial release
+=end
+
+require 'yaml'
+require 'fileutils'
+
+module BSProfiles
+  # Keys that exist only to back the profile-tab widgets and must never land
+  # in a file. Mirrors Bigshot::Setup#pre_save.
+  TRANSIENT_KEYS = %w[profile_name profile_button save_current profile_save profile_overwrite
+                      profile_cancel msg_label no_current_profile boon_flee_from].freeze
+
+  EDITOR_CHOICE = '<editor>'.freeze
+
+  module_function
+
+  # ---------------------------------------------------------------- files --
+
+  def dir
+    d = File.join($data_dir, XMLData.game, Char.name, 'bigshot_profiles')
+    FileUtils.mkdir_p(d)
+    d
+  end
+
+  # Every file operation goes through here, so a name that could escape the
+  # profiles directory (slashes, "..", drive letters) is refused at the source.
+  def path(name)
+    raise ArgumentError, "invalid profile name #{name.inspect}" unless valid_name?(name)
+
+    File.join(dir, "#{name.to_s.strip}.yaml")
+  end
+
+  def names
+    Dir.children(dir).select { |f| f.end_with?('.yaml') }.map { |f| f.sub(/\.yaml\z/, '') }.sort_by(&:downcase)
+  end
+
+  def exist?(name)
+    valid_name?(name) && File.exist?(path(name))
+  end
+
+  # @return [Hash{String=>Object}] string-keyed settings, or nil if missing
+  def load(name)
+    return nil unless exist?(name)
+
+    data = YAML.load_file(path(name))
+    return nil unless data.is_a?(Hash)
+
+    data.transform_keys(&:to_s)
+  end
+
+  def save(name, settings)
+    clean = settings.transform_keys(&:to_s).reject { |k, _| TRANSIENT_KEYS.include?(k) }
+    File.write(path(name), clean.to_yaml)
+    path(name)
+  end
+
+  # A single file name: no path separators or drive/stream colons, no
+  # Windows-reserved characters, not "." or "..", and not hidden.
+  def valid_name?(name)
+    n = name.to_s.strip
+    !n.empty? && n !~ %r{[\\/:*?"<>|\x00-\x1f]} && !n.start_with?('.')
+  end
+
+  # ------------------------------------------------------- bigshot's class --
+
+  def bigshot_path
+    base = defined?(SCRIPT_DIR) ? SCRIPT_DIR : $script_dir
+    File.join(base, 'bigshot.lic')
+  end
+
+  # Pull `class Bigshot; class Setup < Gtk::Builder ... end; end` out of
+  # bigshot.lic. The class closes at the first column-0 `end` after it opens.
+  #
+  # @return [Array(String, Integer)] source and its starting line number
+  def extract_setup_source
+    raise "bigshot.lic not found at #{bigshot_path}" unless File.exist?(bigshot_path)
+
+    text = File.read(bigshot_path)
+    start = text.index(/^class Bigshot\n  class Setup < Gtk::Builder/)
+    raise 'could not find class Bigshot::Setup in bigshot.lic' if start.nil?
+
+    stop = text.index(/^end$/, start)
+    raise 'could not find the end of class Bigshot::Setup in bigshot.lic' if stop.nil?
+
+    src = text[start, stop - start + 3]
+    line = text[0...start].count("\n") + 1
+    [src, line]
+  end
+
+  def bigshot_version
+    File.read(bigshot_path)[/^\s*version: (\d+\.\d+\.\d+)/i, 1]
+  rescue StandardError
+    nil
+  end
+
+  def gui_available?
+    defined?(Gtk) && defined?(Gtk::Version) && Gtk::Version::MAJOR == 3
+  end
+
+  # Settings schema shared with bigshot: {key(Symbol) => {default: ...}}.
+  # Comes from the loaded Bigshot::Setup class when there is one; without
+  # GTK that class cannot exist, so the CLI reads the hash literal straight
+  # out of bigshot.lic instead.
+  def schema
+    if defined?(Bigshot::Setup)
+      Bigshot::Setup.class_variable_get(:@@categories)[:general]
+    else
+      @schema ||= extract_categories[:general]
+    end
+  end
+
+  # The `@@categories = { ... }` literal from bigshot.lic, evaluated on its
+  # own. It is plain data (symbols, strings, numbers, arrays), no GTK.
+  def extract_categories
+    raise "bigshot.lic not found at #{bigshot_path}" unless File.exist?(bigshot_path)
+
+    text = File.read(bigshot_path)
+    literal = text[/^    @@categories = (\{.*?^    \})/m, 1]
+    raise 'could not find @@categories in bigshot.lic' if literal.nil?
+
+    data = eval(literal, TOPLEVEL_BINDING, bigshot_path)
+    raise 'unexpected @@categories shape in bigshot.lic' unless data.is_a?(Hash) && data[:general].is_a?(Hash)
+
+    data
+  end
+
+  def ordered_keys
+    schema.keys.map(&:to_s) - TRANSIENT_KEYS
+  end
+
+  # Fresh string-keyed settings hash from bigshot's defaults.
+  def defaults
+    schema.each_with_object({}) do |(key, meta), h|
+      next if TRANSIENT_KEYS.include?(key.to_s)
+
+      d = meta[:default]
+      h[key.to_s] = d.is_a?(Array) ? d.dup : d
+    end
+  end
+
+  # -------------------------------------------------------------- compare --
+
+  def display_value(v)
+    case v
+    when nil then ''
+    when Array then v.map(&:to_s).sort.join(', ')
+    else v.to_s.strip
+    end
+  end
+
+  def same_value?(a, b)
+    if a.is_a?(Array) || b.is_a?(Array)
+      Array(a).map(&:to_s).sort == Array(b).map(&:to_s).sort
+    else
+      a.to_s.strip == b.to_s.strip
+    end
+  end
+
+  # Compares effective settings: bigshot fills a missing key with its default
+  # at load, so an older file that omits a key and a newer one that stores
+  # the default are the same profile. Unknown keys are kept for display.
+  #
+  # @return [Array<Array(String key, Object a, Object b, Boolean differs)>]
+  def compare(a, b)
+    a = defaults.merge((a || {}).transform_keys(&:to_s))
+    b = defaults.merge((b || {}).transform_keys(&:to_s))
+    keys = ordered_keys + ((a.keys + b.keys).map(&:to_s).uniq - ordered_keys - TRANSIENT_KEYS)
+    keys.map { |k| [k, a[k], b[k], !same_value?(a[k], b[k])] }
+  end
+
+  # ------------------------------------------------------------ creatures --
+
+  def templates
+    unless defined?(Lich::Gemstone::CreatureTemplate)
+      require File.join(LIB_DIR, 'gemstone', 'creature.rb')
+    end
+    @templates ||= Lich::Gemstone::CreatureTemplate.all
+                                                   .select { |t| t.areas.is_a?(Array) && !t.areas.empty? }
+                                                   .sort_by { |t| t.name.to_s.downcase }
+  end
+
+  # Resolve a room id or uNNN into a Map room.
+  def resolve_room(text)
+    s = text.to_s.strip
+    return nil if s.empty?
+
+    if s =~ /\Au?(\d+)\z/i && s.start_with?('u', 'U')
+      ids = Map.ids_from_uid(Regexp.last_match(1).to_i)
+      ids.empty? ? nil : Map[ids.first]
+    else
+      Map[s.to_i]
+    end
+  end
+
+  def templates_at_room(room)
+    return [] if room.nil?
+
+    uids = Array(room.uid).map(&:to_i)
+    return [] if uids.empty?
+
+    templates.select { |t| uids.any? { |u| t.found_at_uid?(u) } }
+  end
+
+  # Expand one area's uid list (ranges and ints) to uids.
+  def area_uids(area)
+    Array(area[:uids]).flat_map { |r| r.respond_to?(:to_a) ? r.to_a : [r] }.map(&:to_i).uniq.sort
+  end
+
+  # Rooms bordering +ids+ without being in it (bigshot's boundary list).
+  def perimeter(ids)
+    inside = {}
+    ids.each { |i| inside[i.to_i] = true }
+    border = {}
+    inside.each_key do |id|
+      room = Map[id] or next
+      (room.wayto || {}).each_key do |dest|
+        d = dest.to_i
+        border[d] = true unless inside[d]
+      end
+    end
+    Map.list.compact.each do |room|
+      next if inside[room.id] || border[room.id]
+
+      border[room.id] = true if (room.wayto || {}).keys.any? { |dest| inside[dest.to_i] }
+    end
+    border.keys.sort
+  end
+
+  def noun_for(t)
+    t.name.to_s.split.last.to_s
+  end
+
+  # Level band the creature list opens on: character level -5 to +10,
+  # or everything when the level is unknown.
+  def default_band
+    lvl = (defined?(Stats) && Stats.respond_to?(:level) ? Stats.level.to_i : 0)
+    return [1, 120] if lvl <= 0
+
+    [[lvl - 5, 1].max, [lvl + 10, 120].min]
+  end
+
+  def area_names
+    @area_names ||= templates.flat_map { |t| t.areas.map { |a| a[:name].to_s } }.reject(&:empty?).uniq.sort_by(&:downcase)
+  end
+
+  # Other creatures found in any of +uids+.
+  def cospawns(t, uids)
+    templates.select { |o| !o.equal?(t) && uids.any? { |u| o.found_at_uid?(u) } }
+  end
+
+  def fmt(v)
+    case v
+    when nil, '' then nil
+    when Range then "#{v.first}-#{v.last}"
+    when Array then v.empty? ? nil : v.map { |x| fmt(x) }.compact.join(', ')
+    when Hash then v.map { |k, x| "#{k}: #{fmt(x)}" }.join(', ')
+    when true then 'yes'
+    when false then 'no'
+    else v.to_s
+    end
+  end
+
+  def named_list(items, value_key)
+    Array(items).map do |i|
+      next fmt(i) unless i.is_a?(Hash)
+
+      v = fmt(i[value_key])
+      v ? "#{i[:name]} (#{v})" : i[:name].to_s
+    end.compact
+  end
+
+  # Pango markup for the creature detail panel.
+  def detail_markup(t)
+    e = method(:escape_markup)
+    out = []
+    line = lambda do |label, value|
+      v = fmt(value)
+      out << "<b>#{e.call(label)}:</b> #{e.call(v)}" if v
+    end
+    head = lambda { |text| out << '' << "<b><u>#{e.call(text)}</u></b>" }
+
+    out << "<span size=\"large\"><b>#{e.call(t.name)}</b></span>  level #{t.level}"
+    kind = [t.family, t.type, t.size].compact.reject(&:empty?).join(' ')
+    kind += ', undead' if t.undead
+    kind += ", #{t.boss_type || 'boss'}" if t.boss
+    out << e.call(kind) unless kind.empty?
+    line.call('Max HP', t.max_hp)
+    line.call('Speed', t.speed)
+    line.call('Boon-capable', t.bcs) unless t.bcs.nil?
+    line.call('Wiki', t.url)
+
+    atk = t.attack_attributes
+    head.call('Attacks')
+    line.call('Physical', named_list(atk.physical_attacks, :as))
+    line.call('Bolts', named_list(atk.bolt_spells, :as))
+    line.call('Warding', named_list(atk.warding_spells, :cs))
+    line.call('Offensive spells', named_list(atk.offensive_spells, :cs))
+    line.call('Maneuvers', named_list(atk.maneuvers, :as))
+    specials = Array(atk.special_abilities).map { |s| s.note.to_s.empty? ? s.name.to_s : "#{s.name} (#{s.note})" }
+    line.call('Special', specials)
+
+    d = t.defense_attributes
+    head.call('Defense')
+    line.call('Armor', d.asg)
+    ds = { 'melee' => d.melee, 'ranged' => d.ranged, 'bolt' => d.bolt, 'UDF' => d.udf }.reject { |_, v| v.nil? }
+    line.call('DS', ds.map { |k, v| "#{k} #{fmt(v)}" })
+    td = { 'Bard' => d.bar_td, 'Cleric' => d.cle_td, 'Empath' => d.emp_td, 'Paladin' => d.pal_td,
+           'Ranger' => d.ran_td, 'Sorcerer' => d.sor_td, 'Wizard' => d.wiz_td, 'Maj Elem' => d.mje_td,
+           'Min Elem' => d.mne_td, 'Maj Spirit' => d.mjs_td, 'Min Spirit' => d.mns_td, 'Min Mental' => d.mnm_td }
+         .reject { |_, v| v.nil? }
+    line.call('TD', td.map { |k, v| "#{k} #{fmt(v)}" })
+    line.call('Immunities', d.immunities)
+    line.call('Defensive spells', named_list(d.defensive_spells, :ds))
+    line.call('Defensive abilities', named_list(d.defensive_abilities, :note))
+    line.call('Special defenses', named_list(d.special_defenses, :note))
+
+    tr = t.treasure.to_h
+    head.call('Treasure')
+    drops = %i[coins gems boxes].select { |k| tr[k] }.map(&:to_s)
+    drops << 'skin' if tr[:skin]
+    drops << 'magic items' if tr[:magic_items]
+    line.call('Drops', drops)
+    line.call('Skin', tr[:skin]) if tr[:skin].is_a?(String)
+    line.call('Other', tr[:other])
+    line.call('Armaments', tr[:armaments])
+    line.call('Transmogs', tr[:transmogs])
+    line.call('Blunt required', true) if tr[:blunt_required]
+
+    info = t.messaging.instance_variable_get(:@info)
+    if info.is_a?(Hash)
+      general = Array(info[:general]).map(&:to_s).reject(&:empty?)
+      tips = (info[:class_tips] || {}).select { |_, v| Array(v).any? { |s| !s.to_s.empty? } }
+      if general.any? || tips.any?
+        head.call('Tips')
+        general.each { |g| out << e.call(g) }
+        tips.each do |klass, list|
+          out << "<b>#{e.call(klass.to_s.capitalize)}</b>"
+          Array(list).each { |s| out << e.call(s.to_s) }
+        end
+      end
+    end
+
+    head.call('Areas')
+    t.areas.each do |a|
+      uids = area_uids(a)
+      mapped = uids.count { |u| !Map.ids_from_uid(u).empty? }
+      out << "#{e.call(a[:name])}: #{uids.size} uid(s), #{mapped} mapped"
+    end
+
+    out.join("\n")
+  end
+
+  def escape_markup(text)
+    text.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+  end
+
+  # ------------------------------------------------------------------ map --
+
+  # Display name for a map image, from the mapdb's meta:mapname tag when a
+  # room on that map carries one, else the file name.
+  def map_display_name(image)
+    @map_names ||= {}
+    return @map_names[image] if @map_names.key?(image)
+
+    name = nil
+    Map.list.compact.each do |r|
+      next unless r.image == image
+
+      tag = Array(r.tags).find { |t| t.to_s.start_with?('meta:mapname:') }
+      next unless tag
+
+      name = tag.to_s.sub('meta:mapname:', '')
+      break
+    end
+    @map_names[image] = name || File.basename(image.to_s, '.*')
+  end
+
+  # ;map's dark-mode preference. It lives in map.lic's own script settings,
+  # so read it by script name; anything goes wrong, default to light.
+  def map_dark_default
+    !!Settings.get_scoped_setting(':', 'dark_mode', script_name: 'map')
+  rescue StandardError
+    false
+  end
+
+  # Path for a map image, preferring the maps-dark sibling of MAP_DIR the
+  # way ;map does when dark mode is on and that file exists.
+  def map_image_path(image, dark)
+    light = File.join(MAP_DIR, image)
+    return light unless dark
+
+    dark_path = File.join(MAP_DIR.sub(/maps\z/, 'maps-dark'), image)
+    File.exist?(dark_path) ? dark_path : light
+  end
+
+  # A marker image the way ;map draws its tag markers: Cairo onto an ARGB
+  # surface, then wrapped in a pixbuf. Cairo's ARGB32 comes out BGRA in
+  # memory while the pixbuf reads RGBA, so red and blue are swapped on the
+  # way in.
+  #
+  # @param shape [Symbol] :x, :box or :circle
+  def marker_pixbuf(width, height, rgb, shape, line = 2)
+    width = [width, 10].max
+    height = [height, 10].max
+    surface = Cairo::ImageSurface.new(Cairo::FORMAT_ARGB32, width, height)
+    ctx = Cairo::Context.new(surface)
+    ctx.set_source_rgba(rgb[2], rgb[1], rgb[0], 0.85)
+    ctx.set_line_width(line)
+    half = line / 2.0
+    case shape
+    when :x
+      ctx.move_to(half, half)
+      ctx.line_to(width - half, height - half)
+      ctx.stroke
+      ctx.move_to(width - half, half)
+      ctx.line_to(half, height - half)
+      ctx.stroke
+    when :box
+      ctx.rectangle(half, half, width - line, height - line)
+      ctx.stroke
+    when :circle
+      ctx.arc(width / 2.0, height / 2.0, [width, height].min / 2.0 - half, 0, 2 * Math::PI)
+      ctx.stroke
+    end
+    GdkPixbuf::Pixbuf.new(
+      data: surface.data, colorspace: GdkPixbuf::Colorspace::RGB, has_alpha: true,
+      bits_per_sample: 8, width: width, height: height, rowstride: surface.stride
+    )
+  end
+
+  # ------------------------------------------------------------------ cli --
+
+  def print_compare(name_a, name_b)
+    a = load(name_a) or return respond("bsprofiles: no profile named '#{name_a}'")
+    b = load(name_b) or return respond("bsprofiles: no profile named '#{name_b}'")
+    rows = compare(a, b).select { |r| r[3] }
+    if rows.empty?
+      respond "bsprofiles: '#{name_a}' and '#{name_b}' are identical."
+      return
+    end
+    respond "bsprofiles: #{rows.size} setting(s) differ between '#{name_a}' (A) and '#{name_b}' (B)"
+    rows.each do |key, va, vb, _|
+      respond "  #{key}"
+      respond "    A: #{display_value(va)}"
+      respond "    B: #{display_value(vb)}"
+    end
+  end
+
+  def print_show(name)
+    data = load(name) or return respond("bsprofiles: no profile named '#{name}'")
+    respond "bsprofiles: #{path(name)}"
+    (ordered_keys + (data.keys - ordered_keys)).each do |k|
+      v = display_value(data[k])
+      next if v.empty?
+
+      respond "  #{k}: #{v}"
+    end
+  end
+
+  def print_list
+    list = names
+    if list.empty?
+      respond "bsprofiles: no profiles in #{dir}"
+    else
+      respond "bsprofiles: #{list.size} profile(s) in #{dir}"
+      list.each { |n| respond "  #{n}" }
+    end
+  end
+
+  def apply(name)
+    data = load(name) or return respond("bsprofiles: no profile named '#{name}'")
+    data['profile_current'] = name
+    data['save_profile_name'] = ''
+    UserVars.op = data
+    respond "bsprofiles: '#{name}' is now bigshot's live settings."
+  end
+
+  def help
+    text = File.read(File.join(defined?(SCRIPT_DIR) ? SCRIPT_DIR : $script_dir, "#{Script.current.name}.lic"))
+    text[/\A=begin\n(.*?)\n\s*author:/m, 1].to_s.each_line { |l| respond l.rstrip }
+  end
+end
+
+$bigshot_version ||= BSProfiles.bigshot_version
+
+# Everything from here to the main section needs GTK: Bigshot::Setup is a
+# Gtk::Builder and the editor subclasses it. Without GTK the command-line
+# actions still work on their own.
+if BSProfiles.gui_available?
+# rubocop:disable Layout/IndentationWidth -- a 1200-line class body is not re-indented for one guard
+
+# Make Bigshot::Setup available. If bigshot already ran this session the class
+# exists; otherwise evaluate it from bigshot.lic in this script's namespace,
+# which is the same namespace bigshot itself defines it in.
+unless defined?(Bigshot::Setup)
+  bs_setup_src, bs_setup_line = BSProfiles.extract_setup_source
+  eval(bs_setup_src, binding, BSProfiles.bigshot_path, bs_setup_line)
+end
+
+module BSProfiles
+  # The editor window: bigshot's own setup window, pointed at a file instead
+  # of at UserVars.op.
+  class Editor < Bigshot::Setup
+    DIFF_COLOR = '#a51d2d'.freeze
+
+    # @param name [String, nil] profile to open; nil opens defaults
+    def self.open(name = nil)
+      data = name ? BSProfiles.load(name) : nil
+      if name && data.nil?
+        respond "bsprofiles: no profile named '#{name}'"
+        return
+      end
+      data ||= BSProfiles.defaults
+      BSProfiles.templates # warm the creature cache off the GTK thread
+      new(stamp_profile(data.transform_keys(&:to_sym), name), name).start
+    end
+
+    # The file the window represents is authoritative over whatever
+    # profile_current a copied or renamed file still carries inside it.
+    # load_settings pours @settings into the widgets, profile_current entry
+    # included, so this has to be set in the hash before any load.
+    def self.stamp_profile(settings, name)
+      settings[:profile_current] = name.to_s
+      settings[:save_profile_name] = ''
+      settings
+    end
+
+    # Widgets on the Profiles tab whose changes are bookkeeping, not edits.
+    NOT_EDITS = %w[profile_name profile_current save_profile_name].freeze
+
+    def initialize(settings, profile_name)
+      @profile = profile_name
+      @dirty = false
+      @loading = false
+      @template = nil
+      super(settings)
+      Gtk.queue { build_extras }
+    end
+
+    # ------------------------------------------------- overridden behaviour --
+
+    def on_update(obj)
+      overwrite = obj.is_a?(Gtk::Button) && obj.builder_name.to_s == 'profile_overwrite'
+      # Bigshot's overwrite handler writes @settings to the file as-is, with
+      # no pre_save. Every other path in this editor folds the keys back to
+      # symbols, so normalize here, before the queued write, or the file
+      # comes out with symbol keys that bigshot cannot read.
+      pre_save if overwrite
+      super
+      loading = @loading # captured now; the queued block runs later
+      Gtk.queue do
+        resymbolize!
+        if obj.is_a?(Gtk::Button)
+          if overwrite && @filename.to_s != '' && File.exist?(@filename)
+            saved(File.basename(@filename, '.yaml'))
+          end
+        elsif !loading && !NOT_EDITS.include?(obj.builder_name.to_s)
+          mark_dirty
+        end
+      end
+    end
+
+    # Boon checkboxes bypass on_update: bigshot wires them straight to
+    # update_boon. Count those as edits too, except while a profile is being
+    # poured into the widgets.
+    def update_boon(obj, key, value)
+      super
+      mark_dirty unless @loading
+    end
+
+    # Load Profile button: same as bigshot, but fills in defaults for keys an
+    # older profile lacks, and tracks which file the editor now represents.
+    def on_profile_load
+      name = @settings[:profile_name].to_s
+      return if name.empty?
+
+      open_choice(name)
+      self['profile_name'].set_active(0)
+    end
+
+    def save_profile
+      name = self['save_profile_name'].text.to_s
+      # Bigshot's save writes File.join(dir, "#{name}.yaml") with no check,
+      # so refuse anything that is not a plain file name before it runs.
+      unless name.empty? || BSProfiles.valid_name?(name)
+        self['test_label'].text = 'Profile names cannot contain \\ / : * ? " < > | or start with a dot.'
+        self['test_label'].show
+        return
+      end
+      existed = !name.empty? && BSProfiles.exist?(name)
+      super
+      # An existing file goes through the overwrite confirmation instead.
+      saved(name) if !name.empty? && !existed && BSProfiles.exist?(name)
+      resymbolize!
+    end
+
+    def save_profile_changes
+      name = self['profile_current'].text.to_s
+      unless name.empty? || BSProfiles.valid_name?(name)
+        self['no_current_profile'].text = 'Profile names cannot contain \\ / : * ? " < > | or start with a dot.'
+        self['no_current_profile'].show
+        return
+      end
+      super
+      saved(name) unless name.empty?
+      resymbolize!
+    end
+
+    # Bigshot blanks the Profiles-tab tooltips; give them real ones here.
+    #
+    # Bigshot's own set_tooltips still names a widget its window no longer
+    # has (boon_flee_from). Inside Lich that is silent, because Lich makes
+    # nil swallow unknown methods; anywhere else it raises and would abort
+    # the initializer before the window's signals are connected. Contain it
+    # so a missing tooltip is all that is lost either way.
+    def set_tooltips
+      begin
+        super
+      rescue NoMethodError => e
+        respond "bsprofiles: bigshot's tooltip setup stopped early (#{e.message}); continuing." if $bigshot_debug
+      end
+      self['profile_name'].tooltip_text = 'Saved profiles for this character. Pick one and click Load Profile.'
+      self['profile_button'].tooltip_text = "Load the chosen profile into the editor, replacing what is here.\nUnsaved edits are lost."
+      self['profile_current'].tooltip_text = 'The profile file this window represents. Update Profile writes to it.'
+      self['save_current'].tooltip_text = 'Write the current settings to the profile named above.'
+      self['profile_save'].tooltip_text = 'Write the current settings to a new profile with the name typed below.'
+      self['save_profile_name'].tooltip_text = 'Name for the new profile. Spaces are fine.'
+      self['profile_overwrite'].tooltip_text = 'A profile with that name exists. Click to overwrite it.'
+      self['profile_cancel'].tooltip_text = 'Keep the existing profile and do nothing.'
+      self['notes'].tooltip_text = 'Free-form notes stored with the profile.'
+    end
+
+    def on_close_clicked
+      if @dirty
+        Lich::Messaging.msg('yellow', " bsprofiles: editor closed with UNSAVED changes. Nothing was written.")
+      else
+        Lich::Messaging.msg('plain', " bsprofiles: editor closed.")
+      end
+      @silent_exit = true
+      self['main'].destroy
+    end
+
+    def on_destroy
+      Gtk.queue {
+        Lich::Messaging.msg('plain', " bsprofiles: editor closed (window X). Nothing was written.") unless @silent_exit
+        @running = false
+      }
+    end
+
+    # -------------------------------------------------------------- helpers --
+
+    # Bigshot's pre_save leaves string keys behind while on_update keeps
+    # writing symbol keys. Fold them back to symbols, newest value wins.
+    def resymbolize!
+      @settings = @settings.each_with_object({}) { |(k, v), h| h[k.to_sym] = v }
+    end
+
+    def mark_dirty
+      return if @dirty
+
+      @dirty = true
+      refresh_title
+    end
+
+    def saved(name)
+      @profile = name
+      @dirty = false
+      refresh_title
+      refresh_profile_lists
+    end
+
+    def refresh_title
+      label = @profile.to_s.empty? ? 'new profile' : @profile
+      self['main'].set_title "Bigshot Profiles: #{label}#{@dirty ? ' *' : ''}"
+      refresh_footer
+    end
+
+    # Footer: which file the window represents, whether it has unsaved
+    # edits, and where the profiles live.
+    def refresh_footer
+      return unless @footer
+
+      state = if @profile.to_s.empty?
+                @dirty ? 'new profile, not yet saved' : 'new profile'
+              else
+                @dirty ? "#{@profile}  (unsaved changes)" : "#{@profile}  (saved)"
+              end
+      count = BSProfiles.names.size
+      @footer.set_markup("<b>Editing:</b> #{BSProfiles.escape_markup(state)}    " \
+                         "<b>Profiles:</b> #{count} in #{BSProfiles.escape_markup(BSProfiles.dir)}    " \
+                         "<b>Bigshot:</b> v#{BSProfiles.escape_markup($bigshot_version.to_s)}")
+      @footer.tooltip_text = "Close does not write anything. Save with Update Profile or Save Current Settings as... on the Profiles tab.\n" \
+                             "Apply to Bigshot copies the current settings into bigshot's live settings without writing a file."
+    end
+
+    # A string-keyed, file-shaped copy of the editor's current state.
+    def snapshot
+      pre_save
+      copy = Marshal.load(Marshal.dump(@settings))
+      resymbolize!
+      copy
+    end
+
+    def apply_to_bigshot
+      data = snapshot
+      data['profile_current'] = @profile.to_s
+      data['save_profile_name'] = ''
+      UserVars.op = data
+      Lich::Messaging.msg('plain', " bsprofiles: editor settings applied to bigshot (UserVars.op)#{@dirty ? ' - remember they are not saved to a profile yet' : ''}.")
+    end
+
+    MAP_ENTRIES = %w[hunting_room_id rallypoint_room_ids hunting_boundaries].freeze
+
+    def set_entry(id, text)
+      self[id].text = text.to_s
+      refresh_map_markers if MAP_ENTRIES.include?(id.to_s)
+    end
+
+    def append_list_entry(id, item)
+      current = self[id].text.to_s.strip
+      items = current.empty? ? [] : current.split(/\s*,\s*/)
+      return if items.any? { |i| i.sub(/\(.*\)\z/, '').strip.casecmp?(item) }
+
+      set_entry(id, (items + [item]).join(', '))
+    end
+
+    def status(msg)
+      @extra_status.text = msg if @extra_status
+    end
+
+    # ---------------------------------------------------------- build tabs --
+
+    def build_extras
+      refresh_title
+      self['profile_current'].text = @profile.to_s
+      self['msg_label'].text = "Standalone profile editor.\n\nProfiles are read from and written to:\n#{BSProfiles.dir}\n\n" \
+                               "Close does not save. Use Update Profile or Save Current Settings as...\n" \
+                               "Apply to Bigshot (bottom right) copies these settings into bigshot's live settings."
+
+      outer = self['main'].child
+      notebook = outer.children.find { |c| c.is_a?(Gtk::Notebook) }
+      bottom = outer.children.find { |c| c.is_a?(Gtk::Box) }
+
+      if bottom
+        hint = bottom.children.find { |c| c.is_a?(Gtk::Label) }
+        if hint
+          hint.halign = :start
+          hint.xalign = 0
+          hint.hexpand = true
+          hint.ellipsize = :end if hint.respond_to?(:ellipsize=)
+          @footer = hint
+        end
+        close_btn = bottom.children.find { |c| c.is_a?(Gtk::Button) }
+        close_btn.tooltip_text = "Close the editor. Nothing is written: save on the Profiles tab first if you made changes." if close_btn
+        apply_btn = Gtk::Button.new(label: 'Apply to Bigshot')
+        apply_btn.tooltip_text = "Copy the editor's settings into bigshot's live settings (UserVars.op), which bigshot reads when it starts.\n" \
+                                 "Same effect as ;bigshot profile load. Does not write a profile file."
+        apply_btn.margin_top = 5
+        apply_btn.margin_bottom = 10
+        apply_btn.margin_end = 10
+        apply_btn.signal_connect('clicked') { guard { apply_to_bigshot } }
+        bottom.pack_end(apply_btn, false, false, 0)
+        apply_btn.show
+        refresh_footer
+      end
+
+      return unless notebook
+
+      notebook.append_page(build_compare_page, Gtk::Label.new('Compare'))
+      notebook.append_page(build_creature_page, Gtk::Label.new('Creatures'))
+      map_page = build_map_page
+      @map_page_index = notebook.append_page(map_page, Gtk::Label.new('Map'))
+      # Entries on the Hunting tab can change by hand, so rebuild the map
+      # whenever its tab comes to the front.
+      @map_gc << proc { |_, _, num| guard { refresh_map_tab } if num == @map_page_index; false }
+      notebook.signal_connect('switch-page', &@map_gc.last)
+      notebook.show_all
+      refresh_map_tab
+    end
+
+    def guard
+      yield
+    rescue StandardError => e
+      respond "bsprofiles: #{e.class}: #{e.message}"
+      respond e.backtrace.first(5).join("\n") if $bigshot_debug
+    end
+
+    # ------------------------------------------------------------- compare --
+
+    def build_compare_page
+      vbox = Gtk::Box.new(:vertical, 6)
+      vbox.border_width = 10
+
+      row = Gtk::Box.new(:horizontal, 6)
+      @cmp_a = Gtk::ComboBoxText.new
+      @cmp_b = Gtk::ComboBoxText.new
+      side_tip = "A saved profile, or <editor> for the unsaved state of this window."
+      @cmp_a.tooltip_text = "Left side of the comparison.\n#{side_tip}"
+      @cmp_b.tooltip_text = "Right side of the comparison.\n#{side_tip}"
+      @cmp_only_diff = Gtk::CheckButton.new('Only differences')
+      @cmp_only_diff.active = true
+      @cmp_only_diff.tooltip_text = 'Hide settings that are the same on both sides.'
+      compare_btn = Gtk::Button.new(label: 'Compare')
+      compare_btn.tooltip_text = 'Re-run the comparison. Differences are shown in red.'
+      open_a = Gtk::Button.new(label: 'Open A in editor')
+      open_b = Gtk::Button.new(label: 'Open B in editor')
+      open_tip = "Load this profile into the editor tabs, replacing what is there.\nUnsaved edits in the window are lost."
+      open_a.tooltip_text = open_tip
+      open_b.tooltip_text = open_tip
+
+      row.pack_start(Gtk::Label.new('A:'), false, false, 0)
+      row.pack_start(@cmp_a, false, false, 0)
+      row.pack_start(Gtk::Label.new('B:'), false, false, 0)
+      row.pack_start(@cmp_b, false, false, 0)
+      row.pack_start(compare_btn, false, false, 6)
+      row.pack_start(@cmp_only_diff, false, false, 0)
+      row.pack_end(open_b, false, false, 0)
+      row.pack_end(open_a, false, false, 0)
+      vbox.pack_start(row, false, false, 0)
+
+      @cmp_summary = Gtk::Label.new('')
+      @cmp_summary.xalign = 0
+      vbox.pack_start(@cmp_summary, false, false, 0)
+
+      @cmp_store = Gtk::ListStore.new(String, String, String, TrueClass)
+      tv = Gtk::TreeView.new(@cmp_store)
+      tv.rules_hint = true if tv.respond_to?(:rules_hint=)
+      tv.tooltip_text = 'Every bigshot setting, side by side. Red rows differ. Drag column edges to widen long values.'
+      [['Setting', 0], ['A', 1], ['B', 2]].each do |title, idx|
+        r = Gtk::CellRendererText.new
+        col = Gtk::TreeViewColumn.new(title, r, 'markup' => idx)
+        col.resizable = true
+        col.min_width = 140 if idx.zero?
+        tv.append_column(col)
+      end
+      sw = Gtk::ScrolledWindow.new
+      sw.set_policy(:automatic, :automatic)
+      sw.shadow_type = :in
+      sw.add(tv)
+      vbox.pack_start(sw, true, true, 0)
+
+      compare_btn.signal_connect('clicked') { guard { run_compare } }
+      @cmp_only_diff.signal_connect('toggled') { guard { run_compare } }
+      open_a.signal_connect('clicked') { guard { open_choice(@cmp_a.active_text) } }
+      open_b.signal_connect('clicked') { guard { open_choice(@cmp_b.active_text) } }
+
+      refresh_profile_lists
+      vbox
+    end
+
+    def refresh_profile_lists
+      return unless @cmp_a
+
+      choices = [EDITOR_CHOICE] + BSProfiles.names
+      [@cmp_a, @cmp_b].each do |combo|
+        prev = combo.active_text
+        combo.remove_all
+        choices.each { |c| combo.append_text(c) }
+        idx = choices.index(prev) || 0
+        combo.set_active(idx)
+      end
+      @cmp_b.set_active(choices.index(@profile) || 0) if @profile && @cmp_b.active_text == EDITOR_CHOICE
+    end
+
+    def settings_for_choice(choice)
+      return snapshot if choice.nil? || choice == EDITOR_CHOICE
+
+      BSProfiles.load(choice) || {}
+    end
+
+    def run_compare
+      a_name = @cmp_a.active_text || EDITOR_CHOICE
+      b_name = @cmp_b.active_text || EDITOR_CHOICE
+      rows = BSProfiles.compare(settings_for_choice(a_name), settings_for_choice(b_name))
+      diffs = rows.count { |r| r[3] }
+      @cmp_store.clear
+      rows.each do |key, va, vb, differs|
+        next if @cmp_only_diff.active? && !differs
+
+        iter = @cmp_store.append
+        k = BSProfiles.escape_markup(key)
+        a = BSProfiles.escape_markup(BSProfiles.display_value(va))
+        b = BSProfiles.escape_markup(BSProfiles.display_value(vb))
+        if differs
+          iter[0] = "<span foreground=\"#{DIFF_COLOR}\"><b>#{k}</b></span>"
+          iter[1] = "<span foreground=\"#{DIFF_COLOR}\">#{a}</span>"
+          iter[2] = "<span foreground=\"#{DIFF_COLOR}\">#{b}</span>"
+        else
+          iter[0] = k
+          iter[1] = a
+          iter[2] = b
+        end
+        iter[3] = differs
+      end
+      @cmp_summary.text = "#{diffs} of #{rows.size} settings differ between '#{a_name}' and '#{b_name}'."
+    end
+
+    def open_choice(choice)
+      return if choice.nil? || choice == EDITOR_CHOICE
+
+      data = BSProfiles.load(choice) or return status("no profile named #{choice}")
+      @settings = data.transform_keys(&:to_sym)
+      Bigshot::Setup.class_variable_get(:@@categories).each do |_, defs|
+        defs.each { |key, meta| @settings[key] = meta[:default] if @settings[key].nil? }
+      end
+      @settings.delete_if { |key, _| Bigshot::Setup.get_category(key).nil? }
+      Editor.stamp_profile(@settings, choice)
+      self['profile_current'].text = choice
+      @loading = true
+      load_settings(false)
+      Gtk.queue { @loading = false }
+      @profile = choice
+      @dirty = false
+      refresh_title
+      refresh_profile_lists
+      @cmp_summary.text = "Opened '#{choice}' in the editor." if @cmp_summary
+    end
+
+    # ----------------------------------------------------------- creatures --
+    #
+    # Three columns: [filters + creature list] [creature detail] [area, rooms,
+    # co-spawns, send-to-profile]. The list starts filtered to a level band
+    # around the character so a level 100 hunter sees level 95-110 creatures,
+    # not the whole bestiary.
+
+    ROOM_LIST_HEIGHT = 180
+    COSPAWN_LIST_HEIGHT = 150
+
+    def build_creature_page
+      outer = Gtk::Box.new(:vertical, 6)
+      outer.border_width = 8
+
+      # ---- filter row ----
+      filters = Gtk::Box.new(:horizontal, 6)
+      lo, hi = BSProfiles.default_band
+      @lvl_min = Gtk::SpinButton.new(1, 120, 1)
+      @lvl_max = Gtk::SpinButton.new(1, 120, 1)
+      @lvl_min.value = lo
+      @lvl_max.value = hi
+      band_tip = "Only creatures in this level range are listed.\nOpens at your level -5 to +10. Set 1 to 120 to see everything."
+      @lvl_min.tooltip_text = "Lowest level to list.\n#{band_tip}"
+      @lvl_max.tooltip_text = "Highest level to list.\n#{band_tip}"
+      @cr_name = Gtk::Entry.new
+      @cr_name.placeholder_text = 'name contains'
+      @cr_name.width_chars = 16
+      @cr_name.tooltip_text = 'Keep only creatures whose name contains this text.'
+      @cr_area_filter = Gtk::ComboBoxText.new
+      @cr_area_filter.append_text('All areas')
+      BSProfiles.area_names.each { |n| @cr_area_filter.append_text(n) }
+      @cr_area_filter.set_active(0)
+      @cr_area_filter.tooltip_text = 'Keep only creatures that spawn in this area. Combine with the level band to see what a hunting ground holds for you.'
+      @cr_undead = Gtk::ComboBoxText.new
+      %w[Any Undead Living].each { |o| @cr_undead.append_text(o) }
+      @cr_undead.set_active(0)
+      @cr_undead.tooltip_text = "Any: all creatures. Undead: only undead. Living: only non-undead.\nUseful for clerics and paladins, or for skipping undead when hunting for blood."
+      @cr_room = Gtk::Entry.new
+      @cr_room.placeholder_text = 'room id or uNNN'
+      @cr_room.width_chars = 12
+      @cr_room.tooltip_text = "A Lich room id (29882) or a game uid (u7503101).\nPress Enter or click Creatures at room. Blank uses the profile's hunting room."
+      here_btn = Gtk::Button.new(label: 'Creatures at room')
+      here_btn.tooltip_text = "Limit the list to creatures whose spawn areas include this room.\nBlank uses the profile's hunting room. Clear the room to go back to the level band."
+      reset_btn = Gtk::Button.new(label: 'Reset')
+      reset_btn.tooltip_text = 'Back to the level band around your character, all areas, no name filter.'
+
+      filters.pack_start(Gtk::Label.new('Level'), false, false, 0)
+      filters.pack_start(@lvl_min, false, false, 0)
+      filters.pack_start(Gtk::Label.new('to'), false, false, 0)
+      filters.pack_start(@lvl_max, false, false, 0)
+      filters.pack_start(Gtk::Label.new('Name'), false, false, 6)
+      filters.pack_start(@cr_name, false, false, 0)
+      filters.pack_start(Gtk::Label.new('Area'), false, false, 6)
+      filters.pack_start(@cr_area_filter, true, true, 0)
+      filters.pack_start(@cr_undead, false, false, 6)
+      filters.pack_start(@cr_room, false, false, 0)
+      filters.pack_start(here_btn, false, false, 0)
+      filters.pack_start(reset_btn, false, false, 0)
+      outer.pack_start(filters, false, false, 0)
+
+      # ---- left: creature list ----
+      @cr_store = Gtk::ListStore.new(Integer, String, String, Integer)
+      @cr_tv = Gtk::TreeView.new(@cr_store)
+      [['Lvl', 0], ['Creature', 1], ['Areas', 2]].each do |title, idx|
+        col = Gtk::TreeViewColumn.new(title, Gtk::CellRendererText.new, 'text' => idx)
+        col.resizable = true
+        col.sort_column_id = idx
+        @cr_tv.append_column(col)
+      end
+      @cr_store.set_sort_column_id(0, :ascending)
+      @cr_tv.tooltip_text = 'Creatures matching the filters. Click a row to see its details, areas and rooms. Click a column header to sort.'
+      cr_sw = Gtk::ScrolledWindow.new
+      cr_sw.set_policy(:automatic, :automatic)
+      cr_sw.shadow_type = :in
+      cr_sw.add(@cr_tv)
+      @cr_count = Gtk::Label.new('')
+      @cr_count.xalign = 0
+      @cr_count.tooltip_text = 'How many creatures match the current filters.'
+      left = Gtk::Box.new(:vertical, 4)
+      left.pack_start(cr_sw, true, true, 0)
+      left.pack_start(@cr_count, false, false, 0)
+
+      # ---- middle: detail ----
+      @cr_detail = Gtk::Label.new('')
+      @cr_detail.xalign = 0
+      @cr_detail.yalign = 0
+      @cr_detail.wrap = true
+      @cr_detail.selectable = true
+      @cr_detail.margin = 8
+      @cr_detail.set_markup('<i>Select a creature.</i>')
+      @cr_detail.tooltip_text = "Everything the creature template records: attacks and attack strength, spells and casting strength,\n" \
+                                "defenses and target defense per profession, treasure, hunting tips, and spawn areas.\nText is selectable."
+      detail_sw = Gtk::ScrolledWindow.new
+      detail_sw.set_policy(:never, :automatic)
+      detail_sw.shadow_type = :in
+      detail_sw.add(@cr_detail)
+
+      # ---- right: area, rooms, co-spawns, actions ----
+      right = Gtk::Box.new(:vertical, 6)
+
+      area_row = Gtk::Box.new(:horizontal, 6)
+      area_row.pack_start(Gtk::Label.new('Area'), false, false, 0)
+      @area_combo = Gtk::ComboBoxText.new
+      @area_combo.tooltip_text = "The selected creature's spawn areas, with how many of the area's rooms are in your map database.\nPicking one fills the room list and the co-spawn list below."
+      area_row.pack_start(@area_combo, true, true, 0)
+      right.pack_start(area_row, false, false, 0)
+
+      @room_store = Gtk::ListStore.new(TrueClass, String, String, String, Integer)
+      room_tv = Gtk::TreeView.new(@room_store)
+      room_tv.selection.mode = :multiple
+      toggle = Gtk::CellRendererToggle.new
+      toggle.signal_connect('toggled') do |_, tpath|
+        iter = @room_store.get_iter(tpath)
+        iter[0] = !iter[0] if iter && iter[4].to_i.positive?
+        refresh_room_summary
+      end
+      room_tv.append_column(Gtk::TreeViewColumn.new('', toggle, 'active' => 0))
+      [['Room', 1], ['UID', 2], ['Title', 3]].each do |title, idx|
+        col = Gtk::TreeViewColumn.new(title, Gtk::CellRendererText.new, 'text' => idx)
+        col.resizable = true
+        room_tv.append_column(col)
+      end
+      room_tv.tooltip_text = "Mapped rooms in the chosen area. Tick the rooms you want the fence to enclose,\nhighlight rows (Ctrl+click for several) to use as the start room or rally points."
+      room_sw = Gtk::ScrolledWindow.new
+      room_sw.set_policy(:automatic, :automatic)
+      room_sw.shadow_type = :in
+      room_sw.set_size_request(-1, ROOM_LIST_HEIGHT)
+      room_sw.add(room_tv)
+      right.pack_start(room_sw, false, false, 0)
+
+      @room_summary = Gtk::Label.new('')
+      @room_summary.xalign = 0
+      room_btns = Gtk::Box.new(:horizontal, 6)
+      check_all = Gtk::Button.new(label: 'Check all')
+      check_all.tooltip_text = 'Tick every mapped room in the list.'
+      uncheck_all = Gtk::Button.new(label: 'Uncheck all')
+      uncheck_all.tooltip_text = 'Clear every tick in the list.'
+      @room_summary.tooltip_text = 'Ticked rooms are what the Boundaries buttons use. Uids not in the map database cannot be used.'
+      room_btns.pack_start(check_all, false, false, 0)
+      room_btns.pack_start(uncheck_all, false, false, 0)
+      room_btns.pack_start(@room_summary, true, true, 0)
+      right.pack_start(room_btns, false, false, 0)
+
+      cos_label = Gtk::Label.new('Also spawns in this area')
+      cos_label.xalign = 0
+      right.pack_start(cos_label, false, false, 0)
+      @cos_store = Gtk::ListStore.new(TrueClass, Integer, String)
+      @cos_tv = Gtk::TreeView.new(@cos_store)
+      cos_toggle = Gtk::CellRendererToggle.new
+      cos_toggle.signal_connect('toggled') do |_, tpath|
+        iter = @cos_store.get_iter(tpath)
+        iter[0] = !iter[0] if iter
+      end
+      @cos_tv.append_column(Gtk::TreeViewColumn.new('', cos_toggle, 'active' => 0))
+      [['Lvl', 1], ['Creature', 2]].each do |title, idx|
+        col = Gtk::TreeViewColumn.new(title, Gtk::CellRendererText.new, 'text' => idx)
+        col.resizable = true
+        col.sort_column_id = idx
+        @cos_tv.append_column(col)
+      end
+      @cos_store.set_sort_column_id(1, :ascending)
+      @cos_tv.tooltip_text = "Other creatures that spawn in the chosen area, so you know what else you will meet there.\n" \
+                             "Tick the ones you also want to hunt, then use the co-spawn buttons below. Double-click a row to view that creature."
+      cos_sw = Gtk::ScrolledWindow.new
+      cos_sw.set_policy(:automatic, :automatic)
+      cos_sw.shadow_type = :in
+      cos_sw.set_size_request(-1, COSPAWN_LIST_HEIGHT)
+      cos_sw.add(@cos_tv)
+      right.pack_start(cos_sw, true, true, 0)
+
+      send_frame = Gtk::Frame.new('Send to profile')
+      send_frame.tooltip_text = "These buttons write into the profile being edited (the Hunting, Resting and Commands tabs).\nNothing is saved to disk until you save on the Profiles tab."
+      send_box = Gtk::Box.new(:vertical, 4)
+      send_box.border_width = 6
+      row1 = Gtk::Box.new(:horizontal, 4)
+      start_btn = Gtk::Button.new(label: 'Start room <- row')
+      start_btn.tooltip_text = "Set the profile's hunting start room (hunting_room_id) to the highlighted room.\nIf several rows are highlighted the first one is used."
+      rest_btn = Gtk::Button.new(label: 'Rally points <- rows')
+      rest_btn.tooltip_text = "Replace the profile's rally points (rallypoint_room_ids) with the highlighted rooms.\n" \
+                              "Ctrl+click or Shift+click to highlight more than one row.\n" \
+                              "Bigshot stops at a rally point before the start room to cast hunting spells and start hunting scripts, and a group leader waits there for the group.\n" \
+                              "Blank means bigshot uses the start room."
+      row1.pack_start(start_btn, true, true, 0)
+      row1.pack_start(rest_btn, true, true, 0)
+      row2 = Gtk::Box.new(:horizontal, 4)
+      perim_btn = Gtk::Button.new(label: 'Boundaries <- perimeter')
+      perim_btn.tooltip_text = "Replace hunting_boundaries with the ring of rooms just outside the ticked rooms.\n" \
+                               "This is how bigshot's boundaries work: it hunts every room it can reach from the start room without stepping into a boundary room.\n" \
+                               "Tick the rooms you want to hunt, and this builds the fence around them."
+      fence_add_btn = Gtk::Button.new(label: 'Boundaries += perimeter')
+      fence_add_btn.tooltip_text = "Add the perimeter of the ticked rooms to hunting_boundaries, keeping what is already there.\nUse this to fence a second area into the same profile."
+      row2.pack_start(perim_btn, true, true, 0)
+      row2.pack_start(fence_add_btn, true, true, 0)
+      row3 = Gtk::Box.new(:horizontal, 4)
+      target_btn = Gtk::Button.new(label: 'Targets += creature')
+      target_btn.tooltip_text = "Add the selected creature's noun to the profile's target list (Commands tab).\nAdd a command letter afterwards if you want it, e.g. wendigo(a). Already-listed nouns are skipped."
+      quick_btn = Gtk::Button.new(label: 'Quick targets += creature')
+      quick_btn.tooltip_text = "Add the selected creature's noun to the quick-hunt target list used by ;bigshot quick."
+      row3.pack_start(target_btn, true, true, 0)
+      row3.pack_start(quick_btn, true, true, 0)
+      row4 = Gtk::Box.new(:horizontal, 4)
+      cos_target_btn = Gtk::Button.new(label: 'Targets += checked co-spawns')
+      cos_target_btn.tooltip_text = "Add the noun of every ticked co-spawn to the profile's target list. Already-listed nouns are skipped."
+      cos_quick_btn = Gtk::Button.new(label: 'Quick += checked co-spawns')
+      cos_quick_btn.tooltip_text = 'Add the noun of every ticked co-spawn to the quick-hunt target list.'
+      row4.pack_start(cos_target_btn, true, true, 0)
+      row4.pack_start(cos_quick_btn, true, true, 0)
+      [row1, row2, row3, row4].each { |r| send_box.pack_start(r, false, false, 0) }
+      send_frame.add(send_box)
+      right.pack_start(send_frame, false, false, 0)
+
+      @extra_status = Gtk::Label.new('')
+      @extra_status.xalign = 0
+      @extra_status.tooltip_text = 'Result of the last action on this tab.'
+      right.pack_start(@extra_status, false, false, 0)
+
+      # ---- assemble columns ----
+      inner = Gtk::Paned.new(:horizontal)
+      inner.pack1(detail_sw, true, false)
+      inner.pack2(right, false, false)
+      inner.position = 430
+      columns = Gtk::Paned.new(:horizontal)
+      columns.pack1(left, false, false)
+      columns.pack2(inner, true, false)
+      columns.position = 330
+      outer.pack_start(columns, true, true, 0)
+
+      # ---- signals ----
+      [@lvl_min, @lvl_max].each { |s| s.signal_connect('value-changed') { guard { refresh_creature_list } } }
+      @cr_name.signal_connect('changed') { guard { refresh_creature_list } }
+      @cr_area_filter.signal_connect('changed') { guard { refresh_creature_list } }
+      @cr_undead.signal_connect('changed') { guard { refresh_creature_list } }
+      @cr_room.signal_connect('activate') { guard { creatures_at_room } }
+      here_btn.signal_connect('clicked') { guard { creatures_at_room } }
+      reset_btn.signal_connect('clicked') { guard { reset_filters } }
+      @cr_tv.selection.signal_connect('changed') { |sel| guard { creature_row_selected(sel.selected) } }
+      @area_combo.signal_connect('changed') { guard { select_area(@area_combo.active) } }
+      @cos_tv.signal_connect('row-activated') { |_, tpath, _| guard { cospawn_activated(tpath) } }
+      check_all.signal_connect('clicked') { guard { set_all_rooms(true) } }
+      uncheck_all.signal_connect('clicked') { guard { set_all_rooms(false) } }
+      start_btn.signal_connect('clicked') { guard { room_to_entry(room_tv, 'hunting_room_id') } }
+      rest_btn.signal_connect('clicked') { guard { rooms_to_entry(room_tv, 'rallypoint_room_ids') } }
+      perim_btn.signal_connect('clicked') { guard { boundaries_from(BSProfiles.perimeter(checked_rooms), replace: true, what: 'perimeter') } }
+      fence_add_btn.signal_connect('clicked') { guard { boundaries_from(BSProfiles.perimeter(checked_rooms), replace: false, what: 'perimeter') } }
+      target_btn.signal_connect('clicked') { guard { noun_to_entry('targets') } }
+      quick_btn.signal_connect('clicked') { guard { noun_to_entry('quickhunt_targets') } }
+      cos_target_btn.signal_connect('clicked') { guard { cospawns_to_entry('targets') } }
+      cos_quick_btn.signal_connect('clicked') { guard { cospawns_to_entry('quickhunt_targets') } }
+
+      refresh_creature_list
+      outer
+    end
+
+    def reset_filters
+      lo, hi = BSProfiles.default_band
+      @cr_room.text = ''
+      @cr_name.text = ''
+      @cr_area_filter.set_active(0)
+      @cr_undead.set_active(0)
+      @lvl_min.value = lo
+      @lvl_max.value = hi
+      refresh_creature_list
+    end
+
+    # Enter in the room box or the Creatures at room button. A blank box
+    # falls back to the profile's hunting room; the room is written into the
+    # box so the filter in force is visible, and Reset clears it as usual.
+    def creatures_at_room
+      if @cr_room.text.to_s.strip.empty?
+        fallback = self['hunting_room_id'].text.to_s.strip
+        return status('type a room, or set a hunting room on the Hunting tab first') if fallback.empty?
+
+        @cr_room.text = fallback
+      end
+      refresh_creature_list
+    end
+
+    # Rebuild the creature list from the filter row.
+    def refresh_creature_list
+      lo = @lvl_min.value.to_i
+      hi = @lvl_max.value.to_i
+      lo, hi = hi, lo if lo > hi
+      name = @cr_name.text.to_s.strip.downcase
+      area = @cr_area_filter.active_text
+      area = nil if area.nil? || area == 'All areas'
+
+      room_text = @cr_room.text.to_s.strip
+      room = nil
+      if !room_text.empty?
+        room = BSProfiles.resolve_room(room_text)
+        return status("room '#{room_text}' not found in the map database") if room.nil?
+      end
+
+      list = BSProfiles.templates.select { |t| t.level.to_i.between?(lo, hi) }
+      list = list.select { |t| t.name.to_s.downcase.include?(name) } unless name.empty?
+      list = list.select { |t| t.areas.any? { |a| a[:name].to_s == area } } if area
+      case @cr_undead.active
+      when 1 then list = list.select { |t| t.undead }
+      when 2 then list = list.reject { |t| t.undead }
+      end
+      list = BSProfiles.templates_at_room(room) & list if room
+
+      @cr_list = list
+      @cr_tv.selection.unselect_all
+      @cr_store.clear
+      list.each do |t|
+        iter = @cr_store.append
+        iter[0] = t.level.to_i
+        iter[1] = t.name.to_s
+        iter[2] = t.areas.map { |a| a[:name].to_s }.uniq.join(', ')
+        iter[3] = BSProfiles.templates.index(t)
+      end
+      where = room ? " at room #{room.id}" : ''
+      kind = { 1 => ', undead', 2 => ', living' }[@cr_undead.active].to_s
+      @cr_count.text = "#{list.size} creature(s), level #{lo}-#{hi}#{kind}#{area ? ", #{area}" : ''}#{where}"
+      first = @cr_store.iter_first
+      @cr_tv.selection.select_iter(first) if first
+    end
+
+    def creature_row_selected(iter)
+      t = iter && BSProfiles.templates[iter[3]]
+      if t
+        show_creature(t)
+      else
+        clear_creature
+      end
+    end
+
+    # No creature selected (filters matched nothing, or the list was
+    # rebuilt): drop the stale creature so the send-to-profile buttons have
+    # nothing to act on.
+    def clear_creature
+      @template = nil
+      @cr_detail.set_markup('<i>Select a creature.</i>')
+      @area_combo.remove_all
+      @room_store.clear
+      @cos_store.clear
+      @unmapped_count = 0
+      refresh_room_summary
+      refresh_map_tab
+    end
+
+    # Point the detail, area and room panels at +t+.
+    def show_creature(t)
+      @template = t
+      @cr_detail.set_markup(BSProfiles.detail_markup(t))
+      @area_combo.remove_all
+      t.areas.each_with_index do |area, i|
+        uids = BSProfiles.area_uids(area)
+        mapped = uids.count { |u| !Map.ids_from_uid(u).empty? }
+        @area_combo.append_text("#{area[:name]}  (#{mapped}/#{uids.size} rooms mapped)  [#{i + 1}/#{t.areas.size}]")
+      end
+      @room_store.clear
+      @cos_store.clear
+      @area_combo.set_active(0) if t.areas.any?
+    end
+
+    def select_area(index)
+      @room_store.clear
+      @cos_store.clear
+      return if index.nil? || index.negative? || @template.nil?
+
+      area = @template.areas[index] or return
+      uids = BSProfiles.area_uids(area)
+      unmapped = 0
+      uids.each do |uid|
+        ids = Map.ids_from_uid(uid)
+        if ids.empty?
+          unmapped += 1
+          next
+        end
+        ids.each do |id|
+          room = Map[id]
+          row = @room_store.append
+          row[0] = true
+          row[1] = id.to_s
+          row[2] = "u#{uid}"
+          row[3] = Array(room&.title).first.to_s.gsub(/[\[\]]/, '')
+          row[4] = id.to_i
+        end
+      end
+      @unmapped_count = unmapped
+      refresh_room_summary
+
+      BSProfiles.cospawns(@template, uids).each do |o|
+        row = @cos_store.append
+        row[0] = false
+        row[1] = o.level.to_i
+        row[2] = o.name.to_s
+      end
+      refresh_map_tab
+    end
+
+    def refresh_room_summary
+      total = 0
+      checked = 0
+      each_room_row do |row|
+        total += 1
+        checked += 1 if row[0]
+      end
+      extra = @unmapped_count.to_i.positive? ? ", #{@unmapped_count} uid(s) not in the map database" : ''
+      @room_summary.text = "#{checked} of #{total} mapped room(s) checked#{extra}"
+      refresh_map_markers
+    end
+
+    def cospawn_activated(tpath)
+      iter = @cos_store.get_iter(tpath) or return
+      t = BSProfiles.templates.find { |x| x.name.to_s == iter[2] } or return
+      # If it is in the current list select it there so the list stays in
+      # step; otherwise show it directly.
+      idx = BSProfiles.templates.index(t)
+      target = nil
+      row = @cr_store.iter_first
+      if row
+        loop do
+          if row[3] == idx
+            target = row
+            break
+          end
+          break unless row.next!
+        end
+      end
+      if target
+        @cr_tv.selection.select_iter(target)
+        @cr_tv.scroll_to_cell(target.path, nil, false, 0, 0)
+      else
+        show_creature(t)
+      end
+    end
+
+    def each_room_row
+      iter = @room_store.iter_first
+      return unless iter
+
+      loop do
+        yield iter
+        break unless iter.next!
+      end
+    end
+
+    def set_all_rooms(flag)
+      each_room_row { |row| row[0] = flag if row[4].to_i.positive? }
+      refresh_room_summary
+    end
+
+    def checked_rooms
+      ids = []
+      each_room_row { |row| ids << row[4].to_i if row[0] && row[4].to_i.positive? }
+      ids.uniq.sort
+    end
+
+    def checked_cospawns
+      names = []
+      iter = @cos_store.iter_first
+      return names unless iter
+
+      loop do
+        names << iter[2] if iter[0]
+        break unless iter.next!
+      end
+      names
+    end
+
+    # Room ids of the highlighted rows, in list order, unmapped rows skipped.
+    def selected_room_ids(tv)
+      ids = []
+      # selected_each hands over iters directly; selected_rows returns
+      # [paths, model] on current bindings and would need unpacking.
+      tv.selection.selected_each { |_model, _path, iter| ids << iter[4].to_i }
+      ids.select(&:positive?).uniq
+    end
+
+    # Single-room setting: first highlighted row.
+    def room_to_entry(tv, id)
+      ids = selected_room_ids(tv)
+      return status('select a room row first') if ids.empty?
+
+      set_entry(id, ids.first.to_s)
+      status("#{id} set to #{ids.first}")
+    end
+
+    # List setting: replaced with every highlighted row.
+    def rooms_to_entry(tv, id)
+      ids = selected_room_ids(tv)
+      return status('select one or more room rows first') if ids.empty?
+
+      set_entry(id, ids.join(', '))
+      status("#{id} set to #{ids.join(', ')}")
+    end
+
+    def boundaries_from(ids, replace:, what:)
+      return status('no rooms checked') if ids.empty?
+
+      if replace
+        set_entry('hunting_boundaries', ids.join(', '))
+      else
+        current = self['hunting_boundaries'].text.to_s.split(/\s*,\s*/).map(&:strip).reject(&:empty?)
+        set_entry('hunting_boundaries', (current + ids.map(&:to_s)).uniq.join(', '))
+      end
+      status("hunting_boundaries #{replace ? 'set from' : 'extended with'} #{what}: #{ids.size} room(s)")
+    end
+
+    def noun_to_entry(id)
+      return status('pick a creature first') if @template.nil?
+
+      noun = BSProfiles.noun_for(@template)
+      append_list_entry(id, noun)
+      status("#{id}: added #{noun}")
+    end
+
+    def cospawns_to_entry(id)
+      names = checked_cospawns
+      return status('no co-spawns checked') if names.empty?
+
+      nouns = names.map { |n| n.split.last.to_s }.uniq
+      nouns.each { |n| append_list_entry(id, n) }
+      status("#{id}: added #{nouns.join(', ')}")
+    end
+
+    # ----------------------------------------------------------------- map --
+    #
+    # The same map images ;map uses (MAP_DIR, room.image / room.image_coords),
+    # drawn into a Gtk::Layout with marker overlays the way ;map draws its tag
+    # markers. Shows the rooms of the area chosen on the Creatures tab and the
+    # profile's own rooms, and lets you tick rooms by clicking them.
+
+    MAP_MIN_SCALE = 0.2
+    MAP_MAX_SCALE = 6.0
+    MAP_COLORS = {
+      checked: [0.0, 0.6, 0.0],
+      area: [0.55, 0.55, 0.55],
+      start: [0.85, 0.0, 0.0],
+      rally: [0.0, 0.3, 0.9],
+      boundary: [0.95, 0.5, 0.0],
+      perimeter: [0.7, 0.0, 0.8]
+    }.freeze
+
+    def build_map_page
+      @map_gc = [] # anchors handler procs so GC cannot collect them
+      @map_pixbufs = {}
+      @map_markers = []
+      @map_scale = 1.0
+      @map_current = nil
+      @map_drag = nil
+
+      outer = Gtk::Box.new(:vertical, 6)
+      outer.border_width = 8
+
+      bar = Gtk::Box.new(:horizontal, 6)
+      bar.pack_start(Gtk::Label.new('Map'), false, false, 0)
+      @map_combo = Gtk::ComboBoxText.new
+      @map_combo.tooltip_text = "Maps that contain rooms from the chosen area or the profile.\nThe count is how many of those rooms are on that map."
+      bar.pack_start(@map_combo, true, true, 0)
+      zoom_out = Gtk::Button.new(label: '-')
+      zoom_in = Gtk::Button.new(label: '+')
+      zoom_fit = Gtk::Button.new(label: 'Fit')
+      zoom_100 = Gtk::Button.new(label: '100%')
+      zoom_out.tooltip_text = 'Zoom out. Ctrl + mouse wheel also zooms.'
+      zoom_in.tooltip_text = 'Zoom in. Ctrl + mouse wheel also zooms.'
+      zoom_fit.tooltip_text = 'Zoom so the whole map fits in the window.'
+      zoom_100.tooltip_text = 'Show the map at its natural size.'
+      [zoom_out, zoom_in, zoom_fit, zoom_100].each { |b| bar.pack_start(b, false, false, 0) }
+      @map_click_toggles = Gtk::CheckButton.new('Click toggles room')
+      @map_click_toggles.active = true
+      @map_click_toggles.tooltip_text = "When on, clicking a room on the map ticks or unticks it in the Creatures tab room list.\nDrag to pan either way."
+      bar.pack_start(@map_click_toggles, false, false, 6)
+      @map_show_perimeter = Gtk::CheckButton.new('Preview perimeter')
+      @map_show_perimeter.active = true
+      @map_show_perimeter.tooltip_text = "Show the rooms that \"Boundaries <- perimeter\" would set right now: the ring just outside the ticked rooms.\nPurple X. Changes as you tick and untick."
+      bar.pack_start(@map_show_perimeter, false, false, 0)
+      @map_dark = Gtk::CheckButton.new('Dark')
+      @map_dark.active = BSProfiles.map_dark_default
+      @map_dark.tooltip_text = "Use the dark map images from the maps-dark folder when they exist, as ;map does.\nStarts from ;map's own dark mode setting."
+      bar.pack_start(@map_dark, false, false, 0)
+      outer.pack_start(bar, false, false, 0)
+
+      legend = Gtk::Label.new
+      legend.xalign = 0
+      legend.set_markup(
+        "<span foreground=\"#009900\"><b>X</b></span> ticked room   " \
+        "<span foreground=\"#8c8c8c\"><b>X</b></span> area room, not ticked   " \
+        "<span foreground=\"#d90000\"><b>O</b></span> start room   " \
+        "<span foreground=\"#004ce6\"><b>O</b></span> rally point   " \
+        "<span foreground=\"#f28000\"><b>[]</b></span> boundary   " \
+        "<span foreground=\"#b300cc\"><b>X</b></span> perimeter preview"
+      )
+      legend.tooltip_text = 'Start room, rally points and boundaries come from the profile being edited, so this shows the fence as bigshot will see it.'
+      outer.pack_start(legend, false, false, 0)
+
+      @map_scroller = Gtk::ScrolledWindow.new
+      @map_scroller.set_policy(:automatic, :automatic)
+      @map_scroller.shadow_type = :in
+      @map_layout = Gtk::Layout.new
+      @map_layout.can_focus = true
+      @map_image = Gtk::Image.new
+      @map_layout.put(@map_image, 0, 0)
+      @map_layout.add_events(Gdk::EventMask::BUTTON_PRESS_MASK | Gdk::EventMask::BUTTON_RELEASE_MASK |
+                             Gdk::EventMask::POINTER_MOTION_MASK | Gdk::EventMask::SCROLL_MASK)
+      @map_scroller.add(@map_layout)
+      outer.pack_start(@map_scroller, true, true, 0)
+
+      @map_status = Gtk::Label.new('')
+      @map_status.xalign = 0
+      @map_status.tooltip_text = 'Which map is shown and how many of the rooms of interest are on it.'
+      outer.pack_start(@map_status, false, false, 0)
+
+      # Signals. Each handler is anchored in @map_gc.
+      anchor = lambda { |p| @map_gc << p; p }
+      @map_combo.signal_connect('changed', &anchor.call(proc { guard { map_combo_changed }; false }))
+      @map_show_perimeter.signal_connect('toggled', &anchor.call(proc { guard { refresh_map_markers }; false }))
+      @map_dark.signal_connect('toggled', &anchor.call(proc { guard { show_map(@map_current) }; false }))
+      zoom_out.signal_connect('clicked', &anchor.call(proc { guard { map_zoom(@map_scale / 1.25) }; false }))
+      zoom_in.signal_connect('clicked', &anchor.call(proc { guard { map_zoom(@map_scale * 1.25) }; false }))
+      zoom_fit.signal_connect('clicked', &anchor.call(proc { guard { map_zoom_fit }; false }))
+      zoom_100.signal_connect('clicked', &anchor.call(proc { guard { map_zoom(1.0) }; false }))
+      @map_layout.signal_connect('button-press-event', &anchor.call(proc { |_, ev| guard { map_press(ev) }; false }))
+      @map_layout.signal_connect('motion-notify-event', &anchor.call(proc { |_, ev| guard { map_motion(ev) }; false }))
+      @map_layout.signal_connect('button-release-event', &anchor.call(proc { |_, ev| guard { map_release(ev) }; false }))
+      @map_layout.signal_connect('scroll-event', &anchor.call(proc { |_, ev| guard { map_scroll(ev) } == true }))
+
+      outer
+    end
+
+    # ---- what to draw ----
+
+    # Room ids from a comma-separated profile entry.
+    def entry_room_ids(id)
+      self[id].text.to_s.split(/\s*,\s*/).map { |s| BSProfiles.resolve_room(s)&.id }.compact
+    end
+
+    # {room_id => [kinds]} for every room the map should show.
+    def map_rooms_of_interest
+      rooms = Hash.new { |h, k| h[k] = [] }
+      each_room_row do |row|
+        id = row[4].to_i
+        next unless id.positive?
+
+        rooms[id] << (row[0] ? :checked : :area)
+      end
+      entry_room_ids('hunting_room_id').each { |id| rooms[id] << :start }
+      entry_room_ids('rallypoint_room_ids').each { |id| rooms[id] << :rally }
+      entry_room_ids('hunting_boundaries').each { |id| rooms[id] << :boundary }
+      if @map_show_perimeter&.active?
+        BSProfiles.perimeter(checked_rooms).each { |id| rooms[id] << :perimeter }
+      end
+      rooms
+    end
+
+    # Rebuild the map dropdown from the rooms of interest. Keeps the current
+    # map selected when it is still relevant, otherwise picks the map with
+    # the most area rooms.
+    def refresh_map_tab
+      return unless @map_combo
+
+      interest = map_rooms_of_interest
+      counts = Hash.new(0)
+      area_counts = Hash.new(0)
+      interest.each do |id, kinds|
+        room = Map[id]
+        next if room.nil? || room.image.to_s.empty?
+        next unless File.exist?(File.join(MAP_DIR, room.image))
+
+        counts[room.image] += 1
+        area_counts[room.image] += 1 if kinds.include?(:checked) || kinds.include?(:area)
+      end
+      maps = counts.keys.sort_by { |img| [-area_counts[img], -counts[img], img] }
+      @map_list = maps
+
+      @map_refreshing = true
+      @map_combo.remove_all
+      maps.each { |img| @map_combo.append_text("#{BSProfiles.map_display_name(img)}  (#{counts[img]} rooms)") }
+      idx = maps.index(@map_current) || 0
+      @map_combo.set_active(idx) if maps.any?
+      @map_refreshing = false
+
+      if maps.empty?
+        @map_current = nil
+        @map_image.pixbuf = nil
+        clear_map_markers
+        @map_status.text = 'No map images for these rooms. Pick an area on the Creatures tab, or set rooms on the Hunting tab.'
+      else
+        show_map(maps[idx])
+      end
+    end
+
+    def map_combo_changed
+      return if @map_refreshing
+
+      i = @map_combo.active
+      return if i.nil? || i.negative? || @map_list.nil?
+
+      show_map(@map_list[i])
+    end
+
+    # Redraw the markers only (a tick changed, an entry changed).
+    def refresh_map_markers
+      return unless @map_combo && @map_current
+
+      draw_map_markers
+    end
+
+    # ---- drawing ----
+
+    def map_pixbuf(image)
+      path = BSProfiles.map_image_path(image, @map_dark&.active?)
+      @map_pixbufs[path] ||= GdkPixbuf::Pixbuf.new(file: path)
+    end
+
+    def show_map(image, center_on: nil)
+      return if image.nil?
+
+      changed = image != @map_current
+      @map_current = image
+      base = map_pixbuf(image)
+      w = [(base.width * @map_scale).to_i, 1].max
+      h = [(base.height * @map_scale).to_i, 1].max
+      @map_image.pixbuf = base.scale_simple(w, h, GdkPixbuf::InterpType::BILINEAR)
+      @map_layout.set_size(w, h)
+      @map_layout.move(@map_image, 0, 0)
+      draw_map_markers
+      if center_on
+        map_center_on_room(center_on)
+      elsif changed
+        map_center_on_interest
+      end
+    rescue StandardError => e
+      @map_status.text = "Could not load #{image}: #{e.message}"
+    end
+
+    def clear_map_markers
+      @map_markers.each { |m| m.destroy unless m.destroyed? }
+      @map_markers.clear
+    end
+
+    def draw_map_markers
+      clear_map_markers
+      return if @map_current.nil?
+
+      interest = map_rooms_of_interest
+      shown = 0
+      interest.each do |id, kinds|
+        room = Map[id]
+        next if room.nil? || room.image != @map_current
+        next unless (coords = room.image_coords)
+
+        x1, y1, x2, y2 = coords
+        x = (x1 * @map_scale).to_i
+        y = (y1 * @map_scale).to_i
+        w = [((x2 - x1) * @map_scale).to_i, 10].max
+        h = [((y2 - y1) * @map_scale).to_i, 10].max
+        shown += 1
+
+        # Base mark: ticked (green X), unticked area room (grey X)
+        if kinds.include?(:checked)
+          put_marker(BSProfiles.marker_pixbuf(w, h, MAP_COLORS[:checked], :x, 3), x, y)
+        elsif kinds.include?(:area)
+          put_marker(BSProfiles.marker_pixbuf(w, h, MAP_COLORS[:area], :x, 1), x, y)
+        end
+        put_marker(BSProfiles.marker_pixbuf(w, h, MAP_COLORS[:perimeter], :x, 2), x, y) if kinds.include?(:perimeter)
+        # Profile marks layered on top
+        put_marker(BSProfiles.marker_pixbuf(w + 6, h + 6, MAP_COLORS[:boundary], :box, 3), x - 3, y - 3) if kinds.include?(:boundary)
+        put_marker(BSProfiles.marker_pixbuf(w + 10, h + 10, MAP_COLORS[:rally], :circle, 3), x - 5, y - 5) if kinds.include?(:rally)
+        put_marker(BSProfiles.marker_pixbuf(w + 10, h + 10, MAP_COLORS[:start], :circle, 3), x - 5, y - 5) if kinds.include?(:start)
+      end
+      checked = interest.count { |_, k| k.include?(:checked) }
+      @map_status.text = "#{BSProfiles.map_display_name(@map_current)}: #{shown} of #{interest.size} room(s) of interest are on this map, #{checked} ticked. Zoom #{(@map_scale * 100).round}%."
+    end
+
+    def put_marker(pixbuf, x, y)
+      img = Gtk::Image.new(pixbuf: pixbuf)
+      @map_layout.put(img, x, y)
+      img.show
+      @map_markers << img
+    end
+
+    # ---- zoom and pan ----
+
+    def map_zoom(scale)
+      return if @map_current.nil?
+
+      # keep the viewport centre fixed while zooming
+      hadj = @map_scroller.hadjustment
+      vadj = @map_scroller.vadjustment
+      cx = (hadj.value + hadj.page_size / 2) / @map_scale
+      cy = (vadj.value + vadj.page_size / 2) / @map_scale
+      @map_scale = [[scale, MAP_MIN_SCALE].max, MAP_MAX_SCALE].min
+      show_map(@map_current)
+      map_scroll_to(cx * @map_scale, cy * @map_scale)
+    end
+
+    def map_zoom_fit
+      return if @map_current.nil?
+
+      base = map_pixbuf(@map_current)
+      alloc = @map_scroller.allocation
+      return if alloc.width < 10 || alloc.height < 10
+
+      @map_scale = [[(alloc.width - 4).to_f / base.width, (alloc.height - 4).to_f / base.height].min, MAP_MIN_SCALE].max
+      show_map(@map_current)
+    end
+
+    # Scroll so that layout point (x, y) sits in the middle of the viewport.
+    # Deferred a tick so the layout has taken its new size first.
+    def map_scroll_to(x, y)
+      @map_timeout_proc = proc do
+        begin
+          hadj = @map_scroller.hadjustment
+          vadj = @map_scroller.vadjustment
+          hadj.value = [[x - hadj.page_size / 2, 0].max, hadj.upper - hadj.page_size].min
+          vadj.value = [[y - vadj.page_size / 2, 0].max, vadj.upper - vadj.page_size].min
+        rescue StandardError
+          nil
+        end
+        @map_timeout_proc = nil
+        false
+      end
+      GLib::Timeout.add(30, &@map_timeout_proc)
+    end
+
+    # Pointer position inside the layout's scrolled content, like ;map does it.
+    def map_pointer
+      win = @map_layout.window
+      return nil unless win
+
+      p = win.pointer
+      [@map_scroller.hadjustment.value + p[1], @map_scroller.vadjustment.value + p[2]]
+    end
+
+    def map_center_on_room(id)
+      room = Map[id]
+      return unless room && room.image == @map_current && room.image_coords
+
+      x1, y1, x2, y2 = room.image_coords
+      map_scroll_to((x1 + x2) / 2.0 * @map_scale, (y1 + y2) / 2.0 * @map_scale)
+    end
+
+    # Centre on the ticked rooms (or all rooms of interest) on this map.
+    def map_center_on_interest
+      pts = []
+      map_rooms_of_interest.each do |id, kinds|
+        room = Map[id]
+        next if room.nil? || room.image != @map_current || room.image_coords.nil?
+        next if kinds == [:area] && pts.any?
+
+        x1, y1, x2, y2 = room.image_coords
+        pts << [(x1 + x2) / 2.0, (y1 + y2) / 2.0]
+      end
+      return if pts.empty?
+
+      cx = pts.sum { |p| p[0] } / pts.size
+      cy = pts.sum { |p| p[1] } / pts.size
+      map_scroll_to(cx * @map_scale, cy * @map_scale)
+    end
+
+    def map_press(ev)
+      return unless ev.button == 1
+
+      click = map_pointer or return
+      @map_drag = {
+        x: ev.x_root, y: ev.y_root, moved: false,
+        hadj: @map_scroller.hadjustment.value, vadj: @map_scroller.vadjustment.value,
+        click_x: click[0], click_y: click[1]
+      }
+    end
+
+    def map_motion(ev)
+      return unless @map_drag
+
+      dx = ev.x_root - @map_drag[:x]
+      dy = ev.y_root - @map_drag[:y]
+      @map_drag[:moved] = true if dx.abs > 5 || dy.abs > 5
+      return unless @map_drag[:moved]
+
+      @map_scroller.hadjustment.value = [@map_drag[:hadj] - dx, 0].max
+      @map_scroller.vadjustment.value = [@map_drag[:vadj] - dy, 0].max
+    end
+
+    def map_release(ev)
+      drag = @map_drag
+      @map_drag = nil
+      return unless drag && ev.button == 1 && !drag[:moved]
+
+      map_click(drag[:click_x] / @map_scale, drag[:click_y] / @map_scale)
+    end
+
+    def map_scroll(ev)
+      return false unless ev.state.control_mask?
+
+      case ev.direction
+      when Gdk::ScrollDirection::UP then map_zoom(@map_scale * 1.15)
+      when Gdk::ScrollDirection::DOWN then map_zoom(@map_scale / 1.15)
+      end
+      true
+    end
+
+    # A click at unscaled map coordinates: toggle the room's tick in the
+    # Creatures tab room list, or just report the room if toggling is off.
+    def map_click(x, y)
+      return if @map_current.nil?
+
+      room = Map.list.compact.find do |r|
+        next false unless r.image == @map_current && r.image_coords
+
+        x1, y1, x2, y2 = r.image_coords
+        x.between?(x1, x2) && y.between?(y1, y2)
+      end
+      return if room.nil?
+
+      title = Array(room.title).first.to_s.gsub(/[\[\]]/, '')
+      unless @map_click_toggles.active?
+        @map_status.text = "Room #{room.id}: #{title}"
+        return
+      end
+
+      hit = false
+      each_room_row do |row|
+        next unless row[4].to_i == room.id
+
+        row[0] = !row[0]
+        hit = true
+      end
+      if hit
+        refresh_room_summary # also redraws the markers
+      else
+        @map_status.text = "Room #{room.id} (#{title}) is not in the chosen area's room list, so it cannot be ticked here."
+      end
+    end
+  end
+end
+
+end # if BSProfiles.gui_available?
+# rubocop:enable Layout/IndentationWidth
+
+# ------------------------------------------------------------------ main --
+
+args = Script.current.vars
+cmd = args[1].to_s.downcase
+rest = args[0].to_s.sub(/\A\s*#{Regexp.escape(args[1].to_s)}\s*/i, '').strip
+
+two_names = lambda do
+  parts = rest.include?('|') ? rest.split('|', 2) : rest.split(/\s+/, 2)
+  parts.map { |p| p.to_s.strip }
+end
+
+gui_ok = BSProfiles.gui_available?
+
+case cmd
+when '', 'edit'
+  if gui_ok
+    BSProfiles::Editor.open(rest.empty? ? nil : rest)
+  else
+    respond 'bsprofiles: the editor needs GTK 3. Command-line actions still work (;bsprofiles help).'
+  end
+when 'new'
+  if rest.empty?
+    respond 'bsprofiles: name required. ;bsprofiles new <name>'
+  elsif !BSProfiles.valid_name?(rest)
+    respond "bsprofiles: '#{rest}' is not a valid file name."
+  elsif BSProfiles.exist?(rest)
+    respond "bsprofiles: '#{rest}' already exists. Use ;bsprofiles edit #{rest}"
+  else
+    BSProfiles.save(rest, BSProfiles.defaults)
+    respond "bsprofiles: created #{BSProfiles.path(rest)}"
+    BSProfiles::Editor.open(rest) if gui_ok
+  end
+when 'list'
+  BSProfiles.print_list
+when 'show'
+  rest.empty? ? respond('bsprofiles: name required.') : BSProfiles.print_show(rest)
+when 'compare', 'diff'
+  a, b = two_names.call
+  if a.to_s.empty? || b.to_s.empty?
+    respond 'bsprofiles: two names required. ;bsprofiles compare <a> | <b>'
+  else
+    BSProfiles.print_compare(a, b)
+  end
+when 'copy', 'rename'
+  a, b = two_names.call
+  if a.to_s.empty? || b.to_s.empty?
+    respond "bsprofiles: two names required. ;bsprofiles #{cmd} <a> | <b>"
+  elsif !BSProfiles.exist?(a)
+    respond "bsprofiles: no profile named '#{a}'"
+  elsif !BSProfiles.valid_name?(b)
+    respond "bsprofiles: '#{b}' is not a valid file name."
+  elsif BSProfiles.exist?(b)
+    respond "bsprofiles: '#{b}' already exists."
+  else
+    if cmd == 'copy'
+      FileUtils.cp(BSProfiles.path(a), BSProfiles.path(b))
+    else
+      FileUtils.mv(BSProfiles.path(a), BSProfiles.path(b))
+    end
+    respond "bsprofiles: #{cmd == 'copy' ? 'copied' : 'renamed'} '#{a}' to '#{b}'"
+  end
+when 'delete', 'remove'
+  name = rest.sub(/\s+confirm\z/i, '').strip
+  if name.empty?
+    respond 'bsprofiles: name required.'
+  elsif !BSProfiles.exist?(name)
+    respond "bsprofiles: no profile named '#{name}'"
+  elsif rest !~ /\s+confirm\z/i
+    respond "bsprofiles: this deletes #{BSProfiles.path(name)}. Run: ;bsprofiles delete #{name} confirm"
+  else
+    File.delete(BSProfiles.path(name))
+    respond "bsprofiles: deleted '#{name}'"
+  end
+when 'apply', 'load'
+  rest.empty? ? respond('bsprofiles: name required.') : BSProfiles.apply(rest)
+else
+  BSProfiles.help
+end
