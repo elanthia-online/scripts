@@ -22,6 +22,8 @@
 # bug fail loudly instead of silently undercounting again.
 
 require_relative '../spec_helper'
+require 'tmpdir'
+require 'fileutils'
 
 module PilePullRewardsSpec
   SOURCE_PATH = find_lic_source('pilepull.lic', from: __dir__)
@@ -44,12 +46,38 @@ module PilePullRewardsSpec
   EVENT_HALF_SRC = extract_lic_method(SOURCE, 'event_half', source_path: SOURCE_PATH)
   EVENT_KEY_FOR_SRC = extract_lic_method(SOURCE, 'event_key_for', source_path: SOURCE_PATH)
   LABEL_FOR_KEY_SRC = extract_lic_method(SOURCE, 'label_for_key', source_path: SOURCE_PATH)
+  WITH_COMMAS_SRC = extract_lic_method(SOURCE, 'with_commas', source_path: SOURCE_PATH)
   RECORD_ITEM_SRC = extract_lic_method(SOURCE, 'record_item', source_path: SOURCE_PATH)
   HANDLE_LOOT_SRC = extract_lic_method(SOURCE, 'handle_loot', source_path: SOURCE_PATH)
   SEARCH_PILE_SRC = extract_lic_method(SOURCE, 'search_pile', source_path: SOURCE_PATH)
   PERSISTED_DEFAULT_SRC = extract_lic_method(SOURCE, 'persisted_default', source_path: SOURCE_PATH)
   PARSE_BOOLEAN_FLAG_SRC = extract_lic_method(SOURCE, 'parse_boolean_flag', source_path: SOURCE_PATH)
   PARSE_CONFIG_ARGS_SRC = extract_lic_method(SOURCE, 'parse_config_args', source_path: SOURCE_PATH)
+  PULL_LINE_SRC = extract(
+    /^      PULL_LINE = .*? unless const_defined\?\(:PULL_LINE, false\)$/,
+    'PULL_LINE'
+  )
+  DEBUG_ECHO_SRC = extract(
+    /^      DEBUG_ECHO = .*? unless const_defined\?\(:DEBUG_ECHO, false\)$/,
+    'DEBUG_ECHO'
+  )
+  DATE_HEADER_SRC = extract(
+    /^      DATE_HEADER = .*? unless const_defined\?\(:DATE_HEADER, false\)$/,
+    'DATE_HEADER'
+  )
+  FILENAME_DATE_SRC = extract(
+    /^      FILENAME_DATE = .*? unless const_defined\?\(:FILENAME_DATE, false\)$/,
+    'FILENAME_DATE'
+  )
+  DUSKRUIN_WINDOWS_SRC = extract(
+    /^      DUSKRUIN_WINDOWS = \[.*?\]\.freeze unless const_defined\?\(:DUSKRUIN_WINDOWS, false\)$/m,
+    'DUSKRUIN_WINDOWS'
+  )
+  IN_DUSKRUIN_WINDOW_SRC = extract_lic_method(SOURCE, 'in_duskruin_window?', source_path: SOURCE_PATH)
+  RELEVANT_LOG_PATHS_SRC = extract_lic_method(SOURCE, 'relevant_log_paths', source_path: SOURCE_PATH)
+  DISCOVER_ROOTS_SRC = extract_lic_method(SOURCE, 'discover_roots', source_path: SOURCE_PATH)
+  SELECT_ROOTS_SRC = extract_lic_method(SOURCE, 'select_roots', source_path: SOURCE_PATH)
+  SCAN_FILE_SRC = extract_lic_method(SOURCE, 'scan_file', source_path: SOURCE_PATH)
 
   # Real tier/canonicalization/event-bucketing logic under test, evaluated so
   # bare XMLData and PilePull references resolve to the stand-ins nested here.
@@ -298,6 +326,80 @@ module PilePullRewardsSpec
     module_eval(PARSE_BOOLEAN_FLAG_SRC, SOURCE_PATH)
     module_eval(PARSE_CONFIG_ARGS_SRC, SOURCE_PATH)
   end
+
+  # Real LogScan.scan_file/discover_roots under test, with LogScan nested
+  # for real inside a Rewards stand-in -- not flattened onto one class --
+  # specifically so a bare call from inside LogScan to a method defined on
+  # the enclosing Rewards module (tier_for, event_key_for, label_for_key,
+  # with_commas) resolves (or fails to resolve) exactly the way it does in
+  # the actual nested module structure.
+  #
+  # This harness replaces an earlier, flatter one that module_eval'd
+  # TIER_FOR_SRC/EVENT_KEY_FOR_SRC directly onto the same class as
+  # SCAN_FILE_SRC: that made `tier_for`/`event_key_for` real singleton
+  # methods on the exact object `self` already pointed at inside scan_file,
+  # so a bare (unqualified) call to either happily resolved in the spec even
+  # though production code at the time made that same bare call -- which
+  # cannot resolve in the real file, since nesting one module inside another
+  # gives the inner module access to the outer module's *constants* via
+  # lexical scoping, but not its *methods*, which are looked up on the
+  # actual receiver, not the lexical nesting chain. That gap shipped
+  # ";pilepull logs" with a `NoMethodError` on its very first real run
+  # (`undefined method 'tier_for' for module ...Rewards::LogScan`), caught
+  # only by the fix in scan_file/print_event_block that added an explicit
+  # `Rewards.` receiver to those calls. This harness's real nesting is what
+  # makes a regression of the same mistake (a reintroduced bare call) fail
+  # here instead of only in-game.
+  class Rewards
+    module XMLData
+      class << self
+        attr_accessor :game
+      end
+    end
+
+    module PilePull
+      class << self
+        def dbg(_msg); end
+      end
+    end
+
+    module_eval(TIER_PATTERNS_SRC, SOURCE_PATH)
+    module_eval(FALLBACK_ITEM_FIXUPS_SRC, SOURCE_PATH)
+    module_eval(TIER_FOR_SRC, SOURCE_PATH)
+    module_eval(EVENT_HALF_SRC, SOURCE_PATH)
+    module_eval(EVENT_KEY_FOR_SRC, SOURCE_PATH)
+    module_eval(LABEL_FOR_KEY_SRC, SOURCE_PATH)
+    module_eval(WITH_COMMAS_SRC, SOURCE_PATH)
+
+    class LogScan
+      class << self
+        attr_reader :echoed
+
+        def reset!
+          @echoed = []
+        end
+
+        def echo(msg)
+          @echoed << msg
+        end
+      end
+
+      module_eval(FILENAME_DATE_SRC, SOURCE_PATH)
+      module_eval(DATE_HEADER_SRC, SOURCE_PATH)
+      module_eval(PULL_LINE_SRC, SOURCE_PATH)
+      module_eval(DEBUG_ECHO_SRC, SOURCE_PATH)
+      module_eval(DUSKRUIN_WINDOWS_SRC, SOURCE_PATH)
+      module_eval(IN_DUSKRUIN_WINDOW_SRC, SOURCE_PATH)
+      module_eval(RELEVANT_LOG_PATHS_SRC, SOURCE_PATH)
+      module_eval(DISCOVER_ROOTS_SRC, SOURCE_PATH)
+      module_eval(SELECT_ROOTS_SRC, SOURCE_PATH)
+      module_eval(SCAN_FILE_SRC, SOURCE_PATH)
+
+      def self.new_totals
+        Hash.new { |h, k| h[k] = { pulls: 0, items: Hash.new(0) } }
+      end
+    end
+  end
 end
 
 RSpec.describe 'pilepull.lic reward tracking' do
@@ -315,6 +417,14 @@ RSpec.describe 'pilepull.lic reward tracking' do
 
   def search_pile
     PilePullRewardsSpec::SearchPile
+  end
+
+  def log_scan
+    PilePullRewardsSpec::Rewards::LogScan
+  end
+
+  def log_scan_rewards
+    PilePullRewardsSpec::Rewards
   end
 
   def config
@@ -781,6 +891,220 @@ RSpec.describe 'pilepull.lic reward tracking' do
       it 'returns an already-stored value as-is without touching it' do
         config::CharSettings['baz'] = 999
         expect(config.persisted_default('baz', 1)).to eq(999)
+      end
+    end
+  end
+
+  describe 'Rewards::LogScan' do
+    let(:tmp_dir) { Dir.mktmpdir('pilepull_logscan_spec') }
+
+    before do
+      log_scan.reset!
+      stub_const('PilePullRewardsSpec::Rewards::LogScan::LOG_DIR', tmp_dir)
+    end
+
+    after do
+      FileUtils.rm_rf(tmp_dir)
+    end
+
+    def write_log(filename, content)
+      path = File.join(tmp_dir, filename)
+      File.write(path, content)
+      path
+    end
+
+    describe 'discover_roots' do
+      before do
+        %w[GSF-Pickasso GSF-Tysong GSJ-Other].each { |name| Dir.mkdir(File.join(tmp_dir, name)) }
+        # A file, not a directory, matching the glob -- exercises the
+        # File.directory? filter rather than assuming everything the glob
+        # returns is a real log directory.
+        File.write(File.join(tmp_dir, 'GSF-NotADirectory'), '')
+      end
+
+      it 'finds every "<game>-<character>" directory for the current game, keyed by character name' do
+        log_scan_rewards::XMLData.game = 'GSF'
+        result = log_scan.discover_roots
+        expect(result.keys).to contain_exactly('Pickasso', 'Tysong')
+        expect(result['Pickasso']).to eq(File.join(tmp_dir, 'GSF-Pickasso'))
+        expect(result['Tysong']).to eq(File.join(tmp_dir, 'GSF-Tysong'))
+      end
+
+      it 'does not pick up a directory belonging to a different game' do
+        log_scan_rewards::XMLData.game = 'GSF'
+        expect(log_scan.discover_roots.keys).not_to include('Other')
+      end
+
+      it 'skips a file that happens to match the glob but is not a directory' do
+        log_scan_rewards::XMLData.game = 'GSF'
+        expect(log_scan.discover_roots.keys).not_to include('NotADirectory')
+      end
+
+      it 'honors an explicit game: override instead of the current game' do
+        expect(log_scan.discover_roots(game: 'GSJ').keys).to contain_exactly('Other')
+      end
+
+      it 'returns an empty hash when there is no current game' do
+        log_scan_rewards::XMLData.game = nil
+        expect(log_scan.discover_roots).to eq({})
+      end
+    end
+
+    describe 'select_roots' do
+      let(:all_roots) { { 'Pickasso' => '/logs/GSF-Pickasso', 'Tysong' => '/logs/GSF-Tysong' } }
+
+      # The actual regression this guards: ";pilepull logs" used to default
+      # to every character's logs combined, which mixes drop rates and
+      # search counts across characters and skews every percentage shown --
+      # it must default to just the current character instead.
+      it 'defaults to only the given character, not everyone discovered' do
+        result = log_scan.select_roots(all_roots, character: 'Pickasso', all_characters: false)
+        expect(result).to eq({ 'Pickasso' => '/logs/GSF-Pickasso' })
+      end
+
+      it 'matches the character case-insensitively' do
+        result = log_scan.select_roots(all_roots, character: 'pickasso', all_characters: false)
+        expect(result).to eq({ 'Pickasso' => '/logs/GSF-Pickasso' })
+      end
+
+      it 'combines every discovered character when all_characters is true, ignoring character' do
+        result = log_scan.select_roots(all_roots, character: 'Pickasso', all_characters: true)
+        expect(result).to eq(all_roots)
+      end
+
+      it 'returns an empty hash for a character with no matching discovered root' do
+        result = log_scan.select_roots(all_roots, character: 'NoSuchCharacter', all_characters: false)
+        expect(result).to eq({})
+      end
+    end
+
+    describe 'in_duskruin_window?' do
+      {
+        [2, 21] => true,   # padded start of the Feb/Mar window
+        [2, 28] => true,   # last week of Feb proper
+        [3, 1]  => true,    # the actual event date seen in real logs
+        [3, 8]  => true,    # padded end of the Feb/Mar window
+        [2, 20] => false, # one day before the padded start
+        [3, 9]  => false, # one day after the padded end
+        [1, 15] => false,  # nowhere near either window
+        [8, 24] => true,   # padded start of the Aug/Sep window
+        [8, 31] => true,   # last week of Aug proper
+        [9, 1]  => true,    # the actual event date seen in real logs
+        [9, 8]  => true,    # padded end of the Aug/Sep window
+        [8, 23] => false, # one day before the padded start
+        [9, 9]  => false, # one day after the padded end
+        [6, 30] => false # nowhere near either window
+      }.each do |(month, day), expected|
+        it "treats #{month}/#{day} as #{expected ? 'inside' : 'outside'} a Duskruin window" do
+          expect(log_scan.in_duskruin_window?(month, day)).to eq(expected)
+        end
+      end
+    end
+
+    describe 'relevant_log_paths' do
+      it 'keeps only log files dated inside a Duskruin window, in sorted order' do
+        in_window = [
+          write_log('2026-03-01_15-47-17.log', ''),
+          write_log('2026-02-21_00-00-01.log', '')
+        ]
+        write_log('2026-01-15_00-00-01.log', '')  # outside any window
+        write_log('2026-04-01_00-00-01.log', '')  # outside any window
+        write_log('README.log', '')               # no date prefix at all
+
+        expect(log_scan.relevant_log_paths(tmp_dir)).to eq(in_window.sort)
+      end
+    end
+
+    describe 'scan_file' do
+      let(:totals) { log_scan.new_totals }
+
+      it "parses the pile's search response text into tiered item counts, using the filename's date" do
+        write_log('2026-03-01_15-47-17.log', <<~LOG)
+          15:47:44: The world grows blurry and indistinct.
+          18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a small locker expansion contract from within!
+          18:58:23: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull an Adventurer's Guild voucher pack from within!
+        LOG
+
+        log_scan.scan_file(File.join(tmp_dir, '2026-03-01_15-47-17.log'), 'Pickasso', totals)
+
+        event_key = log_scan_rewards.event_key_for(2026, 3)
+        bucket = totals[['Pickasso', event_key]]
+        expect(bucket[:pulls]).to eq(2)
+        expect(bucket[:items][['epic', 'small locker expansion contract']]).to eq(1)
+        expect(bucket[:items][['uncommon', "Adventurer's Guild voucher pack"]]).to eq(1)
+      end
+
+      it 'records an item not in TIER_PATTERNS as unknown instead of dropping it' do
+        write_log('2026-03-01_15-47-17.log', <<~LOG)
+          18:58:36: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a mangled steel spoon from within!
+        LOG
+
+        log_scan.scan_file(File.join(tmp_dir, '2026-03-01_15-47-17.log'), 'Pickasso', totals)
+
+        event_key = log_scan_rewards.event_key_for(2026, 3)
+        bucket = totals[['Pickasso', event_key]]
+        expect(bucket[:items][['unknown', 'mangled steel spoon']]).to eq(1)
+      end
+
+      it 'rebuckets pulls into the new month/event after a mid-file day-rollover header' do
+        write_log('2026-06-30_23-55-00.log', <<~LOG)
+          2026-06-30 23:58:00.000 -05:00
+          23:58:05: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a swirling yellow-green potion from within!
+          2026-07-01 00:02:00.000 -05:00
+          00:02:05: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!
+        LOG
+
+        log_scan.scan_file(File.join(tmp_dir, '2026-06-30_23-55-00.log'), 'Pickasso', totals)
+
+        june_key = log_scan_rewards.event_key_for(2026, 6)
+        july_key = log_scan_rewards.event_key_for(2026, 7)
+        expect(totals[['Pickasso', june_key]][:items][['uncommon', 'swirling yellow-green potion']]).to eq(1)
+        expect(totals[['Pickasso', july_key]][:items][['rare', 'glowing orb']]).to eq(1)
+      end
+
+      it 'does not match an unrelated "you pull" line (e.g. pulling on a door)' do
+        write_log('2026-03-01_15-47-17.log', <<~LOG)
+          17:49:02: You pull upon the door gently.
+        LOG
+
+        log_scan.scan_file(File.join(tmp_dir, '2026-03-01_15-47-17.log'), 'Pickasso', totals)
+
+        expect(totals).to be_empty
+      end
+
+      # Regression: a session run with ";pilepull --debug" has search_pile's
+      # own dbg("search_pile: result=#{result.inspect}") echo the raw search
+      # response text -- including the "You pull a/an ... from within!"
+      # phrase -- back into the log as a second line, right after the real
+      # one. Left unfiltered that debug echo also matches PULL_LINE, so
+      # every search under --debug got counted twice -- confirmed against a
+      # real character's Aug/Sep 2026 log history: it reported roughly
+      # double the silver actually spent.
+      it 'counts a search only once even when --debug logged a duplicate echo of the result' do
+        write_log('2026-09-05_20-34-22.log', <<~LOG)
+          20:35:49:  935 20 35 49  You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a locker runner contract from within!
+          20:35:49:  935 20 35 49  [pilepull  [pilepull-debug] search_pile  result="You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a locker runner contract from within!"]
+        LOG
+
+        log_scan.scan_file(File.join(tmp_dir, '2026-09-05_20-34-22.log'), 'Tysong', totals)
+
+        event_key = log_scan_rewards.event_key_for(2026, 9)
+        bucket = totals[['Tysong', event_key]]
+        expect(bucket[:pulls]).to eq(1)
+        expect(bucket[:items][['common', 'locker runner contract']]).to eq(1)
+      end
+
+      it 'skips a file whose name does not start with a date, without raising' do
+        write_log('README.log', "18:58:21: You pull a glowing orb from within!\n")
+
+        expect { log_scan.scan_file(File.join(tmp_dir, 'README.log'), 'Pickasso', totals) }.not_to raise_error
+        expect(totals).to be_empty
+      end
+
+      it 'rescues a missing log file (valid filename, but never written) instead of raising' do
+        missing_path = File.join(tmp_dir, '2026-03-01_15-47-17.log')
+        expect { log_scan.scan_file(missing_path, 'Pickasso', totals) }.not_to raise_error
+        expect(log_scan.echoed.join).to match(/could not read log/)
       end
     end
   end
