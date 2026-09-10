@@ -1106,6 +1106,26 @@ RSpec.describe 'pilepull.lic reward tracking' do
         expect { log_scan.scan_file(missing_path, 'Pickasso', totals) }.not_to raise_error
         expect(log_scan.echoed.join).to match(/could not read log/)
       end
+
+      # Regression: a real session log can contain a line with a byte
+      # sequence that isn't valid UTF-8 (a stray control byte from a rough
+      # disconnect, a client-side encoding hiccup, etc.). String#match
+      # raises ArgumentError on an invalid-encoding string rather than just
+      # failing to match, which crashed the entire scan on one bad line in
+      # one file out of a character's whole log history.
+      it 'does not crash on a line containing an invalid UTF-8 byte sequence, and still parses the rest of the file' do
+        path = File.join(tmp_dir, '2026-03-01_15-47-17.log')
+        File.open(path, 'wb') do |f|
+          f.write("18:58:20: #{[0xFF, 0xFE].pack('C*')}garbled text\n")
+          f.write("18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!\n")
+        end
+
+        expect { log_scan.scan_file(path, 'Pickasso', totals) }.not_to raise_error
+
+        event_key = log_scan_rewards.event_key_for(2026, 3)
+        bucket = totals[['Pickasso', event_key]]
+        expect(bucket[:items][['rare', 'glowing orb']]).to eq(1)
+      end
     end
   end
 end
