@@ -106,7 +106,7 @@ Cap search at 12 ordinary mapped steps/30 seconds (or smaller preset limits),
 with one direction send and verified arrival per step. Pin the first encounter
 room and clear it once; never resume searching afterward. Existing modes gain
 no movement authority. LAB uses the existing opt-in controller manifest and
-`quick_area` proof, requires movement/combat ownership, and adds no listener or
+`quick_refuge` proof, requires movement/combat ownership, and adds no listener or
 arbitrary-script capability. Test cancellation, map callback denial, arrival
 races, limits, and unchanged legacy modes before deployment/live testing.
 

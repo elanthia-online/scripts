@@ -192,9 +192,9 @@ RSpec.describe 'Bigshot complete-file Quick CLI smoke' do
     expect(result.fetch('reset')).to be(false)
   end
 
-  it 'rejects a malformed Quick verb without falling through to hunting initialization' do
-    result = probe('quick', 'cleer')
-    expect(result.fetch('output').join).to include('Unknown quick command')
+  it 'rejects a malformed extended Quick option without falling through to hunting initialization' do
+    result = probe('quick', 'clear', '--bogus')
+    expect(result.fetch('output').join).to include('Unknown quick option')
     expect(result.fetch('reset')).to be(false)
   end
 

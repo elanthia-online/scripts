@@ -19,11 +19,11 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
-  v5.17.0  (2026-09-10)
-    - expanded bigshot quick into bounded clear, watch, assist, trial, and seek modes using existing profiles
-    - added supervised controls, exact-target engagement, unknown-creature policy, and observed ineffective-action limits
-    - added safe-start and safe-return outings with external refuge travel and verified equipment restoration
-    - added guarded room-scoped eLoot integration without allowing selling, child-script travel, or unrelated cleanup
+  v5.17.0  (2026-09-09)
+    - added configurable Quick Combat modes for clearing a room, watching for arrivals, assisting a group, running a named trial, or finding one encounter
+    - added live Quick controls for status, hold, resume, stop, retreat, and selecting an unfamiliar target
+    - added optional bounded eLoot cleanup and supervised outings that verify a safe return and restored equipment
+    - kept existing bare quick and historical quick arguments unchanged
   v5.16.0  (2026-08-13)
     - creature tracking is more accurate right after a kill or a room change, so targeting and looting are less likely to grab a stale target
     - added checks for more creature states (calm, disoriented, hovering, immobilized, kneeling, sitting, sleeping, stunned, webbed, flying, rooted) and creature types (mounts, riders, mini-bosses, and more), so combat commands react to them correctly
@@ -423,10 +423,12 @@
       Celerity (506) support from grouped wizards for MStrikes
 =end
 # Quick Combat admission gate: classify before settings writes/global resets.
-# Every nonlegacy Quick tail is parsed strictly after the class definitions;
-# even a typo must never fall through to legacy hunting.
+# Only recognized extended verbs and flags are parsed after the class
+# definitions. Other tails retain Quick's historical permissive behavior.
 quick_words = Script.current.vars.drop(2).map { |word| word.to_s.downcase }
-quick_extended = Script.current.vars[1].to_s.casecmp('quick').zero? && ![[], ['once'], ['single']].include?(quick_words)
+quick_extended_verbs = %w[clear watch assist trial seek status hold resume stop retreat help engage].freeze
+quick_extended = Script.current.vars[1].to_s.casecmp('quick').zero? && !quick_words.empty? &&
+                 (quick_extended_verbs.include?(quick_words.first) || quick_words.first.start_with?('--'))
 if !quick_extended && Script.list.any? { |other| !other.equal?(Script.current) && other.respond_to?(:quick_combat_runtime) }
   echo 'An active Quick Combat run owns Bigshot. Stop that run before starting another Bigshot command.'
   exit
@@ -681,8 +683,11 @@ class Bigshot
       value.freeze
     end
 
-    # argv excludes the initial "quick" token. The complete supported legacy
-    # forms are bare quick, quick once and quick single (case insensitive).
+    # Parses the words following the initial +quick+ token.
+    #
+    # @param argv [Array<String>] Quick arguments without the leading token
+    # @return [QuickRequest] immutable parsed request
+    # @raise [ArgumentError] when recognized extended syntax is malformed
     def self.parse(argv)
       raise ArgumentError, 'Quick arguments must be an array of words' unless argv.is_a?(Array) && argv.all? { |word| word.is_a?(String) && !word.empty? }
 
@@ -830,6 +835,11 @@ class Bigshot
       end
     end
 
+    # Validates and fills one Quick Combat preset.
+    #
+    # @param preset [Hash] player-supplied preset values
+    # @return [Hash] normalized independent settings
+    # @raise [ArgumentError] when a key, enum, or bound is invalid
     def self.normalize(preset)
       raise ArgumentError, 'Encounter preset must be a mapping' unless preset.is_a?(Hash)
 
@@ -929,6 +939,11 @@ class Bigshot
       @state['trials'].delete(name)
     end
 
+    # Validates one named trial sequence.
+    #
+    # @param sequence [Hash] trial commands and optional bounds
+    # @return [Hash] normalized independent trial values
+    # @raise [ArgumentError] when commands or bounds are invalid
     def self.normalize_trial(sequence)
       raise ArgumentError, 'Trial must contain actions and optional max_actions/max_seconds' unless sequence.is_a?(Hash)
 
@@ -1012,6 +1027,13 @@ class Bigshot
       @fallback
     end
 
+    # Determines whether the current policy authorizes a creature.
+    #
+    # @param target [Hash, nil] current creature observation
+    # @param group_engaged [Boolean] verified group engagement evidence
+    # @param manual [Boolean] current-room human selection
+    # @param trial [Boolean] exact trial-target admission
+    # @return [Boolean] whether this observation is eligible
     def eligible?(target, group_engaged: false, manual: false, trial: false)
       kind = classification(target)
       return false if kind == :excluded
@@ -1073,6 +1095,8 @@ class Bigshot
       @room_engaged = false
       @engagement_roster = nil
       @active_target = nil
+      @encounter_started = false
+      @retreat_attempted = false
     end
 
     def validate_command!(command)
@@ -1208,6 +1232,9 @@ class Bigshot
       status
     end
 
+    # Returns an immutable snapshot without issuing game reads.
+    #
+    # @return [Hash] bounded controller state and recent observations
     def status
       attempt = @attempts[@active_target]
       deadline = if @mode == 'trial'
@@ -1265,6 +1292,9 @@ class Bigshot
       @policy.eligible?(target, group_engaged: !!engaged, manual: manual, trial: @mode == 'trial')
     end
 
+    # Advances at most one bounded controller operation.
+    #
+    # @return [Hash] immutable status after the operation
     def tick
       return status if terminal?
 
@@ -1387,7 +1417,7 @@ class Bigshot
                          evidence_reason: result.is_a?(Hash) ? result[:evidence_reason] : nil)
       if outcome == :interrupted
         return status if terminal?
-        reason = result[:reason].to_s
+        reason = result.is_a?(Hash) ? result[:reason].to_s : ''
         if %w[room_id_changed room_epoch_changed].include?(reason)
           synchronize_room(@snapshot.call)
           return status
@@ -1484,6 +1514,10 @@ class Bigshot
       false
     end
 
+    # Classifies queued native combat events for one command context.
+    #
+    # @param context [Hash] fresh tracker provenance for the command
+    # @return [Hash] evidence outcome and reason
     def result(context:)
       now = @clock.call
       @mutex.synchronize do
@@ -1725,12 +1759,19 @@ class Bigshot
   # QuickIO handles Bigshot's own sleeps without charging sends a second time.
   module QuickExecution
     def quick_run_loop(run, owner: Script.current, observation: nil, attack_observation: nil)
+      debug_msg(@DEBUG_SYSTEM, 'Quick Combat lifecycle started') if respond_to?(:debug_msg, true)
       last_hold = nil
+      last_debug_state = nil
       runner = proc do |drain = nil|
         loop do
           yield run if block_given?
           drain.call if drain
           current = run.tick
+          debug_state = current.slice(:state, :reason, :room_id, :room_epoch, :target_id, :actions, :sends)
+          if debug_state != last_debug_state
+            debug_msg(@DEBUG_STATUS, "Quick Combat status: #{debug_state}") if respond_to?(:debug_msg, true)
+            last_debug_state = debug_state
+          end
           hold = current[:state] == :held ? current[:reason] : nil
           if hold && hold != last_hold
             respond("Quick Combat held: #{hold} (#{current.fetch(:sends, 0)} combat sends, #{current.fetch(:loot_sends, 0)} loot sends).")
@@ -1748,11 +1789,13 @@ class Bigshot
           runner.call
         end
       end
-    rescue StandardError
+    rescue StandardError => error
+      debug_msg(@DEBUG_SYSTEM, "Quick Combat lifecycle error: #{error.class}: #{error.message}") if respond_to?(:debug_msg, true)
       run.fail('execution_error') if run.status[:refuge]
       raise
     ensure
       run.close
+      debug_msg(@DEBUG_SYSTEM, 'Quick Combat lifecycle finished') if respond_to?(:debug_msg, true)
     end
 
     def quick_attack_observation_available?
@@ -1877,6 +1920,17 @@ class Bigshot
           elsif control == 'status'
             detail = "Quick Combat: #{snapshot[:state] || 'unknown'}; target #{snapshot[:target_id] || '-'}; actions #{snapshot[:actions] || 0}; reason #{snapshot[:reason] || '-'}"
             detail += "; control error #{snapshot[:control_error]}" if snapshot[:control_error]
+            recent = Array(snapshot[:observations]).last(3).map do |event|
+              item = "##{event[:sequence]} #{event[:command]}=#{event[:outcome]}"
+              item += "/#{event[:reason]}" if event[:reason]
+              item
+            end
+            detail += "; recent #{recent.join(', ')}" unless recent.empty?
+            if snapshot[:error]
+              error = snapshot[:error]
+              detail += "; error #{error[:class]}: #{error[:message]}"
+              detail += " at #{error[:location]}" unless error[:location].to_s.empty?
+            end
             respond("#{detail}.")
           else
             respond("Quick Combat #{control} queued (current state: #{snapshot[:state] || 'unknown'}).")
@@ -1898,8 +1952,18 @@ class Bigshot
       UpstreamHook.remove(hook_name) if hook_name
     end
 
+    # Executes one existing Bigshot command inside an exact native guard.
+    #
+    # @param command [String, Array<String>] admitted profile command
+    # @param target [BigshotCreature, Lich::Common::GameObj] selected target
+    # @param guard [QuickGuard] immutable identity and budget guard
+    # @param owner [Script] exact running script instance
+    # @param prefix [String] native game-wire prefix
+    # @return [Hash] observed outcome and counted sends
     def quick_execute(command, target, guard:, owner:, prefix:)
-      with_quick_outcome_evidence(target) do
+      target_id = target.id if target.respond_to?(:id)
+      debug_msg(@DEBUG_COMMANDS, "Quick Combat execute: command=#{command.inspect} target_id=#{target_id}")
+      result = with_quick_outcome_evidence(target) do
         quick_execution_scope(target, guard: guard, owner: owner, prefix: prefix) do
           # Reuse native per-target state, retaining UAC followups across routines
           # only while this exact target and room visit remain guarded.
@@ -1911,6 +1975,8 @@ class Bigshot
           quick_settle_outcome_evidence if @quick_outcome_evidence
         end
       end
+      debug_msg(@DEBUG_COMMANDS, "Quick Combat execute result: #{result}")
+      result
     end
 
     def quick_outcome_observation_available?
@@ -2079,6 +2145,7 @@ class Bigshot
     # Native dropdown XML confirms selection; no guessed names or timed sleeps
     # stand in for confirmation. The existing execution deadline bounds waits.
     def quick_incant_scope(target_id)
+      debug_msg(@DEBUG_COMMANDS, "Quick Combat incant selector start: target_id=#{target_id.inspect}")
       raise ArgumentError, 'Quick incant requires its active execution scope' unless @quick_native_scope && @quick_guard
       raise ArgumentError, 'Quick incant cannot replace an active selector scope' if @quick_incant_selector
       unless XMLData.respond_to?(:current_target_id) && (target_id.nil? || target_id.to_s.match?(/\A[1-9]\d*\z/))
@@ -2095,6 +2162,7 @@ class Bigshot
         yield
       ensure
         @quick_incant_selector = nil
+        debug_msg(@DEBUG_COMMANDS, 'Quick Combat incant selector cleared')
       end
     end
 
@@ -2191,6 +2259,12 @@ class Bigshot
       end
     end
 
+    # Verifies exclusive ownership and required native guard/control APIs.
+    #
+    # @param owner [Script] exact running Bigshot script instance
+    # @param prefix [String] native game-wire prefix
+    # @return [void]
+    # @raise [ArgumentError] when ownership or a required API is unavailable
     def self.admit_owner!(owner, prefix)
       raise ArgumentError, 'Quick Combat requires exclusive ownership; another Bigshot may be active' unless owner_available?(owner)
       raise ArgumentError, 'Quick Combat runtime is already published on this owner' if owner.respond_to?(:quick_combat_runtime, true)
@@ -2309,6 +2383,18 @@ class Bigshot
       end
     end
 
+    # Resolves configuration, publishes one run, and owns its full lifecycle.
+    #
+    # @param argv [Array<String>] extended Quick arguments
+    # @param reset [#call] global reset callback, invoked only after admission
+    # @param output [#call] player-facing status callback
+    # @param owner [Script] exact running script instance
+    # @param prefix [String] native game-wire prefix
+    # @param stored [#call] character Quick settings provider
+    # @param profile [#call] current Bigshot profile provider
+    # @param directory [#call] named profile directory provider
+    # @return [Hash] immutable terminal run status
+    # @raise [ArgumentError] when admission or configuration fails
     def self.call(argv, reset:, output:, owner: Script.current, prefix: $cmd_prefix,
                   stored: -> { CharSettings[EncounterSettings::STORAGE_KEY] },
                   profile: -> { UserVars.op },
@@ -2437,6 +2523,17 @@ class Bigshot
   class QuickGroupInitialization
     MAX_SECONDS = 3.0
 
+    # Refreshes and verifies group membership for assist admission.
+    #
+    # @param engine [Bigshot] command receiver
+    # @param owner [Script] exact running script instance
+    # @param prefix [String] native game-wire prefix
+    # @param snapshot [#call] fresh observation provider
+    # @param leader [String] required leader name, or empty for any group member
+    # @param group [Module] native group-state provider
+    # @param permit [Proc, nil] optional current supervisor authority
+    # @return [Array] immutable verified member records
+    # @raise [ArgumentError] when group identity cannot be verified
     def self.call(engine:, owner:, prefix:, snapshot:, leader: '', group: Lich::Gemstone::Group, permit: nil,
                   clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) })
       unless owner && Script.current.equal?(owner) && %i[with_execution_guard check_execution_guard! execution_guard_active? execution_sleep stopping?].all? { |name| owner.respond_to?(name) }
@@ -2562,6 +2659,9 @@ class Bigshot
 
     # The owner supplies one observation-only cooperative checkpoint. It drains
     # queued controls and checks session/authority without evaluating wound Ruby.
+    #
+    # @yieldreturn [Hash] fresh retreat/session observation
+    # @return [Hash] immutable retreat outcome, send count, and reason
     def call(&checkpoint)
       raise ArgumentError, '130 retreat requires an owner checkpoint' unless checkpoint
       raise ArgumentError, '130 retreat requires its current native script owner' unless Script.current.equal?(@owner)
@@ -2644,6 +2744,9 @@ class Bigshot
       observed
     end
 
+    # @param outcome [Symbol] terminal adapter outcome
+    # @param reason [String] stable machine-readable reason
+    # @return [Hash] immutable retreat result
     def result(outcome, reason)
       { outcome: outcome, sends: @sends, reason: reason }.freeze
     end
@@ -2687,6 +2790,10 @@ class Bigshot
       true
     end
 
+    # Runs the exact owned go2 child and verifies its destination.
+    #
+    # @yieldreturn [Hash] fresh travel/session observation
+    # @return [Hash] immutable travel outcome, send count, and reason
     def call(&checkpoint)
       unless checkpoint && Script.current.equal?(@owner) && !@owner.execution_guard_active? &&
              Script.const_defined?(:START_EXECUTION_GUARD_PROTOCOL) && Script::START_EXECUTION_GUARD_PROTOCOL == 1 &&
@@ -2778,6 +2885,9 @@ class Bigshot
       fail!(observed[:escape_cancelled].to_s) if observed[:escape_cancelled]
     end
 
+    # @param outcome [Symbol] terminal adapter outcome
+    # @param reason [String] stable machine-readable reason
+    # @return [Hash] immutable travel result
     def result(outcome, reason)
       { outcome: outcome, sends: @sends || 0, reason: reason }.freeze
     end
@@ -2820,6 +2930,9 @@ class Bigshot
 
     # movement receives a disposable command copy. An already verified
     # refuge succeeds with zero sends; that is refuge proof, not travel proof.
+    #
+    # @yieldreturn [Hash] fresh retreat/session observation
+    # @return [Hash] immutable retreat outcome, send count, and reason
     def call(&checkpoint)
       raise ArgumentError, 'Walking retreat requires its owner checkpoint' unless checkpoint && Script.current.equal?(@owner)
       raise ArgumentError, 'Walking retreat cannot nest an execution scope' if @owner.execution_guard_active?
@@ -2974,6 +3087,9 @@ class Bigshot
       end.freeze
     end
 
+    # @param outcome [Symbol] terminal adapter outcome
+    # @param reason [String] stable machine-readable reason
+    # @return [Hash] immutable retreat result
     def result(outcome, reason)
       { outcome: outcome, sends: @sends || 0, reason: reason }.freeze
     end
@@ -2997,6 +3113,12 @@ class Bigshot
       @sends = 0
     end
 
+    # Performs at most one bounded room-cleanup step.
+    #
+    # @param snapshot [Hash] current room/corpse/loot observation
+    # @param attacked_ids [Array<String>] targets engaged by this run
+    # @param dispatch [#call] guarded eLoot command adapter
+    # @return [Hash] cleanup progress or terminal outcome
     def call(snapshot:, attacked_ids:, dispatch:)
       return { outcome: :complete } if @mode == 'off' || (!@looter.empty? && !@looter.casecmp?(@character))
       return { outcome: :complete } if snapshot.fetch(:targets, []).any? { |target| target[:hostile] == true && !target[:dead] }
@@ -3056,6 +3178,7 @@ class Bigshot
       @steps, @sends, @visited = 0, 0, Hash.new(0)
     end
 
+    # @return [Hash] immutable bounded search status
     def status
       { steps: @steps, sends: @sends, max_steps: @max_steps, max_seconds: @max_seconds,
         started_at: @started, reason: @reason, phase: @phase, error: @error }.freeze
@@ -3085,10 +3208,20 @@ class Bigshot
 
       @phase = :movement
       @owner.with_execution_guard(lambda { |wire|
-        observe!(checkpoint)
+        begin
+          observe!(checkpoint)
+        rescue StandardError
+          next false
+        end
+        if !wire.nil? && (wire != "#{@prefix}#{@direction}" || @sent)
+          @reason ||= 'seek_command_denied'
+          next false
+        end
+        if !wire.nil? && @sends >= @max_steps
+          @reason ||= 'seek_step_limit'
+          next false
+        end
         unless wire.nil?
-          fail!('seek_command_denied') unless wire == "#{@prefix}#{@direction}" && !@sent
-          fail!('seek_step_limit') if @sends >= @max_steps
           @sends += 1
           @sent = true
         end
@@ -3211,12 +3344,18 @@ class Bigshot
       cache_status
     end
 
+    # Reads the immutable cached status without touching game state.
+    #
+    # @return [Hash] latest run status
     def status
       @mutex.synchronize { @cached_status }
     end
 
     # The exact supervisor installs only a cached observation predicate. It
     # cannot extend the immutable launch window or activate this run twice.
+    #
+    # @param valid [Proc] current authority predicate
+    # @return [Boolean] whether activation was accepted
     def activate_supervised(valid:)
       return false unless valid.is_a?(Proc)
       @mutex.synchronize do
@@ -3274,6 +3413,10 @@ class Bigshot
 
     # Optional authority predicate is evaluated on the owner thread when the
     # queued operation is applied, never on the caller or under the mailbox lock.
+    #
+    # @param action [String, Symbol] control name
+    # @param valid [Proc, nil] optional authority predicate
+    # @return [Hash] immutable acknowledgement and cached status
     def request(action, valid: nil)
       name = action.to_s.dup
       @mutex.synchronize do
@@ -3291,6 +3434,9 @@ class Bigshot
     # Human selection uses the same owner mailbox, not an extra LAB capability.
     # Pin the last displayed scene at receipt and revalidate on the owner thread.
     # Never grant an old click/command permission in a different room.
+    #
+    # @param target_id [String, Integer] positive creature ID
+    # @return [Hash] immutable acknowledgement and cached status
     def request_engagement(target_id)
       id = target_id.to_s
       @mutex.synchronize do
@@ -3313,6 +3459,9 @@ class Bigshot
       end
     end
 
+    # Applies queued controls and advances at most one owner-thread operation.
+    #
+    # @return [Hash] immutable status after the operation
     def tick
       assert_owner_thread!
       drain_controls
@@ -3333,6 +3482,9 @@ class Bigshot
       cache_status
     end
 
+    # Closes the mailbox and records an incomplete outing as failed.
+    #
+    # @return [Hash] immutable final status
     def close
       assert_owner_thread!
       @mutex.synchronize { @mailbox.clear; @closed = true }
@@ -3383,6 +3535,7 @@ class Bigshot
       snapshot[:loot_sends] = @loot.sends if @loot
       snapshot[:loot_recovery] = @loot_recovery if @loot_recovery
       snapshot[:control_error] = @control_error if @control_error
+      snapshot[:error] = @execution_error if @execution_error
       snapshot[:area] = @area_state if @area
       snapshot[:search] = @seek.status if @seek
       snapshot[:execution_window] = @mutex.synchronize { @execution_window } if @execution_window
@@ -3498,6 +3651,7 @@ class Bigshot
     end
 
     def outing_outbound
+      diagnose("refuge outbound started: room=#{@refuge_origin[:room_id]}")
       observed = outing_checkpoint
       unless observed.slice(:session, :room_id, :room_epoch) == @refuge_origin && observed[:stable] == true
         @controller.finish(:stopped, 'refuge_start_changed')
@@ -3505,6 +3659,7 @@ class Bigshot
         return cache_status
       end
       result = @refuge[:outbound].call { outing_checkpoint }
+      diagnose("refuge outbound result: #{result}")
       @outbound_sends = result[:sends].is_a?(Integer) && result[:sends] >= 0 ? result[:sends] : nil
       @outbound_reason = result[:reason]
       if result[:outcome] == :retreated && !@outing_finish_requested
@@ -3522,6 +3677,7 @@ class Bigshot
     end
 
     def finish_outing
+      diagnose("refuge recovery started: work=#{@controller.status.slice(:state, :reason, :actions, :sends)}")
       @work_result ||= EncounterPolicy.immutable_copy(@controller.status)
       @outing_phase = 'recovering'
       cache_status
@@ -3550,6 +3706,7 @@ class Bigshot
       @outing_phase = 'returning'
       cache_status
       result = @refuge[:return_walk].call { outing_checkpoint }
+      diagnose("refuge return result: #{result}")
       @return_sends = result[:sends].is_a?(Integer) && result[:sends] >= 0 ? result[:sends] : nil
       @return_reason = result[:reason]
       observed = outing_checkpoint
@@ -3566,11 +3723,13 @@ class Bigshot
     end
 
     def finish_refuge_failure(reason)
+      diagnose("refuge failed: #{reason}")
       @outing_phase = 'finished'
       @controller.finish(:stopped, reason)
     end
 
     def execute_retreat
+      diagnose('retreat requested')
       return :unconfirmed if @inside_dispatch || @owner.execution_guard_active?
       observed = run_snapshot
       return :unconfirmed unless observed[:owner] && observed[:connected]
@@ -3586,6 +3745,7 @@ class Bigshot
       # Ongoing authority revocation is delivered as an explicit stop control.
       @pending_retreat_valid = nil
       result = @retreat.call { retreat_checkpoint }
+      diagnose("retreat result: #{result}")
       if result.is_a?(Hash)
         @escape_sends = (@escape_sends || 0) + result.fetch(:sends, 0)
         @escape_reason = result[:reason]
@@ -3617,12 +3777,14 @@ class Bigshot
     end
 
     def seek_step(snapshot)
-      @engine.quick_seek_execute(@seek, snapshot: snapshot, owner: @owner) do
+      result = @engine.quick_seek_execute(@seek, snapshot: snapshot, owner: @owner) do
         drain_controls
         fresh = run_snapshot
         eligible = fresh.fetch(:targets, []).any? { |target| @policy.eligible?(target) }
         fresh.merge(control: @controller.state, eligible_target: eligible, operation_expired: execution_window_expired)
       end
+      diagnose("seek step: #{result} status=#{@seek.status}")
+      result
     end
 
     def dispatch_loot(command:, snapshot:, max_actions:, max_seconds:)
@@ -3735,12 +3897,33 @@ class Bigshot
       @inside_dispatch = true
       @engine.quick_execute(command, target, guard: @active_guard, owner: @owner, prefix: @prefix)
     rescue QuickGuard::Interrupted => error
+      diagnose("command interrupted: target=#{target_id} command=#{command.inspect} reason=#{error.reason}", category: :commands)
       { outcome: :interrupted, sends: @active_guard ? @active_guard.sends : 0, reason: error.reason }
-    rescue StandardError
+    rescue StandardError => error
+      @execution_error = EncounterPolicy.immutable_copy(
+        class: error.class.name.to_s,
+        message: error.message.to_s,
+        location: File.basename(Array(error.backtrace).first.to_s)
+      )
+      diagnose("command error: target=#{target_id} command=#{command.inspect} error=#{@execution_error}", category: :commands)
       { outcome: :interrupted, sends: @active_guard ? @active_guard.sends : 0, reason: 'execution_error' }
     ensure
       @inside_dispatch = false
       @active_guard = nil
+    end
+
+    # Emits optional Quick diagnostics without affecting combat outcomes.
+    #
+    # @param message [String] diagnostic detail
+    # @param category [Symbol] existing Bigshot debug category
+    # @return [void]
+    def diagnose(message, category: :system)
+      return unless @engine.respond_to?(:debug_msg)
+
+      flag = @engine.instance_variable_get("@DEBUG_#{category.to_s.upcase}")
+      @engine.debug_msg(flag, "Quick Combat #{message}")
+    rescue StandardError
+      nil
     end
   end
 
@@ -5699,8 +5882,14 @@ class Bigshot
     #
     # @return [void]
     def on_close_clicked
-      return if @encounter_settings && !save_encounter_form
-      return if @encounter_settings && !save_quick_trial(allow_empty: true)
+      if @encounter_settings && !save_encounter_form
+        show_encounter_validation_error
+        return
+      end
+      if @encounter_settings && !save_quick_trial(allow_empty: true)
+        show_encounter_validation_error
+        return
+      end
 
       pre_save
       UserVars.op = @settings
@@ -5710,6 +5899,56 @@ class Bigshot
       Lich::Messaging.msg('plain', " Bigshot UI closed, saving any changes")
 
       self['main'].destroy
+    end
+
+    # Keeps validation failures visible when Setup closes from another tab.
+    #
+    # @return [void]
+    def show_encounter_validation_error
+      self['bigshot_notebook'].page = @encounter_page if @encounter_page
+      message = @encounter_message&.text.to_s
+      Lich::Messaging.msg('error', " Bigshot Quick Combat settings were not saved: #{message}") unless message.empty?
+    end
+
+    # Plain-language hover help for every Quick preset field.
+    #
+    # @return [Hash{String=>String}] field names and tooltip text
+    def quick_field_tooltips
+      {
+        'profile'              => 'Choose the existing Bigshot combat profile that supplies creatures, attack routines, safety limits, and hunting rooms. Leave blank to use the currently selected profile.',
+        'mode'                 => 'Choose what Quick does by default: clear this room, watch for arrivals, assist group attacks, run a named trial, or seek one encounter inside the profile area.',
+        'area'                 => 'Profile requires Quick to start inside the selected hunting area and obey its boundary rooms. Off limits Quick to the current room unless you explicitly start seek mode.',
+        'trigger'              => 'Choose when combat may begin: immediately, after the selected leader attacks, or after any verified group member attacks.',
+        'leader'               => 'Enter the group member whose observed attack permits Quick to assist. This is required when the engagement trigger is leader.',
+        'targeting'            => 'Assist only attacks the creature your group engaged. Assist then cleanup may continue against other eligible creatures after that target dies.',
+        'unknown'              => 'Choose how Quick handles a creature missing from the combat profile: ignore it, wait for a manual quick engage command, or attack it only after a verified group member does.',
+        'fallback_commands'    => 'Commands to use against admitted unknown creatures when no creature-specific routine exists. Enter the same target-aware combat commands used by a Bigshot profile.',
+        'excluded_creatures'   => 'Comma-separated creature name patterns Quick must never attack, even when unknown-creature handling would otherwise allow it.',
+        'max_actions'          => 'Maximum combat commands Quick may send for one target. In a named trial, this limits the entire trial run.',
+        'max_seconds'          => 'Maximum seconds Quick may spend on one target. In a named trial, this limits the entire trial run.',
+        'max_ineffective'      => 'Number of verified ineffective combat actions allowed against one target before Quick holds or retreats.',
+        'ineffective_action'   => 'Choose whether Quick pauses for your decision or performs its configured retreat after too many verified ineffective actions.',
+        'loot'                 => 'Choose no cleanup, eLoot only bodies Quick killed, or eLoot the whole room. Quick waits for the bounded eLoot pass to finish before continuing.',
+        'looter'               => 'Name the group member responsible for looting. Leave blank to make this character the designated looter.',
+        'loot_max_actions'     => 'Maximum commands the bounded eLoot room pass may send, including setup and recovery commands.',
+        'loot_max_seconds'     => 'Maximum seconds the bounded eLoot room pass may run before Quick stops it safely.',
+        'safety_action'        => 'Choose whether Quick holds in place or retreats when the selected combat profile reports a safety threshold.',
+        'retreat_command'      => 'Choose 130 or walk for an emergency retreat. Leave blank to disable automatic retreat; actions configured as retreat will then fail closed.',
+        'retreat_destinations' => 'Comma-separated safe room IDs or uIDs that Quick may verify as retreat destinations. Leave blank to use the combat profile resting room.'
+      }
+    end
+
+    # Plain-language hover help for every named-trial field.
+    #
+    # @return [Hash{String=>String}] trial field names and tooltip text
+    def quick_trial_tooltips
+      {
+        'picker'      => 'Choose a previously saved named trial to load, edit, or delete.',
+        'name'        => 'Give this reusable test sequence a name containing letters, numbers, spaces, dashes, or underscores.',
+        'commands'    => 'Enter one Bigshot combat command per line. Start the trial with an explicit target ID; fixed or implicit targets are rejected.',
+        'max_actions' => 'Optionally limit total combat commands for this trial. Leave blank to inherit the selected Quick preset limit.',
+        'max_seconds' => 'Optionally limit total runtime for this trial. Leave blank to inherit the selected Quick preset limit.'
+      }
     end
 
     # Quick settings are separate from the normal hunt profile. Runtime admission
@@ -5731,6 +5970,8 @@ class Bigshot
 
       @encounter_presets = Gtk::ComboBoxText.new
       @encounter_name = Gtk::Entry.new
+      @encounter_presets.tooltip_text = 'Choose a saved Quick Combat preset to load, edit, or delete.'
+      @encounter_name.tooltip_text = 'Name this reusable Quick Combat setup with letters, numbers, spaces, dashes, or underscores.'
       grid.attach(Gtk::Label.new('Saved Quick Combat preset'), 0, 1, 1, 1)
       grid.attach(@encounter_presets, 1, 1, 1, 1)
       grid.attach(Gtk::Label.new('Preset name'), 0, 2, 1, 1)
@@ -5739,6 +5980,12 @@ class Bigshot
       { 'Load' => :load_encounter_preset, 'New' => :new_encounter_preset,
         'Save preset' => :save_encounter_form, 'Delete' => :delete_encounter_preset }.each do |label, handler|
         button = Gtk::Button.new(label: label)
+        button.tooltip_text = {
+          'Load'        => 'Load the selected Quick preset into the editor.',
+          'New'         => 'Reset the editor to safe defaults for a new Quick preset.',
+          'Save preset' => 'Validate and stage this Quick preset. Click Close to save staged changes for this character.',
+          'Delete'      => 'Stage deletion of the selected Quick preset. Click Close to save the deletion.'
+        }.fetch(label)
         button.signal_connect('clicked') { send(handler) }
         buttons.pack_start(button, expand: false, fill: false, padding: 0)
       end
@@ -5768,9 +6015,11 @@ class Bigshot
           field = Gtk::Entry.new
         end
         field.hexpand = true
+        field.tooltip_text = quick_field_tooltips.fetch(key)
         @encounter_fields[key] = field
         caption = Gtk::Label.new(label)
         caption.xalign = 0
+        caption.tooltip_text = field.tooltip_text
         grid.attach(caption, 0, index + 4, 1, 1)
         grid.attach(field, 1, index + 4, 1, 1)
       end
@@ -5781,7 +6030,9 @@ class Bigshot
       build_quick_trial_editor(grid, labels.length + 5)
       scroll = Gtk::ScrolledWindow.new
       scroll.add(grid)
-      self['bigshot_notebook'].append_page(scroll, Gtk::Label.new('Quick Combat'))
+      notebook = self['bigshot_notebook']
+      @encounter_page = notebook.n_pages
+      notebook.append_page(scroll, Gtk::Label.new('Quick Combat'))
       refresh_encounter_presets
       show_encounter_preset(@encounter_settings.selected)
     rescue ArgumentError => error
@@ -5809,6 +6060,10 @@ class Bigshot
       @quick_trial_max_actions = Gtk::Entry.new
       @quick_trial_max_seconds = Gtk::Entry.new
       {
+        'picker' => @quick_trial_picker, 'name' => @quick_trial_name, 'commands' => @quick_trial_commands,
+        'max_actions' => @quick_trial_max_actions, 'max_seconds' => @quick_trial_max_seconds
+      }.each { |key, field| field.tooltip_text = quick_trial_tooltips.fetch(key) }
+      {
         'Saved trial' => @quick_trial_picker, 'Trial name' => @quick_trial_name,
         'Commands (one per line)' => @quick_trial_commands,
         'Trial maximum actions (blank = preset)' => @quick_trial_max_actions,
@@ -5817,6 +6072,7 @@ class Bigshot
         field.hexpand = true
         caption = Gtk::Label.new(label)
         caption.xalign = 0
+        caption.tooltip_text = field.tooltip_text
         grid.attach(caption, 0, row + index + 1, 1, 1)
         grid.attach(field, 1, row + index + 1, 1, 1)
       end
@@ -5824,6 +6080,12 @@ class Bigshot
       { 'Load trial' => :load_quick_trial, 'New trial' => :new_quick_trial,
         'Save trial' => :save_quick_trial, 'Delete trial' => :delete_quick_trial }.each do |label, handler|
         button = Gtk::Button.new(label: label)
+        button.tooltip_text = {
+          'Load trial'   => 'Load the selected trial into the editor.',
+          'New trial'    => 'Clear the trial editor for a new test sequence.',
+          'Save trial'   => 'Validate and stage this trial. Click Close to save staged changes for this character.',
+          'Delete trial' => 'Stage deletion of the selected trial. Click Close to save the deletion.'
+        }.fetch(label)
         button.signal_connect('clicked') { send(handler) }
         buttons.pack_start(button, expand: false, fill: false, padding: 0)
       end
@@ -6979,7 +7241,7 @@ class Bigshot
 
     instance_variable_set("@CORRECT_PERCENT_MIND", @quick_profile ? Lich::Gemstone::Experience.percent_fxp : check_mind)
 
-    @TRACKING_CREATURE = options[0].gsub(/(solo|bounty|quick|single|head|tail)\s*/i, '').strip
+    @TRACKING_CREATURE = options[0].gsub(/(solo|bounty|quick|single|once|head|tail)\s*/i, '').strip
     @BANDIT_NOUN_REGEX = /bandit|brigand|robber|thug|thief|rogue|outlaw|mugger|marauder|highwayman/i
 
     @DAGGER_REGEX = /alfange|basilard|bodkin|cinquedea|dagger|dirk|knife|kozuka|ice pick|misericord|parazonium|pavade|poignard|pugio|scramasax|sgian achlais|spike|stiletto|tanto|sidearm-of-Onar/i
@@ -10631,12 +10893,12 @@ class Bigshot
       unless seconds.is_a?(Numeric) && seconds.finite? && seconds >= 0
         raise ArgumentError, 'Quick swing wait requires finite nonnegative seconds'
       end
-      raise QuickGuard::Interrupted, 'swing_target_missing' unless target && target.id.to_s.match?(/\A[1-9]\d*\z/)
+      @quick_guard.interrupt!('swing_target_missing') unless target && target.id.to_s.match?(/\A[1-9]\d*\z/)
 
       owner = Script.current
       unless owner && owner.respond_to?(:execution_guard_active?) && owner.execution_guard_active? &&
              defined?(Lich::Gemstone::Combat::Parser) && defined?(Lich::Gemstone::Combat::Definitions::Attacks::ATTACK_LOOKUP)
-        raise QuickGuard::Interrupted, 'swing_observation_unavailable'
+        @quick_guard.interrupt!('swing_observation_unavailable')
       end
       parser = Lich::Gemstone::Combat::Parser
       target_id = target.id.to_s
@@ -12287,7 +12549,10 @@ class Bigshot
 
     begin
       @quick_seek_owner = owner
-      seek.call(snapshot: snapshot, &checkpoint)
+      debug_msg(@DEBUG_SYSTEM, "Quick Combat seek start: #{seek.status}") if respond_to?(:debug_msg, true) && seek.respond_to?(:status)
+      result = seek.call(snapshot: snapshot, &checkpoint)
+      debug_msg(@DEBUG_SYSTEM, "Quick Combat seek finish: result=#{result} status=#{seek.status}") if respond_to?(:debug_msg, true) && seek.respond_to?(:status)
+      result
     ensure
       @quick_seek_owner = nil
     end

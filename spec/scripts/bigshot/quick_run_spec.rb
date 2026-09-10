@@ -333,6 +333,13 @@ RSpec.describe BigshotQuickRunSpec::QuickRun do
       raise 'unconfirmed helper failure'
     end
     expect(run.tick).to include(state: :held, reason: 'execution_error', actions: 3)
+    expect(run.status[:error]).to include(class: 'RuntimeError', message: 'unconfirmed helper failure')
+    expect(run.status[:error][:location]).to match(/quick_run_spec\.rb:/)
+  end
+
+  it 'handles a bare interrupted adapter result without masking it as a dispatch error' do
+    allow(engine).to receive(:quick_execute).and_return(:interrupted)
+    expect(run.tick).to include(state: :held, reason: 'dispatch_interrupted', actions: 1)
   end
 
   it 'does not report an empty room clear when disconnected or ownership is missing' do

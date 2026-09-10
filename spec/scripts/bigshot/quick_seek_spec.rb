@@ -4,6 +4,8 @@ require_relative '../../support/bigshot_quick_run_harness'
 
 module BigshotQuickSeekSpec
   class Owner
+    attr_reader :policy_results
+
     def execution_guard_active? = !@guard.nil?
 
     def with_execution_guard(guard)
@@ -18,7 +20,8 @@ module BigshotQuickSeekSpec
     end
 
     def check_execution_guard!(command: nil)
-      raise 'denied' unless @guard.call(command)
+      (@policy_results ||= []) << @guard.call(command)
+      raise 'denied' unless @policy_results.last
     end
 
     def execution_sleep(_seconds)
@@ -109,6 +112,7 @@ RSpec.describe BigshotQuickRunSpec::QuickSeek do
         owner.check_execution_guard!(command: ">#{extra}")
       })
       expect(seeker.call(snapshot: snapshot.dup) { snapshot.dup }).to include(outcome: :interrupted, reason: 'seek_command_denied')
+      expect(owner.policy_results).to include(false) if owner.policy_results
       expect(seeker.status[:sends]).to eq(1)
     end
   end

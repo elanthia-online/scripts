@@ -7,6 +7,19 @@ module BigshotQuickSwingWaitSpec
       class Interrupted < StandardError; end
     end
 
+    class Guard
+      attr_reader :deadline, :reason
+
+      def initialize(deadline)
+        @deadline = deadline
+      end
+
+      def interrupt!(reason)
+        @reason ||= reason
+        raise QuickGuard::Interrupted, @reason
+      end
+    end
+
     module Script
       class << self
         attr_accessor :current
@@ -92,7 +105,7 @@ module BigshotQuickSwingWaitSpec
 
     def initialize(deadline)
       @quick_native_scope = true
-      @quick_guard = Struct.new(:deadline).new(deadline)
+      @quick_guard = Guard.new(deadline)
       @WANDER_STANCE = 'defensive'
       @stances = []
     end
@@ -108,7 +121,10 @@ module BigshotQuickSwingWaitSpec
       @stances << values
     end
 
-    class_eval(SOURCE[/^  def wait_for_swing\(seconds, target = nil\)\n.*?^  end$/m])
+    wait_source = SOURCE[/^  def wait_for_swing\(seconds, target = nil\)\n.*?^  end$/m]
+    raise 'could not extract wait_for_swing' unless wait_source
+
+    class_eval(wait_source)
   end
 end
 
@@ -199,6 +215,13 @@ RSpec.describe BigshotQuickSwingWaitSpec::Harness do
     expect { subject.wait_for_swing(-1, target) }.to raise_error(ArgumentError)
     owner.active = false
     expect { subject.wait_for_swing(5, target) }.to raise_error(described_class::QuickGuard::Interrupted, 'swing_observation_unavailable')
+    expect(subject.instance_variable_get(:@quick_guard).reason).to eq('swing_observation_unavailable')
     expect([owner.want_downstream, owner.want_downstream_xml]).to eq([true, false])
+  end
+
+  it 'latches a missing target through the active guard' do
+    install_owner
+    expect { subject.wait_for_swing(5) }.to raise_error(described_class::QuickGuard::Interrupted, 'swing_target_missing')
+    expect(subject.instance_variable_get(:@quick_guard).reason).to eq('swing_target_missing')
   end
 end

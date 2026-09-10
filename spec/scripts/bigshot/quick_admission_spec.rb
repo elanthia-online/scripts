@@ -20,17 +20,17 @@ module BigshotQuickAdmissionSpec
 end
 
 RSpec.describe 'Quick Combat admission gate' do
-  it 'defers every nonlegacy tail, including typos, to the strict extended parser' do
-    %w[clear watch assist trial status hold resume stop retreat help --profile --preset clera].each do |command|
+  it 'defers recognized extended verbs and flags to the strict parser' do
+    %w[clear watch assist trial seek status hold resume stop retreat help engage --profile --preset].each do |command|
       expect(BigshotQuickAdmissionSpec.run('quick', command)).to eq([:extended, []])
     end
     expect(BigshotQuickAdmissionSpec.run('QUICK', 'CLEAR').first).to eq(:extended)
-    expect(BigshotQuickAdmissionSpec.run('quick', 'once', 'extra').first).to eq(:extended)
     expect(BigshotQuickAdmissionSpec.run('encounter', 'clear').first).to eq(:stopped)
   end
 
-  it 'does not change normal hunting, bare quick, or existing quick once handling' do
-    [[], ['quick'], %w[quick once], %w[quick single], ['solo'], ['setup'], ['help'], ['head'], ['tail']].each do |args|
+  it 'does not change normal hunting or historical permissive quick arguments' do
+    [[], ['quick'], %w[quick once], %w[quick single], %w[quick bounty], %w[quick giant rat],
+     %w[quick solo], %w[quick once bounty], %w[quick clera], ['solo'], ['setup'], ['help'], ['head'], ['tail']].each do |args|
       expect(BigshotQuickAdmissionSpec.run(*args)).to eq([:legacy, []])
     end
   end

@@ -8,7 +8,10 @@ module BigshotEncounterSettingsSpec
 
   module Harness
     module_eval(SETTINGS_SOURCE)
-    module_eval(SOURCE[/^  class QuickRequest\n.*?^  end$/m])
+    request_source = SOURCE[/^  class QuickRequest\n.*?^  end$/m]
+    raise 'QuickRequest source missing' unless request_source
+
+    module_eval(request_source)
   end
 end
 
@@ -122,13 +125,21 @@ module BigshotEncounterSettingsSpec
     UserVars = Struct.new(:op).new({ 'profile_current' => 'ordinary' })
     module Lich
       module Messaging
-        def self.msg(*); end
+        class << self
+          attr_accessor :messages
+
+          def msg(_style, message)
+            self.messages ||= []
+            messages << message
+          end
+        end
       end
     end
 
     module Gtk
       class Widget
-        attr_accessor :wrap, :xalign, :hexpand, :row_spacing, :column_spacing, :margin, :text, :active_id, :height_request
+        attr_accessor :wrap, :xalign, :hexpand, :row_spacing, :column_spacing, :margin, :text, :active_id, :height_request,
+                      :tooltip_text
         attr_reader :children
 
         def initialize(text = nil, *)
@@ -159,7 +170,7 @@ module BigshotEncounterSettingsSpec
       %i[Label Grid ComboBoxText Entry Box Button ScrolledWindow TextView].each { |name| const_set(name, Class.new(Widget)) }
     end
     Field = Struct.new(:text, :active_id)
-    Window = Struct.new(:destroyed) do
+    Window = Struct.new(:destroyed, :page) do
       def destroy
         self.destroyed = true
       end
@@ -171,6 +182,10 @@ module BigshotEncounterSettingsSpec
 
       def pages
         @pages || []
+      end
+
+      def n_pages
+        pages.length
       end
     end
     attr_reader :window, :encounter_settings, :encounter_fields, :encounter_message
@@ -185,6 +200,7 @@ module BigshotEncounterSettingsSpec
       end
       @settings = UserVars.op.dup
       @window = Window.new(false)
+      Lich::Messaging.messages = []
       CharSettings.clear
     end
 
@@ -195,9 +211,13 @@ module BigshotEncounterSettingsSpec
       @window
     end
 
-    %w[save_encounter_form on_close_clicked build_encounter_tab show_encounter_preset
+    %w[save_encounter_form on_close_clicked show_encounter_validation_error quick_field_tooltips quick_trial_tooltips
+       build_encounter_tab show_encounter_preset
        build_quick_trial_editor refresh_quick_trials new_quick_trial load_quick_trial save_quick_trial delete_quick_trial].each do |name|
-      class_eval(SOURCE[/^    def #{name}(?:\n|\().*?^    end$/m])
+      body = SOURCE[/^    def #{name}(?:\n|\().*?^    end$/m]
+      raise "could not extract Setup##{name}" unless body
+
+      class_eval(body)
     end
   end
 end
@@ -220,6 +240,25 @@ RSpec.describe BigshotEncounterSettingsSpec::EditorHarness do
     )
     expect(labels.first).to start_with('Quick Combat requires Lich execution guard support. Existing bare quick is unchanged.')
     expect(labels).to include('Designated looter (blank = this character)')
+  end
+
+  it 'explains every Quick preset and trial field with a plain-language hover tooltip' do
+    editor = described_class.new
+    editor.build_encounter_tab
+
+    preset_widgets = [
+      editor.instance_variable_get(:@encounter_presets),
+      editor.instance_variable_get(:@encounter_name),
+      *editor.encounter_fields.values
+    ]
+    trial_widgets = %w[picker name commands max_actions max_seconds].map { |name| trial_widget(editor, name) }
+    (preset_widgets + trial_widgets).each do |widget|
+      expect(widget.tooltip_text).to be_a(String)
+      expect(widget.tooltip_text.strip.length).to be >= 20
+    end
+    expect(editor.encounter_fields['unknown'].tooltip_text).to include('creature')
+    expect(editor.encounter_fields['retreat_command'].tooltip_text).to include('130')
+    expect(editor.encounter_fields['loot'].tooltip_text).to include('eLoot')
   end
 
   it 'stages preset edits and only persists them on Close, preserving the combat profile' do
@@ -288,6 +327,8 @@ RSpec.describe BigshotEncounterSettingsSpec::EditorHarness do
     trial_widget(editor, 'max_seconds').text = '0'
     editor.on_close_clicked
     expect(editor.encounter_message.text).to include('Trial max_seconds must be a positive whole number')
+    expect(editor.window.page).to eq(editor.window.pages.length - 1)
+    expect(described_class::Lich::Messaging.messages.last).to include('Trial max_seconds must be a positive whole number')
     expect(editor.window.destroyed).to eq(false)
     expect(described_class::CharSettings).to be_empty
     expect(editor.encounter_settings.trial_names).to be_empty

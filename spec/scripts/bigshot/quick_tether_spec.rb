@@ -7,9 +7,54 @@ require 'rbconfig'
 # Source-extracted actual cmd/cmd_tether, native Spell/Script and Game transport.
 # Only character state and socket responses are synthetic; no live connection.
 module BigshotQuickTetherSpec
-  source = File.read(File.expand_path('../../../scripts/bigshot.lic', __dir__)).gsub("\r\n", "\n")
+  SOURCE = File.read(File.expand_path('../../../scripts/bigshot.lic', __dir__)).gsub("\r\n", "\n")
   class Admission; end
-  Admission.class_eval(source[/^    def self.command_supported!\(command\)\n.*?^    end$/m])
+  admission_source = SOURCE[/^    def self.command_supported!\(command\)\n.*?^    end$/m]
+  raise 'could not extract command_supported!' unless admission_source
+
+  Admission.class_eval(admission_source)
+
+  class LegacyTetherHarness
+    class Spell706
+      attr_reader :casts
+
+      def initialize
+        @casts = 0
+      end
+
+      def known? = true
+      def affordable? = true
+
+      def force_incant(*)
+        @casts += 1
+        'The tenebrous chains dissolve into black mist.'
+      end
+    end
+
+    TETHER_SPELL = Spell706.new
+    Spell = Object.new
+    Spell.define_singleton_method(:[]) { |number| number == 706 ? TETHER_SPELL : nil }
+
+    def initialize
+      @quick_native_scope = false
+    end
+
+    def debug_msg(*); end
+    def dead_or_gone?(*) = false
+    def still_targetable?(*) = true
+    def waitrt?; end
+    def waitcastrt?; end
+    def get = nil
+    def should_flee? = true
+    def standing? = true
+    def stand; end
+    def sleep(*); end
+
+    tether_source = BigshotQuickTetherSpec::SOURCE[/^  def cmd_tether\(npc, recast_on_transfer = false\)\n.*?^  end$/m]
+    raise 'could not extract cmd_tether' unless tether_source
+
+    class_eval(tether_source)
+  end
 
   PROBE = <<~'RUBY'
     require 'json'
@@ -175,6 +220,16 @@ RSpec.describe 'Quick plain tether admission' do
   end
 end
 
+RSpec.describe 'Legacy tether helper' do
+  it 'keeps the ordinary non-Quick cast path executable without native guard support' do
+    target = Struct.new(:id).new('123')
+    spell = BigshotQuickTetherSpec::LegacyTetherHarness::TETHER_SPELL
+    before = spell.casts
+    BigshotQuickTetherSpec::LegacyTetherHarness.new.cmd_tether(target)
+    expect(spell.casts).to eq(before + 1)
+  end
+end
+
 RSpec.describe 'Quick plain tether through native Spell and owner-thread completion' do
   before { skip 'Set LICH_EXECUTION_GUARD_ROOT for native tether integration' unless ENV['LICH_EXECUTION_GUARD_ROOT'] }
 
@@ -214,9 +269,5 @@ RSpec.describe 'Quick plain tether through native Spell and owner-thread complet
   it 'keeps ineligible skips silent and refuses recast before any sends' do
     %w[unknown unaffordable].each { |scenario| expect(probe(scenario)).to include('writes' => [], 'sends' => 0) }
     expect(probe('recast')).to include('writes' => [], 'reason' => 'tether_recast_unsupported')
-  end
-
-  it 'leaves the ordinary helper cast path without a new target selection' do
-    expect(probe('legacy')).to include('writes' => ['<c>incant 706'], 'casts' => 1, 'reason' => nil)
   end
 end

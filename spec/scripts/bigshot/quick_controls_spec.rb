@@ -58,14 +58,21 @@ module BigshotQuickControlsSpec
 
   class Engine
     include QuickExecution
-    attr_reader :messages
+    attr_reader :messages, :debug_messages
 
     def initialize
       @messages = []
+      @debug_messages = []
+      @DEBUG_SYSTEM = :system
+      @DEBUG_COMMANDS = :commands
     end
 
     def respond(message)
       @messages << message
+    end
+
+    def debug_msg(type, message)
+      @debug_messages << [type, message]
     end
   end
 end
@@ -103,6 +110,17 @@ RSpec.describe 'Bigshot scoped Quick client controls' do
     expect(engine.messages.last).to include('running', 'target 123', 'actions 2')
     expect(engine.messages.last).not_to include('queued')
     expect(hooks.registrations.last.last).to be(false)
+  end
+
+  it 'surfaces recent observation and execution error diagnostics on explicit status' do
+    diagnostic = cached.merge(
+      observations: [{ sequence: 7, command: 'attack target', outcome: :interrupted, reason: 'execution_error' }],
+      error: { class: 'RuntimeError', message: 'adapter failed', location: 'adapter.rb:42' }
+    ).freeze
+    allow(run).to receive(:request).with('status').and_return(accepted: true, status: diagnostic)
+    scoped { expect(hooks.run(';bigshot quick status')).to be_nil }
+    expect(engine.messages.last).to include('recent #7 attack target=interrupted/execution_error')
+    expect(engine.messages.last).to include('error RuntimeError: adapter failed at adapter.rb:42')
   end
 
   it 'matches literal custom prefixes and owner names containing regex characters' do
@@ -193,6 +211,8 @@ RSpec.describe 'Bigshot scoped Quick client controls' do
       expect(engine.messages.grep(/Quick Combat held:/)).to eq(['Quick Combat held: manual_hold (0 combat sends, 0 loot sends).'])
       expect(hooks.hooks).to be_empty
       expect(run.request('resume')).to include(accepted: false, reason: 'run_closed')
+      expect(engine.debug_messages).to include([:system, a_string_including('Quick Combat lifecycle started')],
+                                               [:system, a_string_including('Quick Combat lifecycle finished')])
     end
 
     it 'cleans up its hook and lifecycle when the event pump fails' do
