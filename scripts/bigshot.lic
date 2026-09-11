@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.15.4
+       version: 5.16.0
       required: Lich >= 5.19.0
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -428,6 +428,110 @@ if Gem::Version.new(LICH_VERSION) < Gem::Version.new(lich_gem_requires)
     _respond "##" + "########################################"
   end
   exit
+end
+
+# Creature / Combat::Tracker (Lich::Gemstone, requires Lich >= 5.19.0 - already
+# enforced by the version gate above, so no separate respond_to? guard needed).
+# See: https://github.com/elanthia-online/lich-5/wiki/Gemstone-IV-Creature-&-Combat-Module-Guide
+Creature = Lich::Gemstone::Creature unless defined?(Creature)
+Combat   = Lich::Gemstone::Combat   unless defined?(Combat)
+
+# GameObj -> Creature/Combat migration adapter.
+#
+# Wraps a Lich::Gemstone::Creature::CreatureInstance so bigshot's many
+# cmd_* methods, which read .status/.type/.id in the GameObj shape, keep
+# working while the room-creature source of truth comes from Creature.targets/
+# Creature.in_room (the room roster) instead of the (stale-prone) GameObj
+# selected-target list.
+#
+# Most .status-string command checks and the ubiquitous dead/gone liveness
+# check read .creature.crtr_flag?/.creature.has_status? directly (see
+# dead_or_gone?, npc_has_status?, npc_crtr_flag? below) rather than going
+# through this adapter's synthesized strings. New code should do the same.
+#
+# .status and .type are NOT temporary migration debt, though - they stay
+# GameObj-backed permanently, for reasons confirmed against the actual
+# lich-5 source rather than assumed:
+#   - .type (undead/noncorporeal/aggressive npc/companion/familiar/boon/
+#     escort/bandit classification) comes from GameObj's own @@type_data
+#     table (lib/common/gameobj.rb), a static noun/name regex lookup with
+#     no connection to the live <crtrStatus> feed at all. There is no
+#     Creature-module equivalent to migrate to.
+#   - .status is still the source of truth for "frozen"/"prone" and every
+#     other free-text state a regex against the room annotation can catch;
+#     nothing here reads those natively yet.
+class BigshotCreature
+  attr_reader :creature
+
+  # @param creature [Lich::Gemstone::Creature::CreatureInstance] the creature to wrap
+  def initialize(creature)
+    @creature = creature
+  end
+
+  # The matching GameObj entry for this creature, if the parser has indexed
+  # one under the same id. Both systems parse the same room feed, so this is
+  # normally present; nil only in the brief window where Creature has
+  # registered a creature GameObj has not indexed yet.
+  # @return [Lich::Common::GameObj, nil]
+  def gameobj
+    GameObj[id]
+  end
+
+  # @return [String] the creature id, normalized to String to match
+  #   XMLData.current_target_id and the GameObj-shaped ids used throughout
+  def id
+    creature.id.to_s
+  end
+
+  # @return [String] the creature's noun
+  def noun
+    creature.noun
+  end
+
+  # @return [String] the creature's full name
+  def name
+    creature.name
+  end
+
+  # Preserves the exact GameObj status string existing regex checks match
+  # against (e.g. npc.status =~ /dead|gone/, now largely replaced by
+  # dead_or_gone?(npc) - see the notes below). Falls back to a minimal
+  # synthesized string covering only the dead case if no matching GameObj
+  # entry exists yet, rather than raising. Does NOT synthesize "gone" from
+  # valid_target? - valid_target? is false whenever CreatureInstance#dead?
+  # is true, which (see the module-level migration notes) trusts a guessed
+  # max_hp against never-reset accumulated damage, not the game's own
+  # <crtrStatus> dead flag. Synthesizing "gone" from it would let a live
+  # creature be misreported as gone during the brief window before GameObj
+  # has indexed it, the exact failure mode this migration exists to avoid.
+  # @return [String, nil] GameObj's status string, or "dead" when no
+  #   matching GameObj entry exists yet and the live dead flag is set
+  def status
+    go = gameobj
+    return go.status if go
+
+    "dead" if creature.crtr_flag?(:dead)
+  end
+
+  # Preserves the exact GameObj type string (comma-separated classification
+  # tokens like "undead", "aggressive npc", "noncorporeal", "boon" - these
+  # are not all represented as crtrStatus flags, so GameObj remains the
+  # source of truth here). Falls back to the bestiary undead flag, the one
+  # classification also reachable off CreatureInstance directly, if no
+  # matching GameObj entry exists yet.
+  # @return [String] GameObj's comma-separated classification string, or the
+  #   bestiary undead flag alone when no GameObj entry exists yet
+  def type
+    go = gameobj
+    return go.type if go
+
+    creature.template&.undead ? "undead" : ""
+  end
+
+  # @return [String] the creature's name
+  def to_s
+    name
+  end
 end
 
 if UserVars
@@ -2711,6 +2815,11 @@ class Bigshot
     end
     debug_msg(@DEBUG_SYSTEM, "initialize | options: #{options}")
 
+    # Turn on Combat::Tracker so HP/wound/UCS data populates on Creature
+    # objects going forward. Persists per character - this is effectively a
+    # no-op after the first run for a given character.
+    Combat::Tracker.enable! unless Combat::Tracker.enabled?
+
     @followers = nil
     @event_stack = []
 
@@ -3257,11 +3366,17 @@ class Bigshot
     return result
   end
 
+  # Pulls downed players to their feet before engaging.
+  #
+  # Only acts when the +@PULL+ setting is on and there is something hostile in
+  # the room; a player who is merely sitting out of combat is left alone.
+  #
+  # @return [void]
   def check_for_deaders_prone
     debug_msg(@DEBUG_COMMANDS, "check_for_deaders_prone")
     return if GameObj.pcs.nil?
 
-    if @PULL && GameObj.targets.any? { |s| s.type =~ /aggressive npc/ }
+    if @PULL && bs_hostile_creatures.any?
       GameObj.pcs.each do |s|
         if s.status =~ /sitting|^lying|prone/ && s.status !~ /dead/
           fput "pull #{s.noun}"
@@ -3307,7 +3422,7 @@ class Bigshot
     if command.is_a?(Array)
       stance_dance = false if command.any? { |j| j =~ /stance/ }
       command.each do |i|
-        break if npc.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == npc.id }
+        break if dead_or_gone?(npc) || !still_targetable?(npc.id)
 
         debug_msg(@DEBUG_COMMANDS, "cmd | command array[i]: #{i}")
         cmd(i, npc, stance_dance)
@@ -3319,7 +3434,7 @@ class Bigshot
       command = command.gsub(/\bkick\b/i, "punch")
     end
 
-    $bigshot_dislodge_location = [] if npc.status =~ /dead|gone/
+    $bigshot_dislodge_location = [] if dead_or_gone?(npc)
 
     # waitrt/waitcastrt
     unless (command =~ /^nudgeweapons?|slipperymind/)
@@ -3524,11 +3639,17 @@ class Bigshot
     (Time.now - last) < seconds
   end
 
+  # Runs a command against every valid creature in the room, then restores
+  # the original target.
+  #
+  # @param command [String] the command definition
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the current target, restored afterward
+  # @return [void]
   def cmd_eachtarget(command, npc)
     debug_msg(@DEBUG_COMMANDS, "cmd_eachtarget | npc: #{npc} | command: #{command}")
 
     current_target = npc
-    GameObj.targets.each { |target|
+    bs_targets.each { |target|
       next unless valid_target?(target)
       fput "target ##{target.id}" unless XMLData.current_target_id == target.id
       cmd(command, target, check_priority: false)
@@ -3834,10 +3955,15 @@ class Bigshot
     }
   end
 
+  # Casts a Curse-family effect.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param type [String] curse variant
+  # @return [void]
   def cmd_curse(npc, type)
     debug_msg(@DEBUG_COMMANDS, "cmd_curse | npc: #{npc} | type: #{type}")
 
-    return if npc.status =~ /dead|gone/
+    return if dead_or_gone?(npc)
     return if type == 'star' && Effects::Spells.time_left("Curse of the Star (bonus)") > 0.5
     timeout = Time.now + 10
     loop do
@@ -3848,14 +3974,19 @@ class Bigshot
       fput('release') unless checkprep == "None"
       results = dothistimeout('prep 715', 2, /Your spell is ready\./)
       break if results
-      return if npc.status =~ /dead|gone/
+      return if dead_or_gone?(npc)
       return if Time.now > timeout
     end
     waitrt?
     waitcastrt?
-    fput("curse ##{npc.id} #{type}") unless npc.status =~ /dead|gone/
+    fput("curse ##{npc.id} #{type}") unless dead_or_gone?(npc)
   end
 
+  # Performs a weapon combat maneuver.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param cmd [String] the maneuver name
+  # @return [void]
   def cmd_weapons(npc, cmd)
     debug_msg(@DEBUG_COMMANDS, "cmd_weapons | npc: #{npc} | cmd: #{cmd}")
 
@@ -3998,10 +4129,16 @@ class Bigshot
     }
   end
 
+  # Casts a spell to interrupt a creature's own casting.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param spell [Integer] spell number to cast
+  # @param extra [String, nil] extra cast arguments
+  # @return [void]
   def cmd_caststop(npc, spell, extra)
     debug_msg(@DEBUG_COMMANDS, "cmd_caststop | npc: #{npc} | spell: #{spell} | extra: #{extra}")
-    return if npc.status.match?(/dead|gone/)
-    return unless GameObj.targets.any? { |s| s.id == npc.id }
+    return if dead_or_gone?(npc)
+    return unless still_targetable?(npc.id)
     return unless Spell[spell].known? and Spell[spell].affordable?
     waitrt?
     waitcastrt?
@@ -4009,11 +4146,16 @@ class Bigshot
     fput "stop #{spell}"
   end
 
+  # Casts Song of Depression (1015).
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param original_command [String] the command definition, for logging
+  # @return [void]
   def cmd_depress(npc, original_command)
     debug_msg(@DEBUG_COMMANDS, "cmd_depress | npc: #{npc}")
 
-    return if npc.status.match?(/dead|gone/)
-    return unless GameObj.targets.any? { |s| s.id == npc.id }
+    return if dead_or_gone?(npc)
+    return unless still_targetable?(npc.id)
     return unless Spell[1015].known? && Spell[1015].affordable?
 
     if @COMMANDS_REGISTRY.any? { |_k, v| v.include?(original_command) }
@@ -4033,11 +4175,15 @@ class Bigshot
     end
   end
 
+  # Casts Phase (1130) to make a noncorporeal creature attackable.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_phase(npc)
     debug_msg(@DEBUG_COMMANDS, "cmd_phase | npc: #{npc}")
 
-    return if npc.status.match?(/dead|gone/)
-    return unless GameObj.targets.any? { |s| s.id == npc.id }
+    return if dead_or_gone?(npc)
+    return unless still_targetable?(npc.id)
     return unless Spell[704].known? && Spell[704].affordable?
 
     Spell[704].force_cast("##{npc.id}")
@@ -4045,11 +4191,16 @@ class Bigshot
     waitcastrt?
   end
 
+  # Unravels a creature's active spells.
+  #
+  # @param cmd [String] the unravel command variant
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_unravel(cmd, npc)
     debug_msg(@DEBUG_COMMANDS, "cmd_unravel | npc: #{npc} | cmd: #{cmd}")
 
-    return if npc.status.match?(/dead|gone/)
-    return unless GameObj.targets.any? { |s| s.id == npc.id }
+    return if dead_or_gone?(npc)
+    return unless still_targetable?(npc.id)
     return unless Spell[1013].known? && Spell[1013].affordable?
 
     cast_results = Regexp.union(
@@ -4260,7 +4411,6 @@ class Bigshot
       /^You don't have that property equipped\./, # jewel not equipped
       /^You fail to find a target\./, # no valid target to use gem on
       /^You have not yet unlocked Gemstones\./, # have not unlocked gemstones at all yet, wtf are you doing?
-
       # copied from Spell.cast @result_regex
       /^Cast Roundtime [0-9]+ Seconds?\.$/,
       /keeps? the spell from working\./,
@@ -4501,10 +4651,15 @@ class Bigshot
     sleep(0.5)
   end
 
+  # Repeatedly Smites an undead or noncorporeal creature until it is listed
+  # as smitten, dies, leaves, or the character must flee.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_volnsmite(npc)
     debug_msg(@DEBUG_COMMANDS, "cmd_volnsmite | npc: #{npc}")
 
-    while !$bigshot_smite_list.any? { |a| a.to_i == npc.id.to_i } && npc.status !~ /dead|gone/ && GameObj.targets.any? { |s| s.id == npc.id } && !should_flee? && (npc.type.split(',').any? { |a| a == "undead" } || npc.type.split(',').any? { |a| a == "noncorporeal" })
+    while !$bigshot_smite_list.any? { |a| a.to_i == npc.id.to_i } && !dead_or_gone?(npc) && still_targetable?(npc.id) && !should_flee? && (npc.type.split(',').any? { |a| a == "undead" } || npc.type.split(',').any? { |a| a == "noncorporeal" })
       res = dothistimeout "smite ##{npc.id}", 1, /^Roundtime|^What were you referring to\?$|^It looks like somebody already did the job for you\.$/
       if res =~ /^It looks like somebody already did the job for you\.$/i
         $bigshot_smite_list.push(npc.id.to_i)
@@ -4528,10 +4683,17 @@ class Bigshot
     end
   end
 
+  # Performs an unarmed (UCS) attack.
+  #
+  # @param command [String] the command definition
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param manualaim [String, nil] explicit aim target, if given
+  # @param stance_dance [Boolean] whether stance may be changed
+  # @return [void]
   def cmd_unarmed(command, npc, manualaim, stance_dance)
     debug_msg(@DEBUG_COMMANDS, "cmd_unarmed | npc: #{npc} | command: #{command} | manualaim: #{manualaim}")
 
-    return if npc.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == npc.id }
+    return if dead_or_gone?(npc) || !still_targetable?(npc.id)
 
     $bigshot_aim = -1 if manualaim != "" && $bigshot_aim == 0
     $mstrike_taken = false
@@ -4614,7 +4776,7 @@ class Bigshot
       elsif line =~ /You are unable to muster the will to attack anything\.|Your rage causes you to use all of your skill in an all out attack!/
         Spell[1201].cast if Spell[1201].known? && Spell[1201].affordable?
         break
-      elsif npc.status =~ /dead|gone/ || !(GameObj.targets.any? { |s| s.id == npc.id }) || should_flee? || should_rest? || line =~ /You currently have no valid target\.  You will need to specify one\.|^It looks like somebody already did the job for you\.$|What were you referring to/
+      elsif dead_or_gone?(npc) || !still_targetable?(npc.id) || should_flee? || should_rest? || line =~ /You currently have no valid target\.  You will need to specify one\.|^It looks like somebody already did the job for you\.$|What were you referring to/
         $bigshot_unarmed_tier = 1
         $bigshot_unarmed_followup = false
         $bigshot_unarmed_followup_attack = ""
@@ -4786,18 +4948,23 @@ class Bigshot
       if (force_this =~ /^(\d+) / && !Spell[$1.to_i].affordable?)
         message("yellow", "Force ran out of mana. Giving up."); return;
       end
-      return if GameObj.targets.size.nil? || gameobj_npc_check() == 0
+      return if bs_hostile_creatures.empty? || gameobj_npc_check() == 0
       return if should_flee?
       return if should_rest?
-      return if npc.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == npc.id }
+      return if dead_or_gone?(npc) || !still_targetable?(npc.id)
       return if (Time.now - start) > 30
     end
   end
 
+  # Casts Tangle Weed (610) at a target.
+  #
+  # @param command [String] the command definition
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_weed(command, target)
     debug_msg(@DEBUG_COMMANDS, "cmd_weed | command: #{command} | target: #{target}")
 
-    return if target.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == target.id }
+    return if dead_or_gone?(target) || !still_targetable?(target.id)
     return if GameObj.loot.find { |loot| loot.name =~ /\b(?:vine|bramble|widgeonweed|vathor club|swallowwort|smilax|creeper|briar|ivy|tumbleweed)\b/ }
     return unless Spell[610].known? and Spell[610].affordable?
 
@@ -4886,7 +5053,7 @@ class Bigshot
     return if id == 608 && hiding?
     return if id == 703 && $bigshot_703_list.any? { |s| s == target.id }
     return if id == 1614 && $bigshot_1614_list.any? { |s| s == target.id }
-    return if id.to_s !~ /902|411/ && (target.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == target.id })
+    return if id.to_s !~ /902|411/ && (dead_or_gone?(target) || !still_targetable?(target.id))
     return if id == 720 && Effects::Cooldowns.active?("Implosion") # implosion cooldown
     # short duration buff cooldown check
     return if [140, 211, 215, 219, 919, 1619, 1650].include?(Spell[id].num) && Effects::Cooldowns.active?(Spell[id].name)
@@ -5076,11 +5243,16 @@ class Bigshot
     Spell[515].cast
   end
 
+  # Casts Elemental Fury.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param extra [String, nil] extra cast arguments
+  # @return [void]
   def cmd_efury(npc, extra)
     debug_msg(@DEBUG_COMMANDS, "cmd_efury | npc: #{npc} | extra: #{extra}")
 
-    return if npc.status =~ /dead|gone/
-    return unless GameObj.targets.any? { |s| s.id == npc.id }
+    return if dead_or_gone?(npc)
+    return unless still_targetable?(npc.id)
     return unless Spell[917].known? and Spell[917].affordable?
 
     spell_complete = false
@@ -5110,14 +5282,18 @@ class Bigshot
     loop do
       break if Time.now > time_out
       break if should_flee?
-      break if npc.status =~ /dead|gone/
-      break unless GameObj.targets.any? { |s| s.id == npc.id }
+      break if dead_or_gone?(npc)
+      break unless still_targetable?(npc.id)
       break if spell_complete
       stand unless standing?
       sleep(0.5)
     end
   end
 
+  # Attempts to hide, retrying up to a limit.
+  #
+  # @param attempts [Integer] maximum tries
+  # @return [Boolean] whether hiding succeeded
   def cmd_hide(attempts)
     debug_msg(@DEBUG_COMMANDS, "cmd_hide | attempts: #{attempts}")
     tries = 0
@@ -5168,7 +5344,7 @@ class Bigshot
       $mstrike_taken = false
       return
     end
-    if Skills.multiopponentcombat >= 30 && GameObj.targets.all? { |i| i.noun !~ /nest/i }
+    if Skills.multiopponentcombat >= 30 && bs_hostile_creatures.all? { |i| i.noun !~ /nest/i }
       if (!Effects::Cooldowns.active?("Multi-Strike") || (@MSTRIKE_COOLDOWN && Char.stamina >= @MSTRIKE_STAMINA_COOLDOWN))
         if @MSTRIKE_QUICKSTRIKE && Char.stamina >= @MSTRIKE_STAMINA_QUICKSTRIKE && !Effects::Debuffs.active?("Overexerted")
           if (gameobj_npc_check() >= @MSTRIKE_MOB || target.nil?)
@@ -5185,7 +5361,7 @@ class Bigshot
         end
         $mstrike_taken = true
       end
-    elsif Skills.multiopponentcombat >= 5 && GameObj.targets.all? { |i| i.noun !~ /nest/i } && gameobj_npc_check() >= @MSTRIKE_MOB
+    elsif Skills.multiopponentcombat >= 5 && bs_hostile_creatures.all? { |i| i.noun !~ /nest/i } && gameobj_npc_check() >= @MSTRIKE_MOB
       if (!Effects::Cooldowns.active?("Multi-Strike") || (@MSTRIKE_COOLDOWN && Char.stamina >= @MSTRIKE_STAMINA_COOLDOWN))
         if @MSTRIKE_QUICKSTRIKE && Char.stamina >= @MSTRIKE_STAMINA_QUICKSTRIKE && !Effects::Debuffs.active?("Overexerted")
           bs_put "quickstrike 1 #{command}"
@@ -5249,9 +5425,14 @@ class Bigshot
     end
   end
 
+  # Hurls a weapon at a target (Dhurl).
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param command [String] the command definition
+  # @return [void]
   def cmd_dhurl(target, command)
     debug_msg(@DEBUG_COMMANDS, "cmd_dhurl")
-    if target.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == target.id }
+    if dead_or_gone?(target) || !still_targetable?(target.id)
       $bigshot_ambush = 0
       return
     end
@@ -5321,10 +5502,14 @@ class Bigshot
     end
   end
 
+  # Performs a ranged (bow/crossbow) attack.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_ranged(npc)
     debug_msg(@DEBUG_COMMANDS, "cmd_ranged | npc: #{npc}")
 
-    if npc.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == npc.id }
+    if dead_or_gone?(npc) || !still_targetable?(npc.id)
       $bigshot_archery_aim = 0
       $bigshot_archery_stuck_location = []
       return
@@ -5390,7 +5575,7 @@ class Bigshot
     waitrt?
     waitcastrt?
     result = dothistimeout("cman dislodge ##{npc.id} #{target}", 2, /attempting to dislodge|suitable weapons lodged|You can't reach|awkward proposition|little bit late|still stunned|too injured|what?|round(time)?|You cannot|Could not find|seconds/i)
-    if (result =~ /You manage to dislodge|You skillfully wrench/ && npc.status =~ /dead|gone/)
+    if (result =~ /You manage to dislodge|You skillfully wrench/ && dead_or_gone?(npc))
       $bigshot_dislodge_location = []
       $bigshot_dislodge_target = nil
     elsif (result =~ /You manage to dislodge|You skillfully wrench/)
@@ -5472,14 +5657,19 @@ class Bigshot
     time.to_i.times do
       sleep(1)
       break if should_rest?
-      break if npc && npc.status =~ /dead|gone/
+      break if npc && dead_or_gone?(npc)
     end
   end
 
+  # Ambushes a target from hiding.
+  #
+  # @param command [String] the command definition
+  # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @return [void]
   def cmd_ambush(command, target)
     debug_msg(@DEBUG_COMMANDS, "cmd_ambush | target: #{target} | command: #{command}")
 
-    if target.status =~ /dead|gone/ || !GameObj.targets.any? { |s| s.id == target.id }
+    if dead_or_gone?(target) || !still_targetable?(target.id)
       $bigshot_ambush = 0
       return
     end
@@ -5557,8 +5747,8 @@ class Bigshot
 
     attempts = 0
     loop do
-      return if npc.status =~ /dead|gone/
-      return unless GameObj.targets.any? { |s| s.id == npc.id }
+      return if dead_or_gone?(npc)
+      return unless still_targetable?(npc.id)
       return unless Spell[706].known? and Spell[706].affordable?
       waitrt?
       waitcastrt?
@@ -5586,8 +5776,8 @@ class Bigshot
     loop do
       break if Time.now > time_out
       break if should_flee?
-      break if npc.status =~ /dead|gone/
-      break unless GameObj.targets.any? { |s| s.id == npc.id }
+      break if dead_or_gone?(npc)
+      break unless still_targetable?(npc.id)
       break if spell_complete
       stand unless standing?
       sleep(0.5)
@@ -5597,22 +5787,25 @@ class Bigshot
       return if spell_complete || Time.now > time_out || should_flee?
 
       # wait for XMLData.current_target_id to update if DOTs transferred
-      if npc.status =~ /dead|gone/ && reget(10).any? { |line| line =~ tether_transferred }
+      if dead_or_gone?(npc) && reget(10).any? { |line| line =~ tether_transferred }
         sleep(0.5)
       end
 
       # returns if npc died and DOTs didn't transfer
-      return if npc.status =~ /dead|gone/ && npc.id == XMLData.current_target_id
+      return if dead_or_gone?(npc) && npc.id == XMLData.current_target_id
 
       # update npc variable to new possible DOT transferred npc
-      npc = GameObj.npcs.find { |potential_npc| potential_npc.id == XMLData.current_target_id && potential_npc.status !~ /dead|gone/ }
+      npc = bs_room_creatures.find { |potential_npc| potential_npc.id == XMLData.current_target_id && !dead_or_gone?(potential_npc) }
       return if npc.nil?                  # returns if no NPC found
-      return if npc.status =~ /dead|gone/ # returns if NPC dead
+      return if dead_or_gone?(npc)        # returns if NPC dead
       return unless valid_target?(npc)    # returns if NPC isn't valid
       cmd_tether(npc, recast_on_transfer) # recasts tether on new npc
     end
   end
 
+  # Treats status ailments afflicting group members.
+  #
+  # @return [void]
   def group_status_ailments()
     debug_msg(@DEBUG_STATUS, "group_status_ailments")
 
@@ -5730,8 +5923,14 @@ class Bigshot
     end
   end
 
+  # Counts attackable creatures in the room.
+  #
+  # Excludes animated decoys, appendages, and anything the character has marked
+  # untargetable, so the count reflects what would actually be fought.
+  #
+  # @return [Integer]
   def gameobj_npc_check()
-    npcs = GameObj.targets.find_all { |i| i.status !~ /dead|gone/ }
+    npcs = bs_targets
     npcs.delete_if { |npc| (npc.name =~ /animated/ && npc.name !~ /animated slush/) }
     npcs.delete_if { |npc| CharSettings['untargetable'].include?(npc.name) }
     npcs.delete_if { |npc| npc.noun =~ /^(?:arm|appendage|claw|limb|pincer|tentacle)s?$|^(?:palpus|palpi)$/i }
@@ -6537,7 +6736,7 @@ class Bigshot
     if XMLData.current_target_id != target.id
       # Rest variables and retarget if target changed
       reset_variables(false)
-      bs_put "target ##{target.id}" if target.status !~ /dead|gone/
+      bs_put "target ##{target.id}" if !dead_or_gone?(target)
     end
 
     # Make sure followers are attacking
@@ -6637,7 +6836,7 @@ class Bigshot
       end
     else
       dead_npcs.each do |i|
-        next if i.status =~ /gone/
+        next if gone?(i)
         waitrt?
         use_lte_boost()
         add_overkill()
@@ -6844,6 +7043,189 @@ class Bigshot
     return true if (abilities & @BOONS_IGNORE).any?
   end
 
+  # --- Creature/Combat targeting helpers (GameObj -> Creature migration) ---
+
+  # Hostile, attackable creatures in the room, wrapped for GameObj-shape
+  # compatibility with the rest of bigshot. Replaces GameObj.targets as the
+  # source of truth: this reads the room roster directly instead of the
+  # client's selected-target list, so it can't go stale after a kill or room
+  # change. See bs_hostile_creatures for why it is not Creature.targets.
+  # Always an Array (never nil).
+  # @param filters [Array<Symbol, String>] optional Creature filters
+  # @return [Array<BigshotCreature, Lich::Common::GameObj>] wrapped creatures,
+  #   plus any bridged raw GameObj targets
+  def bs_targets(*filters)
+    bs_hostile_creatures(*filters).map do |c|
+      # bs_hostile_creatures can return raw GameObj entries bridged in for
+      # creatures the Creature module cannot represent (see there). Only wrap
+      # real CreatureInstances; the rest already present the GameObj shape.
+      c.respond_to?(:crtr_flag?) ? BigshotCreature.new(c) : c
+    end
+  end
+
+  # Deliberately NOT Creature.targets, despite that being the obvious choice.
+  #
+  # Creature.targets selects on `valid_target? && crtr_flag?(:hostile)`, and
+  # CreatureInstance#valid_target? returns false when #dead? is true - where
+  # #dead? means `max_hp - damage_taken <= 0`, NOT the game's own <crtrStatus>
+  # dead flag. damage_taken is accumulated by Combat::Tracker from every damage
+  # number it parses out of the feed, is never reset (Creature#reset_damage
+  # exists but nothing in lich-5 calls it), and max_hp is frequently a guess:
+  # 131 of the 611 bundled creature templates carry `max_hp: nil`, which falls
+  # through to Tracker.fallback_hp or a hardcoded 400.
+  #
+  # Because bigshot enables Combat::Tracker at startup AND uses this list as
+  # its only source of targets, trusting #dead? means a creature that is very
+  # much alive silently disappears from the target list once its *estimated*
+  # damage crosses that guessed ceiling - bigshot stops attacking while the
+  # creature keeps attacking back. Group hunting makes this the common case
+  # rather than the edge case: every group member's damage on a shared target
+  # is parsed from each client's own feed, so a 4-person group over-attributes
+  # roughly 4x and blows through a 300-400 HP estimate long before the
+  # creature actually dies.
+  #
+  # So: take the room roster, apply the two facts the game itself asserts over
+  # <crtrStatus> (hostile, not dead), and reimplement valid_target?'s other
+  # two exclusions directly. Those must be reimplemented rather than assumed
+  # to be covered elsewhere in bigshot: the animated check is duplicated in
+  # valid_target?, but the appendage-noun check only ever existed in
+  # should_flee? and gameobj_npc_check - both of which count creatures for
+  # flee/mob decisions and sit on neither the sort_npcs -> find_target ->
+  # valid_target? selection path. GameObj.targets used to strip appendages at
+  # the source, so dropping that filter here would let bigshot select and
+  # attack a severed limb it previously never saw.
+  # @param filters [Array<Symbol, String>] optional Creature filters; a filtered
+  #   query returns the native roster alone and is not bridged
+  # @return [Array<Lich::Gemstone::Creature::CreatureInstance, Lich::Common::GameObj>]
+  def bs_hostile_creatures(*filters)
+    native = Creature.in_room(*filters).select do |c|
+      next false unless c.crtr_flag?(:hostile)
+      next false if c.crtr_flag?(:dead)
+      # Reimplemented from CreatureInstance#valid_target? / GameObj.targets
+      # rather than inherited, because valid_target? bundles these two safe
+      # exclusions together with the unsafe HP-estimate death check above.
+      # Both lists must stay byte-identical to lib/gemstone/creature.rb's
+      # valid_target? - if that upstream regex gains a case, mirror it here.
+      next false if c.name =~ /^animated\b/i && c.name !~ /^animated slush/i
+      next false if c.noun =~ /^(?:arm|appendage|claw|limb|pincer|tentacle)s?$|^(?:palpus|palpi)$/i &&
+                    c.name !~ /(?:amaranthine|ghostly|grizzled|ancient) kraken tentacle/i
+
+      true
+    end
+
+    # Filters are a Creature-module concept (flag_active?), so a filtered
+    # query can't be bridged and returns the native roster alone.
+    return native unless filters.empty?
+
+    # Bridge in anything GameObj considers an attackable target that the
+    # Creature module has no instance for at all. That is not a hypothetical:
+    # bandit_track() manufactures its quarry with GameObj.new_npc after
+    # scraping a manual "look", precisely because bandits never appear in the
+    # normal room feed - so Creature.register is never called for them, and
+    # they could never carry crtr_flag?(:hostile) even if it were, since that
+    # flag can only come from a <crtrStatus> tag they never send. Without this
+    # bridge $bigshot_bandits finds its target, adds it to
+    # XMLData.current_target_ids, and then sort_npcs never sees it.
+    #
+    # Scoped deliberately to ids Creature has NO instance for. Anything
+    # Creature does know about is left to the native roster above, so the
+    # stale client-dropdown behavior this migration set out to escape does not
+    # leak back in for ordinary creatures. GameObj.targets applies its own
+    # dead/gone, animated and appendage exclusions, so bridged entries arrive
+    # pre-vetted by the same rules.
+    #
+    # These are raw GameObj objects, not CreatureInstances: they quack the
+    # same for id/noun/name/status/type, and creature_backed? already reports
+    # false for them so every native crtrStatus reader degrades safely.
+    bridged = GameObj.targets.reject { |go| Creature[go.id] }
+    native + bridged
+  end
+
+  # All tracked creatures in the room (alive, dead, hostile, or not), wrapped
+  # the same way.
+  #
+  # CAUTION - not a drop-in replacement for GameObj.npcs, despite looking
+  # like one: Creature only registers/re-marks-in-room a bolded room object
+  # when a live <crtrStatus> tag arrives for it OR its id is in the client's
+  # target dropdown (XMLData.current_target_ids) - see the text() handler in
+  # lib/common/xmlparser.rb. GameObj.npcs has no such gate; it tracks every
+  # bolded room object unconditionally. A corpse that stops getting fresh
+  # crtrStatus updates post-mortem, or a named-but-not-currently-hostile NPC
+  # (e.g. a bounty rescue target), can therefore be present in the room and
+  # visible via GameObj.npcs while absent here. Prefer GameObj.npcs directly
+  # for general "is X present in the room" presence checks (see loot()'s
+  # dead_npcs and should_flee?'s ALWAYS_FLEE_FROM for examples); this helper
+  # is safe for id-anchored lookups against an id you already know is live
+  # (e.g. XMLData.current_target_id) or for reading crtrStatus data off a
+  # creature you already have another way.
+  # @param filters [Array<Symbol, String>] optional Creature filters
+  # @return [Array<BigshotCreature>]
+  def bs_room_creatures(*filters)
+    Creature.in_room(*filters).map { |c| BigshotCreature.new(c) }
+  end
+
+  # Is a creature id still present in the current hostile/attackable roster?
+  # Replaces the repeated GameObj.targets.any? { |s| s.id == npc.id } pattern
+  # used throughout the cmd_* methods to check whether a target died or left
+  # before a follow-up command runs.
+  #
+  # @param id [String, Integer] creature id to look for
+  # @return [Boolean]
+  def still_targetable?(id)
+    bs_hostile_creatures.any? { |c| c.id.to_s == id.to_s }
+  end
+
+  # Whether npc carries a live CreatureInstance for native crtrStatus reads
+  # (npc.creature.crtr_flag?/has_status?). True for everything bs_targets/
+  # bs_room_creatures/leader_target? normally hand back. False only for the
+  # rare raw GameObj leader_target? falls back to when a group leader's
+  # selected target has no matching Creature registry entry yet - guard
+  # native-only checks with this rather than assuming it can't happen.
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to test
+  # @return [Boolean] true when a live CreatureInstance backs this npc, so
+  #   native crtrStatus reads are available
+  def creature_backed?(npc)
+    !npc.nil? && npc.respond_to?(:creature) && !npc.creature.nil?
+  end
+
+  # Replacement for the old npc.status =~ /dead|gone/ regex, sourced
+  # from the live <crtrStatus> dead flag plus room-roster membership instead
+  # of GameObj's status string. Falls back to the regex for the rare
+  # non-creature-backed npc (see creature_backed?) so it degrades exactly to
+  # the pre-migration behavior rather than raising.
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to test
+  # @return [Boolean] true if nil, flagged dead, or reported dead/gone by GameObj
+  def dead_or_gone?(npc)
+    return true if npc.nil?
+    return !!(npc.status =~ /dead|gone/) unless creature_backed?(npc)
+
+    # crtr_flag?(:dead) is the game's own assertion over <crtrStatus>; the
+    # status fallback is GameObj's, which tracks every bolded room object
+    # unconditionally. Deliberately NOT room-roster membership
+    # (bs_room_creatures) - Creature only re-registers an object on a
+    # room-objs refresh when a fresh <crtrStatus> arrives for it or its id is
+    # in the client's target dropdown, so a live creature can drop out of the
+    # roster for a tick and be misreported as gone. See bs_room_creatures.
+    npc.creature.crtr_flag?(:dead) || !!(npc.status =~ /dead|gone/)
+  end
+
+  # Whether a creature has left the room roster entirely - decayed, fully
+  # looted, or otherwise removed - independent of the dead flag. Narrower
+  # than dead_or_gone?: needed for call sites (e.g. the dead_npcs loot loop)
+  # where every candidate is already known dead, so dead_or_gone? would
+  # trivially return true for all of them and skip looting entirely.
+  # @param npc [BigshotCreature, Lich::Common::GameObj, nil] npc to test
+  # @return [Boolean]
+  def gone?(npc)
+    return true if npc.nil?
+
+    # BigshotCreature#status already delegates to the matching GameObj entry,
+    # so this is correct for wrapped and unwrapped npcs alike - and unlike
+    # room-roster membership it isn't subject to Creature's registration gate
+    # (see bs_room_creatures).
+    !!(npc.status =~ /gone/)
+  end
+
   def should_flee_from_boons?
     debug_msg(@DEBUG_COMBAT, "should_flee_from_boons?")
 
@@ -6876,16 +7258,25 @@ class Bigshot
       return true if (@FLEE_VOIDS && i.name =~ /black void/)
     end
 
-    return true if GameObj.npcs.any?  { |i| @ALWAYS_FLEE_FROM.include?(i.noun) or @ALWAYS_FLEE_FROM.include?(i.name) }
-    return true if checkpcs.any?      { |i| @ALWAYS_FLEE_FROM.include?(i) }
+    # Deliberately GameObj.npcs, not bs_room_creatures/Creature.in_room: a
+    # named creature on this list might not be hostile-tagged yet (that's
+    # often exactly why it's feared - see the dead_npcs comment in loot()
+    # for the same Creature registration-gate reasoning), so this shouldn't
+    # depend on Creature's crtrStatus/target-dropdown registration gate.
+    return true if GameObj.npcs.any? { |i| @ALWAYS_FLEE_FROM.include?(i.noun) or @ALWAYS_FLEE_FROM.include?(i.name) }
+    return true if checkpcs.any? { |i| @ALWAYS_FLEE_FROM.include?(i) }
 
     return false if $bigshot_bandits
 
-    return true if @BOONS_FLEE.any? && GameObj.targets.any? { |c| c.type.include?("boon") } && should_flee_from_boons?
+    return true if @BOONS_FLEE.any? && bs_targets.any? { |c| c.type.include?("boon") } && should_flee_from_boons?
     return true if !leading? && checkpcs.empty?
 
-    npcs = GameObj.targets.reject! do |npc|
-      npc.status =~ /dead|gone/ ||
+    # bs_targets always returns a fresh Array (never nil), so plain #reject
+    # (not #reject!) is used here - no need for the `|| GameObj.targets`
+    # fallback the old GameObj#reject! required to cover the "nothing was
+    # rejected" nil-return case.
+    npcs = bs_targets.reject do |npc|
+      dead_or_gone?(npc) ||
         @INVALID_TARGETS.include?(npc.name) ||
         @INVALID_TARGETS.include?(npc.noun) ||
         CharSettings['untargetable'].include?(npc.name) ||
@@ -6893,13 +7284,18 @@ class Bigshot
         npc.noun =~ /^(?:grik|grik'trak|grik'mlar|grik'pwal|grik'tval|verlok|verlok'asha|verlok'cina|verlok'ar|imp|abyran|abyran'a|abyran'sa|grantris|igaesha|haze|rouk|brume|haar|murk|nyle|mist|smoke|vapor|fog|aishan|shien|darkling|shadowling|arashan)$/i ||
         ['quickly growing troll king', 'severed troll arm', 'severed troll leg'].include?(npc.name) ||
         (npc.type =~ /companion|familiar/i && npc.type !~ /aggressive npc/i)
-    end || GameObj.targets
+    end
 
     flee_count = (just_entered && @LONE_TARGETS_ONLY) ? 1 : @FLEE_COUNT
 
     return npcs.size > flee_count
   end
 
+  # Whether a creature may be attacked.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the creature
+  # @param just_entered [Boolean] forwarded to {#should_flee?}
+  # @return [Boolean]
   def valid_target?(target, just_entered = false)
     debug_msg(@DEBUG_COMBAT, "valid_target? | target: #{target}")
 
@@ -6907,8 +7303,8 @@ class Bigshot
     invalid_conditions = {
       'target == nil || target == false'                         => !target,
       'should_flee?(just_entered)'                               => should_flee?(just_entered),
-      'target.status =~ /dead|gone/'                             => target.status =~ /dead|gone/,
-      'target gone from GameObj.targets collection'              => GameObj.targets.none? { |n| n.id == target.id },
+      'dead_or_gone?(target)'                                    => dead_or_gone?(target),
+      'target gone from hostile room roster'                     => !still_targetable?(target.id),
       'target.name contains animated but not an animated slush/' => target.name =~ /animated/ && target.name !~ /animated slush/,
       'targets with boons are being ignored'                     => (target.type.include?("boon") && invalid_target_with_boons(target))
     }
@@ -6916,7 +7312,7 @@ class Bigshot
     invalid_conditions.each do |condition, result|
       if result
         debug_msg(@DEBUG_COMBAT, "valid_target?| returning false for #{target.name} | reason: #{condition}")
-        if target.name =~ /animated/ && target.name !~ /animated slush/ && target.status !~ /dead|gone/
+        if target.name =~ /animated/ && target.name !~ /animated slush/ && !dead_or_gone?(target)
           CharSettings['untargetable'].push(target.name)
         end
 
@@ -6925,12 +7321,12 @@ class Bigshot
     end
 
     # Still here? Make sure we can target it. If not add to CharSettings['untargetable']
-    if (!CharSettings['targetable'].include?(target.name) && !CharSettings['untargetable'].include?(target.name) && target.status !~ /dead|gone/)
+    if (!CharSettings['targetable'].include?(target.name) && !CharSettings['untargetable'].include?(target.name) && !dead_or_gone?(target))
       result = dothistimeout("target ##{target.id}", 3, /^You are now targeting|^You can't target|^You discern that you are the origin|^You are unable to discern the origin/)
       if (result =~ /^You are now targeting/)
-        CharSettings['targetable'].push(target.name) if target.status !~ /dead|gone/
+        CharSettings['targetable'].push(target.name) if !dead_or_gone?(target)
       elsif (result =~ /^You can't target|^You discern that you are the origin|^You are unable to discern the origin/)
-        CharSettings['untargetable'].push(target.name) if target.status !~ /dead|gone/
+        CharSettings['untargetable'].push(target.name) if !dead_or_gone?(target)
       end
     end
 
@@ -6956,7 +7352,7 @@ class Bigshot
       sorted_targets = {}
 
       if @QUICKHUNT_TARGETS.empty?
-        GameObj.targets.each do |npc|
+        bs_hostile_creatures.each do |npc|
           next if CharSettings['untargetable'].include?(npc.name)
           next if $bigshot_bandits && npc.noun !~ @BANDIT_NOUN_REGEX
 
@@ -6970,7 +7366,7 @@ class Bigshot
       @TARGETS ||= { ".+"=>"a" }
     end
 
-    targets = @TARGETS.keys.flat_map { |target| GameObj.targets.select { |npc| npc.name =~ /^#{target}$/i || npc.noun =~ /^#{target}$/i } }
+    targets = @TARGETS.keys.flat_map { |target| bs_targets.select { |npc| npc.name =~ /^#{target}$/i || npc.noun =~ /^#{target}$/i } }
 
     debug_msg(@DEBUG_COMBAT, "sort_npcs | targets: #{targets}")
     return targets
@@ -6978,28 +7374,40 @@ class Bigshot
 
   # Anchored so priority uses the same matching as sort_npcs and can never rank
   # a creature that find_target would be unable to pick
+  # @return [Array<Regexp>] anchored patterns for the configured target names
   def priority_matchers
     @TARGETS.keys.map { |name| /^#{name}$/i }
   end
 
   # Position of a creature in the ordered target list, infinity when unlisted
+  # Ranks a creature against the configured target list.
+  #
+  # @param npc [BigshotCreature, Lich::Common::GameObj] creature to rank
+  # @param matchers [Array<Regexp>] patterns from {#priority_matchers}
+  # @return [Integer, Float] list index, or +Float::INFINITY+ when unlisted
   def priority_rank(npc, matchers)
     index = matchers.index { |matcher| npc.name =~ matcher || npc.noun =~ matcher }
     index.nil? ? Float::INFINITY : index
   end
 
+  # Whether a target still outranks everything else in the room.
+  #
+  # @param target [BigshotCreature, Lich::Common::GameObj] the creature
+  # @return [Boolean]
+  # @note Compares ranks rather than identity, so a target that briefly drops
+  #   out of the roster is not abandoned to a lower-priority creature.
   def priority(target)
     return false if target.nil?
     return true if $bigshot_bandits
     return true if !@PRIORITY
 
     matchers = priority_matchers
-    npcs = GameObj.targets.reject { |npc| CharSettings['untargetable'].include?(npc.name) || invalid_target_with_boons(npc, false) }
+    npcs = bs_targets.reject { |npc| CharSettings['untargetable'].include?(npc.name) || invalid_target_with_boons(npc, false) }
     target_rank = priority_rank(target, matchers)
     best_rank = npcs.map { |npc| priority_rank(npc, matchers) }.min || Float::INFINITY
 
-    # Ranks, not identity: GameObj.targets is the game's target dropdown, which is
-    # rebuilt wholesale, so the current target can drop out of it for a moment.
+    # Ranks, not identity: the hostile roster is rebuilt from the room feed
+    # each call, so the current target can drop out of it for a moment.
     # Only a creature that outranks the target may interrupt it.
     priority = best_rank >= target_rank
 
@@ -7161,9 +7569,13 @@ class Bigshot
     return poisoned
   end
 
+  # Whether the current bounty is complete.
+  #
+  # @return [Boolean]
+  # @see #set_bounty_eval
   def bounty_check?()
     return false unless @BOUNTY_MODE
-    return false if @BANDIT_HUNTING && GameObj.targets.any? { |target| target.type =~ /bandit/ }
+    return false if @BANDIT_HUNTING && bs_targets.any? { |target| target.type =~ /bandit/ }
 
     if @BOUNTY_EVAL.to_s.empty?
       Lich::Messaging.msg('error', " Bigshot is running in bounty mode and bounty_eval is empty. Exiting...")
@@ -7697,11 +8109,11 @@ class Bigshot
     result = dothistimeout("track #{@TRACKING_CREATURE}", 1, tracking_results)
     case result
     when /Your keen eye spots the beginnings of a trail and you rush to follow it/ # success, new room, so we can go ahead
-      uncover() if GameObj.targets.empty? # maybe remove - probably a lot bigger update to reveal hidden targets universally
+      uncover() if bs_hostile_creatures.empty? # maybe remove - probably a lot bigger update to reveal hidden targets universally
       return true # return true to return out of wander and not change rooms again
     when /^You don't have to go far\./ # success, but target is hidden in the existing room
       if bigclaim?
-        uncover() if GameObj.targets.empty? # probably remove - same as above
+        uncover() if bs_hostile_creatures.empty? # probably remove - same as above
         return true # return true so wander doesn't move us
       elsif !bigclaim?
         return false # if room is claimed, we return false and let wander move us because track kept us in the same room which had to already been claimed
@@ -7709,11 +8121,14 @@ class Bigshot
     end
   end
 
+  # Reveals hidden creatures in the room.
+  #
+  # @return [void]
   def uncover
     debug_msg(@DEBUG_COMBAT, "uncover")
 
     waitrt?
-    return unless GameObj.targets.empty?
+    return unless bs_hostile_creatures.empty?
     if Stats.prof == "Ranger" && Spell[609].known? && Spell[609].affordable?
       waitcastrt?
       fput("incant 609 open")
@@ -8279,7 +8694,7 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
 
           # Sync to leader's target if available, or find one
           leader_tgt = group.leader_target
-          unless leader_tgt.nil? || leader_tgt.status =~ /dead|gone/
+          unless leader_tgt.nil? || bs.dead_or_gone?(leader_tgt)
             target = leader_tgt
           end
 
