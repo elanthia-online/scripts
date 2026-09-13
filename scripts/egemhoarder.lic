@@ -17,9 +17,13 @@
   contributors: Caithris, Falicor, Yalathanil
   game: gs
   tags: gems, hoarding, locker, jars
-  version: 2.0.1
+  version: 2.1.0
 
   Version Control:
+  v2.1.0 (2026-09-12)
+    - add combine command to merge duplicate partial jars of the same gem in bin into one
+    - deposit now keeps filling additional jars in the same run instead of stopping after the first one fills
+    - add single_jar config option: when on, every gem is capped at one jar per locker, extra gems stay in your gemsack
   V2.0.1 (2026-08-08)
     - fix: hanging/termiantion when noun was bottle
   Major_change.feature_addition.bugfix
@@ -69,7 +73,7 @@ module EGemHoarder
   end
 
   def self.default_data
-    { jars: [], known_lockers: [], config: { lockermode: 'strict', exclude: [], gemsack: '' } }
+    { jars: [], known_lockers: [], config: { lockermode: 'strict', exclude: [], gemsack: '', single_jar: false } }
   end
 
   def self.save_data(data)
@@ -142,6 +146,10 @@ module EGemHoarder
   def self.gem_excluded?(gem_name, data)
     cn = clean_name(gem_name).downcase
     excluded_gems(data).any? { |ex| cn.include?(ex) }
+  end
+
+  def self.single_jar?(data)
+    !!data.dig(:config, :single_jar)
   end
 
   def self.locker_mode(data)
@@ -273,7 +281,7 @@ module EGemHoarder
     key = Script.current.vars[2].to_s.strip.downcase
     val = Script.current.vars[3..-1].to_a.join(' ').strip
 
-    data[:config] ||= { lockermode: 'strict', exclude: [], gemsack: '' }
+    data[:config] ||= { lockermode: 'strict', exclude: [], gemsack: '', single_jar: false }
 
     case key
     when "lockermode"
@@ -289,11 +297,18 @@ module EGemHoarder
     when "gemsack"
       data[:config][:gemsack] = val
       echo "EGemHoarder: gemsack set to '#{val}'."
+    when "single_jar"
+      unless %w[true false on off yes no].include?(val.downcase)
+        echo "EGemHoarder: single_jar must be true or false."
+        return
+      end
+      data[:config][:single_jar] = %w[true on yes].include?(val.downcase)
+      echo "EGemHoarder: single_jar set to #{data[:config][:single_jar] ? 'on' : 'off'}."
     when ""
-      echo "EGemHoarder: usage: ;egemhoarder config <lockermode|exclude|gemsack> <value>"
+      echo "EGemHoarder: usage: ;egemhoarder config <lockermode|exclude|gemsack|single_jar> <value>"
       return
     else
-      echo "EGemHoarder: unknown config key '#{key}'. Valid keys: lockermode, exclude, gemsack"
+      echo "EGemHoarder: unknown config key '#{key}'. Valid keys: lockermode, exclude, gemsack, single_jar"
       return
     end
     save_data(data)
@@ -306,6 +321,7 @@ module EGemHoarder
     respond "  gemsack    : #{cfg[:gemsack].to_s.empty? ? '(not set)' : cfg[:gemsack]}"
     respond "  lockermode : #{cfg[:lockermode] || 'strict'}"
     respond "  exclude    : #{(cfg[:exclude] || []).empty? ? '(none)' : cfg[:exclude].join(', ')}"
+    respond "  single_jar : #{cfg[:single_jar] ? 'on' : 'off'}"
     respond ""
   end
 
@@ -335,6 +351,7 @@ module EGemHoarder
     respond "  set <gem> <n> [full] [town]"
     respond "                           Manually set/update a jar entry; n=0 to delete"
     respond "  raid <gem> [count]       Pull gems from locker into gemsack (default: 1)"
+    respond "  combine                  Merge duplicate partial jars of the same gem in bin"
     respond ""
     respond "Config keys (;egemhoarder config <key> <value>):"
     respond "  gemsack <name>           Container holding loose gems (REQUIRED)"
@@ -343,6 +360,8 @@ module EGemHoarder
     respond "    normal = store here if other locker jar is full"
     respond "    loose  = always store regardless of other lockers"
     respond "  exclude <gem1, gem2>     Comma-separated gems to never jar"
+    respond "  single_jar <true|false>  When on, every gem is capped at one jar per locker;"
+    respond "                           once that jar is full, extra gems stay in gemsack"
     respond ""
     respond "Notes:"
     respond "  Deposit and raid auto-navigate to public lockers via go2,"
@@ -353,6 +372,8 @@ module EGemHoarder
     respond "  ;egemhoarder config gemsack canvas gem pouch"
     respond "  ;egemhoarder config lockermode normal"
     respond "  ;egemhoarder config exclude uncut diamond, doomstone, urglaes fang"
+    respond "  ;egemhoarder config single_jar true"
+    respond "  ;egemhoarder combine"
     respond "  ;egemhoarder settings"
     respond "  ;egemhoarder search ruby"
     respond "  ;egemhoarder search green amber"
@@ -532,6 +553,121 @@ module EGemHoarder
     true
   end
 
+  # -- Combine Duplicate Jars -----------------------------------------------------
+
+  def self.combine(data, location)
+    sack = find_gemsack(data)
+    return unless sack
+
+    echo "EGemHoarder: checking for duplicate partial jars at #{location}..."
+
+    bin_result = open_locker_part("bin")
+    unless bin_result
+      echo "EGemHoarder: could not open bin -- aborting combine."
+      return
+    end
+    bin_id, bin_contents = bin_result
+
+    jars_by_gem = bin_contents
+                  .select { |o| o.noun =~ JAR_NOUNS && !o.after_name.to_s.strip.empty? }
+                  .group_by { |o| clean_name(o.after_name) }
+                  .select { |_gem, jars| jars.size > 1 }
+
+    if jars_by_gem.empty?
+      echo "EGemHoarder: no duplicate partial jars found at #{location}."
+      close_locker
+      return
+    end
+
+    combined_any = false
+
+    jars_by_gem.each do |gem_name, jars|
+      jar_details = jars.map { |jar|
+        look = dothistimeout "look in ##{jar.id} from ##{bin_id}", 5,
+                             /Inside.*?you see \d+ portion|I could not find|That is not/
+        next unless look =~ /Inside.*?you see (\d+) portion/
+        { jar: jar, count: $1.to_i }
+      }.compact
+
+      next if jar_details.size < 2
+
+      echo "EGemHoarder: combining #{jar_details.size} jars of '#{gem_name}'..."
+
+      dest    = jar_details.max_by { |j| j[:count] }
+      sources = jar_details - [dest]
+
+      get_r = dothistimeout "get ##{dest[:jar].id} from ##{bin_id}", 4, /^You remove|Get what/
+      unless get_r =~ /^You remove/
+        echo "EGemHoarder: could not retrieve destination jar for '#{gem_name}', skipping."
+        next
+      end
+
+      dest_full = false
+
+      sources.each do |src|
+        break if dest_full
+
+        get_r = dothistimeout "get ##{src[:jar].id} from ##{bin_id}", 4, /^You remove|Get what/
+        unless get_r =~ /^You remove/
+          echo "EGemHoarder: could not retrieve a source jar for '#{gem_name}', skipping it."
+          next
+        end
+
+        extracted    = 0
+        attempts     = 0
+        max_attempts = src[:count] * 2
+
+        while extracted < src[:count] && attempts < max_attempts && !dest_full
+          attempts += 1
+          res = dothistimeout "shake ##{src[:jar].id}", 4,
+                              /fall into your|free hand|nothing falls out|realize that it is empty/
+
+          case res
+          when /fall into your/, /free hand/
+            gem = [GameObj.right_hand, GameObj.left_hand].compact.find { |o|
+              o.id != src[:jar].id && o.id != dest[:jar].id && o.type =~ /gem/i
+            }
+            unless gem
+              echo "EGemHoarder: shook '#{gem_name}' jar but no gem appeared, stopping this jar."
+              break
+            end
+
+            drag_r = dothistimeout "_drag ##{gem.id} ##{dest[:jar].id}", 4,
+                                   /^You add|^You put|filling it|is full|does not appear to be a suitable/
+            case drag_r
+            when /filling it/
+              extracted += 1
+              dest_full  = true
+            when /^You add|^You put/
+              extracted += 1
+            when /is full/
+              dest_full = true
+              fput "put ##{gem.id} in ##{sack.id}"
+            else
+              echo "EGemHoarder: unexpected combine response for '#{gem_name}', stopping this jar."
+              fput "put ##{gem.id} in ##{sack.id}"
+              break
+            end
+          when /nothing falls out|realize that it is empty/
+            break
+          else
+            echo "EGemHoarder: shake timed out on '#{gem_name}', stopping this jar."
+            break
+          end
+        end
+
+        fput "put ##{src[:jar].id} in chest"
+        combined_any = true if extracted.positive?
+      end
+
+      fput "put ##{dest[:jar].id} in #{dest_full ? 'wardrobe' : 'bin'}"
+    end
+
+    close_locker
+
+    echo "EGemHoarder: combine complete -- run ;egemhoarder newlocker to refresh jar data." if combined_any
+  end
+
   # -- Deposit Loop --------------------------------------------------------------
 
   def self.deposit_gems(data, location)
@@ -654,58 +790,80 @@ module EGemHoarder
           echo "EGemHoarder: no empty jars in chest for #{gem_groups.size} new gem type(s)."
         else
           gem_groups.each do |gem_name, group|
-            jar = empty_jars.shift
-            break unless jar
+            queue = group.dup
 
-            get_r = dothistimeout "get ##{jar.id} from ##{chest_id}", 4, /^You remove|Get what/
-            next unless get_r =~ /^You remove/
-
-            data[:jars] ||= []
-            record       = { gem: gem_name, count: 0, full: false, location: location }
-            data[:jars] << record
-
-            jar_returned = false
-            filled       = false
-
-            group.each do |gem|
-              res = dothistimeout "_drag ##{gem.id} ##{jar.id}", 4,
-                                  /^You add|^You put|filling it|is full|does not appear to be a suitable|^I could not find/
-              case res
-              when /^You add.*filling it/, /filling it/
-                record[:gem]   = clean_name(jar.after_name) unless jar.after_name.to_s.strip.empty?
-                record[:count] = record[:count].to_i + 1
-                record[:full]  = true
-                filled = true
-                gems.delete(gem)
-                deposited += 1
+            until queue.empty?
+              # single_jar: once one jar (full or not) exists for this gem here, stop
+              # starting new ones -- leave whatever's left of this gem in the gemsack.
+              if single_jar?(data) &&
+                 (data[:jars] || []).any? { |j| j[:location] == location && clean_name(j[:gem]) =~ gem_regex(gem_name) }
+                echo "EGemHoarder: single_jar is on -- leaving #{queue.size} '#{gem_name}' in gemsack."
                 break
-              when /^You add|^You put/
-                record[:gem]   = clean_name(jar.after_name) unless jar.after_name.to_s.strip.empty?
-                record[:count] = record[:count].to_i + 1
-                gems.delete(gem)
-                deposited += 1
-                break unless GameObj.right_hand&.id == jar.id || GameObj.left_hand&.id == jar.id
-              when /is full/
-                record[:full] = true
-                filled = true
-                fput "put ##{gem.id} in ##{sack.id}"
-                break
-              when /does not appear to be a suitable/
-                not_suitable << gem.id
-                fput "put ##{gem.id} in ##{sack.id}"
-                data[:jars].delete(record)
-                fput "put ##{jar.id} in chest"
-                jar_returned = true
-                break
-              when /^I could not find/
-                break
-              else
-                fput "put ##{gem.id} in ##{sack.id}"
               end
-            end
 
-            unless jar_returned
-              fput "put ##{jar.id} in #{filled ? 'wardrobe' : 'bin'}"
+              jar = empty_jars.shift
+              break unless jar
+
+              get_r = dothistimeout "get ##{jar.id} from ##{chest_id}", 4, /^You remove|Get what/
+              break unless get_r =~ /^You remove/
+
+              data[:jars] ||= []
+              record       = { gem: gem_name, count: 0, full: false, location: location }
+              data[:jars] << record
+
+              jar_returned  = false
+              filled        = false
+              abort_gem     = false
+
+              until queue.empty?
+                gem = queue.first
+                res = dothistimeout "_drag ##{gem.id} ##{jar.id}", 4,
+                                    /^You add|^You put|filling it|is full|does not appear to be a suitable|^I could not find/
+                case res
+                when /^You add.*filling it/, /filling it/
+                  record[:gem]   = clean_name(jar.after_name) unless jar.after_name.to_s.strip.empty?
+                  record[:count] = record[:count].to_i + 1
+                  record[:full]  = true
+                  filled = true
+                  gems.delete(gem)
+                  queue.shift
+                  deposited += 1
+                  break
+                when /^You add|^You put/
+                  record[:gem]   = clean_name(jar.after_name) unless jar.after_name.to_s.strip.empty?
+                  record[:count] = record[:count].to_i + 1
+                  gems.delete(gem)
+                  queue.shift
+                  deposited += 1
+                  break unless GameObj.right_hand&.id == jar.id || GameObj.left_hand&.id == jar.id
+                when /is full/
+                  record[:full] = true
+                  filled = true
+                  fput "put ##{gem.id} in ##{sack.id}"
+                  break
+                when /does not appear to be a suitable/
+                  not_suitable << gem.id
+                  fput "put ##{gem.id} in ##{sack.id}"
+                  queue.shift
+                  data[:jars].delete(record)
+                  fput "put ##{jar.id} in chest"
+                  jar_returned = true
+                  abort_gem    = true
+                  break
+                when /^I could not find/
+                  abort_gem = true
+                  break
+                else
+                  fput "put ##{gem.id} in ##{sack.id}"
+                  queue.shift
+                end
+              end
+
+              unless jar_returned
+                fput "put ##{jar.id} in #{filled ? 'wardrobe' : 'bin'}"
+              end
+
+              break if abort_gem
             end
           end
         end
@@ -960,6 +1118,28 @@ module EGemHoarder
 
     when "set"
       cmd_set(data)
+
+    when "combine"
+      origin_id = Room.current.id
+      stowed    = stow_hands
+
+      unless go_to_locker
+        restore_hands(stowed)
+        exit
+      end
+
+      location = current_location
+      data[:known_lockers] ||= []
+
+      unless data[:known_lockers].include?(location)
+        echo "EGemHoarder: #{location} is not a registered locker. Run ;egemhoarder newlocker first."
+      else
+        combine(data, location)
+      end
+
+      close_locker
+      go_to_origin(origin_id)
+      restore_hands(stowed)
 
     when "raid"
       origin_id = Room.current.id
