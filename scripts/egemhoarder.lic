@@ -11,15 +11,20 @@
     - multi-locker, multi-jar support with per-jar tracking
     - auto-navigates to locker, stows hands, returns to origin after deposit/raid
     - raid pulls gems from locker back into gemsack
+    - bounty checks your active gem bounty and raids the gem you're short on
     - configurable via ;egemhoarder config <key> <value>
 
   author: elanthia-online
   contributors: Caithris, Falicor, Yalathanil
   game: gs
   tags: gems, hoarding, locker, jars
-  version: 2.1.0
+  version: 2.2.0
 
   Version Control:
+  v2.2.0 (2026-09-12)
+    - add bounty command: reads your active gem bounty and tops off the gemsack from
+      whichever known locker has that gem, leaving selling/turn-in to eloot or ebounty
+    - locker navigation now uses go2's CHE-aware locker target on newer Lich versions
   v2.1.0 (2026-09-12)
     - add combine command to merge duplicate partial jars of the same gem in bin into one
     - deposit now keeps filling additional jars in the same run instead of stopping after the first one fills
@@ -73,7 +78,7 @@ module EGemHoarder
   end
 
   def self.default_data
-    { jars: [], known_lockers: [], config: { lockermode: 'strict', exclude: [], gemsack: '', single_jar: false } }
+    { jars: [], known_lockers: [], locker_rooms: {}, config: { lockermode: 'strict', exclude: [], gemsack: '', single_jar: false } }
   end
 
   def self.save_data(data)
@@ -202,12 +207,22 @@ module EGemHoarder
     result =~ /You see nothing unusual/i ? true : false
   end
 
-  def self.go_to_locker
+  def self.go_to_locker(target: nil)
     return true if at_locker?
 
-    echo "EGemHoarder: navigating to public lockers..."
-    Script.run("go2", "publiclockers")
+    if target
+      echo "EGemHoarder: navigating to locker (room ##{target})..."
+      Script.run("go2", target.to_s)
+    else
+      echo "EGemHoarder: navigating to nearest locker..."
+      go2_target = Gem::Version.new(LICH_VERSION) >= Gem::Version.new('5.12.2') ? "locker" : "publiclockers"
+      Script.run("go2", go2_target)
+    end
     pause 0.5
+
+    # go2's "locker" target (Lich >= 5.12.2) is CHE-aware and may walk straight
+    # into the booth; only fall back to manual opening/curtain hunting if it didn't.
+    return true if at_locker?
 
     10.times do
       ["opening", "curtain"].each do |exit_name|
@@ -352,6 +367,7 @@ module EGemHoarder
     respond "                           Manually set/update a jar entry; n=0 to delete"
     respond "  raid <gem> [count]       Pull gems from locker into gemsack (default: 1)"
     respond "  combine                  Merge duplicate partial jars of the same gem in bin"
+    respond "  bounty                   Check your active gem bounty and raid the gem needed"
     respond ""
     respond "Config keys (;egemhoarder config <key> <value>):"
     respond "  gemsack <name>           Container holding loose gems (REQUIRED)"
@@ -364,9 +380,12 @@ module EGemHoarder
     respond "                           once that jar is full, extra gems stay in gemsack"
     respond ""
     respond "Notes:"
-    respond "  Deposit and raid auto-navigate to public lockers via go2,"
+    respond "  Deposit and raid auto-navigate to your nearest locker via go2,"
     respond "  stow held items, and return you to your original location."
     respond "  newlocker must be run from inside the locker room."
+    respond "  bounty reads your active bounty via Lich's Bounty API, tops off the"
+    respond "  gemsack from whichever known locker has the most of that gem, and"
+    respond "  leaves selling/turn-in to eloot or ebounty."
     respond ""
     respond "Examples:"
     respond "  ;egemhoarder config gemsack canvas gem pouch"
@@ -374,6 +393,7 @@ module EGemHoarder
     respond "  ;egemhoarder config exclude uncut diamond, doomstone, urglaes fang"
     respond "  ;egemhoarder config single_jar true"
     respond "  ;egemhoarder combine"
+    respond "  ;egemhoarder bounty"
     respond "  ;egemhoarder settings"
     respond "  ;egemhoarder search ruby"
     respond "  ;egemhoarder search green amber"
@@ -903,16 +923,7 @@ module EGemHoarder
 
   # -- Raid ----------------------------------------------------------------------
 
-  def self.raid(data, location)
-    args     = Script.current.vars[2..-1].to_a
-    count    = args.last =~ /^\d+$/ ? args.pop.to_i : 1
-    gem_name = args.join(' ').strip
-
-    if gem_name.empty?
-      echo "EGemHoarder: usage: ;egemhoarder raid <gem> [count]"
-      return
-    end
-
+  def self.raid(data, location, gem_name, count)
     sack = find_gemsack(data)
     return unless sack
 
@@ -1070,6 +1081,85 @@ module EGemHoarder
     save_data(data)
   end
 
+  # -- Bounty --------------------------------------------------------------------
+
+  def self.bounty(data)
+    task = Bounty.task
+
+    unless task.type == :gem
+      if task.type == :gem_assignment
+        echo "EGemHoarder: gem bounty offered but not accepted yet -- ask the jeweler about bounty first."
+      else
+        echo "EGemHoarder: no active gem-retrieval bounty right now (current: #{task.type})."
+      end
+      return
+    end
+
+    gem_name = task.gem.to_s
+    needed   = task.number.to_i
+
+    if gem_name.empty? || needed.zero?
+      echo "EGemHoarder: could not read the bounty's gem/count -- aborting."
+      return
+    end
+
+    sack = find_gemsack(data)
+    return unless sack
+
+    on_hand = gem_contents(sack).count { |g| clean_name(g.name) =~ gem_regex(gem_name) }
+    echo "EGemHoarder: bounty needs #{needed} #{gem_name}, you have #{on_hand} on hand."
+
+    deficit = needed - on_hand
+    if deficit <= 0
+      echo "EGemHoarder: enough on hand already -- hand off to eloot/ebounty to sell/turn in."
+      return
+    end
+
+    candidates = (data[:jars] || []).select { |j| clean_name(j[:gem]) =~ gem_regex(gem_name) }
+    if candidates.empty?
+      echo "EGemHoarder: no known locker has '#{gem_name}' jarred."
+      return
+    end
+
+    best_location, available = candidates
+                               .group_by { |j| j[:location] }
+                               .transform_values { |jars| jars.sum { |j| j[:count].to_i } }
+                               .max_by { |_loc, count| count }
+
+    take = [deficit, available].min
+
+    origin_id = Room.current.id
+    stowed    = stow_hands
+    room_id   = data.dig(:locker_rooms, best_location)
+
+    unless go_to_locker(target: room_id)
+      echo "EGemHoarder: could not reach the locker at #{best_location}."
+      restore_hands(stowed)
+      return
+    end
+
+    unless current_location == best_location
+      echo "EGemHoarder: ended up at #{current_location}, not the registered '#{best_location}' locker -- aborting raid."
+      close_locker
+      go_to_origin(origin_id)
+      restore_hands(stowed)
+      return
+    end
+
+    raid(data, best_location, gem_name, take)
+
+    close_locker
+    go_to_origin(origin_id)
+    restore_hands(stowed)
+
+    remaining = deficit - take
+    if remaining.positive?
+      echo "EGemHoarder: still short #{remaining} #{gem_name} -- other known lockers hold more but weren't visited this run."
+    else
+      echo "EGemHoarder: gemsack should now have enough #{gem_name} -- hand off to eloot/ebounty to sell/turn in."
+    end
+  end
+
   # -- Entry Point ---------------------------------------------------------------
 
   def self.main
@@ -1142,6 +1232,15 @@ module EGemHoarder
       restore_hands(stowed)
 
     when "raid"
+      args     = Script.current.vars[2..-1].to_a
+      count    = args.last =~ /^\d+$/ ? args.pop.to_i : 1
+      gem_name = args.join(' ').strip
+
+      if gem_name.empty?
+        echo "EGemHoarder: usage: ;egemhoarder raid <gem> [count]"
+        exit
+      end
+
       origin_id = Room.current.id
       stowed    = stow_hands
 
@@ -1162,18 +1261,25 @@ module EGemHoarder
         exit
       end
 
-      raid(data, location)
+      raid(data, location, gem_name, count)
 
       close_locker
       go_to_origin(origin_id)
       restore_hands(stowed)
 
+    when "bounty"
+      data[:jars]         ||= []
+      data[:locker_rooms] ||= {}
+      bounty(data)
+
     when "newlocker"
       location = current_location
       data[:jars]          ||= []
       data[:known_lockers] ||= []
+      data[:locker_rooms]  ||= {}
       if scan_locker(data, location)
         data[:known_lockers] |= [location]
+        data[:locker_rooms][location] = Room.current.id
         save_data(data)
         echo "EGemHoarder: #{location} registered. Run ;egemhoarder to deposit gems."
       end
@@ -1195,11 +1301,13 @@ module EGemHoarder
       location = current_location
       data[:known_lockers] ||= []
       data[:jars]          ||= []
+      data[:locker_rooms]  ||= {}
 
       unless data[:known_lockers].include?(location)
         echo "EGemHoarder: #{location} is a new locker -- scanning first..."
         if scan_locker(data, location)
           data[:known_lockers] |= [location]
+          data[:locker_rooms][location] = Room.current.id
           save_data(data)
         end
       end
