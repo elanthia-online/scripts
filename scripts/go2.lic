@@ -235,9 +235,9 @@ module Go2
   #   Events.on('go2.status', name: 'mysupervisor') { |_topic, st| ... }   # Lich 5.22+
   #   Go2.on_status('mysupervisor') { |st| ... }                          # any Lich
   #
-  # Both fire on the emitter's thread; set a flag or queue work, never fput
-  # from the block. The Events form is cleaned up automatically when your
-  # script dies. Fields:
+  # Both fire on go2's thread with a frozen snapshot of the status; set a flag
+  # or queue work, never fput from the block. The Events form is cleaned up
+  # automatically when your script dies. Fields:
   #   phase            :idle, :pathing, :moving, :blocked, :paused, :arrived, :failed, :aborted
   #   reason           why the last step didn't progress (game line), or nil
   #   command          the command go2 sent that didn't progress, or nil
@@ -268,8 +268,9 @@ module Go2
     @@last_result
   end
 
-  # Go2.on_status(name = caller script) { |status| ... } - called after each update.
-  # Hooks are removed with Go2.off_status(name). Exceptions in hooks are swallowed.
+  # Go2.on_status(name = caller script) { |status| ... } - called after each update
+  # with a frozen snapshot. Hooks are removed with Go2.off_status(name).
+  # Exceptions in hooks are swallowed.
   def self.on_status(name = nil, &block)
     return false unless block
     name ||= (Script.current&.name || 'unknown')
@@ -289,12 +290,23 @@ module Go2
   end
 
   # Tell everyone listening: the shared Events board when this Lich has it,
-  # and the script-local on_status hooks either way.
+  # and the script-local on_status hooks either way. Listeners get a frozen
+  # snapshot, never the live struct: what they stash stays what it was at
+  # emit time, and nothing they do can alter go2's own trip state. Neither
+  # route may raise into the movement loop, whatever a listener (or a
+  # half-loaded Events) does.
   def self.notify_status(st)
-    Lich::Common::Events.emit('go2.status', st) if defined?(Lich::Common::Events)
+    snapshot = st.dup.freeze
+    if defined?(Lich::Common::Events)
+      begin
+        Lich::Common::Events.emit('go2.status', snapshot)
+      rescue StandardError => e
+        Lich.log "go2: Events.emit failed: #{e.class}: #{e.message}" if defined?(Lich.log)
+      end
+    end
     @@status_hooks.each_value { |blk|
       begin
-        blk.call(st)
+        blk.call(snapshot)
       rescue StandardError => e
         Lich.log "go2: status hook error: #{e.class}: #{e.message}" if defined?(Lich.log)
       end
@@ -306,12 +318,14 @@ module Go2
     status_update(**fields)
   end
 
-  # Called when the trip ends: freeze a copy as last_result, then go idle.
+  # Called when the trip ends: emit the terminal phase, keep a frozen copy as
+  # last_result, then go idle silently. "Went idle" follows every trip end and
+  # is not a transition a listener can act on, so it is not emitted; act on
+  # :arrived / :failed / :aborted instead.
   def self.status_finish(phase, **fields)
     status_update(phase: phase, **fields)
     @@last_result = @@status.dup.freeze
     @@status = Status.new(phase: :idle, restarts: 0, max_restarts: 0)
-    notify_status(@@status)
     @@last_result
   end
 
