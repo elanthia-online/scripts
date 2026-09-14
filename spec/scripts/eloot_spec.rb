@@ -2219,7 +2219,7 @@ RSpec.describe 'ELoot.shop_unavailable_in_town?' do
     # The predicate reads the HINTERWILDS_TOWN_UID constant defined alongside it in
     # eloot.lic; mirror it from the source so this spec fails loudly if that constant is
     # renamed or its value changed, rather than passing against a stale hardcoded number.
-    uid = extract_from_source(source, /HINTERWILDS_TOWN_UID = \d+/, label: 'HINTERWILDS_TOWN_UID', source_path: path)
+    uid = extract_from_source(source, /HINTERWILDS_TOWN_UID \|\|= \d+/, label: 'HINTERWILDS_TOWN_UID', source_path: path)
 
     mod = Module.new
     mod.const_set(:Room, ShopGuardHarness::Room)
