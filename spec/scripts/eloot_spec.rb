@@ -99,12 +99,18 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
   let(:box_contents) { [] }
   let(:box) { Struct.new(:id, :name, :contents).new('box-1', 'a strongbox', box_contents) }
 
+  # Shops the current town hasn't got (ELoot.nearest_shop returns nil for these).
+  let(:unavailable_shops) { [] }
+
   let(:harness) do
     recorder = calls
     routes = routing
+    missing = unavailable_shops
 
     mod = Module.new
     mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
+    # Mirrors ELoot.nearest_shop: nil when the town hasn't got the shop.
+    mod.define_singleton_method(:nearest_shop) { |shop| missing.include?(shop) ? nil : "#{shop}-room" }
     mod.const_set(:ELoot, mod)
 
     room = Module.new
@@ -182,6 +188,50 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
       harness.sell_box_contents(box, data)
 
       expect(calls.select { |c| c.first == :go2 }).to contain_exactly([:go2, 'pawnshop-room'], [:go2, 'gemshop-room'])
+    end
+  end
+
+  # v2.11.9 regression: this recovery picks its shops with its own nearest-shop lookup
+  # rather than going through Sell.go_sell, so it did not get go_sell's Hinterwilds
+  # skip. At the Hinterwilds locksmith pool -- which is where this code runs -- a box
+  # holding a pawnshop-only item would walk the character to Icemule Trace mid-hunt.
+  context 'in a town without a pawnshop (Hinterwilds locksmith pool)' do
+    let(:unavailable_shops) { ['pawnshop'] }
+    let(:spur) { item_class.new('1', 'a drake yierka-spur') }
+    let(:orb) { item_class.new('2', 'a shimmering blue orb') }
+    let(:box_contents) { [spur, orb] }
+    let(:routing) do
+      { 'a drake yierka-spur' => ['pawnshop'], 'a shimmering blue orb' => ['gemshop'] }
+    end
+
+    it 'does not leave town for the pawnshop' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls.select { |c| c.first == :go2 }).to contain_exactly([:go2, 'gemshop-room'])
+    end
+
+    it 'still sells what the town can buy' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).to include([:appraise, 'a shimmering blue orb', 'Gemshop'])
+    end
+
+    it 'leaves the unsellable item in the box' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls.map { |c| c[1] }).not_to include('a drake yierka-spur')
+    end
+  end
+
+  context 'when nothing in the box can be sold in this town' do
+    let(:unavailable_shops) { ['pawnshop'] }
+    let(:box_contents) { [item_class.new('1', 'a drake yierka-spur')] }
+    let(:routing) { { 'a drake yierka-spur' => ['pawnshop'] } }
+
+    it 'never travels at all' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).to be_empty
     end
   end
 
@@ -1936,14 +1986,15 @@ RSpec.describe 'ELoot::Sell.retry_wrong_shop_jewelry_at_pawnshop' do
     mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
     mod.define_singleton_method(:silver_check) { silvers.shift }
     mod.define_singleton_method(:data) { data_obj }
-    mod.define_singleton_method(:shop_unavailable_in_town?) { |shop| recorder << [:shop_check, shop]; unavailable }
+    # Two distinct cases the method handles differently: the town hasn't got a pawnshop
+    # at all (clear the queue -- it can never succeed here), vs. no pawnshop reachable
+    # (leave it queued for a later run, the pre-existing behaviour).
+    mod.define_singleton_method(:shop_unavailable_in_town?) do |shop|
+      recorder << [:shop_check, shop]
+      unavailable
+    end
+    mod.define_singleton_method(:nearest_shop) { |_shop| found ? 'pawnshop-room' : nil }
     mod.const_set(:ELoot, mod)
-
-    room = Module.new
-    current = Module.new
-    current.define_singleton_method(:find_nearest_by_tag) { |_tag| found ? 'pawnshop-room' : nil }
-    room.define_singleton_method(:current) { current }
-    mod.const_set(:Room, room)
 
     inventory = Module.new
     inventory.define_singleton_method(:drag) { |item| recorder << [:drag, item.name] }
@@ -2239,5 +2290,47 @@ RSpec.describe 'ELoot.shop_unavailable_in_town?' do
     it 'returns false for nil rather than raising' do
       expect(guard.shop_unavailable_in_town?(nil)).to be false
     end
+  end
+end
+
+# ELoot.nearest_shop folds the town guard into the shop lookup itself, so a sell path
+# gets the Hinterwilds skip by construction rather than having to remember a separate
+# check. Verified here against the real method body, with find_nearest_by_tag stubbed,
+# since its whole contract is "nil means don't go".
+RSpec.describe 'ELoot.nearest_shop' do
+  let(:lookup) do
+    path = find_lic_source('eloot.lic', from: __dir__)
+    source = File.read(path)
+    body = extract_lic_method(source, 'nearest_shop', source_path: path)
+
+    mod = Module.new
+    mod.module_eval(body)
+    mod
+  end
+
+  # Stubs the guard and the underlying map lookup independently.
+  def with(unavailable:, found: 'pawnshop-room')
+    mod = lookup
+    eloot = Module.new
+    eloot.define_singleton_method(:shop_unavailable_in_town?) { |_shop| unavailable }
+    room = Module.new
+    current = Module.new
+    current.define_singleton_method(:find_nearest_by_tag) { |_shop| found }
+    room.define_singleton_method(:current) { current }
+    mod.const_set(:ELoot, eloot) unless mod.const_defined?(:ELoot, false)
+    mod.const_set(:Room, room) unless mod.const_defined?(:Room, false)
+    mod
+  end
+
+  it 'returns the nearest room when the town has the shop' do
+    expect(with(unavailable: false).nearest_shop('pawnshop')).to eq('pawnshop-room')
+  end
+
+  it 'returns nil when the town has not got the shop, without consulting the map' do
+    expect(with(unavailable: true).nearest_shop('pawnshop')).to be_nil
+  end
+
+  it 'returns nil when the shop is allowed but unreachable' do
+    expect(with(unavailable: false, found: nil).nearest_shop('pawnshop')).to be_nil
   end
 end
