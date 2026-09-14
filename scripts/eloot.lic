@@ -15,9 +15,16 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.15.0
-           version: 2.11.8
+           version: 2.11.9
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.11.9 (2026-09-14)
+    - fix: selling in the Hinterwilds (Coldriver Village) no longer walks you to Icemule
+      Trace. The town has no pawnshop, and several sell paths routed to the nearest one
+      anywhere on the map instead of skipping it like the main sell trip already did.
+      Affected the pawnshop retries added in v2.11.7, the locksmith pool full-box
+      recovery added in v2.11.8, and ;eloot sell/type. Those items are left with your
+      loot again, as they were before.
   v2.11.8 (2026-09-09)
     - fix: eloot could pause and wait for you to clear space by hand when the locksmith
       pool handed back a box and your containers were already full. It now sells off
@@ -3215,6 +3222,44 @@ module ELoot # Game utility type methods
     (room.location =~ /Four Winds|Mist Harbor|Western Harbor/)
   end
 
+  # The Hinterwilds town (Coldriver Village) has only a gemshop, a furrier and
+  # the locksmith pool -- no pawnshop, collectibles, consignment or chronomage.
+  # Any trip to one of those from here leaves the area entirely (the nearest
+  # pawnshop on the map is Icemule's), which is almost never what you want mid-
+  # hunt, so we skip those shops unless "Sell in FWI" is on and you've opted
+  # into travelling to sell. Shared by every shop-routing path so a new one
+  # can't quietly reintroduce the cross-continent walk.
+  HINTERWILDS_TOWN_UID ||= 7503205
+
+  def self.shop_unavailable_in_town?(shop)
+    return false unless shop.to_s =~ /collect|pawnshop|consignment|chronomage/
+    return false if ELoot.data.settings[:sell_fwi]
+
+    town = Room.current.find_nearest_by_tag("town")
+    return false if town.nil?
+
+    Room[town].uid.first == HINTERWILDS_TOWN_UID
+  end
+
+  # Single way to ask "where do I sell this, and should I even go?". Returns the
+  # nearest room tagged for the shop, or nil when the shop doesn't exist in this
+  # town (see shop_unavailable_in_town?) or isn't reachable at all.
+  #
+  # Every path that travels to a shop should find it through here rather than
+  # calling find_nearest_by_tag directly: that method searches the whole map
+  # graph with no town or distance scoping, so in a town without the shop it
+  # happily returns one on the other side of the continent. Folding the guard
+  # into the lookup means a new sell path gets it by construction instead of
+  # having to remember a separate check -- which is exactly how the v2.11.7
+  # pawnshop retry ended up walking Hinterwilds hunters to Icemule Trace.
+  # @param shop [String] shop tag, e.g. "pawnshop"
+  # @return [Integer, nil] room id to travel to, or nil to skip this shop
+  def self.nearest_shop(shop)
+    return nil if ELoot.shop_unavailable_in_town?(shop)
+
+    Room.current.find_nearest_by_tag(shop)
+  end
+
   def self.fwi_return
     current_town = Room.current.find_nearest_by_tag("town")
 
@@ -5351,7 +5396,7 @@ module ELoot # Room looting
       end
       return if routed.empty?
 
-      rooms = routed.map(&:last).uniq.filter_map { |shop| Room.current.find_nearest_by_tag(shop) }.uniq
+      rooms = routed.map(&:last).uniq.filter_map { |shop| ELoot.nearest_shop(shop) }.uniq
       return if rooms.empty?
 
       _prev, distances = Room.current.dijkstra
@@ -5951,10 +5996,15 @@ module ELoot # Sells the loot
       items = Array(ELoot.data.pawn_recheck).compact
       return if items.empty?
 
+      if ELoot.shop_unavailable_in_town?("pawnshop")
+        ELoot.msg(type: "info", text: " No pawnshop in this town; leaving the refused items with your loot.", space: true)
+        ELoot.data.pawn_recheck = []
+        return
+      end
+
       ELoot.msg(type: "info", text: " Rechecking #{items.length} gemshop-refused item(s) at the pawnshop...", space: true)
 
-      pawn = Room.current.find_nearest_by_tag("pawnshop")
-      if pawn.nil?
+      if ELoot.nearest_shop("pawnshop").nil?
         ELoot.msg(type: "info", text: " No pawnshop found nearby; leaving the refused items with your loot.")
         return
       end
@@ -6007,10 +6057,15 @@ module ELoot # Sells the loot
       items = Array(ELoot.data.jewelry_wrong_shop).compact
       return if items.empty?
 
+      if ELoot.shop_unavailable_in_town?("pawnshop")
+        ELoot.msg(type: "info", text: " No pawnshop in this town; leaving the declined items with your loot.", space: true)
+        ELoot.data.jewelry_wrong_shop = []
+        return
+      end
+
       ELoot.msg(type: "info", text: " Selling #{items.length} gemshop-declined item(s) at the pawnshop...", space: true)
 
-      pawn = Room.current.find_nearest_by_tag("pawnshop")
-      if pawn.nil?
+      if ELoot.nearest_shop("pawnshop").nil?
         ELoot.msg(type: "info", text: " No pawnshop found nearby; leaving the declined items with your loot.")
         return
       end
@@ -6489,11 +6544,11 @@ module ELoot # Sells the loot
     def self.collectibles
       return unless ELoot.data.settings[:sell_collectibles]
 
-      places = []
-      places.push(Room.current.find_nearest_by_tag("collectible")) unless Room.current.find_nearest_by_tag("collectible").nil?
-      places.push(Room.current.find_nearest_by_tag("collectibles")) unless Room.current.find_nearest_by_tag("collectibles").nil?
+      places = [ELoot.nearest_shop("collectible"), ELoot.nearest_shop("collectibles")].compact
+      return if places.empty?
 
       go_place = Room.current.find_nearest(places)
+      return if go_place.nil?
 
       ELoot.go2(go_place)
 
@@ -6592,8 +6647,10 @@ module ELoot # Sells the loot
 
       Inventory.clear_hands
 
-      # Go to each location and sell
+      # Go to each location and sell, skipping any this town hasn't got
       locations.each do |place|
+        next if ELoot.shop_unavailable_in_town?(place)
+
         ELoot.go2(place)
         ELoot.wait_rt
 
@@ -6715,7 +6772,11 @@ module ELoot # Sells the loot
       # if its empty we are done
       return if locations.empty?
 
-      # finally lets go sell stuff
+      # finally lets go sell stuff, skipping any shop this town hasn't got. No early
+      # return on an empty list: hands still need returning, and finish_sell_run has
+      # its own queued-item work to do (and its own town guard) regardless.
+      locations = locations.reject { |shop| ELoot.shop_unavailable_in_town?(shop) }
+
       Sell.gold_rings if locations.include?("chronomage")
       Sell.furrier if locations.include?("furrier")
       Sell.gemshop(sell_types) if locations.include?("gemshop")
@@ -7018,17 +7079,14 @@ module ELoot # Sells the loot
 
       rooms = []
       selling.each { |shop|
-        if Room[Room.current.find_nearest_by_tag("town")].uid.first == 7503205 && !ELoot.data.settings[:sell_fwi] # HW doesn't have some shops
-          next if shop =~ /collect|pawnshop|consignment|chronomage/
-        end
-
         next if shop == "chronomage" && ELoot.fwi?(Room.current) # No chronomage in FWI
         if shop == "chronomage" && !ELoot.fwi?(Room.current) && ELoot.data.settings[:sell_fwi]
           Sell.gold_rings
           next
         end
 
-        room = Room.current.find_nearest_by_tag(shop)
+        # nil when the town hasn't got the shop (HW) or it isn't reachable
+        room = ELoot.nearest_shop(shop)
         rooms.push(room) unless room.nil?
       }
 
