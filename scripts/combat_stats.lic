@@ -1,0 +1,1563 @@
+# frozen_string_literal: true
+
+=begin
+  combat_stats.lic - record combat to SQLite and report on it on demand.
+
+  Recording: rides the Combat module's observer seam - every assembled
+  attack (resolutions, flares, hits, crits), status change, spell loss
+  and UCS fact lands in a per-character database as it happens.
+  Sessions are hunts: one opens on the first combat event and closes
+  after 5 minutes without one (inbound or outbound), stamped at the
+  last event's time so town time never pads a hunt. When a hunt
+  closes, a one-line notice with a [report] link prints - the full
+  report is on demand only.
+
+  Reports (upstream hook - type these like game commands, or click):
+    cstats                      session report for the latest hunt
+    cstats <id>                 session report for a specific hunt
+    cstats full [id]            session report listing every creature instance
+    cstats all                  aggregate report over every hunt
+    cstats last <n>             aggregate report over the last n hunts
+    cstats sessions             list recent hunts
+    cstats abilities [scope]    damage-by-ability / flare rollup for a hunt
+                                (scope: id | all | last <n>; also for blind/control/
+                                family/aim/accuracy/ttk below)
+    cstats creature <id|noun>   a creature's attack tree
+    cstats attack <name> [n]    the nth instance of an attack (attack #<id> by row id)
+    cstats tree <id>            a spawn tree (root attack id)
+    cstats flare [name]         flare analytics
+    cstats def [noun]           DS/TD/UDF readings
+    cstats hp [noun|id]         creature HP estimates
+    cstats blind|control|family [session]
+    cstats aim [location] [session]
+    cstats accuracy|ttk [session]
+    cstats compare [session session]
+    cstats creature full <id>   original detailed tree
+    cstats help
+
+  The database (7 tables: sessions/creatures/attacks/resolutions/
+  flares/hits/statuses) lives at:
+    <DATA_DIR>/<game>/<character>/combat_stats.db
+
+  author: Elanthia Online
+  contributors: Nisugi
+  game: Gemstone
+  tags: combat, recording, statistics
+  version: 1.0.0 (2026-09-12)
+  required: Lich >= 5.21.1
+=end
+
+# The recorder schema this script reads (attacks.ours, flares.ours,
+# creatures.kill_credit, parent_confidence 'unbound', the session-finished
+# hook) shipped in Lich 5.21.1; gate before the require so an older Lich gets
+# the standard "too old" notice instead of a load error.
+exit unless Script.require_lich_version!
+
+require File.join(LIB_DIR, 'gemstone', 'combat', 'recorder')
+
+module CombatStats
+  IDLE_TIMEOUT = 300 # seconds without a combat event = hunt over
+  HOOK_NAME = 'combat_stats'
+  CMD_PATTERN = /^(?:<c>)?cstats?(?:\s+(.*))?$/i.freeze
+
+  Combat = Lich::Gemstone::Combat
+
+  DB_PATH = File.join(DATA_DIR, XMLData.game, XMLData.name, 'combat_stats.db')
+
+  # Ownership is decided by the recorder at write time (attacks.ours,
+  # flares.ours); these fragments only name the columns for each query shape.
+  #
+  # Our own OUTBOUND attack: not inbound, not a nearby player's, not on a
+  # foreign target, not an unowned effect tick, not an orphan sink row.
+  OWN_ATTACK = 'a.ours = 1'
+  # OWN_ATTACK without the `a.` table qualifier, for single-table attack queries.
+  OWN_ATTACK_BARE = 'ours = 1'
+  # A flare of ours (2p). On an inbound row this is our REACTIVE flare (shield
+  # spike, thorns); the creature's own weapon proc striking us has ours = 0.
+  OWN_FLARE = 'f.ours = 1'
+  # A hit WE dealt: its attack `a` is ours, or it rode a flare of ours
+  # (a reactive flare on an inbound row). Needs hits `h` and attacks `a` in scope.
+  OWN_HIT = "(a.ours = 1 OR EXISTS (SELECT 1 FROM flares f WHERE f.id = h.flare_id AND #{OWN_FLARE}))"
+  # Damage WE dealt to a creature, classified by the hit's RECIPIENT.
+  OUR_DMG_TO_CREATURE = "h.creature_id IS NOT NULL AND #{OWN_HIT}"
+  # The kill is ours when the crediting attack `a` is our own swing, OR when
+  # a hit of ours on creature `c` rode it (our reactive flare on an inbound
+  # row). The recorder picks the crediting attack (creatures.kill_credit).
+  OUR_KILL = "(#{OWN_ATTACK} OR EXISTS (SELECT 1 FROM hits h JOIN flares f ON f.id = h.flare_id " \
+             "WHERE h.attack_id = a.id AND h.creature_id = c.id AND #{OWN_FLARE}))"
+
+  RULE = '-' * 60
+
+  class << self
+    # ---- db / formatting helpers -------------------------------------
+
+    def with_db
+      db = SQLite3::Database.new(DB_PATH, readonly: true)
+      db.busy_timeout = 2_000
+      yield db
+    ensure
+      db&.close
+    end
+
+    def fmt_ts(epoch)
+      epoch ? Time.at(epoch).strftime('%Y-%m-%d %H:%M:%S') : ''
+    end
+
+    def fmt_clock(epoch)
+      epoch ? Time.at(epoch).strftime('%H:%M:%S') : ''
+    end
+
+    def fmt_dur(sec)
+      return 'open' unless sec
+
+      sec = sec.round
+      sec >= 60 ? format('%dm%02ds', sec / 60, sec % 60) : "#{sec}s"
+    end
+
+    # "[LEFT ARM R5 PUNCTURE]" from a hit row's location / crit_rank / crit_type
+    def crit_str(loc, rank, type)
+      return '' unless loc
+
+      "[#{[loc.to_s.upcase, ("R#{rank}" if rank), type&.upcase].compact.join(' ')}]"
+    end
+
+    # signed integer for resolution lines ("+520", "-12")
+    def sgn(n)
+      n.nil? ? '?' : format('%+d', n)
+    end
+
+    # "AS: +639 vs DS: +250 with AvD: +27 + d100: +94 = +510" etc, per roll type
+    def resolution_line(type, att, def_, mod, roll, bonus, penalty, result, total)
+      case type
+      when 'as_ds'   then "AS: #{sgn(att)} vs DS: #{sgn(def_)} with AvD: #{sgn(mod)} + d100: #{sgn(roll)} = #{sgn(result)}"
+      when 'cs_td'   then "CS: #{sgn(att)} - TD: #{sgn(def_)} + CvA: #{sgn(mod)} + d100: #{sgn(roll)} = #{sgn(result)}"
+      when 'uaf_udf' then "UAF: #{sgn(att)} vs UDF: #{sgn(def_)} = #{total || '?'} + MM: #{sgn(mod)} + d100: #{sgn(roll)} = #{sgn(result)}"
+      when 'fear'    then "FS: #{sgn(att)} vs FD: #{sgn(def_)} with FvP: #{sgn(mod)} + d100: #{sgn(roll)} = #{sgn(result)}"
+      else
+        parts = ["d100: #{roll}"]
+        parts << "Bonus: #{sgn(bonus)}" if bonus
+        parts << "Penalty: #{sgn(penalty)}" if penalty
+        "#{type.to_s.upcase} result: #{result} (#{parts.join(', ')})"
+      end
+    end
+
+    # ---- output helpers (Lich::Messaging) ---------------------------
+
+    # A clickable link running a CombatStats method via ;eq (quiet exec, so
+    # Lich does not print "exec active / has exited" around the report).
+    def link(label, call)
+      Lich::Messaging.make_cmd_link(label.to_s, ";eq CombatStats.#{call}")
+    end
+
+    def say(line)
+      Lich::Messaging.msg('info', line.to_s)
+      nil
+    end
+
+    # A whole report goes out as ONE mono block so it stays aligned in any
+    # frontend. Lines may contain <d cmd=...> links (mono passes them raw).
+    def mono(lines)
+      Lich::Messaging.mono(Array(lines).join("\n"))
+      nil
+    end
+
+    # ASCII grid lines (widths measured on visible text, tags stripped).
+    def grid(cols, rows)
+      strip = ->(s) { s.to_s.gsub(/<[^>]+>/, '') }
+      widths = cols.each_index.map do |i|
+        ([strip.call(cols[i]).length] + rows.map { |r| strip.call(r[i]).length }).max
+      end
+      sep = '+' + widths.map { |w| '-' * (w + 2) }.join('+') + '+'
+      pad = ->(cell, i) { " #{cell}#{' ' * (widths[i] - strip.call(cell).length)} " }
+      lines = [sep, '|' + cols.each_index.map { |i| pad.call(cols[i].to_s, i) }.join('|') + '|', sep]
+      rows.each { |r| lines << '|' + cols.each_index.map { |i| pad.call(r[i].to_s, i) }.join('|') + '|' }
+      lines << sep
+    end
+
+    def table(title, cols, rows)
+      mono(section(title, cols, rows))
+    end
+
+    # A titled grid as lines, for reports that stack several grids in one mono block.
+    def section(title, cols, rows)
+      [title] + grid(cols, rows)
+    end
+
+    # ---- scope -------------------------------------------------------
+    # A report scope is nil (the latest hunt), a session id, :all (every
+    # hunt in this character's database) or an Array of session ids
+    # (`cstats ... last N`). resolve_scope returns [ids, label] - ids is
+    # nil for :all - or nil when nothing matches; scope_sql turns ids into
+    # a WHERE fragment on the given column, so one query serves every scope.
+
+    def resolve_scope(db, scope)
+      case scope
+      when :all
+        n = db.get_first_value('SELECT COUNT(*) FROM sessions').to_i
+        return nil if n.zero?
+
+        [nil, "ALL #{n} SESSIONS"]
+      when Array
+        ids = scope.map(&:to_i).uniq
+        return nil if ids.empty?
+
+        [ids, ids.size == 1 ? "SESSION ##{ids.first}" : "LAST #{ids.size} SESSIONS (##{ids.min}-##{ids.max})"]
+      else
+        sid = scope ? scope.to_i : db.get_first_value('SELECT MAX(id) FROM sessions')
+        return nil unless sid && db.get_first_value('SELECT 1 FROM sessions WHERE id = ?', [sid])
+
+        [[sid], "SESSION ##{sid}"]
+      end
+    end
+
+    def scope_sql(col, ids)
+      return ['1=1', []] if ids.nil?
+
+      ["#{col} IN (#{(['?'] * ids.size).join(',')})", ids]
+    end
+
+    def last_sessions(db, n)
+      db.execute('SELECT id FROM sessions ORDER BY id DESC LIMIT ?', [[n.to_i, 1].max]).flatten
+    end
+
+    # Trailing scope words of a command ("all", "last N", "ID"), consumed
+    # from `words`; nil when none (= latest hunt).
+    def scope_from_words(words, db = nil)
+      if words.last.to_s =~ /\Aall\z/i
+        words.pop
+        :all
+      elsif words.size >= 2 && words[-2] =~ /\Alast\z/i && words[-1] =~ /\A\d+\z/
+        n = words.pop.to_i
+        words.pop
+        db ? last_sessions(db, n) : with_db { |d| last_sessions(d, n) }
+      elsif words.last.to_s =~ /\A\d+\z/
+        words.pop.to_i
+      end
+    end
+
+    # Ruby literal for a scope inside a link
+    def scope_lit(scope)
+      case scope
+      when :all then ':all'
+      when Array then scope.inspect
+      when nil then 'nil'
+      else scope.to_i.to_s
+      end
+    end
+
+    # Clickable picker: items wrapped a few per line, each a link.
+    def link_picker(title, items, per_row = 4)
+      return say("#{title}  (none)") if items.empty?
+
+      lines = [title]
+      items.each_slice(per_row) { |slice| lines << '  ' + slice.map { |it| link("[#{it}]", yield(it)) }.join('  ') }
+      mono(lines)
+    end
+
+    def quick_actions(scope = nil)
+      lit = scope_lit(scope)
+      sid = scope.is_a?(Integer) ? scope : nil
+      [
+        RULE,
+        'QUICK ACTIONS:',
+        '  ' + [
+          link('[sessions]', 'list_sessions'),
+          link('[all hunts]', 'aggregate_report(:all)'),
+          link('[abilities]', "recount(#{lit})"),
+          link('[recent attacks]', 'recent_attacks(20)'),
+          link('[creatures]', 'recent_creatures(20)'),
+          link('[flares]', 'flare_report'),
+          link('[defenses]', 'defense_report'),
+          link('[hp]', "hp_report(#{sid || 'nil'})"),
+          link('[accuracy]', "analytics_report(:accuracy, #{lit})"),
+          link('[kill efficiency]', "analytics_report(:ttk, #{lit})")
+        ].join('  ')
+      ]
+    end
+
+    # ---- dispatch ----------------------------------------------------
+
+    def report(arg)
+      arg = arg.to_s.strip
+      cmd, rest = arg.split(/\s+/, 2)
+      cmd = cmd.to_s
+      case cmd
+      when ''                        then session_report(nil)
+      when /\A(?:menu|help)\z/i      then usage
+      when /\A\d+\z/                 then session_report(cmd.to_i, full: rest.to_s =~ /\Afull\z/i ? true : false)
+      when /\Afull\z/i               then session_report(rest =~ /\A\d+\z/ ? rest.to_i : nil, full: true)
+      when /\A(?:session|report)\z/i then session_report(rest =~ /\A\d+\z/ ? rest.to_i : nil)
+      when /\Asessions\z/i           then list_sessions
+      when /\Aall\z/i                then aggregate_report(:all)
+      when /\Alast\z/i               then rest =~ /\A\d+\z/ ? aggregate_report(with_db { |db| last_sessions(db, rest.to_i) }) : say('[combat_stats] usage: cstats last N')
+      when /\A(?:abilit(?:y|ies)|recount)\z/i then recount(scope_from_words(rest.to_s.split))
+      when /\Acreatures?\z/i         then dispatch_creature(rest)
+      when /\Aattacks?\z/i           then dispatch_attack(rest)
+      when /\Atree\z/i               then rest =~ /\A\d+\z/ ? tree_report(rest.to_i) : say('[combat_stats] usage: cstats tree ID (root attack id)')
+      when /\Aflares?\z/i            then flare_report(rest)
+      when /\Adef(?:ense)?\z/i       then defense_report(rest)
+      when /\Ahp\z/i                 then hp_report(rest)
+      when /\A(?:blind|control|aim|accuracy|ttk|compare|family)\z/i then analytics_report(cmd.downcase, rest)
+      else usage
+      end
+      nil
+    rescue StandardError => e
+      # ANY report failure stays in the report: this runs on the script's
+      # thread, and an unrescued error would end the script - and with it
+      # the recorder, silently losing the rest of the hunt
+      respond "[combat_stats] report error: #{e.class}: #{e.message}"
+      respond "[combat_stats]   #{e.backtrace&.first}" if e.backtrace
+      nil
+    end
+
+    # cstats attack            -> recent-attack feed
+    # cstats attack last [n]   -> recent-attack feed, n rows
+    # cstats attack #<id>      -> that attack row's detail
+    # cstats attack <name> [n] -> nth instance of that attack type
+    def dispatch_attack(rest)
+      a, b = rest.to_s.strip.split(/\s+/, 2)
+      if a.nil? || a.empty?          then recent_attacks
+      elsif a =~ /\Alast\z/i         then recent_attacks(b.to_i)
+      elsif a =~ /\A#?(\d+)\z/       then attack_detail(Regexp.last_match(1).to_i)
+      else                                attack_report(a, b)
+      end
+    end
+
+    # cstats creature                -> top creatures picker
+    # cstats creature last [n]       -> recent-creature feed
+    # cstats creature <exist_id|noun> [idx]
+    def dispatch_creature(rest)
+      a, b = rest.to_s.strip.split(/\s+/, 2)
+      if a.to_s.downcase == 'full' then creature_report(b, nil, full: true)
+      elsif a.nil? || a.empty? then creature_report(nil)
+      elsif a =~ /\Alast\z/i then recent_creatures(b.to_i)
+      else                        creature_report(a, b)
+      end
+    end
+
+    def usage
+      mono([
+             'cstats - click to explore, or type a command:',
+             '  ' + [
+               link('[session report]', 'session_report(nil)'),
+               link('[all hunts]', 'aggregate_report(:all)'),
+               link('[sessions]', 'list_sessions'),
+               link('[abilities]', 'recount(nil)'),
+               link('[recent attacks]', 'recent_attacks(20)'),
+               link('[creatures]', 'recent_creatures(20)'),
+               link('[flares]', 'flare_report'),
+               link('[defenses]', 'defense_report'),
+               link('[hp]', 'hp_report'),
+               link('[blind]', "analytics_report(:blind)"),
+               link('[aim]', "analytics_report(:aim)"),
+               link('[accuracy]', "analytics_report(:accuracy)"),
+               link('[kill efficiency]', "analytics_report(:ttk)"),
+               link('[control]', "analytics_report(:control)"),
+               link('[photo/bloom]', "analytics_report(:family)"),
+               link('[compare hunts]', "analytics_report(:compare)")
+             ].join('  '),
+             '',
+             # (no angle brackets - mono output is raw markup to the frontend)
+             'commands (SCOPE = hunt ID | all | last N; default latest hunt):',
+             '  cstats blind|control|family [SCOPE]  control and photo/bloom coverage',
+             '  cstats accuracy|ttk [SCOPE]          accuracy and kill efficiency',
+             '  cstats aim [LOCATION] [SCOPE]        aimed comparison; location is assumed',
+             '  cstats compare [SESSION SESSION]      compare hunts (default: latest two)',
+             '  cstats                      session report for the latest hunt',
+             '  cstats ID                   session report for hunt ID',
+             '  cstats full [ID]            session report with every creature instance listed',
+             '  cstats all | last N         aggregate report over every hunt / the last N',
+             '  cstats sessions             list recent hunts',
+             '  cstats abilities [SCOPE]    damage by ability / flare rollup',
+             '  cstats creature full ID    full creature tree',
+             '  cstats creature ID|NOUN     a creature\'s attack tree (creature last [N] = recent feed)',
+             '  cstats attack NAME [N]      Nth instance of an attack; attack #ID = by row id',
+             '  cstats tree ID              a spawn tree by root attack id',
+             '  cstats flare [NAME]         flare analytics (crit-rank / location)',
+             '  cstats def [NOUN]           DS/TD/UDF readings for a creature',
+             '  cstats hp [NOUN|ID]         creature HP estimates'
+           ])
+    end
+
+    # ---- sessions ----------------------------------------------------
+
+    def list_sessions(n = 10)
+      with_db do |db|
+        rows = db.execute(<<~SQL, [[n.to_i, 1].max])
+          SELECT s.id, s.character, s.started_at, s.ended_at,
+                 (SELECT MAX(occurred_at) FROM attacks WHERE session_id = s.id),
+                 (SELECT COUNT(*) FROM attacks a WHERE a.session_id = s.id AND #{OWN_ATTACK}),
+                 (SELECT COUNT(*) FROM creatures c JOIN attacks a ON a.id = c.killed_by_attack_id
+                   WHERE c.session_id = s.id AND c.killed_at IS NOT NULL AND #{OUR_KILL}),
+                 (SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id
+                   WHERE h.session_id = s.id AND #{OUR_DMG_TO_CREATURE})
+          FROM sessions s ORDER BY s.id DESC LIMIT ?
+        SQL
+        return say('[combat_stats] no sessions recorded yet') if rows.empty?
+
+        table_rows = rows.map do |id, char, st, en, last, atks, kills, dmg|
+          [link(id, "session_report(#{id})"), char.to_s, fmt_ts(st), fmt_ts(last || st),
+           en ? fmt_ts(en) : 'ACTIVE', atks.to_s, kills.to_s, dmg.to_s]
+        end
+        table("Last #{rows.size} Combat Sessions (click an id)",
+              ['ID', 'Character', 'Started At', 'Last Event', 'Ended At', 'Attacks', 'Kills', 'Damage'], table_rows)
+      end
+    end
+
+    # Kills vs assists, both ownership-scoped:
+    #   kill   - creature died and OUR attack landed the fatal blow
+    #   assist - creature died, we damaged it, someone else landed the blow
+    # `scope` is a session id, an Array of ids, or nil for every session.
+    def kill_assist_counts(db, scope)
+      cc, cp = scope_sql('c.session_id', scope.is_a?(Integer) ? [scope] : scope)
+      kills = db.get_first_value(<<~SQL, cp)
+        SELECT COUNT(*) FROM creatures c JOIN attacks a ON a.id = c.killed_by_attack_id
+        WHERE #{cc} AND c.killed_at IS NOT NULL AND #{OUR_KILL}
+      SQL
+      assists = db.get_first_value(<<~SQL, cp)
+        SELECT COUNT(*) FROM creatures c
+        WHERE #{cc} AND c.killed_at IS NOT NULL
+          AND EXISTS (SELECT 1 FROM hits h JOIN attacks a ON a.id = h.attack_id WHERE h.creature_id = c.id AND #{OWN_HIT})
+          AND (c.killed_by_attack_id IS NULL
+               OR NOT EXISTS (SELECT 1 FROM attacks a WHERE a.id = c.killed_by_attack_id AND #{OUR_KILL}))
+      SQL
+      [kills.to_i, assists.to_i]
+    end
+
+    # === SESSION REPORT #n === : header, stats, creatures grouped by kind.
+    # Compact by default (one line per kind); full: true lists every instance.
+    def session_report(session_id = nil, full: false)
+      with_db do |db|
+        latest = db.get_first_value('SELECT MAX(id) FROM sessions')
+        return say('[combat_stats] no sessions recorded yet') unless latest
+
+        session_id ||= latest
+        meta = db.get_first_row('SELECT character, started_at, ended_at FROM sessions WHERE id = ?', [session_id])
+        return say("[combat_stats] no session ##{session_id} (latest is ##{latest})") unless meta
+
+        char, st, en = meta
+        last = db.get_first_value('SELECT MAX(occurred_at) FROM attacks WHERE session_id = ?', [session_id])
+        atks, trees = db.get_first_row(<<~SQL, [session_id])
+          SELECT COUNT(*), COUNT(DISTINCT COALESCE(a.root_attack_id, a.id)) FROM attacks a
+          WHERE a.session_id = ? AND #{OWN_ATTACK}
+        SQL
+        inbound = db.get_first_value('SELECT COUNT(*) FROM attacks WHERE session_id = ? AND inbound = 1', [session_id])
+        kills, assists = kill_assist_counts(db, session_id)
+        dealt = db.get_first_value(<<~SQL, [session_id])
+          SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id
+          WHERE h.session_id = ? AND #{OUR_DMG_TO_CREATURE}
+        SQL
+        taken = db.get_first_value(<<~SQL, [session_id])
+          SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id
+          WHERE h.session_id = ? AND h.creature_id IS NULL AND a.inbound = 1
+        SQL
+
+        creatures = db.execute(<<~SQL, [session_id])
+          SELECT c.id, c.exist_id, c.noun, c.name, c.first_seen, c.last_seen, c.killed_at,
+                 (SELECT COUNT(*) FROM attacks a WHERE a.creature_id = c.id AND #{OWN_ATTACK}),
+                 (SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id
+                   WHERE h.creature_id = c.id AND #{OWN_HIT}),
+                 (SELECT #{OUR_KILL} FROM attacks a WHERE a.id = c.killed_by_attack_id)
+          FROM creatures c WHERE c.session_id = ? ORDER BY c.noun, c.first_seen
+        SQL
+
+        lines = []
+        lines << "=== SESSION REPORT ##{session_id} ==="
+        lines << "Character: #{char}"
+        lines << "Started: #{fmt_ts(st)}"
+        lines << "Last Event: #{fmt_ts(last || st)}"
+        lines << "Ended: #{en ? "#{fmt_ts(en)} (#{fmt_dur(en - st)})" : 'ACTIVE'}"
+        lines << ''
+        lines << 'SESSION STATS:'
+        lines << "  Total Attacks: #{atks}    Sequences: #{trees}    Inbound: #{inbound}"
+        lines << "  Kills: #{kills}    Assists: #{assists}    Damage Dealt: #{dealt}    Damage Taken: #{taken}"
+        lines << ''
+        groups = creatures.group_by { |r| r[2] || '(unknown)' }
+        unless full
+          lines << "CREATURES ENCOUNTERED (#{creatures.size}) - #{link('[full report]', "session_report(#{session_id}, full: true)")} lists every instance:"
+          rows = groups.map do |noun, group|
+            kills = group.count { |r| r[9] == 1 }
+            dead = group.count { |r| !r[6].nil? }
+            dmg = group.sum { |r| r[8].to_i }
+            natk = group.sum { |r| r[7].to_i }
+            [link(noun.upcase, "creature_report(#{noun.inspect})"), group.size.to_s, kills.to_s, (dead - kills).to_s,
+             (group.size - dead).to_s, natk.to_s, dmg.to_s]
+          end
+          lines.concat(grid(%w[Kind Seen Kills Other-dead Alive Attacks Damage], rows))
+          lines.concat(quick_actions(session_id))
+          return mono(lines)
+        end
+
+        lines << "CREATURES ENCOUNTERED (#{creatures.size}):"
+        lines << RULE
+
+        groups.each do |noun, group|
+          lines << ''
+          lines << "#{noun.upcase} (#{group.size}):"
+          group.each_with_index do |(_cid, eid, _noun, name, first, seen, killed, n_atk, dmg, our_kill), i|
+            label = eid ? link("##{eid}", "creature_report(#{eid})") : '#?'
+            status = if killed.nil? then 'ALIVE'
+                     elsif our_kill == 1 then 'DEAD (kill)'
+                     elsif dmg.to_i.positive? then 'DEAD (assist)'
+                     else 'DEAD'
+                     end
+            dur = (seen && first) ? fmt_dur(seen - first) : '?'
+            lines << format('  [%d] %s - %s', i + 1, label, name)
+            lines << format('      Status: %s | Attacks: %d | Damage: %d | Duration: %s', status, n_atk, dmg, dur)
+          end
+        end
+
+        lines << ''
+        lines.concat(quick_actions(session_id))
+        mono(lines)
+      end
+    end
+
+    # === AGGREGATE REPORT === : the session report's numbers summed over
+    # a scope (:all or an Array of session ids), plus per-hour rates and a
+    # per-hunt grid. Creature kinds are pooled across hunts.
+    def aggregate_report(scope = :all)
+      with_db do |db|
+        ids, label = resolve_scope(db, scope)
+        return say('[combat_stats] no sessions recorded yet') unless label
+
+        sc, sp = scope_sql('s.id', ids)
+        ac, ap = scope_sql('a.session_id', ids)
+        hc, hp = scope_sql('h.session_id', ids)
+        cc, cp = scope_sql('c.session_id', ids)
+        # an open hunt ends at its last event for duration purposes
+        sessions = db.execute(<<~SQL, sp)
+          SELECT s.id, s.character, s.started_at,
+                 COALESCE(s.ended_at, (SELECT MAX(occurred_at) FROM attacks WHERE session_id = s.id), s.started_at),
+                 s.ended_at IS NULL,
+                 (SELECT COUNT(*) FROM attacks a WHERE a.session_id = s.id AND #{OWN_ATTACK}),
+                 (SELECT COUNT(*) FROM creatures c JOIN attacks a ON a.id = c.killed_by_attack_id
+                   WHERE c.session_id = s.id AND c.killed_at IS NOT NULL AND #{OUR_KILL}),
+                 (SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id
+                   WHERE h.session_id = s.id AND #{OUR_DMG_TO_CREATURE})
+          FROM sessions s WHERE #{sc} ORDER BY s.id
+        SQL
+        hunt_time = sessions.sum { |_, _, st, en, *| (en - st).to_f }
+        atks, trees = db.get_first_row("SELECT COUNT(*), COUNT(DISTINCT COALESCE(a.root_attack_id, a.id)) FROM attacks a WHERE #{ac} AND #{OWN_ATTACK}", ap)
+        inbound = db.get_first_value("SELECT COUNT(*) FROM attacks a WHERE #{ac} AND a.inbound = 1", ap)
+        kills, assists = kill_assist_counts(db, ids)
+        dealt = db.get_first_value("SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id WHERE #{hc} AND #{OUR_DMG_TO_CREATURE}", hp)
+        taken = db.get_first_value("SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id WHERE #{hc} AND h.creature_id IS NULL AND a.inbound = 1", hp)
+        creatures = db.execute(<<~SQL, cp)
+          SELECT c.noun, c.killed_at IS NOT NULL,
+                 (SELECT COUNT(*) FROM attacks a WHERE a.creature_id = c.id AND #{OWN_ATTACK}),
+                 (SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id
+                   WHERE h.creature_id = c.id AND #{OWN_HIT}),
+                 (SELECT #{OUR_KILL} FROM attacks a WHERE a.id = c.killed_by_attack_id)
+          FROM creatures c WHERE #{cc}
+        SQL
+        per_hour = ->(n) { hunt_time.positive? ? format('%.1f', 3600.0 * n / hunt_time) : '-' }
+
+        lines = ["=== AGGREGATE REPORT - #{label} ==="]
+        lines << "Character: #{sessions.map { |r| r[1] }.uniq.join(', ')}"
+        lines << "Hunts: #{sessions.size}    First: #{fmt_ts(sessions.first[2])}    Last: #{fmt_ts(sessions.last[3])}"
+        lines << "Hunt time: #{fmt_dur(hunt_time)} (avg #{fmt_dur(hunt_time / sessions.size)} per hunt)"
+        lines << ''
+        lines << 'TOTALS:'
+        lines << "  Total Attacks: #{atks}    Sequences: #{trees}    Inbound: #{inbound}"
+        lines << "  Kills: #{kills}    Assists: #{assists}    Damage Dealt: #{dealt}    Damage Taken: #{taken}"
+        lines << "  Per hour: #{per_hour.call(kills)} kills    #{per_hour.call(dealt)} damage    #{per_hour.call(atks)} attacks    #{per_hour.call(taken)} taken"
+        lines << ''
+        lines << "CREATURES ENCOUNTERED (#{creatures.size}):"
+        rows = creatures.group_by { |r| r[0] || '(unknown)' }.sort_by { |_, g| -g.count { |r| r[4] == 1 } }.map do |noun, group|
+          k = group.count { |r| r[4] == 1 }
+          dead = group.count { |r| r[1] == 1 }
+          [link(noun.upcase, "creature_report(#{noun.inspect})"), group.size.to_s, k.to_s, (dead - k).to_s,
+           (group.size - dead).to_s, group.sum { |r| r[2].to_i }.to_s, group.sum { |r| r[3].to_i }.to_s, per_hour.call(k)]
+        end
+        lines.concat(grid(%w[Kind Seen Kills Other-dead Alive Attacks Damage Kills/hr], rows))
+        if sessions.size <= 20
+          lines << ''
+          lines << 'PER HUNT (click an id):'
+          rows = sessions.map do |id, _, st, en, open, n_atk, k, dmg|
+            [link(id, "session_report(#{id})"), fmt_ts(st), open == 1 ? 'ACTIVE' : fmt_dur(en - st), n_atk.to_s, k.to_s, dmg.to_s]
+          end
+          lines.concat(grid(%w[ID Started Duration Attacks Kills Damage], rows))
+        else
+          lines << ''
+          lines << "#{sessions.size} hunts - #{link('[sessions]', "list_sessions(#{sessions.size})")} lists them."
+        end
+        lines.concat(quick_actions(ids.nil? ? :all : ids))
+        mono(lines)
+      end
+    end
+
+    # Damage by ability / flare rollup (the old recount). scope: nil
+    # (latest hunt), a session id, :all or an Array of ids.
+    def recount(scope = nil)
+      with_db do |db|
+        ids, label = resolve_scope(db, scope)
+        return say('[combat_stats] no sessions recorded yet') unless label
+
+        ac, ap = scope_sql('a.session_id', ids)
+        lines = ["=== ABILITIES - #{label} ==="]
+        # attempts = every own swing of the ability (misses included); the
+        # hit columns are summed per swing so the same query serves one
+        # hunt or many. (The old single query joined through hits, so
+        # "Atk" silently dropped every miss.)
+        abilities = db.execute(<<~SQL, ap)
+          SELECT a.name, a.parent, COUNT(*),
+                 SUM(EXISTS (SELECT 1 FROM hits h WHERE h.attack_id = a.id AND h.flare_id IS NULL AND h.creature_id IS NOT NULL)),
+                 SUM((SELECT COUNT(*) FROM hits h WHERE h.attack_id = a.id AND h.flare_id IS NULL AND h.creature_id IS NOT NULL)),
+                 SUM((SELECT COALESCE(SUM(h.damage), 0) FROM hits h WHERE h.attack_id = a.id AND h.flare_id IS NULL AND h.creature_id IS NOT NULL)),
+                 SUM((SELECT COUNT(*) FROM hits h WHERE h.attack_id = a.id AND h.flare_id IS NULL AND h.creature_id IS NOT NULL AND h.crit_rank IS NOT NULL)),
+                 SUM((SELECT COUNT(*) FROM hits h WHERE h.attack_id = a.id AND h.flare_id IS NULL AND h.creature_id IS NOT NULL AND h.fatal = 1))
+          FROM attacks a
+          WHERE #{ac} AND #{OWN_ATTACK}
+          GROUP BY a.name, a.parent ORDER BY 6 DESC
+        SQL
+        unless abilities.empty?
+          rows = abilities.map do |name, parent, attempts, landed, hits, total, crits, fatal|
+            label = link(name, "attack_report(#{name.inspect})")
+            label += " (via #{parent})" if parent
+            [label, attempts.to_s, landed.to_s, hits.to_s, total.to_s,
+             hits.to_i.positive? ? format('%.1f', total.to_f / hits) : '-', crits.to_s, fatal.to_s]
+          end
+          lines << 'Damage by ability (own swings; Landed = swings with a hit, Hits = damage components):'
+          lines.concat(grid(%w[Ability Attempts Landed Hits Dmg Avg Crits Fatal], rows))
+        end
+
+        flares = db.execute(<<~SQL, ap)
+          SELECT f.name, COUNT(DISTINCT f.id), COUNT(h.id), COALESCE(SUM(h.damage), 0), SUM(h.fatal)
+          FROM flares f JOIN attacks a ON a.id = f.attack_id
+          LEFT JOIN hits h ON h.flare_id = f.id
+          WHERE #{ac} AND #{OWN_FLARE}
+          GROUP BY f.name ORDER BY 4 DESC, 2 DESC
+        SQL
+        unless flares.empty?
+          rows = flares.map do |name, n, hits, total, fatal|
+            [link(name, "flare_report(#{name.inspect})"), n.to_s, hits.to_s, total.to_s, fatal.to_i.to_s]
+          end
+          lines << ''
+          lines << 'Flares (own, click for analytics):'
+          lines.concat(grid(%w[Flare Procs Hits Dmg Fatal], rows))
+        end
+
+        inbound = db.execute(<<~SQL, ap)
+          SELECT a.name, a.attacker, COUNT(*), GROUP_CONCAT(DISTINCT a.outcome),
+                 SUM((SELECT COALESCE(SUM(h.damage), 0) FROM hits h WHERE h.attack_id = a.id AND h.creature_id IS NULL))
+          FROM attacks a WHERE #{ac} AND a.inbound = 1
+          GROUP BY a.name, a.attacker ORDER BY 3 DESC
+        SQL
+        unless inbound.empty?
+          rows = inbound.map { |name, who, n, outcomes, dmg| [name.to_s, who.to_s, n.to_s, outcomes.to_s, dmg.to_s] }
+          lines << ''
+          lines << 'Attacks against you:'
+          lines.concat(grid(%w[Attack Attacker N Outcomes Dmg], rows))
+        end
+
+        lines.concat(quick_actions(ids.nil? ? :all : (ids.size == 1 ? ids.first : ids)))
+        mono(lines)
+      end
+    end
+
+    # ---- feeds -------------------------------------------------------
+
+    def recent_attacks(n = nil)
+      n = 15 if n.nil? || n <= 0
+      with_db do |db|
+        sid = db.get_first_value('SELECT MAX(id) FROM sessions')
+        return say('[combat_stats] no sessions recorded yet') unless sid
+
+        rows = db.execute(<<~SQL, [sid, n])
+          SELECT a.id, a.name, a.occurred_at, a.outcome, c.name, c.exist_id,
+                 (SELECT COALESCE(SUM(h.damage), 0) FROM hits h WHERE h.attack_id = a.id),
+                 (SELECT COUNT(*) FROM flares f WHERE f.attack_id = a.id),
+                 (a.parent_confidence = 'unbound')
+          FROM attacks a LEFT JOIN creatures c ON c.id = a.creature_id
+          WHERE a.session_id = ? AND #{OWN_ATTACK}
+          ORDER BY a.seq DESC LIMIT ?
+        SQL
+        return say('[combat_stats] no attacks recorded this hunt') if rows.empty?
+
+        table_rows = rows.map do |aid, name, at, outcome, cname, eid, dmg, nfl, child|
+          [link("##{aid}", "attack_detail(#{aid})"), name.to_s + (child == 1 ? ' (echo)' : ''), dmg.to_s,
+           (outcome || 'hit'), nfl.to_s, (eid ? link(cname, "creature_report(#{eid})") : cname.to_s), fmt_clock(at)]
+        end
+        table("Last #{rows.size} attacks (newest first - click # for detail, target for tree)",
+              %w[# Attack Dmg Outcome Flares Target When], table_rows)
+      end
+    end
+
+    def recent_creatures(n = nil)
+      n = 15 if n.nil? || n <= 0
+      with_db do |db|
+        sid = db.get_first_value('SELECT MAX(id) FROM sessions')
+        return say('[combat_stats] no sessions recorded yet') unless sid
+
+        rows = db.execute(<<~SQL, [sid, n])
+          SELECT c.exist_id, c.name, c.killed_at, c.first_seen, c.last_seen,
+                 (SELECT COUNT(*) FROM attacks a WHERE a.creature_id = c.id AND #{OWN_ATTACK}),
+                 (SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id
+                   WHERE h.creature_id = c.id AND #{OWN_HIT})
+          FROM creatures c WHERE c.session_id = ? AND c.exist_id IS NOT NULL
+          ORDER BY c.last_seen DESC LIMIT ?
+        SQL
+        return say('[combat_stats] no creatures recorded this hunt') if rows.empty?
+
+        table_rows = rows.map do |eid, name, killed, first, seen, natk, dmg|
+          [link("##{eid}", "creature_report(#{eid})"), name.to_s, (killed ? 'DEAD' : 'ALIVE'),
+           natk.to_s, dmg.to_s, fmt_dur(seen && first ? seen - first : nil), fmt_clock(seen)]
+        end
+        table("Last #{rows.size} creatures (newest first - click # for tree)",
+              %w[ID Creature Status Attacks Damage Duration Last], table_rows)
+      end
+    end
+
+    # ---- creature tree -----------------------------------------------
+
+    # Resolve to { 'id' =>, 'exist_id' =>, 'name' =>, 'noun' => } or nil.
+    # Numeric = exist_id (newest instance). Otherwise noun (+ optional index,
+    # 1-based from the first seen; negative from the last).
+    def resolve_creature(db, arg, idx = nil)
+      if arg.to_s =~ /\A#?(\d+)\z/ && idx.nil?
+        row = db.get_first_row('SELECT id, exist_id, name, noun FROM creatures WHERE exist_id = ? ORDER BY first_seen DESC LIMIT 1', [Regexp.last_match(1).to_i])
+        return { 'id' => row[0], 'exist_id' => row[1], 'name' => row[2], 'noun' => row[3] } if row
+
+        say("[combat_stats] no creature with id #{arg}")
+        return nil
+      end
+      noun = db.get_first_value('SELECT noun FROM creatures WHERE upper(noun) = upper(?) LIMIT 1', [arg.to_s])
+      unless noun
+        nouns = db.execute('SELECT DISTINCT noun FROM creatures WHERE noun IS NOT NULL ORDER BY noun').map(&:first)
+        link_picker("Unknown creature '#{arg}'. Click a noun:", nouns) { |nn| "creature_report(#{nn.inspect})" }
+        return nil
+      end
+      ids = db.execute('SELECT id FROM creatures WHERE noun = ? ORDER BY first_seen', [noun]).map(&:first)
+      i = (idx || -1).to_i
+      zero = i.positive? ? i - 1 : ids.size + i
+      unless zero.between?(0, ids.size - 1)
+        say("[combat_stats] index #{i} out of range for #{noun} (#{ids.size} seen)")
+        return nil
+      end
+      row = db.get_first_row('SELECT id, exist_id, name, noun FROM creatures WHERE id = ?', [ids[zero]])
+      { 'id' => row[0], 'exist_id' => row[1], 'name' => row[2], 'noun' => row[3] }
+    end
+
+    # Status names attributed to an attack (optionally on one creature):
+    # "stunned(5), prone"
+    # Statuses on an attack row. flare: nil = the swing's own (not riding a
+    # flare); an id = the ones that rode that flare (glowbark blind).
+    def attack_statuses(db, aid, cid = nil, flare: nil)
+      rows = db.execute(<<~SQL, [aid, cid, cid, flare, flare])
+        SELECT kind, status, action, value FROM statuses
+        WHERE attack_id = ? AND (? IS NULL OR creature_id = ?) AND action IS NOT 'remove'
+          AND ((? IS NULL AND flare_id IS NULL) OR flare_id = ?)
+        ORDER BY id
+      SQL
+      # The recorder merges a swing's crit-table stun and its messaging twin
+      # into one kind='stun' row carrying the rounds. Rows written before
+      # that change still come in pairs; keep the one with the rounds.
+      seen = {}
+      rows.each do |kind, status, _action, value|
+        next if status.nil? || status.empty?
+        next if kind == 'status' && seen[status].to_s.start_with?("#{status}(")
+
+        seen[status] = (kind == 'stun' && value) ? "stunned(#{value})" : status
+      end
+      seen.values.join(', ')
+    end
+
+    # Rows for one attack, its flares, and the attacks those flares spawned,
+    # in the tree grid:  Attack | DMG | STATUS | CRIT | FATAL? [| TARGET]
+    #
+    #   fire                 102   [CHEST R7 PUNCTURE]
+    #     mirror_image
+    #       fire              88   [NECK R6 SLASH]        <- the echo, under its flare
+    #     phosphorescence     30   [ABDOMEN R6 PLASMA]
+    #
+    # A spawned attack (parent_attack_id = this one, parent = the flare's
+    # name) nests under the flare that spawned it; a child with no matching
+    # flare row (blink's bracketed cast) follows the flares. Hits are filtered
+    # to `cid` when given (AoE/echo trees can touch others); `only` limits the
+    # children rendered (a creature report shows just the attacks that touched
+    # it); `seen` collects every attack id rendered so the caller can list the
+    # tree members this recursion did not reach.
+    def attack_rows(db, aid, indent, cid = nil, only: nil, seen: nil, with_target: false)
+      seen&.add(aid)
+      name, outcome, tcid, pconf = db.get_first_row('SELECT name, outcome, creature_id, parent_confidence FROM attacks WHERE id = ?', [aid])
+      label = (' ' * indent) + link(name.to_s, "attack_detail(#{aid})")
+      # spawned by a flare (parent names it) whose row the recorder could not
+      # bind to; it labels these 'unbound'. A volley's per-target rows share
+      # a root too but no flare spawned them - they are not echoes.
+      label += ' (echo)' if pconf == 'unbound'
+      status = attack_statuses(db, aid, cid)
+      target = with_target && tcid ? db.get_first_value('SELECT name FROM creatures WHERE id = ?', [tcid]).to_s : nil
+      row = ->(cells, first) { with_target ? cells + [first ? target.to_s : ''] : cells }
+      hits = db.execute(<<~SQL, [aid, cid, cid])
+        SELECT damage, location, crit_rank, crit_type, fatal FROM hits
+        WHERE attack_id = ? AND flare_id IS NULL AND (? IS NULL OR creature_id = ?) ORDER BY seq
+      SQL
+      rows = []
+      if hits.empty?
+        # the swing itself went at ANOTHER creature (we're here because a flare
+        # or status of it touched this one): point at the real target, with id
+        if cid && tcid && tcid != cid
+          teid, tname = db.get_first_row('SELECT exist_id, name FROM creatures WHERE id = ?', [tcid])
+          label += " -> #{link("#{tname} ##{teid}", "creature_report(#{teid})")}"
+        end
+        rows << row.call([label, '', status, (outcome || '').upcase, ''], true)
+      else
+        hits.each_with_index do |(dmg, loc, rank, type, fatal), i|
+          rows << row.call([(i.zero? ? label : ''), dmg.to_s, (i.zero? ? status : ''), crit_str(loc, rank, type), (fatal == 1 ? 'Y' : '')], i.zero?)
+        end
+      end
+
+      # (dup: the sqlite3 gem hands back a frozen result set)
+      children = db.execute('SELECT id, parent FROM attacks WHERE parent_attack_id = ? ORDER BY seq', [aid]).dup
+      children = children.select { |id, _| only.include?(id) } if only
+      db.execute('SELECT f.id, f.name, f.damaging, f.outcome, f.creature_id, c.exist_id, c.name FROM flares f LEFT JOIN creatures c ON c.id = f.creature_id WHERE f.attack_id = ? ORDER BY f.seq', [aid]).each do |fid, fname, _dmging, foutcome, fcid, feid, fcname|
+        fhits = db.execute(<<~SQL, [fid, cid, cid])
+          SELECT damage, location, crit_rank, crit_type, fatal FROM hits
+          WHERE flare_id = ? AND (? IS NULL OR creature_id = ?) ORDER BY seq
+        SQL
+        flabel = (' ' * (indent + 2)) + link(fname, "flare_report(#{fname.inspect})")
+        fstatus = attack_statuses(db, aid, cid, flare: fid)
+        if fhits.empty?
+          # a flare that struck ANOTHER creature (AoE bloom): say so, with the
+          # id, instead of an empty row that reads as "no damage" - two
+          # same-named creatures are still two creatures
+          other = cid && fcid && fcid != cid ? " -> #{link("#{fcname} ##{feid}", "creature_report(#{feid})")}" : ''
+          rows << row.call([flabel + other, '', fstatus, (foutcome || '').upcase, ''], false)
+        else
+          fhits.each_with_index do |(dmg, loc, rank, type, fatal), i|
+            rows << row.call([(i.zero? ? flabel : ''), dmg.to_s, (i.zero? ? fstatus : ''), crit_str(loc, rank, type), (fatal == 1 ? 'Y' : '')], false)
+          end
+        end
+        # the attack this flare spawned (mirror image / afterimage echo)
+        if (child = children.find { |_, pflare| pflare == fname.to_s })
+          children -= [child]
+          rows.concat(attack_rows(db, child.first, indent + 4, cid, only: only, seen: seen, with_target: with_target))
+        end
+      end
+      children.each { |id, _| rows.concat(attack_rows(db, id, indent + 4, cid, only: only, seen: seen, with_target: with_target)) }
+      rows
+    end
+
+    # A creature's attack tree: every spawn tree that touched it, root first,
+    # echoes/spawned members indented beneath.
+    def creature_report(arg = nil, idx = nil, full: false, all: false)
+      if arg.nil? || arg.to_s.strip.empty?
+        return with_db do |db|
+          seen = db.execute(<<~SQL)
+            SELECT c.exist_id, c.name,
+                   COALESCE((SELECT SUM(h.damage) FROM hits h JOIN attacks a ON a.id = h.attack_id
+                             WHERE h.creature_id = c.id AND #{OWN_HIT}), 0) AS dmg,
+                   c.killed_at IS NOT NULL
+            FROM creatures c
+            WHERE c.exist_id IS NOT NULL
+            ORDER BY dmg DESC LIMIT 20
+          SQL
+          if seen.empty?
+            say('[combat_stats] no creatures recorded yet')
+          else
+            rows = seen.map { |eid, name, dmg, dead| [link("##{eid}", "creature_report(#{eid})"), name, dmg.to_i.to_s, dead == 1 ? 'DEAD' : 'ALIVE'] }
+            table('cstats creature ID|NOUN - click a creature (top 20 by damage)', %w[ID Creature Damage Status], rows)
+          end
+        end
+      end
+
+      with_db do |db|
+        ci = resolve_creature(db, arg, idx)
+        return unless ci
+
+        cid = ci['id']
+        first, seen, killed, killer, sid = db.get_first_row('SELECT first_seen, last_seen, killed_at, killed_by_attack_id, session_id FROM creatures WHERE id = ?', [cid])
+        dmg, nhits = db.get_first_row(<<~SQL, [cid])
+          SELECT COALESCE(SUM(h.damage), 0), COUNT(*) FROM hits h JOIN attacks a ON a.id = h.attack_id
+          WHERE h.creature_id = ? AND #{OWN_HIT}
+        SQL
+        killer_name = killer && db.get_first_value('SELECT name FROM attacks WHERE id = ?', [killer])
+
+        lines = []
+        lines << format(' Name: %s', ci['name'])
+        lines << format(' Noun: %-18s ID: %s   Session: %s', ci['noun'], ci['exist_id'] || '?', link(sid, "session_report(#{sid})"))
+        lines << format('First: %-18s Last: %s   Duration: %s', fmt_clock(first), fmt_clock(seen), fmt_dur(seen && first ? seen - first : nil))
+        lines << format('  DMG: %-18s Hits: %-6d Alive: %s', dmg, nhits, killed ? "False (#{fmt_clock(killed)}#{killer ? ", by #{killer_name} ##{killer}" : ''})" : 'True')
+
+        lines.concat(wound_map(db, cid))
+
+        # every attack that hit or targeted this creature, grouped by spawn tree
+        touched = db.execute(<<~SQL, [cid, cid])
+          SELECT DISTINCT a.id, COALESCE(a.root_attack_id, a.id) AS root, a.seq
+          FROM attacks a
+          WHERE (a.creature_id = ? AND #{OWN_ATTACK})
+             OR EXISTS (SELECT 1 FROM hits h WHERE h.attack_id = a.id AND h.creature_id = ? AND #{OWN_HIT})
+          ORDER BY a.seq
+        SQL
+        if touched.empty?
+          lines << ''
+          lines << '  (no attacks recorded)'
+          return mono(lines)
+        end
+
+        return compact_creature(db, ci, first, touched, lines, all: all) unless full
+
+        rows = []
+        touched.group_by { |_id, root, _seq| root }.each_with_index do |(root, members), gi|
+          rows << ['', '', '', '', ''] if gi.positive?
+          ids = members.map(&:first)
+          only = Set.new(ids)
+          seen = Set.new
+          # the root itself may not have touched this creature (AoE/echo onto it)
+          if ids.include?(root)
+            rows.concat(attack_rows(db, root, 0, cid, only: only, seen: seen))
+          else
+            rname, rtarget = db.get_first_row('SELECT a.name, c.name FROM attacks a LEFT JOIN creatures c ON c.id = a.creature_id WHERE a.id = ?', [root])
+            rows << [link(rname, "attack_detail(#{root})") + " (root, on #{rtarget || 'no target'})", '', '', '', '']
+            seen << root
+          end
+          # members the recursion did not reach: spawned by a flare we could
+          # not name (rendered flat, marked "(echo)")
+          (ids - seen.to_a).each { |aid| rows.concat(attack_rows(db, aid, 4, cid, only: only, seen: seen)) unless seen.include?(aid) }
+        end
+        lines << ''
+        lines.concat(grid(%w[Attack DMG STATUS CRIT FATAL?], rows))
+        mono(lines)
+      end
+    end
+
+    # Crit counts by body region, drawn on a small figure.
+    def wound_map(db, cid)
+      # worst wound left on each location (CritRanks wound_rank 0-3; a crit
+      # that left no wound still marks the location as struck, rank 0)
+      worst = {}
+      db.execute('SELECT body_part, MAX(COALESCE(wound_rank, 0)) FROM hits WHERE creature_id = ? AND body_part IS NOT NULL GROUP BY body_part', [cid]).each do |bp, r|
+        worst[bp] = r.to_i
+      end
+      return [] if worst.empty?
+
+      # The injury-doll shape (e e eyes, o head, /|\ torso+arms, o | o hands,
+      # / \ legs, o o feet). A region keeps its glyph while unstruck and shows
+      # its worst wound rank once hit (owner 2026-09-07: "it's a wound map" -
+      # a fatal head shot reads 3, not "1 crit"); neck/back/arms/legs, which
+      # have no glyph of their own, ride the side labels like the doll's nk/bk.
+      rank = ->(*keys) { keys.filter_map { |k| worst[k] }.max }
+      g = lambda do |k, glyph|
+        r = rank.call(*Array(k))
+        r.nil? ? glyph : r.to_s
+      end
+      side = ->(label, *keys) { r = rank.call(*keys); r.nil? ? '' : "#{label} #{r}" }
+      [
+        '',
+        'Wounds:',
+        format('    %s   %s      %s', g.call('leftEye', 'e'), g.call('rightEye', 'e'), side.call('nk', 'neck')),
+        format('      %s        %s', g.call('head', 'o'), side.call('arms', 'leftArm', 'rightArm')),
+        format('     /%s\\       %s', g.call('chest', '|'), side.call('bk', 'back')),
+        format('    %s %s %s      %s', g.call('leftHand', 'o'), g.call('abdomen', '|'), g.call('rightHand', 'o'), side.call('legs', 'leftLeg', 'rightLeg')),
+        format('     / \\       %s', side.call('feet', 'leftFoot', 'rightFoot')).rstrip,
+        format('    %s   %s', g.call('leftFoot', 'o'), g.call('rightFoot', 'o')).rstrip
+      ]
+    end
+
+    # ---- attack detail / tree ----------------------------------------
+
+    def list_attack_types(prefix = nil)
+      with_db do |db|
+        names = db.execute("SELECT DISTINCT name FROM attacks WHERE #{OWN_ATTACK_BARE} ORDER BY name").map(&:first)
+        link_picker([prefix, 'Recorded attacks (click one):'].compact.join(' '), names) { |a| "attack_report(#{a.inspect})" }
+      end
+    end
+
+    # nth instance of an attack type (latest by default) -> attack_detail
+    def attack_report(name = nil, idx = nil)
+      return list_attack_types if name.nil?
+
+      with_db do |db|
+        real = db.get_first_value('SELECT name FROM attacks WHERE upper(name) = upper(?) LIMIT 1', [name])
+        return list_attack_types("Unknown attack '#{name}'.") unless real
+
+        ids = db.execute("SELECT id FROM attacks WHERE name = ? AND #{OWN_ATTACK_BARE} ORDER BY id", [real]).map(&:first)
+        return say("[combat_stats] no recorded #{real}") if ids.empty?
+
+        i = (idx || -1).to_i
+        zero = i.positive? ? i - 1 : ids.size + i
+        return say("[combat_stats] index #{i} out of range (#{ids.size} #{real})") unless zero.between?(0, ids.size - 1)
+
+        attack_detail(ids[zero], ordinal: "#{zero + 1}/#{ids.size}")
+      end
+    end
+
+    # === ATTACK REPORT #id === : type/outcome/sequence/target, resolution,
+    # damage components, statuses, flares, spawn tree.
+    def attack_detail(aid, ordinal: nil)
+      with_db do |db|
+        a = db.get_first_row(<<~SQL, [aid])
+          SELECT a.name, a.outcome, a.outcomes_all, a.seq, a.occurred_at, a.session_id, a.creature_id, c.name, c.exist_id,
+                 a.root_attack_id, a.parent_attack_id, a.parent, a.parent_weapon, a.parent_confidence, a.via,
+                 a.target_kind, a.attacker, a.weapon, a.aimed, a.ambush, a.inbound, a.foreign_caster, a.unowned, a.orphan
+          FROM attacks a LEFT JOIN creatures c ON c.id = a.creature_id WHERE a.id = ?
+        SQL
+        return say("[combat_stats] no attack ##{aid}") unless a
+
+        name, outcome, outcomes_all, seq, at, sid, cid, cname, eid, root, parent_id, parent, pweapon, pconf, via,
+          tkind, attacker, weapon, aimed, ambush, inbound, foreign, unowned, orphan = a
+
+        flags = []
+        flags << 'INBOUND' if inbound == 1
+        flags << 'FOREIGN CASTER' if foreign == 1
+        flags << 'UNOWNED' if unowned == 1
+        flags << 'ORPHAN' if orphan == 1
+        flags << 'AIMED' if aimed == 1
+        flags << 'AMBUSH' if ambush == 1
+
+        lines = []
+        lines << "=== ATTACK REPORT ##{aid} ===#{ordinal ? "  (#{name} #{ordinal})" : ''}"
+        lines << "Type: #{name.to_s.upcase}#{via ? " (via #{via})" : ''}#{weapon ? "  Weapon: #{weapon}" : ''}"
+        lines << "Outcome: #{(outcomes_all || outcome || 'HIT').to_s.upcase}"
+        lines << "Sequence: #{seq}   Session: #{link(sid, "session_report(#{sid})")}"
+        lines << "Occurred: #{fmt_ts(at)}"
+        target = if cid && eid then "#{link(cname, "creature_report(#{eid})")} (##{eid})"
+                 elsif cid then "#{cname} (#?)"
+                 elsif attacker then "#{tkind} (attacker: #{attacker})"
+                 else tkind.to_s
+                 end
+        lines << "Target: #{target}"
+        lines << "Attacker: #{attacker}" if attacker && cid
+        lines << "Flags: #{flags.join(', ')}" unless flags.empty?
+
+        res = db.execute('SELECT type, attacker_stat, defender_stat, modifier, roll, bonus, penalty, result, total FROM resolutions WHERE attack_id = ? AND flare_id IS NULL ORDER BY seq', [aid])
+        lines << ''
+        if res.empty?
+          lines << 'RESOLUTION: NONE'
+        else
+          lines << "RESOLUTION: #{res.map(&:first).map(&:upcase).uniq.join(', ')}"
+          res.each { |r| lines << '  ' + resolution_line(*r) }
+        end
+
+        hits = db.execute('SELECT damage, location, crit_rank, crit_type, wound_rank, fatal, amputated, secondary_location, secondary_rank FROM hits WHERE attack_id = ? AND flare_id IS NULL ORDER BY seq', [aid])
+        lines << ''
+        lines << "DAMAGE COMPONENTS (#{hits.size}):"
+        hits.each_with_index do |(dmg, loc, rank, type, wrank, fatal, amp, sloc, srank), i|
+          lines << format('  [%d] Damage: %d%s', i + 1, dmg, fatal == 1 ? ' [FATAL]' : '')
+          lines << "      Crit: #{[loc.to_s.upcase, ("R#{rank}" if rank), type&.upcase].compact.join(' ')}#{wrank ? " (wound #{wrank})" : ''}#{amp == 1 ? ' AMPUTATED' : ''}" if loc
+          lines << "      Secondary: #{sloc.to_s.upcase} R#{srank}" if sloc
+        end
+
+        statuses = db.execute('SELECT s.kind, s.status, s.action, s.value, s.subject, s.source, f.name, s.spell_name, s.cause FROM statuses s LEFT JOIN flares f ON f.id = s.flare_id WHERE s.attack_id = ? ORDER BY s.id', [aid])
+        lines << ''
+        if statuses.empty?
+          lines << 'STATUS EFFECTS: NONE'
+        else
+          lines << "STATUS EFFECTS (#{statuses.size}):"
+          statuses.each do |kind, status, action, value, subject, source, via_flare, spell_name, cause|
+            desc = case kind
+                   when 'stun' then "stunned #{value} rounds"
+                   # a spell wearing off the subject: cause says whether a
+                   # dispel stripped it, death cleanup dropped it, or it
+                   # simply expired (nil)
+                   when 'spell_loss' then "lost #{spell_name || 'a spell'}#{cause ? " (#{cause})" : ''}"
+                   else "#{status}#{value ? " #{value}" : ''} #{action}"
+                   end
+            tag = via_flare ? "  (via #{via_flare})" : (source == 'window' ? '  (window)' : '')
+            lines << format('  %-28s %s%s', desc, subject, tag)
+          end
+        end
+
+        flares = db.execute('SELECT f.id, f.name, f.damaging, f.outcome, f.weapon, c.name, f.creature_id, c.exist_id FROM flares f LEFT JOIN creatures c ON c.id = f.creature_id WHERE f.attack_id = ? ORDER BY f.seq', [aid])
+        lines << ''
+        if flares.empty?
+          lines << 'FLARES: NONE'
+        else
+          lines << "FLARES (#{flares.size}):"
+          flares.each do |fid, fname, dmging, foutcome, fweapon, fcreature, fcid, feid|
+            fh = db.execute('SELECT damage, location, crit_rank, crit_type, fatal FROM hits WHERE flare_id = ? ORDER BY seq', [fid])
+            fr = db.execute('SELECT type, attacker_stat, defender_stat, modifier, roll, bonus, penalty, result, total FROM resolutions WHERE flare_id = ? ORDER BY seq', [fid])
+            head = "  #{link(fname.to_s.upcase, "flare_report(#{fname.inspect})")} (flare ##{fid})"
+            head += ' [damaging]' if dmging == 1
+            head += " outcome: #{foutcome}" if foutcome
+            # compare by creature ROW, not name - two same-named mastodons in
+            # a room are two creatures (real-feed 2026-09-07, 18:51:58)
+            head += " on #{link("#{fcreature} ##{feid}", "creature_report(#{feid})")} (another creature)" if fcid && fcid != cid
+            head += " via #{fweapon}" if fweapon
+            lines << head
+            fr.each { |r| lines << '      ' + resolution_line(*r) }
+            fh.each { |dmg, loc, rank, type, fatal| lines << format('      Damage: %d %s%s', dmg, crit_str(loc, rank, type), fatal == 1 ? ' [FATAL]' : '') }
+          end
+        end
+
+        lines << ''
+        lineage = []
+        lineage << "parent flare: #{parent}#{pweapon ? " (#{pweapon})" : ''}" if parent
+        lineage << "parent attack: ##{parent_id} (#{pconf})" if parent_id
+        root ||= aid
+        members = db.execute('SELECT id, name, outcome, occurred_at, creature_id FROM attacks WHERE root_attack_id = ? ORDER BY seq', [root])
+        if members.size > 1 || !lineage.empty?
+          lines << "SEQUENCE: root #{link("##{root}", "tree_report(#{root})")}#{lineage.empty? ? '' : "  (#{lineage.join('; ')})"}"
+          lines << "  Started: #{fmt_ts(members.first[3])}   Ended: #{fmt_ts(members.last[3])}" unless members.empty?
+          lines << '  Steps:'
+          members.each_with_index do |(mid, mname, moutcome, mat, mcid), i|
+            tgt = mcid && mcid != cid ? "  -> #{db.get_first_value('SELECT name FROM creatures WHERE id = ?', [mcid])}" : ''
+            # (no raw '<' in mono output - the frontend reads it as markup)
+            mark = mid == aid ? '  (this attack)' : ''
+            lines << format('    [%d] %s - %s | %s | %s%s%s', i + 1, link("Attack ##{mid}", "attack_detail(#{mid})"), mname.to_s.upcase, (moutcome || 'hit').to_s.upcase, fmt_clock(mat), tgt, mark)
+          end
+        else
+          lines << 'SEQUENCE: single attack (no spawn tree)'
+        end
+        mono(lines)
+      end
+    end
+
+    # A spawn tree as a grid: root, then every member with its flares.
+    def tree_report(root)
+      with_db do |db|
+        members = db.execute('SELECT id, creature_id FROM attacks WHERE root_attack_id = ? OR id = ? ORDER BY seq', [root, root])
+        return say("[combat_stats] no spawn tree rooted at ##{root}") if members.empty?
+
+        seen = Set.new
+        rows = attack_rows(db, root, 0, nil, seen: seen, with_target: true)
+        # members not reachable through parent links (spawned by a flare we
+        # could not name) follow flat, marked "(echo)"
+        members.map(&:first).each do |aid|
+          next if seen.include?(aid)
+
+          rows.concat(attack_rows(db, aid, 4, nil, seen: seen, with_target: true))
+        end
+        table("Spawn tree ##{root} (#{members.size} attacks)", %w[Attack DMG STATUS CRIT FATAL? TARGET], rows)
+      end
+    end
+
+    # ---- analytics ---------------------------------------------------
+
+    def flare_report(name = nil)
+      if name.to_s.strip.empty?
+        with_db do |db|
+          names = db.execute(<<~SQL).map { |n, dmg| dmg.positive? ? n : "#{n}*" }
+            SELECT f.name, COUNT(h.id) FROM flares f JOIN attacks a ON a.id = f.attack_id
+            LEFT JOIN hits h ON h.flare_id = f.id
+            WHERE #{OWN_FLARE} GROUP BY f.name ORDER BY f.name
+          SQL
+          return link_picker('Flares (click for analytics; * = no damage recorded):', names) { |f| "flare_report(#{f.delete('*').inspect})" }
+        end
+      end
+      with_db do |db|
+        real = db.get_first_value('SELECT name FROM flares WHERE upper(name) = upper(?) LIMIT 1', [name.to_s.delete('*')])
+        return say("[combat_stats] no flare named '#{name}'") unless real
+
+        # Every count below is OUR flares only (flares.ours: a 2p flare of
+        # ours; on an inbound row that is our reactive flare, while the
+        # creature's own weapon proc striking us is excluded) - the same
+        # scope the damage hits use, so "hits as % of procs" compares like
+        # with like.
+        ours = "JOIN attacks a ON a.id = f.attack_id AND #{OWN_FLARE}"
+        procs = db.get_first_value("SELECT COUNT(*) FROM flares f #{ours} WHERE f.name = ?", [real]).to_i
+        sessions = db.get_first_value("SELECT COUNT(DISTINCT a.session_id) FROM flares f #{ours} WHERE f.name = ?", [real]).to_i
+        # Proc rate = procs / own swings of each attack the flare rode on
+        # (fire, volley, ...). Echo swings spawned by mirror/afterimage are
+        # own attacks too, so they count as swings the flare could ride.
+        by_attack = db.execute(<<~SQL, [real])
+          SELECT a.name, COUNT(f.id) FROM flares f JOIN attacks a ON a.id = f.attack_id
+          WHERE f.name = ? AND #{OWN_ATTACK} GROUP BY a.name ORDER BY COUNT(f.id) DESC
+        SQL
+        rate_rows = by_attack.map do |an, fp|
+          swings = db.get_first_value("SELECT COUNT(*) FROM attacks a WHERE a.name = ? AND #{OWN_ATTACK}", [an]).to_i
+          [an, swings, fp.to_i]
+        end
+        # a REACTIVE flare (shield spike, wall of thorns) rides the creature's
+        # attack on us: its rate is procs per inbound attack, one row
+        inbound_procs = db.get_first_value(<<~SQL, [real]).to_i
+          SELECT COUNT(*) FROM flares f JOIN attacks a ON a.id = f.attack_id
+          WHERE f.name = ? AND a.inbound = 1 AND #{OWN_FLARE}
+        SQL
+        if inbound_procs.positive?
+          inbound_swings = db.get_first_value('SELECT COUNT(*) FROM attacks WHERE inbound = 1 AND foreign_caster = 0 AND unowned = 0').to_i
+          rate_rows << ['(inbound attacks on us)', inbound_swings, inbound_procs]
+          rate_rows.sort_by! { |_, _, fp| -fp }
+        end
+        # headline rate on the attack that carries the flare most (a bow
+        # flare's rate is per fire, not diluted by volley rounds it never
+        # rides); the per-attack grid below shows the rest
+        main_attack, main_swings, main_procs = rate_rows.first
+        pct = ->(num, den) { den.positive? ? format('%.1f%%', 100.0 * num / den) : '-' }
+        outcomes = db.execute("SELECT f.outcome, COUNT(*) FROM flares f #{ours} WHERE f.name = ? AND f.outcome IS NOT NULL GROUP BY f.outcome ORDER BY 2 DESC", [real])
+        statuses = db.execute(<<~SQL, [real])
+          SELECT s.status, COUNT(*) FROM statuses s JOIN flares f ON f.id = s.flare_id #{ours}
+          WHERE f.name = ? AND s.action = 'add' GROUP BY s.status ORDER BY 2 DESC
+        SQL
+        children = db.execute("SELECT a.name, COUNT(*) FROM attacks a WHERE a.parent = ? AND #{OWN_ATTACK} GROUP BY a.name ORDER BY 2 DESC", [real])
+        weapons = db.execute("SELECT f.weapon, COUNT(*) FROM flares f #{ours} WHERE f.name = ? AND f.weapon IS NOT NULL GROUP BY f.weapon ORDER BY 2 DESC", [real])
+        companions = db.execute(<<~SQL, [real])
+          SELECT f2.name, COUNT(*) FROM flares f #{ours} JOIN flares f2 ON f2.attack_id = f.attack_id AND f2.name <> f.name
+          WHERE f.name = ? GROUP BY f2.name ORDER BY 2 DESC LIMIT 6
+        SQL
+        hits = db.execute(<<~SQL, [real])
+          SELECT h.damage, h.crit_rank, h.wound_rank, h.location, h.fatal
+          FROM hits h JOIN flares f ON f.id = h.flare_id JOIN attacks a ON a.id = h.attack_id
+          WHERE f.name = ? AND #{OUR_DMG_TO_CREATURE}
+        SQL
+
+        lines = ["=== #{real.to_s.tr('_', ' ').upcase} FLARE REPORT ==="]
+        lines << format('  %-28s %s', "Procs: #{procs}", "Sessions: #{sessions}")
+        if main_attack
+          carrier = main_attack.start_with?('(') ? "#{main_procs} procs on #{main_swings} inbound attacks on us" : "#{main_procs} of #{main_swings} own #{main_attack} swings"
+          lines << format('  %-28s %s', "Proc rate: #{pct.call(main_procs, main_swings)}", "(#{carrier})")
+        end
+        lines << "  Weapons: #{weapons.map { |w, c| "#{w} #{c}" }.join(', ')}" unless weapons.empty?
+        lines << "  Outcomes: #{outcomes.map { |o, c| "#{o} #{c} (#{pct.call(c, procs)})" }.join(', ')}" unless outcomes.empty?
+        lines << "  Statuses inflicted: #{statuses.map { |s, c| "#{s} #{c} (#{pct.call(c, procs)} of procs)" }.join(', ')}" unless statuses.empty?
+        lines << "  Spawned swings: #{children.map { |an, c| "#{c} #{an}" }.join(', ')}" unless children.empty?
+        lines << "  Fires alongside: #{companions.map { |fn, c| "#{fn} #{pct.call(c, procs)}" }.join(', ')}" unless companions.empty?
+        unless rate_rows.empty?
+          lines << ''
+          lines << 'Proc rate by attack:'
+          lines.concat(grid(%w[Attack Swings Procs Rate], rate_rows.map { |an, sw, fp| [an, sw.to_s, fp.to_s, pct.call(fp, sw)] }))
+        end
+        if hits.empty?
+          lines << ''
+          lines << '  No damage recorded (non-damaging flare).'
+          return mono(lines)
+        end
+
+        n = hits.size
+        dmgs = hits.map { |h| h[0].to_i }.reject(&:zero?).sort
+        fatal = hits.count { |h| h[4] == 1 }
+        crits = hits.map { |h| h[1] }.compact
+        ranks = Hash.new(0)
+        crits.each { |r| ranks[r] += 1 }
+        locs = Hash.new(0)
+        hits.each { |h| locs[group_location(h[3])] += 1 if h[3] }
+        med = dmgs.empty? ? 0 : (dmgs.size.odd? ? dmgs[dmgs.size / 2] : ((dmgs[dmgs.size / 2 - 1] + dmgs[dmgs.size / 2]) / 2.0).round(1))
+
+        lines << ''
+        lines << 'Damage:'
+        lines << format('  %-28s %s', "Hits: #{n} (#{format('%.0f', 100.0 * n / [procs, 1].max)}% of procs)", "Average: #{dmgs.empty? ? '-' : format('%.1f', dmgs.sum.to_f / dmgs.size)}")
+        lines << format('  %-28s %s', '', "Median: #{med}")
+        lines << format('  %-28s %s', "Fatal: #{fatal} (#{format('%.0f', 100.0 * fatal / n)}%)", "Range: #{dmgs.empty? ? '-' : "#{dmgs.first}..#{dmgs.last}"}")
+        lines << format('  %-28s', "Crits: #{crits.size} (#{format('%.0f', 100.0 * crits.size / n)}%)")
+        rank_rows = (1..9).select { |r| ranks[r].positive? }.map { |r| ["Rank #{r}", ranks[r].to_s, format('%.1f%%', 100.0 * ranks[r] / [crits.size, 1].max)] }
+        loc_rows = locs.sort_by { |_, c| -c }.map { |loc, c| [loc, c.to_s, format('%.1f%%', 100.0 * c / [crits.size, 1].max)] }
+        unless rank_rows.empty?
+          lines << ''
+          lines << 'Crit rank:'
+          lines.concat(grid(%w[Rank N Pct], rank_rows))
+        end
+        unless loc_rows.empty?
+          lines << ''
+          lines << 'Crit location:'
+          lines.concat(grid(%w[Location N Pct], loc_rows))
+        end
+        mono(lines)
+      end
+    end
+
+    def defense_report(noun = nil)
+      if noun.to_s.strip.empty?
+        with_db do |db|
+          nouns = db.execute('SELECT DISTINCT noun FROM creatures WHERE noun IS NOT NULL ORDER BY noun').map(&:first)
+          return link_picker('Creatures (click for DS/TD/UDF):', nouns) { |nn| "defense_report(#{nn.inspect})" }
+        end
+      end
+      with_db do |db|
+        rows_raw = db.execute(<<~SQL, [noun.to_s.strip])
+          SELECT COALESCE(f.name, a.name), r.type, r.defender_stat
+          FROM resolutions r JOIN attacks a ON a.id = r.attack_id
+          LEFT JOIN flares f ON f.id = r.flare_id
+          JOIN creatures c ON c.id = COALESCE(f.creature_id, a.creature_id)
+          WHERE upper(c.noun) = upper(?) AND r.defender_stat IS NOT NULL AND r.type IN ('as_ds','cs_td','uaf_udf')
+        SQL
+        return say("[combat_stats] no DS/TD/UDF readings for '#{noun}'") if rows_raw.empty?
+
+        stat_name = { 'as_ds' => 'DS', 'cs_td' => 'TD', 'uaf_udf' => 'UDF' }
+        buckets = Hash.new { |h, k| h[k] = [] }
+        rows_raw.each { |an, type, val| buckets[[an, stat_name[type]]] << val.to_i }
+        rows = buckets.sort.map do |(an, stat), vals|
+          s = vals.sort
+          med = s.size.odd? ? s[s.size / 2] : ((s[s.size / 2 - 1] + s[s.size / 2]) / 2.0).round(1)
+          [an, stat, s.size.to_s, s.first.to_s, format('%.0f', s.sum.to_f / s.size), med.to_s, s.last.to_s]
+        end
+        table("#{noun} - defensive readings", %w[Attack Stat N Min Avg Median Max], rows)
+      end
+    end
+
+    # HP estimates for killed creatures: total damage taken from us plus the
+    # ordered damage list (last hit = the killing blow). arg = noun or session id.
+    def hp_report(arg = nil)
+      with_db do |db|
+        arg = arg.to_s.strip
+        where, params, title = if arg.empty? then ['', [], '']
+                               elsif arg =~ /\A\d+\z/ then ['AND c.session_id = ?', [arg.to_i], " - Session ##{arg}"]
+                               else ['AND upper(c.noun) = upper(?)', [arg], " - #{arg}"]
+                               end
+        creatures = db.execute("SELECT c.id, c.exist_id, c.name FROM creatures c WHERE c.killed_at IS NOT NULL #{where} ORDER BY c.first_seen", params)
+        return say("[combat_stats] no killed creatures#{title}") if creatures.empty?
+
+        rows = creatures.filter_map do |cid, eid, cname|
+          # every recorded hit on the creature, ours flagged: the kill type
+          # comes from the ACTUAL killing blow (last hit, whoever landed
+          # it), and a total that omits other owners' hits is not an HP
+          # estimate - mark it shared/assist rather than pass it off as one
+          all = db.execute(<<~SQL, [cid])
+            SELECT h.damage, h.fatal, (#{OWN_HIT}) FROM hits h JOIN attacks a ON a.id = h.attack_id
+            WHERE h.creature_id = ? ORDER BY h.id
+          SQL
+          ours = all.select { |_, _, own| own == 1 }
+          next if ours.empty?
+
+          our_total = ours.sum { |d, _, _| d.to_i }
+          all_total = all.sum { |d, _, _| d.to_i }
+          our_kill = db.get_first_value("SELECT #{OUR_KILL} FROM creatures c JOIN attacks a ON a.id = c.killed_by_attack_id WHERE c.id = ?", [cid]) == 1
+          kind = all.last[1] == 1 ? 'CRIT' : 'HP'
+          kind = our_kill ? (ours.size == all.size ? kind : "#{kind} shared") : 'ASSIST'
+          [(eid ? link("##{eid}", "creature_report(#{eid})") : '#?'), cname, our_total.to_s,
+           ours.size == all.size ? '' : all_total.to_s, kind,
+           all.map { |d, f, own| "#{own == 1 ? '' : '~'}#{d}#{f == 1 ? '*' : ''}" }.join(' ')]
+        end
+        return say('[combat_stats] no damage recorded for those creatures') if rows.empty?
+
+        table("Creature HP Estimates#{title} (* = fatal crit, ~ = another owner's hit)", ['ID', 'Creature', 'Our DMG', 'All DMG', 'Kill', 'Damages'], rows)
+      end
+    end
+
+    # A compact sequence view retains the original tree behind an explicit link.
+    def compact_creature(db, ci, first, touched, lines, all: false)
+      cid = ci['id']
+      rows = touched.group_by { |_, root, _| root }.map do |root, members|
+        ids = members.map(&:first)
+        marks = (['?'] * ids.size).join(',')
+        name, at = db.get_first_row('SELECT name, occurred_at FROM attacks WHERE id = ?', [root])
+        hits = db.execute("SELECT flare_id, damage, fatal, location FROM hits WHERE creature_id = ? AND attack_id IN (#{marks})", [cid, *ids])
+        statuses = db.execute("SELECT DISTINCT status FROM statuses WHERE creature_id = ? AND attack_id IN (#{marks}) AND action = 'add'", [cid, *ids]).flatten.compact
+        fatal = hits.find { |h| h[2] == 1 }
+        statuses << "Fatal: #{fatal[3] || 'crit'}" if fatal
+        [format('+%.1fs', at.to_f - first.to_f), link(name, "tree_report(#{root})"),
+         hits.select { |h| h[0].nil? }.sum { |h| h[1].to_i }.to_s,
+         hits.reject { |h| h[0].nil? }.sum { |h| h[1].to_i }.to_s, statuses.join(', ')]
+      end
+      other = db.get_first_value("SELECT COALESCE(SUM(h.damage),0) FROM hits h JOIN attacks a ON a.id=h.attack_id WHERE h.creature_id=? AND NOT (#{OWN_HIT})", [cid])
+      lines << "Other recorded damage: #{other}" if other.positive?
+      ref = ci['exist_id'] ? ci['exist_id'].to_s : ci['noun'].inspect
+      if !all && rows.size > 10
+        count = rows.size
+        rows = rows.first(3) + [['...', "#{count - 6} sequences omitted", '', '', '']] + rows.last(3)
+      end
+      lines << 'Sequences (direct includes spawned attacks; flare damage is separate):'
+      lines.concat(grid(%w[Time Sequence Direct Flares Result], rows))
+      lines << [link('[show all]', "creature_report(#{ref}, nil, all: true)"),
+                link('[full tree]', "creature_report(#{ref}, nil, full: true)"),
+                link('[session]', "session_report(#{db.get_first_value('SELECT session_id FROM creatures WHERE id = ?', [cid])})")].join('  ')
+      mono(lines)
+    end
+
+    def fraction(n, d)
+      "#{n}/#{d} (#{d.zero? ? '-' : format('%.1f%%', 100.0 * n / d)})"
+    end
+
+    def median(values)
+      values = values.sort
+      return '-' if values.empty?
+      (values[(values.size - 1) / 2].to_f + values[values.size / 2].to_f) / 2
+    end
+
+    # These reports use only recorded facts. Missing status events are not
+    # failures, and a requested aim location is an assumption, never history.
+    # `arg` is the command's remaining words (a location for aim, then the
+    # scope words), or a scope directly from a link.
+    def analytics_report(kind, arg = nil)
+      kind = kind.to_s
+      words = arg.is_a?(String) ? arg.split : []
+      with_db do |db|
+        if kind == 'compare'
+          ids = words.map(&:to_i)
+          ids = db.execute('SELECT id FROM sessions ORDER BY id DESC LIMIT 2').flatten.reverse if ids.empty?
+          return say('cstats compare: supply two session IDs') unless ids.size == 2 && ids.all? { |id| db.get_first_value('SELECT 1 FROM sessions WHERE id = ?', [id]) }
+          rows = ids.map do |id|
+            start, finish = db.get_first_row('SELECT started_at, ended_at FROM sessions WHERE id = ?', [id])
+            kills, assists = kill_assist_counts(db, id)
+            dealt = db.get_first_value("SELECT COALESCE(SUM(h.damage),0) FROM hits h JOIN attacks a ON a.id=h.attack_id WHERE h.session_id=? AND #{OUR_DMG_TO_CREATURE}", [id])
+            taken = db.get_first_value('SELECT COALESCE(SUM(h.damage),0) FROM hits h JOIN attacks a ON a.id=h.attack_id WHERE h.session_id=? AND a.inbound=1 AND h.creature_id IS NULL', [id])
+            mix = db.execute('SELECT noun, COUNT(*) FROM creatures WHERE session_id=? GROUP BY noun', [id]).map { |n, c| "#{n}: #{c}" }.join(', ')
+            duration = finish && finish - start
+            attempts = db.get_first_value("SELECT COUNT(*) FROM attacks a WHERE a.session_id=? AND #{OWN_ATTACK}", [id])
+            hits = db.get_first_value("SELECT COUNT(*) FROM attacks a WHERE a.session_id=? AND #{OWN_ATTACK} AND EXISTS (SELECT 1 FROM hits h WHERE h.attack_id=a.id AND h.flare_id IS NULL AND h.creature_id IS NOT NULL)", [id])
+            [link(id, "session_report(#{id})"), fmt_dur(duration), kills, assists, dealt, taken, duration && duration.positive? ? format('%.2f', 60.0 * kills / duration) : '-', fraction(hits, attempts), mix]
+          end
+          return table('Hunt comparison (creature mix affects results)', %w[Session Duration Kills Assists Dealt Taken Kills/min Hit-recorded Creatures], rows)
+        end
+        scope = arg.is_a?(String) ? scope_from_words(words, db) : arg
+        ids, label = resolve_scope(db, scope)
+        return say('No matching session') unless label
+        location = words.join(' ').downcase
+        return control_report(db, ids, label, kind) if %w[blind control family].include?(kind)
+        ac, ap = scope_sql('a.session_id', ids)
+        attacks = db.execute("SELECT a.id,a.name,a.aimed,a.outcome,a.creature_id,c.noun,a.occurred_at FROM attacks a LEFT JOIN creatures c ON c.id=a.creature_id WHERE #{ac} AND #{OWN_ATTACK} ORDER BY a.id", ap)
+        if kind == 'accuracy' || kind == 'aim'
+          rows = attacks.group_by { |a| [a[1], a[5], (kind == 'aim' ? (a[2] == 1 ? 'aimed' : 'unaimed') : 'all')] }.map do |key, group|
+            hit = 0; known = 0; on_target = 0; damage = 0; fatal = 0
+            group.each do |a|
+              hs = db.execute('SELECT damage,location,fatal FROM hits WHERE attack_id=? AND flare_id IS NULL AND creature_id IS NOT NULL', [a[0]])
+              hit += 1 unless hs.empty?
+              damage += hs.sum { |h| h[0].to_i }
+              fatal += 1 if hs.any? { |h| h[2] == 1 }
+              known += 1 if hs.any? { |h| h[1] }
+              on_target += 1 if !location.empty? && hs.any? { |h| location == 'eyes' ? %w[left\ eye right\ eye].include?(h[1].to_s.downcase) : h[1].to_s.downcase == location }
+            end
+            outcomes = group.group_by { |a| a[3] || 'no outcome recorded' }.map { |o, g| "#{o}: #{g.size}" }.join(', ')
+            row = [*key, group.size, fraction(hit, group.size), format('%.1f', damage.to_f / group.size), fraction(fatal, group.size), outcomes]
+            row += [fraction(on_target, group.size), fraction(on_target, known)] if kind == 'aim' && !location.empty?
+            row
+          end
+          cols = %w[Attack Creature Mode Attempts Hit-recorded Dmg/attempt Fatal Outcomes]
+          cols += %w[On-target/attempts On-target/known] if kind == 'aim' && !location.empty?
+          lines = section("#{kind.capitalize} - #{label}#{location.empty? ? '' : " - assumed aim: #{location}"}", cols, rows)
+          return mono(lines) unless kind == 'aim'
+
+          return mono(lines + [''] + efficiency_lines(db, ids, label, attacks))
+        end
+        mono(efficiency_lines(db, ids, label, attacks))
+      end
+    end
+
+    # Kill-efficiency grid(s) as lines; the caller wraps them in one mono block.
+    def efficiency_lines(db, ids, label, attacks)
+      cc, cp = scope_sql('c.session_id', ids)
+      samples = []
+      db.execute("SELECT c.id,c.noun,c.killed_at FROM creatures c WHERE #{cc} AND c.killed_at IS NOT NULL", cp).each do |cid, noun, ended|
+        group = attacks.select { |a| a[4] == cid }
+        next if group.empty?
+        shared = db.get_first_value("SELECT COUNT(*) FROM hits h JOIN attacks a ON a.id=h.attack_id WHERE h.creature_id=? AND NOT (#{OWN_HIT})", [cid]).positive?
+        own = db.get_first_value("SELECT #{OUR_KILL} FROM creatures c JOIN attacks a ON a.id=c.killed_by_attack_id WHERE c.id=?", [cid]) == 1
+        mode = group.map { |a| a[2] }.uniq
+        mode = mode.size > 1 ? 'mixed' : (mode.first == 1 ? 'aimed' : 'unaimed')
+        group.group_by { |a| a[1] }.each do |name, xs|
+          # damage THIS attack name did to the creature (its own hits, not
+          # flares) - the creature total on every row overstated each one
+          marks = (['?'] * xs.size).join(',')
+          damage = db.get_first_value("SELECT COALESCE(SUM(h.damage),0) FROM hits h WHERE h.creature_id=? AND h.flare_id IS NULL AND h.attack_id IN (#{marks})", [cid, *xs.map(&:first)])
+          samples << [[noun, name, mode, own ? (shared ? 'shared' : 'solo observed') : 'assist'], xs.size, [ended - group.first[6], 0].max, damage]
+        end
+      end
+      r1 = ->(v) { v.is_a?(Numeric) ? format('%.1f', v) : v.to_s }
+      rows = samples.group_by(&:first).map do |key, xs|
+        [*key, xs.size, r1.call(median(xs.map { |x| x[1] })), r1.call(median(xs.map { |x| x[2] })),
+         r1.call(xs.map { |x| x[2] }.sort[[(xs.size * 0.9).ceil - 1, 0].max]), r1.call(median(xs.map { |x| x[3] }))]
+      end
+      lines = section("Kill efficiency - #{label} (observed association; mixed fights separate)", %w[Creature Attack Aim Ownership Kills Median-attempts Median-seconds P90-seconds Median-damage], rows)
+      differences = samples.select { |x| x[0][3] == 'solo observed' }.group_by { |x| x[0].first(2) }.filter_map do |key, xs|
+        aimed = xs.select { |x| x[0][2] == 'aimed' }
+        unaimed = xs.select { |x| x[0][2] == 'unaimed' }
+        next if aimed.empty? || unaimed.empty?
+        [*key, aimed.size, unaimed.size, median(unaimed.map { |x| x[1] }) - median(aimed.map { |x| x[1] })]
+      end
+      lines += [''] + section('Fewer median attempts with aiming (positive favors aiming)', %w[Creature Attack Aimed-kills Unaimed-kills Difference], differences) unless differences.empty?
+      lines
+    end
+
+    def control_report(db, ids, label, kind)
+      sc, sp = scope_sql('s.session_id', ids)
+      cc, cp = scope_sql('c.session_id', ids)
+      ac, ap = scope_sql('a.session_id', ids)
+      statuses = db.execute("SELECT s.flare_id,s.creature_id,s.status,s.attack_id FROM statuses s JOIN attacks a ON a.id=s.attack_id WHERE #{sc} AND s.action='add' AND s.creature_id IS NOT NULL AND #{OWN_ATTACK}", sp)
+      encountered = db.get_first_value("SELECT COUNT(*) FROM creatures c WHERE #{cc}", cp)
+      if kind == 'control'
+        rows = statuses.group_by { |s| s[2] }.map { |status, xs| [status, xs.size, fraction(xs.map { |s| s[1] }.uniq.size, encountered)] }
+        return table("Observed control - #{label} (applications may include repeats)", %w[Status Events Creature-coverage], rows)
+      end
+      flares = db.execute("SELECT f.id,f.name,f.attack_id,COALESCE(f.creature_id,a.creature_id) FROM flares f JOIN attacks a ON a.id=f.attack_id WHERE #{ac} AND #{OWN_FLARE} AND f.name IN ('phosphorescence','spectral_bloom','glowbright')", ap)
+      all_targets = Set.new; all_blind = Set.new
+      blind_components = []
+      rows = %w[phosphorescence spectral_bloom].map do |name|
+        fs = flares.select { |f| f[1] == name }
+        targets = Set.new; blinded = Set.new; damage = 0; fatal = 0
+        opportunities = Set.new; applications = Set.new
+        fs.each do |fid, _, _aid, cid|
+          hs = db.execute('SELECT creature_id,damage,fatal FROM hits WHERE flare_id=? AND creature_id IS NOT NULL', [fid])
+          targets.merge(hs.map(&:first)); targets.add(cid) if cid
+          damage += hs.sum { |h| h[1].to_i }; fatal += hs.count { |h| h[2] == 1 }
+          reached = hs.map(&:first).compact
+          reached << cid if cid
+          reached.uniq.each { |target| opportunities.add([fid, target]) }
+          applied = statuses.select { |s| s[0] == fid && s[2] == 'blind' }.map { |s| s[1] }.uniq
+          applied.each { |target| applications.add([fid, target]) }
+          blinded.merge(applied)
+        end
+        all_targets.merge(targets); all_blind.merge(blinded)
+        blind_components << [name, targets, blinded]
+        [name, fs.size, targets.size, blinded.size, fraction(blinded.size, targets.size), fraction(applications.size, opportunities.size), damage, fatal]
+      end
+      lines = section("Photo / bloom - #{label}", %w[Component Procs Targets Blinded Coverage Applications/targets Damage Fatal], rows)
+      lines += ["Combined blind coverage: #{fraction(all_blind.size, all_targets.size)}; session coverage: #{fraction(all_blind.size, encountered)}",
+                'Observed blind applications only; eligibility, prior blindness and missing events are not inferred.', '']
+      creatures = db.execute("SELECT c.id,c.noun FROM creatures c WHERE #{cc}", cp)
+      coverage = creatures.group_by { |c| c[1] || '(unknown)' }.map do |noun, group|
+        ids = group.map(&:first).to_set
+        cells = blind_components.map { |_, targets, blinded| fraction((ids & blinded).size, (ids & targets).size) }
+        [noun, *cells, fraction((ids & all_blind).size, (ids & all_targets).size), fraction((ids & all_blind).size, ids.size)]
+      end
+      lines += section('Blind coverage by creature kind', %w[Creature Photo Bloom Combined Session], coverage)
+      photo = flares.select { |f| f[1] == 'phosphorescence' }.map { |f| f[2] }.uniq
+      triggered = flares.select { |f| f[1] == 'glowbright' }.map { |f| f[2] }.uniq & photo
+      spread = triggered.map { |aid| flares.select { |f| f[2] == aid && f[1] == 'spectral_bloom' }.map { |f| f[3] }.compact.uniq.size }
+      lines += ["Bloom trigger / photo-bearing attacks: #{fraction(triggered.size, photo.size)}",
+                "Additional targets per trigger: #{spread.empty? ? '-' : format('%.2f', spread.sum.to_f / spread.size)}; distribution: #{spread.tally.sort.map { |n, c| "#{n}: #{c}" }.join(', ')}"]
+      mono(lines)
+    end
+
+    def group_location(loc)
+      {
+        'left eye' => 'eyes', 'right eye' => 'eyes', 'left arm' => 'arms', 'right arm' => 'arms',
+        'left hand' => 'hands', 'right hand' => 'hands', 'left leg' => 'legs', 'right leg' => 'legs',
+        'left foot' => 'feet', 'right foot' => 'feet'
+      }.fetch(loc.to_s.downcase, loc)
+    end
+
+    # ---- main -------------------------------------------------------
+
+    def main
+      db_dir = File.dirname(DB_PATH)
+      Dir.mkdir(db_dir) unless File.directory?(db_dir)
+
+      # No emit_attacks configure here: the recorder's :attack observer already
+      # makes the processor emit attack events, and configure would persist the
+      # flag per character for the life of the settings.
+      Combat::Tracker.enable! unless Combat::Tracker.enabled?
+
+      rec = Combat::Recorder.new(DB_PATH, character: XMLData.name, source: 'live', idle_timeout: IDLE_TIMEOUT)
+      rec.subscribe!
+
+      queue = Queue.new
+      UpstreamHook.add(HOOK_NAME, proc do |line|
+        if (m = CMD_PATTERN.match(line))
+          queue.push(m[1].to_s)
+          nil
+        else
+          line
+        end
+      end)
+
+      before_dying do
+        UpstreamHook.remove(HOOK_NAME)
+        rec.close
+      end
+
+      respond "[combat_stats] recording to #{DB_PATH}"
+      respond '[combat_stats] sessions: auto (5-minute idle gap ends a hunt); reports: cstats'
+
+      args = Script.current.vars[0]
+      report(args) if args && !args.empty?
+
+      # The recorder fires this for EVERY close path (our idle poll below, the
+      # next event's own idle check, close), so the notice no longer depends
+      # on this loop being the closer.
+      rec.on_session_finished do |finished|
+        mono("[combat_stats] hunt #{finished} over  " + link('[report]', "session_report(#{finished})"))
+      end
+
+      loop do
+        arg = queue.pop(timeout: 30)
+        if arg
+          report(arg)
+        else
+          rec.check_idle!
+        end
+      end
+    end
+  end
+end
+
+CombatStats.main
