@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.16.1
+       version: 5.16.2
       required: Lich >= 5.21.0
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,6 +17,8 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
+  v5.16.2  (2026-09-16)
+    - fix: bigshot would stop attacking a creature as soon as it was made sympathetic (e.g. by Sympathy 1120), even though it was still fighting back
   v5.16.1  (2026-09-13)
     - added lying command check
   v5.16.0  (2026-08-13)
@@ -8169,22 +8171,40 @@ class Bigshot
   # roughly 4x and blows through a 300-400 HP estimate long before the
   # creature actually dies.
   #
-  # So: take the room roster, apply the two facts the game itself asserts over
-  # <crtrStatus> (hostile, not dead), and reimplement valid_target?'s other
-  # two exclusions directly. Those must be reimplemented rather than assumed
-  # to be covered elsewhere in bigshot: the animated check is duplicated in
-  # valid_target?, but the appendage-noun check only ever existed in
-  # should_flee? and gameobj_npc_check - both of which count creatures for
-  # flee/mob decisions and sit on neither the sort_npcs -> find_target ->
-  # valid_target? selection path. GameObj.targets used to strip appendages at
-  # the source, so dropping that filter here would let bigshot select and
-  # attack a severed limb it previously never saw.
+  # So: take the room roster, apply the facts the game itself asserts over
+  # <crtrStatus> (hostile-or-sympathetic, not dead), and reimplement
+  # valid_target?'s other two exclusions directly. Those must be reimplemented
+  # rather than assumed to be covered elsewhere in bigshot: the animated check
+  # is duplicated in valid_target?, but the appendage-noun check only ever
+  # existed in should_flee? and gameobj_npc_check - both of which count
+  # creatures for flee/mob decisions and sit on neither the sort_npcs ->
+  # find_target -> valid_target? selection path. GameObj.targets used to
+  # strip appendages at the source, so dropping that filter here would let
+  # bigshot select and attack a severed limb it previously never saw.
+  #
+  # sympathetic is allowed alongside hostile because <crtrStatus> is a full
+  # snapshot, not a delta: casting Sympathy 1120 on a creature replaces its
+  # hostile="1" with sympathetic="1" in the very next tag, with no hostile
+  # flag at all. The creature is still fully engaged - still attacking, still
+  # damageable - the game just reclassifies it. Requiring hostile alone made
+  # bigshot silently break off mid-fight the instant Sympathy landed, on a
+  # creature that never stopped being a valid target.
+  #
+  # sympathetic alone is NOT trusted, though - it's gated behind
+  # ever_hostile?(c.id) (see there) so a creature that picks up sympathetic
+  # without ever having been asserted hostile by the game doesn't slip in as
+  # a false-positive target. Not GameObj.targets: that's the client's
+  # selected-target dropdown, which is exactly the stale, event-driven list
+  # this migration moved away from as a source of truth (see the note above)
+  # - it has no obligation to refresh on a hostile -> sympathetic transition,
+  # so gating on it here would swap one unreliable signal for another.
   # @param filters [Array<Symbol, String>] optional Creature filters; a filtered
   #   query returns the native roster alone and is not bridged
   # @return [Array<Lich::Gemstone::Creature::CreatureInstance, Lich::Common::GameObj>]
   def bs_hostile_creatures(*filters)
     native = Creature.in_room(*filters).select do |c|
-      next false unless c.crtr_flag?(:hostile)
+      remember_hostile(c) if c.crtr_flag?(:hostile)
+      next false unless c.crtr_flag?(:hostile) || (c.crtr_flag?(:sympathetic) && ever_hostile?(c.id))
       next false if c.crtr_flag?(:dead)
       # Reimplemented from CreatureInstance#valid_target? / GameObj.targets
       # rather than inherited, because valid_target? bundles these two safe
@@ -8224,6 +8244,43 @@ class Bigshot
     # false for them so every native crtrStatus reader degrades safely.
     bridged = GameObj.targets.reject { |go| Creature[go.id] }
     native + bridged
+  end
+
+  # Records that <crtrStatus> has asserted a creature hostile at least once.
+  #
+  # Backs {#ever_hostile?}, which lets {#bs_hostile_creatures} trust a later
+  # sympathetic="1" (Sympathy 1120 replaces hostile with sympathetic in the
+  # same tag - see there) only for a creature the game itself put into combat
+  # at some point, not for any creature that happens to carry sympathetic
+  # without ever having been hostile.
+  #
+  # @param creature [Lich::Gemstone::Creature::CreatureInstance]
+  # @return [void]
+  def remember_hostile(creature)
+    hostile_seen_ids[creature.id.to_i] = true
+  end
+
+  # Whether <crtrStatus> has ever asserted this creature id hostile, per
+  # {#remember_hostile}.
+  #
+  # @param id [String, Integer] creature id
+  # @return [Boolean]
+  def ever_hostile?(id)
+    !!hostile_seen_ids[id.to_i]
+  end
+
+  # The backing store for {#remember_hostile}/{#ever_hostile?}, pruned to ids
+  # Creature still knows about so it can't grow unbounded over a long hunting
+  # session - Creature's own registry already caps size and evicts old
+  # entries (see {ClassMethods#cleanup_old}), so mirroring its live id set
+  # here rides that same cap for free instead of reimplementing eviction.
+  #
+  # @return [Hash{Integer=>true}]
+  def hostile_seen_ids
+    @hostile_seen_ids ||= {}
+    live_ids = Creature.all.map { |c| c.id.to_i }
+    @hostile_seen_ids.select! { |id, _| live_ids.include?(id) }
+    @hostile_seen_ids
   end
 
   # All tracked creatures in the room (alive, dead, hostile, or not), wrapped
