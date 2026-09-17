@@ -416,6 +416,49 @@ RSpec.describe 'ELoot disk-backed box routing' do
     expect(data.disk).to equal(disk_obj)
   end
 
+  it 'accepts the game confirmation when disk contents have not refreshed yet' do
+    item_class = Struct.new(:id, :name)
+    bag_class = Struct.new(:id, :name, :contents)
+    item = item_class.new('box-1', 'a rotting maoral chest')
+    disk = bag_class.new('disk-1', 'Skooshii disk', [])
+    data = Struct.new(:put_regex, :settings, :sacks_full, :silent_open).new(
+      /You/,
+      { auto_close: [] },
+      {},
+      /You open/
+    )
+
+    game_obj = Module.new
+    game_obj.define_singleton_method(:containers) { {} }
+
+    eloot = Module.new
+    eloot.define_singleton_method(:data) { data }
+    eloot.singleton_class.attr_accessor :commands
+    eloot.commands = []
+    eloot.define_singleton_method(:msg) { |**| nil }
+    eloot.define_singleton_method(:get_command) do |command, _pattern|
+      commands << command
+      ['You put a rotting maoral chest in the Skooshii disk.']
+    end
+    eloot.define_singleton_method(:get_res) { |*| nil }
+    eloot.define_singleton_method(:in_hand?) { |_item| false }
+    eloot.define_singleton_method(:unlootable) { |_item| nil }
+    eloot.define_singleton_method(:save_profile) { nil }
+
+    inventory = Module.new
+    inventory.const_set(:ELoot, eloot)
+    inventory.const_set(:GameObj, game_obj)
+    inventory.const_set(:Inventory, inventory)
+    inventory.const_set(:Room, Struct.new(:current).new(Struct.new(:id).new(4142)))
+    inventory.define_singleton_method(:open_single_container) { |_bag| nil }
+    inventory.define_singleton_method(:sleep) { |_seconds| nil }
+    inventory.define_singleton_method(:waitrt?) { nil }
+    inventory.module_eval(extract_lic_method(source, 'store_item', source_path: eloot_path))
+
+    expect(inventory.store_item(disk, item)).to be true
+    expect(eloot.commands).to contain_exactly('_drag #box-1 #disk-1')
+  end
+
   it 'rescans boxes after the disk arrives at the locksmith pool' do
     item_class = Struct.new(:id, :type, :name)
     box = item_class.new('box-1', 'box', 'a waterlogged coffer')
