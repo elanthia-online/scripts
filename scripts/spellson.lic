@@ -8,13 +8,21 @@
   contributors: Tillmen, Elanthia-Online
           game: gs
           tags: spells, debuffs, cooldowns, buffs, wizardfe, uberspells
-       version: 1.0.0
-      required: Lich >= 5.0
+       version: 2.0.0
+      required: Lich >= 5.22.0
 
      Help Contribute: https://github.com/elanthia-online/scripts
 
   Version Control:
     Major_change.feature_addition.bugfix
+  v2.0.0 (2026-09-17)
+    - Rewritten from GTK to Lich's WebUI. The window is a browser app window
+      served by Lich; every active spell is one row of a composite (contract
+      2.17 bar and label layers), coloured by spell circle as before, so the
+      bars stay crisp at any zoom. The window size and position are read and
+      written under the same Settings keys as before, so nothing is lost on
+      upgrade. The GTK dark-theme palette is gone: the page has no theme
+      signal, and one palette reads on either background.
   v1.0.0 (2023-06-28)
     - Initial release
     - Rework of Tillmen's inactivespells script
@@ -23,136 +31,299 @@
     - Permit differentiation in progress bar colors
 
   ToDo:
-    1) Refactor code (get rid of eval and find better balance) - done
-    2) Enable user personalization of colors, fonts
-    3) Enable feature to cast from the window
+    1) Enable user personalization of colors, fonts
+    2) Enable feature to cast from the window
 
 =end
 
 no_kill_all
 no_pause_all
-# hide_me
 
-Settings.load
-window_width = Settings['window_width'] || 240
-window_height = Settings['window_height'] || 25
-window_position = Settings['window_position']
+# Only if Lich has not already loaded it. `require` keys on the literal path,
+# and Lich's own LIB_DIR can differ from this one by case alone, which Windows
+# treats as the same file and Ruby does not; requiring it twice would define a
+# second Lich::WebUI::Contract and a tree built against one set of constants
+# then fails validation against the other.
+require File.join(LIB_DIR, 'webui.rb') unless defined?(::Lich::WebUI::Contract)
+require 'json'
 
-@bars = {}
-@spell_duration = {}
-@spell_p_bar = {}
-duration = {}
-@window = @bar_box = @color = done = window_close = nil
-
-Gtk.queue do
-  @window = Gtk::Window.new(:toplevel)
-  @window.title = Char.name.to_s
-  @window.icon = @default_icon
-  @window.signal_connect('delete_event') { window_close = true }
-  @window.resize(window_width.to_i, window_height.to_i)
-  @window_position[0] = [[0, window_position[0].to_i].max, (Gdk::Screen.default.width - window_width)].min
-  @window_position[1] = [[0, window_position[1].to_i].max, (Gdk::Screen.default.height - window_height)].min
-  @window.move(window_position[0].to_i, (window_position[1].to_i + 28)) # test against Win / Linux
-  done = true
-  @bar_box = Gtk::Box.new(:vertical, 0)
-  @window.add(@bar_box)
+unless defined?(::Lich::WebUI::Contract) && ::Lich::WebUI::Contract::VERSION.split('.').first(2).map(&:to_i).then { |major, minor| major == 2 && minor >= 17 }
+  found = defined?(::Lich::WebUI::Contract) ? ::Lich::WebUI::Contract::VERSION : 'none'
+  respond
+  respond "Your version of Lich is too old for this script: it needs the WebUI at contract 2.17 or later (this Lich loaded #{found})."
+  respond 'The library is read when Lich starts; if lib/webui was updated since, restart Lich.'
+  respond
+  exit
 end
 
-wait_until { done }
+# The active-spells window, rendered through Lich's WebUI.
+#
+# One page: a composite whose layers are one row per active spell (the time
+# left, a bar coloured by spell circle, the spell name over the bar), and a
+# hidden field the browser reports the window's size and position through.
+module SpellsOn
+  PAGE_ID = 'spellson'
+  DEFAULT_WIDTH = 240
+  DEFAULT_HEIGHT = 25
+  # Row geometry in page pixels: the time column, then the bar.
+  ROW_HEIGHT = 24
+  TIME_WIDTH = 68
+  BAR_HEIGHT = 22
+  # The width the browser reports is the window's outer width. Inside it are
+  # the window's own borders (about 16px on Windows) and the page's 16px
+  # padding on each side; the bars must fit in what is left or the page
+  # grows a horizontal scrollbar however wide the window is dragged.
+  SIDE_ALLOWANCE = 56
+  MIN_BAR_WIDTH = 80
+  # Stacking spells have no duration; the old script scaled them to a
+  # fixed ceiling, in minutes.
+  STACK_CEILING = 250.0
+  SHORT_STACK_CEILING = 3.0
+  SHORT_STACK_SPELLS = [9710, 9711, 9719].freeze
+  # Past ten hours the game reports no useful countdown.
+  INDEFINITE_MINUTES = 599
 
-before_dying do
-  done = false
-  Gtk.queue do
-    window_width = @window.allocation.width
-    window_height = @window.allocation.height
-    window_position = @window.position
-    @window.destroy
-    done = true
+  # Bar colours by spell circle, as the contract's RGBA tints. The GTK
+  # script's light palette, by name; the fallback is the same red it used.
+  # The death-decay timer (6666) is circle '66' by the same rule as every
+  # other spell; the GTK script keyed it '6666', which never matched.
+  PALETTE = {
+    '1' => [0xDD, 0xA0, 0xDD], '2' => [0xEE, 0x82, 0xEE], '3' => [0xDA, 0x70, 0xD6],
+    '4' => [0xB0, 0xE0, 0xE6], '5' => [0x87, 0xCE, 0xEB], '6' => [0xAD, 0xFF, 0x2F],
+    '7' => [0xFF, 0x69, 0xB4], '9' => [0x00, 0xBF, 0xFF], '10' => [0xFF, 0xD7, 0x00],
+    '11' => [0xDE, 0xB8, 0x87], '16' => [0xF0, 0x80, 0x80], '17' => [0xD3, 0xD3, 0xD3],
+    '90' => [0x00, 0xFF, 0x00], '95' => [0x90, 0xEE, 0x90], '96' => [0xB0, 0xC4, 0xDE],
+    '97' => [0x40, 0xE0, 0xD0], '66' => [0xFF, 0xA0, 0x7A]
+  }.freeze
+  FALLBACK_COLOUR = [0xC6, 0x28, 0x28].freeze
+
+  class << self
+    # @return [Window, nil] the live window, for before_dying
+    attr_accessor :current_window
   end
-  wait_until { done }
-  Settings['window_width'] = window_width
-  Settings['window_height'] = window_height
-  if window_position.instance_of?(Array) && (window_position[0].to_i > -5) && (window_position[1].to_i > -5)
-    Settings['window_position'] = window_position
+
+  # @param circle [String] the spell number without its last two digits
+  # @return [Hash] an RGBA tint
+  def self.tint(circle)
+    r, g, b = PALETTE.fetch(circle, FALLBACK_COLOUR)
+    { r: r, g: g, b: b, a: 0.85 }
   end
-  Settings.save
-end
 
-def palette(circle)
-  if Gtk::Settings.default.gtk_application_prefer_dark_theme?
+  # One row of the window: everything the render needs, read on the script
+  # thread so the render never touches Spell itself.
+  Row = Struct.new(:num, :name, :fraction, :text, keyword_init: true)
 
-    rainbow = { '1' => '#9AA5B1', '2' => '#7B8784', '3' => '#616E7C',
-              '4' => '#627D98', '5' => '#486581', '6' => '#625D52',
-              '7' => '#504A40', '9' => '#334E68', '10' => '#102A43',
-              '11' => '#616E7C', '12' => '#857F72', '16' => '#323F4B',
-              '17' => '#BDBDBD', '90' => '#303F9F', '95' => '#00879B',
-              '96' => '#0089B7', '97' => '#0089B7', '98' => '#0089B7',
-              '99' => '#0089B7', '6666' => '#C62828' }
-  else
-    rainbow = { '1' => '#DDA0DD', '2' => 'violet', '3' => 'orchid',
-                '4' => 'powderblue', '5' => 'skyblue', '6' => 'greenyellow',
-                '7' => 'hotpink', '9' => 'deepskyblue', '10' => 'gold',
-                '11' => 'burlywood', '16' => 'lightcoral', '17' => 'lightgray',
-                '90' => 'lime', '95' => 'lightgreen', '96' => 'lightsteelblue',
-                '97' => 'turquoise', '6666' => 'lightsalmon' }
-  end
-  rainbow.fetch(circle, '#C62828')
-end
+  class Window
+    def initialize(script)
+      @script = script
+      @lock = Mutex.new
+      @closed = Queue.new
+      @page = nil
+      @browser = nil
+      @rows = []
+      # A non-stacking spell's duration when it was first seen, so the bar
+      # drains from full rather than from wherever the spell was at start.
+      @durations = {}
+      load_settings
+    end
 
-until window_close
-  Spell.active.each do |spell|
-    Gtk.queue do
-      unless @bars[spell.num]
-        # start build a bar - if a bar for a spell is not present, build a bar
-        duration[spell.num] = proc { (spell.duration).to_f }.call unless spell.stacks
-        @bars[spell.num] = Gtk::Paned.new(:horizontal)
-        @spell_p_bar[spell.num] = Gtk::ProgressBar.new
-        @spell_duration[spell.num] = Gtk::Label.new
-        @spell_duration[spell.num].set_width_chars(9)
-        @s_overlay = Gtk::Overlay.new
+    # ---- lifecycle ----------------------------------------------------------
 
-        circle = (spell.num).to_s[0..-3]
-        @circle_color = palette(circle)
-        provider = Gtk::CssProvider.new
-        provider.load(data: "label { font-weight: bold; }\
-                            trough {font-weight: bold; min-height: 22px; }\
-                            progress {font-weight: bold; min-height: 20px; background-image: none; background-color: %s;}" % @circle_color)
-        @spell_p_bar[spell.num].style_context.add_provider(provider, Gtk::StyleProvider::PRIORITY_USER)
-        @s_overlay.add(@spell_p_bar[spell.num])
-        @s_label = Gtk::Label.new(spell.name.to_s)
-        @s_overlay.add_overlay(@s_label)
-        @bars[spell.num].add1(@spell_duration[spell.num])
-        @bars[spell.num].add2(@s_overlay)
-        @bars = @bars.sort_by { |k, _v| k }.to_h
-        @bar_box.pack_start(@bars[spell.num])
-        @bar_box.reorder_child(@bars[spell.num], @bars.keys.index(spell.num))
-        # end build a bar - bar is built and inserted at this point
+    # Registers the page, starts the shared WebUI service and opens the window.
+    def show
+      window = self
+      @page = Lich::WebUI.page(
+        owner: @script, id: PAGE_ID, title: Char.name.to_s, props: { bare: true },
+        on: { close: ->(_event) { window.closed_by_viewer } }
+      ) { |builder| window.render(builder) }
+
+      # The WebUI listener is one accept-loop thread, and a thread created
+      # from a script belongs to that script's ThreadGroup, which Lich kills
+      # when the script stops. Start the shared service from the default
+      # group so it outlives us.
+      starter = Thread.new { Lich::WebUI.start }
+      ThreadGroup::Default.add(starter)
+      starter.join
+
+      url = Lich::WebUI.launch_url(page: @page)
+      respond "[spellson: #{url}]" unless Lich::WebUI.open_browser?
+      # Keep-above belongs to the OS window, which the page cannot reach;
+      # the opener finds the browser's window and applies it.
+      @browser = Lich::WebUI.open(page: @page, presentation: -> { window.window_presentation },
+                                  title: Char.name.to_s,
+                                  geometry: { width: @settings[:window_width].to_i, height: @settings[:window_height].to_i })
+      @browser = nil unless @browser.respond_to?(:apply)
+    end
+
+    # The GTK window was kept above everything, every tick.
+    def window_presentation
+      { always_on_top: true, opacity: 1.0 }
+    end
+
+    def closed_by_viewer
+      @closed.push(:viewer)
+    end
+
+    def should_exit
+      !@closed.empty?
+    end
+
+    # Tears the page down. The WebUI service is shared with every other
+    # script using it, so terminate_owner, never service.stop.
+    def destroy
+      Lich::WebUI.terminate_owner(@script)
+    rescue StandardError => e
+      respond "[spellson: error closing window: #{e.message}]"
+    end
+
+    # ---- settings -----------------------------------------------------------
+
+    def load_settings
+      Settings.load
+      position = Settings['window_position']
+      position = [0, 0] unless position.is_a?(Array) && position.length == 2
+      @settings = {
+        window_width: (Settings['window_width'] || DEFAULT_WIDTH).to_i,
+        window_height: (Settings['window_height'] || DEFAULT_HEIGHT).to_i,
+        window_position: position.first(2).map(&:to_i)
+      }
+    end
+
+    def save_settings
+      @lock.synchronize do
+        Settings['window_width'] = @settings[:window_width]
+        Settings['window_height'] = @settings[:window_height]
+        position = @settings[:window_position]
+        Settings['window_position'] = position if position[0] > -5 && position[1] > -5
+        Settings.save
       end
+    end
 
-      if spell.stacks
-        if (spell.num == 9710) || (spell.num == 9711) || (spell.num == 9719)
-          @spell_p_bar[spell.num].set_fraction(spell.timeleft / 3.0)
-        else
-          @spell_p_bar[spell.num].set_fraction(spell.timeleft / 250.0)
+    # ---- spells -------------------------------------------------------------
+
+    # Reads the active spells into rows, in spell-number order.
+    # @return [Boolean] whether the rows changed
+    def update
+      rows = Spell.active.sort_by(&:num).map { |spell| row_for(spell) }
+      active = rows.map(&:num)
+      @durations.delete_if { |num, _| !active.include?(num) }
+      @lock.synchronize do
+        return false if rows == @rows
+
+        @rows = rows
+      end
+      true
+    end
+
+    def row_for(spell)
+      timeleft = spell.timeleft.to_f
+      fraction = if spell.stacks
+                   timeleft / (SHORT_STACK_SPELLS.include?(spell.num) ? SHORT_STACK_CEILING : STACK_CEILING)
+                 else
+                   duration = (@durations[spell.num] ||= spell.duration.to_f)
+                   duration.positive? ? timeleft / duration : 0.0
+                 end
+      fraction = 0.0 unless fraction.finite?
+      text = timeleft > INDEFINITE_MINUTES ? 'Indefinite' : spell.remaining.to_s
+      Row.new(num: spell.num, name: spell.name.to_s, fraction: fraction.clamp(0.0, 1.0), text: text)
+    end
+
+    # ---- rendering ----------------------------------------------------------
+
+    def render(builder)
+      @lock.synchronize do
+        window = self
+        # The window's size and position, as GTK's resize and move: the
+        # browser sizes the window from it when the page first shows, and
+        # the hidden window-geometry field below keeps it current so a
+        # reopened window comes back where the viewer left it.
+        x, y = @settings[:window_position]
+        builder.facility(:geometry, { width: @settings[:window_width], height: @settings[:window_height], x: x, y: y })
+        builder.facility(:presentation, window_presentation)
+        width = [@settings[:window_width] - SIDE_ALLOWANCE, TIME_WIDTH + MIN_BAR_WIDTH].max
+        height = [@rows.length, 1].max * ROW_HEIGHT
+        builder.composite(key: 'spells', width: width, height: height, layers: layers(width))
+        builder.text_input(key: 'window-geometry', hidden: true, max_length: 256,
+                           value: JSON.generate(width: @settings[:window_width], height: @settings[:window_height],
+                                                position: @settings[:window_position]),
+                           on: { change: ->(event) { window.on_window_geometry(event) } })
+      end
+    end
+
+    # One row per spell: the time left, the bar, the name over the bar.
+    def layers(width)
+      bar_width = width - TIME_WIDTH
+      @rows.each_with_index.flat_map do |row, index|
+        top = index * ROW_HEIGHT
+        circle = row.num.to_s[0..-3]
+        [
+          { kind: 'label', x: 4, y: top + 4, text: row.text, emphasis: 'strong' },
+          { kind: 'bar', x: TIME_WIDTH, y: top + 1, w: bar_width, h: BAR_HEIGHT, value: row.fraction, tone: SpellsOn.tint(circle) },
+          { kind: 'label', x: TIME_WIDTH + 6, y: top + 4, text: row.name, emphasis: 'strong' }
+        ]
+      end
+    end
+
+    def refresh
+      Lich::WebUI.refresh(@page) if @page
+    end
+
+    # ---- events -------------------------------------------------------------
+
+    def on_window_geometry(event)
+      geometry = JSON.parse(event.payload.fetch(:value))
+      width = geometry['width'].to_i
+      height = geometry['height'].to_i
+      position = geometry['position']
+      @lock.synchronize do
+        if width > 100 && height > 20
+          @settings[:window_width] = width
+          @settings[:window_height] = height
         end
-      else
-        @spell_p_bar[spell.num].set_fraction(spell.timeleft / duration[spell.num])
+        @settings[:window_position] = position.first(2).map(&:to_i) if position.is_a?(Array) && position.length == 2
       end
-
-      spell.timeleft > 599 ? @spell_duration[spell.num].text = 'Indefinite' : @spell_duration[spell.num].text = (spell.remaining)
-      @window.show_all
-      @window.keep_above = true
+      save_settings
+      # The bars are as wide as the window; a resize redraws them.
+      refresh
+    rescue JSON::ParserError, KeyError
+      nil
     end
   end
 
-  active = Spell.active.collect(&:num)
-  @bars.each_pair do |num, bar|
-    Gtk.queue { @bars.delete(num); bar.destroy } unless active.include?(num)
+  def self.run(script)
+    window = Window.new(script)
+    SpellsOn.current_window = window
+    window.show
+
+    until window.should_exit
+      window.refresh if window.update
+      sleep 0.5
+    end
+
+    window.save_settings
+    window.destroy
+    SpellsOn.current_window = nil
+  rescue StandardError => e
+    respond "[spellson: Fatal error: #{e.class}: #{e.message}]"
+    respond "[spellson: Backtrace: #{e.backtrace.first(5).join("\n")}]"
+    SpellsOn.current_window = nil
+    raise
   end
-
-  sleep 0.5
-
 end
+
+before_dying do
+  if (window = SpellsOn.current_window)
+    begin
+      window.save_settings
+      window.destroy
+    rescue StandardError => e
+      respond "[spellson: Error during cleanup: #{e.message}]" rescue nil
+    end
+    SpellsOn.current_window = nil
+  end
+end
+
+SpellsOn.run(Script.current)
 
 #
 # Spell number reference
