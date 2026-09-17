@@ -725,6 +725,15 @@ module BigshotCreatureAdapterSpec
       Creature.registry = fake_creatures.each_with_object({}) { |c, h| h[c.id] = c }
     end
 
+    # Simulates the real Creature.clear_room: empties the room roster only,
+    # leaving the registry (Creature.all/Creature.[]) untouched. room(...)
+    # always sets both to the same set, so nothing exercises the two
+    # diverging without this - and hostile_seen_ids pruning against the
+    # wrong one (in_room instead of all) would otherwise pass every test.
+    def clear_room
+      Creature.room_targets = []
+    end
+
     def wrap(fake_creature)
       BigshotCreature.new(fake_creature)
     end
@@ -1204,6 +1213,24 @@ module BigshotCreatureAdapterSpec
         bs.room # Creature registry no longer has this id at all
 
         expect(bs.ever_hostile?(goblin.id)).to be false
+      end
+
+      it 'survives a room-roster clear while the registry still holds the id' do
+        # Pins the distinction the method above cannot: pruning must key off
+        # Creature.all (the full registry), not Creature.in_room (the room
+        # roster). clear_room empties only the roster, the way the real
+        # Creature.clear_room does when the parser rebuilds it a creature at
+        # a time on a room refresh (see lib/common/xmlparser.rb) - a
+        # creature not yet re-marked present must not be forgotten mid-
+        # rebuild, or the very next tag for it (possibly the sympathetic
+        # one) would find it already evicted from hostile_seen_ids.
+        goblin.flags[:hostile] = true
+        bs.room(goblin)
+        bs.bs_hostile_creatures
+
+        bs.clear_room
+
+        expect(bs.ever_hostile?(goblin.id)).to be true
       end
     end
 
