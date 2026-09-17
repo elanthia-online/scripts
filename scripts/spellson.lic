@@ -16,13 +16,12 @@
   Version Control:
     Major_change.feature_addition.bugfix
   v2.0.0 (2026-09-17)
-    - Rewritten from GTK to Lich's WebUI. The window is a browser app window
-      served by Lich; every active spell is one row of a composite (contract
-      2.17 bar and label layers), coloured by spell circle as before, so the
-      bars stay crisp at any zoom. The window size and position are read and
-      written under the same Settings keys as before, so nothing is lost on
-      upgrade. The GTK dark-theme palette is gone: the page has no theme
-      signal, and one palette reads on either background.
+    - The spell window now opens in a browser window instead of GTK. Needs
+      Lich 5.22 or later and Chrome or Edge installed; your saved window size
+      and position carry over.
+    - The death decay timer's bar is salmon, as it was always meant to be.
+    - Bars for a few spells whose duration is a formula (Spirit Warding,
+      bard songs) used to sit empty; they fill properly now.
   v1.0.0 (2023-06-28)
     - Initial release
     - Rework of Tillmen's inactivespells script
@@ -50,7 +49,7 @@ require 'json'
 unless defined?(::Lich::WebUI::Contract) && ::Lich::WebUI::Contract::VERSION.split('.').first(2).map(&:to_i).then { |major, minor| major == 2 && minor >= 17 }
   found = defined?(::Lich::WebUI::Contract) ? ::Lich::WebUI::Contract::VERSION : 'none'
   respond
-  respond "Your version of Lich is too old for this script: it needs the WebUI at contract 2.17 or later (this Lich loaded #{found})."
+  respond "Your version of Lich is incompatible with this script: it needs the WebUI at contract 2.17 or later within contract 2 (this Lich loaded #{found})."
   respond 'The library is read when Lich starts; if lib/webui was updated since, restart Lich.'
   respond
   exit
@@ -61,33 +60,36 @@ end
 # One page: a composite whose layers are one row per active spell (the time
 # left, a bar coloured by spell circle, the spell name over the bar), and a
 # hidden field the browser reports the window's size and position through.
+# `||=` throughout: the module is defined at script top level, so a second
+# ;spellson in one Lich session re-runs it, and a plain assignment would
+# redefine every constant with a warning each.
 module SpellsOn
-  PAGE_ID = 'spellson'
-  DEFAULT_WIDTH = 240
-  DEFAULT_HEIGHT = 25
+  PAGE_ID ||= 'spellson'
+  DEFAULT_WIDTH ||= 240
+  DEFAULT_HEIGHT ||= 25
   # Row geometry in page pixels: the time column, then the bar.
-  ROW_HEIGHT = 24
-  TIME_WIDTH = 68
-  BAR_HEIGHT = 22
-  # The width the browser reports is the window's outer width. Inside it are
-  # the window's own borders (about 16px on Windows) and the page's 16px
-  # padding on each side; the bars must fit in what is left or the page
-  # grows a horizontal scrollbar however wide the window is dragged.
-  SIDE_ALLOWANCE = 56
-  MIN_BAR_WIDTH = 80
+  ROW_HEIGHT ||= 24
+  TIME_WIDTH ||= 68
+  BAR_HEIGHT ||= 22
+  # The bars must fit inside the page's 16px padding on each side, with a
+  # little left over for a scrollbar, or the page grows a horizontal
+  # scrollbar however wide the window is dragged. The width the browser
+  # reports is the page's inner width, so no window border is in it.
+  SIDE_ALLOWANCE ||= 48
+  MIN_BAR_WIDTH ||= 80
   # Stacking spells have no duration; the old script scaled them to a
   # fixed ceiling, in minutes.
-  STACK_CEILING = 250.0
-  SHORT_STACK_CEILING = 3.0
-  SHORT_STACK_SPELLS = [9710, 9711, 9719].freeze
+  STACK_CEILING ||= 250.0
+  SHORT_STACK_CEILING ||= 3.0
+  SHORT_STACK_SPELLS ||= [9710, 9711, 9719].freeze
   # Past ten hours the game reports no useful countdown.
-  INDEFINITE_MINUTES = 599
+  INDEFINITE_MINUTES ||= 599
 
   # Bar colours by spell circle, as the contract's RGBA tints. The GTK
   # script's light palette, by name; the fallback is the same red it used.
   # The death-decay timer (6666) is circle '66' by the same rule as every
   # other spell; the GTK script keyed it '6666', which never matched.
-  PALETTE = {
+  PALETTE ||= {
     '1' => [0xDD, 0xA0, 0xDD], '2' => [0xEE, 0x82, 0xEE], '3' => [0xDA, 0x70, 0xD6],
     '4' => [0xB0, 0xE0, 0xE6], '5' => [0x87, 0xCE, 0xEB], '6' => [0xAD, 0xFF, 0x2F],
     '7' => [0xFF, 0x69, 0xB4], '9' => [0x00, 0xBF, 0xFF], '10' => [0xFF, 0xD7, 0x00],
@@ -95,7 +97,7 @@ module SpellsOn
     '90' => [0x00, 0xFF, 0x00], '95' => [0x90, 0xEE, 0x90], '96' => [0xB0, 0xC4, 0xDE],
     '97' => [0x40, 0xE0, 0xD0], '66' => [0xFF, 0xA0, 0x7A]
   }.freeze
-  FALLBACK_COLOUR = [0xC6, 0x28, 0x28].freeze
+  FALLBACK_COLOUR ||= [0xC6, 0x28, 0x28].freeze
 
   class << self
     # @return [Window, nil] the live window, for before_dying
@@ -111,7 +113,7 @@ module SpellsOn
 
   # One row of the window: everything the render needs, read on the script
   # thread so the render never touches Spell itself.
-  Row = Struct.new(:num, :name, :fraction, :text, keyword_init: true)
+  Row ||= Struct.new(:num, :name, :fraction, :text, keyword_init: true)
 
   class Window
     def initialize(script)
@@ -138,25 +140,64 @@ module SpellsOn
         on: { close: ->(_event) { window.closed_by_viewer } }
       ) { |builder| window.render(builder) }
 
-      # The WebUI listener is one accept-loop thread, and a thread created
-      # from a script belongs to that script's ThreadGroup, which Lich kills
-      # when the script stops. Start the shared service from the default
-      # group so it outlives us.
-      starter = Thread.new { Lich::WebUI.start }
-      ThreadGroup::Default.add(starter)
-      starter.join
+      start_service
 
       url = Lich::WebUI.launch_url(page: @page)
-      respond "[spellson: #{url}]" unless Lich::WebUI.open_browser?
+      # Under --webui-no-browser the window is a URL the player opens where
+      # their browser is; nothing is spawned here.
+      unless Lich::WebUI.open_browser?
+        respond "[spellson: window ready; open it at #{url}]"
+        return
+      end
       # Keep-above belongs to the OS window, which the page cannot reach;
-      # the opener finds the browser's window and applies it. The position
-      # is the launcher's to apply too (--window-position); the client only
-      # sizes from the geometry facility.
+      # the opener finds the browser's window and applies it, and the loop
+      # re-applies it as the GTK window did. The position is the launcher's
+      # to apply too (--window-position); the client sizes from the
+      # geometry facility.
+      geometry = { width: @settings[:window_width].to_i, height: @settings[:window_height].to_i }
+      geometry[:position] = @settings[:window_position] if @settings[:window_position]
       @browser = Lich::WebUI.open(page: @page, presentation: -> { window.window_presentation },
-                                  title: Char.name.to_s,
-                                  geometry: { width: @settings[:window_width].to_i, height: @settings[:window_height].to_i,
-                                              position: @settings[:window_position].first(2).map(&:to_i) })
+                                  title: Char.name.to_s, geometry: geometry)
       @browser = nil unless @browser.respond_to?(:apply)
+      # false or nil: no Chrome or Edge to spawn. The page is still served.
+      respond "[spellson: no browser window could be opened; open it at #{url}]" unless @browser
+    end
+
+    # Starts the shared WebUI service from the default thread group.
+    #
+    # The service's accept loop inherits the group of whoever calls start,
+    # and a thread created from a script belongs to that script's group,
+    # which Lich kills when the script stops: a service started from here
+    # would lose its listener with this script and could never rebind its
+    # port. The starter is created parked and moved before it runs, so the
+    # move cannot lose the race with the start.
+    def start_service
+      service = Lich::WebUI.service
+      return if service.server.running?
+      return Lich::WebUI.start if Thread.current.group.equal?(ThreadGroup::Default)
+
+      gate = Queue.new
+      result = Queue.new
+      thread = Thread.new do
+        gate.pop
+        result << [:ok, Lich::WebUI.start]
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        result << [:error, e]
+      end
+      begin
+        ThreadGroup::Default.add(thread)
+      rescue ThreadError
+        nil # an enclosed group keeps its threads; start anyway
+      end
+      gate << true
+      status, value = result.pop
+      raise value if status == :error
+
+      value
+    end
+
+    def present_window
+      @browser&.apply
     end
 
     # The GTK window was kept above everything, every tick.
@@ -182,15 +223,17 @@ module SpellsOn
 
     # ---- settings -----------------------------------------------------------
 
+    # The position is nil until the browser has reported one, so a first
+    # run opens where the OS puts it rather than pinned to the top-left.
     def load_settings
-      Settings.load
       position = Settings['window_position']
-      position = [0, 0] unless position.is_a?(Array) && position.length == 2
+      position = position.is_a?(Array) && position.length == 2 ? position.first(2).map(&:to_i) : nil
       @settings = {
         window_width: (Settings['window_width'] || DEFAULT_WIDTH).to_i,
         window_height: (Settings['window_height'] || DEFAULT_HEIGHT).to_i,
-        window_position: position.first(2).map(&:to_i)
+        window_position: position
       }
+      @saved_settings = @settings.dup
     end
 
     # Settings resolve their namespace from Script.current, which is nil on
@@ -207,14 +250,18 @@ module SpellsOn
       save_settings if dirty
     end
 
+    # Each Settings write serialises the whole blob, so a drag that reports
+    # twice a second is written only when something actually changed.
     def save_settings
       @lock.synchronize do
         @settings_dirty = false
+        next if @settings == @saved_settings
+
         Settings['window_width'] = @settings[:window_width]
         Settings['window_height'] = @settings[:window_height]
         position = @settings[:window_position]
-        Settings['window_position'] = position if position[0] > -5 && position[1] > -5
-        Settings.save
+        Settings['window_position'] = position if position && position[0] > -5 && position[1] > -5
+        @saved_settings = @settings.dup
       end
     end
 
@@ -239,7 +286,10 @@ module SpellsOn
       fraction = if spell.stacks
                    timeleft / (SHORT_STACK_SPELLS.include?(spell.num) ? SHORT_STACK_CEILING : STACK_CEILING)
                  else
-                   duration = (@durations[spell.num] ||= spell.duration.to_f)
+                   # time_per evaluates the duration formula; `duration` is
+                   # the formula's source text, which to_f read as 0 for
+                   # any that starts with a bracket or a method call.
+                   duration = (@durations[spell.num] ||= spell.time_per.to_f)
                    duration.positive? ? timeleft / duration : 0.0
                  end
       fraction = 0.0 unless fraction.finite?
@@ -256,8 +306,9 @@ module SpellsOn
         # browser sizes the window from it when the page first shows, and
         # the hidden window-geometry field below keeps it current so a
         # reopened window comes back where the viewer left it.
-        x, y = @settings[:window_position]
-        builder.facility(:geometry, { width: @settings[:window_width], height: @settings[:window_height], x: x, y: y })
+        geometry = { width: @settings[:window_width], height: @settings[:window_height] }
+        geometry[:x], geometry[:y] = @settings[:window_position] if @settings[:window_position]
+        builder.facility(:geometry, geometry)
         builder.facility(:presentation, window_presentation)
         width = [@settings[:window_width] - SIDE_ALLOWANCE, TIME_WIDTH + MIN_BAR_WIDTH].max
         height = [@rows.length, 1].max * ROW_HEIGHT
@@ -317,6 +368,7 @@ module SpellsOn
     until window.should_exit
       window.refresh if window.update
       window.flush_settings
+      window.present_window
       sleep 0.5
     end
 
@@ -324,9 +376,9 @@ module SpellsOn
     window.destroy
     SpellsOn.current_window = nil
   rescue StandardError => e
+    # current_window is left set: before_dying saves and destroys it.
     respond "[spellson: Fatal error: #{e.class}: #{e.message}]"
     respond "[spellson: Backtrace: #{e.backtrace.first(5).join("\n")}]"
-    SpellsOn.current_window = nil
     raise
   end
 end
