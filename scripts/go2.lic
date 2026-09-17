@@ -16,7 +16,9 @@
    changelog:
       2.5.0 (2026-09-13)
         Report trip progress to other scripts (Go2.status, ;force go2 status while moving)
-        Give up after 30 restarts instead of looping forever (--max-restarts=<N>, 0 = never)
+        Give up after 60 seconds without entering a new room, or 30 restarts, instead of
+        looping forever (--max-stuck=<seconds>, --max-restarts=<N>, 0 = never)
+        A bank detour that cannot reach the bank or the silvers fails the trip
       2.4.0 (2026-09-10)
         Add a one-trip --preserve-scripts flag for guarded callers that must keep
         roomnumbers and textsubs running during supervised travel
@@ -245,6 +247,7 @@ module Go2
   #   last_progress_at Time of the last room change
   #   restarts         number of internal restart cycles this trip
   #   max_restarts     restart ceiling for this trip (0 = unlimited)
+  #   max_stuck        seconds without a room change before giving up (0 = unlimited)
   #   eta              estimated seconds remaining when the path was last computed
   #   started_at       Time the trip started
   # Go2.status is reset to :idle when the script exits; the final state is kept
@@ -255,7 +258,7 @@ module Go2
   # script include, and an unqualified const_defined?(:Status) found it, so the
   # struct was never defined and Status.new hit that module instead.
   TripStatus = Struct.new(:phase, :reason, :cause, :command, :destination, :rooms_left, :last_room,
-                          :last_progress_at, :restarts, :max_restarts, :eta, :started_at,
+                          :last_progress_at, :restarts, :max_restarts, :max_stuck, :eta, :started_at,
                           keyword_init: true) unless const_defined?(:TripStatus, false)
   @@status ||= TripStatus.new(phase: :idle, restarts: 0, max_restarts: 0)
   @@last_result ||= nil
@@ -1079,6 +1082,7 @@ module Go2
   CharSettings['disable_confirm']        = false if CharSettings['disable_confirm'].nil?
   CharSettings['confirm_distance']       = 20    if CharSettings['confirm_distance'].nil?
   CharSettings['max_restarts']           = 30    if CharSettings['max_restarts'].nil?
+  CharSettings['max_stuck_seconds']      = 60    if CharSettings['max_stuck_seconds'].nil?
 
   show_help = proc {
     output = []
@@ -1105,6 +1109,7 @@ module Go2
     output << "     --disable-confirm                       Skip the confirmation prompt for this trip only."
     output << "     --preserve-scripts                      Leave roomnumbers/textsubs running for this trip only."
     output << "     --max-restarts=<#>                      Give up after this many internal restarts (0 = never)."
+    output << "     --max-stuck=<#>                         Give up after this many seconds without entering a new room (0 = never)."
     output << "                                               Default 30; saved when given without a target."
     output << "     --disable-confirm=<on|off>              Persistently skip (or show) the confirmation prompt for long trips."
     output << "     --confirm-distance=<#>                  Trips shorter than this many rooms skip the confirmation prompt."
@@ -1425,6 +1430,7 @@ module Go2
   setting_instability             = nil
   setting_preserve_scripts        = false
   setting_max_restarts            = nil
+  setting_max_stuck               = nil
   setting_drag                    = nil
   setting_use_caravan_to_sos      = nil
   setting_use_caravan_from_sos    = nil
@@ -1447,6 +1453,8 @@ module Go2
       setting_preserve_scripts = true
     elsif var =~ /^(?:\-\-)?max[_\-]restarts=([0-9]+)$/i
       setting_max_restarts = $1.to_i
+    elsif var =~ /^(?:\-\-)?max[_\-]stuck=([0-9]+)$/i
+      setting_max_stuck = $1.to_i
     elsif var =~ /^(?:\-\-)?disable[_\-]confirm=(on|true|yes|off|false|no)$/i
       setting_disable_confirm = setting_value[$1.downcase]
     elsif var =~ /^(?:\-\-)?confirm[_\-]distance=([0-9]+)$/i
@@ -1555,6 +1563,10 @@ module Go2
     unless setting_max_restarts.nil?
       CharSettings['max_restarts'] = setting_max_restarts
       echo "go2 will give up after #{setting_max_restarts > 0 ? setting_max_restarts : 'an unlimited number of'} restarts"
+    end
+    unless setting_max_stuck.nil?
+      CharSettings['max_stuck_seconds'] = setting_max_stuck
+      echo "go2 will give up after #{setting_max_stuck > 0 ? "#{setting_max_stuck} seconds" : 'any amount of time'} without entering a new room"
     end
 
     if XMLData.game =~ /^GSPlat|^GSF/
@@ -2378,6 +2390,7 @@ module Go2
   $go2_restart = false
   first_move   = true
   max_restarts = (setting_max_restarts.nil? ? CharSettings['max_restarts'] : setting_max_restarts).to_i
+  max_stuck    = (setting_max_stuck.nil? ? CharSettings['max_stuck_seconds'] : setting_max_stuck).to_i
   last_sent    = nil
   restarts     = 0
 
@@ -2386,7 +2399,7 @@ module Go2
     Go2.status_update(phase: :moving, reason: "bank detour to #{destination.id}", command: nil)
   else
     Go2.status_reset(phase: :pathing, destination: destination.id, last_room: start_room.id,
-                     last_progress_at: Time.now, started_at: Time.now, max_restarts: max_restarts)
+                     last_progress_at: Time.now, started_at: Time.now, max_restarts: max_restarts, max_stuck: max_stuck)
     # If we exit any other way than arriving or giving up (killed, error, dead),
     # record that and clear the live status so it isn't stale after exit.
     before_dying {
@@ -2413,12 +2426,21 @@ module Go2
       else
         restarts = Go2.status_update(restarts: Go2.status.restarts + 1).restarts
       end
-      if max_restarts > 0 and restarts > max_restarts
-        st = Go2.status
-        echo "giving up after #{restarts} restarts (--max-restarts=#{max_restarts})"
+      # two ceilings: restarts, and wall-clock time since the last room change
+      # (the one a wedged trip actually hits: restarts come fast when every
+      # attempt is refused, so a count alone said little about time)
+      st = Go2.status
+      stuck_for = st.last_progress_at ? (Time.now - st.last_progress_at).round : 0
+      give_up = if max_restarts > 0 and restarts > max_restarts
+                  "giving up after #{restarts} restarts (--max-restarts=#{max_restarts})"
+                elsif max_stuck > 0 and stuck_for > max_stuck
+                  "giving up after #{stuck_for} seconds without entering a new room (--max-stuck=#{max_stuck})"
+                end
+      if give_up
+        echo give_up
         echo "last blocker: #{st.command.inspect} -> #{st.reason}" if st.reason
         if $go2_started_go2_bank
-          $go2_bank_detour_gave_up = true
+          $go2_bank_detour_failed = give_up
         else
           Go2.status_finish(:failed)
         end
@@ -2508,18 +2530,26 @@ module Go2
             end
             if $go2_started_go2_bank
               echo "You're too poor to go to the bank."
+              $go2_bank_detour_failed = 'too poor to reach the bank'
               exit
             end
             begin
               $go2_started_go2_bank = true
-              $go2_bank_detour_gave_up = false
+              $go2_bank_detour_failed = nil
               go2_count = Script.running.find_all { |sr| sr.name == Script.current.name }.length
               force_start_script Script.current.name, [bank_id.to_s]
               wait_until { Script.running.find_all { |sr| sr.name == Script.current.name }.length <= go2_count }
             ensure
               $go2_started_go2_bank = false
             end
-            echo "the bank detour gave up; continuing to #{destination.id} without the silvers" if $go2_bank_detour_gave_up
+            # the silvers were needed to get there: without them the trip
+            # cannot be completed, so it fails here with the detour's reason
+            # rather than walking on to be refused at the first toll
+            if $go2_bank_detour_failed
+              echo "the bank detour failed (#{$go2_bank_detour_failed}); the trip to #{destination.id} needs those silvers"
+              Go2.status_finish(:failed, reason: "bank detour failed: #{$go2_bank_detour_failed}")
+              exit
+            end
             unless (start_room = Room.current)
               echo 'error: your current room was not found in the map database'
               exit
@@ -2552,6 +2582,7 @@ module Go2
             if self.go2_check_silver() < needed_silvers
               echo "You are too poor to make this trip."
               echo "Not enough silver in current area's bank."
+              Go2.status_finish(:failed, reason: 'not enough silver in the bank') unless $go2_started_go2_bank
               exit
             end
           else
