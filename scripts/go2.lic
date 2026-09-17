@@ -10,10 +10,15 @@
       contributors: Deysh, Doug, Gildaren, Sarvatt, Tysong, Xanlin, Dissonance, Drafix
               game: any
               tags: core, movement
-           version: 2.4.0
+           version: 2.5.0
           required: Lich >= 5.12.0
 
    changelog:
+      2.5.0 (2026-09-13)
+        Report trip progress to other scripts (Go2.status, ;force go2 status while moving)
+        Give up after 60 seconds without entering a new room, or 30 restarts, instead of
+        looping forever (--max-stuck=<seconds>, --max-restarts=<N>, 0 = never)
+        A bank detour that cannot reach the bank or the silvers fails the trip
       2.4.0 (2026-09-10)
         Add a one-trip --preserve-scripts flag for guarded callers that must keep
         roomnumbers and textsubs running during supervised travel
@@ -208,7 +213,6 @@
 
 module Go2
   @@data ||= nil
-  @@mounted = false
 
   def self.mounted
     @@mounted
@@ -217,6 +221,221 @@ module Go2
   def self.mounted=(value)
     @@mounted = value
   end
+
+  #
+  # Trip status, readable by other scripts while go2 runs. Poll Go2.status from
+  # a tick loop, or hear every change as it happens:
+  #
+  #   Events.on('go2.status', name: 'mysupervisor') { |_topic, st| ... }   # Lich 5.22+
+  #   Go2.on_status('mysupervisor') { |st| ... }                          # any Lich
+  #
+  # Both fire on go2's thread with a frozen snapshot of the status; set a flag
+  # or queue work, never fput from the block. Both are cleaned up
+  # automatically when your script dies. Fields:
+  #   phase            :idle, :pathing, :moving, :blocked, :paused, :arrived, :failed, :aborted
+  #   reason           why the last step didn't progress (game line), or nil
+  #   cause            that reason as a symbol a supervisor can act on, when
+  #                    this Lich's move() reports one (Lich::Common::Move):
+  #                    :injured :encumbered :engaged :position :hidden :hands
+  #                    :closed :map :denied :climb :swim :roundtime :unknown;
+  #                    :muckled is go2's own (sleeping/bound/stunned/webbed).
+  #                    nil on older Lich.
+  #   command          the command go2 sent that didn't progress, or nil
+  #   destination      destination room id
+  #   rooms_left       rooms still to move through (nil until a path exists)
+  #   last_room        last room id actually entered
+  #   last_progress_at Time of the last room change
+  #   restarts         number of internal restart cycles this trip
+  #   max_restarts     restart ceiling for this trip (0 = unlimited)
+  #   max_stuck        seconds without a room change before giving up (0 = unlimited)
+  #   eta              estimated seconds remaining when the path was last computed
+  #   started_at       Time the trip started
+  # Go2.status is reset to :idle when the script exits; the final state is kept
+  # in Go2.last_result (phase :arrived, :failed or :aborted) for supervisors
+  # that only look after Script.running?('go2') turns false.
+  #
+  # TripStatus, not Status: Lich::Gemstone::Status is visible here through the
+  # script include, and an unqualified const_defined?(:Status) found it, so the
+  # struct was never defined and Status.new hit that module instead.
+  TripStatus = Struct.new(:phase, :reason, :cause, :command, :destination, :rooms_left, :last_room,
+                          :last_progress_at, :restarts, :max_restarts, :max_stuck, :eta, :started_at,
+                          keyword_init: true) unless const_defined?(:TripStatus, false)
+  @@status ||= TripStatus.new(phase: :idle, restarts: 0, max_restarts: 0)
+  @@last_result ||= nil
+  # name => { script:, block: }; the owning script so a hook dies with it,
+  # like an Events subscription. Guarded by @@status_lock: a supervisor
+  # registers from its own thread while go2 may be mid-emit.
+  @@status_hooks ||= {}
+  @@status_lock ||= Mutex.new
+
+  def self.status
+    @@status
+  end
+
+  def self.last_result
+    @@last_result
+  end
+
+  # Go2.on_status(name = caller script) { |status| ... } - called after each update
+  # with a frozen snapshot. Hooks are removed with Go2.off_status(name), or
+  # dropped when the script that registered them is no longer running.
+  # Exceptions in hooks are swallowed.
+  def self.on_status(name = nil, &block)
+    return false unless block
+    script = Script.current
+    name ||= (script&.name || 'unknown')
+    @@status_lock.synchronize { @@status_hooks[name] = { script: script, block: block } }
+    name
+  end
+
+  def self.off_status(name = nil)
+    name ||= (Script.current&.name || 'unknown')
+    @@status_lock.synchronize { @@status_hooks.delete(name) }
+  end
+
+  def self.status_update(**fields)
+    # strings are frozen copies so a listener can't edit the live status
+    # through the snapshot, which shares its members
+    fields.each { |k, v| @@status[k] = (v.is_a?(String) ? v.dup.freeze : v) }
+    notify_status(@@status)
+    @@status
+  end
+
+  # Tell everyone listening: the shared Events board when this Lich has it,
+  # and the script-local on_status hooks either way. Listeners get a frozen
+  # snapshot, never the live struct: what they stash stays what it was at
+  # emit time, and nothing they do can alter go2's own trip state. Neither
+  # route may raise into the movement loop, whatever a listener (or a
+  # half-loaded Events) does.
+  def self.notify_status(st)
+    snapshot, hooks = @@status_lock.synchronize {
+      alive = Script.list
+      @@status_hooks.delete_if { |_name, h| h[:script] && !alive.include?(h[:script]) }
+      [st.dup.freeze, @@status_hooks.values]
+    }
+    if defined?(Lich::Common::Events)
+      begin
+        Lich::Common::Events.emit('go2.status', snapshot)
+      rescue StandardError => e
+        Lich.log "go2: Events.emit failed: #{e.class}: #{e.message}" if defined?(Lich.log)
+      end
+    end
+    # hooks run outside the lock, so one may register or remove another
+    hooks.each { |h|
+      begin
+        h[:block].call(snapshot)
+      rescue StandardError => e
+        Lich.log "go2: status hook error: #{e.class}: #{e.message}" if defined?(Lich.log)
+      end
+    }
+  end
+
+  def self.status_reset(**fields)
+    @@status = TripStatus.new(phase: :idle, restarts: 0, max_restarts: 0)
+    # whatever failure is there predates this trip; per thread because
+    # Move.last_failure is, and a nested bank go2 runs on its own thread
+    Thread.current[:go2_seen_move_failure] = move_failure
+    status_update(**fields)
+  end
+
+  # Lich::Common::Move.last_failure on a Lich that has it, else nil.
+  def self.move_failure
+    return nil unless defined?(Lich::Common::Move) && Lich::Common::Move.respond_to?(:last_failure)
+    Lich::Common::Move.last_failure
+  rescue StandardError
+    nil
+  end
+
+  # The Move failure recorded since we last looked, or nil. move() sees the
+  # exact failing line and classifies it, which beats scraping the buffer.
+  def self.fresh_move_failure
+    f = move_failure
+    return nil if f.nil? || f.equal?(Thread.current[:go2_seen_move_failure])
+    Thread.current[:go2_seen_move_failure] = f
+    f
+  end
+
+  # Called when the trip ends: emit the terminal phase, keep a frozen copy as
+  # last_result, then go idle silently. "Went idle" follows every trip end and
+  # is not a transition a listener can act on, so it is not emitted; act on
+  # :arrived / :failed / :aborted instead.
+  def self.status_finish(phase, **fields)
+    status_update(phase: phase, **fields)
+    @@last_result = @@status.dup.freeze
+    @@status = TripStatus.new(phase: :idle, restarts: 0, max_restarts: 0)
+    @@last_result
+  end
+
+  def self.status_summary(st = @@status)
+    out = "go2 status: #{st.phase}"
+    out += " -> #{st.destination}" if st.destination
+    out += ", #{st.rooms_left} rooms left" if st.rooms_left
+    out += ", last room #{st.last_room}" if st.last_room
+    out += " (#{(Time.now - st.last_progress_at).round}s ago)" if st.last_progress_at
+    out += ", restarts #{st.restarts}/#{st.max_restarts.to_i > 0 ? st.max_restarts : 'unlimited'}" if st.restarts.to_i > 0
+    out += ", blocked on #{st.command.inspect}: #{st.reason}" if st.reason
+    out += " [#{st.cause}]" if st.cause
+    out
+  end
+
+  # Human-readable form of a wayto entry (string or StringProc).
+  def self.describe_way(way)
+    return nil if way.nil?
+    if way.class == Proc
+      way.respond_to?(:_dump) ? way._dump.to_s.strip : way.inspect
+    else
+      way.to_s
+    end
+  end
+
+  BLOCKED_LINE = /^You are in far too much agony|^You can't|^You cannot|^You don't|^You'll (?:have|need)|^You must|^You need|^You are (?:too|already|engaged|overburdened|unable)|^You're (?:too|still)|^You (?:realize|try to move|struggle|attempt|fail|search|make a valiant)|^Sorry|^There (?:doesn't|is not|isn't|'s not)|^Maybe|^What were you|^Where are you|^I could not find|^How do you|^An unseen force|^That's probably not|^Uh, yeah|^Definitely NOT|^Your attempt fails|(?:appears|seems) to be closed|too far|may not pass|impassable|prevents you|Please leave promptly|^\.\.\.wait|^Wait \d/i unless const_defined?(:BLOCKED_LINE, false)
+
+  # Pick the game line that explains why the current step didn't move us.
+  # Looks at the lines since the last room title (i.e. since we last arrived
+  # somewhere) and returns the first failure-looking one, so that the root
+  # cause wins over the cascade of "You can't go there" that typeahead sends
+  # afterwards. Falls back to the whole window when titles are hidden.
+  def self.blocked_reason(lines = nil)
+    lines ||= reget(40) || []
+    lines = lines.map(&:strip).reject { |l| l.empty? or l.start_with?('>') }
+    last_title = lines.rindex { |l| l =~ /^\[.+\]$/ }
+    window = last_title ? lines[(last_title + 1)..-1] : lines
+    (window.find { |l| l =~ BLOCKED_LINE } || lines.find { |l| l =~ BLOCKED_LINE })
+  end
+
+  # Prefer what move() recorded for this step (line + cause); fall back to
+  # picking the line out of the buffer on a Lich whose move() predates that.
+  def self.mark_blocked(command, reason = nil)
+    if reason.nil? && (f = fresh_move_failure)
+      status_update(phase: :blocked, command: (command || f.dir), reason: (f.line || 'no progress'), cause: f.cause)
+    else
+      status_update(phase: :blocked, command: command, reason: (reason || blocked_reason || 'no progress'), cause: nil)
+    end
+  end
+
+  # Record a room change (if any) for the current path.
+  def self.note_progress(path, idx)
+    here = Room.current.id
+    return if here.nil?
+    st = @@status
+    if st.last_room != here
+      pos = path.index(here)
+      status_update(phase: :moving, reason: nil, cause: nil, command: nil, last_room: here,
+                    last_progress_at: Time.now,
+                    rooms_left: (pos ? (path.length - 1 - pos) : (path.length - 1 - idx)))
+    end
+  end
+
+  # Answered before anything below runs: Script.start refuses a second go2, so
+  # this arrives as `;force go2 status` beside a live trip, and the rest of the
+  # script resets state that trip owns (@@mounted, the urchin before_dying).
+  if Script.current.vars[1] =~ /^status$/i
+    echo status_summary
+    echo "last result: #{status_summary(last_result).sub(/^go2 status: /, '')}" if last_result
+    exit
+  end
+
+  @@mounted = false
 
   def self.get_script_version
     data = Script.list.find { |x| x.name == 'go2' }.inspect
@@ -862,6 +1081,8 @@ module Go2
   CharSettings['echo_input']             = true  if CharSettings['echo_input'].nil?
   CharSettings['disable_confirm']        = false if CharSettings['disable_confirm'].nil?
   CharSettings['confirm_distance']       = 20    if CharSettings['confirm_distance'].nil?
+  CharSettings['max_restarts']           = 30    if CharSettings['max_restarts'].nil?
+  CharSettings['max_stuck_seconds']      = 60    if CharSettings['max_stuck_seconds'].nil?
 
   show_help = proc {
     output = []
@@ -887,6 +1108,9 @@ module Go2
     output << "     --hide_room_titles=<on|off>             When 'on', turns room titles off for traveling"
     output << "     --disable-confirm                       Skip the confirmation prompt for this trip only."
     output << "     --preserve-scripts                      Leave roomnumbers/textsubs running for this trip only."
+    output << "     --max-restarts=<#>                      Give up after this many internal restarts (0 = never)."
+    output << "     --max-stuck=<#>                         Give up after this many seconds without entering a new room (0 = never)."
+    output << "                                               Default 30; saved when given without a target."
     output << "     --disable-confirm=<on|off>              Persistently skip (or show) the confirmation prompt for long trips."
     output << "     --confirm-distance=<#>                  Trips shorter than this many rooms skip the confirmation prompt."
     output << "                                               Minimum 20; default 20."
@@ -944,6 +1168,8 @@ module Go2
     output << "      #{$lich_char}#{Script.current.name} delete custom target        Deletes a saved custom target."
     output << "      #{$lich_char}#{Script.current.name} list                        Shows your settings and custom targets."
     output << "      #{$lich_char}#{Script.current.name} targets                     Shows the built-in targets."
+    output << "      #{$lich_char}force #{Script.current.name} status          Shows the current trip status while a trip is running"
+    output << "      #{''.rjust($lich_char.length + Script.current.name.length)}                               (also Go2.status from scripts)."
     output << ""
 
     respond output
@@ -1203,6 +1429,8 @@ module Go2
   setting_use_old_portals         = nil
   setting_instability             = nil
   setting_preserve_scripts        = false
+  setting_max_restarts            = nil
+  setting_max_stuck               = nil
   setting_drag                    = nil
   setting_use_caravan_to_sos      = nil
   setting_use_caravan_from_sos    = nil
@@ -1223,6 +1451,10 @@ module Go2
       setting_disable_confirm = true
     elsif var =~ /^--preserve-scripts$/i
       setting_preserve_scripts = true
+    elsif var =~ /^(?:\-\-)?max[_\-]restarts=([0-9]+)$/i
+      setting_max_restarts = $1.to_i
+    elsif var =~ /^(?:\-\-)?max[_\-]stuck=([0-9]+)$/i
+      setting_max_stuck = $1.to_i
     elsif var =~ /^(?:\-\-)?disable[_\-]confirm=(on|true|yes|off|false|no)$/i
       setting_disable_confirm = setting_value[$1.downcase]
     elsif var =~ /^(?:\-\-)?confirm[_\-]distance=([0-9]+)$/i
@@ -1327,6 +1559,14 @@ module Go2
       setting_confirm_distance = 20 if setting_confirm_distance < 20
       CharSettings['confirm_distance'] = setting_confirm_distance
       echo "go2 will prompt for confirmation when the trip distance is at least #{setting_confirm_distance} rooms"
+    end
+    unless setting_max_restarts.nil?
+      CharSettings['max_restarts'] = setting_max_restarts
+      echo "go2 will give up after #{setting_max_restarts > 0 ? setting_max_restarts : 'an unlimited number of'} restarts"
+    end
+    unless setting_max_stuck.nil?
+      CharSettings['max_stuck_seconds'] = setting_max_stuck
+      echo "go2 will give up after #{setting_max_stuck > 0 ? "#{setting_max_stuck} seconds" : 'any amount of time'} without entering a new room"
     end
 
     if XMLData.game =~ /^GSPlat|^GSF/
@@ -2149,6 +2389,23 @@ module Go2
   error_count  = 0
   $go2_restart = false
   first_move   = true
+  max_restarts = (setting_max_restarts.nil? ? CharSettings['max_restarts'] : setting_max_restarts).to_i
+  max_stuck    = (setting_max_stuck.nil? ? CharSettings['max_stuck_seconds'] : setting_max_stuck).to_i
+  last_sent    = nil
+  restarts     = 0
+
+  if $go2_started_go2_bank
+    # nested trip to the bank on behalf of an outer go2: report under its status
+    Go2.status_update(phase: :moving, reason: "bank detour to #{destination.id}", command: nil)
+  else
+    Go2.status_reset(phase: :pathing, destination: destination.id, last_room: start_room.id,
+                     last_progress_at: Time.now, started_at: Time.now, max_restarts: max_restarts, max_stuck: max_stuck)
+    # If we exit any other way than arriving or giving up (killed, error, dead),
+    # record that and clear the live status so it isn't stale after exit.
+    before_dying {
+      Go2.status_finish(:aborted) unless Go2.status.phase == :idle
+    }
+  end
 
   # Store start room for future use
   UserVars.go2_start_room = start_room.id
@@ -2162,7 +2419,35 @@ module Go2
         break if Room.current.id == destination.id
         sleep 0.05
       }
-      echo 'restarting script...'
+      # a bank detour shares the outer trip's status: it counts its own
+      # restarts and never ends the outer trip's status when it gives up
+      if $go2_started_go2_bank
+        restarts += 1
+      else
+        restarts = Go2.status_update(restarts: Go2.status.restarts + 1).restarts
+      end
+      # two ceilings: restarts, and wall-clock time since the last room change
+      # (the one a wedged trip actually hits: restarts come fast when every
+      # attempt is refused, so a count alone said little about time)
+      st = Go2.status
+      stuck_for = st.last_progress_at ? (Time.now - st.last_progress_at).round : 0
+      give_up = if max_restarts > 0 and restarts > max_restarts
+                  "giving up after #{restarts} restarts (--max-restarts=#{max_restarts})"
+                elsif max_stuck > 0 and stuck_for > max_stuck
+                  "giving up after #{stuck_for} seconds without entering a new room (--max-stuck=#{max_stuck})"
+                end
+      if give_up
+        echo give_up
+        echo "last blocker: #{st.command.inspect} -> #{st.reason}" if st.reason
+        if $go2_started_go2_bank
+          $go2_bank_detour_failed = give_up
+        else
+          Go2.status_finish(:failed)
+        end
+        exit
+      end
+      echo "restarting script... (#{restarts}#{max_restarts > 0 ? "/#{max_restarts}" : ''})"
+      Go2.status_update(phase: :pathing) unless Go2.status.phase == :blocked
       if error_count > 1
         if XMLData.game =~ /^GS/
           dothistimeout 'help lag-check', 5, /^No help files matching that entry were found\./
@@ -2245,15 +2530,25 @@ module Go2
             end
             if $go2_started_go2_bank
               echo "You're too poor to go to the bank."
+              $go2_bank_detour_failed = 'too poor to reach the bank'
               exit
             end
             begin
               $go2_started_go2_bank = true
+              $go2_bank_detour_failed = nil
               go2_count = Script.running.find_all { |sr| sr.name == Script.current.name }.length
               force_start_script Script.current.name, [bank_id.to_s]
               wait_until { Script.running.find_all { |sr| sr.name == Script.current.name }.length <= go2_count }
             ensure
               $go2_started_go2_bank = false
+            end
+            # the silvers were needed to get there: without them the trip
+            # cannot be completed, so it fails here with the detour's reason
+            # rather than walking on to be refused at the first toll
+            if $go2_bank_detour_failed
+              echo "the bank detour failed (#{$go2_bank_detour_failed}); the trip to #{destination.id} needs those silvers"
+              Go2.status_finish(:failed, reason: "bank detour failed: #{$go2_bank_detour_failed}")
+              exit
             end
             unless (start_room = Room.current)
               echo 'error: your current room was not found in the map database'
@@ -2287,6 +2582,7 @@ module Go2
             if self.go2_check_silver() < needed_silvers
               echo "You are too poor to make this trip."
               echo "Not enough silver in current area's bank."
+              Go2.status_finish(:failed, reason: 'not enough silver in the bank') unless $go2_started_go2_bank
               exit
             end
           else
@@ -2310,18 +2606,26 @@ module Go2
     start_time = Time.now unless $go2_restart
 
     $go2_restart = false
+    fields = { rooms_left: path.length - 1, eta: est_time }
+    fields[:phase] = :moving unless Go2.status.phase == :blocked
+    Go2.status_update(**fields)
 
     path.each_index { |idx|
       room = Map[path[idx]]
       next_id = (path[idx + 1] || break).to_s
 
+      Go2.note_progress(path, idx)
       exit if dead?
       if muckled?
-        echo("You're currently sleeping! Waiting until you're no longer sleeping!") if XMLData.game =~ /^GS/ && checksleeping
-        echo("You're currently bound! Waiting until you're no longer bound!") if XMLData.game =~ /^GS/ && checkbound
-        echo("You're currently stunned! Waiting until you're no longer stunned!") if checkstunned
-        echo("You're currently webbed! Waiting until you're no longer webbed!") if checkwebbed
+        muckled_by = []
+        muckled_by << 'sleeping' if XMLData.game =~ /^GS/ && checksleeping
+        muckled_by << 'bound' if XMLData.game =~ /^GS/ && checkbound
+        muckled_by << 'stunned' if checkstunned
+        muckled_by << 'webbed' if checkwebbed
+        Go2.status_update(phase: :blocked, command: nil, cause: :muckled, reason: "muckled: #{muckled_by.join(', ')}")
+        muckled_by.each { |why| echo("You're currently #{why}! Waiting until you're no longer #{why}!") }
         wait_while { muckled? }
+        Go2.status_update(phase: :moving, reason: nil, cause: nil)
       end
       unless standing? or (room.wayto[next_id].inspect =~ /\b(?:swim|pedal)\b/i) or Go2.mounted
         waitrt?
@@ -2346,6 +2650,7 @@ module Go2
           if UserVars.mapdb_use_urchins
             echo("Urchin guide usage was enabled, not compatible while mounted.")
             echo("Setting urchin usage off for remainder of travel.")
+            Go2.status_update(phase: :pathing, command: 'stand', reason: 'mounted: urchin guides disabled, re-pathing')
             $go2_restart = true
             before_dying { UserVars.mapdb_use_urchins = true } if setting_use_urchins.nil?
             UserVars.mapdb_use_urchins = false
@@ -2386,7 +2691,9 @@ module Go2
                 move way
               end
             }
+            Go2.status_update(phase: :paused, command: nil, reason: 'stop-for-dead: a dead player was seen; script paused')
             pause_script
+            Go2.status_update(phase: :pathing, reason: nil)
             $go2_see_dead_people = false
             break
           end
@@ -2395,14 +2702,19 @@ module Go2
               echo 'reducing typeahead setting...'
               setting_typeahead -= 1
             end
+            Go2.mark_blocked(last_sent)
             $go2_restart = true
             break
           end
         end
         begin
-          # room_id_before_proc = Room.current.id
+          room_id_before_proc = Room.current.id
+          last_sent = Go2.describe_way(room.wayto[next_id])
           room.wayto[next_id].call
           sleep setting_delay
+          # status only: movement semantics are unchanged (no restart here), but
+          # a supervisor should still see that this step didn't move us
+          Go2.mark_blocked(last_sent) if Room.current.id == room_id_before_proc and room_id_before_proc != next_id.to_i
           pause_script if setting_stop_for_dead and GameObj.pcs.any? { |pc| pc.status =~ /dead/ }
           # $go2_restart = true if Room.current.id == room_id_before_proc
           break if $go2_restart
@@ -2436,7 +2748,9 @@ module Go2
                 move way
               end
             }
+            Go2.status_update(phase: :paused, command: nil, reason: 'stop-for-dead: a dead player was seen; script paused')
             pause_script
+            Go2.status_update(phase: :pathing, reason: nil)
             $go2_see_dead_people = false
             break
           end
@@ -2445,9 +2759,11 @@ module Go2
               echo 'reducing typeahead setting...'
               setting_typeahead -= 1
             end
+            Go2.mark_blocked(last_sent)
             $go2_restart = true
             break
           end
+          last_sent = room.wayto[next_id]
           put room.wayto[next_id]
           moves_sent += 1
         else
@@ -2457,21 +2773,25 @@ module Go2
             way = room.wayto[next_id]
             if way =~ /^(north|northeast|east|southeast|south|southwest|west|northwest|n|ne|e|se|s|sw|w|nw|up|u|down|d|out)$/i
               way = "drag #{setting_drag} #{way}"
+              last_sent = way
               result = move way
             elsif way =~ /^(?:go|climb) /i
               way = way.sub(/^(?:go|climb) /i, "drag #{setting_drag} ")
+              last_sent = way
               result = move way
             else
               echo "error: drag feature doesn't know how to deal with this movement: #{way}"
               exit
             end
           else
+            last_sent = room.wayto[next_id]
             result = move room.wayto[next_id]
           end
           sleep setting_delay
           pause_script if setting_stop_for_dead and GameObj.pcs.any? { |pc| pc.status =~ /dead/ }
           unless result
             error_count += 1
+            Go2.mark_blocked(last_sent)
             if (idx == 0) and (error_count > 2) and (Room.current.id == room.id)
               echo "changing Room[#{room.id}].timeto['#{next_id}'] to nil"
               old_room = room
@@ -2500,6 +2820,7 @@ module Go2
         sleep 0.05
       }
       unless $room_count >= moves_sent
+        Go2.mark_blocked(last_sent)
         $go2_restart = true
       end
     end
@@ -2514,4 +2835,6 @@ module Go2
   end_time = Time.now
   travel_time = (end_time.to_r - start_time.to_r).to_f
   echo "travel time: #{sprintf("%d:%02d:%06.3f", (travel_time / 3600), (travel_time / 60) % 60, travel_time % 60)}"
+  Go2.note_progress([destination.id], 0)
+  Go2.status_finish(:arrived, reason: nil, command: nil, rooms_left: 0) unless $go2_started_go2_bank
 end
