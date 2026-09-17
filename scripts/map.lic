@@ -31,6 +31,10 @@ Tracks your current room on visual maps
         window size and position, is read and written under the same keys
         as before, so nothing is lost on upgrade. All GC-anchoring, gtk_safe
         wrapping and platform-specific window hints are gone with GTK.
+        Keep window on top and Opacity act on the OS window and are offered
+        only where Lich can reach it (Windows); elsewhere the two items are
+        not shown. Tag and location markers are capped at what one composite
+        may hold, and say so once when a selection is cut short.
     v2.1.4 (2026-05-29)
       * Anchor transient dialog handlers (find + note dialogs). Their handler
         Procs and widgets were connected but never rooted on the Ruby side, so
@@ -61,7 +65,7 @@ require 'erb'
 unless defined?(::Lich::WebUI::Contract) && ::Lich::WebUI::Contract::VERSION.split('.').first(2).map(&:to_i).then { |major, minor| major == 2 && minor >= 19 }
   found = defined?(::Lich::WebUI::Contract) ? ::Lich::WebUI::Contract::VERSION : 'none'
   respond
-  respond "Your version of Lich is too old for this script: it needs the WebUI at contract 2.19 or later (this Lich loaded #{found})."
+  respond "Your version of Lich does not fit this script: it needs the WebUI at contract 2.19 or later within contract 2 (this Lich loaded #{found})."
   respond 'The library is read when Lich starts; if lib/webui was updated since, restart Lich.'
   respond
   exit
@@ -284,6 +288,9 @@ module ElanthiaMap
       @last_position = nil
       @last_user_scroll = nil
       @pending_center = nil
+      @pending_zoom_scroll = nil
+      @settings_dirty = false  # a change made off the script thread, waiting for the loop to write it
+      @markers_cut = nil       # the (sheet, selection) already reported as truncated
 
       @fix_mode = script.vars[1] =~ /fix/ ? true : false
       @trouble_mode = script.vars[1] =~ /trouble/ ? true : false
@@ -317,11 +324,13 @@ module ElanthiaMap
       diag('window.url', url: url)
       # Keep-above and opacity belong to the OS window, which the page
       # cannot reach; the opener finds the browser's window and applies
-      # them, and `apply` re-reads them after a menu toggle.
-      window = self
+      # them, and `apply` re-reads them after a menu toggle. The position
+      # is the launcher's to apply too (--window-position); the client
+      # only sizes from the geometry facility.
       @browser = Lich::WebUI.open(page: @page, presentation: -> { window.window_presentation },
                                   title: title_for(nil),
-                                  geometry: { width: @char_settings[:window_width].to_i, height: @char_settings[:window_height].to_i })
+                                  geometry: { width: @char_settings[:window_width].to_i, height: @char_settings[:window_height].to_i,
+                                              position: @char_settings[:window_position].first(2).map(&:to_i) })
       @browser = nil unless @browser.respond_to?(:apply)
     end
 
@@ -338,6 +347,13 @@ module ElanthiaMap
 
     def present_window
       @browser&.apply
+    end
+
+    # Whether keep-on-top and opacity can reach the OS window on this host.
+    # Where they cannot, the menu leaves the two items out rather than
+    # offering a toggle that persists and does nothing.
+    def presentation_available?
+      defined?(Lich::WebUI::WindowPresentation) && Lich::WebUI::WindowPresentation.available? ? true : false
     end
 
     def closed_by_viewer
@@ -389,8 +405,23 @@ module ElanthiaMap
       respond "[map: character settings: #{@char_settings.inspect}]"
     end
 
+    # Settings resolve their namespace from Script.current, which is nil on
+    # the WebUI dispatcher thread the event handlers run on: a write from
+    # there is silently dropped. Handlers therefore only mark the settings
+    # dirty, and the follow loop, on the script's own thread, writes them.
+    def settings_changed
+      @lock.synchronize { @settings_dirty = true }
+    end
+
+    # Writes the settings if a handler changed them. Script thread only.
+    def flush_settings
+      dirty = @lock.synchronize { @settings_dirty.tap { @settings_dirty = false } }
+      save_settings if dirty
+    end
+
     def save_settings
       @lock.synchronize do
+        @settings_dirty = false
         CharSettings['window_width'] = @char_settings[:window_width]
         CharSettings['window_height'] = @char_settings[:window_height]
         CharSettings['window_position'] = @char_settings[:window_position]
@@ -462,6 +493,8 @@ module ElanthiaMap
                     end
     rescue StandardError => e
       @route = nil
+      @dark_dir = nil
+      @dark_route = nil
       respond "[map: the map directory cannot be served (#{e.message}); markers only]"
     end
 
@@ -671,16 +704,29 @@ module ElanthiaMap
       if route
         result << { kind: 'image', x: ox, y: oy, w: width, h: height, src: "#{route}#{ERB::Util.url_encode(name)}" }
       end
-      marked_rooms(@active_tag) { |room| room.tags&.include?(@active_tag) }.each do |coords|
-        result.concat(cross(coords, ox, oy, BLUE, s))
-      end
-      marked_rooms(@active_location) { |room| room.location.to_s == @active_location }.each do |coords|
-        result.concat(cross(coords, ox, oy, GREEN, s))
-      end
-      result.concat(note_layers(ox, oy))
+      notes = note_layers(ox, oy)
       marker = room_marker(ox, oy, s)
+      # The composite holds at most COLLECTION layers. The sheet, the notes
+      # and the room marker are always drawn; the markers get what is left,
+      # two layers each, and a selection larger than that is cut short and
+      # said so once. Old Ta'Faendryl alone has over 350 rooms on one sheet.
+      budget = COLLECTION - result.length - notes.length - (marker ? 1 : 0)
+      marked = marked_rooms(@active_tag) { |room| room.tags&.include?(@active_tag) }.map { |coords| [coords, BLUE] }
+      marked.concat(marked_rooms(@active_location) { |room| room.location.to_s == @active_location }.map { |coords| [coords, GREEN] })
+      shown = [budget / 2, 0].max
+      report_cut_markers(marked.length, shown) if marked.length > shown
+      marked.first(shown).each { |coords, tint| result.concat(cross(coords, ox, oy, tint, s)) }
+      result.concat(notes)
       result << marker if marker
       result
+    end
+
+    def report_cut_markers(total, shown)
+      key = [@current_map, @active_tag, @active_location]
+      return if @markers_cut == key
+
+      @markers_cut = key
+      respond "[map: #{total} rooms match on this sheet; only #{shown} markers can be drawn at once]"
     end
 
     def marked_rooms(active)
@@ -750,13 +796,15 @@ module ElanthiaMap
                           on: { change: ->(event) { window.on_follow_toggle(event.payload[:value]) } })
         check.call('keep-centered', 'Keep Centered', :keep_centered)
         check.call('expanded-canvas', 'Expanded Canvas', :expanded_canvas)
-        check.call('keep-above', 'Keep window on top', :keep_above)
+        check.call('keep-above', 'Keep window on top', :keep_above) if window.presentation_available?
         check.call('dark-mode', 'Dark Mode', :dark_mode)
         check.call('dynamic-indicator', 'Dynamic Indicator Size', :dynamic_indicator_size)
         check.call('hide-scrollbars', 'Hide Scrollbars', :hide_scrollbars)
         builder.menu_item(key: 'sep-1', kind: 'separator')
-        window.render_radio_submenu(builder, 'opacity', 'Opacity', OPACITY_STEPS, window.settings[:opacity]) do |value|
-          window.on_opacity(value)
+        if window.presentation_available?
+          window.render_radio_submenu(builder, 'opacity', 'Opacity', OPACITY_STEPS, window.settings[:opacity]) do |value|
+            window.on_opacity(value)
+          end
         end
         window.render_scale_submenu(builder)
         window.render_maps_submenu(builder)
@@ -935,7 +983,7 @@ module ElanthiaMap
 
     def on_setting_toggle(setting, value)
       @lock.synchronize { @settings[setting] = value ? true : false }
-      save_settings
+      settings_changed
       present_window if setting == :keep_above
     end
 
@@ -945,18 +993,18 @@ module ElanthiaMap
         @temp_follow_disabled = false
         @fake_room = nil if @follow_mode
       end
-      save_settings
+      settings_changed
     end
 
     def on_opacity(value)
       @lock.synchronize { @settings[:opacity] = value }
-      save_settings
+      settings_changed
       present_window
     end
 
     def on_scale(value)
       @lock.synchronize { set_scale(value) }
-      save_settings
+      settings_changed
     end
 
     def set_scale(value)
@@ -1078,7 +1126,7 @@ module ElanthiaMap
         end
         @char_settings[:window_position] = position.first(2).map(&:to_i) if position.is_a?(Array) && position.length == 2
       end
-      save_settings
+      settings_changed
     rescue JSON::ParserError, KeyError
       nil
     end
@@ -1135,7 +1183,7 @@ module ElanthiaMap
         vy = payload[:y].to_i * old
         @pending_zoom_scroll = [[(px * new - vx).round, 0].max, [(py * new - vy).round, 0].max]
       end
-      save_settings
+      settings_changed
       refresh
       scroll = @lock.synchronize { @pending_zoom_scroll.tap { @pending_zoom_scroll = nil } }
       @lock.synchronize { push_scroll(*scroll) } if scroll
@@ -1275,8 +1323,14 @@ module ElanthiaMap
         window.show_room(current_room&.image ? current_room : nil)
       end
       room_count = $room_count
-      sleep 0.2 while room_count == $room_count && !window.should_exit
-      sleep 0.1 while !window.follow_mode && !window.should_exit
+      following = window.follow_mode
+      # Wait for a room change or a Follow toggle, writing any setting a
+      # handler changed in the meantime; with Follow off only the toggle ends
+      # the wait.
+      while !window.should_exit && window.follow_mode == following && (!following || room_count == $room_count)
+        window.flush_settings
+        sleep 0.2
+      end
     end
 
     window.save_settings
