@@ -1184,6 +1184,28 @@ module BigshotCreatureAdapterSpec
         expect(bs.bs_hostile_creatures).to be_empty
       end
 
+      it 'self-heals a cold-start sympathetic creature once Sympathy naturally expires' do
+        # Confirmed against live play: hostile="1" comes back once Sympathy
+        # drops, rather than the reclassification sticking for the fight. So
+        # the cold-start gap above is only a miss for the window between
+        # first sighting and that natural expiry - once hostile reasserts,
+        # remember_hostile fires from the ordinary branch and the creature is
+        # fully trackable afterward, including through a later re-sympathetic
+        # flip (e.g. a second Sympathy cast).
+        cold_start = FakeCreatureInstance.new(307, 'nymph', 'a sea nymph')
+        cold_start.flags[:sympathetic] = true
+        bs.room(cold_start)
+        expect(bs.bs_hostile_creatures).to be_empty # the miss, while it lasts
+
+        cold_start.flags[:sympathetic] = false
+        cold_start.flags[:hostile] = true # Sympathy expires; hostile reasserts
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(307)
+
+        cold_start.flags[:hostile] = false
+        cold_start.flags[:sympathetic] = true # a later re-sympathetic flip
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(307)
+      end
+
       it 'still drops a sympathetic creature the game flags dead, even if once hostile' do
         dead_sympathetic = FakeCreatureInstance.new(305, 'nymph', 'a sea nymph')
         dead_sympathetic.flags[:hostile] = true
