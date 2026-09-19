@@ -130,6 +130,13 @@ module BigshotPrioritySpec
           (@room_targets || []).find { |c| c.id.to_i == id.to_i }
         end
 
+        # NOT a faithful stand-in for the real Creature.all, which is the
+        # whole registry independent of room membership - this harness has
+        # no separate registry concept, so all aliases the room roster. Fine
+        # for the priority/ranking tests this harness serves, none of which
+        # exercise hostile_seen_ids' registry-vs-roster pruning distinction
+        # (BigshotCreatureAdapterSpec's harness below models that properly).
+        # A future pruning test added here would get a false pass.
         def all
           (@room_targets || []).dup
         end
