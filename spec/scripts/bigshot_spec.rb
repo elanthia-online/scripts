@@ -57,6 +57,9 @@ module BigshotPrioritySpec
   BIGSHOT_CREATURE_SRC = extract(/^class BigshotCreature\n.*?^end$/m, 'BigshotCreature')
   BS_TARGETS_SRC = extract(/^  def bs_targets\(\*filters\).*?^  end$/m, 'bs_targets')
   BS_HOSTILE_SRC = extract(/^  def bs_hostile_creatures\(\*filters\).*?^  end$/m, 'bs_hostile_creatures')
+  REMEMBER_HOSTILE_SRC = extract(/^  def remember_hostile\(creature\).*?^  end$/m, 'remember_hostile')
+  EVER_HOSTILE_SRC = extract(/^  def ever_hostile\?\(id\).*?^  end$/m, 'ever_hostile?')
+  HOSTILE_SEEN_IDS_SRC = extract(/^  def hostile_seen_ids\n.*?^  end$/m, 'hostile_seen_ids')
   BS_ROOM_CREATURES_SRC = extract(/^  def bs_room_creatures\(\*filters\).*?^  end$/m, 'bs_room_creatures')
   PRIORITY_SRC = extract(/^  def priority\(target\).*?^  end$/m, 'priority')
   MATCHERS_SRC = extract(/^  def priority_matchers\n.*?^  end$/m, 'priority_matchers')
@@ -125,6 +128,17 @@ module BigshotPrioritySpec
 
         def [](id)
           (@room_targets || []).find { |c| c.id.to_i == id.to_i }
+        end
+
+        # NOT a faithful stand-in for the real Creature.all, which is the
+        # whole registry independent of room membership - this harness has
+        # no separate registry concept, so all aliases the room roster. Fine
+        # for the priority/ranking tests this harness serves, none of which
+        # exercise hostile_seen_ids' registry-vs-roster pruning distinction
+        # (BigshotCreatureAdapterSpec's harness below models that properly).
+        # A future pruning test added here would get a false pass.
+        def all
+          (@room_targets || []).dup
         end
       end
     end
@@ -235,6 +249,9 @@ module BigshotPrioritySpec
     eval(BIGSHOT_CREATURE_SRC)
     eval(BS_TARGETS_SRC)
     eval(BS_HOSTILE_SRC)
+    eval(REMEMBER_HOSTILE_SRC)
+    eval(EVER_HOSTILE_SRC)
+    eval(HOSTILE_SEEN_IDS_SRC)
     eval(BS_ROOM_CREATURES_SRC)
     eval(PRIORITY_SRC)
     eval(MATCHERS_SRC)
@@ -582,6 +599,9 @@ module BigshotCreatureAdapterSpec
   BIGSHOT_CREATURE_SRC = extract(/^class BigshotCreature\n.*?^end$/m, 'BigshotCreature')
   BS_ROOM_CREATURES_SRC = extract(/^  def bs_room_creatures\(\*filters\).*?^  end$/m, 'bs_room_creatures')
   BS_HOSTILE_SRC = extract(/^  def bs_hostile_creatures\(\*filters\).*?^  end$/m, 'bs_hostile_creatures')
+  REMEMBER_HOSTILE_SRC = extract(/^  def remember_hostile\(creature\).*?^  end$/m, 'remember_hostile')
+  EVER_HOSTILE_SRC = extract(/^  def ever_hostile\?\(id\).*?^  end$/m, 'ever_hostile?')
+  HOSTILE_SEEN_IDS_SRC = extract(/^  def hostile_seen_ids\n.*?^  end$/m, 'hostile_seen_ids')
   BS_TARGETS_SRC = extract(/^  def bs_targets\(\*filters\).*?^  end$/m, 'bs_targets')
   CREATURE_BACKED_SRC = extract(/^  def creature_backed\?\(npc\).*?^  end$/m, 'creature_backed?')
   DEAD_OR_GONE_SRC = extract(/^  def dead_or_gone\?\(npc\).*?^  end$/m, 'dead_or_gone?')
@@ -669,6 +689,12 @@ module BigshotCreatureAdapterSpec
         def [](id)
           (@registry || {})[id.to_i]
         end
+
+        # Backs hostile_seen_ids' pruning: real Creature.all is the full
+        # registry (room or not), not just the current room roster.
+        def all
+          (@registry || {}).values
+        end
       end
     end
 
@@ -706,6 +732,15 @@ module BigshotCreatureAdapterSpec
       Creature.registry = fake_creatures.each_with_object({}) { |c, h| h[c.id] = c }
     end
 
+    # Simulates the real Creature.clear_room: empties the room roster only,
+    # leaving the registry (Creature.all/Creature.[]) untouched. room(...)
+    # always sets both to the same set, so nothing exercises the two
+    # diverging without this - and hostile_seen_ids pruning against the
+    # wrong one (in_room instead of all) would otherwise pass every test.
+    def clear_room
+      Creature.room_targets = []
+    end
+
     def wrap(fake_creature)
       BigshotCreature.new(fake_creature)
     end
@@ -713,6 +748,9 @@ module BigshotCreatureAdapterSpec
     eval(BIGSHOT_CREATURE_SRC)
     eval(BS_ROOM_CREATURES_SRC)
     eval(BS_HOSTILE_SRC)
+    eval(REMEMBER_HOSTILE_SRC)
+    eval(EVER_HOSTILE_SRC)
+    eval(HOSTILE_SEEN_IDS_SRC)
     eval(BS_TARGETS_SRC)
     eval(CREATURE_BACKED_SRC)
     eval(DEAD_OR_GONE_SRC)
@@ -1119,6 +1157,109 @@ module BigshotCreatureAdapterSpec
         bs.room(bystander)
 
         expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'keeps a creature that turns sympathetic after being seen hostile' do
+        # <crtrStatus> is a full snapshot, not a delta: casting Sympathy 1120
+        # replaces a creature's hostile="1" with sympathetic="1" in the very
+        # next tag - no hostile flag at all - even though it is still fully
+        # engaged in combat. Requiring hostile alone made bigshot break off
+        # mid-fight the instant Sympathy landed. ever_hostile? is what makes
+        # this trustworthy: the creature was seen hostile first, in the same
+        # bs_hostile_creatures call that now sees only sympathetic.
+        nymph = FakeCreatureInstance.new(304, 'nymph', 'a sea nymph')
+        nymph.flags[:hostile] = true
+        bs.room(nymph)
+        bs.bs_hostile_creatures # primes hostile_seen_ids before the flip
+
+        nymph.flags[:hostile] = false
+        nymph.flags[:sympathetic] = true
+
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(304)
+      end
+
+      it 'drops a creature that is sympathetic but was never seen hostile' do
+        # The failure mode ever_hostile? exists to prevent: sympathetic alone
+        # is not proof of hostility, so a creature the game never once
+        # flagged hostile must not become attackable just because it later
+        # (or always) carries sympathetic.
+        never_hostile = FakeCreatureInstance.new(306, 'nymph', 'a sea nymph')
+        never_hostile.flags[:sympathetic] = true
+
+        bs.room(never_hostile)
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'self-heals a cold-start sympathetic creature once Sympathy naturally expires' do
+        # Confirmed against live play: hostile="1" comes back once Sympathy
+        # drops, rather than the reclassification sticking for the fight. So
+        # the cold-start gap above is only a miss for the window between
+        # first sighting and that natural expiry - once hostile reasserts,
+        # remember_hostile fires from the ordinary branch and the creature is
+        # fully trackable afterward, including through a later re-sympathetic
+        # flip (e.g. a second Sympathy cast).
+        cold_start = FakeCreatureInstance.new(307, 'nymph', 'a sea nymph')
+        cold_start.flags[:sympathetic] = true
+        bs.room(cold_start)
+        expect(bs.bs_hostile_creatures).to be_empty # the miss, while it lasts
+
+        cold_start.flags[:sympathetic] = false
+        cold_start.flags[:hostile] = true # Sympathy expires; hostile reasserts
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(307)
+
+        cold_start.flags[:hostile] = false
+        cold_start.flags[:sympathetic] = true # a later re-sympathetic flip
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(307)
+      end
+
+      it 'still drops a sympathetic creature the game flags dead, even if once hostile' do
+        dead_sympathetic = FakeCreatureInstance.new(305, 'nymph', 'a sea nymph')
+        dead_sympathetic.flags[:hostile] = true
+        bs.room(dead_sympathetic)
+        bs.bs_hostile_creatures
+
+        dead_sympathetic.flags[:hostile] = false
+        dead_sympathetic.flags[:sympathetic] = true
+        dead_sympathetic.flags[:dead] = true
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+    end
+
+    describe '#ever_hostile?/#remember_hostile' do
+      it 'forgets a creature id once Creature no longer knows about it' do
+        # hostile_seen_ids is pruned against Creature.all so it cannot grow
+        # unbounded over a long hunting session - it rides the same eviction
+        # the Creature registry already does (see ClassMethods#cleanup_old)
+        # instead of reimplementing it.
+        goblin.flags[:hostile] = true
+        bs.room(goblin)
+        bs.bs_hostile_creatures
+
+        expect(bs.ever_hostile?(goblin.id)).to be true
+
+        bs.room # Creature registry no longer has this id at all
+
+        expect(bs.ever_hostile?(goblin.id)).to be false
+      end
+
+      it 'survives a room-roster clear while the registry still holds the id' do
+        # Pins the distinction the method above cannot: pruning must key off
+        # Creature.all (the full registry), not Creature.in_room (the room
+        # roster). clear_room empties only the roster, the way the real
+        # Creature.clear_room does when the parser rebuilds it a creature at
+        # a time on a room refresh (see lib/common/xmlparser.rb) - a
+        # creature not yet re-marked present must not be forgotten mid-
+        # rebuild, or the very next tag for it (possibly the sympathetic
+        # one) would find it already evicted from hostile_seen_ids.
+        goblin.flags[:hostile] = true
+        bs.room(goblin)
+        bs.bs_hostile_creatures
+
+        bs.clear_room
+
+        expect(bs.ever_hostile?(goblin.id)).to be true
       end
     end
 
