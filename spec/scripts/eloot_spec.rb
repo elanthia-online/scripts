@@ -1173,6 +1173,12 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
   # which is exactly what "pool is full" already covers.
   let(:pool_result) { :noop }
 
+  # How many Sell.locksmith calls fail to clear the box (table/bell/keys/chime not
+  # found, etc.) before one finally succeeds. 0 means the very first call succeeds,
+  # matching every pre-v2.11.9 scenario below. A value >= the number of calls
+  # box_in_hand actually makes means town never succeeds at all.
+  let(:town_open_failures) { 0 }
+
   let(:harness) do
     r = right
     l = left
@@ -1186,6 +1192,7 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
     openable = town_openable
     pool_res = pool_result
     empty = empty_hand
+    remaining_failures = town_open_failures
 
     gameobj = Module.new
     gameobj.define_singleton_method(:right_hand) { r }
@@ -1209,6 +1216,12 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
     mod.define_singleton_method(:gem_bounty_override?) { override }
     mod.define_singleton_method(:locksmith) do |items|
       log << [:locksmith, items.map(&:noun)]
+
+      if remaining_failures.positive?
+        remaining_failures -= 1
+        next
+      end
+
       items.each do |it|
         l = empty if l.equal?(it)
         r = empty if r.equal?(it)
@@ -1255,6 +1268,44 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
       harness.box_in_hand
 
       expect(routing_calls(calls)).to eq([[:locksmith, ['strongbox']]])
+    end
+  end
+
+  # v2.11.9: the first town attempt failing to clear the box (no table/bell/keys/chime
+  # found, an empty "look", etc. -- anything short of a real per-box refusal, which
+  # town_openable? already screens out) used to fall straight into the unconditional
+  # pool loop below, shipping the box to the pool on the very first hiccup even with
+  # Locksmith Priority set to town first.
+  context 'Locksmith Priority set to town first, the first town attempt fails to clear the box' do
+    let(:priority) { 'locksmith' }
+    let(:town_open_failures) { 1 }
+
+    it 'gives town a second try instead of falling back to the pool immediately' do
+      harness.box_in_hand
+
+      expect(routing_calls(calls)).to eq([[:locksmith, ['strongbox']], [:locksmith, ['strongbox']]])
+    end
+
+    it 'never touches the pool once the second town attempt succeeds' do
+      harness.box_in_hand
+
+      expect(routing_calls(calls).map(&:first)).not_to include(:locksmith_pool)
+    end
+  end
+
+  context 'Locksmith Priority set to town first, town keeps failing to clear the box' do
+    let(:priority) { 'locksmith' }
+    let(:town_open_failures) { 999 }
+
+    it 'retries town at most once before falling back to the pool, rather than looping forever' do
+      begin
+        harness.box_in_hand
+      rescue RuntimeError
+        nil
+      end
+
+      calls_before_pool = routing_calls(calls).take_while { |c| c.first == :locksmith }
+      expect(calls_before_pool.length).to eq(2)
     end
   end
 
@@ -2332,5 +2383,89 @@ RSpec.describe 'ELoot.nearest_shop' do
 
   it 'returns nil when the shop is allowed but unreachable' do
     expect(with(unavailable: false, found: nil).nearest_shop('pawnshop')).to be_nil
+  end
+end
+
+# RSpec for ELoot::Hoard.hoarding_list's single-item filter.
+#
+# hoarding_list(single) previously matched with an unanchored, unescaped
+# `item.name =~ /#{single}/`, a plain substring search. Any reagent/gem whose
+# name is a substring of another's (e.g. "ayanad crystal" inside
+# "t'ayanad crystal") was incorrectly swept into the other's result, so
+# store_items would drag the wrong reagent into an already-labeled jar and the
+# game would reject it ("already contains ayanad crystals, so you think
+# better of mixing in your t'ayanad crystal"). Exercises the real method body
+# with fake containers/data -- hoarding_list's own collaborators (StowList,
+# Inventory.open_single_container, ELoot.data) are all easily stubbed.
+
+RSpec.describe 'ELoot::Hoard.hoarding_list' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_body) do
+    body = source[/^ {4}def self\.hoarding_list\b[\s\S]*?^ {4}end$/]
+    raise "hoarding_list could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  let(:item_class) { Struct.new(:name, :type, :id) }
+  let(:data_class) { Struct.new(:container_settings, :hoard_type, :settings, :items_to_hoard) }
+
+  let(:container_items) do
+    [
+      item_class.new('ayanad crystal', 'reagent', 'id-ayanad'),
+      item_class.new("t'ayanad crystal", 'reagent', "id-t'ayanad"),
+      item_class.new('essence of water', 'reagent', 'id-essence')
+    ]
+  end
+
+  let(:harness) do
+    items = container_items
+    container = Struct.new(:contents).new(items)
+
+    data = data_class.new([:pouch], 'alchemy', { alchemy_horde_use_overflow: false }, nil)
+
+    eloot = Module.new
+    eloot.define_singleton_method(:data) { data }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { pouch: container } }
+
+    inventory = Module.new
+    inventory.define_singleton_method(:open_single_container) { |_c| }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Inventory, inventory)
+    mod.module_eval(method_body)
+    mod
+  end
+
+  before { $sell_ignore = [] }
+
+  it "does not confuse a reagent name that is a substring of another's (ayanad crystal / t'ayanad crystal)" do
+    expect(harness.hoarding_list('ayanad crystal').map(&:name)).to eq(['ayanad crystal'])
+  end
+
+  it "still finds the longer name on its own, not swept up by the shorter one" do
+    expect(harness.hoarding_list("t'ayanad crystal").map(&:name)).to eq(["t'ayanad crystal"])
+  end
+
+  it 'still matches by exact name as before for reagents with no overlap' do
+    expect(harness.hoarding_list('essence of water').map(&:name)).to eq(['essence of water'])
   end
 end
