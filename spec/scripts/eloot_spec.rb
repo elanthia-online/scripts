@@ -2469,3 +2469,68 @@ RSpec.describe 'ELoot::Hoard.hoarding_list' do
     expect(harness.hoarding_list('essence of water').map(&:name)).to eq(['essence of water'])
   end
 end
+
+# Companion to the spec above: proves the anchored match doesn't regress the actual
+# purpose of hoarding_list(single) -- gathering every physical copy of one exact
+# gem/reagent name scattered across the configured hoard containers (backpack, mantle,
+# overflow, ...) before jarring them together in one trip. Anchoring only narrows what
+# matches (an exact match under the old unanchored /#{single}/ is still an exact match
+# under /\A#{single}\z/), so duplicates of the same name across containers, and the gem
+# code path specifically (not just alchemy/reagent), both still work.
+RSpec.describe 'ELoot::Hoard.hoarding_list (duplicate-grouping, gem type)' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__),
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../scripts/eloot.lic', __dir__)
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_body) do
+    body = source[/^ {4}def self\.hoarding_list\b[\s\S]*?^ {4}end$/]
+    raise "hoarding_list could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  let(:item_class) { Struct.new(:name, :type, :id) }
+  let(:data_class) { Struct.new(:container_settings, :hoard_type, :settings, :items_to_hoard) }
+
+  let(:harness) do
+    # Two containers, each holding its own "fire opal" -- the scenario hoarding_list(single)
+    # exists for: find every copy of the same exact gem name, wherever it's stashed.
+    backpack = Struct.new(:contents).new([item_class.new('fire opal', 'gem', 'id-opal-1')])
+    mantle = Struct.new(:contents).new([item_class.new('fire opal', 'gem', 'id-opal-2')])
+
+    data = data_class.new(%i[backpack mantle], 'gem', { gem_horde_use_overflow: false }, nil)
+
+    eloot = Module.new
+    eloot.define_singleton_method(:data) { data }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { backpack: backpack, mantle: mantle } }
+
+    inventory = Module.new
+    inventory.define_singleton_method(:open_single_container) { |_c| }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Inventory, inventory)
+    mod.module_eval(method_body)
+    mod
+  end
+
+  before { $sell_ignore = [] }
+
+  it 'still gathers every copy of the exact same gem name across different containers' do
+    expect(harness.hoarding_list('fire opal').map(&:id)).to contain_exactly('id-opal-1', 'id-opal-2')
+  end
+end
