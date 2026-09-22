@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.16.3
+       version: 5.16.4
       required: Lich >= 5.21.0
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,6 +17,8 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
+  v5.16.4  (2026-09-21)
+    - fix: a follower would keep trying to attack on its own, spamming failed target attempts, if the group leader stopped running bigshot while everyone stayed grouped - followers now stand down until the leader is hunting again
   v5.16.3  (2026-09-21)
     - fix: a follower could get stuck spamming failed target attempts on a creature the group leader had already killed, instead of picking a new target
   v5.16.2  (2026-09-16)
@@ -985,6 +987,23 @@ class Bigshot
     # @see Bigshot#leader_target?
     def leader_target
       @leader.leader_target?
+    end
+
+    # Whether the leader's own bigshot instance is still actively hunting.
+    #
+    # Followers should not attack, retarget, or otherwise act on their own
+    # once this is false - there's nothing driving target selection for the
+    # group anymore, and hunting solo leads a follower to churn on stale
+    # leader state instead of just going idle. DRbConnError (leader's whole
+    # Lich process gone, not just the script) is treated the same as "not
+    # active" rather than raising, matching member_online's handling of an
+    # unreachable remote member elsewhere in this class.
+    # @return [Boolean]
+    # @see Bigshot#active?
+    def leader_active?
+      @leader.active?
+    rescue DRb::DRbConnError
+      false
     end
 
     # @param member [DRbObject] a follower's remote Bigshot instance
@@ -3369,6 +3388,11 @@ class Bigshot
       }
       fput("movement autosneak off") if $bigshot_sneaky_hunt
       echo "debug active for bigshot version #{$bigshot_version}" if $bigshot_debug
+
+      # So #active? (and a follower's leader_active? check over DRb) reflects
+      # this character's bigshot as stopped immediately on exit, rather than
+      # staying stuck on whatever hunting/ready/etc. state it last set.
+      $bigshot_status = nil
     }
   end
 
@@ -7217,6 +7241,18 @@ class Bigshot
     return @followers.nil?
   end
 
+  # Whether this character's own bigshot instance is actively hunting right
+  # now. $bigshot_status is reset to nil in the shared before_dying teardown
+  # (see #initialize), so this goes false as soon as the script exits -
+  # not just while it never started - which is what lets a follower detect
+  # "the leader killed their bigshot" via {Group#leader_active?} rather than
+  # a stale DRb call that just keeps returning whatever the leader's client
+  # last happened to have selected.
+  # @return [Boolean]
+  def active?
+    !$bigshot_status.nil?
+  end
+
   # @return [Boolean] whether hunting may proceed with no other players present
   def no_players_hunt()
     debug_msg(@DEBUG_COMBAT, "no_players_hunt")
@@ -10235,12 +10271,25 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
           next
         end
 
+        # Followers only fight while the leader's own bigshot is actively
+        # hunting - without that, nothing is driving target selection for
+        # the group, and a follower hunting solo just churns forever trying
+        # to sync to a leader target that will never update again (e.g. the
+        # leader killed their bigshot but stayed grouped). Drop the queued
+        # attack and go back to idling instead.
+        unless group.leader_active?
+          bs.message("yellow", " Skipping attack: leader is not actively hunting")
+          bs.remove_event(:ATTACK)
+          next
+        end
+
         # Start by syncing to leader's current target (if any)
         target = group.leader_target
 
         # Scan for targets until leader says to move or loot
         loop do
-          # Break loop if moving or looting
+          # Break loop if moving/looting, or the leader stops hunting mid-cycle
+          break unless group.leader_active?
           break if bs.event_stack.any? { |a| [:PREP_REST, :FOLLOW_NOW].include?(a.type) || (a.type == :LOOT && group.looter == Char.name) }
 
           # Make sure follower is joined
