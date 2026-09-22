@@ -18,11 +18,14 @@ module CombatStreamSpec
   SOURCE = File.read(SOURCE_PATH)
 
   CLASSIFIER_SRC = extract_lic_module(SOURCE, 'Classifier', source_path: SOURCE_PATH)
-  ROUTER_SRC     = extract_lic_module(SOURCE, 'Router', kind: 'class', source_path: SOURCE_PATH)
+  HOOK_OPTIONS_SRC = extract_lic_method(SOURCE, 'hook_options', source_path: SOURCE_PATH)
+  ROUTER_SRC = extract_lic_module(SOURCE, 'Router', kind: 'class', source_path: SOURCE_PATH)
 
   module Harness; end
   Harness.module_eval(CLASSIFIER_SRC, SOURCE_PATH)
   Harness.module_eval(ROUTER_SRC, SOURCE_PATH)
+  Harness.const_set(:HOOK_PRIORITY, SOURCE[/HOOK_PRIORITY = (-?[\d_]+)/, 1].delete('_').to_i)
+  Harness.module_eval(HOOK_OPTIONS_SRC, SOURCE_PATH)
 
   # Loads the real Gemstone combat defs and crit tables from lich-5, or
   # returns false when there is no checkout. They resolve DATA_DIR/LIB_DIR
@@ -334,6 +337,25 @@ RSpec.describe 'combatstream.lic' do
       debug_router.call(attack)
       debug_router.call(flavor)
       expect(seen).to eq([[:attack, attack], [:block, flavor]])
+    end
+  end
+
+  describe 'hook_options' do
+    it 'runs our hook last where the registry supports priorities (current lich-5)' do
+      registry = Class.new { def self.add(_name, _action, persist: nil, priority: 0); end }
+      expect(harness.hook_options(registry)).to eq(persist: false, priority: harness::HOOK_PRIORITY)
+      expect(harness::HOOK_PRIORITY).to be_negative
+    end
+
+    it 'passes only what an older registry accepts (lich-5 5.21)' do
+      registry = Class.new { def self.add(_name, _action, persist: nil); end }
+      expect(harness.hook_options(registry)).to eq(persist: false)
+    end
+
+    it 'matches the real lich-5 hook registry when a checkout is available' do
+      source = read_lich5_source('lib/common/hook_registry.rb')
+      skip 'no lich-5 checkout with hook_registry.rb' unless source
+      expect(source).to include('Higher-priority hooks run first')
     end
   end
 
