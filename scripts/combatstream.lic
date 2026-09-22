@@ -17,6 +17,9 @@
                                               crit flavor and roundtime that follow an attack)
         --line                              - only move the individual lines Lich recognizes as combat
         --stream=<id>                       - stream id to send combat to (default: combat)
+        --no-mirror                         - don't copy the line just before a combat block (usually the attack
+                                              itself, when Lich doesn't recognize it) into the combat stream
+        --mirror                            - (default) turn that copy back on
 
         --debug                             - echo which kind of combat each moved line was, for this run only
         --help                              - show this help and exit
@@ -139,14 +142,18 @@ module CombatStream
     # @param classifier [#call] line -> family Symbol or nil
     # @param stream [String] stream id to route combat into
     # @param mode [Symbol] :block or :line (see the script help)
+    # @param mirror [Boolean] copy the line before a combat block into the
+    #   stream too (see #call)
     # @param debug [#call, nil] called with (family, line) for each routed line
-    def initialize(classifier, stream: 'combat', mode: :block, debug: nil)
+    def initialize(classifier, stream: 'combat', mode: :block, mirror: true, debug: nil)
       @classifier = classifier
       @stream = stream
       @mode = mode
+      @mirror = mirror
       @debug = debug
       @in_block = false
       @stream_depth = 0
+      @previous = nil
     end
 
     # @param line [String] one raw server string
@@ -154,12 +161,34 @@ module CombatStream
     def call(line)
       return line unless line.is_a?(String)
 
+      family = route(line)
+      return line unless family
+
+      @in_block = true if @mode == :block
+      out = +''
+      # The line naming the attack ("You gesture at ...", an odd weapon
+      # verb) often matches no def, so the block starts on the roll or
+      # damage line after it. That line has already gone to the story
+      # window and can't be taken back, but a copy can open the block so
+      # the combat window shows the whole exchange.
+      if @mirror && @previous && family != :block
+        @debug&.call(:mirror, @previous)
+        out << wrap(@previous)
+      end
+      @previous = nil
+      @debug&.call(family, line)
+      out << wrap(line)
+    end
+
+    # @return [Symbol, nil] why line goes to the stream (a def family, or
+    #   :block inside a combat block), or nil to leave it in place
+    def route(line)
       if line.include?(PROMPT)
         # Lich core closes a server stream left open at the prompt, so ours
         # resets here too rather than getting stuck.
         @in_block = false
         @stream_depth = 0
-        return line
+        return clear_previous
       end
 
       # Track streams the server opens itself (its own combat, thoughts,
@@ -167,28 +196,29 @@ module CombatStream
       # again would nest streams.
       if PUSH_STREAM.match?(line) || POP_STREAM.match?(line)
         @stream_depth = [@stream_depth + line.scan(PUSH_STREAM).size - line.scan(POP_STREAM).size, 0].max
-        return line
+        return clear_previous
       end
-      return line if @stream_depth.positive?
+      return clear_previous if @stream_depth.positive?
 
       if STRUCTURAL.match?(line)
         @in_block = false
-        return line
+        return clear_previous
       end
-      return line if CONVERSATION.match?(line)
+      return clear_previous if CONVERSATION.match?(line)
 
-      family = if @in_block
-                 :block
-               elsif line.strip.empty?
-                 nil
-               else
-                 @classifier.call(line)
-               end
-      return line unless family
+      return :block if @in_block
+      return nil if line.strip.empty?
 
-      @in_block = true if @mode == :block
-      @debug&.call(family, line)
-      wrap(line)
+      family = @classifier.call(line)
+      # Plain story text that stays put is the mirror candidate for a
+      # combat line that follows it.
+      @previous = line unless family
+      family
+    end
+
+    # Forget the mirror candidate; returns nil so route can return it.
+    def clear_previous
+      @previous = nil
     end
 
     # Each line is its own push/pop pair rather than one stream held open
@@ -210,6 +240,8 @@ module CombatStream
         ;combatstream --block         (default) route everything from a combat line to the next prompt
         ;combatstream --line          route only lines recognized as combat
         ;combatstream --stream=<id>   stream id to use (default: combat)
+        ;combatstream --no-mirror     don't copy the line before a combat block into the stream
+        ;combatstream --mirror        (default) copy it; it stays in the main window too
         ;combatstream --debug         echo the kind of each routed line (this run only)
         ;combatstream --list          show settings
         ;combatstream --help          show this help
@@ -223,6 +255,7 @@ module CombatStream
   def self.show_settings
     respond "combatstream settings:"
     respond "  mode:   #{CharSettings['mode'] || 'block'}"
+    respond "  mirror: #{CharSettings['mirror'] != false}"
     respond "  stream: #{CharSettings['stream'] || 'combat'}"
   end
 
@@ -244,6 +277,8 @@ module CombatStream
 
     CharSettings['mode'] = 'block' if args.include?('--block')
     CharSettings['mode'] = 'line' if args.include?('--line')
+    CharSettings['mirror'] = true if args.include?('--mirror')
+    CharSettings['mirror'] = false if args.include?('--no-mirror')
     if (stream_arg = args.find { |a| a.start_with?('--stream=') })
       stream = stream_arg.split('=', 2).last
       unless STREAM_ID_PATTERN.match?(stream)
@@ -269,7 +304,8 @@ module CombatStream
     _respond("<streamWindow id=\"#{stream}\" title=\"Combat\" location=\"center\" save=\"true\" />")
     _respond("<exposeStream id=\"#{stream}\"/>")
 
-    router = Router.new(->(line) { Classifier.classify(families, line) }, stream: stream, mode: mode, debug: debug)
+    classifier = ->(line) { Classifier.classify(families, line) }
+    router = Router.new(classifier, stream: stream, mode: mode, mirror: CharSettings['mirror'] != false, debug: debug)
     warned = false
     hook = proc do |server_string|
       router.call(server_string)

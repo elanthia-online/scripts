@@ -126,6 +126,59 @@ RSpec.describe 'combatstream.lic' do
       end
     end
 
+    context 'mirroring the line before a combat block' do
+      let(:setup) { "You leap from hiding to strike!\r\n" }
+
+      it 'copies it into the stream ahead of the combat line, leaving the original in place' do
+        expect(router.call(setup)).to equal(setup)
+        expect(router.call(attack)).to eq(wrapped(setup) + wrapped(attack))
+      end
+
+      it 'copies only at the start of a block, not for lines inside it' do
+        router.call(setup)
+        router.call(attack)
+        expect(router.call(flavor)).to eq(wrapped(flavor))
+      end
+
+      it 'does not reach back past a prompt' do
+        router.call(setup)
+        router.call(CombatStreamSpec::PROMPT)
+        expect(router.call(attack)).to eq(wrapped(attack))
+      end
+
+      it 'skips blank lines to find it' do
+        router.call(setup)
+        router.call("\r\n")
+        expect(router.call(attack)).to eq(wrapped(setup) + wrapped(attack))
+      end
+
+      it 'never copies speech, structural tags or server streams' do
+        [
+          "<preset id='speech'>Bob says,</preset> \"Go!\"\r\n",
+          "<style id=\"roomName\" />[Castle Anwyn]\r\n",
+          "<pushStream id=\"familiar\" />Your raven croaks.<popStream/>\r\n"
+        ].each do |line|
+          fresh = harness::Router.new(classifier)
+          fresh.call(line)
+          expect(fresh.call(attack)).to eq(wrapped(attack))
+        end
+      end
+
+      it 'is off with mirror: false' do
+        plain = harness::Router.new(classifier, mirror: false)
+        plain.call(setup)
+        expect(plain.call(attack)).to eq(wrapped(attack))
+      end
+
+      it 'reports the copy to the debug callback' do
+        seen = []
+        debug_router = harness::Router.new(classifier, debug: ->(family, line) { seen << [family, line] })
+        debug_router.call(setup)
+        debug_router.call(attack)
+        expect(seen).to eq([[:mirror, setup], [:attack, attack]])
+      end
+    end
+
     context 'in line mode' do
       let(:mode) { :line }
 
