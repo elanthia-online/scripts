@@ -152,7 +152,7 @@ RSpec.describe 'combatstream.lic' do
         expect(router.call(attack)).to eq(wrapped(setup) + wrapped(attack))
       end
 
-      it 'never copies speech, structural tags or server streams' do
+      it 'never copies speech, structural tags or text in a server stream' do
         [
           "<preset id='speech'>Bob says,</preset> \"Go!\"\r\n",
           "<style id=\"roomName\" />[Castle Anwyn]\r\n",
@@ -162,6 +162,38 @@ RSpec.describe 'combatstream.lic' do
           fresh.call(line)
           expect(fresh.call(attack)).to eq(wrapped(attack))
         end
+      end
+
+      it 'copies every story line since the last prompt, in order' do
+        lunge = "A greater construct lunges forward!\r\n"
+        router.call(CombatStreamSpec::PROMPT)
+        router.call(setup)
+        router.call(lunge)
+        expect(router.call(attack)).to eq(wrapped(setup) + wrapped(lunge) + wrapped(attack))
+      end
+
+      it 'leaves speech out without losing the lines around it' do
+        lunge = "A greater construct lunges forward!\r\n"
+        router.call(setup)
+        router.call("<preset id='speech'>Bob says,</preset> \"Look out!\"\r\n")
+        router.call(lunge)
+        expect(router.call(attack)).to eq(wrapped(setup) + wrapped(lunge) + wrapped(attack))
+      end
+
+      it 'starts over at a room change' do
+        router.call(setup)
+        router.call("<style id=\"roomName\" />[Castle Anwyn]\r\n")
+        after = "A greater construct lumbers in.\r\n"
+        router.call(after)
+        expect(router.call(attack)).to eq(wrapped(after) + wrapped(attack))
+      end
+
+      it "holds at most #{CombatStreamSpec::Harness::Router::MIRROR_LIMIT} lines" do
+        limit = harness::Router::MIRROR_LIMIT
+        lines = (1..(limit + 5)).map { |i| "Line #{i}.\r\n" }
+        lines.each { |line| router.call(line) }
+        expected = lines.last(limit).map { |line| wrapped(line) }.join + wrapped(attack)
+        expect(router.call(attack)).to eq(expected)
       end
 
       it 'is off with mirror: false' do
