@@ -69,9 +69,9 @@ RSpec.describe 'combatstream.lic' do
     let(:combat_lines) { [] }
     let(:classifier) { ->(line) { combat_lines.include?(line) ? :attack : nil } }
     let(:mode) { :block }
-    let(:router) { harness::Router.new(classifier, stream: 'combat', mode: mode) }
+    let(:router) { harness::Router.new(classifier, mode: mode) }
 
-    def wrapped(line, id = 'combat')
+    def wrapped(line, id = 'CombatStream')
       "<pushStream id=\"#{id}\"/>#{line.chomp}\r\n<popStream/>\r\n"
     end
 
@@ -79,6 +79,10 @@ RSpec.describe 'combatstream.lic' do
     let(:flavor) { "The greater construct gurgles once and goes still.\r\n" }
 
     before { combat_lines << attack }
+
+    it 'defaults to the CombatStream stream, not the game\'s own "combat"' do
+      expect(harness::Router::DEFAULT_STREAM).to eq('CombatStream')
+    end
 
     it 'wraps a combat line in its own push/pop pair' do
       expect(router.call(attack)).to eq(wrapped(attack))
@@ -363,7 +367,7 @@ RSpec.describe 'combatstream.lic' do
     it 'routes a whole round, flavor lines included, and nothing after the prompt' do
       router = harness::Router.new(->(line) { harness::Classifier.classify(families, line) })
       out = CombatStreamSpec::ROUND.map { |line| router.call(line) }
-      expect(out).to all(start_with('<pushStream id="combat"/>'))
+      expect(out).to all(start_with('<pushStream id="CombatStream"/>'))
       expect(router.call(CombatStreamSpec::PROMPT)).to eq(CombatStreamSpec::PROMPT)
       expect(router.call("Obvious paths: north.\r\n")).to eq("Obvious paths: north.\r\n")
     end
