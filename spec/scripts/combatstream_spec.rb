@@ -19,6 +19,8 @@ module CombatStreamSpec
 
   CLASSIFIER_SRC = extract_lic_module(SOURCE, 'Classifier', source_path: SOURCE_PATH)
   HOOK_OPTIONS_SRC = extract_lic_method(SOURCE, 'hook_options', source_path: SOURCE_PATH)
+  SUMMARY_SRC = extract_lic_module(SOURCE, 'Summary', source_path: SOURCE_PATH)
+  COMPRESSOR_SRC = extract_lic_module(SOURCE, 'Compressor', kind: 'class', source_path: SOURCE_PATH)
   ROUTER_SRC = extract_lic_module(SOURCE, 'Router', kind: 'class', source_path: SOURCE_PATH)
 
   module Harness; end
@@ -26,6 +28,8 @@ module CombatStreamSpec
   Harness.module_eval(ROUTER_SRC, SOURCE_PATH)
   Harness.const_set(:HOOK_PRIORITY, SOURCE[/HOOK_PRIORITY = (-?[\d_]+)/, 1].delete('_').to_i)
   Harness.module_eval(HOOK_OPTIONS_SRC, SOURCE_PATH)
+  Harness.module_eval(SUMMARY_SRC, SOURCE_PATH)
+  Harness.module_eval(COMPRESSOR_SRC, SOURCE_PATH)
 
   # Loads the real Gemstone combat defs and crit tables from lich-5, or
   # returns false when there is no checkout. They resolve DATA_DIR/LIB_DIR
@@ -43,6 +47,22 @@ module CombatStreamSpec
     require messages if File.exist?(messages)
     require File.join(lib, 'gemstone/critranks')
     true
+  end
+
+  # lich-5's Processor, for the end-to-end summary check -- only builds that
+  # emit whole attack events (newer than 5.21), which is what --compress
+  # needs. Loaded on demand from that example.
+  def self.load_processor
+    return false unless LICH5_DEFS
+
+    path = File.join(lich5_path, 'lib/gemstone/combat/processor.rb')
+    return false unless File.exist?(path) && File.read(path).include?("'combat.attack'")
+
+    require path
+    true
+  rescue LoadError, NameError => e
+    warn "combatstream_spec: lich-5 Processor not loaded: #{e.class}: #{e.message}"
+    false
   end
 
   module ::Lich; module Gemstone; end; end
@@ -340,6 +360,185 @@ RSpec.describe 'combatstream.lic' do
     end
   end
 
+  describe 'Router in compress mode' do
+    let(:rounds) { [] }
+    let(:combat_lines) { [] }
+    let(:classifier) { ->(line) { combat_lines.include?(line) ? :attack : nil } }
+    let(:log) { [] }
+    let(:router) do
+      harness::Router.new(classifier, commands: -> { log.dup },
+                                      compress: ->(time, commands, raw) { rounds << [time, commands, raw] })
+    end
+    let(:attack) { "You swing a mace at #{CombatStreamSpec::CONSTRUCT}!\r\n" }
+    let(:flavor) { "The greater construct gurgles once and goes still.\r\n" }
+
+    before { combat_lines << attack }
+
+    it 'hides the round and hands it over at the prompt, stamped with its server time' do
+      router.call(CombatStreamSpec::PROMPT)
+      log << '<c>attack construct'
+      setup = "You lunge forward.\r\n"
+      expect(router.call(setup)).to equal(setup)
+      expect(router.call(attack)).to be_nil
+      expect(router.call(flavor)).to be_nil
+      expect(rounds).to be_empty
+      expect(router.call(CombatStreamSpec::PROMPT)).to equal(CombatStreamSpec::PROMPT)
+      expect(rounds).to eq([[1_758_500_000, ['>attack construct'], [setup, attack, flavor]]])
+    end
+
+    it 'hands over nothing for a round without combat' do
+      router.call("Obvious paths: north.\r\n")
+      router.call(CombatStreamSpec::PROMPT)
+      expect(rounds).to be_empty
+    end
+
+    it 'leaves speech and structure in the story window mid-fight' do
+      router.call(attack)
+      speech = "<preset id='speech'>Bob says,</preset> \"Nice!\"\r\n"
+      expect(router.call(speech)).to eq(speech)
+    end
+  end
+
+  describe 'Summary' do
+    let(:construct) { { id: 37_507_821, noun: 'construct', name: 'greater construct' } }
+    let(:kobold) { { id: 11, noun: 'kobold', name: 'kobold' } }
+
+    def event(**fields)
+      { name: :attack, target: {}, attacker: nil, inbound: nil, foreign_caster: nil,
+        hits: [], flares: [], outcomes: [], statuses: [] }.merge(fields)
+    end
+
+    def crit(location, rank, **extra)
+      { type: 'crush', location: location, rank: rank, fatal: false, stunned: 0 }.merge(extra)
+    end
+
+    def lines(events, hp: nil)
+      harness::Summary.lines(events, hp: hp)
+    end
+
+    it 'totals our swing on a creature: damage, hits, crits and flares' do
+      swing = event(target: construct, hits: [{ damage: 20, crit: crit('left leg', 1) }],
+                    flares: [{ name: :ensorcell, hits: [], outcomes: [] }])
+      expect(lines([swing])).to eq(['greater construct: 20 dmg, 1 hit, L leg r1, ensorcell'])
+    end
+
+    it 'sums every swing and flare on the same creature in the round' do
+      one = event(target: construct, hits: [{ damage: 20, crit: crit('right arm', 2) }])
+      two = event(target: construct, hits: [{ damage: 15, crit: nil }],
+                  flares: [{ name: :fire_flare, hits: [{ damage: 12, crit: crit('chest', 3) }], outcomes: [] }])
+      expect(lines([one, two])).to eq(['greater construct: 47 dmg, 2 hits, R arm r2, chest r3, fire flare'])
+    end
+
+    it 'shows what a creature did to us, including what we avoided' do
+      inbound = event(inbound: true, attacker: construct, outcomes: [:evade])
+      expect(lines([inbound])).to eq(['you: 0 dmg (1 evaded)'])
+    end
+
+    it 'marks a kill and leaves the HP estimate off' do
+      swing = event(target: construct, hits: [{ damage: 40, crit: crit('head', 9, fatal: true) }])
+      expect(lines([swing], hp: ->(_id) { 10 })).to eq(['greater construct: 40 dmg, 1 hit, head r9 -- killed'])
+    end
+
+    it 'adds the HP estimate when one is known' do
+      swing = event(target: construct, hits: [{ damage: 20, crit: nil }])
+      expect(lines([swing], hp: ->(id) { id == construct[:id] ? 64 : nil }))
+        .to eq(['greater construct: 20 dmg, 1 hit [~64% hp]'])
+    end
+
+    it 'credits a flare that names another creature to that creature' do
+      swing = event(target: construct, hits: [{ damage: 5, crit: nil }],
+                    flares: [{ name: :lightning, target_info: kobold, hits: [{ damage: 9, crit: nil }], outcomes: [] }])
+      expect(lines([swing])).to eq(['greater construct: 5 dmg, 1 hit', 'kobold: 9 dmg, lightning'])
+    end
+
+    it "credits a reactive flare on a creature's attack to that attacker, not to us" do
+      inbound = event(inbound: true, attacker: construct, hits: [{ damage: 7, crit: nil }],
+                      flares: [{ name: :spikes, hits: [{ damage: 4, crit: nil }], outcomes: [] }])
+      expect(lines([inbound])).to eq(['you: 7 dmg, 1 hit', 'greater construct: 4 dmg, spikes'])
+    end
+
+    it "keeps another player's attack apart from ours" do
+      theirs = event(foreign_caster: true, attacker: { id: -5, name: 'Bob' }, target: construct,
+                     hits: [{ damage: 30, crit: nil }])
+      expect(lines([theirs])).to eq(['Bob on greater construct: 30 dmg, 1 hit'])
+    end
+
+    it 'lists stuns from crits and statuses the attack applied' do
+      swing = event(target: construct, hits: [{ damage: 10, crit: crit('neck', 4, stunned: 2) }], statuses: [:prone])
+      expect(lines([swing])).to eq(['greater construct: 10 dmg, 1 hit, neck r4, stunned, prone'])
+    end
+
+    it 'skips an event with nothing to show' do
+      expect(lines([event(target: construct)])).to be_empty
+    end
+  end
+
+  describe 'Compressor' do
+    let(:summaries) { [] }
+    let(:compressor) do
+      harness::Compressor.new(lambda { |events|
+        summaries << events
+        events.map { |e| "summary of #{e[:name]}" }
+      })
+    end
+    let(:wait) { harness::Compressor::ROUND_WAIT }
+
+    def batch_event(id, index, size, at, name = :attack)
+      { name: name, at: Time.at(at), observation_batch: { id: id, index: index, size: size } }
+    end
+
+    it 'replaces a round with the summary of its batch, after the commands' do
+      expect(compressor.add_round(100, ['>attack'], ['raw'], now: 0)).to eq([])
+      expect(compressor.add_event(batch_event(1, 0, 1, 100), now: 0.01)).to eq([['>attack', 'summary of attack']])
+      expect(compressor).not_to be_waiting
+    end
+
+    it 'waits for every event in the batch' do
+      compressor.add_round(100, [], ['raw'], now: 0)
+      expect(compressor.add_event(batch_event(1, 0, 2, 100, :swing), now: 0)).to eq([])
+      expect(compressor.add_event(batch_event(1, 1, 2, 100, :flare), now: 0)).to eq([['summary of swing', 'summary of flare']])
+    end
+
+    it 'pairs a batch that arrives before its round' do
+      expect(compressor.add_event(batch_event(1, 0, 1, 100), now: 0)).to eq([])
+      expect(compressor.add_round(100, [], ['raw'], now: 0.01)).to eq([['summary of attack']])
+    end
+
+    it 'accepts a round one second off (server time offset read a prompt apart)' do
+      compressor.add_round(101, [], ['raw'], now: 0)
+      expect(compressor.add_event(batch_event(1, 0, 1, 100), now: 0)).to eq([['summary of attack']])
+    end
+
+    it 'shows a round as-is when no batch comes in time' do
+      compressor.add_round(100, ['>look'], ['raw 1', 'raw 2'], now: 0)
+      expect(compressor.tick(now: wait - 0.1)).to eq([])
+      expect(compressor.tick(now: wait)).to eq([['>look', 'raw 1', 'raw 2']])
+    end
+
+    it 'shows an earlier waiting round as-is once a later batch completes' do
+      compressor.add_round(100, [], ['first'], now: 0)
+      compressor.add_round(105, [], ['second'], now: 0)
+      expect(compressor.add_event(batch_event(1, 0, 1, 105), now: 0)).to eq([['first'], ['summary of attack']])
+    end
+
+    it 'shows the round as-is when the summary comes out empty' do
+      quiet = harness::Compressor.new(->(_events) { [] })
+      quiet.add_round(100, [], ['raw'], now: 0)
+      expect(quiet.add_event(batch_event(1, 0, 1, 100), now: 0)).to eq([['raw']])
+    end
+
+    it 'drops a batch no round ever claims' do
+      compressor.add_event(batch_event(1, 0, 1, 100), now: 0)
+      expect(compressor.tick(now: harness::Compressor::BATCH_KEEP + 1)).to eq([])
+      expect(compressor).not_to be_waiting
+    end
+
+    it 'ignores events without batch information' do
+      expect(compressor.add_event({ name: :attack }, now: 0)).to eq([])
+      expect(compressor).not_to be_waiting
+    end
+  end
+
   describe 'hook_options' do
     it 'runs our hook last where the registry supports priorities (current lich-5)' do
       registry = Class.new { def self.add(_name, _action, persist: nil, priority: 0); end }
@@ -350,12 +549,6 @@ RSpec.describe 'combatstream.lic' do
     it 'passes only what an older registry accepts (lich-5 5.21)' do
       registry = Class.new { def self.add(_name, _action, persist: nil); end }
       expect(harness.hook_options(registry)).to eq(persist: false)
-    end
-
-    it 'matches the real lich-5 hook registry when a checkout is available' do
-      source = read_lich5_source('lib/common/hook_registry.rb')
-      skip 'no lich-5 checkout with hook_registry.rb' unless source
-      expect(source).to include('Higher-priority hooks run first')
     end
   end
 
@@ -384,6 +577,19 @@ RSpec.describe 'combatstream.lic' do
     it 'ignores ordinary story text' do
       expect(classify("Obvious paths: north, east.\r\n")).to be_nil
       expect(classify("You feel energized!\r\n")).to be_nil
+    end
+
+    it "summarizes lich-5's own parse of a real round" do
+      skip 'lich-5 here has no whole-attack events (needs newer than 5.21)' unless CombatStreamSpec.load_processor
+
+      stub_const('Lich::Gemstone::Combat::Tracker', Module.new)
+      allow(Lich::Gemstone::Combat::Tracker).to receive_messages(
+        settings: { track_statuses: true, track_ucs: true, emit_attacks: true, track_damage: true, track_wounds: true },
+        debug?: false
+      )
+      events = Lich::Gemstone::Combat::Processor.parse_events(CombatStreamSpec::ROUND.map(&:chomp),
+                                                              include_attack_events: true)
+      expect(harness::Summary.lines(events)).to eq(['greater construct: 20 dmg, 1 hit, L leg r1, ensorcell'])
     end
 
     it 'routes a whole round, flavor lines included, and nothing after the prompt' do

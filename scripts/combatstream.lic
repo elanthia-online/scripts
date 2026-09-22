@@ -21,6 +21,11 @@
                                               the attack itself, when Lich doesn't recognize it) into the
                                               combat stream
         --mirror                            - (default) turn that copy back on
+        --compress                          - show one summary line per creature per round instead of the combat
+                                              text itself (damage, hits, crits, flares, kills, HP estimate), using
+                                              Lich's combat tracker. Needs combat tracking on and a Lich newer than
+                                              5.21.0; falls back to the full text for any round it can't summarize
+        --no-compress                       - (default) show the combat text itself
 
         --debug                             - echo which kind of combat each moved line was, for this run only
         --help                              - show this help and exit
@@ -149,18 +154,25 @@ module CombatStream
     #   into the stream when a combat block starts (see #call)
     # @param commands [#call, nil] returns the command log, oldest first
     #   ($_CLIENTBUFFER_ in the script); nil leaves commands out of the mirror
+    # @param compress [#call, nil] compress mode: routed lines are held
+    #   instead of wrapped, and at each prompt this is called with
+    #   (prompt_time, commands, raw_lines) for the round (see Compressor)
     # @param debug [#call, nil] called with (family, line) for each routed line
-    def initialize(classifier, stream: DEFAULT_STREAM, mode: :block, mirror: true, commands: nil, debug: nil)
+    def initialize(classifier, stream: DEFAULT_STREAM, mode: :block, mirror: true, commands: nil, compress: nil,
+                   debug: nil)
       @classifier = classifier
       @stream = stream
       @mode = mode
       @mirror = mirror
       @commands = commands
+      @compress = compress
       @debug = debug
       @in_block = false
       @stream_depth = 0
       @pending = []
       @command_mark = latest_command
+      @round_commands = []
+      @round_raw = []
     end
 
     # Most lines held back for mirroring, in case no prompt comes for a
@@ -168,7 +180,8 @@ module CombatStream
     MIRROR_LIMIT = 20
 
     # @param line [String] one raw server string
-    # @return [String] the string, wrapped in the combat stream or unchanged
+    # @return [String, nil] the string, wrapped in the combat stream or
+    #   unchanged; nil in compress mode for a line held for the round summary
     def call(line)
       return line unless line.is_a?(String)
 
@@ -176,32 +189,43 @@ module CombatStream
       return line unless family
 
       @in_block = true if @mode == :block
-      out = +''
       # The lines leading into a fight (the attack itself when it is "You
       # gesture at ..." or an odd weapon verb, a creature's lunge ...) often
       # match no def, so the block starts on the roll or damage line after
       # them. They have already gone to the story window and can't be taken
       # back, but copies can open the block so the combat window shows the
       # whole exchange since the last prompt.
-      if @mirror && family != :block
-        new_commands.each do |command|
-          @debug&.call(:command, command)
-          out << wrap(command)
-        end
-        @pending.each do |held|
-          @debug&.call(:mirror, held)
-          out << wrap(held)
-        end
-      end
+      commands, held = @mirror && family != :block ? lead_in : [[], []]
       @pending.clear
       @debug&.call(family, line)
+
+      if @compress
+        # The summary replaces the round's lines; they are kept only so the
+        # round can be shown as-is if no summary comes.
+        @round_commands.concat(commands)
+        @round_raw.concat(held) << line
+        return nil
+      end
+
+      out = +''
+      (commands + held).each { |text| out << wrap(text) }
       out << wrap(line)
+    end
+
+    # @return [Array(Array<String>, Array<String>)] the commands sent and
+    #   the story lines held since the last prompt
+    def lead_in
+      commands = new_commands
+      commands.each { |command| @debug&.call(:command, command) }
+      @pending.each { |held| @debug&.call(:mirror, held) }
+      [commands, @pending.dup]
     end
 
     # @return [Symbol, nil] why line goes to the stream (a def family, or
     #   :block inside a combat block), or nil to leave it in place
     def route(line)
       if line.include?(PROMPT)
+        finish_round(line) if @compress
         # Lich core closes a server stream left open at the prompt, so ours
         # resets here too rather than getting stuck.
         @in_block = false
@@ -243,6 +267,19 @@ module CombatStream
         @pending.shift if @pending.size > MIRROR_LIMIT
       end
       family
+    end
+
+    PROMPT_TIME = /<prompt time=["'](\d+)/.freeze
+
+    # Hands the round's held lines to the compressor, stamped with the
+    # prompt's server time -- the same time Combat::Tracker stamps on the
+    # attack events it parses from this chunk, which is how they meet up.
+    def finish_round(prompt)
+      return if @round_raw.empty?
+
+      @compress.call(prompt[PROMPT_TIME, 1]&.to_i, @round_commands, @round_raw)
+      @round_commands = []
+      @round_raw = []
     end
 
     # Forget the held lines; returns nil so route can return it.
@@ -295,6 +332,214 @@ module CombatStream
     end
   end
 
+  # Turns one round's Combat::Tracker attack events into one line per
+  # creature (and one for you), totalling every swing and flare that landed
+  # on it:
+  #
+  #   greater construct: 20 dmg, 1 hit, L leg r1, ensorcell [~64% hp]
+  #   you: 0 dmg (1 evaded)
+  module Summary
+    OUTCOME_WORDS = {
+      evade: 'evaded', block: 'blocked', parry: 'parried', miss: 'missed', warded: 'warded',
+      fumble: 'fumbled', hindrance: 'hindered', confused: 'confused'
+    }.freeze
+
+    # @param events [Array<Hash>] combat.attack payloads, in order
+    # @param hp [#call, nil] creature id -> estimated HP percent, or nil
+    #   when unknown
+    # @return [Array<String>] one line per creature, first seen first
+    def self.lines(events, hp: nil)
+      groups = {}
+      events.each { |event| add_event(groups, event) }
+      groups.each_value.filter_map { |group| summary_line(group, hp) }
+    end
+
+    def self.add_event(groups, event)
+      target = event[:target] || {}
+      attacker = event[:attacker] || {}
+      main = if event[:inbound]
+               group(groups, :you, 'you')
+             elsif event[:foreign_caster]
+               # Another player's attack: shown, but kept apart from ours.
+               group(groups, [:foreign, attacker[:id] || attacker[:name], target[:id] || target[:name]],
+                     "#{attacker[:name]} on #{target[:name] || 'something'}")
+             else
+               creature_group(groups, target)
+             end
+
+      if main
+        (event[:hits] || []).each { |hit| add_hit(main, hit, count: true) }
+        (event[:outcomes] || []).each { |outcome| main[:outcomes][outcome] += 1 }
+        (event[:statuses] || []).each { |status| main[:statuses] << status.to_s }
+      end
+
+      (event[:flares] || []).each do |flare|
+        # A flare can land on another creature than the swing (an AoE, or a
+        # reactive flare on an inbound attack hitting its attacker).
+        owner = creature_group(groups, flare[:target_info]) if flare[:target_info]
+        owner ||= event[:inbound] ? creature_group(groups, attacker) : main
+        next unless owner
+
+        owner[:flares] << flare[:name].to_s.tr('_', ' ')
+        (flare[:hits] || []).each { |hit| add_hit(owner, hit, count: false) }
+        (flare[:outcomes] || []).each { |outcome| owner[:outcomes][outcome] += 1 }
+      end
+    end
+
+    def self.creature_group(groups, who)
+      return nil unless who && (who[:id] || who[:name])
+
+      group(groups, [:creature, who[:id] || who[:name]], who[:name] || "##{who[:id]}", id: who[:id])
+    end
+
+    def self.group(groups, key, label, id: nil)
+      groups[key] ||= { label: label, id: id, damage: 0, hits: 0, crits: [], flares: [], statuses: [],
+                        outcomes: Hash.new(0), killed: false }
+    end
+
+    # A flare's hits add damage and crits but aren't counted as swings.
+    def self.add_hit(group, hit, count:)
+      group[:damage] += hit[:damage].to_i
+      group[:hits] += 1 if count
+      crit = hit[:crit]
+      return unless crit
+
+      group[:crits] << crit_text(crit)
+      group[:statuses] << 'stunned' if crit[:stunned].to_i.positive?
+      group[:killed] ||= crit[:fatal]
+    end
+
+    def self.crit_text(crit)
+      return 'coup de grace' if crit[:type] == 'coup_de_grace'
+
+      location = crit[:location].to_s.sub(/\Aleft /, 'L ').sub(/\Aright /, 'R ')
+      crit[:rank] ? "#{location} r#{crit[:rank]}" : location
+    end
+
+    def self.summary_line(group, hp)
+      outcomes = group[:outcomes].map { |outcome, n| "#{n} #{OUTCOME_WORDS.fetch(outcome, outcome.to_s)}" }
+      # Nothing landed and nothing was avoided: not worth a line.
+      return nil if group[:damage].zero? && group[:hits].zero? && group[:crits].empty? &&
+                    group[:flares].empty? && group[:statuses].empty? && outcomes.empty? && !group[:killed]
+
+      parts = ["#{group[:damage]} dmg"]
+      parts << "#{group[:hits]} hit#{'s' unless group[:hits] == 1}" if group[:hits].positive?
+      parts.concat(group[:crits])
+      parts.concat(group[:flares].uniq)
+      parts.concat(group[:statuses].uniq)
+      text = "#{group[:label]}: #{parts.join(', ')}"
+      text << " (#{outcomes.join(', ')})" unless outcomes.empty?
+      if group[:killed]
+        text << ' -- killed'
+      elsif group[:id] && hp && (percent = hp.call(group[:id]))
+        text << " [~#{percent}% hp]"
+      end
+      text
+    end
+
+    private_class_method :add_event, :creature_group, :group, :add_hit, :crit_text, :summary_line
+  end
+
+  # Pairs each round the Router held back with the attack events
+  # Combat::Tracker parsed from the same chunk, and decides what to show.
+  #
+  # The tracker parses each chunk on its own worker thread after the prompt,
+  # so the two arrive separately and in either order. They meet on the
+  # prompt's server time, which the tracker stamps on every event (:at; see
+  # round_for for the one-second slack), and
+  # a batch is complete once all observation_batch[:size] of its events are
+  # in. A round whose batch never comes (tracking off, nothing the tracker
+  # could parse, a lagging worker) is shown as-is after ROUND_WAIT: text is
+  # never silently lost.
+  #
+  # No threads or Lich calls here -- the script feeds it and prints what it
+  # returns.
+  class Compressor
+    ROUND_WAIT = 1.5
+    # A complete batch with no round (a chunk we routed nothing from) is
+    # kept this long in case its round is still on the way.
+    BATCH_KEEP = 5.0
+
+    # @param summarize [#call] events -> Array<String> summary lines
+    def initialize(summarize)
+      @summarize = summarize
+      @rounds = []
+      @batches = {}
+    end
+
+    # @return [Array<Array<String>>] outputs ready to show, each a list of
+    #   lines (commands, then the summary or the raw lines)
+    def add_round(time, commands, raw, now:)
+      @rounds << { time: time, commands: commands, raw: raw, deadline: now + ROUND_WAIT }
+      settle(now)
+    end
+
+    # @param event [Hash] a combat.attack payload
+    def add_event(event, now:)
+      batch = event[:observation_batch]
+      return settle(now) unless batch
+
+      entry = (@batches[batch[:id]] ||= { time: event[:at]&.to_i, size: batch[:size], events: [], seen: now })
+      entry[:events] << event
+      settle(now)
+    end
+
+    # Call periodically so rounds without a batch are released.
+    def tick(now:)
+      settle(now)
+    end
+
+    # @return [Boolean] true while anything is waiting
+    def waiting?
+      !@rounds.empty? || !@batches.empty?
+    end
+
+    private
+
+    def settle(now)
+      out = []
+      @batches.keys.sort.each do |id|
+        batch = @batches[id]
+        next if batch[:events].size < batch[:size]
+
+        if (index = round_for(batch[:time]))
+          # Batches arrive in chunk order, so any earlier round still
+          # waiting will never get one.
+          @rounds.shift(index).each { |round| out << raw_output(round) }
+          out << summary_output(@rounds.shift, batch[:events])
+          @batches.delete(id)
+        elsif now - batch[:seen] > BATCH_KEEP
+          @batches.delete(id)
+        end
+      end
+      out << raw_output(@rounds.shift) while @rounds.first && @rounds.first[:deadline] <= now
+      out
+    end
+
+    # The round stamped with this batch's time: exact first, else one second
+    # either way. Both sides shift the prompt's server time by
+    # XMLData.server_time_offset, which is recomputed at every prompt; the
+    # tracker's worker can read it a prompt later than the hook did, and
+    # since server time is whole seconds the two can floor one apart.
+    def round_for(time)
+      return nil unless time
+
+      @rounds.index { |round| round[:time] == time } ||
+        @rounds.index { |round| round[:time] && (round[:time] - time).abs <= 1 }
+    end
+
+    def summary_output(round, events)
+      summary = @summarize.call(events)
+      return raw_output(round) if summary.empty?
+
+      round[:commands] + summary
+    end
+
+    def raw_output(round)
+      round[:commands] + round[:raw]
+    end
+  end
+
   HOOK_NAME = 'combatstream'
   STREAM_ID_PATTERN = /\A[a-zA-Z][\w-]*\z/.freeze
 
@@ -326,6 +571,8 @@ module CombatStream
         ;combatstream --stream=<id>   stream id and window title to use (default: CombatStream)
         ;combatstream --no-mirror     don't copy the commands and lines since the last prompt into the stream
         ;combatstream --mirror        (default) copy them when combat starts; they stay in the main window too
+        ;combatstream --compress      one summary line per creature per round (needs combat tracking on)
+        ;combatstream --no-compress   (default) the combat text itself
         ;combatstream --debug         echo the kind of each routed line (this run only)
         ;combatstream --list          show settings
         ;combatstream --help          show this help
@@ -339,6 +586,7 @@ module CombatStream
     respond "combatstream settings:"
     respond "  mode:   #{CharSettings['mode'] || 'block'}"
     respond "  mirror: #{CharSettings['mirror'] != false}"
+    respond "  compress: #{CharSettings['compress'] == true}"
     respond "  stream: #{CharSettings['stream'] || Router::DEFAULT_STREAM}"
   end
 
@@ -362,6 +610,8 @@ module CombatStream
     CharSettings['mode'] = 'line' if args.include?('--line')
     CharSettings['mirror'] = true if args.include?('--mirror')
     CharSettings['mirror'] = false if args.include?('--no-mirror')
+    CharSettings['compress'] = true if args.include?('--compress')
+    CharSettings['compress'] = false if args.include?('--no-compress')
     if (stream_arg = args.find { |a| a.start_with?('--stream=') })
       stream = stream_arg.split('=', 2).last
       unless STREAM_ID_PATTERN.match?(stream)
@@ -391,8 +641,27 @@ module CombatStream
     classifier = ->(line) { Classifier.classify(families, line) }
     # A snapshot ($_CLIENTBUFFER_ is appended to from script threads).
     commands = -> { $_CLIENTBUFFER_.dup.to_a }
+
+    compress = CharSettings['compress'] == true
+    if compress && (problem = compress_problem)
+      echo "--compress is off for this run: #{problem}"
+      compress = false
+    end
+    # Rounds from the hook and attack events from the tracker's worker both
+    # land here; only this script's own thread touches the Compressor.
+    queue = Thread::Queue.new if compress
+    # The tracker stamps events with the prompt's time shifted by the
+    # server clock offset (Processor.prompt_time), so the round's time is
+    # shifted the same way for the two to meet.
+    if compress
+      on_round = lambda do |time, round_commands, raw|
+        time = (time + XMLData.server_time_offset.to_f).floor if time
+        queue << [:round, time, round_commands, raw]
+      end
+    end
+
     router = Router.new(classifier, stream: stream, mode: mode, mirror: CharSettings['mirror'] != false,
-                                    commands: commands, debug: debug)
+                                    commands: commands, compress: on_round, debug: debug)
     warned = false
     hook = proc do |server_string|
       router.call(server_string)
@@ -406,10 +675,62 @@ module CombatStream
       server_string
     end
 
+    if compress
+      tracker = Lich::Gemstone::Combat::Tracker
+      # Tracker callbacks run on its worker thread and must stay cheap:
+      # just queue the event for this script's thread.
+      tracker.on(:attack, name: HOOK_NAME) { |_topic, event| queue << [:event, event] }
+      before_dying { tracker.off(HOOK_NAME) }
+    end
+
     before_dying { DownstreamHook.remove(HOOK_NAME) }
     DownstreamHook.add(HOOK_NAME, hook, **hook_options(DownstreamHook))
-    respond "[combatstream] routing combat to stream '#{stream}' (#{mode} mode, #{families.size} combat families). ;kill combatstream to stop."
-    sleep
+    respond "[combatstream] routing combat to stream '#{stream}' (#{mode} mode#{', compressed' if compress}, " \
+            "#{families.size} combat families). ;kill combatstream to stop."
+    compress ? run_compressor(queue, router) : sleep
+  end
+
+  # @return [String, nil] why --compress can't run here, or nil if it can
+  def self.compress_problem
+    combat = Lich::Gemstone::Combat
+    unless defined?(Lich::Common::Events) && combat::Processor.respond_to?(:attack_events_requested?)
+      return 'it needs a Lich newer than 5.21.0 (Combat::Tracker attack events).'
+    end
+    # Held lines are hidden by returning nil, which ends the hook chain:
+    # only safe when ours is guaranteed to run last.
+    return 'this Lich has no hook priorities.' unless hook_options(DownstreamHook).key?(:priority)
+    return 'combat tracking is off. Turn it on with: ;e Lich::Gemstone::Combat::Tracker.enable!' unless combat::Tracker.enabled?
+
+    nil
+  end
+
+  # The script's main loop in compress mode: feeds rounds and attack events
+  # to the Compressor and prints what it releases.
+  def self.run_compressor(queue, router)
+    compressor = Compressor.new(->(events) { Summary.lines(events, hp: method(:hp_percent)) })
+    loop do
+      item = queue.pop(timeout: 0.25)
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      outputs = case item&.first
+                when :round then compressor.add_round(item[1], item[2], item[3], now: now)
+                when :event then compressor.add_event(item[1], now: now)
+                else compressor.tick(now: now)
+                end
+      outputs.each { |lines| _respond(lines.map { |text| router.wrap(text) }.join) }
+    rescue StandardError => e
+      Lich.log "combatstream: compressor: #{e.class}: #{e.message}\n\t#{e.backtrace&.first(5)&.join("\n\t")}"
+    end
+  end
+
+  # Estimated HP left, only for creatures with a real template: without one
+  # Lich assumes a flat fallback max HP, and a percentage of that would
+  # mislead.
+  # @return [Integer, nil]
+  def self.hp_percent(id)
+    creature = Lich::Gemstone::Creature[id.to_i]
+    return nil unless creature && !creature.dead? && creature.template&.max_hp.to_i.positive?
+
+    creature.hp_percent&.round
   end
 end
 
