@@ -211,6 +211,81 @@ RSpec.describe 'combatstream.lic' do
       end
     end
 
+    context 'mirroring commands sent since the last prompt' do
+      let(:log) { [] }
+      let(:router) { harness::Router.new(classifier, commands: -> { log.dup }) }
+      let(:leap) { "You leap from hiding to attack!\r\n" }
+
+      def send_command(entry)
+        log << entry.dup
+      end
+
+      before { combat_lines << leap }
+
+      it 'shows a script command as the story window does, ahead of the fight' do
+        router.call(CombatStreamSpec::PROMPT)
+        send_command("[bigshot]><c>ambush #382609757 right leg\r\n")
+        expect(router.call(leap)).to eq(wrapped('[bigshot]>ambush #382609757 right leg') + wrapped(leap))
+      end
+
+      it 'shows a typed command with the prompt character' do
+        router.call(CombatStreamSpec::PROMPT)
+        send_command('<c>attack kobold')
+        expect(router.call(leap)).to eq(wrapped('>attack kobold') + wrapped(leap))
+      end
+
+      it 'puts commands before the story lines leading into the fight' do
+        router.call(CombatStreamSpec::PROMPT)
+        send_command('<c>ambush kobold')
+        setup = "You slip out of the shadows.\r\n"
+        router.call(setup)
+        expect(router.call(leap)).to eq(wrapped('>ambush kobold') + wrapped(setup) + wrapped(leap))
+      end
+
+      it 'leaves out commands sent before the last prompt' do
+        send_command('<c>look')
+        router.call(CombatStreamSpec::PROMPT)
+        expect(router.call(leap)).to eq(wrapped(leap))
+      end
+
+      it 'counts the same command sent again as new' do
+        send_command('<c>ambush kobold')
+        router.call(CombatStreamSpec::PROMPT)
+        send_command('<c>ambush kobold')
+        expect(router.call(leap)).to eq(wrapped('>ambush kobold') + wrapped(leap))
+      end
+
+      it 'mirrors each command once' do
+        router.call(CombatStreamSpec::PROMPT)
+        send_command('<c>ambush kobold')
+        router.call(leap)
+        router.call(CombatStreamSpec::PROMPT)
+        expect(router.call(leap)).to eq(wrapped(leap))
+      end
+
+      it 'escapes markup in the command' do
+        router.call(CombatStreamSpec::PROMPT)
+        send_command('<c>say <grin> & run')
+        expect(router.call(leap)).to eq(wrapped('>say &lt;grin> &amp; run') + wrapped(leap))
+      end
+
+      it 'is off with mirror: false' do
+        quiet = harness::Router.new(classifier, mirror: false, commands: -> { log.dup })
+        quiet.call(CombatStreamSpec::PROMPT)
+        send_command('<c>ambush kobold')
+        expect(quiet.call(leap)).to eq(wrapped(leap))
+      end
+
+      it 'reports each command to the debug callback' do
+        seen = []
+        debug_router = harness::Router.new(classifier, commands: -> { log.dup }, debug: ->(family, line) { seen << [family, line] })
+        debug_router.call(CombatStreamSpec::PROMPT)
+        send_command('<c>ambush kobold')
+        debug_router.call(leap)
+        expect(seen).to eq([[:command, '>ambush kobold'], [:attack, leap]])
+      end
+    end
+
     context 'in line mode' do
       let(:mode) { :line }
 

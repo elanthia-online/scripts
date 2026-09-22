@@ -17,8 +17,9 @@
                                               crit flavor and roundtime that follow an attack)
         --line                              - only move the individual lines Lich recognizes as combat
         --stream=<id>                       - stream id to send combat to (default: combat)
-        --no-mirror                         - don't copy the lines since the last prompt (usually the attack
-                                              itself, when Lich doesn't recognize it) into the combat stream
+        --no-mirror                         - don't copy the commands and lines since the last prompt (usually
+                                              the attack itself, when Lich doesn't recognize it) into the
+                                              combat stream
         --mirror                            - (default) turn that copy back on
 
         --debug                             - echo which kind of combat each moved line was, for this run only
@@ -144,16 +145,20 @@ module CombatStream
     # @param mode [Symbol] :block or :line (see the script help)
     # @param mirror [Boolean] copy the story lines since the last prompt
     #   into the stream when a combat block starts (see #call)
+    # @param commands [#call, nil] returns the command log, oldest first
+    #   ($_CLIENTBUFFER_ in the script); nil leaves commands out of the mirror
     # @param debug [#call, nil] called with (family, line) for each routed line
-    def initialize(classifier, stream: 'combat', mode: :block, mirror: true, debug: nil)
+    def initialize(classifier, stream: 'combat', mode: :block, mirror: true, commands: nil, debug: nil)
       @classifier = classifier
       @stream = stream
       @mode = mode
       @mirror = mirror
+      @commands = commands
       @debug = debug
       @in_block = false
       @stream_depth = 0
       @pending = []
+      @command_mark = latest_command
     end
 
     # Most lines held back for mirroring, in case no prompt comes for a
@@ -177,6 +182,10 @@ module CombatStream
       # back, but copies can open the block so the combat window shows the
       # whole exchange since the last prompt.
       if @mirror && family != :block
+        new_commands.each do |command|
+          @debug&.call(:command, command)
+          out << wrap(command)
+        end
         @pending.each do |held|
           @debug&.call(:mirror, held)
           out << wrap(held)
@@ -195,6 +204,9 @@ module CombatStream
         # resets here too rather than getting stuck.
         @in_block = false
         @stream_depth = 0
+        # Commands already in the log belong to this prompt's output, so
+        # only ones sent after it count as leading into the next fight.
+        @command_mark = latest_command
         return clear_pending
       end
 
@@ -237,6 +249,42 @@ module CombatStream
       nil
     end
 
+    # Commands sent since the mark, as the story window shows them
+    # ("[bigshot]>ambush ..." for a script, ">look" for one you typed),
+    # then moves the mark past them.
+    #
+    # The log holds a script's command as "[name]>" + $cmd_prefix + command
+    # and a typed one as $cmd_prefix + command. Its entries are found by
+    # identity, not text, so the same command sent twice still counts as
+    # new. If the mark has aged out of the log (bounded), everything left
+    # is newer than it.
+    def new_commands
+      log = command_log
+      return [] if log.empty?
+
+      mark = log.rindex { |entry| entry.equal?(@command_mark) }
+      fresh = mark ? log[(mark + 1)..] : log
+      @command_mark = log.last
+      fresh.last(MIRROR_LIMIT).map { |entry| display_command(entry) }
+    end
+
+    COMMAND_PREFIX = /\A(\[[^\]]*\]>)?(?:<c>)?/.freeze
+
+    def display_command(entry)
+      text = entry.to_s.chomp.sub(COMMAND_PREFIX) { Regexp.last_match(1) || '>' }
+      # Our own XML is wrapped around it, so the command itself must not be
+      # read as markup ("say <grin>").
+      text.gsub('&', '&amp;').gsub('<', '&lt;')
+    end
+
+    def latest_command
+      command_log.last
+    end
+
+    def command_log
+      @commands&.call || []
+    end
+
     # Each line is its own push/pop pair rather than one stream held open
     # across strings: a lost prompt can never leave the story window stuck
     # inside our stream, and bold/mono tags stay balanced within the pair.
@@ -256,7 +304,7 @@ module CombatStream
         ;combatstream --block         (default) route everything from a combat line to the next prompt
         ;combatstream --line          route only lines recognized as combat
         ;combatstream --stream=<id>   stream id to use (default: combat)
-        ;combatstream --no-mirror     don't copy the lines since the last prompt into the stream
+        ;combatstream --no-mirror     don't copy the commands and lines since the last prompt into the stream
         ;combatstream --mirror        (default) copy them when combat starts; they stay in the main window too
         ;combatstream --debug         echo the kind of each routed line (this run only)
         ;combatstream --list          show settings
@@ -321,7 +369,10 @@ module CombatStream
     _respond("<exposeStream id=\"#{stream}\"/>")
 
     classifier = ->(line) { Classifier.classify(families, line) }
-    router = Router.new(classifier, stream: stream, mode: mode, mirror: CharSettings['mirror'] != false, debug: debug)
+    # A snapshot ($_CLIENTBUFFER_ is appended to from script threads).
+    commands = -> { $_CLIENTBUFFER_.dup.to_a }
+    router = Router.new(classifier, stream: stream, mode: mode, mirror: CharSettings['mirror'] != false,
+                                    commands: commands, debug: debug)
     warned = false
     hook = proc do |server_string|
       router.call(server_string)
