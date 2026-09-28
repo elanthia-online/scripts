@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.16.5
+       version: 5.16.7
       required: Lich >= 5.22.0
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,8 +17,13 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
-  v5.16.5  (2026-09-21)
+  v5.16.7  (2026-09-28)
     - now requires Lich 5.22.0 or newer; keeping up the attack on creatures made sympathetic mid-fight is now handled by Lich itself
+  v5.16.6  (2026-09-27)
+    - fix: bigshot could get stuck spamming failed target attempts on a creature that had already fully decayed/left the room, instead of picking a new one
+  v5.16.5  (2026-09-23)
+    - fix: mounts (e.g. a gigas's battle mastodon) were ignored as targets until something else hurt them first
+    - fix: Rangers leading a group with a follower count (e.g. ;bigshot head 2) would try to track the number instead of hunting normally
   v5.16.4  (2026-09-21)
     - fix: a follower would keep trying to attack on its own, spamming failed target attempts, if the group leader stopped running bigshot while everyone stayed grouped - followers now stand down until the leader is hunting again
   v5.16.3  (2026-09-21)
@@ -3345,7 +3350,7 @@ class Bigshot
 
     instance_variable_set("@CORRECT_PERCENT_MIND", check_mind)
 
-    @TRACKING_CREATURE = options[0].gsub(/(solo|bounty|quick|single|head|tail)\s*/i, '').strip
+    @TRACKING_CREATURE = options[0].to_s.gsub(/\b(?:solo|bounty|quick|single|once|head|lead|tail|\d+)\b\s*/i, '').strip
     @BANDIT_NOUN_REGEX = /bandit|brigand|robber|thug|thief|rogue|outlaw|mugger|marauder|highwayman/i
 
     @DAGGER_REGEX = /alfange|basilard|bodkin|cinquedea|dagger|dirk|knife|kozuka|ice pick|misericord|parazonium|pavade|poignard|pugio|scramasax|sgian achlais|spike|stiletto|tanto|sidearm-of-Onar/i
@@ -7799,42 +7804,51 @@ class Bigshot
   # @param target [BigshotCreature, Lich::Common::GameObj] the creature to attack
   # @return [void]
   def attack(target) # Starts the process when a target is found
-    commands = find_routine(target)
-    debug_msg(@DEBUG_COMBAT, "attack | commands #{commands}")
+    # dead_or_gone? alone isn't enough: it trusts the crtrStatus dead flag
+    # (or a GameObj status fallback), which can lag or never fire for a
+    # creature that's fully decayed/left the room without ever being
+    # flagged dead here - still_targetable? (the local hostile room
+    # roster) is what valid_target? itself checks for that case. Bail
+    # before touching commands/target/follower state at all rather than
+    # continuing into the method against a target that's already gone.
+    unless dead_or_gone?(target) || !still_targetable?(target.id)
+      commands = find_routine(target)
+      debug_msg(@DEBUG_COMBAT, "attack | commands #{commands}")
 
-    if XMLData.current_target_id != target.id
-      # Rest variables and retarget if target changed
-      reset_variables(false)
-      bs_put "target ##{target.id}" if !dead_or_gone?(target)
-    end
-
-    # Make sure followers are attacking
-    @followers.add_event(:ATTACK)
-
-    commands.each do |i|
-      break if attack_break(target)
-
-      if (!solo? && leading?) && (!@followers.all_present? || Lich::Gemstone::Group.broken?)
-        @followers.add_event(:FOLLOW_NOW) # trigger rubber band
-        @followers.add_event(:ATTACK)
-        Lich::Util.quiet_command_xml("group open", /Your group status/)
-        fput('unhide') if hidden?
-        message("yellow", "A follower is missing. Calling them back")
+      if XMLData.current_target_id != target.id
+        # Rest variables and retarget if target changed
+        reset_variables(false)
+        bs_put "target ##{target.id}"
       end
 
-      if @leader != Char.name && !checkpcs.include?(@leader)
-        group_all_followers
-        break
+      # Make sure followers are attacking
+      @followers.add_event(:ATTACK)
+
+      commands.each do |i|
+        break if attack_break(target)
+
+        if (!solo? && leading?) && (!@followers.all_present? || Lich::Gemstone::Group.broken?)
+          @followers.add_event(:FOLLOW_NOW) # trigger rubber band
+          @followers.add_event(:ATTACK)
+          Lich::Util.quiet_command_xml("group open", /Your group status/)
+          fput('unhide') if hidden?
+          message("yellow", "A follower is missing. Calling them back")
+        end
+
+        if @leader != Char.name && !checkpcs.include?(@leader)
+          group_all_followers
+          break
+        end
+
+        group_status_ailments() if @TROUBADOURS_RALLY && Spell[1040].known?
+        stand(i) if !standing?
+        cast_signs()
+
+        debug_msg(@DEBUG_COMBAT, "reaction_check | $bigshot_reaction: #{$bigshot_reaction} | weapon reaction enabled: #{@WEAPON_REACTION}")
+        perform_reaction if ($bigshot_reaction != nil) && @WEAPON_REACTION
+        cmd(i, target)
+        debug_note_death(target)
       end
-
-      group_status_ailments() if @TROUBADOURS_RALLY && Spell[1040].known?
-      stand(i) if !standing?
-      cast_signs()
-
-      debug_msg(@DEBUG_COMBAT, "reaction_check | $bigshot_reaction: #{$bigshot_reaction} | weapon reaction enabled: #{@WEAPON_REACTION}")
-      perform_reaction if ($bigshot_reaction != nil) && @WEAPON_REACTION
-      cmd(i, target)
-      debug_note_death(target)
     end
 
     # Check for Roa'ter swallowing or Hinterwilds Ooze swallowing
@@ -8264,7 +8278,7 @@ class Bigshot
   # @return [Array<Lich::Gemstone::Creature::CreatureInstance, Lich::Common::GameObj>]
   def bs_hostile_creatures(*filters)
     native = Creature.in_room(*filters).select do |c|
-      next false unless c.crtr_flag?(:hostile) || (c.crtr_flag?(:sympathetic) && c.ever_hostile?)
+      next false unless c.crtr_flag?(:hostile) || (c.crtr_flag?(:sympathetic) && c.ever_hostile?) || unreported_target?(c)
       next false if c.crtr_flag?(:dead)
       # Reimplemented from CreatureInstance#valid_target? / GameObj.targets
       # rather than inherited, because valid_target? bundles these two safe
@@ -8304,6 +8318,24 @@ class Bigshot
     # false for them so every native crtrStatus reader degrades safely.
     bridged = GameObj.targets.reject { |go| Creature[go.id] }
     native + bridged
+  end
+
+  # Whether a creature the game has sent no <crtrStatus> for yet is in the
+  # client's target dropdown - the pre-Creature GameObj.targets signal.
+  #
+  # A freshly seen mount carries a bold link and shows up in the dropdown,
+  # but sends no <crtrStatus> of its own until it is first harmed (only its
+  # rider's tag arrives, with rider="1"), so crtr_flag?(:hostile) is false
+  # and it would never be targeted. crtr_flags? tells "the feed said not
+  # hostile" apart from "the feed has said nothing". Once a real tag
+  # arrives, the native flags take over and this no longer applies.
+  #
+  # Deliberately does not remember_hostile: that stays anchored to the
+  # game's own hostile="1".
+  # @param creature [Lich::Gemstone::Creature::CreatureInstance]
+  # @return [Boolean]
+  def unreported_target?(creature)
+    !creature.crtr_flags? && XMLData.current_target_ids.include?(creature.id.to_s)
   end
 
   # All tracked creatures in the room (alive, dead, hostile, or not), wrapped

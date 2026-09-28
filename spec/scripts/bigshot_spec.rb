@@ -57,6 +57,7 @@ module BigshotPrioritySpec
   BIGSHOT_CREATURE_SRC = extract(/^class BigshotCreature\n.*?^end$/m, 'BigshotCreature')
   BS_TARGETS_SRC = extract(/^  def bs_targets\(\*filters\).*?^  end$/m, 'bs_targets')
   BS_HOSTILE_SRC = extract(/^  def bs_hostile_creatures\(\*filters\).*?^  end$/m, 'bs_hostile_creatures')
+  UNREPORTED_TARGET_SRC = extract(/^  def unreported_target\?\(creature\).*?^  end$/m, 'unreported_target?')
   BS_ROOM_CREATURES_SRC = extract(/^  def bs_room_creatures\(\*filters\).*?^  end$/m, 'bs_room_creatures')
   PRIORITY_SRC = extract(/^  def priority\(target\).*?^  end$/m, 'priority')
   MATCHERS_SRC = extract(/^  def priority_matchers\n.*?^  end$/m, 'priority_matchers')
@@ -100,6 +101,10 @@ module BigshotPrioritySpec
 
       def ever_hostile?
         !!(flags || {})[:ever_hostile]
+      end
+
+      def crtr_flags?
+        !(flags || {}).empty?
       end
 
       def has_status?(_name)
@@ -162,7 +167,7 @@ module BigshotPrioritySpec
 
     module XMLData
       class << self
-        attr_accessor :current_target_id
+        attr_accessor :current_target_id, :current_target_ids
       end
     end
 
@@ -185,6 +190,7 @@ module BigshotPrioritySpec
       GameObj.registry = {}
       Creature.room_targets = []
       XMLData.current_target_id = nil
+      XMLData.current_target_ids = []
     end
 
     def fput(command)
@@ -239,6 +245,7 @@ module BigshotPrioritySpec
     eval(BIGSHOT_CREATURE_SRC)
     eval(BS_TARGETS_SRC)
     eval(BS_HOSTILE_SRC)
+    eval(UNREPORTED_TARGET_SRC)
     eval(BS_ROOM_CREATURES_SRC)
     eval(PRIORITY_SRC)
     eval(MATCHERS_SRC)
@@ -586,6 +593,7 @@ module BigshotCreatureAdapterSpec
   BIGSHOT_CREATURE_SRC = extract(/^class BigshotCreature\n.*?^end$/m, 'BigshotCreature')
   BS_ROOM_CREATURES_SRC = extract(/^  def bs_room_creatures\(\*filters\).*?^  end$/m, 'bs_room_creatures')
   BS_HOSTILE_SRC = extract(/^  def bs_hostile_creatures\(\*filters\).*?^  end$/m, 'bs_hostile_creatures')
+  UNREPORTED_TARGET_SRC = extract(/^  def unreported_target\?\(creature\).*?^  end$/m, 'unreported_target?')
   BS_TARGETS_SRC = extract(/^  def bs_targets\(\*filters\).*?^  end$/m, 'bs_targets')
   CREATURE_BACKED_SRC = extract(/^  def creature_backed\?\(npc\).*?^  end$/m, 'creature_backed?')
   DEAD_OR_GONE_SRC = extract(/^  def dead_or_gone\?\(npc\).*?^  end$/m, 'dead_or_gone?')
@@ -625,6 +633,12 @@ module BigshotCreatureAdapterSpec
     # itself is lich-5's to test; here a test just sets flags[:ever_hostile].
     def ever_hostile?
       !!flags[:ever_hostile]
+    end
+
+    # Real CreatureInstance#crtr_flags? is true once any <crtrStatus> has
+    # been seen; a key present as false still counts as seen.
+    def crtr_flags?
+      !flags.empty?
     end
 
     # Real CreatureInstance#valid_target? is false whenever the guessed
@@ -682,6 +696,12 @@ module BigshotCreatureAdapterSpec
       end
     end
 
+    module XMLData
+      class << self
+        attr_accessor :current_target_ids
+      end
+    end
+
     module GameObj
       class << self
         attr_accessor :target
@@ -706,6 +726,7 @@ module BigshotCreatureAdapterSpec
       GameObj.registry = {}
       GameObj.target = nil
       GameObj.target_list = []
+      XMLData.current_target_ids = []
     end
 
     # Registers a creature in both the Creature id registry and the current
@@ -723,6 +744,7 @@ module BigshotCreatureAdapterSpec
     eval(BIGSHOT_CREATURE_SRC)
     eval(BS_ROOM_CREATURES_SRC)
     eval(BS_HOSTILE_SRC)
+    eval(UNREPORTED_TARGET_SRC)
     eval(BS_TARGETS_SRC)
     eval(CREATURE_BACKED_SRC)
     eval(DEAD_OR_GONE_SRC)
@@ -1155,6 +1177,34 @@ module BigshotCreatureAdapterSpec
         never_hostile.flags[:sympathetic] = true
 
         bs.room(never_hostile)
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'keeps a fresh mount in the target dropdown that has sent no crtrStatus yet' do
+        # Live capture: the rider's tag arrives with rider="1", but its
+        # mastodon sends nothing until first harmed, even though it is in
+        # the dropdown.
+        mount = FakeCreatureInstance.new(437850810, 'mastodon', 'heavily armored battle mastodon')
+        bs.room(mount)
+        Harness::XMLData.current_target_ids = ['437850810']
+
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(437850810)
+      end
+
+      it 'drops a creature with no crtrStatus that is not in the target dropdown' do
+        mount = FakeCreatureInstance.new(437850810, 'mastodon', 'heavily armored battle mastodon')
+        bs.room(mount)
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'trusts crtrStatus over the dropdown once the game has reported the creature' do
+        # hostile present as false = the feed spoke and said "not hostile".
+        calmed = FakeCreatureInstance.new(308, 'mastodon', 'heavily armored battle mastodon')
+        calmed.flags[:hostile] = false
+        bs.room(calmed)
+        Harness::XMLData.current_target_ids = ['308']
 
         expect(bs.bs_hostile_creatures).to be_empty
       end
