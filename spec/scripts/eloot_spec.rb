@@ -2720,3 +2720,52 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
     end
   end
 end
+
+# RSpec for ELoot::Hoard.filter_inventory (;eloot list <type> <filter>).
+RSpec.describe 'ELoot::Hoard.filter_inventory' do
+  let(:harness) do
+    path = find_lic_source('eloot.lic', from: __dir__)
+    mod = Module.new
+    mod.module_eval(extract_lic_method(File.read(path), 'filter_inventory', source_path: path))
+    mod
+  end
+
+  let(:entries) do
+    [
+      { item: 'uncut diamond', count: 3, full: false },
+      { item: 'small uncut diamond', count: 1, full: false },
+      { item: 'blue diamond', count: 2, full: true },
+      { item: 'ruby', count: 5, full: false },
+      { item: '*** empty jars ***', count: 4, full: '  -' }
+    ]
+  end
+
+  def names(filter)
+    harness.filter_inventory(entries, filter).map { |e| e[:item] }
+  end
+
+  it 'returns everything with no filter' do
+    expect(names(nil)).to eq(entries.map { |e| e[:item] })
+    expect(names('  ')).to eq(entries.map { |e| e[:item] })
+  end
+
+  it 'matches every entry containing the word' do
+    expect(names('diamond')).to eq(['uncut diamond', 'small uncut diamond', 'blue diamond'])
+  end
+
+  it 'narrows with multiple words' do
+    expect(names('uncut diamond')).to eq(['uncut diamond', 'small uncut diamond'])
+  end
+
+  it 'is case-insensitive' do
+    expect(names('UnCut DIAMOND')).to eq(['uncut diamond', 'small uncut diamond'])
+  end
+
+  it 'matches words in any order' do
+    expect(names('diamond uncut')).to eq(['uncut diamond', 'small uncut diamond'])
+  end
+
+  it 'returns nothing when no entry matches' do
+    expect(names('emerald')).to eq([])
+  end
+end
