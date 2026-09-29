@@ -2595,8 +2595,8 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
     mod.const_set(:Hoard, mod)
     mod.const_set(:LOCKER_MAX_PASSES, 6)
     mod.const_set(:LOCKER_PASS_WAIT, 10)
-    mod.const_set(:LOCKER_ELSEWHERE, /Your locker is not located here/i)
-    mod.const_set(:LOCKER_INFO, /Your locker is currently located in (.+?)\./i)
+    mod.const_set(:LOCKER_ELSEWHERE, eval(source[%r{LOCKER_ELSEWHERE = (/.*?/i)}, 1])) # the shipped pattern, not a copy
+    mod.const_set(:LOCKER_INFO, eval(source[%r{LOCKER_INFO = (/.*?/i)}, 1]))
     extract('che_locker_rooms', 'town_name', 'che_town_id_for', 'locker_info_town', 'locker_elsewhere?', 'nearest_first', 'booth_room?', 'approach_step', 'take_step', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
     mod.define_singleton_method(:respond) { |*| }
     mod.define_singleton_method(:sleep) { |secs| log[:sleeps] << secs }
@@ -2705,18 +2705,18 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
       moves = log[:moves]
       cur = current
       harness.define_singleton_method(:move) { |_way| moves << cur.id; nil }
-      harness.define_singleton_method(:reget) { |*| ['Your locker is not located here.'] }
+      harness.define_singleton_method(:reget) { |*| ["You can't do that because your locker isn't here!"] }
 
       expect(harness.enter_any_locker(lockers)).to be false
       expect(moves.length).to eq(1)
       expect(log[:sleeps]).to be_empty
       expect(harness.locker_elsewhere?).to be true
-      expect(log[:msgs].grep(/not located here/)).not_to be_empty
+      expect(log[:msgs].grep(/locker isn't in this town/)).not_to be_empty
     end
 
     it 'does not carry the flag into the next visit' do
       harness.define_singleton_method(:move) { |_way| nil }
-      harness.define_singleton_method(:reget) { |*| ['Your locker is not located here.'] }
+      harness.define_singleton_method(:reget) { |*| ["You can't do that because your locker isn't here!"] }
       harness.enter_any_locker(lockers)
 
       harness.define_singleton_method(:move) { |_way| true }
