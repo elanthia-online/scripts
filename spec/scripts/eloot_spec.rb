@@ -2681,6 +2681,12 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
       expect(harness.che_town_id_for(rooms + [mist], 'paupers', 'the Isle of Four Winds')).to eq(3668)
     end
 
+    it 'finds the Ta\'Illistim lockers the map files under "the Lost Home"' do
+      lost = room(27_908, 'the Lost Home', 188, 'meta:che:paupers:locker')
+      expect(harness.che_town_id_for(rooms + [lost], 'paupers', "Ta'Illistim")).to eq(188)
+      expect(harness.che_town_id_for(rooms + [lost], 'paupers', 'the Lost Home')).to eq(188)
+    end
+
     it 'is nil when the house has no lockers there, no CHE, or no town' do
       expect(harness.che_town_id_for(rooms, 'paupers', 'Solhaven')).to be_nil
       expect(harness.che_town_id_for(rooms, 'none', "Kraken's Fall")).to be_nil
