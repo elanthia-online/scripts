@@ -2693,6 +2693,25 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
       expect(log[:msgs].grep(/Locker at room #17580 is in use/)).not_to be_empty
     end
 
+    it 'still takes the step when the room outside mentions a locker or counter object' do
+      steps = []
+      harness.define_singleton_method(:in_locker_room?) { true }
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      expect(harness.enter_locker(booth)).to be true
+      expect(steps).to eq(['go scarlet curtain'])
+    end
+
+    it 'is done without a move when we are already standing in the booth' do
+      steps = []
+      cur = current
+      cur.id = 17580
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      harness::ELoot.define_singleton_method(:go2) { |_place| }
+      current.previous = { 17580 => 17579 }
+      expect(harness.enter_locker(booth)).to be true
+      expect(steps).to be_empty
+    end
+
     it 'is in once the step goes through' do
       harness.define_singleton_method(:move) { |_way| true }
       expect(harness.enter_locker(booth)).to be true
@@ -2831,5 +2850,108 @@ RSpec.describe 'ELoot::Hoard.filter_inventory' do
 
   it 'returns nothing when no entry matches' do
     expect(names('emerald')).to eq([])
+  end
+end
+
+# RSpec for the command dispatcher order at the bottom of eloot.lic. The `case` matches the
+# whole argument string against unanchored regexes (/raid/, /pool/, ...), so the hoard
+# commands, whose free-text list filter can contain any of those words, must be matched first.
+RSpec.describe 'eloot command dispatcher' do
+  let(:branches) do
+    source = File.read(find_lic_source('eloot.lic', from: __dir__))
+    block = source[/^  case Script\.current\.vars\[0\]\n[\s\S]*?^  else\n/]
+    raise 'could not find the command dispatcher' unless block
+
+    block.scan(/^  when (.+)$/).flatten.map do |expr|
+      expr = expr.sub(/\s+#\s.*\z/, '')
+      [expr, eval(expr)] # our own source, literals only
+    end
+  end
+
+  def first_branch(input)
+    branches.find { |_expr, pattern| pattern === input }&.first
+  end
+
+  ['list gem diamond', 'list reagent braided rose', 'list gem pool', 'list gem setup', 'list gem options',
+   'list gem debug', 'LIST Reagent raid', 'deposit gem', 'reset alchemy'].each do |input|
+    it "sends '#{input}' to the hoard branch" do
+      expect(first_branch(input)).to start_with('/\\A\\s*(list|deposit|reset)')
+    end
+  end
+
+  it 'still sends a plain "list" to the settings list' do
+    expect(first_branch('list')).to eq("'list'")
+  end
+
+  it 'still sends raid to the raid branch' do
+    expect(first_branch('raid gem diamond x3')).to eq('/raid/')
+  end
+end
+
+# RSpec for ELoot::Inventory.single_drag's stun handling: it waits out a stun with
+# wait_while instead of the old uncapped, silent raise/rescue/retry loop.
+RSpec.describe 'ELoot::Inventory.single_drag while stunned' do
+  let(:bag) { Struct.new(:name).new('backpack') }
+  let(:item) { Struct.new(:name, :type, :id).new('ruby', 'gem', 'id-ruby') }
+  let(:log) { { stored: [], msgs: [], waited: 0 } }
+
+  # Stunned for the first `stunned_checks` calls to stunned?, then clear
+  def harness_for(stunned_checks:, store_result: true)
+    log = self.log
+    state = { checks: stunned_checks }
+    bag = self.bag
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |text: '', **| log[:msgs] << text }
+    eloot.define_singleton_method(:box_phase) { |_item| }
+    eloot.define_singleton_method(:data) { Struct.new(:sacks_full).new({}) }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { default: bag } }
+
+    inventory = Module.new
+    inventory.define_singleton_method(:single_drag_box) { |_item| false }
+    inventory.define_singleton_method(:store_item) do |target, thing|
+      raise 'boom' if store_result == :raise
+
+      log[:stored] << [target.name, thing.name]
+      store_result
+    end
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Inventory, inventory)
+    mod.define_singleton_method(:stunned?) do
+      state[:checks] -= 1
+      state[:checks] >= 0
+    end
+    mod.define_singleton_method(:wait_while) do |&block|
+      loop do
+        break unless block.call
+
+        log[:waited] += 1
+      end
+    end
+    path = find_lic_source('eloot.lic', from: __dir__)
+    mod.module_eval(extract_lic_method(File.read(path), 'single_drag', source_path: path))
+    mod
+  end
+
+  it 'waits for the stun to clear, then stores the item once' do
+    harness_for(stunned_checks: 2).single_drag(item)
+    expect(log[:waited]).to eq(1)
+    expect(log[:stored]).to eq([%w[backpack ruby]])
+    expect(log[:msgs].grep(/stunned, waiting/)).not_to be_empty
+  end
+
+  it 'does not wait when not stunned' do
+    harness_for(stunned_checks: 0).single_drag(item)
+    expect(log[:waited]).to eq(0)
+    expect(log[:stored]).to eq([%w[backpack ruby]])
+  end
+
+  it 'lets an error from store_item through instead of retrying it forever' do
+    expect { harness_for(stunned_checks: 0, store_result: :raise).single_drag(item) }.to raise_error('boom')
   end
 end
