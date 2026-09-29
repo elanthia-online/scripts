@@ -2735,6 +2735,7 @@ RSpec.describe 'ELoot::Hoard.filter_inventory' do
       { item: 'uncut diamond', count: 3, full: false },
       { item: 'small uncut diamond', count: 1, full: false },
       { item: 'blue diamond', count: 2, full: true },
+      { item: 'uncut blue diamond', count: 1, full: false },
       { item: 'ruby', count: 5, full: false },
       { item: '*** empty jars ***', count: 4, full: '  -' }
     ]
@@ -2750,19 +2751,25 @@ RSpec.describe 'ELoot::Hoard.filter_inventory' do
   end
 
   it 'matches every entry containing the word' do
-    expect(names('diamond')).to eq(['uncut diamond', 'small uncut diamond', 'blue diamond'])
+    expect(names('diamond')).to eq(['uncut diamond', 'small uncut diamond', 'blue diamond', 'uncut blue diamond'])
   end
 
-  it 'narrows with multiple words' do
+  it 'matches the whole filter as a phrase, not its individual words' do
     expect(names('uncut diamond')).to eq(['uncut diamond', 'small uncut diamond'])
+    expect(names('uncut diamond')).not_to include('blue diamond', 'uncut blue diamond')
+  end
+
+  it 'does not match when the words are present but not adjacent or in order' do
+    expect(names('diamond uncut')).to eq([])
+    expect(names('uncut diamond')).not_to include('uncut blue diamond')
   end
 
   it 'is case-insensitive' do
     expect(names('UnCut DIAMOND')).to eq(['uncut diamond', 'small uncut diamond'])
   end
 
-  it 'matches words in any order' do
-    expect(names('diamond uncut')).to eq(['uncut diamond', 'small uncut diamond'])
+  it 'ignores extra spacing in the filter or the name' do
+    expect(names("  uncut    diamond ")).to eq(['uncut diamond', 'small uncut diamond'])
   end
 
   it 'returns nothing when no entry matches' do
