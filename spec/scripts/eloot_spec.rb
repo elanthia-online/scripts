@@ -2541,7 +2541,7 @@ end
 # ("the town of Wehnimer's Landing", id 228) while the CHE locker rooms in that town use the
 # bare name, and ~600 rooms have a `false` location. Room#dijkstra is stubbed the way
 # lich-5's really behaves: given an Array destination it stops at the first one reached, so
-# the stub refuses any argument.
+# the stub refuses an Array argument.
 RSpec.describe 'ELoot::Hoard locker selection and entry' do
   let(:room_class) do
     Struct.new(:id, :location, :tags, :town) do
@@ -2561,7 +2561,8 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
   end
 
   let(:log) { { msgs: [], go2: [], moves: [], sleeps: [] } }
-  let(:current) { Struct.new(:id, :distances).new(0, {}) }
+  let(:current) { Struct.new(:id, :distances, :previous).new(0, {}, {}) }
+  let(:rooms_by_id) { {} }
 
   let(:harness) do
     log = self.log
@@ -2575,13 +2576,15 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
 
     room_const = Module.new
     room_const.define_singleton_method(:current) do
-      current.define_singleton_method(:dijkstra) do |*args|
-        raise ArgumentError, 'dijkstra must be called without a destination list' unless args.empty?
+      current.define_singleton_method(:dijkstra) do |dest = nil|
+        raise ArgumentError, 'dijkstra must not be given a destination list' if dest.is_a?(Array)
 
-        [{}, distances]
+        [previous, distances]
       end
       current
     end
+    rooms_by_id = self.rooms_by_id
+    room_const.define_singleton_method(:[]) { |id| rooms_by_id[id] }
 
     mod = Module.new
     mod.const_set(:ELoot, eloot)
@@ -2589,7 +2592,7 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
     mod.const_set(:Hoard, mod)
     mod.const_set(:LOCKER_MAX_PASSES, 6)
     mod.const_set(:LOCKER_PASS_WAIT, 10)
-    extract('che_locker_rooms', 'nearest_first', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
+    extract('che_locker_rooms', 'nearest_first', 'booth_room?', 'approach_step', 'take_step', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
     mod.define_singleton_method(:respond) { |*| }
     mod.define_singleton_method(:sleep) { |secs| log[:sleeps] << secs }
     mod.define_singleton_method(:fput) { |*| }
@@ -2668,6 +2671,60 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
 
     it 'returns an empty list untouched' do
       expect(harness.nearest_first([])).to eq([])
+    end
+  end
+
+  describe 'enter_locker for a booth room picked from the map tags' do
+    # Mist Harbor's Twilight Hall annex: booth 17580 is only reachable by "go scarlet curtain" from 17579
+    let(:booth) { room(17580, 'Mist Harbor', 3668, 'meta:che:twilight_hall:locker') }
+    let(:lobby_class) { Struct.new(:wayto) }
+
+    before do
+      rooms_by_id[17579] = lobby_class.new({ '17580' => 'go scarlet curtain' })
+      current.previous = { 17580 => 17579 }
+    end
+
+    it 'goes to the room outside the booth, not the booth, and takes the last step itself' do
+      steps = []
+      harness.define_singleton_method(:move) { |way| steps << way; nil }
+      expect(harness.enter_locker(booth)).to be false
+      expect(log[:go2]).to eq([17579])
+      expect(steps).to eq(['go scarlet curtain'])
+      expect(log[:msgs].grep(/Locker at room #17580 is in use/)).not_to be_empty
+    end
+
+    it 'is in once the step goes through' do
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_locker(booth)).to be true
+    end
+
+    it 'does not send a move if the trip to the entrance did not get us there' do
+      steps = []
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      eloot = harness::ELoot
+      eloot.define_singleton_method(:go2) { |_place| } # travel failed, still at room 0
+      expect(harness.enter_locker(booth)).to be false
+      expect(steps).to be_empty
+    end
+
+    it 'runs a scripted move and checks where we ended up' do
+      cur = current
+      rooms_by_id[17579] = lobby_class.new({ '17580' => -> { cur.id = 17580 } })
+      expect(harness.enter_locker(booth)).to be true
+    end
+
+    it 'falls back to plain go2 plus the opening when there is no single last step' do
+      current.previous = {}
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_locker(booth)).to be true
+      expect(log[:go2]).to eq([17580])
+    end
+
+    it 'keeps using go2 for the room outside a public locker' do
+      outside = room(389, "Wehnimer's Landing", 228, 'publiclockers')
+      harness.define_singleton_method(:move) { |_way| nil }
+      expect(harness.enter_locker(outside)).to be false
+      expect(log[:go2]).to eq([389])
     end
   end
 
