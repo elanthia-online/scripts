@@ -2597,7 +2597,7 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
     mod.const_set(:LOCKER_PASS_WAIT, 10)
     mod.const_set(:LOCKER_ELSEWHERE, eval(source[%r{LOCKER_ELSEWHERE = (/.*?/i)}, 1])) # the shipped pattern, not a copy
     mod.const_set(:LOCKER_INFO, eval(source[%r{LOCKER_INFO = (/.*?/i)}, 1]))
-    extract('che_locker_rooms', 'town_name', 'che_town_id_for', 'locker_info_town', 'locker_elsewhere?', 'nearest_first', 'booth_room?', 'approach_step', 'take_step', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
+    extract('che_locker_rooms', 'town_name', 'che_town_id_for', 'locker_info_town', 'lines_since', 'locker_elsewhere?', 'nearest_first', 'booth_room?', 'approach_step', 'take_step', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
     mod.define_singleton_method(:respond) { |*| }
     mod.define_singleton_method(:sleep) { |secs| log[:sleeps] << secs }
     mod.define_singleton_method(:fput) { |*| }
@@ -2675,6 +2675,12 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
       expect(harness.che_town_id_for(rooms, 'paupers', 'Icemule Trace')).to be_nil
     end
 
+    it 'knows the game and map names that differ (Teras Isle / Kharam-Dzu, Isle of Four Winds / Mist Harbor)' do
+      mist = room(16_308, 'Mist Harbor', 3668, 'meta:che:paupers:locker')
+      expect(harness.che_town_id_for(rooms, 'paupers', 'the town of Teras Isle')).to eq(1932)
+      expect(harness.che_town_id_for(rooms + [mist], 'paupers', 'the Isle of Four Winds')).to eq(3668)
+    end
+
     it 'is nil when the house has no lockers there, no CHE, or no town' do
       expect(harness.che_town_id_for(rooms, 'paupers', 'Solhaven')).to be_nil
       expect(harness.che_town_id_for(rooms, 'none', "Kraken's Fall")).to be_nil
@@ -2690,9 +2696,26 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
       expect(log[:commands]).to eq(['locker info'])
     end
 
-    it 'is nil when the reply has no locker location' do
+    it 'is nil when the reply has no locker location, and does not ask again' do
       info_lines.replace(['<prompt>'])
       expect(harness.locker_info_town).to be_nil
+      expect(harness.locker_info_town).to be_nil
+      expect(log[:commands]).to eq(['locker info'])
+    end
+  end
+
+  describe 'lines_since' do
+    it 'returns only the lines that arrived after the first snapshot' do
+      expect(harness.lines_since(%w[a b c], %w[b c d e])).to eq(%w[d e])
+    end
+
+    it 'returns everything when nothing overlaps' do
+      expect(harness.lines_since(%w[a b], %w[x y])).to eq(%w[x y])
+    end
+
+    it 'returns nothing when no new lines arrived' do
+      expect(harness.lines_since(%w[a b], %w[a b])).to eq([])
+      expect(harness.lines_since([], [])).to eq([])
     end
   end
 
@@ -2701,11 +2724,19 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
 
     before { current.distances = { 0 => 0, 1 => 1, 2 => 2 } }
 
+    let(:elsewhere) { "You can't do that because your locker isn't here!" }
+
+    # reget is called once before the step and once after it
+    def reget_sequence(*snapshots)
+      calls = 0
+      harness.define_singleton_method(:reget) { |*| snapshots[[calls, snapshots.length - 1].min].tap { calls += 1 } }
+    end
+
     it 'stops after the first attempt instead of trying every locker and every pass' do
       moves = log[:moves]
       cur = current
       harness.define_singleton_method(:move) { |_way| moves << cur.id; nil }
-      harness.define_singleton_method(:reget) { |*| ["You can't do that because your locker isn't here!"] }
+      reget_sequence([], [elsewhere])
 
       expect(harness.enter_any_locker(lockers)).to be false
       expect(moves.length).to eq(1)
@@ -2714,9 +2745,18 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
       expect(log[:msgs].grep(/locker isn't in this town/)).not_to be_empty
     end
 
+    it 'ignores the same message left over in the buffer from an earlier run' do
+      harness.define_singleton_method(:move) { |_way| nil }
+      reget_sequence([elsewhere], [elsewhere]) # nothing new arrived
+
+      expect(harness.enter_any_locker(lockers)).to be false
+      expect(harness.locker_elsewhere?).to be false
+      expect(log[:sleeps].length).to eq(5) # ordinary busy handling: all six passes
+    end
+
     it 'does not carry the flag into the next visit' do
       harness.define_singleton_method(:move) { |_way| nil }
-      harness.define_singleton_method(:reget) { |*| ["You can't do that because your locker isn't here!"] }
+      reget_sequence([], [elsewhere])
       harness.enter_any_locker(lockers)
 
       harness.define_singleton_method(:move) { |_way| true }
