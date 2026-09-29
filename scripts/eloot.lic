@@ -4314,6 +4314,8 @@ module ELoot # Gem and Reagent hoarding
 
     LOCKER_MAX_PASSES = 6 unless defined?(LOCKER_MAX_PASSES)
     LOCKER_PASS_WAIT = 10 unless defined?(LOCKER_PASS_WAIT)
+    LOCKER_ELSEWHERE = /Your locker is not located here/i.freeze unless defined?(LOCKER_ELSEWHERE)
+    LOCKER_INFO = /Your locker is currently located in (.+?)\./i.freeze unless defined?(LOCKER_INFO)
 
     # The character's own CHE lockers in a town, as go2's "locker" target finds them:
     # the locker rooms themselves, or if none are mapped, the entrances to them.
@@ -4330,6 +4332,37 @@ module ELoot # Gem and Reagent hoarding
       end
 
       []
+    end
+
+    # "the town of Kraken's Fall" and "Kraken's Fall" name the same place
+    def self.town_name(name)
+      name.to_s.strip.sub(/\Athe (?:town|city|village|free port|tunnels and caverns|isle) of /i, '').downcase
+    end
+
+    # The town room id of the house's lockers in the named town (as LOCKER INFO reports it),
+    # or nil if the house has no mapped lockers there.
+    def self.che_town_id_for(rooms, che, town_name)
+      return nil if che.to_s.empty? || che.to_s == 'none' || town_name.to_s.strip.empty?
+
+      wanted = Hoard.town_name(town_name)
+      found = rooms.find do |room|
+        room.tags.any? { |tag| tag =~ /\Ameta:che:#{Regexp.escape(che.to_s)}:(?:locker|entrance_locker)\z/ } && Hoard.town_name(room.location) == wanted
+      end
+
+      found && found.find_nearest_by_tag('town')
+    end
+
+    # Where a non-premium house member's single locker is, straight from LOCKER INFO
+    # ("Your locker is currently located in the town of Kraken's Fall."). nil if unknown.
+    def self.locker_info_town
+      return @locker_info_town if @locker_info_town
+
+      lines = ELoot.get_command('locker info', /Your locker is currently located in .+?\.|<prompt time=".*?">&gt;<\/prompt>/, silent: true, quiet: true)
+      @locker_info_town = lines.join(' ')[LOCKER_INFO, 1]
+    end
+
+    def self.locker_elsewhere?
+      @locker_elsewhere == true
     end
 
     # Reachable rooms only, nearest to where we're standing first. Room#dijkstra is
@@ -4373,7 +4406,14 @@ module ELoot # Gem and Reagent hoarding
       end
 
       manual = ELoot.data.che_rooms.to_s.split(',').map { |num| Room[num.to_i] }.compact
-      town_id = (manual.first || Room.current).find_nearest_by_tag("town")
+
+      # Premium members get a locker in every town, so the town we're in will do. Anyone
+      # else has a single locker in one town, which LOCKER INFO says (and may not be here).
+      town_id = manual.first&.find_nearest_by_tag("town")
+      if town_id.nil? && ELoot.data.account_type !~ /premium/i && (info_town = Hoard.locker_info_town)
+        town_id = Hoard.che_town_id_for(Map.list, Char.che, info_town)
+      end
+      town_id ||= Room.current.find_nearest_by_tag("town")
 
       tagged = town_id ? Hoard.che_locker_rooms(Map.list, Char.che, town_id) : []
       @typed_locker_rooms = tagged.empty?
@@ -4467,6 +4507,12 @@ module ELoot # Gem and Reagent hoarding
         end
       end
 
+      if reget(10).any? { |line| line =~ LOCKER_ELSEWHERE }
+        @locker_elsewhere = true
+        ELoot.msg(text: " Your locker is not located here.")
+        return false
+      end
+
       # move returns nil (not false) for "You'll have to wait, X is presently using that locker booth"
       ELoot.msg(text: result.nil? ? " Locker at room ##{place.id} is in use." : " Not able to get into the locker at room ##{place.id}.")
       false
@@ -4475,6 +4521,8 @@ module ELoot # Gem and Reagent hoarding
     # Tries every locker in turn, nearest first, waiting between rounds. Returns true
     # once inside one, false after LOCKER_MAX_PASSES rounds with none available.
     def self.enter_any_locker(lockers)
+      @locker_elsewhere = false
+
       LOCKER_MAX_PASSES.times do |pass|
         # Re-sorted each pass from wherever the last attempt left us
         lockers = Hoard.nearest_first(lockers) if pass.positive?
@@ -4482,7 +4530,11 @@ module ELoot # Gem and Reagent hoarding
         here, others = lockers.partition { |place| place.id == Room.current.id }
         lockers = here + others
 
-        return true if lockers.any? { |place| Hoard.enter_locker(place) }
+        lockers.each do |place|
+          return true if Hoard.enter_locker(place)
+          # Every other locker in town is just as far from where this one is
+          return false if Hoard.locker_elsewhere?
+        end
 
         break if pass == LOCKER_MAX_PASSES - 1
 
@@ -4530,6 +4582,12 @@ module ELoot # Gem and Reagent hoarding
       end
 
       unless Hoard.enter_any_locker(lockers)
+        if Hoard.locker_elsewhere?
+          where = @locker_info_town ? " It is in #{@locker_info_town}." : ''
+          ELoot.msg(text: " Not able to hoard. Your locker is not in #{locker_town}.#{where} Check LOCKER INFO.", space: true)
+          return false
+        end
+
         ELoot.msg(text: " Not able to enter any locker in #{locker_town} after #{LOCKER_MAX_PASSES} tries. Giving up on hoarding for now.", space: true)
         return false
       end

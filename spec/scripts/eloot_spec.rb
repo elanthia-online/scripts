@@ -2560,7 +2560,8 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
     names.map { |name| extract_lic_method(source, name, source_path: path) }
   end
 
-  let(:log) { { msgs: [], go2: [], moves: [], sleeps: [] } }
+  let(:log) { { msgs: [], go2: [], moves: [], sleeps: [], commands: [] } }
+  let(:info_lines) { [] }
   let(:current) { Struct.new(:id, :distances, :previous).new(0, {}, {}) }
   let(:rooms_by_id) { {} }
 
@@ -2572,6 +2573,8 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
     eloot.define_singleton_method(:msg) { |text: '', **| log[:msgs] << text }
     eloot.define_singleton_method(:go2) { |place| log[:go2] << place; current.id = place if place.is_a?(Integer) }
     eloot.define_singleton_method(:wait_rt) {}
+    info_lines = self.info_lines
+    eloot.define_singleton_method(:get_command) { |cmd, _regex, **| log[:commands] << cmd; info_lines }
     eloot.module_eval(extract_lic_method(source, 'fwi?', source_path: path))
 
     room_const = Module.new
@@ -2592,7 +2595,9 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
     mod.const_set(:Hoard, mod)
     mod.const_set(:LOCKER_MAX_PASSES, 6)
     mod.const_set(:LOCKER_PASS_WAIT, 10)
-    extract('che_locker_rooms', 'nearest_first', 'booth_room?', 'approach_step', 'take_step', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
+    mod.const_set(:LOCKER_ELSEWHERE, /Your locker is not located here/i)
+    mod.const_set(:LOCKER_INFO, /Your locker is currently located in (.+?)\./i)
+    extract('che_locker_rooms', 'town_name', 'che_town_id_for', 'locker_info_town', 'locker_elsewhere?', 'nearest_first', 'booth_room?', 'approach_step', 'take_step', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
     mod.define_singleton_method(:respond) { |*| }
     mod.define_singleton_method(:sleep) { |secs| log[:sleeps] << secs }
     mod.define_singleton_method(:fput) { |*| }
@@ -2641,6 +2646,82 @@ RSpec.describe 'ELoot::Hoard locker selection and entry' do
       expect(harness.che_locker_rooms(rooms, 'none', 228)).to eq([])
       expect(harness.che_locker_rooms(rooms, nil, 228)).to eq([])
       expect(harness.che_locker_rooms(rooms, 'sovyn', 228)).to eq([])
+    end
+  end
+
+  describe 'che_town_id_for (where a non-premium house member\'s single locker is)' do
+    let(:rooms) do
+      [
+        room(1, false, nil),
+        room(28_000, "Kraken's Fall", 28_813, 'meta:che:paupers:locker'),
+        room(27_907, 'the town of Kharam-Dzu', 1932, 'meta:che:paupers:locker'),
+        room(35_000, 'Icemule Trace', 2300, 'meta:che:silvergate_inn:locker'),
+        room(29_000, 'Solhaven', 1438, 'meta:che:paupers:entrance_annex')
+      ]
+    end
+
+    it 'finds the town room for the town LOCKER INFO names' do
+      expect(harness.che_town_id_for(rooms, 'paupers', "Kraken's Fall")).to eq(28_813)
+    end
+
+    it 'treats "the town of X" and "X" as the same place, whichever side carries the prefix' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'the town of Kharam-Dzu')).to eq(1932)
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Kharam-Dzu')).to eq(1932)
+      expect(harness.che_town_id_for(rooms, 'paupers', "the town of Kraken's Fall")).to eq(28_813)
+    end
+
+    it 'is case-insensitive and only looks at the character\'s own house' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'KRAKEN\'S FALL')).to eq(28_813)
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Icemule Trace')).to be_nil
+    end
+
+    it 'is nil when the house has no lockers there, no CHE, or no town' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Solhaven')).to be_nil
+      expect(harness.che_town_id_for(rooms, 'none', "Kraken's Fall")).to be_nil
+      expect(harness.che_town_id_for(rooms, 'paupers', nil)).to be_nil
+    end
+  end
+
+  describe 'locker_info_town' do
+    it 'reads the town from LOCKER INFO once and remembers it' do
+      info_lines.replace(['<prompt>', "Your locker is currently located in the town of Kraken's Fall."])
+      expect(harness.locker_info_town).to eq("the town of Kraken's Fall")
+      expect(harness.locker_info_town).to eq("the town of Kraken's Fall")
+      expect(log[:commands]).to eq(['locker info'])
+    end
+
+    it 'is nil when the reply has no locker location' do
+      info_lines.replace(['<prompt>'])
+      expect(harness.locker_info_town).to be_nil
+    end
+  end
+
+  describe 'a locker that is not in this town' do
+    let(:lockers) { [room(1, 'x', 228), room(2, 'x', 228)] }
+
+    before { current.distances = { 0 => 0, 1 => 1, 2 => 2 } }
+
+    it 'stops after the first attempt instead of trying every locker and every pass' do
+      moves = log[:moves]
+      cur = current
+      harness.define_singleton_method(:move) { |_way| moves << cur.id; nil }
+      harness.define_singleton_method(:reget) { |*| ['Your locker is not located here.'] }
+
+      expect(harness.enter_any_locker(lockers)).to be false
+      expect(moves.length).to eq(1)
+      expect(log[:sleeps]).to be_empty
+      expect(harness.locker_elsewhere?).to be true
+      expect(log[:msgs].grep(/not located here/)).not_to be_empty
+    end
+
+    it 'does not carry the flag into the next visit' do
+      harness.define_singleton_method(:move) { |_way| nil }
+      harness.define_singleton_method(:reget) { |*| ['Your locker is not located here.'] }
+      harness.enter_any_locker(lockers)
+
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(harness.locker_elsewhere?).to be false
     end
   end
 
