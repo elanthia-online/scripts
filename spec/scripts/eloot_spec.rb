@@ -2534,3 +2534,96 @@ RSpec.describe 'ELoot::Hoard.hoarding_list (duplicate-grouping, gem type)' do
     expect(harness.hoarding_list('fire opal').map(&:id)).to contain_exactly('id-opal-1', 'id-opal-2')
   end
 end
+
+# RSpec for the locker selection helpers behind ELoot::Hoard.go2_locker: picking the
+# character's own CHE lockers in a town (like ;go2 locker does) and ordering the
+# candidates nearest-first so a busy booth falls through to the next-closest one.
+RSpec.describe 'ELoot::Hoard locker selection' do
+  let(:harness) do
+    path = find_lic_source('eloot.lic', from: __dir__)
+    source = File.read(path)
+    bodies = %w[same_town? che_locker_rooms nearest_first].map { |name| extract_lic_method(source, name, source_path: path) }
+
+    eloot = Module.new
+    eloot.define_singleton_method(:fwi?) { |room| room.location =~ /Four Winds|Mist Harbor|Western Harbor/ }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:Hoard, mod) # the helpers call each other as Hoard.*
+    bodies.each { |body| mod.module_eval(body) }
+    mod
+  end
+
+  let(:room_class) { Struct.new(:id, :location, :tags) }
+
+  def room(id, location, *tags)
+    room_class.new(id, location, tags)
+  end
+
+  let(:landing) { room(1, "Wehnimer's Landing", 'town') }
+  let(:rooms) do
+    [
+      room(10, "Wehnimer's Landing", 'meta:che:paupers:locker'),
+      room(11, "Wehnimer's Landing", 'meta:che:paupers:locker'),
+      room(12, "Wehnimer's Landing", 'meta:che:paupers:entrance_locker'),
+      room(13, "Wehnimer's Landing", 'meta:che:silvergate_inn:locker'),
+      room(20, 'Solhaven', 'meta:che:paupers:locker'),
+      room(30, 'Ta\'Vaalor', 'meta:che:paupers:entrance_locker'),
+      room(31, 'Ta\'Vaalor', 'meta:che:paupers:entrance_annex')
+    ]
+  end
+
+  describe 'che_locker_rooms' do
+    it 'returns every locker room of the character\'s CHE in the town' do
+      expect(harness.che_locker_rooms(rooms, 'paupers', landing).map(&:id)).to eq([10, 11])
+    end
+
+    it 'ignores other houses and other towns' do
+      expect(harness.che_locker_rooms(rooms, 'silvergate_inn', landing).map(&:id)).to eq([13])
+    end
+
+    it 'falls back to the entrance rooms when no locker room is mapped in town' do
+      vaalor = room(2, "Ta'Vaalor", 'town')
+      expect(harness.che_locker_rooms(rooms, 'paupers', vaalor).map(&:id)).to eq([30])
+    end
+
+    it 'returns nothing for a character without a CHE' do
+      expect(harness.che_locker_rooms(rooms, 'none', landing)).to eq([])
+      expect(harness.che_locker_rooms(rooms, nil, landing)).to eq([])
+    end
+
+    it 'returns nothing when the house has no lockers in town' do
+      expect(harness.che_locker_rooms(rooms, 'sovyn', landing)).to eq([])
+    end
+
+    it 'treats Mist Harbor and the Isle of Four Winds as one town' do
+      mist = room(40, 'Mist Harbor', 'meta:che:paupers:locker')
+      isle = room(3, 'the Isle of Four Winds', 'town')
+      expect(harness.che_locker_rooms(rooms + [mist], 'paupers', isle).map(&:id)).to eq([40])
+    end
+  end
+
+  describe 'nearest_first' do
+    def stub_current_room(distances)
+      current = Object.new
+      current.define_singleton_method(:dijkstra) { |_ids| [{}, distances] }
+      room_const = Module.new
+      room_const.define_singleton_method(:current) { current }
+      harness.const_set(:Room, room_const)
+    end
+
+    it 'orders reachable lockers by path length' do
+      stub_current_room({ 10 => 9, 11 => 2, 12 => 5 })
+      expect(harness.nearest_first(rooms.first(3)).map(&:id)).to eq([11, 12, 10])
+    end
+
+    it 'drops lockers that cannot be reached' do
+      stub_current_room({ 10 => 4 })
+      expect(harness.nearest_first(rooms.first(3)).map(&:id)).to eq([10])
+    end
+
+    it 'returns an empty list untouched' do
+      expect(harness.nearest_first([])).to eq([])
+    end
+  end
+end

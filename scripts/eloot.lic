@@ -15,10 +15,14 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.15.0
-           version: 2.11.12
+           version: 2.12.0
 
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.12.0 (2026-09-29)
+    - feature: hoarding now uses your house's mapped lockers (like ;go2 locker), heads for the
+      nearest locker first, and tries the other lockers in town when one is in use instead of
+      waiting on it. Gives up with a message after a few rounds instead of trying forever.
   v2.11.12 (2026-09-23)
     - fix: could pause while selling a box's contents at the locksmith pool when containers were full
   v2.11.11 (2026-09-21)
@@ -4311,11 +4315,121 @@ module ELoot # Gem and Reagent hoarding
       end
     end
 
+    LOCKER_BUSY = /presently using that locker booth/
+    LOCKER_MAX_PASSES = 6
+    LOCKER_PASS_WAIT = 10
+
+    # Same town if the map location matches, or both are on the Isle of Four Winds
+    # (its town room and the Mist Harbor locker rooms carry different locations).
+    def self.same_town?(room, town_room)
+      room.location == town_room.location || (ELoot.fwi?(room) && ELoot.fwi?(town_room))
+    end
+
+    # The character's own CHE lockers in a town, as go2's "locker" target finds them:
+    # the locker rooms themselves, or if none are mapped, the entrances to them.
+    # Returns [] for characters with no CHE so the manual room list can take over.
+    def self.che_locker_rooms(rooms, che, town_room)
+      return [] if che.to_s.empty? || che.to_s == 'none'
+
+      in_town = rooms.select { |room| Hoard.same_town?(room, town_room) }
+
+      %w[locker entrance_locker].each do |tier|
+        found = in_town.select { |room| room.tags.include?("meta:che:#{che}:#{tier}") }
+        return found unless found.empty?
+      end
+
+      []
+    end
+
+    # Reachable rooms only, nearest to where we're standing first.
+    def self.nearest_first(rooms)
+      return rooms if rooms.empty?
+
+      _previous, distances = Room.current.dijkstra(rooms.map(&:id))
+      rooms.select { |room| distances[room.id] }.sort_by { |room| distances[room.id] }
+    end
+
+    def self.locker_way_in
+      return ELoot.data.che_entry unless ELoot.data.che_entry.to_s.strip.empty?
+
+      way_in_obj = (GameObj.loot.to_a + GameObj.room_desc.to_a).find { |obj| obj.noun =~ /^(?:opening|curtain|tapestry)$/ }
+      return nil if way_in_obj.nil?
+
+      way_in_obj.noun = "opening" if way_in_obj.noun == "tapestry"
+      "go #{way_in_obj.noun}"
+    end
+
+    def self.in_locker_room?
+      (GameObj.room_desc.to_a + GameObj.loot.to_a).any? { |obj| obj.name =~ /locker|counter/ }
+    end
+
+    # Rooms to try, nearest first. House lockers come from Char.che's map tags in the
+    # locker town (the town of the typed CHE rooms if any, otherwise where we are); the
+    # typed CHE rooms are the fallback for a character with no mapped CHE.
+    def self.locker_rooms
+      unless ELoot.data.use_house_locker
+        return Hoard.nearest_first(Map.list.find_all { |room| (room.tags.any?(/meta:che:#{ELoot.data.locker_city}/) && room.tags.any?(/locker/)) || (room.tags.any?(/publiclockers/) && room.location =~ /#{ELoot.data.locker_city}/) })
+      end
+
+      manual = ELoot.data.che_rooms.to_s.split(',').map { |num| Room[num.to_i] }.compact
+      town_source = manual.first || Room.current
+      town_id = town_source.find_nearest_by_tag("town")
+      town_room = town_id && Room[town_id]
+
+      tagged = town_room ? Hoard.che_locker_rooms(Map.list, Char.che, town_room) : []
+
+      Hoard.nearest_first(tagged.empty? ? manual : tagged)
+    end
+
+    # Walks to a locker room and gets inside. Returns true once in the booth; false
+    # if it was occupied or otherwise unusable (the caller moves on to the next one).
+    def self.enter_locker(place)
+      ELoot.go2(place.id)
+      ELoot.wait_rt
+
+      # some rooms go directly to the locker instead of just outside
+      return true if Hoard.in_locker_room?
+
+      if reget(15).any? { |line| line =~ LOCKER_BUSY }
+        ELoot.msg(text: " Locker at room ##{place.id} is in use.")
+        return false
+      end
+
+      way_in = Hoard.locker_way_in
+
+      if way_in.nil?
+        ELoot.msg(text: " No way into the locker from room ##{place.id}, skipping it.")
+        return false
+      end
+
+      result = move way_in
+
+      return true if result == true
+
+      if reget(10).reverse.any? { |line| line =~ /pay off (your|that) debt/i }
+        wealth_pattern = /^You have (no|[,\d]+|but one) silver with you/
+        wealth_lines = ELoot.get_command("wealth quiet", wealth_pattern, silent: true, quiet: true).join(" ")
+        if wealth_lines.to_s =~ /In the back of your mind you remember you owe a debt of ([\d,]+) silver/
+          amount = $1.gsub(',', '').to_i
+          ELoot.silver_withdraw(amount)
+          ELoot.go2("debt")
+          ELoot.wait_rt
+          fput("pay #{amount}")
+          ELoot.silver_withdraw(2500)
+          return Hoard.enter_locker(place)
+        end
+      end
+
+      ELoot.msg(text: " Locker at room ##{place.id} is in use.") if reget(15).any? { |line| line =~ LOCKER_BUSY }
+      false
+    end
+
     def self.go2_locker
-      if ELoot.data.use_house_locker
-        lockers = ELoot.data.che_rooms.split(',').map { |num| Room[num.to_i] }
-      else
-        lockers = Map.list.find_all { |room| (room.tags.any?(/meta:che:#{ELoot.data.locker_city}/) && room.tags.any?(/locker/)) || (room.tags.any?(/publiclockers/) && room.location =~ /#{ELoot.data.locker_city}/) }
+      lockers = Hoard.locker_rooms
+
+      if lockers.empty?
+        ELoot.msg(text: " Not able to hoard. No reachable locker rooms found for #{ELoot.data.locker_city.to_s.empty? ? 'your house' : ELoot.data.locker_city}.", space: true)
+        return
       end
 
       locker_town = Room[Room[lockers.first.id].find_nearest_by_tag("town")].location
@@ -4341,57 +4455,27 @@ module ELoot # Gem and Reagent hoarding
         ELoot.silver_withdraw(2500)
       end
 
-      index = 0
+      LOCKER_MAX_PASSES.times do |pass|
+        # Every locker in town, nearest first; re-sorted each pass from where we ended up
+        lockers = Hoard.nearest_first(lockers) if pass.positive?
 
-      if lockers.any? { |location| location.id == Room.current.id }
-        index = lockers.find_index { |location| location.id == Room.current.id }
+        here, others = lockers.partition { |place| place.id == Room.current.id }
+        lockers = here + others
+
+        if lockers.any? { |place| Hoard.enter_locker(place) }
+          ELoot.wait_rt
+          return Hoard.open_locker
+        end
+
+        break if pass == LOCKER_MAX_PASSES - 1
+
+        respond
+        ELoot.msg(text: " Not able to enter a locker. They might all be taken. Waiting #{LOCKER_PASS_WAIT} seconds then trying again (#{pass + 1} of #{LOCKER_MAX_PASSES}).", space: true)
+        respond
+        sleep(LOCKER_PASS_WAIT)
       end
 
-      loop do
-        place = lockers[index]
-        ELoot.go2(place.id)
-        ELoot.wait_rt
-
-        # some rooms go directly to the locker instead of just outside
-        break if (GameObj.room_desc.to_a + GameObj.loot.to_a).any? { |obj| obj.name =~ /locker|counter/ }
-
-        if ELoot.data.use_house_locker
-          way_in = ELoot.data.che_entry
-        else
-          way_in_obj = (GameObj.loot.to_a + GameObj.room_desc.to_a).find { |obj| obj.noun =~ /^(?:opening|curtain|tapestry)$/ }
-          way_in_obj.noun = "opening" if way_in_obj.noun == "tapestry"
-          way_in = "go #{way_in_obj.noun}"
-        end
-
-        result = move "#{way_in}"
-
-        break if result == true
-
-        if reget(10).reverse.any? { |line| line =~ /pay off (your|that) debt/i }
-          wealth_pattern = /^You have (no|[,\d]+|but one) silver with you/
-          wealth_lines = ELoot.get_command("wealth quiet", wealth_pattern, silent: true, quiet: true).join(" ")
-          if wealth_lines.to_s =~ /In the back of your mind you remember you owe a debt of ([\d,]+) silver/
-            amount = $1.gsub(',', '').to_i
-            ELoot.silver_withdraw(amount)
-            ELoot.go2("debt")
-            ELoot.wait_rt
-            fput("pay #{amount}")
-            ELoot.silver_withdraw(2500)
-            redo
-          end
-        end
-
-        if index == lockers.length - 1 # Pause for 10 seconds if it's the last iteration
-          respond
-          ELoot.msg(text: " Not able to enter a locker. They might all be taken. Waiting 10 seconds then trying again.", space: true)
-          respond
-          sleep(10)
-        end
-
-        index = (index + 1) % lockers.length # Increment index, wrapping around if it exceeds the array length
-      end
-      ELoot.wait_rt
-      Hoard.open_locker
+      ELoot.msg(text: " Not able to enter any locker in #{Room[Room[lockers.first.id].find_nearest_by_tag("town")].location} after #{LOCKER_MAX_PASSES} tries. Giving up on hoarding for now.", space: true)
     end
 
     def self.open_locker(reset: false)
@@ -4447,10 +4531,14 @@ module ELoot # Gem and Reagent hoarding
 
       ELoot.get_res('close locker', /^You/)
 
-      if ELoot.data.use_house_locker
-        way_out = ELoot.data.che_exit
-      else
+      way_out = ELoot.data.che_exit if ELoot.data.use_house_locker
+
+      if way_out.to_s.strip.empty?
         way_out_obj = (GameObj.loot.to_a + GameObj.room_desc.to_a).find { |obj| obj.noun =~ /^(?:opening|curtain|tapestry)$/ }
+
+        # A mapped house locker has no exit verb to send; the next go2 walks us out
+        return if way_out_obj.nil?
+
         way_out_obj.noun = "opening" if way_out_obj.noun == "tapestry"
         way_out = "go #{way_out_obj.noun}"
       end
