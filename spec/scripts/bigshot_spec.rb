@@ -1496,3 +1496,107 @@ RSpec.describe 'bigshot looting_watch' do
     expect(registry.killed).to eq(['eloot'])
   end
 end
+
+# Spec for bigshot.lic's ES/EB/EC/ED Effects command checks, including the
+# optional seconds-left suffix (e.g. ES"Animate Dead"60).
+module BigshotEffectsCheckSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  EFFECTS_CHECK_SRC = extract_from_source(SOURCE, /^  def effects_check\(modifier\).*?^  end$/m,
+                                          label: 'effects_check', source_path: SOURCE_PATH)
+
+  # Stand-in for a Lich::Gemstone::Effects::Registry, keyed by effect name
+  # to seconds remaining. Like the real one, a Regexp matches the first key
+  # and time_left is in minutes.
+  class FakeRegistry
+    attr_accessor :seconds_left
+
+    def initialize
+      @seconds_left = {}
+    end
+
+    def active?(pattern)
+      !find(pattern).nil?
+    end
+
+    def time_left(pattern)
+      (find(pattern) || 0) / 60.0
+    end
+
+    private
+
+    def find(pattern)
+      @seconds_left.find { |name, _| name =~ pattern }&.last
+    end
+  end
+
+  module Effects
+    Spells = FakeRegistry.new
+    Buffs = FakeRegistry.new
+    Cooldowns = FakeRegistry.new
+    Debuffs = FakeRegistry.new
+  end
+
+  class Harness
+    eval(EFFECTS_CHECK_SRC)
+  end
+end
+
+RSpec.describe 'bigshot Effects command checks' do
+  let(:bs) { BigshotEffectsCheckSpec::Harness.new }
+  let(:spells) { BigshotEffectsCheckSpec::Effects::Spells }
+
+  before do
+    BigshotEffectsCheckSpec::Effects.constants.each do |c|
+      BigshotEffectsCheckSpec::Effects.const_get(c).seconds_left = {}
+    end
+  end
+
+  it 'returns nil for a modifier that is not an Effects check' do
+    expect(bs.effects_check('thp66')).to be_nil
+  end
+
+  context 'without a seconds suffix' do
+    it 'skips ES when the spell is down and runs it when up' do
+      expect(bs.effects_check('ES"Animate Dead"')).to be true
+      spells.seconds_left['Animate Dead'] = 5
+      expect(bs.effects_check('ES"Animate Dead"')).to be false
+    end
+
+    it 'inverts for !ES' do
+      expect(bs.effects_check('!ES"Animate Dead"')).to be false
+      spells.seconds_left['Animate Dead'] = 5
+      expect(bs.effects_check('!ES"Animate Dead"')).to be true
+    end
+
+    it 'reads the matching registry for EB/EC/ED' do
+      BigshotEffectsCheckSpec::Effects::Buffs.seconds_left['Empowered (+30)'] = 30
+      BigshotEffectsCheckSpec::Effects::Cooldowns.seconds_left['Coup de Grace'] = 30
+      BigshotEffectsCheckSpec::Effects::Debuffs.seconds_left['Poisoned'] = 30
+
+      expect(bs.effects_check('EB"Empowered"')).to be false
+      expect(bs.effects_check('!EC"Coup de Grace"')).to be true
+      expect(bs.effects_check('ed"poisoned"')).to be false
+      expect(bs.effects_check('ES"Empowered"')).to be true
+    end
+  end
+
+  context 'with a seconds suffix' do
+    it 'ES"x"60 runs only when the spell is up with at least 60 seconds left' do
+      expect(bs.effects_check('ES"Animate Dead"60')).to be true
+      spells.seconds_left['Animate Dead'] = 59
+      expect(bs.effects_check('ES"Animate Dead"60')).to be true
+      spells.seconds_left['Animate Dead'] = 60
+      expect(bs.effects_check('ES"Animate Dead"60')).to be false
+    end
+
+    it '!ES"x"60 runs when the spell is down or has under 60 seconds left' do
+      expect(bs.effects_check('!ES"Animate Dead"60')).to be false
+      spells.seconds_left['Animate Dead'] = 59
+      expect(bs.effects_check('!ES"Animate Dead"60')).to be false
+      spells.seconds_left['Animate Dead'] = 600
+      expect(bs.effects_check('!ES"Animate Dead"60')).to be true
+    end
+  end
+end
