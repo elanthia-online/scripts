@@ -2534,3 +2534,551 @@ RSpec.describe 'ELoot::Hoard.hoarding_list (duplicate-grouping, gem type)' do
     expect(harness.hoarding_list('fire opal').map(&:id)).to contain_exactly('id-opal-1', 'id-opal-2')
   end
 end
+
+# RSpec for the locker selection and entry helpers behind ELoot::Hoard.go2_locker.
+#
+# Fixtures mirror the real GS mapdb: town-tagged rooms carry a prefixed location
+# ("the town of Wehnimer's Landing", id 228) while the CHE locker rooms in that town use the
+# bare name, and ~600 rooms have a `false` location. Room#dijkstra is stubbed the way
+# lich-5's really behaves: given an Array destination it stops at the first one reached, so
+# the stub refuses an Array argument.
+RSpec.describe 'ELoot::Hoard locker selection and entry' do
+  let(:room_class) do
+    Struct.new(:id, :location, :tags, :town) do
+      def find_nearest_by_tag(_tag) = town
+    end
+  end
+
+  def room(id, location, town, *tags)
+    room_class.new(id, location, tags, town)
+  end
+
+  let(:source) { File.read(find_lic_source('eloot.lic', from: __dir__)) }
+  let(:path) { find_lic_source('eloot.lic', from: __dir__) }
+
+  def extract(*names)
+    names.map { |name| extract_lic_method(source, name, source_path: path) }
+  end
+
+  let(:log) { { msgs: [], go2: [], moves: [], sleeps: [], commands: [] } }
+  let(:info_lines) { [] }
+  let(:current) { Struct.new(:id, :distances, :previous).new(0, {}, {}) }
+  let(:rooms_by_id) { {} }
+
+  let(:harness) do
+    log = self.log
+    current = self.current
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |text: '', **| log[:msgs] << text }
+    eloot.define_singleton_method(:go2) { |place| log[:go2] << place; current.id = place if place.is_a?(Integer) }
+    eloot.define_singleton_method(:wait_rt) {}
+    info_lines = self.info_lines
+    eloot.define_singleton_method(:get_command) { |cmd, _regex, **| log[:commands] << cmd; info_lines }
+    eloot.module_eval(extract_lic_method(source, 'fwi?', source_path: path))
+
+    room_const = Module.new
+    room_const.define_singleton_method(:current) do
+      current.define_singleton_method(:dijkstra) do |dest = nil|
+        raise ArgumentError, 'dijkstra must not be given a destination list' if dest.is_a?(Array)
+
+        [previous, distances]
+      end
+      current
+    end
+    rooms_by_id = self.rooms_by_id
+    room_const.define_singleton_method(:[]) { |id| rooms_by_id[id] }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:Room, room_const)
+    mod.const_set(:Hoard, mod)
+    mod.const_set(:LOCKER_MAX_PASSES, 6)
+    mod.const_set(:LOCKER_PASS_WAIT, 10)
+    mod.const_set(:LOCKER_ELSEWHERE, eval(source[%r{LOCKER_ELSEWHERE = (/.*?/i)}, 1])) # the shipped pattern, not a copy
+    mod.const_set(:LOCKER_INFO, eval(source[%r{LOCKER_INFO = (/.*?/i)}, 1]))
+    extract('che_locker_rooms', 'town_name', 'che_town_id_for', 'locker_info_town', 'lines_since', 'locker_elsewhere?', 'nearest_first', 'booth_room?', 'approach_step', 'take_step', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
+    mod.define_singleton_method(:respond) { |*| }
+    mod.define_singleton_method(:sleep) { |secs| log[:sleeps] << secs }
+    mod.define_singleton_method(:fput) { |*| }
+    mod.define_singleton_method(:reget) { |*| ["You'll have to wait, Kimsy is presently using that locker booth."] }
+    mod.define_singleton_method(:in_locker_room?) { false }
+    mod.define_singleton_method(:locker_way_in) { 'go opening' }
+    mod
+  end
+
+  describe 'che_locker_rooms' do
+    let(:rooms) do
+      [
+        room(1, false, nil),
+        room(10, "Wehnimer's Landing", 228, 'meta:che:paupers:locker'),
+        room(11, "Wehnimer's Landing", 228, 'meta:che:paupers:locker'),
+        room(12, "Wehnimer's Landing", 228, 'meta:che:paupers:entrance_locker'),
+        room(13, "Wehnimer's Landing", 228, 'meta:che:silvergate_inn:locker'),
+        room(20, 'Solhaven', 1438, 'meta:che:paupers:locker'),
+        room(30, "Ta'Vaalor", 3519, 'meta:che:paupers:entrance_locker'),
+        room(40, 'Mist Harbor', 3668, 'meta:che:paupers:locker')
+      ]
+    end
+
+    it 'finds the house lockers when the town room and locker rooms use different location strings' do
+      expect(harness.che_locker_rooms(rooms, 'paupers', 228).map(&:id)).to eq([10, 11])
+      expect(harness.che_locker_rooms(rooms, 'paupers', 1438).map(&:id)).to eq([20])
+    end
+
+    it 'does not choke on rooms whose location is false' do
+      expect { harness.che_locker_rooms(rooms, 'paupers', 228) }.not_to raise_error
+    end
+
+    it 'ignores other houses' do
+      expect(harness.che_locker_rooms(rooms, 'silvergate_inn', 228).map(&:id)).to eq([13])
+    end
+
+    it 'falls back to entrance rooms when no locker room is mapped in the town' do
+      expect(harness.che_locker_rooms(rooms, 'paupers', 3519).map(&:id)).to eq([30])
+    end
+
+    it 'finds the Mist Harbor lockers from the Isle of Four Winds town room' do
+      expect(harness.che_locker_rooms(rooms, 'paupers', 3668).map(&:id)).to eq([40])
+    end
+
+    it 'returns nothing for no CHE, or a house with no lockers in town' do
+      expect(harness.che_locker_rooms(rooms, 'none', 228)).to eq([])
+      expect(harness.che_locker_rooms(rooms, nil, 228)).to eq([])
+      expect(harness.che_locker_rooms(rooms, 'sovyn', 228)).to eq([])
+    end
+  end
+
+  describe 'che_town_id_for (where a non-premium house member\'s single locker is)' do
+    let(:rooms) do
+      [
+        room(1, false, nil),
+        room(28_000, "Kraken's Fall", 28_813, 'meta:che:paupers:locker'),
+        room(27_907, 'the town of Kharam-Dzu', 1932, 'meta:che:paupers:locker'),
+        room(35_000, 'Icemule Trace', 2300, 'meta:che:silvergate_inn:locker'),
+        room(29_000, 'Solhaven', 1438, 'meta:che:paupers:entrance_annex')
+      ]
+    end
+
+    it 'finds the town room for the town LOCKER INFO names' do
+      expect(harness.che_town_id_for(rooms, 'paupers', "Kraken's Fall")).to eq(28_813)
+    end
+
+    it 'treats "the town of X" and "X" as the same place, whichever side carries the prefix' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'the town of Kharam-Dzu')).to eq(1932)
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Kharam-Dzu')).to eq(1932)
+      expect(harness.che_town_id_for(rooms, 'paupers', "the town of Kraken's Fall")).to eq(28_813)
+    end
+
+    it 'is case-insensitive and only looks at the character\'s own house' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'KRAKEN\'S FALL')).to eq(28_813)
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Icemule Trace')).to be_nil
+    end
+
+    it 'knows the game and map names that differ (Teras Isle / Kharam-Dzu, Isle of Four Winds / Mist Harbor)' do
+      mist = room(16_308, 'Mist Harbor', 3668, 'meta:che:paupers:locker')
+      expect(harness.che_town_id_for(rooms, 'paupers', 'the town of Teras Isle')).to eq(1932)
+      expect(harness.che_town_id_for(rooms + [mist], 'paupers', 'the Isle of Four Winds')).to eq(3668)
+    end
+
+    it 'finds the Ta\'Illistim lockers the map files under "the Lost Home"' do
+      lost = room(27_908, 'the Lost Home', 188, 'meta:che:paupers:locker')
+      expect(harness.che_town_id_for(rooms + [lost], 'paupers', "Ta'Illistim")).to eq(188)
+      expect(harness.che_town_id_for(rooms + [lost], 'paupers', 'the Lost Home')).to eq(188)
+    end
+
+    it 'is nil when the house has no lockers there, no CHE, or no town' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Solhaven')).to be_nil
+      expect(harness.che_town_id_for(rooms, 'none', "Kraken's Fall")).to be_nil
+      expect(harness.che_town_id_for(rooms, 'paupers', nil)).to be_nil
+    end
+  end
+
+  describe 'locker_info_town' do
+    it 'reads the town from LOCKER INFO once and remembers it' do
+      info_lines.replace(['<prompt>', "Your locker is currently located in the town of Kraken's Fall."])
+      expect(harness.locker_info_town).to eq("the town of Kraken's Fall")
+      expect(harness.locker_info_town).to eq("the town of Kraken's Fall")
+      expect(log[:commands]).to eq(['locker info'])
+    end
+
+    it 'is nil when the reply has no locker location, and does not ask again' do
+      info_lines.replace(['<prompt>'])
+      expect(harness.locker_info_town).to be_nil
+      expect(harness.locker_info_town).to be_nil
+      expect(log[:commands]).to eq(['locker info'])
+    end
+  end
+
+  describe 'lines_since' do
+    it 'returns only the lines that arrived after the first snapshot' do
+      expect(harness.lines_since(%w[a b c], %w[b c d e])).to eq(%w[d e])
+    end
+
+    it 'returns everything when nothing overlaps' do
+      expect(harness.lines_since(%w[a b], %w[x y])).to eq(%w[x y])
+    end
+
+    it 'returns nothing when no new lines arrived' do
+      expect(harness.lines_since(%w[a b], %w[a b])).to eq([])
+      expect(harness.lines_since([], [])).to eq([])
+    end
+  end
+
+  describe 'a locker that is not in this town' do
+    let(:lockers) { [room(1, 'x', 228), room(2, 'x', 228)] }
+
+    before { current.distances = { 0 => 0, 1 => 1, 2 => 2 } }
+
+    let(:elsewhere) { "You can't do that because your locker isn't here!" }
+
+    # reget is called once before the step and once after it
+    def reget_sequence(*snapshots)
+      calls = 0
+      harness.define_singleton_method(:reget) { |*| snapshots[[calls, snapshots.length - 1].min].tap { calls += 1 } }
+    end
+
+    it 'stops after the first attempt instead of trying every locker and every pass' do
+      moves = log[:moves]
+      cur = current
+      harness.define_singleton_method(:move) { |_way| moves << cur.id; nil }
+      reget_sequence([], [elsewhere])
+
+      expect(harness.enter_any_locker(lockers)).to be false
+      expect(moves.length).to eq(1)
+      expect(log[:sleeps]).to be_empty
+      expect(harness.locker_elsewhere?).to be true
+      expect(log[:msgs].grep(/locker isn't in this town/)).not_to be_empty
+    end
+
+    it 'ignores the same message left over in the buffer from an earlier run' do
+      harness.define_singleton_method(:move) { |_way| nil }
+      reget_sequence([elsewhere], [elsewhere]) # nothing new arrived
+
+      expect(harness.enter_any_locker(lockers)).to be false
+      expect(harness.locker_elsewhere?).to be false
+      expect(log[:sleeps].length).to eq(5) # ordinary busy handling: all six passes
+    end
+
+    it 'does not carry the flag into the next visit' do
+      harness.define_singleton_method(:move) { |_way| nil }
+      reget_sequence([], [elsewhere])
+      harness.enter_any_locker(lockers)
+
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(harness.locker_elsewhere?).to be false
+    end
+  end
+
+  describe 'fwi?' do
+    it 'does not raise for a room whose location is false' do
+      expect(harness::ELoot.fwi?(room(1, false, nil))).to be_nil
+      expect(harness::ELoot.fwi?(room(2, 'Mist Harbor', nil))).to be_truthy
+    end
+  end
+
+  describe 'nearest_first' do
+    let(:lockers) { [room(10, 'x', 228), room(11, 'x', 228), room(12, 'x', 228)] }
+
+    it 'orders every reachable locker by path length, not just the closest' do
+      current.distances = { 10 => 9, 11 => 2, 12 => 5 }
+      expect(harness.nearest_first(lockers).map(&:id)).to eq([11, 12, 10])
+    end
+
+    it 'keeps the room we are standing in first without dropping the others' do
+      current.distances = { 10 => 0, 11 => 3, 12 => 7 }
+      expect(harness.nearest_first(lockers).map(&:id)).to eq([10, 11, 12])
+    end
+
+    it 'drops lockers that cannot be reached' do
+      current.distances = { 10 => 4 }
+      expect(harness.nearest_first(lockers).map(&:id)).to eq([10])
+    end
+
+    it 'returns an empty list untouched' do
+      expect(harness.nearest_first([])).to eq([])
+    end
+  end
+
+  describe 'enter_locker for a booth room picked from the map tags' do
+    # Mist Harbor's Twilight Hall annex: booth 17580 is only reachable by "go scarlet curtain" from 17579
+    let(:booth) { room(17580, 'Mist Harbor', 3668, 'meta:che:twilight_hall:locker') }
+    let(:lobby_class) { Struct.new(:wayto) }
+
+    before do
+      rooms_by_id[17579] = lobby_class.new({ '17580' => 'go scarlet curtain' })
+      current.previous = { 17580 => 17579 }
+    end
+
+    it 'goes to the room outside the booth, not the booth, and takes the last step itself' do
+      steps = []
+      harness.define_singleton_method(:move) { |way| steps << way; nil }
+      expect(harness.enter_locker(booth)).to be false
+      expect(log[:go2]).to eq([17579])
+      expect(steps).to eq(['go scarlet curtain'])
+      expect(log[:msgs].grep(/Locker at room #17580 is in use/)).not_to be_empty
+    end
+
+    it 'still takes the step when the room outside mentions a locker or counter object' do
+      steps = []
+      harness.define_singleton_method(:in_locker_room?) { true }
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      expect(harness.enter_locker(booth)).to be true
+      expect(steps).to eq(['go scarlet curtain'])
+    end
+
+    it 'is done without a move when we are already standing in the booth' do
+      steps = []
+      cur = current
+      cur.id = 17580
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      harness::ELoot.define_singleton_method(:go2) { |_place| }
+      current.previous = { 17580 => 17579 }
+      expect(harness.enter_locker(booth)).to be true
+      expect(steps).to be_empty
+    end
+
+    it 'is in once the step goes through' do
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_locker(booth)).to be true
+    end
+
+    it 'does not send a move if the trip to the entrance did not get us there' do
+      steps = []
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      eloot = harness::ELoot
+      eloot.define_singleton_method(:go2) { |_place| } # travel failed, still at room 0
+      expect(harness.enter_locker(booth)).to be false
+      expect(steps).to be_empty
+    end
+
+    it 'runs a scripted move and checks where we ended up' do
+      cur = current
+      rooms_by_id[17579] = lobby_class.new({ '17580' => -> { cur.id = 17580 } })
+      expect(harness.enter_locker(booth)).to be true
+    end
+
+    it 'falls back to plain go2 plus the opening when there is no single last step' do
+      current.previous = {}
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_locker(booth)).to be true
+      expect(log[:go2]).to eq([17580])
+    end
+
+    it 'keeps using go2 for the room outside a public locker' do
+      outside = room(389, "Wehnimer's Landing", 228, 'publiclockers')
+      harness.define_singleton_method(:move) { |_way| nil }
+      expect(harness.enter_locker(outside)).to be false
+      expect(log[:go2]).to eq([389])
+    end
+  end
+
+  describe 'enter_any_locker' do
+    let(:lockers) { [room(1, 'x', 228), room(2, 'x', 228)] }
+
+    before { current.distances = { 0 => 0, 1 => 1, 2 => 2 } }
+
+    def busy_until(free_room)
+      cur = current
+      moves = log[:moves]
+      harness.define_singleton_method(:move) do |_way|
+        moves << cur.id
+        cur.id == free_room ? true : nil
+      end
+    end
+
+    it 'goes to the next locker when the first is in use' do
+      busy_until(2)
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(log[:go2]).to eq([1, 2])
+      expect(log[:msgs].grep(/Locker at room #1 is in use/)).not_to be_empty
+    end
+
+    it 'tries every locker on every pass, even from a stale "in use" line in the buffer' do
+      busy_until(nil)
+      expect(harness.enter_any_locker(lockers)).to be false
+      expect(log[:moves].length).to eq(2 * 6)
+    end
+
+    it 'waits between passes and gives up after six' do
+      busy_until(nil)
+      harness.enter_any_locker(lockers)
+      expect(log[:sleeps]).to eq([10] * 5)
+    end
+
+    it 'succeeds on a later pass once a booth frees up' do
+      attempts = 0
+      harness.define_singleton_method(:move) { |_way| (attempts += 1) > 5 ? true : nil }
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(log[:sleeps]).to eq([10, 10])
+    end
+
+    it 'skips a room with no way in and carries on' do
+      cur = current
+      harness.define_singleton_method(:locker_way_in) { cur.id == 1 ? nil : 'go opening' }
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(log[:msgs].grep(/No way into the locker from room #1/)).not_to be_empty
+    end
+  end
+end
+
+# RSpec for ELoot::Hoard.filter_inventory (;eloot list <type> <filter>).
+RSpec.describe 'ELoot::Hoard.filter_inventory' do
+  let(:harness) do
+    path = find_lic_source('eloot.lic', from: __dir__)
+    mod = Module.new
+    mod.module_eval(extract_lic_method(File.read(path), 'filter_inventory', source_path: path))
+    mod
+  end
+
+  let(:entries) do
+    [
+      { item: 'uncut diamond', count: 3, full: false },
+      { item: 'small uncut diamond', count: 1, full: false },
+      { item: 'blue diamond', count: 2, full: true },
+      { item: 'uncut blue diamond', count: 1, full: false },
+      { item: 'ruby', count: 5, full: false },
+      { item: '*** empty jars ***', count: 4, full: '  -' }
+    ]
+  end
+
+  def names(filter)
+    harness.filter_inventory(entries, filter).map { |e| e[:item] }
+  end
+
+  it 'returns everything with no filter' do
+    expect(names(nil)).to eq(entries.map { |e| e[:item] })
+    expect(names('  ')).to eq(entries.map { |e| e[:item] })
+  end
+
+  it 'matches every entry containing the word' do
+    expect(names('diamond')).to eq(['uncut diamond', 'small uncut diamond', 'blue diamond', 'uncut blue diamond'])
+  end
+
+  it 'matches the whole filter as a phrase, not its individual words' do
+    expect(names('uncut diamond')).to eq(['uncut diamond', 'small uncut diamond'])
+    expect(names('uncut diamond')).not_to include('blue diamond', 'uncut blue diamond')
+  end
+
+  it 'does not match when the words are present but not adjacent or in order' do
+    expect(names('diamond uncut')).to eq([])
+    expect(names('uncut diamond')).not_to include('uncut blue diamond')
+  end
+
+  it 'is case-insensitive' do
+    expect(names('UnCut DIAMOND')).to eq(['uncut diamond', 'small uncut diamond'])
+  end
+
+  it 'ignores extra spacing in the filter or the name' do
+    expect(names("  uncut    diamond ")).to eq(['uncut diamond', 'small uncut diamond'])
+  end
+
+  it 'returns nothing when no entry matches' do
+    expect(names('emerald')).to eq([])
+  end
+end
+
+# RSpec for the command dispatcher order at the bottom of eloot.lic. The `case` matches the
+# whole argument string against unanchored regexes (/raid/, /pool/, ...), so the hoard
+# commands, whose free-text list filter can contain any of those words, must be matched first.
+RSpec.describe 'eloot command dispatcher' do
+  let(:branches) do
+    source = File.read(find_lic_source('eloot.lic', from: __dir__))
+    block = source[/^  case Script\.current\.vars\[0\]\n[\s\S]*?^  else\n/]
+    raise 'could not find the command dispatcher' unless block
+
+    block.scan(/^  when (.+)$/).flatten.map do |expr|
+      expr = expr.sub(/\s+#\s.*\z/, '')
+      [expr, eval(expr)] # our own source, literals only
+    end
+  end
+
+  def first_branch(input)
+    branches.find { |_expr, pattern| pattern === input }&.first
+  end
+
+  ['list gem diamond', 'list reagent braided rose', 'list gem pool', 'list gem setup', 'list gem options',
+   'list gem debug', 'LIST Reagent raid', 'deposit gem', 'reset alchemy'].each do |input|
+    it "sends '#{input}' to the hoard branch" do
+      expect(first_branch(input)).to start_with('/\\A\\s*(list|deposit|reset)')
+    end
+  end
+
+  it 'still sends a plain "list" to the settings list' do
+    expect(first_branch('list')).to eq("'list'")
+  end
+
+  it 'still sends raid to the raid branch' do
+    expect(first_branch('raid gem diamond x3')).to eq('/raid/')
+  end
+end
+
+# RSpec for ELoot::Inventory.single_drag's stun handling: it waits out a stun with
+# wait_while instead of the old uncapped, silent raise/rescue/retry loop.
+RSpec.describe 'ELoot::Inventory.single_drag while stunned' do
+  let(:bag) { Struct.new(:name).new('backpack') }
+  let(:item) { Struct.new(:name, :type, :id).new('ruby', 'gem', 'id-ruby') }
+  let(:log) { { stored: [], msgs: [], waited: 0 } }
+
+  # Stunned for the first `stunned_checks` calls to stunned?, then clear
+  def harness_for(stunned_checks:, store_result: true)
+    log = self.log
+    state = { checks: stunned_checks }
+    bag = self.bag
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |text: '', **| log[:msgs] << text }
+    eloot.define_singleton_method(:box_phase) { |_item| }
+    eloot.define_singleton_method(:data) { Struct.new(:sacks_full).new({}) }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { default: bag } }
+
+    inventory = Module.new
+    inventory.define_singleton_method(:single_drag_box) { |_item| false }
+    inventory.define_singleton_method(:store_item) do |target, thing|
+      raise 'boom' if store_result == :raise
+
+      log[:stored] << [target.name, thing.name]
+      store_result
+    end
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Inventory, inventory)
+    mod.define_singleton_method(:stunned?) do
+      state[:checks] -= 1
+      state[:checks] >= 0
+    end
+    mod.define_singleton_method(:wait_while) do |&block|
+      loop do
+        break unless block.call
+
+        log[:waited] += 1
+      end
+    end
+    path = find_lic_source('eloot.lic', from: __dir__)
+    mod.module_eval(extract_lic_method(File.read(path), 'single_drag', source_path: path))
+    mod
+  end
+
+  it 'waits for the stun to clear, then stores the item once' do
+    harness_for(stunned_checks: 2).single_drag(item)
+    expect(log[:waited]).to eq(1)
+    expect(log[:stored]).to eq([%w[backpack ruby]])
+    expect(log[:msgs].grep(/stunned, waiting/)).not_to be_empty
+  end
+
+  it 'does not wait when not stunned' do
+    harness_for(stunned_checks: 0).single_drag(item)
+    expect(log[:waited]).to eq(0)
+    expect(log[:stored]).to eq([%w[backpack ruby]])
+  end
+
+  it 'lets an error from store_item through instead of retrying it forever' do
+    expect { harness_for(stunned_checks: 0, store_result: :raise).single_drag(item) }.to raise_error('boom')
+  end
+end
