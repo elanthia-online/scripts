@@ -50,9 +50,10 @@ module ResourceHarness
 
   lic_path = find_lic_source('resource.lic', from: __dir__)
   source = File.read(lic_path).gsub("\r\n", "\n")
-  class_body = extract_from_source(source, /^class Resource\n.*?^end\n/m, label: 'class Resource', source_path: lic_path)
-  assert_parses!(class_body, label: 'class Resource', source_path: lic_path)
-  module_eval(class_body, lic_path)
+  CLASS_BODY = extract_from_source(source, /^class Resource\n.*?^end\n/m, label: 'class Resource', source_path: lic_path)
+  LIC_PATH = lic_path
+  assert_parses!(CLASS_BODY, label: 'class Resource', source_path: lic_path)
+  module_eval(CLASS_BODY, lic_path)
 
   Resource.singleton_class.class_eval do
     attr_accessor :output, :outdoors
@@ -71,6 +72,21 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
   let(:resource) { ResourceHarness::Resource }
   let(:points) { ResourceHarness::Resource::TrainingPoints }
   let(:stats) { { str: 20, con: 20, dex: 20, agi: 20, dis: 20, aur: 20, log: 20, int: 20, wis: 20, inf: 20 } }
+
+  describe 'restarting the script in the same session' do
+    after { ResourceHarness.module_eval(ResourceHarness::CLASS_BODY, ResourceHarness::LIC_PATH) }
+
+    it 'reloads without already-initialized constant warnings' do
+      expect { ResourceHarness.module_eval(ResourceHarness::CLASS_BODY, ResourceHarness::LIC_PATH) }.not_to output(/already initialized constant/).to_stderr
+    end
+
+    it 'picks up changed constants instead of keeping the previous run' do
+      updated = ResourceHarness::CLASS_BODY.sub("CAP_EXPERIENCE = 7_572_500", "CAP_EXPERIENCE = 1")
+      expect(updated).not_to eq(ResourceHarness::CLASS_BODY)
+      ResourceHarness.module_eval(updated, ResourceHarness::LIC_PATH)
+      expect(resource::CAP_EXPERIENCE).to eq(1)
+    end
+  end
 
   describe '.skill_bonus' do
     it 'follows the 5/4/3/2/1 per-rank breakpoints' do
