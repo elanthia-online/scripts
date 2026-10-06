@@ -180,8 +180,10 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
   end
 
   describe '.optimize_service' do
-    # Exhaustive search over every rank combination that fits, pruned only by cost.
-    def brute_force_objective(profession, level, budget, reserve_cost)
+    let(:plan_data) { { stats: stats, location_bonus: 20, guild_ranks: 7, weapons: ["Edged Weapons", "Two-Handed Weapons", "Brawling"] } }
+
+    # Exhaustive search over every rank combination of `skills` that fits, pruned only by cost.
+    def brute_force_objective(profession, level, budget, reserve_cost, target: nil, skills: resource::SERVICE_SKILLS[profession])
       cycles = level + 1
       base_ranks = Hash.new(0).merge("Harness Power" => 6)
       units = []
@@ -190,15 +192,15 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
         costs = resource.cumulative_costs(profession, first, cycles)
         units << (0...costs.length).flat_map { |a| (0...(costs.length - a)).map { |b| [{ first => a, second => b }, costs[a + b]] } }
       }
-      (resource::SERVICE_SKILLS[profession] - shared_groups.flatten).each { |skill|
+      (skills - shared_groups.flatten).each { |skill|
         start = base_ranks[skill]
         units << resource.cumulative_costs(profession, skill, cycles, start).each_with_index.map { |cost, added| [{ skill => start + added }, cost] }
       }
-      data = { level: level, stats: stats, location_bonus: 20 }
+      data = plan_data.merge(level: level)
       best = nil
       search = lambda { |index, ranks, spent|
         if index == units.length
-          objective = objective_of(resource.service_totals(profession, data.merge(ranks: ranks)))
+          objective = objective_of(resource.service_totals(profession, data.merge(ranks: ranks)), target)
           best = objective if best.nil? || (objective <=> best) == 1
           return
         end
@@ -212,10 +214,21 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
       best
     end
 
-    # The planner's ranking: weaker tattoo, then combined tattoos, then Self Tattoo.
-    def objective_of(totals)
+    # The planner's ranking: the target title alone when given; otherwise weaker tattoo, then
+    # combined tattoos, then Self Tattoo.
+    def objective_of(totals, target = nil)
+      return [totals.fetch(target)] if target
       return [totals.values.first] if totals.size == 1
       [totals.values.min, totals.values.sum, totals["Self Tattoo"]]
+    end
+
+    def expect_exact_plan(profession, ptp, mtp, target: nil, skills: resource::SERVICE_SKILLS[profession])
+      level = 5
+      budget = points.new(ptp, mtp)
+      reserve_cost = resource.cumulative_costs(profession, "Harness Power", level + 1)[6]
+      plan = resource.optimize_service(profession, plan_data.merge(level: level), budget, { "Harness Power" => 6 }, reserve_cost, target)
+      expect(resource.affordable?(budget, plan.spent)).to be true
+      expect(objective_of(plan.score, target)).to eq(brute_force_objective(profession, level, budget, reserve_cost, target: target, skills: skills))
     end
 
     {
@@ -225,18 +238,31 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
       "Empath"   => [[10, 40], [25, 50], [80, 5]],
       "Bard"     => [[5, 60], [90, 20]],
       "Paladin"  => [[5, 60], [90, 20]],
-      "Monk"     => [[10, 70], [40, 60], [90, 30]],
-      "Ranger"   => [[10, 50], [40, 60], [90, 20]]
+      "Monk"     => [[10, 70], [40, 60], [90, 30], [12, 44]],
+      "Ranger"   => [[10, 50], [40, 60], [90, 20], [8, 46], [8, 70]]
     }.each { |profession, budgets|
       budgets.each { |ptp, mtp|
         it "finds the exact best #{profession} plan for #{ptp} PTP / #{mtp} MTP" do
-          level = 5
-          budget = points.new(ptp, mtp)
-          reserve_cost = resource.cumulative_costs(profession, "Harness Power", level + 1)[6]
-          data = { level: level, stats: stats, location_bonus: 20 }
-          plan = resource.optimize_service(profession, data, budget, { "Harness Power" => 6 }, reserve_cost)
-          expect(resource.affordable?(budget, plan.spent)).to be true
-          expect(objective_of(plan.score)).to eq(brute_force_objective(profession, level, budget, reserve_cost))
+          expect_exact_plan(profession, ptp, mtp)
+        end
+      }
+    }
+
+    # Only the skills in a title's formula can change it, so the brute force searches just those.
+    # Budgets include the 6 reserved Harness Power ranks (60 MTP for Warriors, 54 for Rogues).
+    {
+      ["Warrior", "Weapon"]       => [["Physical Fitness", "Edged Weapons", "Two-Handed Weapons", "Brawling"], [[30, 70], [10, 100]]],
+      ["Warrior", "Armor"]        => [["Physical Fitness", "Armor Use", "Shield Use"], [[40, 70], [10, 110], [300, 300]]],
+      ["Rogue", "Sidestep"]       => [["Ambush", "Pickpocketing", "Dodging"], [[20, 64], [5, 84], [28, 62], [200, 300]]],
+      ["Rogue", "Keen Eye"]       => [["Ambush", "Pickpocketing", "Perception"], [[20, 64], [5, 84]]],
+      ["Rogue", "Escape Artist"]  => [["Ambush", "Pickpocketing", "Combat Maneuvers"], [[20, 64], [5, 94], [20, 58]]],
+      ["Rogue", "Swift Recovery"] => [["Ambush", "Pickpocketing", "Physical Fitness"], [[20, 64], [5, 84]]],
+      ["Rogue", "Poisoncraft"]    => [["Ambush", "Pickpocketing", "Survival"], [[20, 64], [5, 84], [24, 62]]],
+      ["Rogue", "Recharge"]       => [["Ambush", "Pickpocketing", "Dodging", "Perception", "Combat Maneuvers", "Physical Fitness", "Survival"], [[12, 62], [4, 74], [20, 62], [28, 66]]]
+    }.each { |(profession, target), (skills, budgets)|
+      budgets.each { |ptp, mtp|
+        it "finds the exact best #{profession} #{target} plan for #{ptp} PTP / #{mtp} MTP" do
+          expect_exact_plan(profession, ptp, mtp, target: target, skills: skills)
         end
       }
     }
@@ -294,14 +320,21 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
   describe '.maximum' do
     before do
       resource.output = []
-      ResourceHarness::Lich::Util.responses = ResourceHarness.fixture_responses
+      ResourceHarness::Lich::Util.responses = ResourceHarness.fixture_responses.merge(
+        "gld" => ['<output class="mono"/>', "You currently have 25 ranks out of a possible 63 for your training.", '<output class=""/>']
+      )
+      allow(resource).to receive(:save_bonuses)
     end
 
-    it 'refuses unsupported professions without querying the game' do
-      ResourceHarness::Stats.prof = "Rogue"
+    def current_bonus(output, title)
+      output[/Current service bonus:\n(?:  .*\n)*?  #{title}: (\d+)/, 1].to_i
+    end
+
+    it 'refuses a profession it has no model for without querying the game' do
+      ResourceHarness::Stats.prof = ""
       ResourceHarness::Lich::Util.responses = {}
       resource.maximum
-      expect(resource.output.join("\n")).to include("not yet supported for Rogue")
+      expect(resource.output.join("\n")).to include("not yet supported for this profession")
     end
 
     it 'prints a plan from real game output' do
@@ -316,10 +349,27 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
 
     it 'reports the same current bonus as ;resource bonus' do
       ResourceHarness::Stats.prof = "Wizard"
-      allow(resource).to receive(:save_bonuses)
       resource.maximum
-      current = resource.output.join("\n")[/Current service bonus:\n  Enchanting: (\d+)/, 1].to_i
-      expect(resource.bonus(false)).to eq(current)
+      expect(resource.bonus(false)).to eq(current_bonus(resource.output.join("\n"), "Enchanting"))
+    end
+
+    it 'prints a Weapon and an Armor plan for Warriors, matching ;resource bonus' do
+      ResourceHarness::Stats.prof = "Warrior"
+      resource.maximum
+      output = resource.output.join("\n")
+      expect(output.scan(/^== (.+) plan ==$/).flatten).to eq(["Weapon", "Armor"])
+      armor, weapon = resource.bonus(false)
+      expect([current_bonus(output, "Weapon"), current_bonus(output, "Armor")]).to eq([weapon, armor])
+    end
+
+    it 'prints one plan per Covert Art for Rogues, matching ;resource bonus' do
+      ResourceHarness::Stats.prof = "Rogue"
+      resource.maximum
+      output = resource.output.join("\n")
+      arts = ["Sidestep", "Keen Eye", "Escape Artist", "Swift Recovery", "Poisoncraft", "Recharge"]
+      expect(output.scan(/^== (.+) plan ==$/).flatten).to eq(arts)
+      expect(output).to include("Guild ranks: 25")
+      expect(arts.map { |art| current_bonus(output, art) }).to eq(resource.bonus(false))
     end
   end
 end
