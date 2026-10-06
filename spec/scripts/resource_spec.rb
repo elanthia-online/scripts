@@ -1,0 +1,307 @@
+# frozen_string_literal: true
+
+require_relative '../spec_helper'
+
+# Specs for resource.lic's `;resource max` FIXSKILLS planner. The Resource class
+# body is extracted from the script and evaluated inside ResourceHarness so its
+# lexical lookups of Stats / Lich::Util resolve to the stubs below.
+module ResourceHarness
+  module Stats
+    class << self
+      attr_accessor :prof
+    end
+  end
+
+  module Lich
+    module Util
+      class << self
+        attr_accessor :responses
+
+        def quiet_command_xml(command, *_patterns)
+          responses.fetch(command)
+        end
+      end
+    end
+  end
+
+  lic_path = find_lic_source('resource.lic', from: __dir__)
+  source = File.read(lic_path).gsub("\r\n", "\n")
+  class_body = extract_from_source(source, /^class Resource\n.*?^end\n/m, label: 'class Resource', source_path: lic_path)
+  assert_parses!(class_body, label: 'class Resource', source_path: lic_path)
+  module_eval(class_body, lic_path)
+
+  Resource.singleton_class.class_eval do
+    attr_accessor :output, :outdoors
+
+    def respond(message = "")
+      (self.output ||= []) << message.to_s
+    end
+
+    def outside?
+      outdoors
+    end
+  end
+end
+
+RSpec.describe 'resource.lic FIXSKILLS planner' do
+  let(:resource) { ResourceHarness::Resource }
+  let(:points) { ResourceHarness::Resource::TrainingPoints }
+  let(:stats) { { str: 20, con: 20, dex: 20, agi: 20, dis: 20, aur: 20, log: 20, int: 20, wis: 20, inf: 20 } }
+
+  describe '.skill_bonus' do
+    it 'follows the 5/4/3/2/1 per-rank breakpoints' do
+      expect([0, 10, 20, 30, 40, 45].map { |ranks| resource.skill_bonus(ranks) }).to eq([0, 50, 90, 120, 140, 145])
+    end
+  end
+
+  describe '.rank_cost' do
+    it 'doubles each further rank in a level and stops at the per-level cap' do
+      costs = (1..4).map { |rank| resource.rank_cost("Wizard", "Wizard", rank, 1)&.to_a }
+      expect(costs).to eq([[0, 8], [0, 16], [0, 32], nil])
+    end
+  end
+
+  describe '.affordable? and .max_mtp_spend' do
+    let(:budget) { points.new(10, 10) }
+
+    it 'allows converting either pool 2:1 into the other' do
+      expect(resource.affordable?(budget, points.new(0, 15))).to be true
+      expect(resource.affordable?(budget, points.new(0, 16))).to be false
+      expect(resource.affordable?(budget, points.new(15, 0))).to be true
+      expect(resource.affordable?(budget, points.new(16, 0))).to be false
+      expect(resource.affordable?(budget, points.new(12, 9))).to be false
+    end
+
+    it 'reports the most MTP left to spend after a PTP spend' do
+      expect([0, 4, 10, 12, 15].map { |ptp| resource.max_mtp_spend(budget, ptp) }).to eq([15, 13, 10, 6, 0])
+      expect(resource.max_mtp_spend(budget, 16)).to be < 0
+    end
+  end
+
+  describe '.conversion_summary' do
+    let(:budget) { points.new(100, 50) }
+
+    it 'reports PTP converted to cover an MTP overspend' do
+      summary = resource.conversion_summary(budget, points.new(20, 70))
+      expect(summary.slice(:from, :to, :converted)).to eq(from: "PTP", to: "MTP", converted: 40)
+      expect(summary[:unspent].to_a).to eq([40, 0])
+    end
+
+    it 'reports MTP converted to cover a PTP overspend' do
+      summary = resource.conversion_summary(budget, points.new(110, 10))
+      expect(summary.slice(:from, :to, :converted)).to eq(from: "MTP", to: "PTP", converted: 20)
+      expect(summary[:unspent].to_a).to eq([0, 20])
+    end
+
+    it 'reports no conversion when both pools cover the spend' do
+      summary = resource.conversion_summary(budget, points.new(30, 20))
+      expect(summary[:from]).to be_nil
+      expect(summary[:unspent].to_a).to eq([70, 30])
+    end
+  end
+
+  describe '.replay_training_points' do
+    let(:fifties) { resource::STAT_KEYS.to_h { |stat| [stat, 50] } }
+
+    it 'weights prime stats double and splits AUR/DIS across both pools' do
+      # Wizard primes are AUR and LOG: physical 200 + (100 + 50) / 2 = 275, mental 250 + 75 = 325.
+      expect(resource.replay_training_points("Wizard", "Human", 0, fifties).to_a).to eq([25 + 275 / 20, 25 + 325 / 20])
+    end
+
+    it 'adds a cycle of points per level' do
+      level_zero = resource.replay_training_points("Cleric", "Elf", 0, fifties)
+      level_ten = resource.replay_training_points("Cleric", "Elf", 10, fifties)
+      expect(level_ten.ptp).to be >= level_zero.ptp * 11
+      expect(level_ten.mtp).to be >= level_zero.mtp * 11
+    end
+
+    it 'does not mutate the starting stats' do
+      expect { resource.replay_training_points("Wizard", "Human", 100, fifties) }.not_to(change { fifties.dup })
+    end
+
+    it 'returns nil for an unknown race or missing stat' do
+      expect(resource.replay_training_points("Wizard", "Merfolk", 10, fifties)).to be_nil
+      expect(resource.replay_training_points("Wizard", "Human", 10, fifties.except(:wis))).to be_nil
+    end
+  end
+
+  describe '.service_totals' do
+    it 'keeps Monk tattoos separate and every other service as one total' do
+      ranks = Hash.new(0).merge("Mental Lore - Transformation" => 10, "Mental Lore - Telepathy" => 5)
+      monk = resource.service_totals("Monk", level: 10, stats: stats, ranks: ranks)
+      expect(monk.keys).to eq(["Self Tattoo", "Other Tattoo"])
+      expect(monk["Self Tattoo"] - monk["Other Tattoo"]).to eq(25)
+      expect(resource.service_totals("Wizard", level: 10, stats: stats, ranks: Hash.new(0), location_bonus: 50)).to eq("Enchanting" => 10 + 20 + 20 + 25 + 50)
+    end
+  end
+
+  describe '.service_option_sets' do
+    let(:base_ranks) { Hash.new(0).merge("Harness Power" => 6) }
+
+    it 'values paired mana controls together: larger / 2 plus smaller / 4' do
+      sets = resource.service_option_sets("Sorcerer", { level: 5, stats: stats, location_bonus: 20 }, base_ranks)
+      paired = sets.find { |options| options.any? { |option| option.ranks.keys.sort == ["Elemental Mana Control", "Spirit Mana Control"] } }
+      expect(paired).not_to be_nil
+      expect(paired.map(&:value)).to eq(paired.map { |option| larger, smaller = option.ranks.values.minmax.reverse; larger / 2 + smaller / 4 })
+      expect(paired.any? { |option| option.ranks.values.min.positive? }).to be true
+    end
+
+    it 'splits Monk lore ranks evenly with the odd rank on Transformation' do
+      sets = resource.service_option_sets("Monk", { level: 5, stats: stats }, base_ranks)
+      lores = sets.find { |options| options.any? { |option| option.ranks.key?("Mental Lore - Telepathy") } }
+      lores.each { |option|
+        transformation, telepathy = option.ranks.values_at("Mental Lore - Transformation", "Mental Lore - Telepathy")
+        expect(transformation - telepathy).to be_between(0, 1)
+      }
+    end
+  end
+
+  describe '.optimize_service' do
+    # Exhaustive search over every rank combination that fits, pruned only by cost.
+    def brute_force_objective(profession, level, budget, reserve_cost)
+      cycles = level + 1
+      base_ranks = Hash.new(0).merge("Harness Power" => 6)
+      units = []
+      shared_groups = profession == "Monk" ? [resource::MONK_LORES, resource::MONK_MINOR_CIRCLES] : []
+      shared_groups.each { |first, second|
+        costs = resource.cumulative_costs(profession, first, cycles)
+        units << (0...costs.length).flat_map { |a| (0...(costs.length - a)).map { |b| [{ first => a, second => b }, costs[a + b]] } }
+      }
+      (resource::SERVICE_SKILLS[profession] - shared_groups.flatten).each { |skill|
+        start = base_ranks[skill]
+        units << resource.cumulative_costs(profession, skill, cycles, start).each_with_index.map { |cost, added| [{ skill => start + added }, cost] }
+      }
+      data = { level: level, stats: stats, location_bonus: 20 }
+      best = nil
+      search = lambda { |index, ranks, spent|
+        if index == units.length
+          objective = objective_of(resource.service_totals(profession, data.merge(ranks: ranks)))
+          best = objective if best.nil? || (objective <=> best) == 1
+          return
+        end
+        units[index].each { |unit_ranks, cost|
+          total = spent + cost
+          next unless resource.affordable?(budget, total)
+          search.call(index + 1, ranks.merge(unit_ranks), total)
+        }
+      }
+      search.call(0, base_ranks, reserve_cost)
+      best
+    end
+
+    # The planner's ranking: weaker tattoo, then combined tattoos, then Self Tattoo.
+    def objective_of(totals)
+      return [totals.values.first] if totals.size == 1
+      [totals.values.min, totals.values.sum, totals["Self Tattoo"]]
+    end
+
+    {
+      "Wizard"   => [[5, 40], [60, 10], [0, 120]],
+      "Sorcerer" => [[5, 60], [80, 30]],
+      "Cleric"   => [[5, 40], [60, 10]],
+      "Empath"   => [[10, 40], [25, 50], [80, 5]],
+      "Bard"     => [[5, 60], [90, 20]],
+      "Paladin"  => [[5, 60], [90, 20]],
+      "Monk"     => [[10, 70], [40, 60], [90, 30]],
+      "Ranger"   => [[10, 50], [40, 60], [90, 20]]
+    }.each { |profession, budgets|
+      budgets.each { |ptp, mtp|
+        it "finds the exact best #{profession} plan for #{ptp} PTP / #{mtp} MTP" do
+          level = 5
+          budget = points.new(ptp, mtp)
+          reserve_cost = resource.cumulative_costs(profession, "Harness Power", level + 1)[6]
+          data = { level: level, stats: stats, location_bonus: 20 }
+          plan = resource.optimize_service(profession, data, budget, { "Harness Power" => 6 }, reserve_cost)
+          expect(resource.affordable?(budget, plan.spent)).to be true
+          expect(objective_of(plan.score)).to eq(brute_force_objective(profession, level, budget, reserve_cost))
+        end
+      }
+    }
+
+    it 'returns nil when the reserved ranks do not fit' do
+      reserve_cost = points.new(0, 100)
+      expect(resource.optimize_service("Wizard", { level: 5, stats: stats }, points.new(0, 50), { "Harness Power" => 6 }, reserve_cost)).to be_nil
+    end
+
+    it 'converts surplus PTP into service training' do
+      reserve_cost = resource.cumulative_costs("Wizard", "Harness Power", 101)[6]
+      plan = resource.optimize_service("Wizard", { level: 100, stats: stats, location_bonus: 50 }, points.new(4000, 1000), { "Harness Power" => 6 }, reserve_cost)
+      expect(plan.spent.mtp).to be > 1000
+    end
+  end
+
+  describe '.parse_snapshot' do
+    let(:exp_lines) do
+      [
+        "          Level: 100                         Fame: 4,804,958",
+        "     Experience: 37,136,999             Field Exp: 1,350/1,010",
+        "  Ascension Exp: 4,170,132          Recent Deaths: 0",
+        "      Total Exp: 41,307,131         Death's Sting: None"
+      ]
+    end
+    let(:info_lines) do
+      [
+        "Name: Testchar Testerson   Race: Half-Elf   Profession: Wizard",
+        "Gender: Female    Age: 40    Expr: 37136999    Level: 100",
+        *resource::STAT_NAMES.map { |stat, name| "   #{name} (#{stat.to_s.upcase}):   90 (25)    ...   95 (27)" }
+      ]
+    end
+    let(:start_lines) do
+      ["Level 0 Stats for Testchar, Half-Elf Wizard", *resource::STAT_NAMES.map { |stat, name| "   #{name} (#{stat.to_s.upcase}): 60" }]
+    end
+    let(:skill_lines) do
+      [
+        "  Magic Item Use....................|  101  41",
+        "  Elemental Mana Control............|  152  102",
+        "  Wizard............................|  203"
+      ]
+    end
+    let(:snapshot) { resource.parse_snapshot(exp_lines, info_lines, start_lines, skill_lines) }
+
+    it 'reads race, level, base stat bonuses, and level-0 stats' do
+      expect(snapshot.values_at(:race, :level)).to eq(["Half-Elf", 100])
+      expect(snapshot[:stats].values.uniq).to eq([25])
+      expect(snapshot[:starting_stats].values.uniq).to eq([60])
+    end
+
+    it 'reads experience without Ascension' do
+      expect(snapshot[:normal_experience]).to eq(37_136_999)
+    end
+
+    it 'reads ranks, not bonus, for skills and ranks for spell circles' do
+      expect(snapshot[:ranks].slice("Magic Item Use", "Elemental Mana Control", "Wizard")).to eq("Magic Item Use" => 41, "Elemental Mana Control" => 102, "Wizard" => 203)
+    end
+
+    it 'falls back to total minus Ascension experience' do
+      fallback = resource.parse_snapshot(exp_lines.reject { |line| line.include?("Experience:") }, [], [], [])
+      expect(fallback[:normal_experience]).to eq(41_307_131 - 4_170_132)
+    end
+  end
+
+  describe '.maximum' do
+    before { resource.output = [] }
+
+    it 'refuses unsupported professions without querying the game' do
+      ResourceHarness::Stats.prof = "Rogue"
+      ResourceHarness::Lich::Util.responses = {}
+      resource.maximum
+      expect(resource.output.join("\n")).to include("not yet supported for Rogue")
+    end
+
+    it 'prints a plan for a supported profession' do
+      ResourceHarness::Stats.prof = "Wizard"
+      ResourceHarness::Lich::Util.responses = {
+        "exp"              => ["     Experience: 9,072,500             Field Exp: 0/1,010"],
+        "info"             => ["Name: Testchar   Race: Human   Profession: Wizard", "Gender: Male  Age: 30  Expr: 9072500  Level: 100",
+                               *resource::STAT_NAMES.map { |stat, name| "   #{name} (#{stat.to_s.upcase}):   90 (25)    ...   90 (25)" }],
+        "info start"       => ["Level 0 Stats for Testchar, Human Wizard", *resource::STAT_NAMES.map { |stat, name| "   #{name} (#{stat.to_s.upcase}): 70" }],
+        "skills base full" => ["  Wizard............................|  150"]
+      }
+      resource.maximum
+      output = resource.output.join("\n")
+      expect(output).to include("Post-cap PTP/MTP earned: 600 / 600")
+      expect(output).to match(/FIXSKILLS maximum:\n  Enchanting: \d+/)
+      expect(output).to include("FIXSKILLS maximum formula:")
+    end
+  end
+end
