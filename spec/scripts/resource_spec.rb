@@ -12,16 +12,39 @@ module ResourceHarness
     end
   end
 
+  module Char
+    def self.name
+      "Ilten"
+    end
+  end
+
+  # Replays a captured command, checking the caller's start/end patterns
+  # really bound the capture the way Lich::Util.issue_command would.
   module Lich
     module Util
       class << self
         attr_accessor :responses
 
-        def quiet_command_xml(command, *_patterns)
-          responses.fetch(command)
+        def quiet_command_xml(command, start_pattern, end_pattern = /<prompt/, *_rest)
+          lines = responses.fetch(command)
+          raise "#{command}: start #{start_pattern.inspect} misses #{lines.first.inspect}" unless lines.first =~ start_pattern
+          raise "#{command}: end #{end_pattern.inspect} misses #{lines.last.inspect}" unless lines.last =~ end_pattern
+          lines
         end
       end
     end
+  end
+
+  FIXTURES = File.join(__dir__, 'fixtures', 'resource')
+
+  # Real XML captures from a level 100 Dark Elf Wizard.
+  def self.fixture_responses
+    {
+      "info start"  => File.readlines(File.join(FIXTURES, 'info_start.xml'), chomp: true),
+      "exp"         => File.readlines(File.join(FIXTURES, 'exp.xml'), chomp: true),
+      "info"        => File.readlines(File.join(FIXTURES, 'info.xml'), chomp: true),
+      "skills full" => File.readlines(File.join(FIXTURES, 'skills_full.xml'), chomp: true)
+    }
   end
 
   lic_path = find_lic_source('resource.lic', from: __dir__)
@@ -231,55 +254,48 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
   end
 
   describe '.parse_snapshot' do
-    let(:exp_lines) do
-      [
-        "          Level: 100                         Fame: 4,804,958",
-        "     Experience: 37,136,999             Field Exp: 1,350/1,010",
-        "  Ascension Exp: 4,170,132          Recent Deaths: 0",
-        "      Total Exp: 41,307,131         Death's Sting: None"
-      ]
-    end
-    let(:info_lines) do
-      [
-        "Name: Testchar Testerson   Race: Half-Elf   Profession: Wizard",
-        "Gender: Female    Age: 40    Expr: 37136999    Level: 100",
-        *resource::STAT_NAMES.map { |stat, name| "   #{name} (#{stat.to_s.upcase}):   90 (25)    ...   95 (27)" }
-      ]
-    end
-    let(:start_lines) do
-      ["Level 0 Stats for Testchar, Half-Elf Wizard", *resource::STAT_NAMES.map { |stat, name| "   #{name} (#{stat.to_s.upcase}): 60" }]
-    end
-    let(:skill_lines) do
-      [
-        "  Magic Item Use....................|  101  41",
-        "  Elemental Mana Control............|  152  102",
-        "  Wizard............................|  203"
-      ]
-    end
-    let(:snapshot) { resource.parse_snapshot(exp_lines, info_lines, start_lines, skill_lines) }
+    let(:responses) { ResourceHarness.fixture_responses }
+    let(:snapshot) { resource.parse_snapshot(*responses.values_at("exp", "info", "info start", "skills full")) }
 
-    it 'reads race, level, base stat bonuses, and level-0 stats' do
-      expect(snapshot.values_at(:race, :level)).to eq(["Half-Elf", 100])
-      expect(snapshot[:stats].values.uniq).to eq([25])
-      expect(snapshot[:starting_stats].values.uniq).to eq([60])
+    it 'reads race, level, and level-0 stats' do
+      expect(snapshot.values_at(:race, :level)).to eq(["Dark Elf", 100])
+      expect(snapshot[:starting_stats]).to eq(str: 88, con: 85, dex: 49, agi: 73, dis: 77, aur: 49, log: 62, int: 62, wis: 70, inf: 45)
+    end
+
+    it 'reads the Enhanced stat bonuses, the same column ;resource bonus uses' do
+      expect(snapshot[:stats]).to eq(str: 45, con: 40, dex: 55, agi: 50, dis: 35, aur: 55, log: 45, int: 50, wis: 49, inf: 31)
+    end
+
+    it 'takes Enhanced over Ascended when they differ' do
+      lines = ["    Strength (STR):   100 (25)    ...  110 (30)"]
+      expect(resource.parse_snapshot([], lines, [], [])[:stats][:str]).to eq(30)
     end
 
     it 'reads experience without Ascension' do
-      expect(snapshot[:normal_experience]).to eq(37_136_999)
+      expect(snapshot[:normal_experience]).to eq(90_017_202)
     end
 
     it 'reads ranks, not bonus, for skills and ranks for spell circles' do
-      expect(snapshot[:ranks].slice("Magic Item Use", "Elemental Mana Control", "Wizard")).to eq("Magic Item Use" => 41, "Elemental Mana Control" => 102, "Wizard" => 203)
+      expect(snapshot[:ranks].slice("Magic Item Use", "Elemental Mana Control", "Spiritual Lore - Blessings", "Wizard"))
+        .to eq("Magic Item Use" => 252, "Elemental Mana Control" => 353, "Spiritual Lore - Blessings" => 151, "Wizard" => 101)
+    end
+
+    it 'parses the plain-text form of the same output identically' do
+      plain = responses.transform_values { |lines| lines.map { |line| resource.clean_xml(line) } }
+      expect(resource.parse_snapshot(*plain.values_at("exp", "info", "info start", "skills full"))).to eq(snapshot)
     end
 
     it 'falls back to total minus Ascension experience' do
-      fallback = resource.parse_snapshot(exp_lines.reject { |line| line.include?("Experience:") }, [], [], [])
-      expect(fallback[:normal_experience]).to eq(41_307_131 - 4_170_132)
+      fallback = resource.parse_snapshot(responses["exp"].reject { |line| line.include?(" Experience:") }, [], [], [])
+      expect(fallback[:normal_experience]).to eq(1_738_617_202 - 1_648_600_000)
     end
   end
 
   describe '.maximum' do
-    before { resource.output = [] }
+    before do
+      resource.output = []
+      ResourceHarness::Lich::Util.responses = ResourceHarness.fixture_responses
+    end
 
     it 'refuses unsupported professions without querying the game' do
       ResourceHarness::Stats.prof = "Rogue"
@@ -288,20 +304,22 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
       expect(resource.output.join("\n")).to include("not yet supported for Rogue")
     end
 
-    it 'prints a plan for a supported profession' do
+    it 'prints a plan from real game output' do
       ResourceHarness::Stats.prof = "Wizard"
-      ResourceHarness::Lich::Util.responses = {
-        "exp"              => ["     Experience: 9,072,500             Field Exp: 0/1,010"],
-        "info"             => ["Name: Testchar   Race: Human   Profession: Wizard", "Gender: Male  Age: 30  Expr: 9072500  Level: 100",
-                               *resource::STAT_NAMES.map { |stat, name| "   #{name} (#{stat.to_s.upcase}):   90 (25)    ...   90 (25)" }],
-        "info start"       => ["Level 0 Stats for Testchar, Human Wizard", *resource::STAT_NAMES.map { |stat, name| "   #{name} (#{stat.to_s.upcase}): 70" }],
-        "skills base full" => ["  Wizard............................|  150"]
-      }
       resource.maximum
       output = resource.output.join("\n")
-      expect(output).to include("Post-cap PTP/MTP earned: 600 / 600")
+      expect(output).to include("Current service bonus:\n  Enchanting: 698")
+      expect(output).to include("Post-cap PTP/MTP earned: 32977 / 32977")
       expect(output).to match(/FIXSKILLS maximum:\n  Enchanting: \d+/)
       expect(output).to include("FIXSKILLS maximum formula:")
+    end
+
+    it 'reports the same current bonus as ;resource bonus' do
+      ResourceHarness::Stats.prof = "Wizard"
+      allow(resource).to receive(:save_bonuses)
+      resource.maximum
+      current = resource.output.join("\n")[/Current service bonus:\n  Enchanting: (\d+)/, 1].to_i
+      expect(resource.bonus(false)).to eq(current)
     end
   end
 end
