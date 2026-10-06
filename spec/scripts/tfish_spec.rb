@@ -121,6 +121,28 @@ RSpec.describe 'TFish' do
       expect(state.weight).to eq('small silver weight')
     end
 
+    it 'exposes the weight noun so sinkers and weights both come off the pole' do
+      expect(h::Pole.parse(rigged).weight_noun).to eq('weight')
+      expect(h::Pole.parse('An iron sinker is currently strung from the line of the rod to serve as a weight.').weight_noun).to eq('sinker')
+    end
+
+    # Wear levels from https://gswiki.play.net/Fishing_equipment. Only the
+    # "excellent" sentence has been seen in a real log; the others assume the
+    # same "The line itself looks ..." lead-in.
+    {
+      'The line itself looks to be in excellent condition.'          => ['excellent', false],
+      'The line itself looks to be in decent condition.'             => ['decent', false],
+      'The line itself looks to be showing signs of wear.'           => ['showing signs of wear', false],
+      'The line itself looks frayed and in danger of snapping soon.' => ['frayed and in danger of snapping soon', true],
+    }.each do |sentence, (condition, frayed)|
+      it "reads line wear: #{condition}" do
+        state = h::Pole.parse(sentence)
+
+        expect(state.line).to eq(condition)
+        expect(state.frayed?).to be frayed
+      end
+    end
+
     it 'reports nothing rigged on a bare pole' do
       state = h::Pole.parse('You see nothing unusual.')
 
