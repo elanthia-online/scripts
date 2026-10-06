@@ -18,6 +18,7 @@
     - initial release, based on sorter 0.9
     - fix the original look text still showing alongside the sorted list when inventory windows are off
     - fix the sorted list sometimes showing a container's old contents (or nothing) on Lich 5.21 and newer
+    - the sorted list now shows before the prompt instead of after it
 
 =end
 
@@ -30,16 +31,50 @@ module ESorter
   # in front of it (Lich strips it first when inventory windows are off).
   LOOK_LINE = /\A(?<xml><(?:c|clearC|exposeC)ontainer.*inv>)?(?:(?<container>[IO]n the <a exist="\d+".*?) you see .*\.|(?<peer>Peering into the <a exist="\d+".*?, you see .*?)(?:, | and )(?:a|an|some) <.*\.)/
 
-  # DownstreamHook body: hide the plain-text item list (esorter prints the
-  # sorted one) but keep the container XML so container windows still update.
+  # The look line waiting for its prompt: [container label, container id, original text].
+  @pending = nil
+
+  # DownstreamHook body. Hides the plain-text item list (keeping the container
+  # XML so container windows still update), then writes the sorted list in front
+  # of the prompt that ends the look. Lich parses a line's XML before running
+  # hooks on it, and 5.21+ publishes container contents at that prompt, so
+  # GameObj is current here.
   #
   # @param line [String] a server line
   # @return [String, nil] the line to pass on, or nil to squelch it
-  def self.squelch(line)
+  def self.hook(line)
     return line if line.include?('In the') && line.include?('On the')
 
-    match = LOOK_LINE.match(line)
-    match ? match[:xml] : line
+    if (match = LOOK_LINE.match(line))
+      label = match[:container] || "#{match[:peer]} and"
+      @pending = [label, label[/exist="(\d+)"/, 1], match[0].gsub(CONTAINER_XML, '')]
+      rest = match.post_match.sub(/\A\r?\n/, '')
+      line = "#{match[:xml]}#{rest}"
+    end
+
+    if @pending && (at = line.index('<prompt'))
+      label, id, original = @pending
+      @pending = nil
+      line = line.dup.insert(at, sorted_text(label, id, original))
+    end
+
+    line.empty? ? nil : line
+  end
+
+  # @return [String] the sorted list, or the original look text when there is
+  #   nothing to sort, formatted for the frontend
+  def self.sorted_text(label, id, original)
+    contents = lookup(id)
+    text = contents.nil? || contents.empty? ? "#{original}\n" : render(label, categorize(contents), CharSettings['screen_width'])
+    text = text.gsub(/<.*?>/, '') unless Frontend.supports_xml?
+    text.gsub(/\r?\n/, "\r\n")
+  rescue StandardError => e
+    Lich.log("esorter: #{e.class}: #{e.message}")
+    "#{original}\r\n"
+  end
+
+  def self.lookup(id)
+    GameObj.containers[id]
   end
 
   # @param contents [Array<GameObj>]
@@ -92,7 +127,7 @@ module ESorter
       count = items.values.sum { |info| info['count'] }
       items = sort_by_noun(items)
       if width
-        output << "#{monsterbold_start}#{category} (#{count}):#{monsterbold_end} \n"
+        output << "#{bold("#{category} (#{count}):")} \n"
         column_count = best_column_count(items.map(&:first), width)
         row_count = (items.length / column_count.to_f).ceil
         columns = items.each_slice(row_count).to_a
@@ -109,7 +144,7 @@ module ESorter
         end
         output << "\n"
       else
-        output << "#{monsterbold_start}#{category} (#{count}):#{monsterbold_end} "
+        output << "#{bold("#{category} (#{count}):")} "
         output << items.map { |name, info| link(name, info) }.join(', ') << ".\n"
       end
     end
@@ -117,9 +152,8 @@ module ESorter
     output
   end
 
-  def self.show(text)
-    text = text.gsub(/<.*?>/, '') unless Frontend.supports_xml?
-    _respond text
+  def self.bold(text)
+    "#{monsterbold_start}#{text}#{monsterbold_end}"
   end
 end
 
@@ -139,28 +173,7 @@ end
 
 GameObj.load_data if GameObj.type_data.nil? || GameObj.type_data.empty?
 
-Script.current.want_downstream = false
-Script.current.want_downstream_xml = true
 hide_me
 
-DownstreamHook.add('esorter', proc { |line| ESorter.squelch(line) }, persist: false)
-
-while (line = get)
-  next if line.include?('In the') && line.include?('On the')
-  next unless (match = ESorter::LOOK_LINE.match(line))
-
-  container = match[:container] || "#{match[:peer]} and"
-  container_id = container[/exist="(\d+)"/, 1]
-
-  # Lich 5.21+ publishes a container's contents at the prompt that ends the
-  # look, not as the <inv> items arrive -- read GameObj only after it.
-  nil until line.include?('<prompt') || (line = get).include?('<prompt')
-
-  contents = GameObj.containers[container_id]
-  if contents.nil? || contents.empty?
-    # Nothing to sort: give back the text the hook squelched.
-    ESorter.show("#{match[0].gsub(ESorter::CONTAINER_XML, '')}\n")
-  else
-    ESorter.show(ESorter.render(container, ESorter.categorize(contents), CharSettings['screen_width']))
-  end
-end
+DownstreamHook.add('esorter', proc { |line| ESorter.hook(line) }, persist: false)
+sleep

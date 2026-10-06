@@ -1,6 +1,7 @@
-# Spec for esorter.lic's downstream squelch: the original look text must be
+# Spec for esorter.lic's downstream hook: the original look text must be
 # hidden whether or not Lich's inventory_boxes_off hook already stripped the
-# container XML in front of it (it runs first, so esorter sees the bare line).
+# container XML in front of it (it runs first, so esorter sees the bare line),
+# and the sorted list must land in front of the prompt that ends the look.
 
 require_relative '../spec_helper'
 
@@ -15,31 +16,34 @@ Object.class_eval(ESorterSpec::MODULE_SRC)
 
 RSpec.describe ESorter do
   xml = %q{<exposeContainer id='stow'/><container id='stow' title="My Backpack" target='#692447856' location='right' save='' resident='true'/><clearContainer id="stow"/><inv id='stow'>In the <a exist="692447856" noun="backpack">backpack</a>:</inv><inv id='stow'> a <a exist="692447858" noun="ale">flagon of Dacra's Dream ale</a></inv>}
-  text = %q{In the <a exist="692447856" noun="backpack">deerskin backpack</a> you see a <a exist="692447858" noun="ale">flagon of Dacra's Dream ale</a> and a <a exist="692447857" noun="Lace">sprig of Imaera's Lace</a>.}
+  text = %q{In the <a exist="692447856" noun="backpack">deerskin backpack</a> you see a <a exist="692447858" noun="ale">flagon of Dacra's Dream ale</a>.}
+  prompt = %(<prompt time="1791304487">&gt;</prompt>\r\n)
 
-  describe '.squelch' do
-    it 'keeps only the container XML when the game sent it' do
-      expect(described_class.squelch("#{xml}#{text}\r\n")).to eq(xml)
-    end
-
-    it 'squelches the bare line left after Lich strips the container XML' do
-      expect(described_class.squelch("#{text}\r\n")).to be_nil
-    end
-
-    it 'passes through unrelated lines and mixed In/On lines' do
-      expect(described_class.squelch("You see nothing.\r\n")).to eq("You see nothing.\r\n")
-      mixed = "On the <a exist=\"1\" noun=\"table\">table</a> In the corner you see a thing.\r\n"
-      expect(described_class.squelch(mixed)).to eq(mixed)
-    end
+  before do
+    described_class.instance_variable_set(:@pending, nil)
+    allow(described_class).to receive(:sorted_text) { |label, id, _original| "SORTED #{id} #{label}\r\n" }
   end
 
-  describe 'LOOK_LINE' do
-    it 'captures the container name for the sorted header' do
-      expect(described_class::LOOK_LINE.match("#{xml}#{text}")[:container]).to eq('In the <a exist="692447856" noun="backpack">deerskin backpack</a>')
-    end
+  it 'keeps only the container XML, then puts the sorted list before the prompt' do
+    expect(described_class.hook("#{xml}#{text}\r\n")).to eq(xml)
+    expect(described_class.hook(prompt)).to eq(%(SORTED 692447856 In the <a exist="692447856" noun="backpack">deerskin backpack</a>\r\n#{prompt}))
+  end
 
-    it 'recovers the original text by stripping the container XML' do
-      expect("#{xml}#{text}".gsub(described_class::CONTAINER_XML, '')).to eq(text)
-    end
+  it 'squelches the bare line left after Lich strips the container XML' do
+    expect(described_class.hook("#{text}\r\n")).to be_nil
+    expect(described_class.hook(prompt)).to start_with('SORTED 692447856')
+  end
+
+  it 'handles the look and prompt arriving in one line' do
+    expect(described_class.hook("#{text}\r\n#{prompt}")).to start_with('SORTED 692447856').and end_with(prompt)
+  end
+
+  it 'passes through unrelated lines, mixed In/On lines and prompts with nothing pending' do
+    mixed = "On the <a exist=\"1\" noun=\"table\">table</a> In the corner you see a thing.\r\n"
+    [mixed, "You see nothing.\r\n", prompt].each { |line| expect(described_class.hook(line)).to eq(line) }
+  end
+
+  it 'recovers the original text by stripping the container XML' do
+    expect("#{xml}#{text}".gsub(described_class::CONTAINER_XML, '')).to eq(text)
   end
 end
