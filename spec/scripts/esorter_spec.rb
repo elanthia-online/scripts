@@ -38,6 +38,12 @@ RSpec.describe ESorter do
     expect(described_class.hook("#{text}\r\n#{prompt}")).to start_with('SORTED 692447856').and end_with(prompt)
   end
 
+  it 'handles room containers, which have negative ids' do
+    bench = %(<container id='-49715' title='Benches' target='#-49715' location='right'/><clearContainer id="-49715"/><inv id='-49715'>On the <a exist="-49715" noun="benches">benches</a>:</inv>)
+    expect(described_class.hook(%(#{bench}On the <a exist="-49715" noun="benches">wide stone benches</a> you see <a exist="688512006" noun="clove">some sovyn clove</a>.\r\n))).to eq(bench)
+    expect(described_class.hook(prompt)).to start_with('SORTED -49715 On the')
+  end
+
   it 'passes through unrelated lines, mixed In/On lines and prompts with nothing pending' do
     mixed = "On the <a exist=\"1\" noun=\"table\">table</a> In the corner you see a thing.\r\n"
     [mixed, "You see nothing.\r\n", prompt].each { |line| expect(described_class.hook(line)).to eq(line) }
