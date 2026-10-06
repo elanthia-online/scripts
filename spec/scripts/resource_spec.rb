@@ -37,13 +37,14 @@ module ResourceHarness
 
   FIXTURES = File.join(__dir__, 'fixtures', 'resource')
 
-  # Real XML captures from a level 100 Dark Elf Wizard.
+  # Real XML captures: a level 100 Dark Elf Wizard, plus GLD from a Rogue guild master.
   def self.fixture_responses
     {
       "info start"  => File.readlines(File.join(FIXTURES, 'info_start.xml'), chomp: true),
       "exp"         => File.readlines(File.join(FIXTURES, 'exp.xml'), chomp: true),
       "info"        => File.readlines(File.join(FIXTURES, 'info.xml'), chomp: true),
-      "skills full" => File.readlines(File.join(FIXTURES, 'skills_full.xml'), chomp: true)
+      "skills full" => File.readlines(File.join(FIXTURES, 'skills_full.xml'), chomp: true),
+      "gld"         => File.readlines(File.join(FIXTURES, 'gld.xml'), chomp: true)
     }
   end
 
@@ -320,9 +321,7 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
   describe '.maximum' do
     before do
       resource.output = []
-      ResourceHarness::Lich::Util.responses = ResourceHarness.fixture_responses.merge(
-        "gld" => ['<output class="mono"/>', "You currently have 25 ranks out of a possible 63 for your training.", '<output class=""/>']
-      )
+      ResourceHarness::Lich::Util.responses = ResourceHarness.fixture_responses
       allow(resource).to receive(:save_bonuses)
     end
 
@@ -368,7 +367,7 @@ RSpec.describe 'resource.lic FIXSKILLS planner' do
       output = resource.output.join("\n")
       arts = ["Sidestep", "Keen Eye", "Escape Artist", "Swift Recovery", "Poisoncraft", "Recharge"]
       expect(output.scan(/^== (.+) plan ==$/).flatten).to eq(arts)
-      expect(output).to include("Guild ranks: 25")
+      expect(output).to include("Guild ranks: 124")
       expect(arts.map { |art| current_bonus(output, art) }).to eq(resource.bonus(false))
     end
   end
