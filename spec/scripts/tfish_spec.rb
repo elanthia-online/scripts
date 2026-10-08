@@ -51,14 +51,28 @@ RSpec.describe 'TFish' do
       expect(h::Config.cast_distance).to eq('far')
     end
 
+    it 'defaults to no weight cycling' do
+      expect(h::Config[:cycle_weights]).to be false
+    end
+
+    it 'turns off weight cycling saved by pre-2.0 tfish, once' do
+      LichStub::UserVars.tfish = { cycle_weights: true }
+      h::Config.setup!
+      expect(h::Config[:cycle_weights]).to be false
+
+      h::Config.store[:cycle_weights] = true
+      h::Config.setup!
+      expect(h::Config[:cycle_weights]).to be true
+    end
+
     it 'only treats the constant weight as active when cycling is off and one is set' do
       expect(h::Config.constant_weight?).to be false
 
       h::Config.store[:weight_noncycle] = 'glaes'
-      expect(h::Config.constant_weight?).to be false
-
-      h::Config.store[:cycle_weights] = false
       expect(h::Config.constant_weight?).to be true
+
+      h::Config.store[:cycle_weights] = true
+      expect(h::Config.constant_weight?).to be false
     end
   end
 
@@ -204,11 +218,18 @@ RSpec.describe 'TFish' do
         Array.new(count) { TFishSpec::FakeItem.new('weight', 'glaes weight') }
     end
 
+    it 'only needs line by default, since no weight is used' do
+      expect(h::Supplies.shortages([item.new('wire', 'fishing wire')])).to be_empty
+      expect(h::Supplies.shortages([])).to eq(['Fishing Line - wire - 0/1'])
+    end
+
     it 'is empty when line and both cycling weights are stocked' do
+      h::Config.store[:cycle_weights] = true
       expect(h::Supplies.shortages(stocked(5) + [item.new('wire', 'fishing wire')])).to be_empty
     end
 
     it 'reports missing line and short weights' do
+      h::Config.store[:cycle_weights] = true
       expect(h::Supplies.shortages(stocked(4))).to eq([
                                                         'Fishing Line - wire - 0/1',
                                                         'blown glass weight - 4/5',
