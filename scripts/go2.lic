@@ -250,7 +250,8 @@ module Go2
   #   restarts         number of internal restart cycles this trip
   #   max_restarts     restart ceiling for this trip (0 = unlimited)
   #   max_stuck        seconds of failed attempts in one room before giving up,
-  #                    counted from the first restart there (0 = unlimited)
+  #                    counted from the first restart there; a room change or
+  #                    a pause starts it over (0 = unlimited)
   #   eta              estimated seconds remaining when the path was last computed
   #   started_at       Time the trip started
   # Go2.status is reset to :idle when the script exits; the final state is kept
@@ -2403,6 +2404,30 @@ module Go2
   restarts     = 0
   stuck_since  = nil # first restart in stuck_room since the last room change
   stuck_room   = nil
+  # A pause also starts the stuck clock over: time held by ;pause go2 or by
+  # go2's own pause_script is not time spent failing. This thread is the one
+  # held, at Lich's pause checkpoint, so it cannot see that time pass; a
+  # watcher counts pauses instead, as each one begins, so the count is
+  # already up when go2 resumes. It must not call Script.current, which
+  # blocks while paused.
+  pauses       = 0
+  stuck_pauses = 0
+  if max_stuck > 0
+    go2_script = Script.current
+    Thread.new {
+      was_paused = false
+      loop {
+        now_paused = begin
+          go2_script.paused?
+        rescue StandardError
+          false
+        end
+        pauses += 1 if now_paused and not was_paused
+        was_paused = now_paused
+        Kernel.sleep 0.25
+      }
+    }
+  end
 
   if $go2_started_go2_bank
     # nested trip to the bank on behalf of an outer go2: report under its status
@@ -2442,12 +2467,13 @@ module Go2
       st = Go2.status
       # The stuck clock starts at the first restart in a room, not at the last
       # room change, so time before anything failed (the confirmation prompt, a
-      # long but successful step) never counts. Any room change starts it over,
-      # including one made by hand while go2 was paused.
+      # long but successful step) never counts. Any room change or pause since
+      # it started starts it over.
       here = Room.current&.id
-      if stuck_since.nil? or here != stuck_room or (st.last_progress_at and st.last_progress_at > stuck_since)
-        stuck_since = Time.now
-        stuck_room  = here
+      if stuck_since.nil? or here != stuck_room or pauses != stuck_pauses or (st.last_progress_at and st.last_progress_at > stuck_since)
+        stuck_since  = Time.now
+        stuck_room   = here
+        stuck_pauses = pauses
       end
       stuck_for = (Time.now - stuck_since).round
       give_up = if max_restarts > 0 and restarts > max_restarts
@@ -2713,7 +2739,6 @@ module Go2
             }
             Go2.status_update(phase: :paused, command: nil, reason: 'stop-for-dead: a dead player was seen; script paused')
             pause_script
-            stuck_since = nil # time paused is not time stuck
             Go2.status_update(phase: :pathing, reason: nil)
             $go2_see_dead_people = false
             break
@@ -2738,10 +2763,7 @@ module Go2
           # status only: movement semantics are unchanged (no restart here), but
           # a supervisor should still see that this step didn't move us
           Go2.mark_blocked(last_sent) if room_id_before_proc and Room.current&.id == room_id_before_proc and room_id_before_proc != next_id.to_i
-          if setting_stop_for_dead and GameObj.pcs.any? { |pc| pc.status =~ /dead/ }
-            pause_script
-            stuck_since = nil
-          end
+          pause_script if setting_stop_for_dead and GameObj.pcs.any? { |pc| pc.status =~ /dead/ }
           # $go2_restart = true if Room.current.id == room_id_before_proc
           break if $go2_restart
         rescue
@@ -2776,7 +2798,6 @@ module Go2
             }
             Go2.status_update(phase: :paused, command: nil, reason: 'stop-for-dead: a dead player was seen; script paused')
             pause_script
-            stuck_since = nil # time paused is not time stuck
             Go2.status_update(phase: :pathing, reason: nil)
             $go2_see_dead_people = false
             break
@@ -2815,10 +2836,7 @@ module Go2
             result = move room.wayto[next_id]
           end
           sleep setting_delay
-          if setting_stop_for_dead and GameObj.pcs.any? { |pc| pc.status =~ /dead/ }
-            pause_script
-            stuck_since = nil
-          end
+          pause_script if setting_stop_for_dead and GameObj.pcs.any? { |pc| pc.status =~ /dead/ }
           unless result
             error_count += 1
             Go2.mark_blocked(last_sent)
