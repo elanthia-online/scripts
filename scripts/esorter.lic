@@ -1,0 +1,186 @@
+=begin
+
+  Displays the contents of your containers in categories when you look in them.
+
+  ;esorter width=<window width in characters>    display contents in columns
+  ;esorter width=nil                             stop using columns
+
+  Based on sorter.lic by Tillmen.
+
+            author: Elanthia-Online
+      contributors: Tillmen
+              game: Gemstone
+              tags: cosmetic, containers, sorter
+          requires: Lich >= 5.22.0
+           version: 1.0.0
+
+  1.0.0 (2026-10-06)
+    - initial release, based on sorter 0.9
+    - fix the original look text still showing alongside the sorted list when inventory windows are off
+    - fix the sorted list sometimes showing a container's old contents (or nothing) on Lich 5.21 and newer
+    - the sorted list now shows before the prompt instead of after it
+    - other scripts that watch your container looks no longer need esorter stopped first
+
+=end
+
+module ESorter
+  # Drop constants left by an earlier run this session so a restart loads the
+  # current definitions without already-initialized warnings.
+  %i[CONTAINER_XML LOOK_LINE].each { |name| remove_const(name) if const_defined?(name, false) }
+
+  # Container window XML the game puts in front of a LOOK IN/ON line; the same
+  # tags Lich's inventory_boxes_off hook strips when inventory windows are off.
+  CONTAINER_XML = /<(?:container|clearContainer|exposeContainer)[^>]*>|<inv.+\/inv>/
+
+  # A LOOK IN/ON line for a linked container, with or without the container XML
+  # in front of it (Lich strips it first when inventory windows are off).
+  LOOK_LINE = /\A(?<xml><(?:c|clearC|exposeC)ontainer.*inv>)?(?:(?<container>[IO]n the <a exist="-?\d+".*?) you see .*\.|(?<peer>Peering into the <a exist="-?\d+".*?, you see .*?)(?:, | and )(?:a|an|some) <.*\.)/
+
+  # The look line waiting for its prompt: [container label, container id, original text].
+  @pending = nil
+
+  # DownstreamHook body. Hides the plain-text item list (keeping the container
+  # XML so container windows still update), then writes the sorted list in front
+  # of the prompt that ends the look. Lich parses a line's XML before running
+  # hooks on it, and 5.21+ publishes container contents at that prompt, so
+  # GameObj is current here.
+  #
+  # @param line [String] a server line
+  # @return [String, nil] the line to pass on, or nil to squelch it
+  def self.hook(line)
+    return line if line.include?('In the') && line.include?('On the')
+
+    if (match = LOOK_LINE.match(line))
+      label = match[:container] || "#{match[:peer]} and"
+      @pending = [label, label[/exist="(-?\d+)"/, 1], match[0].gsub(CONTAINER_XML, '')]
+      rest = match.post_match.sub(/\A\r?\n/, '')
+      line = "#{match[:xml]}#{rest}"
+    end
+
+    if @pending && (at = line.index('<prompt'))
+      label, id, original = @pending
+      @pending = nil
+      line = line.dup.insert(at, sorted_text(label, id, original))
+    end
+
+    line.empty? ? nil : line
+  end
+
+  # @return [String] the sorted list, or the original look text when there is
+  #   nothing to sort, formatted for the frontend
+  def self.sorted_text(label, id, original)
+    contents = lookup(id)
+    text = contents.nil? || contents.empty? ? "#{original}\n" : render(label, categorize(contents), CharSettings['screen_width'])
+    text = text.gsub(/<.*?>/, '') unless Frontend.supports_xml?
+    text.gsub(/\r?\n/, "\r\n")
+  rescue StandardError => e
+    Lich.log("esorter: #{e.class}: #{e.message}")
+    "#{original}\r\n"
+  end
+
+  def self.lookup(id)
+    GameObj.containers[id]
+  end
+
+  # @param contents [Array<GameObj>]
+  # @return [Hash{String => Hash{String => Hash}}] type => item name => noun/exist/count
+  def self.categorize(contents)
+    sorted = Hash.new { |h, k| h[k] = {} }
+    contents.each do |item|
+      name = if item.full_name =~ /^a crystalline flask containing /
+               item.full_name.sub(/^a crystalline flask containing /, '')
+             else
+               item.full_name.sub(/containing (.*)$/) { "(#{Regexp.last_match(1)})" }
+             end
+      entry = (sorted[item.type || 'other'][name] ||= { 'noun' => item.noun, 'exist' => item.id, 'count' => 0 })
+      entry['count'] += 1
+    end
+    sorted
+  end
+
+  def self.link(name, info)
+    str = "<a exist=\"#{info['exist']}\" noun=\"#{info['noun']}\">#{name}</a>"
+    info['count'] > 1 ? "#{str} (#{info['count']})" : str
+  end
+
+  def self.sort_by_noun(items)
+    items.sort_by { |name, _info| name.split(/\s/).last }
+  end
+
+  def self.best_column_count(names, width)
+    num_columns = 1
+    loop do
+      per_column = (names.length / num_columns.to_f).ceil
+      total = names.each_slice(per_column).sum { |col| col.map(&:length).max }
+      total += (num_columns - 1) * 8
+      if total > width - 8
+        num_columns -= 1
+        break
+      elsif num_columns >= names.length
+        break
+      end
+      num_columns += 1
+    end
+    [num_columns, 1].max
+  end
+
+  def self.render(container, sorted, width)
+    output = String.new
+    output << "<output class=\"mono\"/>\n" if width && Frontend.supports_mono?
+    output << "#{container}:\n"
+    sorted.each do |category, items|
+      count = items.values.sum { |info| info['count'] }
+      items = sort_by_noun(items)
+      if width
+        output << "#{bold("#{category} (#{count}):")} \n"
+        column_count = best_column_count(items.map(&:first), width)
+        row_count = (items.length / column_count.to_f).ceil
+        columns = items.each_slice(row_count).to_a
+        widths = columns.map { |col| col.map { |name, _| name.length }.max }
+        row_count.times do |row|
+          cells = columns.each_with_index.filter_map do |col, i|
+            name, info = col[row]
+            next unless name
+
+            str = link(name, info)
+            str.ljust(widths[i] + str.slice(/<a.*?>/).length + 12)
+          end
+          output << "    #{cells.join.rstrip}\n"
+        end
+        output << "\n"
+      else
+        output << "#{bold("#{category} (#{count}):")} "
+        output << items.map { |name, info| link(name, info) }.join(', ') << ".\n"
+      end
+    end
+    output << "<output class=\"\"/>\n" if width && Frontend.supports_mono?
+    output
+  end
+
+  def self.bold(text)
+    "#{monsterbold_start}#{text}#{monsterbold_end}"
+  end
+end
+
+if Script.current.vars[1] =~ /^width=([0-9]+|nil)$/
+  CharSettings['screen_width'] = Regexp.last_match(1) == 'nil' ? nil : Regexp.last_match(1).to_i
+  echo 'setting saved'
+  exit
+elsif Script.current.vars[1]
+  respond <<~HELP
+
+       #{$clean_lich_char}#{Script.current.name} width=<#>     display container contents in columns sized to your game window
+       #{$clean_lich_char}#{Script.current.name} width=nil     stop using columns
+
+  HELP
+  exit
+end
+
+GameObj.load_data if GameObj.type_data.nil? || GameObj.type_data.empty?
+
+hide_me
+
+# Negative priority: run after every default-priority hook, so scripts that
+# read or squelch container looks (eloot, etc.) see the original line first.
+DownstreamHook.add('esorter', proc { |line| ESorter.hook(line) }, persist: false, priority: -100)
+sleep
