@@ -141,6 +141,8 @@ RSpec.describe 'TFish' do
       The lure has the following qualities:
 
           +12 to attracting fish near the surface
+          +12 to attracting fish at middle depths
+          +16 to attracting fish in deep water
     LOOK
 
     it 'reads line condition, lure and weight' do
@@ -151,15 +153,45 @@ RSpec.describe 'TFish' do
       expect(state.weight).to eq('small silver weight')
     end
 
+    it 'reads the lure bonus for each depth' do
+      state = h::Pole.parse(rigged)
+
+      expect(state.lure_bonus).to eq(surface: 12, middle: 12, deep: 16)
+      expect(state.best_depth).to eq(:deep)
+      expect(state.surface_lure?).to be false
+    end
+
+    it 'counts a lure that is best (or tied best) at the surface as a surface lure' do
+      snowflake = h::Pole.parse(<<~LOOK)
+        A pale snowflake lure is currently attached near the hook to attract fish.
+        The lure has the following qualities:
+            +15 to attracting fish near the surface
+            +10 to attracting fish at middle depths
+            +10 to attracting fish in deep water
+      LOOK
+      tied = h::Pole.parse("    +12 to attracting fish near the surface\n    +12 to attracting fish in deep water")
+
+      expect(snowflake.surface_lure?).to be true
+      expect(snowflake.best_depth).to eq(:surface)
+      expect(tied.surface_lure?).to be true
+    end
+
+    it 'does not flag a lure whose bonuses are unknown' do
+      expect(h::Pole.parse('A pale snowflake lure is currently attached near the hook to attract fish.').surface_lure?).to be true
+    end
+
     it 'reads a pole with no weight, using the line wording shown when unweighted' do
       state = h::Pole.parse(<<~LOOK)
         The pole's line looks to be in excellent condition.
         A dead-eyed freckled grey squid is currently attached near the hook to attract fish.
         The squid has the following qualities:
             +16 to attracting fish near the surface
+            +12 to attracting fish at middle depths
+            +12 to attracting fish in deep water
       LOOK
 
-      expect(state).to eq(h::Pole::State.new(line: 'excellent', lure: 'dead-eyed freckled grey squid', weight: nil))
+      expect(state).to eq(h::Pole::State.new(line: 'excellent', lure: 'dead-eyed freckled grey squid', weight: nil,
+                                             lure_bonus: { surface: 16, middle: 12, deep: 12 }))
     end
 
     it 'sees a fresh line with no lure after restringing' do
