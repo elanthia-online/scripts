@@ -136,13 +136,20 @@ module TFish
     HOOKED = /^You feel a brief jerk on your line before it begins to reel out wildly\./ unless const_defined?(:HOOKED, false)
     # The fish is landed and in hand. Captures the fish name.
     CAUGHT = /^You give your .+? one final tug and the (?<fish>.+?) comes wriggling to the surface!/ unless const_defined?(:CAUGHT, false)
-    # The catch is gone and the line needs attention.
-    LOST = Regexp.union(
-      /\*SNAP\*/,
-      /is already reeled in!/,
-    ) unless const_defined?(:LOST, false)
-    # Every reel reply the reel loop waits on.
-    REEL_REPLY = Regexp.union(CAUGHT, LOST, /^Roundtime: \d+ sec\.$/) unless const_defined?(:REEL_REPLY, false)
+    # The line snapped: fighting a fish too long, or walking away from a cast
+    # line ("You have strayed too far from where you were fishing.").
+    LOST = /\*SNAP\*/ unless const_defined?(:LOST, false)
+    # The line came back in with nothing on it (the fish got away, or nothing was hooked).
+    EMPTY = Regexp.union(
+      /^You reel the line of your .+? in\./,
+      /^But the .+? is already reeled in!/,
+    ) unless const_defined?(:EMPTY, false)
+    # Every reel reply the reel loop waits on. Roundtime ends every reel that's still fighting.
+    REEL_REPLY = Regexp.union(CAUGHT, LOST, EMPTY, /^Roundtime: \d+ sec\.$/) unless const_defined?(:REEL_REPLY, false)
+    # FISH CAST worked, or a line was already out.
+    CAST_OK = /\*WHOOSH!\*|^You've already cast the line/ unless const_defined?(:CAST_OK, false)
+    # FISH CAST failed.
+    CAST_FAIL = /^You must be holding a fishing rod\./ unless const_defined?(:CAST_FAIL, false)
     # Weighing the pole (with a fish on) or a fish in hand.
     WEIGHT = /^You carefully examine the .+? and determine that the weight is about (?<pounds>[\d,]+) pounds\./ unless const_defined?(:WEIGHT, false)
     # Fillet turned up something worth inspecting (T5+).
@@ -159,12 +166,13 @@ module TFish
     module_function
 
     # @param line [String, nil] a reel reply, nil if none arrived in time
-    # @return [Symbol, nil] :caught, :lost, :reeling, or nil for no reply
+    # @return [Symbol, nil] :caught, :lost, :empty, :reeling, or nil for no reply
     def reel_outcome(line)
       case line
       when nil then nil
       when CAUGHT then :caught
       when LOST then :lost
+      when EMPTY then :empty
       else :reeling
       end
     end
@@ -199,7 +207,7 @@ module TFish
     # @return [State]
     def parse(text)
       State.new(
-        line: text[/The line itself looks (?:to be )?(?:in )?(.+?)(?: condition)?\./, 1],
+        line: text[/The (?:line itself|\S+'s line) looks (?:to be )?(?:in )?(.+?)(?: condition)?\./, 1],
         lure: text[/^(?:An?|Some) (.+?) is currently attached near the hook/, 1],
         weight: text[/^(?:An?|Some) (.+?) is currently strung from the line of the .+? to serve as a weight\./, 1],
       )
@@ -294,7 +302,7 @@ module TFish
       supplies_container   "cloak"               container holding pole, lure, line and weights
       supplies_minimum     5                     minimum weights needed to keep fishing
       supplies_pole        "rod"                 noun of your fishing pole
-      supplies_lure        "lure"                noun of your fishing lure
+      supplies_lure        "lure"                noun of your fishing lure (lure, squid, ...)
       supplies_line        "wire"                noun of your fishing line
       fillet_knife         "dagger"              noun of your fillet knife
       knife_container      "cloak"               container holding your knife
@@ -334,7 +342,6 @@ module TFish
           pause_script if Config[:pause_me]
         when :lost
           Config.store[:snap_total] += 1
-          @weight_noun = nil # a snapped line takes the lure and weight with it
           familiar("*SNAP*")
           waitrt?
           stow_pole
@@ -422,16 +429,22 @@ module TFish
       debug("Pole: #{state.inspect}")
     end
 
+    # PULL on the spool snaps a length of line off into the other hand; that
+    # piece goes on the pole and the spool goes back in the container.
+    #
     # @param cut_old [Boolean] cut off the worn line already on the pole first
     def restring(cut_old: false)
-      noun = Config[:supplies_line]
       fput "cut ##{@pole.id}" if cut_old
       fput "put ##{@pole.id} in my #{container}"
-      fput "get my #{noun} from my #{container}"
-      fput "pull my #{noun}"
-      fput "put my second #{noun} in my #{container}"
+      fput "get my #{Config[:supplies_line]} from my #{container}"
+      spool = TFish.hands.first
+      fail!("Couldn't find your #{Config[:supplies_line]} in your #{container}.") unless spool
+      fput "pull ##{spool.id}"
+      piece = TFish.hands.find { it.id != spool.id }
+      fail!("Pulling your #{Config[:supplies_line]} didn't give a length of line.") unless piece
+      fput "put ##{spool.id} in my #{container}"
+      fput "put ##{piece.id} on ##{@pole.id}"
       fput "get ##{@pole.id}"
-      fput "put my #{noun} on ##{@pole.id}"
     end
 
     def attach_lure
@@ -474,7 +487,7 @@ module TFish
 
     # Casts, lets the line sit until a bite, then reels until it resolves.
     #
-    # @return [Symbol] :caught, :lost or :left (walked off the dock)
+    # @return [Symbol] :caught, :lost (snapped), :empty (got away) or :left (walked off the dock)
     def fish
       waitrt?
       cycle_weight
@@ -482,7 +495,8 @@ module TFish
       @cast_index += 1
       Config.store[:cast_total] += 1
       waitrt?
-      fput "fish cast #{Config.cast_distance}"
+      cast = dothistimeout("fish cast #{Config.cast_distance}", 3, Regexp.union(Messages::CAST_OK, Messages::CAST_FAIL))
+      fail!("Couldn't cast: #{cast || 'no reply'}") unless cast =~ Messages::CAST_OK
 
       return :left unless wait_for_bite
 
@@ -509,10 +523,10 @@ module TFish
       end
     end
 
-    # Reels until the fish is landed or lost. No reply at all three times
-    # in a row is treated as lost.
+    # Reels until the fish is landed, snaps the line, or gets away (the line
+    # comes back empty). No reply at all three times in a row counts as away.
     #
-    # @return [Symbol] :caught or :lost
+    # @return [Symbol] :caught, :lost or :empty
     def reel
       reels = 0
       silent = 0
@@ -526,12 +540,11 @@ module TFish
           debug("Reels: #{reels}")
           familiar("Reels: #{reels}")
           return :caught
-        when :lost
-          return :lost
+        when :lost, :empty
+          return outcome
         when nil
-          # ponytail: unknown reply (e.g. fish escaped) ends the fight; add its message to Messages::LOST once seen
           silent += 1
-          return :lost if silent >= 3
+          return :empty if silent >= 3
         else
           silent = 0
         end

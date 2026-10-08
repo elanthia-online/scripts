@@ -78,15 +78,31 @@ RSpec.describe 'TFish' do
 
     it 'classifies reel replies' do
       expect(h::Messages.reel_outcome(caught)).to eq(:caught)
-      expect(h::Messages.reel_outcome('Your line suddenly twists and then breaks with a sharp, poignant *SNAP*!')).to eq(:lost)
+      expect(h::Messages.reel_outcome('The line of your black fishing pole strains and breaks with a sharp *SNAP*!')).to eq(:lost)
+      expect(h::Messages.reel_outcome('You reel the line of your black fishing pole in.  The snowflake lure strung on the line breaks the surface and dangles briefly over the water as you finish retracting the line.')).to eq(:empty)
+      expect(h::Messages.reel_outcome('But the pole is already reeled in!')).to eq(:empty)
       expect(h::Messages.reel_outcome('Roundtime: 8 sec.')).to eq(:reeling)
       expect(h::Messages.reel_outcome(nil)).to be_nil
     end
 
-    it 'waits on roundtime, catch and loss replies when reeling' do
+    it 'waits on roundtime, catch, snap and empty-line replies when reeling' do
       expect('Roundtime: 5 sec.').to match(h::Messages::REEL_REPLY)
       expect(caught).to match(h::Messages::REEL_REPLY)
       expect('Your hook is now about 244 feet away.').not_to match(h::Messages::REEL_REPLY)
+      expect('You take in some of the slack from the line of your black fishing pole.').not_to match(h::Messages::REEL_REPLY)
+    end
+
+    it 'does not treat the run-out-of-line warning as a snap' do
+      expect('Your reel lets out a groan of protest as it runs out of line to give!').not_to match(h::Messages::REEL_REPLY)
+    end
+
+    it 'tells a cast apart from a failed one' do
+      cast = 'You lean back and let the line of your black fishing pole go with a sharp *WHOOSH!*  The freckled grey squid attached near the hook flies through the air before landing with a soft *plink* right off of the side of the jetty.'
+      already = "You've already cast the line of your black fishing pole and will need to pull on your black fishing pole to reel it in."
+
+      expect(cast).to match(h::Messages::CAST_OK)
+      expect(already).to match(h::Messages::CAST_OK)
+      expect('You must be holding a fishing rod.').to match(h::Messages::CAST_FAIL)
     end
 
     it 'reads pounds from a weigh reply' do
@@ -121,18 +137,38 @@ RSpec.describe 'TFish' do
       expect(state.weight).to eq('small silver weight')
     end
 
+    it 'reads a pole with no weight, using the line wording shown when unweighted' do
+      state = h::Pole.parse(<<~LOOK)
+        The pole's line looks to be in excellent condition.
+        A dead-eyed freckled grey squid is currently attached near the hook to attract fish.
+        The squid has the following qualities:
+            +16 to attracting fish near the surface
+      LOOK
+
+      expect(state).to eq(h::Pole::State.new(line: 'excellent', lure: 'dead-eyed freckled grey squid', weight: nil))
+    end
+
+    it 'sees a fresh line with no lure after restringing' do
+      state = h::Pole.parse("The pole's line looks to be in excellent condition.")
+
+      expect(state.line).to eq('excellent')
+      expect(state.lure).to be_nil
+    end
+
     it 'exposes the weight noun so sinkers and weights both come off the pole' do
       expect(h::Pole.parse(rigged).weight_noun).to eq('weight')
       expect(h::Pole.parse('An iron sinker is currently strung from the line of the rod to serve as a weight.').weight_noun).to eq('sinker')
     end
 
-    # Wear levels from https://gswiki.play.net/Fishing_equipment. Only the
-    # "excellent" sentence has been seen in a real log; the others assume the
-    # same "The line itself looks ..." lead-in.
+    # Wear levels from https://gswiki.play.net/Fishing_equipment. Only
+    # "excellent" has been seen in a real log, in both lead-ins ("The line
+    # itself" with a weight on, "The pole's line" without); the other levels
+    # assume the same sentence shape.
     {
       'The line itself looks to be in excellent condition.'          => ['excellent', false],
-      'The line itself looks to be in decent condition.'             => ['decent', false],
-      'The line itself looks to be showing signs of wear.'           => ['showing signs of wear', false],
+      "The pole's line looks to be in excellent condition."          => ['excellent', false],
+      "The rod's line looks to be in decent condition."              => ['decent', false],
+      "The pole's line looks to be showing signs of wear."           => ['showing signs of wear', false],
       'The line itself looks frayed and in danger of snapping soon.' => ['frayed and in danger of snapping soon', true],
     }.each do |sentence, (condition, frayed)|
       it "reads line wear: #{condition}" do
