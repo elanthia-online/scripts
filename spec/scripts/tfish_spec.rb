@@ -75,6 +75,15 @@ RSpec.describe 'TFish' do
       expect(h::Config[:cycle_weights]).to be true
     end
 
+    it 'lists every setting with its value, flagging changed ones' do
+      h::Config.store[:supplies_pole] = 'pole'
+      listing = h::Config.listing
+
+      expect(listing.lines.size).to eq(h::Config::DEFAULTS.size + 1)
+      expect(listing).to match(/^  supplies_pole +"pole"  \(default "rod"\)$/)
+      expect(listing).to match(/^  cast_distance +"far"$/)
+    end
+
     it 'only treats the constant weight as active when cycling is off and one is set' do
       expect(h::Config.constant_weight?).to be false
 
