@@ -283,11 +283,37 @@ RSpec.describe 'TFish' do
   end
 
   describe 'Rooms' do
-    it 'knows the dock and entrance' do
-      expect(h::Rooms.fishing?(32117)).to be true
-      expect(h::Rooms.fishing?(h::Rooms::ENTRANCE)).to be false
-      expect(h::Rooms.ebon_gate?(h::Rooms::ENTRANCE)).to be true
-      expect(h::Rooms.ebon_gate?(1)).to be false
+    it 'tells a dock entrance apart from its fishing spots' do
+      dock = h::Rooms.dock(1)
+
+      expect(dock.fishing?(32117)).to be true
+      expect(dock.fishing?(dock.entrance)).to be false
+      expect(dock.here?(dock.entrance)).to be true
+      expect(dock.here?(1)).to be false
+    end
+
+    it 'defaults to dock 1 and picks a dock by number' do
+      expect(h::Rooms.dock).to eq(h::Rooms::DOCKS[1])
+      expect(h::Rooms.dock(2).entrance).to eq(32074)
+      expect(h::Rooms.dock('2').spots).to eq([32120, 32121, 32122])
+    end
+
+    it 'falls back to dock 1 for an unknown dock number' do
+      expect(h::Rooms.dock(9)).to eq(h::Rooms::DOCKS[1])
+    end
+
+    it 'accepts a custom dock for one not listed yet' do
+      dock = h::Rooms.dock({ entrance: 40000, spots: [40001, '40002'] })
+
+      expect(dock.entrance).to eq(40000)
+      expect(dock.spots).to eq([40001, 40002])
+    end
+
+    it 'finds which known dock a room is on' do
+      expect(h::Rooms.dock_at(32121)).to eq(h::Rooms::DOCKS[2])
+      expect(h::Rooms.dock_at(31834)).to eq(h::Rooms::DOCKS[1])
+      expect(h::Rooms.dock_at(1)).to be_nil
+      expect(h::Rooms.dock_at(nil)).to be_nil
     end
 
     it 'does not count fishing bots toward the crowd' do
