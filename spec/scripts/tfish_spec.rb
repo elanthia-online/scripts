@@ -180,10 +180,33 @@ RSpec.describe 'TFish' do
         .not_to match(h::Messages::FOUND)
     end
 
-    it "reads a caught fish's rarity from LOOK" do
+    it "reads a non-Ebon Gate fish's rarity from LOOK" do
       expect('It is of rare quality.'[h::Messages::QUALITY, :rarity]).to eq('rare')
-      expect('It is of uncommon quality.'[h::Messages::QUALITY, :rarity]).to eq('uncommon')
       expect('The bass is about 13 inches long and weighs around 2 pounds.').not_to match(h::Messages::QUALITY)
+    end
+
+    # FISH TOTAL before and after a catch from fishing_log010.
+    it "tells a catch's rarity from which FISH TOTAL count went up" do
+      total = lambda do |common, uncommon, rare, epic, legendary|
+        <<~TOTAL
+                       Fishing Totals
+           --------------------------------------
+            Common Fish Caught:                #{common}
+            Uncommon Fish Caught:              #{uncommon}
+            Rare Fish Caught:                  #{rare}
+            Epic Fish Caught:                  #{epic}
+            Legendary Fish Caught:             #{legendary}
+            Total Fish Caught:                #{common + uncommon + rare + epic + legendary}
+            Lines Snapped:                     1
+        TOTAL
+      end
+      before = h::Messages.totals(total.(20, 9, 9, 4, 1))
+
+      expect(before).to eq('common' => 20, 'uncommon' => 9, 'rare' => 9, 'epic' => 4, 'legendary' => 1)
+      expect(h::Messages.new_rarity(before, h::Messages.totals(total.(20, 9, 9, 4, 2)))).to eq('legendary')
+      expect(h::Messages.new_rarity(before, h::Messages.totals(total.(21, 9, 9, 4, 1)))).to eq('common')
+      expect(h::Messages.new_rarity(before, before)).to be_nil
+      expect(h::Messages.new_rarity({}, before)).to be_nil
     end
 
     it 'starts capturing a cut on any reply to it' do
