@@ -170,6 +170,24 @@ RSpec.describe 'TFish' do
       expect(xml.match(h::Messages::AT_FEET).named_captures).to eq('id' => '5678', 'noun' => 'squid', 'name' => 'freckled grey squid')
     end
 
+    it 'reads the prize found inside a fish' do
+      coffin = "In addition, you find a gilt-cornered pumpkin ash coffin inside the butterflyfish's belly.  You toss the remaining carcass aside."
+      tombstone = "In addition, you find a laughing dog-shaped tombstone inside the parrotfish's belly.  You toss the remaining carcass aside."
+
+      expect(coffin[h::Messages::FOUND, :item]).to eq('a gilt-cornered pumpkin ash coffin')
+      expect(tombstone[h::Messages::FOUND, :item]).to eq('a laughing dog-shaped tombstone')
+      expect("Lakishiie also found a ghost white turnip inside the roosterfish's belly.")
+        .not_to match(h::Messages::FOUND)
+    end
+
+    it 'starts capturing a cut on any reply to it' do
+      ["You cut into the red scakor's flesh and after a few deft strokes produce a fine fillet of raw scakor.",
+       "You cut into the rainbow roosterfish's flesh but only end up mangling the thing beyond recognition.",
+       'Cut what?', 'Try holding the cod first.'].each { expect(it).to match(h::Messages::CUT_FISH) }
+      expect('Maziie cuts into the tentacled aberration\'s flesh but completely eviscerates the creature.')
+        .not_to match(h::Messages::CUT_FISH)
+    end
+
     it 'recognizes an overfished spot' do
       overfished = "It looks like this area has been heavily overfished.  You'll need to wait some time before you can fish here again."
 
