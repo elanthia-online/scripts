@@ -585,6 +585,14 @@ RSpec.describe 'TFish' do
       expect(dock.spots).to eq([40001, 40002])
     end
 
+    it "stays on a dock you're already fishing, otherwise goes to the configured one" do
+      h::Config.store[:dock] = 4
+
+      expect(h::Rooms.dock_for(32127).name).to eq('Misty Waters')
+      expect(h::Rooms.dock_for(31846).name).to eq('Moss Pond')
+      expect(h::Rooms.dock_for(1).name).to eq('Moss Pond')
+    end
+
     it 'moves to the next spot on the dock, wrapping around' do
       dock = h::Rooms.dock(1)
 
