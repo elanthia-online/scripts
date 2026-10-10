@@ -14,7 +14,7 @@ module TFishSpec
   SOURCE_PATH = find_lic_source('tfish.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH)
 
-  MODULES = %w[Config Messages Pole Weights Supplies Rooms].freeze
+  MODULES = %w[Config Messages Pole Weights Supplies Rooms Familiar].freeze
 
   FakeItem = Struct.new(:noun, :name)
   FakePc = Struct.new(:noun)
@@ -566,6 +566,29 @@ RSpec.describe 'TFish' do
       rows = h::Supplies.check(supplies, knife_box, h::Pole.parse(deep))
 
       expect(rows.last).to eq([:warn, 'dead-eyed freckled grey squid is better at deep depth than the surface'])
+    end
+  end
+
+  describe 'Familiar' do
+    at = Time.new(2026, 10, 10, 13, 16, 5)
+
+    it 'writes one line per catch with what FISH TOTAL does not show' do
+      line = h::Familiar.catch_line(number: 6, at:, cast: 'far', depth: 'Top', fish: 'tentacled aberration', rarity: 'legendary',
+                                    pounds: '5', bite: 25, fight: 252, reels: 40, prize: 'a piece of pitted grey scoria')
+
+      expect(line).to eq('#6 13:16 far/surface tentacled aberration (legendary) 5lb | bite 25s, fight 252s / 40 reels | a piece of pitted grey scoria')
+    end
+
+    it 'leaves out what is unknown' do
+      expect(h::Familiar.catch_line(number: 1, at:, cast: 'middle', depth: nil, fish: 'sand bass', bite: 40, fight: 200, reels: 30))
+        .to eq('#1 13:16 middle sand bass | bite 40s, fight 200s / 30 reels')
+    end
+
+    it 'writes a line for a snap or a fish that got away' do
+      expect(h::Familiar.loss_line(number: 7, at:, cast: 'far', depth: 'Bottom', outcome: :lost, fight: 48, reels: 8))
+        .to eq('#7 13:16 far/bottom SNAP after 48s / 8 reels')
+      expect(h::Familiar.loss_line(number: 7, at:, cast: 'near', depth: 'Middle', outcome: :empty, fight: 90, reels: 15))
+        .to eq('#7 13:16 near/middle got away after 90s / 15 reels')
     end
   end
 

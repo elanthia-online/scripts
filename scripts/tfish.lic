@@ -41,6 +41,7 @@
             fix: lure left at your feet after replacing a worn line
             fix: frayed lines are replaced before fishing so a snap doesn't take your lure
             new announce_finds setting to show what you find inside each fish, and each fish's rarity
+            familiar_debug now shows each fight: cast, depth, rarity, weight, bite/fight time, reels and find
             new replace_line_at setting to replace worn lines before they fray
             new lure settings to use the best lure for each depth
             new ;tfish check to confirm your gear is found for your settings
@@ -575,6 +576,31 @@ module TFish
     def least_crowded(counts) = counts.min_by { |_room, count| count }.first
   end
 
+  # familiar_debug lines: one per fight, with what FISH TOTAL can't show.
+  module Familiar
+    module_function
+
+    # Depth labels for the Weights::DEPTHS rotation.
+    def depth_label(depth) = { "Top" => "surface", "Middle" => "middle", "Bottom" => "bottom" }[depth]
+
+    # @param cast [String] cast distance (far, middle, near)
+    # @param depth [String, nil] Weights depth (Top, Middle, Bottom), nil if unknown
+    # @return [String] e.g. "#6 13:16 far/surface"
+    def heading(number, at, cast, depth) = "##{number} #{at.strftime('%H:%M')} #{[cast, depth_label(depth)].compact.join('/')}"
+
+    # @return [String] e.g. "#6 13:16 far/surface tentacled aberration (legendary) 5lb | bite 25s, fight 252s / 40 reels | pitted grey scoria"
+    def catch_line(number:, at:, cast:, depth:, fish:, bite:, fight:, reels:, rarity: nil, pounds: nil, prize: nil)
+      name = [fish, ("(#{rarity})" if rarity), ("#{pounds}lb" if pounds)].compact.join(" ")
+      ["#{heading(number, at, cast, depth)} #{name}", "bite #{bite}s, fight #{fight}s / #{reels} reels", prize].compact.join(" | ")
+    end
+
+    # @param outcome [Symbol] :lost (snapped) or :empty (got away)
+    # @return [String] e.g. "#7 13:22 far/surface SNAP after 48s / 8 reels"
+    def loss_line(number:, at:, cast:, depth:, outcome:, fight:, reels:)
+      "#{heading(number, at, cast, depth)} #{outcome == :lost ? 'SNAP' : 'got away'} after #{fight}s / #{reels} reels"
+    end
+  end
+
   HELP_TEXT = <<~HELP
     SYNTAX - ;tfish            fish the Ebon Gate dock
              ;tfish bypass     fish right where you're standing (no Ebon Gate travel, dock fee or squelching)
@@ -590,7 +616,8 @@ module TFish
 
       Setting              Default               Description
       pause_me             true                  pause the script after each catch
-      familiar_debug       false                 send catch stats to the familiar window
+      familiar_debug       false                 send a line per fight to the familiar window: cast distance,
+                                                 depth, fish, rarity, weight, bite and fight time, reels, find
       announce_finds       false                 send what you find inside each fish to the familiar window
       debug_my_script      false                 verbose log for diagnosing fishing: shows script commands,
                                                  timestamped cast/hook/reel lines, FISH STATUS/TOTAL, and
@@ -641,6 +668,7 @@ module TFish
       @cast_index = 0
       @pole = nil
       @weight_noun = nil
+      @fight_count = 0
       fput "fish status" if Config[:debug_my_script] # level and perks, for the log
       @totals = read_totals
     end
@@ -657,13 +685,14 @@ module TFish
         rig_pole!
         enter_dock! unless @bypass || @dock.fishing?(Room.current.id)
 
-        case fish
+        case (outcome = fish)
         when :caught
           process_catch
           pause_script if Config[:pause_me]
-        when :lost
-          Config.store[:snap_total] += 1
-          familiar("*SNAP*")
+        when :lost, :empty
+          Config.store[:snap_total] += 1 if outcome == :lost
+          familiar(Familiar.loss_line(number: @fight_count, at: Time.now, cast: @cast_distance, depth: @depth, outcome:,
+                                      fight: @fight_seconds, reels: @reels))
           waitrt?
           stow_pole
         else
@@ -677,9 +706,7 @@ module TFish
     def container = Config[:supplies_container]
 
     def familiar(message)
-      return unless Config[:familiar_debug]
-
-      Lich::Messaging.stream_window("#{Time.now.strftime('%H:%M:%S')} - #{message}", "familiar")
+      Lich::Messaging.stream_window(message, "familiar") if Config[:familiar_debug]
     end
 
     # Timestamped, so the log shows how long each part of a fight takes.
@@ -926,19 +953,21 @@ module TFish
       @cast_index += 1
       Config.store[:cast_total] += 1
       cast!
+      @cast_at = Time.now
+      @cast_distance = Config.cast_distance
+      @depth = depth
       debug_look("Cast #{Config.cast_distance} in room #{Room.current.id}")
 
       return :left unless wait_for_bite
 
       @hooked_at = Time.now
+      @bite_seconds = (@hooked_at - @cast_at).round
+      @fight_count += 1
       debug_look("Hooked")
 
       waitrt?
       pounds = Messages.pounds(dothistimeout("weigh ##{@pole.id}", 2, Messages::WEIGHT))
-      if pounds
-        echo "Fish Weight: #{pounds}"
-        familiar("#{depth || "Weighted"} - Fish Weight: #{pounds}")
-      end
+      echo "Fish Weight: #{pounds}" if pounds
 
       waitrt?
       CMan.use("surge_of_strength") if Config[:use_cman] && !Effects::Buffs.active?("Surge of Strength")
@@ -1004,13 +1033,14 @@ module TFish
         waitrt?
         outcome = Messages.reel_outcome(dothistimeout("fish reel", 5, Messages::REEL_REPLY))
         reels += 1
+        @reels = reels
+        @fight_seconds = (Time.now - @hooked_at).round
         outcome = :caught if catch_in_hand
         debug("Reel #{reels}: #{outcome || 'no reply'}")
         case outcome
         when :caught, :lost, :empty
           debug_look("#{outcome.to_s.capitalize} after #{reels} reels, #{(Time.now - @hooked_at).round}s on the line")
           fput "fish total" if Config[:debug_my_script] && outcome != :caught # a catch reads it anyway
-          familiar("Reels: #{reels}") if outcome == :caught
           return outcome
         when nil
           silent += 1
@@ -1088,7 +1118,8 @@ module TFish
         multifput "analyze ##{found.id}", "inspect ##{found.id}", "look at ##{found.id}", "look in ##{found.id}"
         fput "put ##{found.id} in #{TFish.ref(Vars.lootsack)}"
       end
-      familiar("#{Config[:fish_total]}/#{Config[:cast_total]} - #{caught}(#{found&.name}) - #{pounds}#s")
+      familiar(Familiar.catch_line(number: @fight_count, at: Time.now, cast: @cast_distance, depth: @depth, fish: fish.name,
+                                   rarity:, pounds:, bite: @bite_seconds, fight: @fight_seconds, reels: @reels, prize:))
     end
 
     # @return [Array<String>] ids of what was trashed
