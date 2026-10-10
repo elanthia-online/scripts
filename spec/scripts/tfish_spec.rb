@@ -149,6 +149,15 @@ RSpec.describe 'TFish' do
       expect("You can't cast without a free hand.").to match(h::Messages::CAST_FAIL)
     end
 
+    it 'finds what cutting the line dropped at your feet' do
+      plain = 'With a swift, sharp tug, you snap the line of your fishing rod.  Your freckled grey squid falls to the ground at your feet.'
+      xml = 'With a swift, sharp tug, you snap the line of your <a exist="1234" noun="rod">fishing rod</a>.  ' \
+            'Your <a exist="5678" noun="squid">freckled grey squid</a> falls to the ground at your feet.'
+
+      expect(plain.match(h::Messages::AT_FEET).named_captures).to eq('id' => nil, 'noun' => nil, 'name' => 'freckled grey squid')
+      expect(xml.match(h::Messages::AT_FEET).named_captures).to eq('id' => '5678', 'noun' => 'squid', 'name' => 'freckled grey squid')
+    end
+
     it 'recognizes an overfished spot' do
       overfished = "It looks like this area has been heavily overfished.  You'll need to wait some time before you can fish here again."
 
