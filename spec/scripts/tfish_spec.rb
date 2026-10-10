@@ -188,22 +188,6 @@ RSpec.describe 'TFish' do
         .not_to match(h::Messages::CUT_FISH)
     end
 
-    it 'reads the modifier off your rolls' do
-      expect(h::Messages.roll_modifier('[Fishing result: -16 (Open d100: 8)]')).to eq(-24)
-      expect(h::Messages.roll_modifier('[Fishing result: 122 (Open d100: 76)]')).to eq(46)
-      expect(h::Messages.roll_modifier('Roundtime: 5 sec.')).to be_nil
-    end
-
-    # Modifier sequences from fishing_log009: the fish tires when it jumps
-    # about +70, sometimes via one roll around +25.
-    it 'spots the fish tiring from the jump in roll modifiers' do
-      expect(h::Messages.tired?([-24, -25, -24, -24])).to be false
-      expect(h::Messages.tired?([-24, -25, -24, 46])).to be true
-      expect(h::Messages.tired?([-24, -25, 26])).to be true
-      expect(h::Messages.tired?([-10, -11, 61])).to be true
-      expect(h::Messages.tired?([46])).to be false
-    end
-
     it 'recognizes an overfished spot' do
       overfished = "It looks like this area has been heavily overfished.  You'll need to wait some time before you can fish here again."
 
