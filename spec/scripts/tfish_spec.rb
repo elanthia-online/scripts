@@ -294,12 +294,29 @@ RSpec.describe 'TFish' do
 
     it 'defaults to dock 1 and picks a dock by number' do
       expect(h::Rooms.dock).to eq(h::Rooms::DOCKS[1])
-      expect(h::Rooms.dock(2).entrance).to eq(32074)
-      expect(h::Rooms.dock('2').spots).to eq([32120, 32121, 32122])
+      expect(h::Rooms.dock(3).entrance).to eq(32074)
+      expect(h::Rooms.dock('3').spots).to eq([32120, 32121, 32122])
     end
 
-    it 'falls back to dock 1 for an unknown dock number' do
+    it 'picks a dock by part of its name' do
+      expect(h::Rooms.dock('moss').name).to eq('Moss Pond')
+      expect(h::Rooms.dock('Misty Waters').entrance).to eq(31846)
+    end
+
+    it 'falls back to dock 1 for an unknown dock' do
       expect(h::Rooms.dock(9)).to eq(h::Rooms::DOCKS[1])
+      expect(h::Rooms.dock('nowhere')).to eq(h::Rooms::DOCKS[1])
+      expect(h::Rooms.dock('')).to eq(h::Rooms::DOCKS[1])
+    end
+
+    # Room ids from elanthia-online/mapdb-backup-gs: each entrance is tagged
+    # fishing..fishing4, and every dock's three spots link to each other.
+    it 'has four docks with unique entrances and spots' do
+      docks = h::Rooms::DOCKS.values
+
+      expect(docks.size).to eq(4)
+      expect(docks.map(&:entrance).uniq.size).to eq(4)
+      expect(docks.flat_map(&:spots).uniq.size).to eq(12)
     end
 
     it 'accepts a custom dock for one not listed yet' do
@@ -310,7 +327,8 @@ RSpec.describe 'TFish' do
     end
 
     it 'finds which known dock a room is on' do
-      expect(h::Rooms.dock_at(32121)).to eq(h::Rooms::DOCKS[2])
+      expect(h::Rooms.dock_at(32121)).to eq(h::Rooms::DOCKS[3])
+      expect(h::Rooms.dock_at(32073)).to eq(h::Rooms::DOCKS[4])
       expect(h::Rooms.dock_at(31834)).to eq(h::Rooms::DOCKS[1])
       expect(h::Rooms.dock_at(1)).to be_nil
       expect(h::Rooms.dock_at(nil)).to be_nil
