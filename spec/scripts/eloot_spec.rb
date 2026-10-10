@@ -3082,3 +3082,48 @@ RSpec.describe 'ELoot::Inventory.single_drag while stunned' do
     expect { harness_for(stunned_checks: 0, store_result: :raise).single_drag(item) }.to raise_error('boom')
   end
 end
+
+RSpec.describe 'ELoot loot_stance' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:source) { File.read(eloot_path) }
+  let(:sent) { [] }
+
+  let(:eloot) do
+    recorder = sent
+    mod = Module.new
+    mod.const_set(:ELoot, mod)
+    mod.const_set(:Stance, Module.new do
+      const_set(:NAMES, %w[offensive advance forward neutral guarded defensive].freeze)
+      define_singleton_method(:change) { |s| recorder << s }
+    end)
+    mod.const_set(:Effects, Module.new do
+      const_set(:Debuffs, Module.new { define_singleton_method(:active?) { |_| false } })
+    end)
+    mod.define_singleton_method(:msg) { |**_| nil }
+    mod.define_singleton_method(:seed_missing_defaults) { |_| false }
+    mod.define_singleton_method(:save_profile) { nil }
+    mod.module_eval(extract_lic_method(source, 'change_stance', source_path: eloot_path))
+    mod.module_eval(extract_lic_method(source, 'migrate_overflow_settings', source_path: eloot_path))
+    mod
+  end
+
+  it 'changes to the chosen stance' do
+    eloot.change_stance('guarded')
+    expect(sent).to eq(['guarded'])
+  end
+
+  it 'leaves stance alone for none or a missing setting' do
+    eloot.change_stance('none')
+    eloot.change_stance(nil)
+    expect(sent).to be_empty
+  end
+
+  it 'migrates loot_defensive on to defensive and off to none' do
+    on = { loot_defensive: true }
+    off = { loot_defensive: false, loot_stance: 'none' }
+    eloot.migrate_overflow_settings(on)
+    eloot.migrate_overflow_settings(off)
+    expect(on).to eq(loot_stance: 'defensive')
+    expect(off).to eq(loot_stance: 'none')
+  end
+end
