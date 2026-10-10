@@ -41,6 +41,8 @@
             fix: lure left at your feet after replacing a worn line
             fix: frayed lines are replaced before fishing so a snap doesn't take your lure
             new announce_finds setting to show what you find inside each fish
+            new replace_line_at setting to replace worn lines before they fray
+            new experimental rest_until_tired setting to wait for the fish to tire before reeling
             new lure settings to use the best lure for each depth
             new ;tfish check to confirm your gear is found for your settings
             new lure setting, replaces the old bait setting
@@ -130,6 +132,9 @@ module TFish
       dock: 1,
       fav_room: 0,
       trash_cut: true,
+      replace_line_at: "frayed",
+      rest_until_tired: false,
+      rest_timeout: 180,
     }.freeze
 
     # @return [Array<String>] valid FISH CAST distances
@@ -184,7 +189,7 @@ module TFish
   module Messages
     # Drop constants left by an earlier run this session so a restart loads the
     # current definitions without already-initialized warnings.
-    %i[HOOKED CAUGHT LOST EMPTY REEL_REPLY CAST_OK CAST_FAIL OVERFISHED AT_FEET CUT_REPLY RESTRUNG RESTRING_REPLY WEIGHT INSPECT_ALERT FOUND CUT_FISH GET_OK GET_FAIL HANDS_FULL DOCK_NO_SHARDS DOCK_CONFIRM].each { |name| remove_const(name) if const_defined?(name, false) }
+    %i[HOOKED CAUGHT LOST EMPTY REEL_REPLY CAST_OK CAST_FAIL OVERFISHED AT_FEET CUT_REPLY RESTRUNG RESTRING_REPLY WEIGHT INSPECT_ALERT FOUND CUT_FISH GET_OK GET_FAIL HANDS_FULL DOCK_NO_SHARDS DOCK_CONFIRM ROLL TIRED_JUMP].each { |name| remove_const(name) if const_defined?(name, false) }
 
     # A fish took the lure and the hook is set.
     HOOKED = /^You feel a brief jerk on your line before it begins to reel out wildly\./
@@ -216,6 +221,12 @@ module TFish
     INSPECT_ALERT = /probably deserves a close inspection/
     # Something found inside a fish when cutting it. Captures the item.
     FOUND = /In addition, you find (?<item>.+?) inside the .+?'s belly\./
+    # One of your own rolls (the game only shows your rolls). The modifier is
+    # result minus d100.
+    ROLL = /\[Fishing result: (?<result>-?\d+) \(Open d100: (?<d100>-?\d+)\)\]/
+    # How far the modifier jumps when the fish tires. Logs show about +70
+    # (e.g. -24 to +46), sometimes via one roll around +25.
+    TIRED_JUMP = 30
     # First line of cutting a fish (or failing to).
     CUT_FISH = /^You cut into|^Cut what\?|^Try holding/
     # GET succeeded.
@@ -238,6 +249,17 @@ module TFish
     DOCK_CONFIRM = /If you wish to pay the cost and continue, GO dock again/
 
     module_function
+
+    # @param line [String, nil]
+    # @return [Integer, nil] the roll's modifier (result minus d100), nil if not a roll
+    def roll_modifier(line)
+      roll = line&.match(ROLL)
+      roll[:result].to_i - roll[:d100].to_i if roll
+    end
+
+    # @param mods [Array<Integer>] roll modifiers seen so far in the fight
+    # @return [Boolean] whether the latest has jumped far enough above the lowest to mean the fish tired
+    def tired?(mods) = mods.size > 1 && mods.last >= mods.min + TIRED_JUMP
 
     # @param line [String, nil] a reel reply, nil if none arrived in time
     # @return [Symbol, nil] :caught, :lost, :empty, :reeling, or nil for no reply
@@ -275,6 +297,10 @@ module TFish
 
       # @return [Boolean] whether the line is about to snap and should be replaced
       def frayed? = line.to_s.include?("frayed")
+
+      # @param at [String] replace_line_at setting: "frayed" or "worn"
+      # @return [Boolean] whether the line should be replaced now
+      def replace?(at) = frayed? || (at.to_s == "worn" && line.to_s.include?("signs of wear"))
 
       # @return [Symbol, nil] depth the lure attracts best at, nil if unknown
       def best_depth = lure_bonus.max_by { |_depth, bonus| bonus }&.first
@@ -414,8 +440,9 @@ module TFish
       add.(line_spares.positive?, "Spare line (#{Config[:supplies_line]}): #{line_spares}")
       if pole
         line = pole.line || "none, will be restrung"
-        line += ", will be replaced before fishing" if pole.frayed?
-        add.(!pole.frayed?, "Line on the pole: #{line}", warn: true)
+        replace = pole.replace?(Config[:replace_line_at])
+        line += ", will be replaced before fishing" if replace
+        add.(!replace, "Line on the pole: #{line}", warn: true)
       end
       add.(Array(knife_box).any? { named?(it.name, Config[:fillet_knife]) }, "Knife (#{Config[:fillet_knife]}) in your #{Config[:knife_container]}")
 
@@ -556,6 +583,11 @@ module TFish
                                                  the hook, every 5 reels and when the fish is landed/lost
       squelch_script       true                  run ;tsquelch to hide other fishers' spam
       trash_cut            true                  trash the fillet after cutting the fish
+      replace_line_at      "frayed"              replace the line once it's "frayed", or "worn" to replace it
+                                                 earlier (showing signs of wear) so it can't fray mid-fight
+      rest_until_tired     false                 experimental: after the hook, don't reel until the fish tires
+                                                 (its roll modifier jumps), then reel it in
+      rest_timeout         180                   seconds to rest before reeling anyway
       supplies_container   "cloak"               container holding pole, lure, line and weights
       supplies_minimum     5                     minimum weights needed to keep fishing
       supplies_pole        "rod"                 noun of your fishing pole
@@ -725,7 +757,7 @@ module TFish
       # A frayed line only comes off with a lure on it (CUT is refused
       # otherwise), so this comes after attaching one. Fishing it instead
       # risks a snap that takes the lure with it.
-      if state.frayed?
+      if state.replace?(Config[:replace_line_at])
         restring(cut_old: true)
         state = look_pole
         @lure_name, @lure_noun = state.lure ? [state.lure, state.lure_noun] : attach_lure
@@ -738,7 +770,7 @@ module TFish
       end
       put_weight_on("#{Config[:weight_noncycle]} weight") if Config.constant_weight? && state.weight.nil?
       warn_deep_lure(state)
-      debug("Pole: #{state.inspect}")
+      debug("Pole: line #{state.line || 'none'}, lure #{@lure_name || 'none'}, weight #{state.weight || 'none'}")
     end
 
     # Warns once per run when fishing the surface (no weight) with a lure
@@ -895,7 +927,8 @@ module TFish
 
       waitrt?
       CMan.use("surge_of_strength") if Config[:use_cman] && !Effects::Buffs.active?("Surge of Strength")
-      reel
+      outcome = rest_until_tired if Config[:rest_until_tired]
+      outcome || reel
     end
 
     # Casts the line. If the spot is overfished, waits and tries again, then
@@ -944,6 +977,36 @@ module TFish
 
         debug_look("Still waiting for a bite")
       end
+    end
+
+    # Experimental (rest_until_tired): don't reel while the fish runs. Watch
+    # its rolls instead, and stop resting once the modifier jumps (the fish
+    # tired), the line snaps, or rest_timeout passes.
+    #
+    # @return [Symbol, nil] :lost or :empty if the fight ended while resting, nil to start reeling
+    def rest_until_tired
+      debug("Resting until the fish tires")
+      mods = []
+      deadline = Time.now + Config[:rest_timeout].to_i
+      while Time.now < deadline
+        line = get?
+        unless line
+          sleep 0.1
+          next
+        end
+        if (mod = Messages.roll_modifier(line))
+          mods << mod
+          if Messages.tired?(mods)
+            debug("Fish tired after #{(Time.now - @hooked_at).round}s (modifier #{mods.min} -> #{mod}), reeling")
+            return
+          end
+        elsif (outcome = Messages.reel_outcome(line)) && outcome != :reeling
+          debug("#{outcome.to_s.capitalize} while resting, #{(Time.now - @hooked_at).round}s on the line")
+          return outcome unless outcome == :caught
+        end
+      end
+      debug("Stopped resting after #{Config[:rest_timeout]}s (modifiers #{mods.inspect}), reeling")
+      nil
     end
 
     # Reels until the fish is landed, snaps the line, or gets away (the line
