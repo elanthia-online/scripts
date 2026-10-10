@@ -31,10 +31,11 @@ end
 RSpec.describe 'TFish' do
   let(:h) { TFishSpec::Harness }
 
-  # Every constant tfish.lic assigns has to be in the removal list at the top
-  # of the file, or a rerun in the same Lich session warns about redefining it.
+  # Every constant tfish.lic assigns has to be in its module's removal list
+  # (the `%i[...].each { remove_const }` line at the top of each module), or
+  # a rerun in the same Lich session warns about redefining it.
   it 'lists every constant it defines for removal on rerun' do
-    listed = TFishSpec::SOURCE[/^%w\[\n(.*?)^\]\.each/m, 1].split.map { it.split('::').last }
+    listed = TFishSpec::SOURCE.scan(/%i\[([^\]]*)\]\.each \{ \|name\| remove_const/).flatten.flat_map(&:split)
     assigned = TFishSpec::SOURCE.scan(/^ +([A-Z][A-Za-z_]*) = /).flatten
 
     expect(listed).to match_array(assigned)
