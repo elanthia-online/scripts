@@ -389,6 +389,12 @@ RSpec.describe 'TFish' do
       expect(h::Weights.fishing_depth(0)).to be_nil
     end
 
+    it 'reads how deep a weight sinks the line' do
+      expect(h::Weights.sink_depth('The weight looks like it is heavy enough to sink a line to the middle depths of a body of water.')).to eq('middle depths')
+      expect(h::Weights.sink_depth('The weight looks like it is heavy enough to sink a line to the bottom of a body of water.')).to eq('bottom')
+      expect(h::Weights.sink_depth('You see nothing unusual.')).to be_nil
+    end
+
     it 'uses the lure set for each depth, and none when unset' do
       h::Config.store[:lure_middle] = 'skull-shaped lure'
 

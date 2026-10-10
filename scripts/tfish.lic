@@ -19,6 +19,9 @@
       ;TFISH CHECK
       Check that your pole, line, lures, weights and knife are found for your settings.
 
+      ;TFISH TEST
+      Test putting each weight and lure on the pole and taking it off (no fishing).
+
       ;TFISH HELP
       Show additional help.
 
@@ -42,6 +45,7 @@
             fix: frayed lines are replaced before fishing so a snap doesn't take your lure
             new announce_finds setting to show what you find inside each fish
             new replace_line_at setting to replace worn lines before they fray
+            new ;tfish test to check weights and lures go on and off the pole
             new lure settings to use the best lure for each depth
             new ;tfish check to confirm your gear is found for your settings
             new lure setting, replaces the old bait setting
@@ -375,6 +379,10 @@ module TFish
       lure unless lure.nil? || lure.empty?
     end
 
+    # @param text [String, nil] LOOK at a weight
+    # @return [String, nil] where it sinks a line ("middle depths", "bottom")
+    def sink_depth(text) = text.to_s[/heavy enough to sink a line to the (.+?) of a body of water/, 1]
+
     # @param cast_index [Integer] 0-based cast count this session
     # @return [String, nil] weight name to put on the pole, nil for no weight
     def for_cast(cast_index)
@@ -545,6 +553,8 @@ module TFish
              ;tfish bypass     fish right where you're standing (no Ebon Gate travel, dock fee or squelching)
              ;tfish list       show your current settings
              ;tfish check      check your gear is found for the fishing your settings describe
+             ;tfish test       put each weight and lure you use on the pole and take it off again, to test
+                               the gear handling (no fishing; the pole is left bare and stowed)
 
       Does NOT automatically sell. Empty your containers by selling/lockering yourself.
 
@@ -635,7 +645,59 @@ module TFish
       end
     end
 
+    # `;tfish test`: exercises the gear handling that hasn't been seen in a
+    # live log yet (weights on and off by #id, lure swaps, each weight's sink
+    # depth), without fishing. Leaves the pole bare and stowed; fishing rigs it.
+    #
+    # @return [Array<Array(Symbol, String)>] [:ok or :missing, description] per step
+    def self_test
+      rows = []
+      add = ->(ok, text) { rows << [ok ? :ok : :missing, text] }
+      @pole = get_gear(Config[:supplies_pole])
+      return [[:missing, "Pole (#{Config[:supplies_pole]}) not found in your #{container}"]] unless @pole
+
+      start = look_pole
+      add.(true, "Pole: line #{start.line || 'none'}, lure #{start.lure || 'none'}, weight #{start.weight || 'none'}")
+      take_off_pole(start.lure_noun) if start.lure
+      take_off_pole(start.weight_noun) if start.weight
+      bare = look_pole
+      add.(bare.lure.nil? && bare.weight.nil?, "Took the lure and weight off by noun (#{[start.lure_noun, start.weight_noun].compact.join(', ').then { it.empty? ? 'nothing was on it' : it }})")
+
+      weights = { Config[:weight_depths] => "middle depths", Config[:weight_bottom] => "bottom" }
+      weights = { "#{Config[:weight_noncycle]} weight" => nil } if Config.constant_weight?
+      weights = {} unless Config[:cycle_weights] || Config.constant_weight?
+      weights.each { |name, depth| test_gear("Weight #{name}", name, :weight, rows, depth) }
+
+      lures = [Config[:supplies_lure], *Weights::DEPTHS.filter_map { Weights.lure_for(it) }].uniq
+      lures.each { test_gear("Lure #{it}", it, :lure, rows) }
+
+      stow_pole
+      rows
+    end
+
     private
+
+    # Puts one weight or lure on the pole by #id, checks LOOK sees it with the
+    # right noun, then takes it off by that noun and checks it came off.
+    def test_gear(label, name, kind, rows, depth = nil)
+      add = ->(ok, text) { rows << [ok ? :ok : :missing, "#{label}: #{text}"] }
+      item = supplies_contents.find { Supplies.named?(it.name, name) }
+      return add.(false, "not found in your #{container}") unless item
+
+      if kind == :weight
+        sinks = Weights.sink_depth(dothistimeout("look ##{item.id}", 2, /heavy enough to sink a line|You see nothing unusual/))
+        add.(depth.nil? || sinks == depth, "sinks to the #{sinks || 'unknown'}#{" (expected #{depth})" if depth && sinks != depth}")
+      end
+      fput "get ##{item.id} from #{TFish.ref(container)}"
+      fput "put ##{item.id} on ##{@pole.id}"
+      state = look_pole
+      on, noun = kind == :lure ? [state.lure, state.lure_noun] : [state.weight, state.weight_noun]
+      bonus = " #{state.lure_bonus.map { |d, b| "#{d} +#{b}" }.join(', ')}" if kind == :lure && state.lure_bonus.any?
+      add.(on && noun == item.noun, "put on by #id; LOOK shows #{on.inspect}, noun #{noun.inspect}#{bonus}")
+      take_off_pole(noun || item.noun)
+      off = look_pole
+      add.((kind == :lure ? off.lure : off.weight).nil?, "taken off by noun and put back")
+    end
 
     def container = Config[:supplies_container]
 
@@ -1111,12 +1173,34 @@ module TFish
            end
     dock = Rooms.dock
 
+    report("tfish check: #{mode}, cast #{Config.cast_distance}, dock #{dock.name}", rows,
+           failed: "Fix the MISSING items before fishing (;tfish list shows your settings).", passed: "Everything needed was found.")
+  end
+
+  # `;tfish test`: see Runner#self_test.
+  #
+  # @return [void]
+  def self_test
+    register_shutdown_hook
+    [Config[:supplies_container], Config[:knife_container]].uniq.each { fput "look in #{ref(it)}" }
+    pause 0.5
+    rows = Runner.new(bypass: true).self_test
+    report("tfish test: weights and lures on and off the pole", rows,
+           failed: "Some steps FAILED; please send the log so the script can be fixed.", passed: "All steps passed.")
+  end
+
+  # @param title [String]
+  # @param rows [Array<Array(Symbol, String)>] [:ok, :missing or :warn, description]
+  # @param failed [String] closing line when anything is :missing
+  # @param passed [String] closing line otherwise
+  # @return [void]
+  def report(title, rows, failed:, passed:)
     labels = { ok: "  OK  ", missing: "MISSING", warn: " WARN " }
-    Lich::Messaging.mono(<<~CHECK)
-      tfish check: #{mode}, cast #{Config.cast_distance}, dock #{dock.name}
+    Lich::Messaging.mono(<<~REPORT)
+      #{title}
       #{rows.map { |status, text| "  [#{labels[status]}] #{text}" }.join("\n")}
-      #{rows.any? { it.first == :missing } ? 'Fix the MISSING items before fishing (;tfish list shows your settings).' : 'Everything needed was found.'}
-    CHECK
+      #{rows.any? { it.first == :missing } ? failed : passed}
+    REPORT
   end
 
   # Script entry point.
@@ -1142,6 +1226,10 @@ module TFish
     silence_me unless Config[:debug_my_script]
     if hands.any?
       Lich::Messaging.msg("error", "Please empty your hands before running this script.")
+      return
+    end
+    if arg == "test"
+      self_test
       return
     end
     if Vars.lootsack.to_s.empty?
