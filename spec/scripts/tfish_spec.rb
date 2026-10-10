@@ -307,15 +307,14 @@ RSpec.describe 'TFish' do
       expect(h::Pole.parse('An iron sinker is currently strung from the line of the rod to serve as a weight.').weight_noun).to eq('sinker')
     end
 
-    # Wear levels from https://gswiki.play.net/Fishing_equipment. Only
-    # "excellent" has been seen in a real log, in both lead-ins ("The line
-    # itself" with a weight on, "The pole's line" without); the other levels
-    # assume the same sentence shape.
+    # Wear levels as seen in game logs, in both lead-ins ("The line itself"
+    # with a weight on, "The pole's line" without). The wiki's "signs of wear"
+    # is "signs of use" in game.
     {
       'The line itself looks to be in excellent condition.'          => ['excellent', false],
       "The pole's line looks to be in excellent condition."          => ['excellent', false],
       "The rod's line looks to be in decent condition."              => ['decent', false],
-      "The pole's line looks to be showing signs of wear."           => ['showing signs of wear', false],
+      "The pole's line looks to be showing signs of use."            => ['showing signs of use', false],
       'The line itself looks frayed and in danger of snapping soon.' => ['frayed and in danger of snapping soon', true],
     }.each do |sentence, (condition, frayed)|
       it "reads line wear: #{condition}" do
@@ -350,7 +349,7 @@ RSpec.describe 'TFish' do
     end
 
     it 'replaces the line when frayed, or when worn if set to' do
-      worn = h::Pole.parse("The pole's line looks to be showing signs of wear.")
+      worn = h::Pole.parse("The pole's line looks to be showing signs of use.")
       frayed = h::Pole.parse("The pole's line looks to be frayed and in danger of snapping soon.")
       decent = h::Pole.parse("The pole's line looks to be in decent condition.")
 
