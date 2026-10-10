@@ -276,7 +276,7 @@ RSpec.describe 'TFish' do
       LOOK
 
       expect(state).to eq(h::Pole::State.new(line: 'excellent', lure: 'dead-eyed freckled grey squid', weight: nil,
-                                             lure_bonus: { surface: 16, middle: 12, deep: 12 }))
+                                             lure_bonus: { surface: 16, middle: 12, deep: 12 }, lure_noun: 'squid'))
     end
 
     it 'sees a fresh line with no lure after restringing' do
@@ -284,6 +284,22 @@ RSpec.describe 'TFish' do
 
       expect(state.line).to eq('excellent')
       expect(state.lure).to be_nil
+    end
+
+    # Long descriptions don't end with the noun ("...lure dangling a tiny gold
+    # key"), so the noun comes from the item's XML link in the LOOK output.
+    it 'reads attached gear nouns from the XML link, not the last word of the description' do
+      look = <<~XML
+        The <a exist="709969844" noun="pole">pole's</a> line looks to be in excellent condition.
+        A <a exist="710037312" noun="lure">twisted iron ebon gate lure</a> dangling a tiny gold key is currently attached near the hook to attract fish.
+        A <a exist="709996453" noun="weight">translucent glaes weight</a> with gleaming metallic veins is currently strung from the line of the <a exist="709969844" noun="pole">pole</a> to serve as a weight.
+      XML
+      state = h::Pole.parse(look)
+
+      expect(state.lure).to eq('twisted iron ebon gate lure dangling a tiny gold key')
+      expect(state.lure_noun).to eq('lure')
+      expect(state.weight).to eq('translucent glaes weight with gleaming metallic veins')
+      expect(state.weight_noun).to eq('weight')
     end
 
     it 'exposes the weight noun so sinkers and weights both come off the pole' do
