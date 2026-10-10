@@ -120,6 +120,26 @@ RSpec.describe 'TFish' do
       expect('Your reel lets out a groan of protest as it runs out of line to give!').not_to match(h::Messages::REEL_REPLY)
     end
 
+    # Ebon Gate docks are shared: other players' fishing lines arrive in the
+    # same stream and must never be taken for your own.
+    it "ignores other players' hook, snap and catch lines" do
+      others = [
+        "Remzsii's sugar cane rod bends slightly and its tip dips.  She swiftly gives the rod a tug to set the hook!",
+        "The line of Lakishiie's fishing rod strains and breaks with a sharp *SNAP*!",
+        'Kenzsii gives her sugar cane rod one final tug and a dark brown yellow-finned batfish comes wriggling to the surface!  Moving swiftly, she takes in the rest of her line and unhooks the batfish, then takes hold of it tightly.',
+        "Remzsii's sugar cane rod lets out a groan of protest as it runs out of line to give!",
+      ]
+
+      others.each do |line|
+        expect(line).not_to match(h::Messages::HOOKED)
+        expect(line).not_to match(h::Messages::REEL_REPLY)
+      end
+    end
+
+    it 'fails a cast with no free hand right away instead of waiting for a reply' do
+      expect("You can't cast without a free hand.").to match(h::Messages::CAST_FAIL)
+    end
+
     it 'recognizes an overfished spot' do
       overfished = "It looks like this area has been heavily overfished.  You'll need to wait some time before you can fish here again."
 
