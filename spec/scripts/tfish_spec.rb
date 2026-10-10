@@ -366,6 +366,19 @@ RSpec.describe 'TFish' do
       expect(h::Supplies.shortages(stocked(5) + [wire, mandrake])).to eq(['Lure - ebon gate lure - 0/1'])
     end
 
+    it 'matches items by words, the way you would in game' do
+      mandrake = 'leaf-topped grey mandrake lure'
+
+      expect(h::Supplies.named?(mandrake, 'grey lure')).to be true
+      expect(h::Supplies.named?(mandrake, 'mandrake lure')).to be true
+      expect(h::Supplies.named?(mandrake, 'Leaf-Topped Grey')).to be true
+      expect(h::Supplies.named?(mandrake, 'gre lur')).to be true
+      expect(h::Supplies.named?('pale carved skull-shaped lure', 'skull lure')).to be true
+      expect(h::Supplies.named?(mandrake, 'skull lure')).to be false
+      expect(h::Supplies.named?('blown glass weight', 'glaes weight')).to be false
+      expect(h::Supplies.named?(nil, 'grey lure')).to be false
+    end
+
     it 'treats a missing container as empty' do
       expect(h::Supplies.shortages(nil)).to include('Fishing Line - wire - 0/1')
     end
