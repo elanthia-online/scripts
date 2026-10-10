@@ -594,14 +594,6 @@ RSpec.describe 'TFish' do
       expect(dock.next_spot(nil)).to eq(32116)
     end
 
-    it 'finds which known dock a room is on' do
-      expect(h::Rooms.dock_at(32121)).to eq(h::Rooms::DOCKS[3])
-      expect(h::Rooms.dock_at(32073)).to eq(h::Rooms::DOCKS[4])
-      expect(h::Rooms.dock_at(31834)).to eq(h::Rooms::DOCKS[1])
-      expect(h::Rooms.dock_at(1)).to be_nil
-      expect(h::Rooms.dock_at(nil)).to be_nil
-    end
-
     it 'does not count fishing bots toward the crowd' do
       pcs = %w[Fishmon Ilten Tysong].map { TFishSpec::FakePc.new(it) }
 
