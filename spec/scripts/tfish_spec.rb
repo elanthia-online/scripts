@@ -297,6 +297,27 @@ RSpec.describe 'TFish' do
     end
   end
 
+  describe 'depth lures' do
+    it 'fishes the surface with no weight, rotates when cycling, and is unknown with a constant weight' do
+      expect(h::Weights.fishing_depth(1)).to eq('Top')
+
+      h::Config.store[:cycle_weights] = true
+      expect((0..2).map { h::Weights.fishing_depth(it) }).to eq(%w[Top Middle Bottom])
+
+      h::Config.store[:cycle_weights] = false
+      h::Config.store[:weight_noncycle] = 'glaes'
+      expect(h::Weights.fishing_depth(0)).to be_nil
+    end
+
+    it 'uses the lure set for each depth, and none when unset' do
+      h::Config.store[:lure_middle] = 'skull-shaped lure'
+
+      expect(h::Weights.lure_for('Middle')).to eq('skull-shaped lure')
+      expect(h::Weights.lure_for('Top')).to be_nil
+      expect(h::Weights.lure_for(nil)).to be_nil
+    end
+  end
+
   describe 'Supplies.shortages' do
     item = TFishSpec::FakeItem
 
@@ -330,6 +351,19 @@ RSpec.describe 'TFish' do
 
       expect(h::Supplies.shortages(stocked(5) + [item.new('wire', 'fishing wire')])).to be_empty
       expect(h::Supplies.shortages([item.new('wire', 'fishing wire')])).to eq(['Constant Weight - glaes - 0/5'])
+    end
+
+    it 'needs one of each depth lure that is set and in use' do
+      h::Config.store[:lure_surface] = 'mandrake lure'
+      h::Config.store[:lure_deep] = 'ebon gate lure'
+      wire = item.new('wire', 'fishing wire')
+      mandrake = item.new('lure', 'leaf-topped grey mandrake lure with tiny thorn teeth')
+
+      expect(h::Supplies.shortages([wire, mandrake])).to be_empty
+      expect(h::Supplies.shortages([wire])).to eq(['Lure - mandrake lure - 0/1'])
+
+      h::Config.store[:cycle_weights] = true
+      expect(h::Supplies.shortages(stocked(5) + [wire, mandrake])).to eq(['Lure - ebon gate lure - 0/1'])
     end
 
     it 'treats a missing container as empty' do

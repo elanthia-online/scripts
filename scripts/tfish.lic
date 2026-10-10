@@ -36,6 +36,7 @@
             waits out overfished spots, then moves to another spot on the dock
             new ;tfish list to show your current settings
             fix: lure left at your feet after replacing a worn line
+            new lure settings to use the best lure for each depth
             new lure setting, replaces the old bait setting
             weight cycling now off by default, no weight with a surface lure is best
             warns if your lure is better deep down while fishing with no weight
@@ -111,6 +112,9 @@ module TFish
       weight_noncycle: "",
       weight_depths: "blown glass weight",
       weight_bottom: "glaes weight",
+      lure_surface: "",
+      lure_middle: "",
+      lure_deep: "",
       use_cman: false,
       supplies_minimum: 5,
       cast_timer: 60,
@@ -289,16 +293,34 @@ module TFish
   module Weights
     # Drop constants left by an earlier run this session so a restart loads the
     # current definitions without already-initialized warnings.
-    %i[DEPTHS].each { |name| remove_const(name) if const_defined?(name, false) }
+    %i[DEPTHS DEPTH_LURES].each { |name| remove_const(name) if const_defined?(name, false) }
 
     # Depth labels, in rotation order.
     DEPTHS = %w[Top Middle Bottom].freeze
+    # Setting holding the lure to use at each depth.
+    DEPTH_LURES = { "Top" => :lure_surface, "Middle" => :lure_middle, "Bottom" => :lure_deep }.freeze
 
     module_function
 
     # @param cast_index [Integer] 0-based cast count this session
     # @return [String] depth label for that cast
     def depth(cast_index) = DEPTHS[cast_index % DEPTHS.size]
+
+    # @param cast_index [Integer] 0-based cast count this session
+    # @return [String, nil] depth this cast fishes: rotating when cycling
+    #   weights, the surface with no weight, unknown with a constant weight
+    def fishing_depth(cast_index)
+      return depth(cast_index) if Config[:cycle_weights]
+
+      "Top" unless Config.constant_weight?
+    end
+
+    # @param depth [String, nil]
+    # @return [String, nil] lure name (or part of it) set for that depth, nil if none
+    def lure_for(depth)
+      lure = Config[DEPTH_LURES[depth]].to_s if depth
+      lure unless lure.nil? || lure.empty?
+    end
 
     # @param cast_index [Integer] 0-based cast count this session
     # @return [String, nil] weight name to put on the pole, nil for no weight
@@ -327,6 +349,10 @@ module TFish
       elsif Config.constant_weight?
         weight = Config[:weight_noncycle]
         needs["Constant Weight - #{weight}"] = [contents.count { it.name =~ /#{Regexp.escape(weight)}.* weight/ }, minimum]
+      end
+      depths = Config[:cycle_weights] ? Weights::DEPTHS : [Weights.fishing_depth(0)]
+      depths.filter_map { Weights.lure_for(it) }.uniq.each do |lure|
+        needs["Lure - #{lure}"] = [contents.count { it.name.include?(lure) }, 1]
       end
       needs.filter_map { |label, (have, need)| "#{label} - #{have}/#{need}" if have < need }
     end
@@ -432,6 +458,9 @@ module TFish
                                                  (no weight + a surface lure levels fastest and wears line least)
       weight_depths        "blown glass weight"  weight used for middle depths
       weight_bottom        "glaes weight"        weight used for the bottom
+      lure_surface         ""                    lure for surface fishing (e.g. "mandrake lure"), "" uses supplies_lure
+      lure_middle          ""                    lure for middle depths, used when cycling weights (e.g. "skull-shaped lure")
+      lure_deep            ""                    lure for the bottom, used when cycling weights (e.g. "ebon gate lure")
       weight_noncycle      ""                    constant weight descriptor (needs cycle_weights false)
       dock                 1                     which dock to fish (number or name), if you're not already at one:
                                                  1 Stream of Reflections - entrance 31834
@@ -560,7 +589,7 @@ module TFish
         restring(cut_old: !state.line.nil?)
         state = look_pole
       end
-      attach_lure unless state.lure
+      @lure_name = state.lure || attach_lure
 
       @weight_noun = state.weight_noun
       if state.weight && (!Config.constant_weight? || !state.weight.include?(Config[:weight_noncycle]))
@@ -575,7 +604,7 @@ module TFish
     # Warns once per run when fishing the surface (no weight) with a lure
     # that's better deeper down.
     def warn_deep_lure(state)
-      return if @lure_warned || Config[:cycle_weights] || Config.constant_weight?
+      return if @lure_warned || Config[:cycle_weights] || Config.constant_weight? || Weights.lure_for("Top")
       return if state.lure.nil? || state.surface_lure?
 
       @lure_warned = true
@@ -617,6 +646,7 @@ module TFish
       end
     end
 
+    # @return [String, nil] name of the lure attached
     def attach_lure
       noun = Config[:supplies_lure]
       line = dothistimeout("get my #{noun} from my #{container}", 2, Regexp.union(Messages::GET_OK, Messages::GET_FAIL))
@@ -627,7 +657,9 @@ module TFish
           "Set your lure with: ;e UserVars.tfish[:supplies_lure] = \"lure\"",
         )
       end
-      fput "put my #{noun} on ##{@pole.id}"
+      lure = held_besides(@pole.id)
+      fput "put #{lure ? "##{lure.id}" : "my #{noun}"} on ##{@pole.id}"
+      lure&.name
     end
 
     def remove_weight
@@ -655,13 +687,35 @@ module TFish
       put_weight_on(weight) if weight
     end
 
+    # Swaps in the lure set for this depth (lure_surface/middle/deep), if one
+    # is set and it isn't already on the pole.
+    #
+    # @param depth [String, nil]
+    def match_lure(depth)
+      wanted = Weights.lure_for(depth)
+      return if wanted.nil? || @lure_name.to_s.include?(wanted)
+
+      lure = supplies_contents.find { it.name.include?(wanted) }
+      fail!("Couldn't find a #{wanted} in your #{container} for #{depth.downcase} fishing.") unless lure
+      if @lure_name
+        noun = @lure_name.split.last
+        fput "get #{noun} from ##{@pole.id}"
+        fput "put my #{noun} in my #{container}"
+      end
+      fput "get ##{lure.id} from my #{container}"
+      fput "put ##{lure.id} on ##{@pole.id}"
+      @lure_name = lure.name
+      debug("Lure for #{depth}: #{lure.name}")
+    end
+
     # Casts, lets the line sit until a bite, then reels until it resolves.
     #
     # @return [Symbol] :caught, :lost (snapped), :empty (got away) or :left (walked off the dock)
     def fish
       waitrt?
       cycle_weight
-      depth = Weights.depth(@cast_index)
+      depth = Weights.fishing_depth(@cast_index)
+      match_lure(depth)
       @cast_index += 1
       Config.store[:cast_total] += 1
       cast!
@@ -676,7 +730,7 @@ module TFish
       pounds = Messages.pounds(dothistimeout("weigh ##{@pole.id}", 2, Messages::WEIGHT))
       if pounds
         echo "Fish Weight: #{pounds}"
-        familiar("#{depth} - Fish Weight: #{pounds}")
+        familiar("#{depth || "Weighted"} - Fish Weight: #{pounds}")
       end
 
       waitrt?
