@@ -445,7 +445,7 @@ RSpec.describe 'TFish' do
       rows = h::Supplies.check(contents, knife_box, h::Pole.parse("The pole's line looks to be frayed and in danger of snapping soon."))
 
       expect(rows).to include([:ok, 'Lure: none on the pole, 10 spare grey mandrake lure'],
-                              [:warn, 'Line on the pole: frayed and in danger of snapping soon, will be replaced once it snaps'])
+                              [:warn, 'Line on the pole: frayed and in danger of snapping soon, will be replaced before fishing'])
       expect(rows.map(&:first) - [:warn]).to all(eq(:ok))
     end
 
