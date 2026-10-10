@@ -520,6 +520,18 @@ RSpec.describe 'TFish' do
       expect(rows.map(&:last).grep(/Bottom lure/)).to be_empty
     end
 
+    it 'checks each cycling weight sinks to the depth its setting is for' do
+      h::Config.store[:cycle_weights] = true
+      contents = supplies + Array.new(5) { item.new('weight', 'shimmering blown glass weight') } +
+                 Array.new(5) { item.new('weight', 'translucent glaes weight') }
+      right = h::Supplies.check(contents, knife_box, nil, { 'blown glass weight' => 'middle depths', 'glaes weight' => 'bottom' })
+      swapped = h::Supplies.check(contents, knife_box, nil, { 'blown glass weight' => 'bottom', 'glaes weight' => 'middle depths' })
+
+      expect(right).to include([:ok, 'Weight blown glass weight sinks to the middle depths'], [:ok, 'Weight glaes weight sinks to the bottom'])
+      expect(swapped).to include([:warn, 'Weight blown glass weight sinks to the bottom, expected the middle depths'],
+                                 [:warn, 'Weight glaes weight sinks to the middle depths, expected the bottom'])
+    end
+
     it 'warns when surface fishing with a lure that is better deeper' do
       deep = surface_squid.sub('+16 to attracting fish near the surface', '+12 to attracting fish near the surface')
                           .sub('+12 to attracting fish in deep water', '+16 to attracting fish in deep water')
