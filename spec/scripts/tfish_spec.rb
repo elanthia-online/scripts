@@ -180,6 +180,12 @@ RSpec.describe 'TFish' do
         .not_to match(h::Messages::FOUND)
     end
 
+    it "reads a caught fish's rarity from LOOK" do
+      expect('It is of rare quality.'[h::Messages::QUALITY, :rarity]).to eq('rare')
+      expect('It is of uncommon quality.'[h::Messages::QUALITY, :rarity]).to eq('uncommon')
+      expect('The bass is about 13 inches long and weighs around 2 pounds.').not_to match(h::Messages::QUALITY)
+    end
+
     it 'starts capturing a cut on any reply to it' do
       ["You cut into the red scakor's flesh and after a few deft strokes produce a fine fillet of raw scakor.",
        "You cut into the rainbow roosterfish's flesh but only end up mangling the thing beyond recognition.",
