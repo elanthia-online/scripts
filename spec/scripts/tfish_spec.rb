@@ -120,6 +120,13 @@ RSpec.describe 'TFish' do
       expect('Your reel lets out a groan of protest as it runs out of line to give!').not_to match(h::Messages::REEL_REPLY)
     end
 
+    it 'recognizes an overfished spot' do
+      overfished = "It looks like this area has been heavily overfished.  You'll need to wait some time before you can fish here again."
+
+      expect(overfished).to match(h::Messages::OVERFISHED)
+      expect(overfished).not_to match(h::Messages::CAST_OK)
+    end
+
     it 'tells a cast apart from a failed one' do
       cast = 'You lean back and let the line of your black fishing pole go with a sharp *WHOOSH!*  The freckled grey squid attached near the hook flies through the air before landing with a soft *plink* right off of the side of the jetty.'
       already = "You've already cast the line of your black fishing pole and will need to pull on your black fishing pole to reel it in."
@@ -334,6 +341,15 @@ RSpec.describe 'TFish' do
 
       expect(dock.entrance).to eq(40000)
       expect(dock.spots).to eq([40001, 40002])
+    end
+
+    it 'moves to the next spot on the dock, wrapping around' do
+      dock = h::Rooms.dock(1)
+
+      expect(dock.next_spot(32116)).to eq(32117)
+      expect(dock.next_spot(32118)).to eq(32116)
+      expect(dock.next_spot(dock.entrance)).to eq(32116)
+      expect(dock.next_spot(nil)).to eq(32116)
     end
 
     it 'finds which known dock a room is on' do
