@@ -280,6 +280,29 @@ RSpec.describe 'TFish' do
       end
     end
 
+    # LOOK is captured as XML, so the start pattern sees tags; it must catch
+    # your pole's first line but not a neighbour's fishing line.
+    it "starts capturing on your pole description, not on other players' lines" do
+      starts = [
+        'The <a exist="709969844" noun="pole">pole\'s</a> line looks to be frayed and in danger of snapping soon.',
+        "The rod's line looks to be in excellent condition.",
+        'The line of the <a exist="1" noun="pole">black fishing pole</a> is cast out into the water about 95 feet away.',
+        'The line itself looks to be in excellent condition.',
+        'A small silver weight is currently strung from the line of the pole to serve as a weight.',
+        'You take a closer look at a twisted black fishing pole adorned with tiny fish skulls.',
+        'You see nothing unusual.',
+      ]
+      others = [
+        "The line of Kenzsii's sugar cane rod zigzags back and forth wildly as her catch struggles against her!",
+        "The tension on the line of Maziie's sugar cane rod vanishes for a heartbeat.",
+        "Remzsii's sugar cane rod lets out a groan of protest as it runs out of line to give!",
+        '<a exist="2" noun="Rippee">Rippee</a> leans back and lets the line of his black fishing pole go with a sharp *WHOOSH!*',
+      ]
+
+      starts.each { expect(it).to match(h::Pole::LOOK_START) }
+      others.each { expect(it).not_to match(h::Pole::LOOK_START) }
+    end
+
     it 'reports nothing rigged on a bare pole' do
       state = h::Pole.parse('You see nothing unusual.')
 
