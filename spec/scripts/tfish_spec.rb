@@ -400,6 +400,20 @@ RSpec.describe 'TFish' do
       expect(rows.map(&:first)).to all(eq(:ok))
     end
 
+    # From a real ;tfish check: supplies_lure set to the in-game style name
+    # "grey mandrake lure" counted 0 spares when compared against the noun.
+    it 'finds gear set by name, not just by noun' do
+      h::Config.store[:supplies_lure] = 'grey mandrake lure'
+      h::Config.store[:supplies_pole] = 'black pole'
+      contents = [item.new('pole', 'twisted black fishing pole'), item.new('wire', 'ball of dark braided fishing wire')] +
+                 Array.new(10) { item.new('lure', 'leaf-topped grey mandrake lure') }
+      rows = h::Supplies.check(contents, knife_box, h::Pole.parse("The pole's line looks to be frayed and in danger of snapping soon."))
+
+      expect(rows).to include([:ok, 'Lure: none on the pole, 10 spare grey mandrake lure'],
+                              [:warn, 'Line on the pole: frayed and in danger of snapping soon, will be cut and replaced before fishing'])
+      expect(rows.map(&:first) - [:warn]).to all(eq(:ok))
+    end
+
     it 'flags a missing pole, spare line and knife' do
       rows = h::Supplies.check([], [], nil)
 
