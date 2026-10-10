@@ -145,6 +145,18 @@ RSpec.describe 'TFish' do
       end
     end
 
+    # From a live run: CUT with no lure on, and a new line on an intact one,
+    # are both refused, and a GET with full hands must not time out.
+    it 'recognizes refused cuts and restrings, and full hands' do
+      expect("Your black fishing pole isn't currently strung.").to match(h::Messages::CUT_REPLY)
+      intact = "The line of your black fishing pole is intact.  You'll need to wait before restringing it with a new one."
+      expect(intact).to match(h::Messages::RESTRING_REPLY)
+      expect(intact).not_to match(h::Messages::RESTRUNG)
+      expect('You coil some of your thin silver wire around the reel of your black fishing pole before threading the remainder through its guides.').to match(h::Messages::RESTRUNG)
+      expect('You need a free hand to pick that up.').to match(h::Messages::GET_FAIL)
+      expect('You need a free hand to pick that up.').to match(h::Messages::HANDS_FULL)
+    end
+
     it 'fails a cast with no free hand right away instead of waiting for a reply' do
       expect("You can't cast without a free hand.").to match(h::Messages::CAST_FAIL)
     end
@@ -433,7 +445,7 @@ RSpec.describe 'TFish' do
       rows = h::Supplies.check(contents, knife_box, h::Pole.parse("The pole's line looks to be frayed and in danger of snapping soon."))
 
       expect(rows).to include([:ok, 'Lure: none on the pole, 10 spare grey mandrake lure'],
-                              [:warn, 'Line on the pole: frayed and in danger of snapping soon, will be cut and replaced before fishing'])
+                              [:warn, 'Line on the pole: frayed and in danger of snapping soon, will be replaced once it snaps'])
       expect(rows.map(&:first) - [:warn]).to all(eq(:ok))
     end
 

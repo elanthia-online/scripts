@@ -181,7 +181,7 @@ module TFish
   module Messages
     # Drop constants left by an earlier run this session so a restart loads the
     # current definitions without already-initialized warnings.
-    %i[HOOKED CAUGHT LOST EMPTY REEL_REPLY CAST_OK CAST_FAIL OVERFISHED AT_FEET WEIGHT INSPECT_ALERT GET_OK GET_FAIL DOCK_NO_SHARDS DOCK_CONFIRM].each { |name| remove_const(name) if const_defined?(name, false) }
+    %i[HOOKED CAUGHT LOST EMPTY REEL_REPLY CAST_OK CAST_FAIL OVERFISHED AT_FEET CUT_REPLY RESTRUNG RESTRING_REPLY WEIGHT INSPECT_ALERT GET_OK GET_FAIL HANDS_FULL DOCK_NO_SHARDS DOCK_CONFIRM].each { |name| remove_const(name) if const_defined?(name, false) }
 
     # A fish took the lure and the hook is set.
     HOOKED = /^You feel a brief jerk on your line before it begins to reel out wildly\./
@@ -214,7 +214,17 @@ module TFish
     # GET succeeded.
     GET_OK = /^You (?:remove|already|grab|reach|retrieve)/
     # GET failed.
-    GET_FAIL = /^Get what\?|^Hey, that doesn't|^That's almost certainly a bad idea/
+    GET_FAIL = /^Get what\?|^Hey, that doesn't|^That's almost certainly a bad idea|^You need a free hand to pick that up\./
+    # GET refused because both hands are full.
+    HANDS_FULL = /^You need a free hand to pick that up\./
+    # CUT on the pole: the line came off, or there was nothing to cut. CUT
+    # only works with a lure on the line (seen in logs).
+    CUT_REPLY = /snap the line of your|isn't currently strung/
+    # New line went on the pole.
+    RESTRUNG = /^You coil some of your .+? around the reel of your/
+    # Restring replies: it worked, or the old line is still on (the game won't
+    # replace a line that hasn't snapped or been cut).
+    RESTRING_REPLY = Regexp.union(RESTRUNG, /^The line of your .+? is intact\./)
     # Dock entry when you can't afford it.
     DOCK_NO_SHARDS = /You do not have enough soul shards to enter the dock/
     # Dock entry fee confirmation.
@@ -386,7 +396,7 @@ module TFish
       add.(line_spares.positive?, "Spare line (#{Config[:supplies_line]}): #{line_spares}")
       if pole
         line = pole.line || "none, will be restrung"
-        line += ", will be cut and replaced before fishing" if pole.frayed?
+        line += pole.lure ? ", will be cut and replaced before fishing" : ", will be replaced once it snaps" if pole.frayed?
         add.(!pole.frayed?, "Line on the pole: #{line}", warn: true)
       end
       add.(Array(knife_box).any? { named?(it.name, Config[:fillet_knife]) }, "Knife (#{Config[:fillet_knife]}) in your #{Config[:knife_container]}")
@@ -641,6 +651,7 @@ module TFish
       item = (GameObj[from]&.contents || []).find { Supplies.named?(it.name, wanted) }
       line = dothistimeout("get ##{item.id} from #{TFish.ref(from)}", 2, Regexp.union(Messages::GET_OK, Messages::GET_FAIL)) if item
       return item if line =~ Messages::GET_OK
+      fail!("Your hands are full, so you can't get your #{wanted}. In hand: #{TFish.hands.map(&:name).join(', ')}") if line =~ Messages::HANDS_FULL
       return if refreshed
 
       # Lich's view of the container can be stale; look again and retry once.
@@ -686,7 +697,9 @@ module TFish
     # Restrings, attaches a lure and sets the weight as needed.
     def rig_pole!
       state = look_pole
-      if state.line.nil? || state.frayed?
+      # A frayed line can only be cut off while a lure is on it; otherwise
+      # keep fishing it, and restring once it snaps.
+      if state.line.nil? || (state.frayed? && state.lure)
         restring(cut_old: !state.line.nil?)
         state = look_pole
       end
@@ -720,7 +733,8 @@ module TFish
     #
     # @param cut_old [Boolean] cut off the worn line already on the pole first
     def restring(cut_old: false)
-      cut_line if cut_old
+      return if cut_old && !cut_line
+
       fput "put ##{@pole.id} in #{TFish.ref(container)}"
       spool = get_gear(Config[:supplies_line])
       fail!("Couldn't find your #{Config[:supplies_line]} in your #{container}.") unless spool
@@ -728,22 +742,32 @@ module TFish
       piece = held_besides(spool.id, @pole.id)
       fail!("Pulling your #{Config[:supplies_line]} didn't give a length of line.") unless piece
       fput "put ##{spool.id} in #{TFish.ref(container)}"
-      fput "put ##{piece.id} on ##{@pole.id}"
+      reply = dothistimeout("put ##{piece.id} on ##{@pole.id}", 2, Messages::RESTRING_REPLY)
+      unless reply =~ Messages::RESTRUNG
+        debug("Couldn't restring (#{reply || 'no reply'}), keeping the old line")
+        fput "put ##{piece.id} in #{TFish.ref(container)}"
+      end
       fput "get ##{@pole.id}"
     end
 
     # Cuts the worn line off the pole. Anything that was on it (the lure, a
     # weight) drops at your feet, so pick it up and put it back with the
     # supplies; rigging the pole puts it back on afterwards.
+    #
+    # @return [Boolean] whether the line came off
     def cut_line
-      lines = Lich::Util.issue_command("cut ##{@pole.id}", /snap the line/, usexml: true, quiet: !Config[:debug_my_script])
+      lines = Lich::Util.issue_command("cut ##{@pole.id}", Messages::CUT_REPLY, usexml: true, quiet: !Config[:debug_my_script])
       waitrt?
-      lines.join("\n").scan(Messages::AT_FEET) do
+      text = lines.join("\n")
+      return false unless text.include?("snap the line of your")
+
+      text.scan(Messages::AT_FEET) do
         drop = Regexp.last_match
         item = drop[:id] ? "##{drop[:id]}" : (drop[:noun] || drop[:name].split.last)
         fput "get #{item}"
         fput "put #{drop[:id] ? item : "my #{item}"} in #{TFish.ref(container)}"
       end
+      true
     end
 
     # @return [String, nil] name of the lure attached
