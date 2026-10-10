@@ -16,6 +16,9 @@
       ;TFISH LIST
       Show your current settings.
 
+      ;TFISH CHECK
+      Check that your pole, line, lures, weights and knife are found for your settings.
+
       ;TFISH HELP
       Show additional help.
 
@@ -37,6 +40,7 @@
             new ;tfish list to show your current settings
             fix: lure left at your feet after replacing a worn line
             new lure settings to use the best lure for each depth
+            new ;tfish check to confirm your gear is found for your settings
             new lure setting, replaces the old bait setting
             weight cycling now off by default, no weight with a surface lure is best
             warns if your lure is better deep down while fishing with no weight
@@ -350,6 +354,55 @@ module TFish
 
     # @param contents [Array<#noun, #name>] supplies container contents
     # @return [Array<String>] one "item - have/need" line per missing supply, empty if stocked
+    # Checks everything the current settings need, for `;tfish check`.
+    #
+    # @param supplies [Array<#noun, #name>] supplies container contents
+    # @param knife_box [Array<#noun, #name>] knife container contents
+    # @param pole [Pole::State, nil] what's rigged on the pole, nil if no pole
+    # @return [Array<Array(Symbol, String)>] [:ok, :missing or :warn, description]
+    def check(supplies, knife_box, pole)
+      supplies = Array(supplies)
+      count = ->(&match) { supplies.count(&match) }
+      rows = []
+      add = ->(ok, text, warn: false) { rows << [ok ? :ok : (warn ? :warn : :missing), text] }
+
+      add.(pole, "Pole (#{Config[:supplies_pole]}) in your #{Config[:supplies_container]}")
+      line_spares = count.() { it.noun == Config[:supplies_line] }
+      add.(line_spares.positive?, "Spare line (#{Config[:supplies_line]}): #{line_spares}")
+      add.(true, "Line on the pole: #{pole.line || 'none, will be restrung'}") if pole
+      add.(Array(knife_box).any? { it.noun == Config[:fillet_knife] }, "Knife (#{Config[:fillet_knife]}) in your #{Config[:knife_container]}")
+
+      default_lures = count.() { it.noun == Config[:supplies_lure] }
+      add.(pole&.lure || default_lures.positive?,
+           "Lure: #{pole&.lure ? "#{pole.lure} on the pole" : 'none on the pole'}, #{default_lures} spare #{Config[:supplies_lure]}")
+
+      minimum = Config[:supplies_minimum]
+      if Config[:cycle_weights]
+        [Config[:weight_depths], Config[:weight_bottom]].each do |weight|
+          have = count.() { named?(it.name, weight) }
+          add.(have >= minimum, "Weight #{weight}: #{have}/#{minimum}")
+        end
+      elsif Config.constant_weight?
+        weight = "#{Config[:weight_noncycle]} weight"
+        have = count.() { named?(it.name, weight) } + (named?(pole&.weight, weight) ? 1 : 0)
+        add.(have >= minimum, "Weight #{weight}: #{have}/#{minimum}")
+      elsif pole&.weight
+        add.(true, "Weight: #{pole.weight} on the pole will come off (fishing the surface)")
+      end
+
+      depths = Config[:cycle_weights] ? Weights::DEPTHS : [Weights.fishing_depth(0)]
+      depths.each do |depth|
+        lure = Weights.lure_for(depth) or next
+        found = supplies.find { named?(it.name, lure) }&.name || (pole&.lure if named?(pole&.lure, lure))
+        add.(found, "#{depth} lure (#{lure}): #{found || 'not found'}")
+      end
+
+      if depths == ["Top"] && pole&.lure && !Weights.lure_for("Top") && !pole.surface_lure?
+        add.(false, "#{pole.lure} is better at #{pole.best_depth} depth than the surface", warn: true)
+      end
+      rows
+    end
+
     def shortages(contents)
       contents = Array(contents)
       minimum = Config[:supplies_minimum]
@@ -437,6 +490,7 @@ module TFish
     SYNTAX - ;tfish            fish the Ebon Gate dock
              ;tfish bypass     fish right where you're standing (no Ebon Gate travel, dock fee or squelching)
              ;tfish list       show your current settings
+             ;tfish check      check your gear is found for the fishing your settings describe
 
       Does NOT automatically sell. Empty your containers by selling/lockering yourself.
 
@@ -920,6 +974,36 @@ module TFish
   # @return [Array<GameObj>] items currently held, empty hands excluded
   def hands = [GameObj.right_hand, GameObj.left_hand].compact.select(&:id)
 
+  # `;tfish check`: looks in the containers and at the pole, then reports
+  # whether everything the current settings need was found.
+  #
+  # @return [void]
+  def check_setup
+    containers = [Config[:supplies_container], Config[:knife_container]].uniq
+    containers.each { fput "look in my #{it}" }
+    pause 0.5
+    supplies = GameObj[Config[:supplies_container]]&.contents || []
+    knife_box = GameObj[Config[:knife_container]]&.contents || []
+    pole = supplies.find { it.noun == Config[:supplies_pole] }
+    state = (Pole.parse(Lich::Util.issue_command("look ##{pole.id}", Pole::LOOK_START, usexml: false, quiet: true).join("\n")) if pole)
+
+    rows = Supplies.check(supplies, knife_box, state)
+    rows << [Vars.lootsack.to_s.empty? ? :missing : :ok, "Lootsack: #{Vars.lootsack.to_s.empty? ? 'not set (;vars set lootsack=...)' : Vars.lootsack}"]
+    rows << [Script.exists?("tsquelch.lic") ? :ok : :missing, "Squelching needs ;tsquelch installed"] if Config[:squelch_script]
+    mode = if Config[:cycle_weights] then "cycling weights (top, middle, bottom)"
+           elsif Config.constant_weight? then "constant #{Config[:weight_noncycle]} weight"
+           else "surface, no weight"
+           end
+    dock = Rooms.dock
+
+    labels = { ok: "  OK  ", missing: "MISSING", warn: " WARN " }
+    Lich::Messaging.mono(<<~CHECK)
+      tfish check: #{mode}, cast #{Config.cast_distance}, dock #{dock.name}
+      #{rows.map { |status, text| "  [#{labels[status]}] #{text}" }.join("\n")}
+      #{rows.any? { it.first == :missing } ? 'Fix the MISSING items before fishing (;tfish list shows your settings).' : 'Everything needed was found.'}
+    CHECK
+  end
+
   # Script entry point.
   #
   # @return [void]
@@ -932,6 +1016,10 @@ module TFish
     end
     if arg == "list"
       Lich::Messaging.mono(Config.listing)
+      return
+    end
+    if arg == "check"
+      check_setup
       return
     end
     bypass = arg == "bypass"

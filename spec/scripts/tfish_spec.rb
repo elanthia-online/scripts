@@ -384,6 +384,51 @@ RSpec.describe 'TFish' do
     end
   end
 
+  describe 'Supplies.check' do
+    item = TFishSpec::FakeItem
+    surface_squid = "The rod's line looks to be in excellent condition.\n" \
+                    "A dead-eyed freckled grey squid is currently attached near the hook to attract fish.\n" \
+                    "    +16 to attracting fish near the surface\n    +12 to attracting fish at middle depths\n    +12 to attracting fish in deep water"
+    let(:knife_box) { [item.new('dagger', 'drake dagger')] }
+    let(:supplies) { [item.new('rod', 'flexible fishing rod'), item.new('wire', 'ball of indigo fishing wire')] }
+
+    def statuses(rows) = rows.to_h { |status, text| [text[/^[^:(]+/].strip, status] }
+
+    it 'passes a default surface setup with a surface lure on the pole' do
+      rows = h::Supplies.check(supplies, knife_box, h::Pole.parse(surface_squid))
+
+      expect(rows.map(&:first)).to all(eq(:ok))
+    end
+
+    it 'flags a missing pole, spare line and knife' do
+      rows = h::Supplies.check([], [], nil)
+
+      expect(statuses(rows)).to include('Pole' => :missing, 'Spare line' => :missing, 'Knife' => :missing, 'Lure' => :missing)
+    end
+
+    it 'checks both cycling weights and every depth lure that is set' do
+      h::Config.store[:cycle_weights] = true
+      h::Config.store[:lure_surface] = 'grey lure'
+      h::Config.store[:lure_middle] = 'skull lure'
+      contents = supplies + Array.new(5) { item.new('weight', 'blown glass weight') } +
+                 [item.new('lure', 'leaf-topped grey mandrake lure')]
+      rows = h::Supplies.check(contents, knife_box, h::Pole.parse(surface_squid))
+
+      expect(rows).to include([:ok, 'Weight blown glass weight: 5/5'], [:missing, 'Weight glaes weight: 0/5'],
+                              [:ok, 'Top lure (grey lure): leaf-topped grey mandrake lure'],
+                              [:missing, 'Middle lure (skull lure): not found'])
+      expect(rows.map(&:last).grep(/Bottom lure/)).to be_empty
+    end
+
+    it 'warns when surface fishing with a lure that is better deeper' do
+      deep = surface_squid.sub('+16 to attracting fish near the surface', '+12 to attracting fish near the surface')
+                          .sub('+12 to attracting fish in deep water', '+16 to attracting fish in deep water')
+      rows = h::Supplies.check(supplies, knife_box, h::Pole.parse(deep))
+
+      expect(rows.last).to eq([:warn, 'dead-eyed freckled grey squid is better at deep depth than the surface'])
+    end
+  end
+
   describe 'Rooms' do
     it 'tells a dock entrance apart from its fishing spots' do
       dock = h::Rooms.dock(1)
