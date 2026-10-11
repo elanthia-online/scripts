@@ -84,6 +84,25 @@ RSpec.describe 'TFish' do
       expect(listing).to match(/^  cast_distance +"far"$/)
     end
 
+    it 'uses cast_distance unless cycling distance' do
+      h::Config.store[:cast_distance] = 'near'
+      expect((0..2).map { h::Config.cast_distance_for(it) }).to eq(%w[near near near])
+    end
+
+    it 'rotates near, middle, far with cycle_distance' do
+      h::Config.store[:cycle_distance] = true
+      expect((0..3).map { h::Config.cast_distance_for(it) }).to eq(%w[near middle far near])
+    end
+
+    it 'covers every distance and depth pair when cycling both' do
+      h::Config.store[:cycle_distance] = true
+      h::Config.store[:cycle_weights] = true
+      pairs = (0..8).map { [h::Config.cast_distance_for(it), h::Weights.fishing_depth(it)] }
+
+      expect(pairs.uniq.size).to eq(9)
+      expect(pairs.first(4)).to eq([%w[near Top], %w[near Middle], %w[near Bottom], %w[middle Top]])
+    end
+
     it 'only treats the constant weight as active when cycling is off and one is set' do
       expect(h::Config.constant_weight?).to be false
 
