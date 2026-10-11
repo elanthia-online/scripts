@@ -252,6 +252,28 @@ RSpec.describe 'TFish' do
         .not_to match(h::Messages::CUT_FISH)
     end
 
+    # fishing_log016: the hook message was lost, then a fish fought for 15
+    # minutes while the script kept "waiting for a bite".
+    it "treats your fish's own fight turns as hooked while waiting, but not a neighbour's" do
+      mine = [
+        'Your black fishing pole bends alarmingly as the fish at the end of your line jerks and tugs violently in its attempt to escape.  You have no more slack to let loose!',
+        'With a sudden surge, the catch yanks the line of your black fishing pole forward, creating just enough slack to unsettle your careful hold.',
+        'Your catch pulls with surprising force, the line of your fishing rod momentarily slackening as your grip struggles to keep up.',
+        'A sharp tug vibrates through your fishing rod as your catch struggles to gain ground.  You maintain tension on the line, thwarting the effort.',
+      ]
+      not_fish = [
+        'With a sudden surge, the catch yanks the line of Lakishiie\'s fishing rod forward, creating just enough slack to unsettle his careful hold.',
+        "Kenzsii's sugar cane rod bends alarmingly as the fish at the end of her line jerks and tugs violently in its attempt to escape!",
+        'You wait patiently as the skull-shaped lure of your black fishing pole drifts aimlessly in the current.  No curious fish take notice.',
+        'The water ripples softly around the line of your black fishing pole, but nothing stirs beneath the surface.',
+        'You feel a faint tremor through the line of your fishing rod--a false hope, as it is only the current tugging gently on your freckled grey squid.',
+      ]
+
+      mine.each { expect(it).to match(h::Messages::BITE_WAIT) }
+      not_fish.each { expect(it).not_to match(h::Messages::BITE_WAIT) }
+      expect('The line of your black fishing pole strains and breaks with a sharp *SNAP*!').to match(h::Messages::BITE_WAIT)
+    end
+
     it 'recognizes an overfished spot' do
       overfished = "It looks like this area has been heavily overfished.  You'll need to wait some time before you can fish here again."
 
