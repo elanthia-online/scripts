@@ -185,8 +185,24 @@ RSpec.describe 'TFish' do
       xml = 'With a swift, sharp tug, you snap the line of your <a exist="1234" noun="rod">fishing rod</a>.  ' \
             'Your <a exist="5678" noun="squid">freckled grey squid</a> falls to the ground at your feet.'
 
-      expect(plain.match(h::Messages::AT_FEET).named_captures).to eq('id' => nil, 'noun' => nil, 'name' => 'freckled grey squid')
-      expect(xml.match(h::Messages::AT_FEET).named_captures).to eq('id' => '5678', 'noun' => 'squid', 'name' => 'freckled grey squid')
+      expect(h::Messages.dropped(plain)).to eq([{ id: nil, noun: 'squid', name: 'freckled grey squid' }])
+      expect(h::Messages.dropped(xml)).to eq([{ id: '5678', noun: 'squid', name: 'freckled grey squid' }])
+      expect(h::Messages.dropped('Roundtime: 5 sec.')).to eq([])
+    end
+
+    # fishing_log015: a lure and a weight on the line drop together, "fall".
+    it 'finds every item when the lure and weight both drop' do
+      plain = 'With a swift, sharp tug, you snap the line of your black fishing pole.  Your skull-shaped lure and blown glass weight fall to the ground at your feet.'
+      xml = 'Your <a exist="11" noun="lure">skull-shaped lure</a> and <a exist="22" noun="weight">blown glass weight</a> fall to the ground at your feet.'
+
+      expect(h::Messages.dropped(plain).map { it[:noun] }).to eq(%w[lure weight])
+      expect(h::Messages.dropped(xml)).to eq([{ id: '11', noun: 'lure', name: 'skull-shaped lure' },
+                                              { id: '22', noun: 'weight', name: 'blown glass weight' }])
+    end
+
+    it 'recognizes being stopped by something left at your feet' do
+      expect('As you prepare to move away, you remember the things still placed alongside you.').to match(h::Messages::DOCK_BLOCKED)
+      expect('As you prepare to move away, you remember the freckled grey squid still placed alongside you.').to match(h::Messages::DOCK_BLOCKED)
     end
 
     it 'reads the prize found inside a fish' do
