@@ -460,6 +460,39 @@ RSpec.describe 'TFish' do
     it 'picks no weight, then the depths weight, then the bottom weight' do
       expect((0..2).map { h::Weights.for_cast(it) }).to eq([nil, 'blown glass weight', 'glaes weight'])
     end
+
+    it 'keeps a weight the settings use and removes any other' do
+      glass = 'shimmering blown glass weight flecked with glitter'
+      expect(h::Weights.keep?(glass)).to be false
+
+      h::Config.store[:weight_noncycle] = 'glaes'
+      expect(h::Weights.keep?(glass)).to be false
+      expect(h::Weights.keep?('translucent glaes weight with gleaming metallic veins')).to be true
+
+      h::Config.store[:cycle_weights] = true
+      expect(h::Weights.keep?(glass)).to be true
+      expect(h::Weights.keep?('lead weight')).to be false
+    end
+
+    it 'starts the rotation at the weight on the pole and at cast_distance' do
+      glaes = 'translucent glaes weight with gleaming metallic veins'
+      expect(h::Weights.start_index(glaes)).to eq(0)
+
+      h::Config.store[:cycle_weights] = true
+      expect(h::Weights.start_index(nil)).to eq(0)
+      expect(h::Weights.start_index('shimmering blown glass weight flecked with glitter')).to eq(1)
+      expect(h::Weights.start_index(glaes)).to eq(2)
+      expect(h::Weights.start_index('lead weight')).to eq(0)
+
+      h::Config.store[:cycle_distance] = true
+      h::Config.store[:cast_distance] = 'middle'
+      start = h::Weights.start_index(glaes)
+      expect([h::Config.cast_distance_for(start), h::Weights.fishing_depth(start)]).to eq(%w[middle Bottom])
+      expect([h::Config.cast_distance_for(start + 1), h::Weights.fishing_depth(start + 1)]).to eq(%w[far Top])
+
+      h::Config.store[:cycle_weights] = false
+      expect(h::Config.cast_distance_for(h::Weights.start_index(nil))).to eq('middle')
+    end
   end
 
   describe 'depth lures' do
