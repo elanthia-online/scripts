@@ -168,6 +168,38 @@ RSpec.describe 'eLoot guarded room API' do
     expect(calls).to be_empty
   end
 
+  it 'lets the owner discard an unrestorable recovery so room cleanup works again' do
+    prepare_world
+    set_harness_const(:Room, OpenStruct.new(current: OpenStruct.new(id: 101)))
+    api.instance_variable_set(:@room_recovery, { owner: owner, data: data, room: 100, epoch: 1 })
+    expect { api.restore_room_hands(owner: owner) }.to raise_error(api::RoomScopeError, /context changed/)
+    expect { run_room }.to raise_error(api::RoomScopeError, /recovery is pending/)
+
+    expect(api.discard_room_recovery(owner: owner)).to eq(outcome: :discarded)
+    expect(api.discard_room_recovery(owner: owner)).to eq(outcome: :none)
+    expect(calls).to be_empty
+    expect(run_room).to eq(outcome: :complete)
+  end
+
+  it 'refuses to discard recovery for a different or unguarded owner' do
+    prepare_world
+    recovery = { owner: owner, data: data, room: 100, epoch: 1 }
+    api.instance_variable_set(:@room_recovery, recovery)
+    expect { api.discard_room_recovery(owner: Object.new) }.to raise_error(api::RoomScopeError, /current guarded/)
+    allow(owner).to receive(:execution_guard_active?).and_return(false)
+    expect { api.discard_room_recovery(owner: owner) }.to raise_error(api::RoomScopeError, /current guarded/)
+    expect(api.instance_variable_get(:@room_recovery)).to equal(recovery)
+  end
+
+  it 'stands before verifying when the pass did not stand on its own' do
+    prepare_world
+    stood = []
+    allow(api).to receive(:standing?).and_return(false, true)
+    api.define_singleton_method(:dothistimeout) { |command, *| stood << command }
+    expect(run_room).to eq(outcome: :complete)
+    expect(stood).to eq(['stand'])
+  end
+
   %i[arrives observed missing revoked moved].each do |response|
     it "never duplicates an uncertain sheath command when the delayed response is #{response}" do
       prepare_world
@@ -356,7 +388,10 @@ RSpec.describe 'eLoot guarded room API' do
     api.acquire_room_lease(token)
     api.release_room_lease(Object.new)
     expect { run_room }.to raise_error(api::RoomScopeError, /already running/)
-    expect { harness.module_eval(source, source_path) }.to raise_error(api::RoomScopeError, /already running/)
+    echoed = []
+    harness.define_singleton_method(:echo) { |message| echoed << message }
+    expect { harness.module_eval(source, source_path) }.to raise_error(SystemExit)
+    expect(echoed).to eq(['eLoot is already running; wait for it to finish'])
     api.release_room_lease(token)
     expect(run_room).to eq(outcome: :complete)
   end
