@@ -3127,3 +3127,48 @@ RSpec.describe 'ELoot loot_stance' do
     expect(off).to eq(loot_stance: 'none')
   end
 end
+
+RSpec.describe 'ELoot::Inventory.store_item into a container with stale contents' do
+  let(:item) { Struct.new(:id, :name).new('837915005', 'sturdy fel chest') }
+  let(:bag) { Struct.new(:id, :name, :contents).new('834445867', 'Beelz disk', []) }
+  let(:sent) { [] }
+
+  # Disks get no contents pushes from the game, so bag.contents only changes on `look in`
+  def store(look_finds_item:, in_hand: false)
+    sent = self.sent
+    bag = self.bag
+    item = self.item
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |**| }
+    eloot.define_singleton_method(:in_hand?) { |_| in_hand }
+    eloot.define_singleton_method(:data) { Struct.new(:put_regex, :look_regex, :sacks_full).new(/x/, /x/, {}) }
+    eloot.define_singleton_method(:get_command) do |cmd, _regex, **|
+      sent << cmd
+      bag.contents = [item] if cmd.start_with?('look in') && look_finds_item
+      ["You put a #{item.name} in the #{bag.name}."]
+    end
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.define_singleton_method(:sleep) { |_| }
+    path = find_lic_source('eloot.lic', from: __dir__)
+    mod.module_eval(extract_lic_method(File.read(path), 'store_item', source_path: path))
+    mod.store_item(bag, item)
+  end
+
+  it 'refreshes the container once and succeeds without re-dragging' do
+    expect(store(look_finds_item: true)).to be true
+    expect(sent).to eq(['_drag #837915005 #834445867', 'look in #834445867'])
+  end
+
+  it 'still gives up when the refreshed contents do not have the item' do
+    expect(store(look_finds_item: false)).to be false
+    expect(sent.grep(/_drag/).size).to eq(5)
+  end
+
+  it 'does not refresh while the item is still in hand' do
+    expect(store(look_finds_item: true, in_hand: true)).to be false
+    expect(sent.grep(/look in/)).to be_empty
+  end
+end
