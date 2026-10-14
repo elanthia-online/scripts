@@ -112,7 +112,7 @@ RSpec.describe 'TFish' do
 
     it 'carries cycling and the default lure over to every depth' do
       store, notes = migrate(cycle_weights: true, supplies_lure: 'grey lure', lure_deep: 'ebon gate lure',
-                             weight_depths: 'blown glass weight', cast_distance: 'middle')
+                             weight_depths: 'blown glass weight', cast_distance: 'middle', use_cman: true)
 
       expect(store).to include(depths: %w[surface middle bottom], distances: %w[middle],
                                lure_surface: 'grey lure', lure_middle: 'grey lure', lure_bottom: 'ebon gate lure',
