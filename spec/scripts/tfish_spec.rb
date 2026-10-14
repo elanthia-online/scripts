@@ -946,6 +946,12 @@ RSpec.describe 'TFish' do
       expect(h::Tackle.whispered('USAGE: WHISPER {my} box [#]')).to be_nil
     end
 
+    it 'reads what PLUCK took' do
+      line = 'You fiddle with the angular trays of your mithril tackle box and pluck a twisted iron ebon gate lure dangling a tiny gold key ' \
+             'from the one that is currently opened.'
+      expect(h::Tackle.plucked(line)).to eq('twisted iron ebon gate lure dangling a tiny gold key')
+    end
+
     # From a real TINKER, for boxes without WHISPER.
     it 'reads the tray TINKER cycled to the top' do
       line = 'You discreetly rearrange the angular trays of your mithril tackle box, shifting the one storing ' \
