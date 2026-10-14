@@ -137,6 +137,13 @@ RSpec.describe 'TFish' do
       expect(migrate(cycle_distance: true, cast_distance: 'near').first).to include(distances: %w[near middle far], depths: %w[surface])
     end
 
+    it 'gives a fresh install the defaults without a migration note' do
+      LichStub::UserVars.tfish = nil
+      expect(h::Config.setup!).to be_empty
+      expect(h::Config.store.keys & h::Config::OLD_KEYS).to be_empty
+      expect(h::Config.depths).to eq(%w[surface])
+    end
+
     it 'leaves settings already in the new form alone' do
       LichStub::UserVars.tfish = { v2_settings: true, depths: %w[middle], lure_middle: 'skull lure' }
       expect(h::Config.setup!).to be_empty
