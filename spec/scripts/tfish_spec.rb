@@ -701,6 +701,8 @@ RSpec.describe 'TFish' do
     it 'writes a line for a snap or a fish that got away' do
       expect(h::Familiar.loss_line(number: 7, at:, cast: 'far', depth: 'bottom', outcome: :lost, fight: 48, reels: 8))
         .to eq('#7 13:16 far/bottom SNAP after 48s / 8 reels')
+      expect(h::Familiar.loss_line(number: 7, at:, cast: 'far', depth: 'bottom', outcome: :lost, fight: 48, reels: 8, pounds: '12'))
+        .to eq('#7 13:16 far/bottom SNAP (12lb fish) after 48s / 8 reels')
       expect(h::Familiar.loss_line(number: 7, at:, cast: 'near', depth: 'middle', outcome: :empty, fight: 90, reels: 15))
         .to eq('#7 13:16 near/middle got away after 90s / 15 reels')
     end
