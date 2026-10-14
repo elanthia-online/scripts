@@ -907,6 +907,15 @@ RSpec.describe 'TFish' do
       expect(trays.find { h::Supplies.named?(it.name, 'glaes weight') }.number).to eq(4)
     end
 
+    # From a real GAZE: the last piece in a tray words its ready marker differently.
+    it 'reads a one-piece tray, ready or not' do
+      ready = h::Tackle.trays('1.  a leaf-topped grey mandrake lure with tiny thorn teeth (1 piece, which is ready for plucking)').first
+      waiting = h::Tackle.trays('6.  a leaf-topped grey mandrake lure with tiny thorn teeth (1 piece)').first
+
+      expect(ready).to have_attributes(number: 1, count: 1, ready: true)
+      expect(waiting).to have_attributes(number: 6, count: 1, ready: false)
+    end
+
     it 'counts each piece in the trays as supplies' do
       LichStub::UserVars.tfish.merge!(tackle_box: true, depths: %w[surface middle bottom], lure_surface: 'grey lure',
                                       lure_middle: 'skull lure', lure_bottom: 'ebon gate lure')
