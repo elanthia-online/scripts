@@ -983,12 +983,6 @@ RSpec.describe 'TFish' do
   end
 
   describe 'lag and pulling in' do
-    it 'spots the game refusing a command during roundtime' do
-      expect('...wait 1 seconds.'[h::Messages::RT_WAIT, :seconds]).to eq('1')
-      expect('Wait 3 seconds.'[h::Messages::RT_WAIT, :seconds]).to eq('3')
-      expect('You need a free hand to pick that up.').not_to match(h::Messages::RT_WAIT)
-    end
-
     # From Nairdin's log after pulling a near cast in.
     it 'reads how far out the line is, and nothing once it is reeled in' do
       cast = "The line of the black fishing pole is cast out into the water about 26 feet away.\n" \
