@@ -916,6 +916,22 @@ RSpec.describe 'TFish' do
       expect(waiting).to have_attributes(number: 6, count: 1, ready: false)
     end
 
+    # From a real GAZE: the same gear can fill several trays.
+    it 'prefers a ready tray when the same gear fills several, and counts them all' do
+      trays = h::Tackle.trays(<<~GAZE)
+        4.  a shimmering blown glass weight flecked with glitter (25 pieces)
+        5.  a ball of dark braided fishing wire (25 pieces)
+        10. a shimmering blown glass weight flecked with glitter (9 pieces, one of which is ready for plucking)
+        12. a ball of dark braided fishing wire (1 piece)
+        13. a ball of dark braided fishing wire (7 pieces)
+      GAZE
+
+      expect(h::Tackle.pick(trays, 'blown glass weight').number).to eq(10)
+      expect(h::Tackle.pick(trays, 'wire').number).to eq(5)
+      expect(h::Tackle.pick(trays, 'glaes weight')).to be_nil
+      expect(h::Tackle.items(trays).count { h::Supplies.named?(it.name, 'wire') }).to eq(33)
+    end
+
     it 'counts each piece in the trays as supplies' do
       LichStub::UserVars.tfish.merge!(tackle_box: true, depths: %w[surface middle bottom], lure_surface: 'grey lure',
                                       lure_middle: 'skull lure', lure_bottom: 'ebon gate lure')
