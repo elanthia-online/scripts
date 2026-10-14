@@ -14,7 +14,7 @@ module TFishSpec
   SOURCE_PATH = find_lic_source('tfish.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH)
 
-  MODULES = %w[Config Messages Pole Weights Supplies Rooms Familiar Setup].freeze
+  MODULES = %w[Config Messages Pole Weights Supplies Tackle Rooms Familiar Setup].freeze
 
   FakeItem = Struct.new(:noun, :name)
   FakePc = Struct.new(:noun)
@@ -701,6 +701,8 @@ RSpec.describe 'TFish' do
     it 'writes a line for a snap or a fish that got away' do
       expect(h::Familiar.loss_line(number: 7, at:, cast: 'far', depth: 'bottom', outcome: :lost, fight: 48, reels: 8))
         .to eq('#7 13:16 far/bottom SNAP after 48s / 8 reels')
+      expect(h::Familiar.loss_line(number: 7, at:, cast: 'far', depth: 'bottom', outcome: :lost, fight: 48, reels: 8, pounds: '12'))
+        .to eq('#7 13:16 far/bottom SNAP (12lb fish) after 48s / 8 reels')
       expect(h::Familiar.loss_line(number: 7, at:, cast: 'near', depth: 'middle', outcome: :empty, fight: 90, reels: 15))
         .to eq('#7 13:16 near/middle got away after 90s / 15 reels')
     end
@@ -881,6 +883,102 @@ RSpec.describe 'TFish' do
 
       expect(h::Config.store).to include(lure_bottom: 'ebon gate lure', depths: %w[surface bottom], distances: %w[near])
       expect(h::Config.store.keys & h::Setup::TICKS.values.flat_map(&:values)).to be_empty
+    end
+  end
+
+  describe 'Tackle' do
+    # From a real GAZE of a Super-Fish-All Tackle Box, as XML.
+    gaze = <<~XML
+      Sifting through the angular trays of your <a exist="767883310" noun="box">mithril tackle box</a>, you mentally catalog each in turn:
+
+      1.  a leaf-topped grey mandrake lure with tiny thorn teeth<pushBold/> (25 pieces, one of which is ready for plucking)
+      <popBold/>2.  a pale carved skull-shaped lure with granite-inset eyes<pushBold/> (25 pieces)
+      <popBold/>3.  a twisted iron ebon gate lure dangling a tiny gold key<pushBold/> (1 piece)
+      <popBold/>4.  a translucent glaes weight with gleaming metallic veins<pushBold/> (25 pieces)
+      <popBold/>5.  a shimmering blown glass weight flecked with glitter<pushBold/> (25 pieces)
+      <popBold/>6.  a ball of dark braided fishing wire<pushBold/> (25 pieces)
+      <popBold/><prompt time="1791990767">&gt;</prompt>
+    XML
+
+    it 'reads the trays from GAZE, and which one PLUCK takes from' do
+      trays = h::Tackle.trays(gaze)
+
+      expect(trays.size).to eq(6)
+      expect(trays.first).to have_attributes(number: 1, name: 'leaf-topped grey mandrake lure with tiny thorn teeth', count: 25, ready: true)
+      expect(trays[2]).to have_attributes(number: 3, name: 'twisted iron ebon gate lure dangling a tiny gold key', count: 1, ready: false)
+      expect(trays.find { h::Supplies.named?(it.name, 'glaes weight') }.number).to eq(4)
+    end
+
+    # From a real GAZE: the last piece in a tray words its ready marker differently.
+    it 'reads a one-piece tray, ready or not' do
+      ready = h::Tackle.trays('1.  a leaf-topped grey mandrake lure with tiny thorn teeth (1 piece, which is ready for plucking)').first
+      waiting = h::Tackle.trays('6.  a leaf-topped grey mandrake lure with tiny thorn teeth (1 piece)').first
+
+      expect(ready).to have_attributes(number: 1, count: 1, ready: true)
+      expect(waiting).to have_attributes(number: 6, count: 1, ready: false)
+    end
+
+    # From a real GAZE: the same gear can fill several trays.
+    it 'prefers a ready tray when the same gear fills several, and counts them all' do
+      trays = h::Tackle.trays(<<~GAZE)
+        4.  a shimmering blown glass weight flecked with glitter (25 pieces)
+        5.  a ball of dark braided fishing wire (25 pieces)
+        10. a shimmering blown glass weight flecked with glitter (9 pieces, one of which is ready for plucking)
+        12. a ball of dark braided fishing wire (1 piece)
+        13. a ball of dark braided fishing wire (7 pieces)
+      GAZE
+
+      expect(h::Tackle.pick(trays, 'blown glass weight').number).to eq(10)
+      expect(h::Tackle.pick(trays, 'wire').number).to eq(5)
+      expect(h::Tackle.pick(trays, 'glaes weight')).to be_nil
+      expect(h::Tackle.items(trays).count { h::Supplies.named?(it.name, 'wire') }).to eq(33)
+    end
+
+    it 'counts each piece in the trays as supplies' do
+      LichStub::UserVars.tfish.merge!(tackle_box: true, depths: %w[surface middle bottom], lure_surface: 'grey lure',
+                                      lure_middle: 'skull lure', lure_bottom: 'ebon gate lure')
+      expect(h::Supplies.shortages(h::Tackle.items(h::Tackle.trays(gaze)))).to eq(['Lure - ebon gate lure - 1/5'])
+    end
+
+    it 'reads the tray WHISPER moved to the top' do
+      line = 'Whispering quietly to yourself, you inspect each of the marked labels on the angular trays of your mithril tackle box.  ' \
+             'You quickly find the one with a twisted iron ebon gate lure dangling a tiny gold key inside and move it to the top.'
+
+      expect(h::Tackle.whispered(line)).to eq('twisted iron ebon gate lure dangling a tiny gold key')
+      expect(h::Tackle.whispered('USAGE: WHISPER {my} box [#]')).to be_nil
+    end
+
+    it 'reads what PLUCK took' do
+      line = 'You fiddle with the angular trays of your mithril tackle box and pluck a twisted iron ebon gate lure dangling a tiny gold key ' \
+             'from the one that is currently opened.'
+      expect(h::Tackle.plucked(line)).to eq('twisted iron ebon gate lure dangling a tiny gold key')
+    end
+
+    # From a real TINKER, for boxes without WHISPER.
+    it 'reads the tray TINKER cycled to the top' do
+      line = 'You discreetly rearrange the angular trays of your mithril tackle box, shifting the one storing ' \
+             'a pale carved skull-shaped lure with granite-inset eyes (fishing lure) to the top.'
+
+      expect(h::Tackle.tinkered(line)).to eq('pale carved skull-shaped lure with granite-inset eyes')
+      expect(h::Tackle.tinkered(nil)).to be_nil
+    end
+
+    it 'finds the pole on the loops from LOOK ON' do
+      look = <<~XML
+        <container id='767883310' title='Box' target='#767883310' location='right'/><clearContainer id="767883310"/><inv id='767883310'>The <a exist="767883310" noun="box">box</a> is closed.</inv><inv id='767883310'>On the <a exist="767883310" noun="box">box</a>:</inv><inv id='767883310'> a <a exist="767883098" noun="pole">twisted black fishing pole</a> adorned with tiny fish skulls</inv>On the <a exist="767883310" noun="box">mithril tackle box</a>:
+        <pushBold/>Special [1]:<popBold/> a <a exist="767883098" noun="pole">twisted black fishing pole</a> adorned with tiny fish skulls
+      XML
+      pole = h::Tackle.on_box(look).find { h::Supplies.named?(it[:name], 'black pole') }
+
+      expect(pole).to eq(id: '767883098', noun: 'pole', name: 'twisted black fishing pole')
+    end
+
+    it "won't keep the knife in the tackle box" do
+      values = h::Setup.values_from(h::Config.store).merge(tackle_box: true, supplies_container: 'box', knife_container: 'Box')
+      expect(h::Setup.errors(values)[:knife_container]).to include("can't hold your knife")
+
+      values[:knife_container] = 'cloak'
+      expect(h::Setup.errors(values)).to be_empty
     end
   end
 
