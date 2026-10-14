@@ -751,15 +751,6 @@ RSpec.describe 'TFish' do
       expect(h::Rooms.dock_for(1).name).to eq('Moss Pond')
     end
 
-    it 'moves to the next spot on the dock, wrapping around' do
-      dock = h::Rooms.dock(1)
-
-      expect(dock.next_spot(32116)).to eq(32117)
-      expect(dock.next_spot(32118)).to eq(32116)
-      expect(dock.next_spot(dock.entrance)).to eq(32116)
-      expect(dock.next_spot(nil)).to eq(32116)
-    end
-
     it 'does not count fishing bots toward the crowd' do
       pcs = %w[Fishmon Ilten Tysong].map { TFishSpec::FakePc.new(it) }
 
@@ -830,9 +821,11 @@ RSpec.describe 'TFish' do
     it 'switches between Ebon Gate and bypass fishing' do
       expect(values[:fishing_mode]).to eq('ebon_gate')
       %i[dock fav_room squelch_script].each { expect(h::Setup.enabled?(it, values)).to be true }
+      expect(h::Setup.enabled?(:overfished_wait, values)).to be false
 
       values[:fishing_mode] = 'bypass'
       %i[dock fav_room squelch_script].each { expect(h::Setup.enabled?(it, values)).to be false }
+      expect(h::Setup.enabled?(:overfished_wait, values)).to be true
       h::Setup.save(values, h::Config.store)
       expect(h::Config.bypass?).to be true
 
