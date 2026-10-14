@@ -14,7 +14,7 @@ module TFishSpec
   SOURCE_PATH = find_lic_source('tfish.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH)
 
-  MODULES = %w[Config Messages Pole Weights Supplies Rooms Familiar].freeze
+  MODULES = %w[Config Messages Pole Weights Supplies Rooms Familiar Setup].freeze
 
   FakeItem = Struct.new(:noun, :name)
   FakePc = Struct.new(:noun)
@@ -49,30 +49,36 @@ RSpec.describe 'TFish' do
       h::Config.setup!
 
       expect(h::Config[:supplies_pole]).to eq('pole')
-      expect(h::Config[:supplies_lure]).to eq('lure')
-      expect(h::Config[:cast_distance]).to eq('far')
+      expect(h::Config[:depths]).to eq(%w[surface])
+      expect(h::Config[:distances]).to eq(%w[far])
+      expect(h::Config[:lure_bottom]).to eq('lure')
     end
 
-    it 'falls back to far for an invalid cast distance' do
-      h::Config.store[:cast_distance] = 'MIDDLE'
-      expect(h::Config.cast_distance).to eq('middle')
+    it 'reads depths and distances from a list or words, in rotation order' do
+      h::Config.store[:depths] = %w[bottom SURFACE]
+      expect(h::Config.depths).to eq(%w[surface bottom])
 
-      h::Config.store[:cast_distance] = 'yonder'
-      expect(h::Config.cast_distance).to eq('far')
+      h::Config.store[:distances] = 'far, near'
+      expect(h::Config.distances).to eq(%w[near far])
     end
 
-    it 'defaults to no weight cycling' do
-      expect(h::Config[:cycle_weights]).to be false
+    it 'falls back to the surface and far when nothing valid is set' do
+      h::Config.store.merge!(depths: [], distances: 'yonder')
+      expect(h::Config.depths).to eq(%w[surface])
+      expect(h::Config.distances).to eq(%w[far])
     end
 
-    it 'turns off weight cycling saved by pre-2.0 tfish, once' do
-      LichStub::UserVars.tfish = { cycle_weights: true }
-      h::Config.setup!
-      expect(h::Config[:cycle_weights]).to be false
+    it 'holds each distance for a full rotation of the depths' do
+      h::Config.store.merge!(depths: %w[surface middle bottom], distances: %w[near middle far])
+      pairs = (0..8).map { [h::Config.cast_distance_for(it), h::Weights.depth(it)] }
 
-      h::Config.store[:cycle_weights] = true
-      h::Config.setup!
-      expect(h::Config[:cycle_weights]).to be true
+      expect(pairs.uniq.size).to eq(9)
+      expect(pairs.first(4)).to eq([%w[near surface], %w[near middle], %w[near bottom], %w[middle surface]])
+    end
+
+    it 'rotates distances on their own with one depth' do
+      h::Config.store[:distances] = %w[near far]
+      expect((0..2).map { h::Config.cast_distance_for(it) }).to eq(%w[near far near])
     end
 
     it 'lists every setting with its value, flagging changed ones' do
@@ -81,36 +87,67 @@ RSpec.describe 'TFish' do
 
       expect(listing.lines.size).to eq(h::Config::DEFAULTS.size + 1)
       expect(listing).to match(/^  supplies_pole +"pole"  \(default "rod"\)$/)
-      expect(listing).to match(/^  cast_distance +"far"$/)
+      expect(listing).to match(/^  depths +\["surface"\]$/)
     end
 
-    it 'uses cast_distance unless cycling distance' do
-      h::Config.store[:cast_distance] = 'near'
-      expect((0..2).map { h::Config.cast_distance_for(it) }).to eq(%w[near near near])
+    it 'tells whether fishing mode is bypass' do
+      expect(h::Config.bypass?).to be false
+      h::Config.store[:fishing_mode] = 'bypass'
+      expect(h::Config.bypass?).to be true
+    end
+  end
+
+  describe 'Config.migrate!' do
+    def migrate(old)
+      LichStub::UserVars.tfish = old.merge(v2_settings: true)
+      notes = h::Config.setup!
+      [h::Config.store, notes]
     end
 
-    it 'rotates near, middle, far with cycle_distance' do
-      h::Config.store[:cycle_distance] = true
-      expect((0..3).map { h::Config.cast_distance_for(it) }).to eq(%w[near middle far near])
+    it 'turns weight cycling saved by pre-2.0 tfish into the surface only, once' do
+      LichStub::UserVars.tfish = { cycle_weights: true }
+      h::Config.setup!
+      expect(h::Config.depths).to eq(%w[surface])
     end
 
-    it 'covers every distance and depth pair when cycling both' do
-      h::Config.store[:cycle_distance] = true
-      h::Config.store[:cycle_weights] = true
-      pairs = (0..8).map { [h::Config.cast_distance_for(it), h::Weights.fishing_depth(it)] }
+    it 'carries cycling and the default lure over to every depth' do
+      store, notes = migrate(cycle_weights: true, supplies_lure: 'grey lure', lure_deep: 'ebon gate lure',
+                             weight_depths: 'blown glass weight', cast_distance: 'middle', use_cman: true)
 
-      expect(pairs.uniq.size).to eq(9)
-      expect(pairs.first(4)).to eq([%w[near Top], %w[near Middle], %w[near Bottom], %w[middle Top]])
+      expect(store).to include(depths: %w[surface middle bottom], distances: %w[middle],
+                               lure_surface: 'grey lure', lure_middle: 'grey lure', lure_bottom: 'ebon gate lure',
+                               weight_middle: 'blown glass weight')
+      expect(store.keys & h::Config::OLD_KEYS).to be_empty
+      expect(notes.last).to include('depths surface/middle/bottom, cast middle')
     end
 
-    it 'only treats the constant weight as active when cycling is off and one is set' do
-      expect(h::Config.constant_weight?).to be false
+    it 'turns a constant weight into the depth whose weight it matches' do
+      expect(migrate(weight_noncycle: 'glaes').first[:depths]).to eq(%w[bottom])
+      expect(migrate(weight_noncycle: 'blown glass').first[:depths]).to eq(%w[middle])
+    end
 
-      h::Config.store[:weight_noncycle] = 'glaes'
-      expect(h::Config.constant_weight?).to be true
+    it 'makes an unknown constant weight the bottom weight, with a note' do
+      store, notes = migrate(weight_noncycle: 'granite')
 
-      h::Config.store[:cycle_weights] = true
-      expect(h::Config.constant_weight?).to be false
+      expect(store).to include(depths: %w[bottom], weight_bottom: 'granite weight')
+      expect(notes.first).to include('granite weight is now the bottom weight')
+    end
+
+    it 'carries cycle_distance over to every distance, and fishes the surface by default' do
+      expect(migrate(cycle_distance: true, cast_distance: 'near').first).to include(distances: %w[near middle far], depths: %w[surface])
+    end
+
+    it 'gives a fresh install the defaults without a migration note' do
+      LichStub::UserVars.tfish = nil
+      expect(h::Config.setup!).to be_empty
+      expect(h::Config.store.keys & h::Config::OLD_KEYS).to be_empty
+      expect(h::Config.depths).to eq(%w[surface])
+    end
+
+    it 'leaves settings already in the new form alone' do
+      LichStub::UserVars.tfish = { v2_settings: true, depths: %w[middle], lure_middle: 'skull lure' }
+      expect(h::Config.setup!).to be_empty
+      expect(h::Config.store).to include(depths: %w[middle], lure_middle: 'skull lure')
     end
   end
 
@@ -453,58 +490,45 @@ RSpec.describe 'TFish' do
   end
 
   describe 'Weights' do
-    it 'rotates top, middle, bottom' do
-      expect((0..3).map { h::Weights.depth(it) }).to eq(%w[Top Middle Bottom Top])
+    glass = 'shimmering blown glass weight flecked with glitter'
+    glaes = 'translucent glaes weight with gleaming metallic veins'
+
+    it 'rotates through the depths being fished' do
+      expect((0..1).map { h::Weights.depth(it) }).to eq(%w[surface surface])
+
+      h::Config.store[:depths] = %w[middle bottom]
+      expect((0..2).map { h::Weights.depth(it) }).to eq(%w[middle bottom middle])
     end
 
-    it 'picks no weight, then the depths weight, then the bottom weight' do
-      expect((0..2).map { h::Weights.for_cast(it) }).to eq([nil, 'blown glass weight', 'glaes weight'])
+    it 'uses no weight at the surface and the set weight deeper down' do
+      expect(h::Weights::DEPTHS.map { h::Weights.weight_for(it) }).to eq([nil, 'blown glass weight', 'glaes weight'])
     end
 
-    it 'keeps a weight the settings use and removes any other' do
-      glass = 'shimmering blown glass weight flecked with glitter'
-      expect(h::Weights.keep?(glass)).to be false
+    it 'uses the lure set for each depth, any lure when it is empty' do
+      h::Config.store.merge!(lure_middle: 'skull-shaped lure', lure_bottom: ' ')
 
-      h::Config.store[:weight_noncycle] = 'glaes'
-      expect(h::Weights.keep?(glass)).to be false
-      expect(h::Weights.keep?('translucent glaes weight with gleaming metallic veins')).to be true
-
-      h::Config.store[:cycle_weights] = true
-      expect(h::Weights.keep?(glass)).to be true
-      expect(h::Weights.keep?('lead weight')).to be false
+      expect(h::Weights.lure_for('middle')).to eq('skull-shaped lure')
+      expect(h::Weights.lure_for('surface')).to eq('lure')
+      expect(h::Weights.lure_for('bottom')).to eq('lure')
     end
 
-    it 'starts the rotation at the weight on the pole and at cast_distance' do
-      glaes = 'translucent glaes weight with gleaming metallic veins'
-      expect(h::Weights.start_index(glaes)).to eq(0)
-
-      h::Config.store[:cycle_weights] = true
+    it 'starts the rotation at the depth of the weight on the pole' do
+      h::Config.store[:depths] = %w[surface middle bottom]
       expect(h::Weights.start_index(nil)).to eq(0)
-      expect(h::Weights.start_index('shimmering blown glass weight flecked with glitter')).to eq(1)
+      expect(h::Weights.start_index(glass)).to eq(1)
       expect(h::Weights.start_index(glaes)).to eq(2)
       expect(h::Weights.start_index('lead weight')).to eq(0)
 
-      h::Config.store[:cycle_distance] = true
-      h::Config.store[:cast_distance] = 'middle'
-      start = h::Weights.start_index(glaes)
-      expect([h::Config.cast_distance_for(start), h::Weights.fishing_depth(start)]).to eq(%w[middle Bottom])
-      expect([h::Config.cast_distance_for(start + 1), h::Weights.fishing_depth(start + 1)]).to eq(%w[far Top])
-
-      h::Config.store[:cycle_weights] = false
-      expect(h::Config.cast_distance_for(h::Weights.start_index(nil))).to eq('middle')
+      h::Config.store[:depths] = %w[surface bottom]
+      expect(h::Weights.start_index(glass)).to eq(0)
+      expect(h::Weights.start_index(glaes)).to eq(1)
     end
-  end
 
-  describe 'depth lures' do
-    it 'fishes the surface with no weight, rotates when cycling, and is unknown with a constant weight' do
-      expect(h::Weights.fishing_depth(1)).to eq('Top')
-
-      h::Config.store[:cycle_weights] = true
-      expect((0..2).map { h::Weights.fishing_depth(it) }).to eq(%w[Top Middle Bottom])
-
-      h::Config.store[:cycle_weights] = false
-      h::Config.store[:weight_noncycle] = 'glaes'
-      expect(h::Weights.fishing_depth(0)).to be_nil
+    it 'matches the weight on the pole against the one wanted' do
+      expect(h::Weights.matches?(nil, nil)).to be true
+      expect(h::Weights.matches?(glaes, nil)).to be false
+      expect(h::Weights.matches?(glaes, 'glaes weight')).to be true
+      expect(h::Weights.matches?(glass, 'glaes weight')).to be false
     end
 
     it 'reads how deep a weight sinks the line' do
@@ -512,62 +536,64 @@ RSpec.describe 'TFish' do
       expect(h::Weights.sink_depth('The weight looks like it is heavy enough to sink a line to the bottom of a body of water.')).to eq('bottom')
       expect(h::Weights.sink_depth('You see nothing unusual.')).to be_nil
     end
-
-    it 'uses the lure set for each depth, and none when unset' do
-      h::Config.store[:lure_middle] = 'skull-shaped lure'
-
-      expect(h::Weights.lure_for('Middle')).to eq('skull-shaped lure')
-      expect(h::Weights.lure_for('Top')).to be_nil
-      expect(h::Weights.lure_for(nil)).to be_nil
-    end
   end
 
   describe 'Supplies.shortages' do
     item = TFishSpec::FakeItem
+    wire = item.new('wire', 'fishing wire')
 
     def stocked(count)
       Array.new(count) { TFishSpec::FakeItem.new('weight', 'blown glass weight') } +
         Array.new(count) { TFishSpec::FakeItem.new('weight', 'glaes weight') }
     end
 
-    it 'only needs line by default, since no weight is used' do
-      expect(h::Supplies.shortages([item.new('wire', 'fishing wire')])).to be_empty
-      expect(h::Supplies.shortages([])).to eq(['Fishing Line - wire - 0/1'])
+    def lures(count, name = 'leaf-topped grey mandrake lure') = Array.new(count) { TFishSpec::FakeItem.new('lure', name) }
+
+    it 'needs line and the minimum of spare lures by default, with no weight' do
+      expect(h::Supplies.shortages([wire] + lures(5))).to be_empty
+      expect(h::Supplies.shortages(lures(4))).to eq(['Fishing Line - wire - 0/1', 'Lure - lure - 4/5'])
     end
 
-    it 'is empty when line and both cycling weights are stocked' do
-      h::Config.store[:cycle_weights] = true
-      expect(h::Supplies.shortages(stocked(5) + [item.new('wire', 'fishing wire')])).to be_empty
+    it 'is empty when line, lures and the weights for the depths fished are stocked' do
+      h::Config.store[:depths] = %w[surface middle bottom]
+      expect(h::Supplies.shortages(stocked(5) + lures(5) + [wire])).to be_empty
     end
 
     it 'reports missing line and short weights' do
-      h::Config.store[:cycle_weights] = true
-      expect(h::Supplies.shortages(stocked(4))).to eq([
-                                                        'Fishing Line - wire - 0/1',
-                                                        'blown glass weight - 4/5',
-                                                        'glaes weight - 4/5',
-                                                      ])
+      h::Config.store[:depths] = %w[surface middle bottom]
+      expect(h::Supplies.shortages(stocked(4) + lures(5))).to eq([
+                                                                   'Fishing Line - wire - 0/1',
+                                                                   'Weight - blown glass weight - 4/5',
+                                                                   'Weight - glaes weight - 4/5',
+                                                                 ])
     end
 
-    it 'checks only the constant weight when cycling is off' do
-      h::Config.store[:cycle_weights] = false
-      h::Config.store[:weight_noncycle] = 'glaes'
+    it 'only needs the weights for the depths fished' do
+      h::Config.store[:depths] = %w[bottom]
 
-      expect(h::Supplies.shortages(stocked(5) + [item.new('wire', 'fishing wire')])).to be_empty
-      expect(h::Supplies.shortages([item.new('wire', 'fishing wire')])).to eq(['Constant Weight - glaes - 0/5'])
+      expect(h::Supplies.shortages(stocked(5) + lures(5) + [wire])).to be_empty
+      expect(h::Supplies.shortages(lures(5) + [wire])).to eq(['Weight - glaes weight - 0/5'])
     end
 
-    it 'needs one of each depth lure that is set and in use' do
-      h::Config.store[:lure_surface] = 'mandrake lure'
-      h::Config.store[:lure_deep] = 'ebon gate lure'
-      wire = item.new('wire', 'fishing wire')
-      mandrake = item.new('lure', 'leaf-topped grey mandrake lure with tiny thorn teeth')
+    it 'needs the minimum of each lure in use' do
+      h::Config.store.merge!(lure_surface: 'mandrake lure', lure_bottom: 'ebon gate lure')
 
-      expect(h::Supplies.shortages([wire, mandrake])).to be_empty
-      expect(h::Supplies.shortages([wire])).to eq(['Lure - mandrake lure - 0/1'])
+      expect(h::Supplies.shortages([wire] + lures(5))).to be_empty
+      expect(h::Supplies.shortages([wire] + lures(2))).to eq(['Lure - mandrake lure - 2/5'])
 
-      h::Config.store[:cycle_weights] = true
-      expect(h::Supplies.shortages(stocked(5) + [wire, mandrake])).to eq(['Lure - ebon gate lure - 0/1'])
+      h::Config.store[:depths] = %w[surface middle bottom]
+      expect(h::Supplies.shortages(stocked(5) + [wire] + lures(5))).to eq(['Lure - ebon gate lure - 0/5'])
+      expect(h::Supplies.shortages(stocked(5) + [wire] + lures(5) + lures(5, 'twisted iron ebon gate lure'))).to be_empty
+    end
+
+    it 'lists the lure and weight for each depth fished' do
+      h::Config.store.merge!(lure_surface: 'mandrake lure', lure_bottom: 'ebon gate lure')
+      expect(h::Supplies.lures_in_use).to eq('mandrake lure' => ['surface'])
+      expect(h::Supplies.weights_in_use).to be_empty
+
+      h::Config.store[:depths] = %w[surface middle bottom]
+      expect(h::Supplies.lures_in_use).to eq('mandrake lure' => ['surface'], 'lure' => ['middle'], 'ebon gate lure' => ['bottom'])
+      expect(h::Supplies.weights_in_use).to eq('blown glass weight' => 'middle', 'glaes weight' => 'bottom')
     end
 
     it 'matches items by words, the way you would in game' do
@@ -599,21 +625,22 @@ RSpec.describe 'TFish' do
     def statuses(rows) = rows.to_h { |status, text| [text[/^[^:(]+/].strip, status] }
 
     it 'passes a default surface setup with a surface lure on the pole' do
-      rows = h::Supplies.check(supplies, knife_box, h::Pole.parse(surface_squid))
+      spares = Array.new(5) { item.new('lure', 'glittery pink fish lure') }
+      rows = h::Supplies.check(supplies + spares, knife_box, h::Pole.parse(surface_squid))
 
       expect(rows.map(&:first)).to all(eq(:ok))
     end
 
-    # From a real ;tfish check: supplies_lure set to the in-game style name
+    # From a real ;tfish check: the lure set to the in-game style name
     # "grey mandrake lure" counted 0 spares when compared against the noun.
     it 'finds gear set by name, not just by noun' do
-      h::Config.store[:supplies_lure] = 'grey mandrake lure'
+      h::Config.store[:lure_surface] = 'grey mandrake lure'
       h::Config.store[:supplies_pole] = 'black pole'
       contents = [item.new('pole', 'twisted black fishing pole'), item.new('wire', 'ball of dark braided fishing wire')] +
                  Array.new(10) { item.new('lure', 'leaf-topped grey mandrake lure') }
       rows = h::Supplies.check(contents, knife_box, h::Pole.parse("The pole's line looks to be frayed and in danger of snapping soon."))
 
-      expect(rows).to include([:ok, 'Lure: none on the pole, 10 spare grey mandrake lure'],
+      expect(rows).to include([:ok, 'Lure on the pole: none'], [:ok, 'Lure grey mandrake lure (surface): 10/5'],
                               [:warn, 'Line on the pole: frayed and in danger of snapping soon, will be replaced before fishing'])
       expect(rows.map(&:first) - [:warn]).to all(eq(:ok))
     end
@@ -621,25 +648,22 @@ RSpec.describe 'TFish' do
     it 'flags a missing pole, spare line and knife' do
       rows = h::Supplies.check([], [], nil)
 
-      expect(statuses(rows)).to include('Pole' => :missing, 'Spare line' => :missing, 'Knife' => :missing, 'Lure' => :missing)
+      expect(statuses(rows)).to include('Pole' => :missing, 'Spare line' => :missing, 'Knife' => :missing, 'Lure lure' => :missing)
     end
 
-    it 'checks both cycling weights and every depth lure that is set' do
-      h::Config.store[:cycle_weights] = true
-      h::Config.store[:lure_surface] = 'grey lure'
-      h::Config.store[:lure_middle] = 'skull lure'
+    it 'checks the weight and lure for each depth fished' do
+      h::Config.store.merge!(depths: %w[surface middle bottom], lure_surface: 'grey lure', lure_middle: 'skull lure')
       contents = supplies + Array.new(5) { item.new('weight', 'blown glass weight') } +
                  [item.new('lure', 'leaf-topped grey mandrake lure')]
       rows = h::Supplies.check(contents, knife_box, h::Pole.parse(surface_squid))
 
-      expect(rows).to include([:ok, 'Weight blown glass weight: 5/5'], [:missing, 'Weight glaes weight: 0/5'],
-                              [:ok, 'Top lure (grey lure): leaf-topped grey mandrake lure'],
-                              [:missing, 'Middle lure (skull lure): not found'])
-      expect(rows.map(&:last).grep(/Bottom lure/)).to be_empty
+      expect(rows).to include([:ok, 'Weight blown glass weight (middle): 5/5'], [:missing, 'Weight glaes weight (bottom): 0/5'],
+                              [:missing, 'Lure grey lure (surface): 1/5'], [:missing, 'Lure skull lure (middle): 0/5'],
+                              [:missing, 'Lure lure (bottom): 1/5'])
     end
 
-    it 'checks each cycling weight sinks to the depth its setting is for' do
-      h::Config.store[:cycle_weights] = true
+    it 'checks each weight sinks to the depth its setting is for' do
+      h::Config.store[:depths] = %w[middle bottom]
       contents = supplies + Array.new(5) { item.new('weight', 'shimmering blown glass weight') } +
                  Array.new(5) { item.new('weight', 'translucent glaes weight') }
       right = h::Supplies.check(contents, knife_box, nil, { 'blown glass weight' => 'middle depths', 'glaes weight' => 'bottom' })
@@ -663,7 +687,7 @@ RSpec.describe 'TFish' do
     at = Time.new(2026, 10, 10, 13, 16, 5)
 
     it 'writes one line per catch with what FISH TOTAL does not show' do
-      line = h::Familiar.catch_line(number: 6, at:, cast: 'far', depth: 'Top', fish: 'tentacled aberration', rarity: 'legendary',
+      line = h::Familiar.catch_line(number: 6, at:, cast: 'far', depth: 'surface', fish: 'tentacled aberration', rarity: 'legendary',
                                     pounds: '5', bite: 25, fight: 252, reels: 40, prize: 'a piece of pitted grey scoria')
 
       expect(line).to eq('#6 13:16 far/surface tentacled aberration (legendary) 5lb | bite 25s, fight 252s / 40 reels | a piece of pitted grey scoria')
@@ -675,9 +699,9 @@ RSpec.describe 'TFish' do
     end
 
     it 'writes a line for a snap or a fish that got away' do
-      expect(h::Familiar.loss_line(number: 7, at:, cast: 'far', depth: 'Bottom', outcome: :lost, fight: 48, reels: 8))
+      expect(h::Familiar.loss_line(number: 7, at:, cast: 'far', depth: 'bottom', outcome: :lost, fight: 48, reels: 8))
         .to eq('#7 13:16 far/bottom SNAP after 48s / 8 reels')
-      expect(h::Familiar.loss_line(number: 7, at:, cast: 'near', depth: 'Middle', outcome: :empty, fight: 90, reels: 15))
+      expect(h::Familiar.loss_line(number: 7, at:, cast: 'near', depth: 'middle', outcome: :empty, fight: 90, reels: 15))
         .to eq('#7 13:16 near/middle got away after 90s / 15 reels')
     end
   end
@@ -734,15 +758,6 @@ RSpec.describe 'TFish' do
       expect(h::Rooms.dock_for(1).name).to eq('Moss Pond')
     end
 
-    it 'moves to the next spot on the dock, wrapping around' do
-      dock = h::Rooms.dock(1)
-
-      expect(dock.next_spot(32116)).to eq(32117)
-      expect(dock.next_spot(32118)).to eq(32116)
-      expect(dock.next_spot(dock.entrance)).to eq(32116)
-      expect(dock.next_spot(nil)).to eq(32116)
-    end
-
     it 'does not count fishing bots toward the crowd' do
       pcs = %w[Fishmon Ilten Tysong].map { TFishSpec::FakePc.new(it) }
 
@@ -752,6 +767,127 @@ RSpec.describe 'TFish' do
 
     it 'picks the least crowded room, first on ties' do
       expect(h::Rooms.least_crowded({ 32116 => 2, 32117 => 0, 32118 => 0 })).to eq(32117)
+    end
+  end
+
+  describe 'Setup' do
+    let(:values) { h::Setup.values_from(h::Config.store) }
+
+    it 'has a field for every setting except the counters, with tick boxes for depths and distances' do
+      ticks = h::Setup::TICKS.values.flat_map(&:values)
+      expect(h::Setup::FIELDS.keys - ticks).to match_array(h::Config::DEFAULTS.keys - %i[cast_total fish_total snap_total depths distances])
+      expect(ticks).to eq(%i[depth_surface depth_middle depth_bottom distance_near distance_middle distance_far])
+    end
+
+    it 'gives every field a tooltip' do
+      expect(h::Setup::FIELDS.values.map(&:tip)).to all(be_a(String).and(satisfy { !it.strip.empty? }))
+    end
+
+    it 'cleans up loaded settings so each fits its widget' do
+      store = h::Config.store
+      store.merge!(dock: 'moss', fav_room: 32116, replace_line_at: 'nonsense', cast_timer: 5, supplies_minimum: '3')
+      values = h::Setup.values_from(store)
+
+      expect(values).to include(dock: 4, fav_room: 0, replace_line_at: 'frayed', cast_timer: 10, supplies_minimum: 3)
+    end
+
+    it 'ticks the depths and distances being fished' do
+      h::Config.store.merge!(depths: 'bottom surface', distances: %w[middle])
+
+      expect(values).to include(depth_surface: true, depth_middle: false, depth_bottom: true,
+                                distance_near: false, distance_middle: true, distance_far: false)
+    end
+
+    it 'keeps a spot on the chosen dock and a custom dock' do
+      h::Config.store.merge!(dock: 2, fav_room: 32127)
+      expect(values).to include(dock: 2, fav_room: 32127)
+
+      custom = { entrance: 1, spots: [2, 3] }
+      h::Config.store.merge!(dock: custom, fav_room: 3)
+      reloaded = h::Setup.values_from(h::Config.store)
+      expect(reloaded).to include(dock: custom, fav_room: 3)
+      expect(h::Setup.choices(:dock, reloaded).first).to eq([custom, 'Custom (entrance 1)'])
+    end
+
+    it "offers the chosen dock's spots" do
+      values[:dock] = 3
+      expect(h::Setup.choices(:fav_room, values)).to eq([[0, 'Least crowded'], [32120, 'Room 32120'], [32121, 'Room 32121'], [32122, 'Room 32122']])
+    end
+
+    it "only enables a depth's lure and weight when that depth is ticked" do
+      expect(h::Setup.enabled?(:lure_surface, values)).to be true
+      %i[lure_middle weight_middle lure_bottom weight_bottom].each { expect(h::Setup.enabled?(it, values)).to be false }
+
+      values.merge!(depth_surface: false, depth_bottom: true)
+      expect(h::Setup.enabled?(:lure_surface, values)).to be false
+      expect(h::Setup.enabled?(:lure_bottom, values)).to be true
+      expect(h::Setup.enabled?(:weight_bottom, values)).to be true
+      expect(h::Setup.enabled?(:weight_middle, values)).to be false
+    end
+
+    it 'switches between Ebon Gate and bypass fishing' do
+      expect(values[:fishing_mode]).to eq('ebon_gate')
+      %i[dock fav_room squelch_script].each { expect(h::Setup.enabled?(it, values)).to be true }
+      expect(h::Setup.enabled?(:overfished_wait, values)).to be false
+
+      values[:fishing_mode] = 'bypass'
+      %i[dock fav_room squelch_script].each { expect(h::Setup.enabled?(it, values)).to be false }
+      expect(h::Setup.enabled?(:overfished_wait, values)).to be true
+      h::Setup.save(values, h::Config.store)
+      expect(h::Config.bypass?).to be true
+
+      h::Config.store[:fishing_mode] = 'nonsense'
+      expect(h::Setup.values_from(h::Config.store)[:fishing_mode]).to eq('ebon_gate')
+    end
+
+    it 'accepts the defaults' do
+      expect(h::Setup.errors(values)).to be_empty
+    end
+
+    it 'flags required, quoted and "my" names, but not settings that are off' do
+      values.merge!(supplies_container: ' ', lure_surface: '"grey lure"', fillet_knife: 'my dagger', lure_middle: '')
+      errors = h::Setup.errors(values)
+
+      expect(errors[:supplies_container]).to eq('Required')
+      expect(errors[:lure_surface]).to include('no quotes')
+      expect(errors[:fillet_knife]).to include('my')
+      expect(errors).not_to have_key(:lure_middle)
+    end
+
+    it 'needs at least one depth and one distance ticked' do
+      values.merge!(depth_surface: false, distance_far: false)
+      expect(h::Setup.errors(values)).to include(depth_surface: 'tick at least one depth', distance_near: 'tick at least one cast distance')
+    end
+
+    it 'needs two different weights when fishing both depths' do
+      values.merge!(depth_middle: true, depth_bottom: true, weight_middle: 'glaes weight', weight_bottom: 'Glaes Weight ')
+      expect(h::Setup.errors(values)[:weight_bottom]).to include('different weight')
+
+      values[:depth_middle] = false
+      expect(h::Setup.errors(values)).to be_empty
+
+      values.merge!(depth_middle: true, weight_middle: '')
+      expect(h::Setup.errors(values)[:weight_middle]).to eq('Required')
+    end
+
+    it "accepts names with hyphens and apostrophes" do
+      values[:supplies_container] = "djinn's sea-green sack"
+      expect(h::Setup.errors(values)).to be_empty
+    end
+
+    it 'saves every field with text trimmed, and the ticks as lists' do
+      values.merge!(lure_bottom: '  ebon gate lure ', depth_bottom: true, distance_near: true, distance_far: false)
+      h::Setup.save(values, h::Config.store)
+
+      expect(h::Config.store).to include(lure_bottom: 'ebon gate lure', depths: %w[surface bottom], distances: %w[near])
+      expect(h::Config.store.keys & h::Setup::TICKS.values.flat_map(&:values)).to be_empty
+    end
+  end
+
+  describe 'toggletfish' do
+    it 'matches what you type, with or without a semicolon' do
+      %W[toggletfish ;toggletfish <c>toggletfish\n TOGGLETFISH].each { expect(it).to match(h::Messages::TOGGLE) }
+      ['toggletfish now', 'say toggletfish', ';tfish'].each { expect(it).not_to match(h::Messages::TOGGLE) }
     end
   end
 end
