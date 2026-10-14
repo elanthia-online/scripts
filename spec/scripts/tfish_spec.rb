@@ -982,6 +982,38 @@ RSpec.describe 'TFish' do
     end
   end
 
+  describe 'lag and pulling in' do
+    it 'spots the game refusing a command during roundtime' do
+      expect('...wait 1 seconds.'[h::Messages::RT_WAIT, :seconds]).to eq('1')
+      expect('Wait 3 seconds.'[h::Messages::RT_WAIT, :seconds]).to eq('3')
+      expect('You need a free hand to pick that up.').not_to match(h::Messages::RT_WAIT)
+    end
+
+    # From Nairdin's log after pulling a near cast in.
+    it 'reads how far out the line is, and nothing once it is reeled in' do
+      cast = "The line of the black fishing pole is cast out into the water about 26 feet away.\n" \
+             "The pole's line looks to be in excellent condition."
+      expect(h::Pole.parse(cast).out).to eq(26)
+      expect(h::Pole.parse("The pole's line looks to be in excellent condition.").out).to be_nil
+    end
+
+    it 'ends a pull on roundtime, an already reeled in line, or a bite' do
+      ['Roundtime: 7 sec.', 'But the pole is already reeled in!',
+       'You feel a brief jerk on your line before it begins to reel out wildly.'].each { expect(it).to match(h::Messages::PULL_REPLY) }
+    end
+
+    it 'only offers pulling in with near and surface ticked' do
+      values = h::Setup.values_from(h::Config.store)
+      expect(h::Setup.enabled?(:pull_in, values)).to be false
+
+      values[:distance_near] = true
+      expect(h::Setup.enabled?(:pull_in, values)).to be true
+
+      values[:depth_surface] = false
+      expect(h::Setup.enabled?(:pull_in, values)).to be false
+    end
+  end
+
   describe 'toggletfish' do
     it 'matches what you type, with or without a semicolon' do
       %W[toggletfish ;toggletfish <c>toggletfish\n TOGGLETFISH].each { expect(it).to match(h::Messages::TOGGLE) }
