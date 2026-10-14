@@ -524,50 +524,64 @@ RSpec.describe 'TFish' do
 
   describe 'Supplies.shortages' do
     item = TFishSpec::FakeItem
+    wire = item.new('wire', 'fishing wire')
 
     def stocked(count)
       Array.new(count) { TFishSpec::FakeItem.new('weight', 'blown glass weight') } +
         Array.new(count) { TFishSpec::FakeItem.new('weight', 'glaes weight') }
     end
 
-    it 'only needs line by default, since no weight is used' do
-      expect(h::Supplies.shortages([item.new('wire', 'fishing wire')])).to be_empty
-      expect(h::Supplies.shortages([])).to eq(['Fishing Line - wire - 0/1'])
+    def lures(count, name = 'leaf-topped grey mandrake lure') = Array.new(count) { TFishSpec::FakeItem.new('lure', name) }
+
+    it 'needs line and the minimum of spare lures by default, with no weight' do
+      expect(h::Supplies.shortages([wire] + lures(5))).to be_empty
+      expect(h::Supplies.shortages(lures(4))).to eq(['Fishing Line - wire - 0/1', 'Lure - lure - 4/5'])
     end
 
-    it 'is empty when line and both cycling weights are stocked' do
+    it 'is empty when line, lures and both cycling weights are stocked' do
       h::Config.store[:cycle_weights] = true
-      expect(h::Supplies.shortages(stocked(5) + [item.new('wire', 'fishing wire')])).to be_empty
+      expect(h::Supplies.shortages(stocked(5) + lures(5) + [wire])).to be_empty
     end
 
     it 'reports missing line and short weights' do
       h::Config.store[:cycle_weights] = true
-      expect(h::Supplies.shortages(stocked(4))).to eq([
-                                                        'Fishing Line - wire - 0/1',
-                                                        'blown glass weight - 4/5',
-                                                        'glaes weight - 4/5',
-                                                      ])
+      expect(h::Supplies.shortages(stocked(4) + lures(5))).to eq([
+                                                                   'Fishing Line - wire - 0/1',
+                                                                   'blown glass weight - 4/5',
+                                                                   'glaes weight - 4/5',
+                                                                 ])
     end
 
     it 'checks only the constant weight when cycling is off' do
       h::Config.store[:cycle_weights] = false
       h::Config.store[:weight_noncycle] = 'glaes'
 
-      expect(h::Supplies.shortages(stocked(5) + [item.new('wire', 'fishing wire')])).to be_empty
-      expect(h::Supplies.shortages([item.new('wire', 'fishing wire')])).to eq(['Constant Weight - glaes - 0/5'])
+      expect(h::Supplies.shortages(stocked(5) + lures(5) + [wire])).to be_empty
+      expect(h::Supplies.shortages(lures(5) + [wire])).to eq(['Constant Weight - glaes - 0/5'])
     end
 
-    it 'needs one of each depth lure that is set and in use' do
+    it 'needs the minimum of each lure in use' do
       h::Config.store[:lure_surface] = 'mandrake lure'
       h::Config.store[:lure_deep] = 'ebon gate lure'
-      wire = item.new('wire', 'fishing wire')
-      mandrake = item.new('lure', 'leaf-topped grey mandrake lure with tiny thorn teeth')
 
-      expect(h::Supplies.shortages([wire, mandrake])).to be_empty
-      expect(h::Supplies.shortages([wire])).to eq(['Lure - mandrake lure - 0/1'])
+      expect(h::Supplies.shortages([wire] + lures(5))).to be_empty
+      expect(h::Supplies.shortages([wire] + lures(2))).to eq(['Lure - mandrake lure - 2/5'])
 
       h::Config.store[:cycle_weights] = true
-      expect(h::Supplies.shortages(stocked(5) + [wire, mandrake])).to eq(['Lure - ebon gate lure - 0/1'])
+      expect(h::Supplies.shortages(stocked(5) + [wire] + lures(5))).to eq(['Lure - ebon gate lure - 0/5'])
+      expect(h::Supplies.shortages(stocked(5) + [wire] + lures(5) + lures(5, 'twisted iron ebon gate lure'))).to be_empty
+    end
+
+    it 'lists the lure used at each depth, falling back to supplies_lure' do
+      h::Config.store[:lure_surface] = 'mandrake lure'
+      h::Config.store[:lure_deep] = 'ebon gate lure'
+      expect(h::Supplies.lures_in_use).to eq('mandrake lure' => ['surface'])
+
+      h::Config.store[:cycle_weights] = true
+      expect(h::Supplies.lures_in_use).to eq('mandrake lure' => ['surface'], 'lure' => ['middle'], 'ebon gate lure' => ['bottom'])
+
+      h::Config.store.merge!(cycle_weights: false, weight_noncycle: 'glaes')
+      expect(h::Supplies.lures_in_use).to eq('lure' => ['any depth'])
     end
 
     it 'matches items by words, the way you would in game' do
@@ -599,7 +613,8 @@ RSpec.describe 'TFish' do
     def statuses(rows) = rows.to_h { |status, text| [text[/^[^:(]+/].strip, status] }
 
     it 'passes a default surface setup with a surface lure on the pole' do
-      rows = h::Supplies.check(supplies, knife_box, h::Pole.parse(surface_squid))
+      spares = Array.new(5) { item.new('lure', 'glittery pink fish lure') }
+      rows = h::Supplies.check(supplies + spares, knife_box, h::Pole.parse(surface_squid))
 
       expect(rows.map(&:first)).to all(eq(:ok))
     end
@@ -613,7 +628,7 @@ RSpec.describe 'TFish' do
                  Array.new(10) { item.new('lure', 'leaf-topped grey mandrake lure') }
       rows = h::Supplies.check(contents, knife_box, h::Pole.parse("The pole's line looks to be frayed and in danger of snapping soon."))
 
-      expect(rows).to include([:ok, 'Lure: none on the pole, 10 spare grey mandrake lure'],
+      expect(rows).to include([:ok, 'Lure on the pole: none'], [:ok, 'Lure grey mandrake lure (surface): 10/5'],
                               [:warn, 'Line on the pole: frayed and in danger of snapping soon, will be replaced before fishing'])
       expect(rows.map(&:first) - [:warn]).to all(eq(:ok))
     end
@@ -621,10 +636,10 @@ RSpec.describe 'TFish' do
     it 'flags a missing pole, spare line and knife' do
       rows = h::Supplies.check([], [], nil)
 
-      expect(statuses(rows)).to include('Pole' => :missing, 'Spare line' => :missing, 'Knife' => :missing, 'Lure' => :missing)
+      expect(statuses(rows)).to include('Pole' => :missing, 'Spare line' => :missing, 'Knife' => :missing, 'Lure lure' => :missing)
     end
 
-    it 'checks both cycling weights and every depth lure that is set' do
+    it 'checks both cycling weights and the lure for each depth' do
       h::Config.store[:cycle_weights] = true
       h::Config.store[:lure_surface] = 'grey lure'
       h::Config.store[:lure_middle] = 'skull lure'
@@ -633,9 +648,8 @@ RSpec.describe 'TFish' do
       rows = h::Supplies.check(contents, knife_box, h::Pole.parse(surface_squid))
 
       expect(rows).to include([:ok, 'Weight blown glass weight: 5/5'], [:missing, 'Weight glaes weight: 0/5'],
-                              [:ok, 'Top lure (grey lure): leaf-topped grey mandrake lure'],
-                              [:missing, 'Middle lure (skull lure): not found'])
-      expect(rows.map(&:last).grep(/Bottom lure/)).to be_empty
+                              [:missing, 'Lure grey lure (surface): 1/5'], [:missing, 'Lure skull lure (middle): 0/5'],
+                              [:missing, 'Lure lure (bottom): 1/5'])
     end
 
     it 'checks each cycling weight sinks to the depth its setting is for' do
@@ -799,14 +813,18 @@ RSpec.describe 'TFish' do
       expect(h::Setup.enabled?(:weight_noncycle, values)).to be false
     end
 
-    it 'only enables the weight minimum when fishing with weights' do
-      expect(h::Setup.enabled?(:supplies_minimum, values)).to be false
+    it 'switches between Ebon Gate and bypass fishing' do
+      expect(values[:fishing_mode]).to eq('ebon_gate')
+      expect(h::Config.bypass?).to be false
+      %i[dock fav_room squelch_script].each { expect(h::Setup.enabled?(it, values)).to be true }
 
-      values[:weight_noncycle] = 'glaes'
-      expect(h::Setup.enabled?(:supplies_minimum, values)).to be true
+      values[:fishing_mode] = 'bypass'
+      %i[dock fav_room squelch_script].each { expect(h::Setup.enabled?(it, values)).to be false }
+      h::Setup.save(values, h::Config.store)
+      expect(h::Config.bypass?).to be true
 
-      values.merge!(weight_noncycle: '', cycle_weights: true)
-      expect(h::Setup.enabled?(:supplies_minimum, values)).to be true
+      h::Config.store[:fishing_mode] = 'nonsense'
+      expect(h::Setup.values_from(h::Config.store)[:fishing_mode]).to eq('ebon_gate')
     end
 
     it 'disables the surface lure while a constant weight is set' do

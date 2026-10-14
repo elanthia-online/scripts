@@ -10,9 +10,6 @@
       Requires your lootsack to be set for storing loot
       ;vars set lootsack=cloak
 
-      ;TFISH BYPASS
-      Fish right where you're standing instead of at Ebon Gate.
-
       ;TFISH LIST
       Show your current settings.
 
@@ -36,6 +33,8 @@
     changelog:
         2.1.0 (2026-10-14)
             new ;tfish setup window to change settings, with tooltips and checks on what you enter
+            ;tfish bypass is now the fishing_mode setting ("bypass"), so it no longer has to be typed each run
+            supplies_minimum now applies to spare lures as well as weights
         2.0.0 (2026-10-06)
             updated for the new fishing system (FISH CAST / FISH REEL, lures instead of bait)
             new option to choose cast distance, default far
@@ -139,6 +138,7 @@ module TFish
       cast_timer: 60,
       cast_distance: "far",
       overfished_wait: 30,
+      fishing_mode: "ebon_gate",
       dock: 1,
       fav_room: 0,
       trash_cut: true,
@@ -187,6 +187,9 @@ module TFish
       step = store[:cycle_weights] ? cast_index / Weights::DEPTHS.size : cast_index
       CAST_DISTANCES[step % CAST_DISTANCES.size]
     end
+
+    # @return [Boolean] whether fishing_mode is bypass: fish where you stand, not at Ebon Gate
+    def bypass? = store[:fishing_mode].to_s == "bypass"
 
     # @return [Boolean] whether a single constant weight is configured instead of cycling
     def constant_weight? = !store[:cycle_weights] && !store[:weight_noncycle].to_s.empty?
@@ -525,11 +528,13 @@ module TFish
       end
       add.(Array(knife_box).any? { named?(it.name, Config[:fillet_knife]) }, "Knife (#{Config[:fillet_knife]}) in your #{Config[:knife_container]}")
 
-      default_lures = count.() { named?(it.name, Config[:supplies_lure]) }
-      add.(pole&.lure || default_lures.positive?,
-           "Lure: #{pole&.lure ? "#{pole.lure} on the pole" : 'none on the pole'}, #{default_lures} spare #{Config[:supplies_lure]}")
-
       minimum = Config[:supplies_minimum]
+      add.(true, "Lure on the pole: #{pole.lure || 'none'}") if pole
+      lures_in_use.each do |lure, depths|
+        have = count.() { named?(it.name, lure) }
+        add.(have >= minimum, "Lure #{lure} (#{depths.join(', ')}): #{have}/#{minimum}")
+      end
+
       if Config[:cycle_weights]
         { Config[:weight_depths] => "middle depths", Config[:weight_bottom] => "bottom" }.each do |weight, depth|
           have = count.() { named?(it.name, weight) }
@@ -547,17 +552,21 @@ module TFish
         add.(true, "Weight: #{pole.weight} on the pole will come off (fishing the surface)")
       end
 
-      depths = Config[:cycle_weights] ? Weights::DEPTHS : [Weights.fishing_depth(0)]
-      depths.each do |depth|
-        lure = Weights.lure_for(depth) or next
-        found = supplies.find { named?(it.name, lure) }&.name || (pole&.lure if named?(pole&.lure, lure))
-        add.(found, "#{depth} lure (#{lure}): #{found || 'not found'}")
-      end
-
-      if depths == ["Top"] && pole&.lure && !Weights.lure_for("Top") && !pole.surface_lure?
+      if !Config[:cycle_weights] && Weights.fishing_depth(0) == "Top" && pole&.lure && !Weights.lure_for("Top") && !pole.surface_lure?
         add.(false, "#{pole.lure} is better at #{pole.best_depth} depth than the surface", warn: true)
       end
       rows
+    end
+
+    # The lure setting for each depth fished: the depth's own lure, else
+    # supplies_lure.
+    #
+    # @return [Hash{String => Array<String>}] lure => depths it's used at
+    #   ("surface", "middle", "bottom", or "any depth" with a constant weight)
+    def lures_in_use
+      depths = Config[:cycle_weights] ? Weights::DEPTHS : [Weights.fishing_depth(0)]
+      depths.group_by { Weights.lure_for(it) || Config[:supplies_lure].to_s }
+            .transform_values { |list| list.map { Familiar.depth_label(it) || "any depth" } }
     end
 
     def shortages(contents)
@@ -572,9 +581,8 @@ module TFish
         weight = Config[:weight_noncycle]
         needs["Constant Weight - #{weight}"] = [contents.count { named?(it.name, "#{weight} weight") }, minimum]
       end
-      depths = Config[:cycle_weights] ? Weights::DEPTHS : [Weights.fishing_depth(0)]
-      depths.filter_map { Weights.lure_for(it) }.uniq.each do |lure|
-        needs["Lure - #{lure}"] = [contents.count { named?(it.name, lure) }, 1]
+      lures_in_use.each_key do |lure|
+        needs["Lure - #{lure}"] = [contents.count { named?(it.name, lure) }, minimum]
       end
       needs.filter_map { |label, (have, need)| "#{label} - #{have}/#{need}" if have < need }
     end
@@ -672,13 +680,13 @@ module TFish
     end
   end
 
-  # What the ;tfish setup window shows: each setting's field and tooltip,
-  # which settings apply given the others, and validation. Pure, so the
-  # rules are specced without GTK; SetupWindow only draws them.
+  # What the ;tfish setup window shows: each setting's field and tooltip in
+  # its section, which settings apply given the others, and validation.
+  # Pure, so the rules are specced without GTK; SetupWindow only draws them.
   module Setup
     # Drop constants left by an earlier run this session so a restart loads the
     # current definitions without already-initialized warnings.
-    %i[Field TABS FIELDS REQUIRED NAME_CHARS].each { |name| remove_const(name) if const_defined?(name, false) }
+    %i[Field SECTIONS FIELDS REQUIRED NAME_CHARS].each { |name| remove_const(name) if const_defined?(name, false) }
 
     # @!attribute key [Symbol] UserVars.tfish key
     # @!attribute label [String]
@@ -689,8 +697,8 @@ module TFish
       def initialize(key:, label:, type:, tip:, range: nil) = super
     end
 
-    # @return [Hash{String => Array<Field>}] notebook tab => its fields, in order
-    TABS = {
+    # @return [Hash{String => Array<Field>}] window section => its fields, in order
+    SECTIONS = {
       "Gear"    => [
         Field.new(key: :supplies_container, label: "Supplies container", type: :text,
                   tip: "Container holding your pole, line, lures and weights, as you'd name it in game (e.g. cloak, green sack)."),
@@ -700,8 +708,9 @@ module TFish
                   tip: "Your spool of fishing line (e.g. wire). Spare \"length of\" pieces are used before pulling a new one."),
         Field.new(key: :supplies_lure, label: "Lure", type: :text,
                   tip: "Lure used when no lure is set for the depth being fished (e.g. lure, grey lure)."),
-        Field.new(key: :supplies_minimum, label: "Minimum weights", type: :number, range: 1..50,
-                  tip: "Stop fishing when you have fewer than this many of a weight in use.\nOnly used when fishing with weights."),
+        Field.new(key: :supplies_minimum, label: "Minimum supplies", type: :number, range: 1..50,
+                  tip: "Spare lures and weights of each kind in use to keep in your supplies container.\n" \
+                       "tfish stops when you have fewer. Line needs one spool (50 lengths)."),
         Field.new(key: :fillet_knife, label: "Fillet knife", type: :text,
                   tip: "Knife to cut the fish open with (e.g. dagger)."),
         Field.new(key: :knife_container, label: "Knife container", type: :text,
@@ -725,10 +734,13 @@ module TFish
                   tip: "Lure for the bottom (e.g. ebon gate lure). Empty uses the Lure setting. Needs Cycle depths."),
       ],
       "Fishing" => [
+        Field.new(key: :fishing_mode, label: "Fishing mode", type: :choice,
+                  tip: "Ebon Gate: travel to the dock, pay the fee and fish there.\n" \
+                       "Bypass: fish right where you're standing, with no Ebon Gate travel, dock fee or squelching."),
         Field.new(key: :dock, label: "Dock", type: :choice,
-                  tip: "Ebon Gate dock to fish. If you're already standing on a dock's fishing spot, it fishes there instead."),
+                  tip: "Ebon Gate dock to fish. If you're already standing on a dock's fishing spot, it fishes there instead.\nEbon Gate mode only."),
         Field.new(key: :fav_room, label: "Fishing spot", type: :choice,
-                  tip: "Least crowded picks the spot with the fewest other fishers each time, or pick a room."),
+                  tip: "Least crowded picks the spot with the fewest other fishers each time, or pick a room.\nEbon Gate mode only."),
         Field.new(key: :cast_distance, label: "Cast distance", type: :choice,
                   tip: "Middle lands the most fish per hour; far wears the line fastest.\nWith Cycle distance on, the rotation starts here."),
         Field.new(key: :cycle_distance, label: "Cycle distance", type: :check,
@@ -752,14 +764,14 @@ module TFish
         Field.new(key: :familiar_debug, label: "Fight log", type: :check,
                   tip: "Send a line per fight to the familiar window: cast, depth, fish, rarity, weight, bite and fight time, reels and find."),
         Field.new(key: :squelch_script, label: "Squelch other fishers", type: :check,
-                  tip: "Run ;tsquelch to hide other fishers' messages."),
+                  tip: "Run ;tsquelch to hide other fishers' messages. Ebon Gate mode only."),
         Field.new(key: :debug_my_script, label: "Debug log", type: :check,
                   tip: "Verbose log for diagnosing fishing: script commands, timestamped fight lines and extra LOOKs at the pole."),
       ],
     }.freeze
 
     # @return [Hash{Symbol => Field}]
-    FIELDS = TABS.values.flatten.to_h { [it.key, it] }.freeze
+    FIELDS = SECTIONS.values.flatten.to_h { [it.key, it] }.freeze
 
     # Text settings that can't be left empty (when they apply).
     REQUIRED = %i[supplies_container supplies_pole supplies_line supplies_lure fillet_knife knife_container weight_depths weight_bottom].freeze
@@ -786,6 +798,7 @@ module TFish
       distance = values[:cast_distance].to_s.downcase
       values[:cast_distance] = Config::CAST_DISTANCES.include?(distance) ? distance : "far"
       values[:replace_line_at] = values[:replace_line_at].to_s == "worn" ? "worn" : "frayed"
+      values[:fishing_mode] = values[:fishing_mode].to_s == "bypass" ? "bypass" : "ebon_gate"
       values[:dock] = Rooms::DOCKS.key(Rooms.dock(values[:dock])) unless values[:dock].is_a?(Hash)
       values[:fav_room] = values[:fav_room].to_i
       values[:fav_room] = 0 unless Rooms.dock(values[:dock]).fishing?(values[:fav_room])
@@ -799,6 +812,7 @@ module TFish
       case key
       when :cast_distance then Config::CAST_DISTANCES.map { [it, it.capitalize] }
       when :replace_line_at then [["frayed", "Frayed"], ["worn", "Showing signs of use"]]
+      when :fishing_mode then [["ebon_gate", "Ebon Gate docks"], ["bypass", "Bypass (fish where you stand)"]]
       when :dock
         docks = Rooms::DOCKS.map { |number, dock| [number, "#{number}. #{dock.name}"] }
         values[:dock].is_a?(Hash) ? [[values[:dock], "Custom (entrance #{values[:dock][:entrance]})"], *docks] : docks
@@ -814,7 +828,7 @@ module TFish
       when :weight_depths, :weight_bottom, :lure_middle, :lure_deep then values[:cycle_weights]
       when :weight_noncycle then !values[:cycle_weights]
       when :lure_surface then values[:cycle_weights] || values[:weight_noncycle].to_s.strip.empty?
-      when :supplies_minimum then values[:cycle_weights] || !values[:weight_noncycle].to_s.strip.empty?
+      when :dock, :fav_room, :squelch_script then values[:fishing_mode] != "bypass"
       else true
       end
     end
@@ -854,7 +868,6 @@ module TFish
 
   HELP_TEXT = <<~HELP
     SYNTAX - ;tfish            fish the Ebon Gate dock
-             ;tfish bypass     fish right where you're standing (no Ebon Gate travel, dock fee or squelching)
              ;tfish list       show your current settings
              ;tfish check      check your gear is found for the fishing your settings describe
              ;tfish setup      change settings in a window
@@ -880,7 +893,7 @@ module TFish
       replace_line_at      "frayed"              replace the line once it's "frayed", or "worn" to replace it
                                                  earlier (showing signs of use) so it can't fray mid-fight
       supplies_container   "cloak"               container holding pole, lure, line and weights
-      supplies_minimum     5                     minimum weights needed to keep fishing
+      supplies_minimum     5                     spare lures and weights of each kind in use needed to keep fishing
       supplies_pole        "rod"                 noun of your fishing pole
       supplies_lure        "lure"                noun of your fishing lure (lure, squid, ...)
       supplies_line        "wire"                noun of your fishing line
@@ -888,6 +901,8 @@ module TFish
       knife_container      "cloak"               container holding your knife
       cast_distance        "far"                 near, middle or far
       cast_timer           60                    seconds per castbar refresh while waiting for a bite
+      fishing_mode         "ebon_gate"           "ebon_gate" fishes the Ebon Gate docks; "bypass" fishes right where
+                                                 you're standing (no Ebon Gate travel, dock fee or squelching)
       overfished_wait      30                    seconds to wait before recasting when a spot is overfished,
                                                  then the next spot on the dock is tried
       use_cman             false                 use CMAN SURGE before reeling
@@ -913,7 +928,7 @@ module TFish
                                                  (dock 1: 32117 Main Entrance, 32118 Northwest, 32116 Southeast)
   HELP
 
-  # The ;tfish setup window. Widgets are built from Setup::TABS, and every
+  # The ;tfish setup window. Widgets are built from Setup::SECTIONS, and every
   # change re-applies Setup's rules: settings that don't apply are greyed
   # out, invalid ones are marked, and Save waits until they're fixed. All
   # GTK calls run through Gtk.queue, per Lich5's threading rules.
@@ -947,13 +962,22 @@ module TFish
 
     def build
       @window = Gtk::Window.new
-      @window.title = "TFish Setup"
+      @window.title = "TFish Setup v#{Script.version(Script.current.name)}"
       @window.border_width = 10
       @window.keep_above = true
       @window.signal_connect("delete_event") { @action ||= :cancel; true } # destroyed after show returns
 
-      notebook = Gtk::Notebook.new
-      Setup::TABS.each { |tab, fields| notebook.append_page(page(fields), Gtk::Label.new(tab)) }
+      # Sections in two columns: Gear and Depths, then Fishing and Output.
+      sections = Gtk::Box.new(:horizontal, 10)
+      Setup::SECTIONS.each_slice(2) do |pair|
+        column = Gtk::Box.new(:vertical, 10)
+        pair.each do |title, fields|
+          frame = Gtk::Frame.new(title)
+          frame.add(section(fields))
+          column.pack_start(frame, expand: false, fill: true, padding: 0)
+        end
+        sections.pack_start(column, expand: true, fill: true, padding: 0)
+      end
 
       @status = Gtk::Label.new("")
       @status.xalign = 0
@@ -969,14 +993,14 @@ module TFish
       buttons.pack_end(cancel, expand: false, fill: false, padding: 0)
 
       box = Gtk::Box.new(:vertical, 8)
-      box.pack_start(notebook, expand: true, fill: true, padding: 0)
+      box.pack_start(sections, expand: true, fill: true, padding: 0)
       box.pack_start(buttons, expand: false, fill: false, padding: 0)
       @window.add(box)
     end
 
     # @param fields [Array<Setup::Field>]
     # @return [Gtk::Grid] a label and widget per row, both with the tooltip
-    def page(fields)
+    def section(fields)
       grid = Gtk::Grid.new
       grid.row_spacing = 6
       grid.column_spacing = 12
@@ -1445,7 +1469,7 @@ module TFish
           return line =~ Messages::LOST ? :lost : :hooked
         end
         unless on_fishing_spot?
-          fail!("You left the room you started fishing in. Restart ;tfish bypass where you want to fish.") if @bypass
+          fail!("You left the room you started fishing in. Run ;tfish again where you want to fish.") if @bypass
           return
         end
 
@@ -1698,7 +1722,11 @@ module TFish
       open_setup
       return
     end
-    bypass = arg == "bypass"
+    if arg == "bypass"
+      Lich::Messaging.msg("warn", "Bypass is now a setting: Fishing mode in ;tfish setup, or ;e UserVars.tfish[:fishing_mode] = \"bypass\"")
+      return
+    end
+    bypass = Config.bypass?
 
     silence_me unless Config[:debug_my_script]
     if hands.any?
