@@ -946,6 +946,15 @@ RSpec.describe 'TFish' do
       expect(h::Tackle.whispered('USAGE: WHISPER {my} box [#]')).to be_nil
     end
 
+    # From a real TINKER, for boxes without WHISPER.
+    it 'reads the tray TINKER cycled to the top' do
+      line = 'You discreetly rearrange the angular trays of your mithril tackle box, shifting the one storing ' \
+             'a pale carved skull-shaped lure with granite-inset eyes (fishing lure) to the top.'
+
+      expect(h::Tackle.tinkered(line)).to eq('pale carved skull-shaped lure with granite-inset eyes')
+      expect(h::Tackle.tinkered(nil)).to be_nil
+    end
+
     it 'finds the pole on the loops from LOOK ON' do
       look = <<~XML
         <container id='767883310' title='Box' target='#767883310' location='right'/><clearContainer id="767883310"/><inv id='767883310'>The <a exist="767883310" noun="box">box</a> is closed.</inv><inv id='767883310'>On the <a exist="767883310" noun="box">box</a>:</inv><inv id='767883310'> a <a exist="767883098" noun="pole">twisted black fishing pole</a> adorned with tiny fish skulls</inv>On the <a exist="767883310" noun="box">mithril tackle box</a>:
