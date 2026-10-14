@@ -14,7 +14,7 @@ module TFishSpec
   SOURCE_PATH = find_lic_source('tfish.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH)
 
-  MODULES = %w[Config Messages Pole Weights Supplies Rooms Familiar].freeze
+  MODULES = %w[Config Messages Pole Weights Supplies Rooms Familiar Setup].freeze
 
   FakeItem = Struct.new(:noun, :name)
   FakePc = Struct.new(:noun)
@@ -752,6 +752,105 @@ RSpec.describe 'TFish' do
 
     it 'picks the least crowded room, first on ties' do
       expect(h::Rooms.least_crowded({ 32116 => 2, 32117 => 0, 32118 => 0 })).to eq(32117)
+    end
+  end
+
+  describe 'Setup' do
+    let(:values) { h::Setup.values_from(h::Config.store) }
+
+    it 'has a field for every setting except the counters' do
+      expect(h::Setup::FIELDS.keys).to match_array(h::Config::DEFAULTS.keys - %i[cast_total fish_total snap_total])
+    end
+
+    it 'gives every field a tooltip' do
+      expect(h::Setup::FIELDS.values.map(&:tip)).to all(be_a(String).and(satisfy { !it.strip.empty? }))
+    end
+
+    it 'cleans up loaded settings so each fits its widget' do
+      store = h::Config.store
+      store.merge!(dock: 'moss', fav_room: 32116, cast_distance: 'MIDDLE', replace_line_at: 'nonsense', cast_timer: 5, supplies_minimum: '3')
+      values = h::Setup.values_from(store)
+
+      expect(values).to include(dock: 4, fav_room: 0, cast_distance: 'middle', replace_line_at: 'frayed', cast_timer: 10, supplies_minimum: 3)
+    end
+
+    it 'keeps a spot on the chosen dock and a custom dock' do
+      h::Config.store.merge!(dock: 2, fav_room: 32127)
+      expect(values).to include(dock: 2, fav_room: 32127)
+
+      custom = { entrance: 1, spots: [2, 3] }
+      h::Config.store.merge!(dock: custom, fav_room: 3)
+      reloaded = h::Setup.values_from(h::Config.store)
+      expect(reloaded).to include(dock: custom, fav_room: 3)
+      expect(h::Setup.choices(:dock, reloaded).first).to eq([custom, 'Custom (entrance 1)'])
+    end
+
+    it "offers the chosen dock's spots" do
+      values[:dock] = 3
+      expect(h::Setup.choices(:fav_room, values)).to eq([[0, 'Least crowded'], [32120, 'Room 32120'], [32121, 'Room 32121'], [32122, 'Room 32122']])
+    end
+
+    it 'only enables depth weights and lures when cycling depths' do
+      %i[weight_depths weight_bottom lure_middle lure_deep].each { expect(h::Setup.enabled?(it, values)).to be false }
+      expect(h::Setup.enabled?(:weight_noncycle, values)).to be true
+
+      values[:cycle_weights] = true
+      %i[weight_depths weight_bottom lure_middle lure_deep lure_surface].each { expect(h::Setup.enabled?(it, values)).to be true }
+      expect(h::Setup.enabled?(:weight_noncycle, values)).to be false
+    end
+
+    it 'only enables the weight minimum when fishing with weights' do
+      expect(h::Setup.enabled?(:supplies_minimum, values)).to be false
+
+      values[:weight_noncycle] = 'glaes'
+      expect(h::Setup.enabled?(:supplies_minimum, values)).to be true
+
+      values.merge!(weight_noncycle: '', cycle_weights: true)
+      expect(h::Setup.enabled?(:supplies_minimum, values)).to be true
+    end
+
+    it 'disables the surface lure while a constant weight is set' do
+      values[:weight_noncycle] = 'glaes'
+      expect(h::Setup.enabled?(:lure_surface, values)).to be false
+
+      values[:cycle_weights] = true
+      expect(h::Setup.enabled?(:lure_surface, values)).to be true
+    end
+
+    it 'accepts the defaults' do
+      expect(h::Setup.errors(values)).to be_empty
+    end
+
+    it 'flags required, quoted and "my" names, but not settings that are off' do
+      values.merge!(supplies_container: ' ', supplies_lure: '"grey lure"', fillet_knife: 'my dagger', weight_depths: '')
+      errors = h::Setup.errors(values)
+
+      expect(errors[:supplies_container]).to eq('Required')
+      expect(errors[:supplies_lure]).to include('no quotes')
+      expect(errors[:fillet_knife]).to include('my')
+      expect(errors).not_to have_key(:weight_depths)
+      expect(errors).not_to have_key(:lure_surface)
+    end
+
+    it 'needs two different weights when cycling depths' do
+      values.merge!(cycle_weights: true, weight_depths: 'glaes weight', weight_bottom: 'Glaes Weight ')
+      expect(h::Setup.errors(values)[:weight_bottom]).to include('different weight')
+
+      values[:weight_depths] = ''
+      expect(h::Setup.errors(values)[:weight_depths]).to eq('Required')
+    end
+
+    it "accepts names with hyphens and apostrophes" do
+      values[:supplies_container] = "djinn's sea-green sack"
+      expect(h::Setup.errors(values)).to be_empty
+    end
+
+    it 'saves every field with text trimmed' do
+      values.merge!(supplies_lure: '  grey lure ', cycle_weights: true)
+      h::Setup.save(values, h::Config.store)
+
+      expect(h::Config[:supplies_lure]).to eq('grey lure')
+      expect(h::Config[:cycle_weights]).to be true
     end
   end
 end
