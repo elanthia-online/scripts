@@ -982,6 +982,35 @@ RSpec.describe 'TFish' do
     end
   end
 
+  describe 'lag and pulling in' do
+    # From a real log of reeling a near cast in before a bite.
+    it "reads where a pull left the hook, or that it's all the way in" do
+      expect('Your hook is now about 18 feet away.'[h::Messages::PULL_REPLY, :feet]).to eq('18')
+      reeled = 'You reel the line of your black fishing pole in.  The grey mandrake lure strung on the line breaks the surface ' \
+               'and dangles briefly over the water as you finish retracting the line.'
+      expect(reeled).to match(h::Messages::PULL_REPLY)
+      expect(reeled[h::Messages::PULL_REPLY, :feet]).to be_nil
+      expect('But the pole is already reeled in!').to match(h::Messages::PULL_REPLY)
+    end
+
+    it "doesn't take the pull's slack line for a fish on the line" do
+      slack = 'You take in some of the slack from the line of your black fishing pole.'
+      expect(slack).not_to match(h::Messages::FISH_ON)
+      expect(slack).not_to match(h::Messages::PULL_REPLY)
+    end
+
+    it 'only offers pulling in with near and surface ticked' do
+      values = h::Setup.values_from(h::Config.store)
+      expect(h::Setup.enabled?(:pull_in, values)).to be false
+
+      values[:distance_near] = true
+      expect(h::Setup.enabled?(:pull_in, values)).to be true
+
+      values[:depth_surface] = false
+      expect(h::Setup.enabled?(:pull_in, values)).to be false
+    end
+  end
+
   describe 'toggletfish' do
     it 'matches what you type, with or without a semicolon' do
       %W[toggletfish ;toggletfish <c>toggletfish\n TOGGLETFISH].each { expect(it).to match(h::Messages::TOGGLE) }
