@@ -257,6 +257,14 @@ RSpec.describe 'TFish' do
       expect('The bass is about 13 inches long and weighs around 2 pounds.').not_to match(h::Messages::QUALITY)
     end
 
+    it 'reads weight and rarity from a LOOK that shows them, nil when it does not' do
+      look = "The silver scakor's body is nearly round.\nThe scakor is about 20 inches long and weighs around 8 pounds.\n" \
+             "It is of common quality.\nThe scakor flops and flails wildly in a gregarious struggle to respire!"
+      expect(h::Messages.looked_fish(look)).to eq(%w[common 8 20])
+      expect(h::Messages.looked_fish("The glowing butterflyfish's scales shimmer.")).to eq([nil, nil, nil])
+      expect(h::Messages.looked_fish('')).to eq([nil, nil, nil])
+    end
+
     # FISH TOTAL before and after a catch from fishing_log010.
     it "tells a catch's rarity from which FISH TOTAL count went up" do
       total = lambda do |common, uncommon, rare, epic, legendary|
@@ -688,9 +696,9 @@ RSpec.describe 'TFish' do
 
     it 'writes one line per catch with what FISH TOTAL does not show' do
       line = h::Familiar.catch_line(number: 6, at:, cast: 'far', depth: 'surface', fish: 'tentacled aberration', rarity: 'legendary',
-                                    pounds: '5', bite: 25, fight: 252, reels: 40, prize: 'a piece of pitted grey scoria')
+                                    pounds: '5', inches: '20', bite: 25, fight: 252, reels: 40, prize: 'a piece of pitted grey scoria')
 
-      expect(line).to eq('#6 13:16 far/surface tentacled aberration (legendary) 5lb | bite 25s, fight 252s / 40 reels | a piece of pitted grey scoria')
+      expect(line).to eq('#6 13:16 far/surface tentacled aberration (legendary) 5lb 20in | bite 25s, fight 252s / 40 reels | a piece of pitted grey scoria')
     end
 
     it 'leaves out what is unknown' do
