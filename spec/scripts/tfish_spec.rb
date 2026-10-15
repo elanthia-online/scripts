@@ -983,17 +983,20 @@ RSpec.describe 'TFish' do
   end
 
   describe 'lag and pulling in' do
-    # From Nairdin's log after pulling a near cast in.
-    it 'reads how far out the line is, and nothing once it is reeled in' do
-      cast = "The line of the black fishing pole is cast out into the water about 26 feet away.\n" \
-             "The pole's line looks to be in excellent condition."
-      expect(h::Pole.parse(cast).out).to eq(26)
-      expect(h::Pole.parse("The pole's line looks to be in excellent condition.").out).to be_nil
+    # From a real log of reeling a near cast in before a bite.
+    it "reads where a pull left the hook, or that it's all the way in" do
+      expect('Your hook is now about 18 feet away.'[h::Messages::PULL_REPLY, :feet]).to eq('18')
+      reeled = 'You reel the line of your black fishing pole in.  The grey mandrake lure strung on the line breaks the surface ' \
+               'and dangles briefly over the water as you finish retracting the line.'
+      expect(reeled).to match(h::Messages::PULL_REPLY)
+      expect(reeled[h::Messages::PULL_REPLY, :feet]).to be_nil
+      expect('But the pole is already reeled in!').to match(h::Messages::PULL_REPLY)
     end
 
-    it 'ends a pull on roundtime, an already reeled in line, or a bite' do
-      ['Roundtime: 7 sec.', 'But the pole is already reeled in!',
-       'You feel a brief jerk on your line before it begins to reel out wildly.'].each { expect(it).to match(h::Messages::PULL_REPLY) }
+    it "doesn't take the pull's slack line for a fish on the line" do
+      slack = 'You take in some of the slack from the line of your black fishing pole.'
+      expect(slack).not_to match(h::Messages::FISH_ON)
+      expect(slack).not_to match(h::Messages::PULL_REPLY)
     end
 
     it 'only offers pulling in with near and surface ticked' do
