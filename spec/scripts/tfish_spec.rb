@@ -1020,7 +1020,6 @@ RSpec.describe 'TFish' do
 
       values[:fishing_mode] = 'bypass'
       expect(h::Setup.enabled?(:catch_action, values)).to be true
-      expect(h::Setup.enabled?(:fish_container, values)).to be false
 
       values[:catch_action] = 'keep'
       expect(h::Setup.enabled?(:fish_container, values)).to be true
@@ -1029,6 +1028,9 @@ RSpec.describe 'TFish' do
       values[:catch_action] = 'toss'
       expect(h::Setup.enabled?(:fish_container, values)).to be false
       expect(h::Setup.enabled?(:trash_cut, values)).to be false
+
+      values[:catch_action] = 'cut' # fillets that can't be trashed go there too
+      expect(h::Setup.enabled?(:fish_container, values)).to be true
     end
 
     it 'lets the fish container be left empty for the lootsack' do
