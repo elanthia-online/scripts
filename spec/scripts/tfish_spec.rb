@@ -1011,6 +1011,41 @@ RSpec.describe 'TFish' do
     end
   end
 
+  describe 'catches outside Ebon Gate' do
+    let(:values) { h::Setup.values_from(h::Config.store) }
+
+    it 'only offers tossing or keeping fish in bypass mode' do
+      expect(h::Setup.enabled?(:catch_action, values)).to be false
+      expect(h::Setup.enabled?(:trash_cut, values)).to be true
+
+      values[:fishing_mode] = 'bypass'
+      expect(h::Setup.enabled?(:catch_action, values)).to be true
+      expect(h::Setup.enabled?(:fish_container, values)).to be false
+
+      values[:catch_action] = 'keep'
+      expect(h::Setup.enabled?(:fish_container, values)).to be true
+      expect(h::Setup.enabled?(:trash_cut, values)).to be false
+
+      values[:catch_action] = 'toss'
+      expect(h::Setup.enabled?(:fish_container, values)).to be false
+      expect(h::Setup.enabled?(:trash_cut, values)).to be false
+    end
+
+    it 'lets the fish container be left empty for the lootsack' do
+      values.merge!(fishing_mode: 'bypass', catch_action: 'keep', fish_container: '')
+      expect(h::Setup.errors(values)).to be_empty
+
+      values[:fish_container] = 'my creel'
+      expect(h::Setup.errors(values)[:fish_container]).to include('my')
+    end
+
+    it 'cuts fish open unless set to toss or keep' do
+      h::Config.store[:catch_action] = 'release'
+      expect(h::Setup.values_from(h::Config.store)[:catch_action]).to eq('cut')
+      expect(h::Setup.choices(:catch_action, values).map(&:first)).to eq(%w[cut toss keep])
+    end
+  end
+
   describe 'toggletfish' do
     it 'matches what you type, with or without a semicolon' do
       %W[toggletfish ;toggletfish <c>toggletfish\n TOGGLETFISH].each { expect(it).to match(h::Messages::TOGGLE) }
