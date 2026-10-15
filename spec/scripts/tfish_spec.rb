@@ -257,6 +257,14 @@ RSpec.describe 'TFish' do
       expect('The bass is about 13 inches long and weighs around 2 pounds.').not_to match(h::Messages::QUALITY)
     end
 
+    it 'reads weight and rarity from a LOOK that shows them, nil when it does not' do
+      look = "The silver scakor's body is nearly round.\nThe scakor is about 20 inches long and weighs around 8 pounds.\n" \
+             "It is of common quality.\nThe scakor flops and flails wildly in a gregarious struggle to respire!"
+      expect(h::Messages.looked_fish(look)).to eq(%w[common 8])
+      expect(h::Messages.looked_fish("The glowing butterflyfish's scales shimmer.")).to eq([nil, nil])
+      expect(h::Messages.looked_fish('')).to eq([nil, nil])
+    end
+
     # FISH TOTAL before and after a catch from fishing_log010.
     it "tells a catch's rarity from which FISH TOTAL count went up" do
       total = lambda do |common, uncommon, rare, epic, legendary|
