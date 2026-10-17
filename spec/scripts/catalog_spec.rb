@@ -54,7 +54,7 @@ module CatalogSpec
 
     # Types the specs need, by noun.
     class GameObj
-      TYPES = { 'jar' => 'jar', 'diamond' => 'gem', 'sapphire' => 'gem', 'broadsword' => 'weapon', 'pouch' => 'container' }.freeze
+      TYPES = { 'jar' => 'jar', 'compendium' => 'uncommon', 'orb' => 'magic,uncommon', 'diamond' => 'gem', 'sapphire' => 'gem', 'broadsword' => 'weapon', 'pouch' => 'container' }.freeze
 
       def initialize(_id, noun, _name)
         @noun = noun
@@ -203,6 +203,11 @@ RSpec.describe 'catalog' do
                                                                                                           ['bin > pouch', 'blue sapphire', 1, '', '', false]
                                                                                                         ])
       end
+    end
+
+    it "drops the game's uncommon tag from item types" do
+      expect(parse.item_type('bronze-bound compendium', 'compendium')).to eq('unknown')
+      expect(parse.item_type('indigo orb', 'orb')).to eq('magic')
     end
 
     it 'turns an inventory tree into rows' do
@@ -362,6 +367,19 @@ RSpec.describe 'catalog' do
       expect(cli.abbreviation('inv', cli::TARGETS)).to eq('inventory')
       expect(cli.abbreviation('l', cli::TARGETS)).to eq('locker')
       expect(%w[silver scrip].map { |w| cli.abbreviation(w, cli::TARGETS) }).to eq(%w[bank tickets])
+    end
+
+    it 'treats a whole target name with no action as a query of it' do
+      expect(%w[item inv bank gemstones].map { |word| cli.command([word]) }).to eq([
+                                                                                     ['query', nil, 'item'], ['query', nil, 'inventory'],
+                                                                                     ['query', nil, 'bank'], ['query', nil, 'gemstones']
+                                                                                   ])
+      args = %w[i golden]
+      expect([cli.command(args), args]).to eq([['query', nil, 'item'], %w[i golden]])
+      args = %w[silver wand]
+      expect([cli.command(args), args]).to eq([['query', nil, 'item'], %w[silver wand]])
+      expect(cli.command(%w[export sum bank])).to eq(%w[export sum bank])
+      expect(cli.command(%w[refresh])).to eq(['refresh', nil, 'all'])
     end
 
     it 'splits filters, extras and search words' do
