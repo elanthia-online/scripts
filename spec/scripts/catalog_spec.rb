@@ -273,6 +273,16 @@ RSpec.describe 'catalog' do
       expect(db[:item].select_order_map(:name)).to eq(['green emerald', 'uncut diamond'])
     end
 
+    it 'keeps saved flags for items whose flags were not seen (closed containers)' do
+      sync_items(@xan, [item('drake dagger', path: 'cloak', marked: true), item('star ruby', path: 'cloak')], 100)
+      unknown = { marked: nil, registered: nil, hidden: nil }
+      rows = [item('drake dagger', path: 'cloak', **unknown), item('new gem', path: 'cloak', **unknown)]
+      store.fill_flags({ account_id: @account, character_id: @xan, game: 'GS3', location_id: 2 }, rows)
+      expect(rows.map { |r| [r[:name], r[:marked]] }).to eq([['drake dagger', true], ['new gem', false]])
+      expect(sync_items(@xan, rows, 200)).to eq(inserted: 1, updated: 0, deleted: 1)
+      expect(db[:item].where(name: 'drake dagger').get(:first_seen)).to eq(100)
+    end
+
     it 'keeps family vault items on the account, apart from the characters' do
       sync_items(nil, [item('vault gem')], 100, location_id: catalog::FAMILY_VAULT)
       sync_items(@xan, [], 100, location_id: catalog::FAMILY_VAULT)
