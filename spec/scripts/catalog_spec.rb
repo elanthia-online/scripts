@@ -183,6 +183,28 @@ RSpec.describe 'catalog' do
       expect(parse.locker(['You possess lockers in the following towns:'])).to eq('multi')
     end
 
+    describe '.locker_open' do
+      it 'finds the trunk a trapdoor reveals, and the item count' do
+        lines = [
+          'You open the locker.',
+          'A click can be heard as <a exist="9" noun="trapdoor">trapdoor</a> opens to reveal <a exist="42" noun="trunk">a dark stained antique oak trunk</a> bound in wrought iron.',
+          ' ',
+          'Your locker is currently holding 155 items out of a maximum of 800.  Your family vault is currently holding 11 items out of a maximum of 25.'
+        ]
+        holding, container = parse.locker_open(lines)
+        expect([holding, container.instance_variable_get(:@noun)]).to eq([155, 'trunk'])
+      end
+
+      it 'uses the locker itself when it is the container' do
+        lines = ['You open <a exist="7" noun="locker">your locker</a>.', 'Your locker is currently holding 3 items out of a maximum of 100.']
+        expect(parse.locker_open(lines)[1].instance_variable_get(:@noun)).to eq('locker')
+      end
+
+      it 'finds no locker away from one' do
+        expect(parse.locker_open(['What were you referring to?'])).to eq([nil, nil])
+      end
+    end
+
     it 'turns account types into subscriptions' do
       expect(%w[FREE NORMAL PREMIUM PLATINUM].map { |t| parse.subscription(t) }).to eq(%w[f2p standard premium premium])
     end
