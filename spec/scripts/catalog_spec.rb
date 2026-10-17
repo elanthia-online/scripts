@@ -266,6 +266,13 @@ RSpec.describe 'catalog' do
       end
     end
 
+    it 'counts a single-row save as inserted, then updated only when it changes' do
+      lumnis = { status: '', triple: 10, double: 0, total: 20, start_day: '', start_time: '', last_schedule: '' }
+      expect(store.save_row(:lumnis, @xan, lumnis, 100)).to eq(inserted: 1, updated: 0, deleted: 0)
+      expect(store.save_row(:lumnis, @xan, lumnis, 200)).to eq(inserted: 0, updated: 0, deleted: 0)
+      expect(store.save_row(:lumnis, @xan, lumnis.merge(triple: 5), 300)).to eq(inserted: 0, updated: 1, deleted: 0)
+    end
+
     it 'deletes a character with everything saved for it' do
       sync_items(@xan, [item('uncut diamond')], 100)
       store.sync(:silver, { character_id: @xan }, %i[bank], [{ bank: 'Teras', amount: 5 }], 100)
@@ -375,6 +382,11 @@ RSpec.describe 'catalog' do
   end
 
   describe 'Output' do
+    it 'shows change counts as numbers, not dates' do
+      lines = catalog::Output.table(%i[table inserted updated deleted], [['lumnis', 0, 1, 0]], dates: [])
+      expect(lines[3]).to eq('lumnis |        0 |       1 |       0')
+    end
+
     it 'right-aligns numbers and marks flags' do
       lines = catalog::Output.table(%i[name qty m item], [['Xanlin', 1234, true, 'uncut diamond']])
       expect(lines[1]).to eq('name   |   qty | m | item')
