@@ -403,7 +403,7 @@ module CatalogDB
     GEMSTONE_LINE = /^Gemstone (?<slot>\d+): (?<jewel>.+?)(?<attrs>(?: \([^)]*\))*)\s*$/
     GEMSTONE_PROPERTY = /^\s*\*\s*(?<property>.+?)(?: \(Rank (?<rank>\d+) of (?<max>\d+)\))?\s*$/
 
-    LOCKER_INFO = /You possess locker(?<multi>s)|Your locker(?<multi>s)? in .* are currently being swapped|Your locker is currently located in the town of (?<town>.*?)\./
+    LOCKER_INFO = /You (?:currently )?possess locker(?<multi>s)|Your locker(?<multi>s)? in .* are currently being swapped|Your locker is currently located in the town of (?<town>.*?)\./
 
     # LOCKER INFO names some towns differently from the rest of the game
     LOCKER_TOWNS = { "Kharag 'doth Dzulthu" => 'Zul Logoth', 'Vornavis' => 'Solhaven' }.freeze
@@ -587,6 +587,11 @@ module CatalogDB
       noun.to_s.empty? ? name.split(' ').last.to_s : noun
     end
 
+    # @return [String] the noun of a jar's contents: the last word, except lapis lazuli
+    def self.last_noun(name)
+      name =~ /lapis lazuli$/ ? 'lapis' : name.split.last.to_s
+    end
+
     # @return [String] the item's type from GameObj data, or "unknown"
     def self.item_type(name, noun)
       types = GameObj.new(0, noun, name).type.to_s.split(',') - ['uncommon']
@@ -613,6 +618,13 @@ module CatalogDB
       row = item_row(location_id, path, name, item.noun, item: item,
                      marked: flags.include?('marked'), registered: flags.include?('registered'), hidden: flags.include?('hidden'))
       [row] + item.contents.flat_map { |child| tree_rows(child, location_id, path + [item.noun]) }
+    end
+
+    # @return [Array<Array(String, String, String)>] id, noun and name of each
+    #   item linked after "you see" in a LOOK IN reply
+    def self.look_contents(lines)
+      seen = lines.join(' ')[/you see (.*)/m, 1].to_s
+      seen.scan(/<a exist="(-?\d+)" noun="([^"]+)">([^<]*)<\/a>/)
     end
 
     # Reads OPEN LOCKER.
@@ -714,7 +726,7 @@ module CatalogDB
 
           row[:name] = "#{name} containing #{post}"
           contents = singular(post)
-          rows << item_row(location_id, path + [noun], contents, contents.split.last, amount: count, stack: 'jar')
+          rows << item_row(location_id, path + [noun], contents, last_noun(contents), amount: count, stack: 'jar')
         end
       end
       [rows, shown, read]
@@ -728,14 +740,16 @@ module CatalogDB
     PROMPT = /<prompt/
     INVENTORY_START = /You are (?:currently )?(?:wearing|carrying|holding)|You are carrying nothing|You have nothing/
     LOCKER_OPEN = /You open|already open|locker is currently holding|What were you referring|You (?:don't|do not|can't|cannot)|I could not find/
-    LOOK_START = /exist="|There is nothing|That is closed|could not find|You see the shifting form/
+    # a blank first line is LOOK IN at something that isn't a container,
+    # answered with its description
+    LOOK_START = /^\s*$|exist="|There is nothing|That is closed|could not find|You see the shifting form/
     OPEN_START = /exist="|already open|open already|any way to do that|referring to|locked/
     CLOSE_START = /exist="|already closed|any way to do that|referring to|You tie/
     NOT_OPENED = /already open|open already|any way to do that|referring to|locked/
     BOH_START = Regexp.union(/has multiple pockets/, /^Fashioned (?:from|of)/, /^Crafted from/, /^(?:<popBold\/>)?\d+\. +/,
                              /^There is nothing in there\./, /^You realize/, /^Sifting through/, /^Glancing over your/)
-    MANIFEST_START = /^Thinking back, you recall|^Looking in front of you|^You must first visit|^You must have a Premium|Unknown town specified|You do not currently have a.*? vault/
-    MANIFEST_SKIP = /^You must first visit|^You must have a Premium|Unknown town specified|You do not currently have a.*? vault/
+    MANIFEST_START = /^Thinking back, you recall|^Looking in front of you|^You must first visit|^You must have a Premium|Unknown town specified|You do not currently have a.*? vault|currently being swapped/
+    MANIFEST_SKIP = /^You must first visit|^You must have a Premium|Unknown town specified|You do not currently have a.*? vault|currently being swapped/
 
     # @return [Array<String>] the response lines, without the prompt
     def self.command(cmd, start, timeout: 5)
@@ -767,9 +781,17 @@ module CatalogDB
     def self.character
       {
         prof: Stats.prof.to_s, race: Stats.race.to_s, level: XMLData.level.to_i, exp: Stats.exp.to_i,
-        area: Parse.area(Room.current&.location), citizenship: Char.citizenship.to_s,
+        area: area, citizenship: Char.citizenship.to_s,
         society: Parse.society(Society.status), society_rank: Society.rank.to_s
       }
+    end
+
+    # @return [String, nil] the area you are in; for rooms without one, the
+    #   nearest town's (as invdb did); nil keeps what was saved
+    def self.area
+      location = Room.current&.location || Room[Room.current&.find_nearest_by_tag('town')]&.location
+      area = Parse.area(location)
+      area.empty? ? nil : area
     end
 
     def self.locker_info
@@ -877,16 +899,17 @@ module CatalogDB
                    .sort_by { |c| ancestors(c).size }
       opened = []
       begin
-        closed.each { |c| opened << c if open_container(c.id) }
+        closed.each { |c| opened << c if open_container(c.id, where(c)) }
         todo.each do |row|
-          added = if bohs.include?(row[:name]) then boh_rows(row)
-                  elsif row[:type] =~ /\bjar\b/ then jar_rows(row)
-                  else stack_rows(row)
+          place = where(row[:item])
+          added = if bohs.include?(row[:name]) then boh_rows(row, place)
+                  elsif row[:type] =~ /\bjar\b/ then jar_rows(row, place)
+                  else stack_rows(row, place)
                   end
           rows.concat(added)
         end
       ensure
-        opened.reverse_each { |c| close_container(c.id) }
+        opened.reverse_each { |c| close_container(c.id, where(c)) }
       end
     end
 
@@ -894,6 +917,12 @@ module CatalogDB
       list = []
       list << item while (item = item.parent_item)
       list
+    end
+
+    # @return [String] where an inventory item is, by container id, as invdb
+    #   sent it: "in #123 in #456" (innermost first), or "" at the top
+    def self.where(item)
+      ancestors(item).map { |container| "in ##{container.id}" }.join(' ')
     end
 
     def self.content_path(row)
@@ -905,23 +934,23 @@ module CatalogDB
       row[:status] = found ? found[:status] : 'empty'
       return [] unless found&.dig(:amount)&.positive?
 
-      [Parse.item_row(row[:location_id], content_path(row), found[:contents], found[:contents].split.last,
+      [Parse.item_row(row[:location_id], content_path(row), found[:contents], Parse.last_noun(found[:contents]),
                       amount: found[:amount], stack: 'jar')]
     end
 
-    def self.stack_rows(row)
+    def self.stack_rows(row, where = nil)
       id = row[:item].id
-      count = Parse.stack(command("read ##{id}", /In the Common language|exist="#{id}"/, timeout: 3))
+      count = Parse.stack(command("read ##{id} #{where}".strip, /In the Common language|exist="#{id}"/, timeout: 3))
       return [] unless count&.positive?
 
       [Parse.item_row(row[:location_id], content_path(row), row[:name], row[:noun], amount: count, stack: 'stack')]
     end
 
-    def self.boh_rows(row)
+    def self.boh_rows(row, where = nil)
       id = row[:item].id
       verb = row[:name] =~ /tackle/ ? 'gaze' : 'look in'
-      found = Parse.boh(command("#{verb} ##{id}", BOH_START))
-      found = Parse.boh(command("gaze ##{id}", BOH_START)) if found.empty? && verb != 'gaze'
+      found = Parse.boh(command("#{verb} ##{id} #{where}".strip, BOH_START))
+      found = Parse.boh(command("gaze ##{id} #{where}".strip, BOH_START)) if found.empty? && verb != 'gaze'
       found.map do |f|
         noun, type = Store.known_noun(f[:name])
         noun ||= Parse.noun_guess(f[:name])
@@ -947,10 +976,11 @@ module CatalogDB
       return nil unless container
 
       sorter = Script.running?('sorter')
-      Script.kill('sorter') if sorter
-      look_in(container.id)
-      wait_for_contents(container)
-      rows = locker_rows(container, [])
+      if sorter
+        Script.kill('sorter')
+        sleep 0.1 while Script.running?('sorter')
+      end
+      rows = locker_rows(container, [], look_in(container.id))
       counted = rows.count { |row| row[:stack].empty? }
       _respond "catalog: read #{counted} locker items, the game says #{holding}" if holding && counted != holding
       rows
@@ -960,8 +990,9 @@ module CatalogDB
     end
 
     # @param where [String] where +container+'s items are, e.g. "in sack in locker"
-    def self.locker_rows(container, path, where = 'in locker')
-      container.contents.to_a.flat_map do |obj|
+    # @param look [Array<String>] the LOOK IN reply for +container+
+    def self.locker_rows(container, path, look, where = 'in locker')
+      contents(container, look).flat_map do |obj|
         name = [obj.before_name, obj.name, obj.after_name].compact.join(' ').strip.sub(Parse::LEADING_ARTICLE, '')
         row = Parse.item_row(LOCKER, path, name, obj.noun.to_s)
         rows = [row]
@@ -971,21 +1002,28 @@ module CatalogDB
           row.delete(:item)
         elsif obj.type.to_s =~ /container|clothing/ && !noopen?(name)
           opened = open_container(obj.id, where)
-          look_in(obj.id, where)
-          wait_for_contents(obj)
-          rows.concat(locker_rows(obj, path + [obj.noun], "in #{obj.noun} #{where}"))
+          look = look_in(obj.id, where)
+          rows.concat(locker_rows(obj, path + [obj.noun], look, "in #{obj.noun} #{where}"))
           close_container(obj.id, where) if opened
         end
         rows
       end
     end
 
-    # Lich fills in what a container holds a moment after LOOK IN answers.
-    def self.wait_for_contents(container, seconds = 1)
-      (seconds * 10).times do
+    # What a container holds: the items linked in its LOOK IN reply, or, when
+    # the reply links none, what Lich has for it (filled in a moment after
+    # the reply).
+    #
+    # @return [Array<GameObj>]
+    def self.contents(container, look)
+      linked = Parse.look_contents(look)
+      return linked.map { |id, noun, name| GameObj.new(id, noun, name) } unless linked.empty?
+
+      10.times do
         break if container.contents
         sleep 0.1
       end
+      container.contents.to_a
     end
 
     # Rows for one LOCKER MANIFEST, trying up to three times when lines go missing.

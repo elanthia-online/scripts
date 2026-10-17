@@ -163,6 +163,11 @@ RSpec.describe 'catalog' do
                                       ])
     end
 
+    it 'calls lapis lazuli in a jar lapis' do
+      lines = ['  On an armor stand:', '      a glass jar containing blue lapis lazuli (5/50)', 'Obvious items: 1']
+      expect(parse.manifest(lines, 11)[0].last.values_at(:name, :noun)).to eq(['blue lapis lazuli', 'lapis'])
+    end
+
     it 'reads a free account single bank line' do
       line = 'You currently have an account with the Icemule Trace Bank in the amount of 2,000 silver.'
       expect(parse.bank([line])).to eq([{ bank: 'Icemule Trace Bank', amount: 2000 }])
@@ -181,6 +186,13 @@ RSpec.describe 'catalog' do
       ]
       expect(parse.locker(lines)).to eq('Solhaven')
       expect(parse.locker(['You possess lockers in the following towns:'])).to eq('multi')
+      expect(parse.locker(['WARNING: You currently possess lockers in multiple towns.  However, you are no longer eligible for them.'])).to eq('multi')
+    end
+
+    it 'reads the items a LOOK IN reply links' do
+      lines = ['In the <a exist="5" noun="bag">gold paper bag</a> you see <a exist="6" noun="ring">a gold ring</a> and <a exist="7" noun="gem">a blue gem</a>.']
+      expect(parse.look_contents(lines)).to eq([['6', 'ring', 'a gold ring'], ['7', 'gem', 'a blue gem']])
+      expect(parse.look_contents(['There is nothing in there.'])).to eq([])
     end
 
     describe '.locker_open' do
