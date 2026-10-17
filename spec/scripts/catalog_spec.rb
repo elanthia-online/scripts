@@ -205,6 +205,22 @@ RSpec.describe 'catalog' do
       end
     end
 
+    it 'reads registered/marked/hidden from INVENTORY FULL by item id' do
+      lines = [
+        'You are currently wearing:',
+        '  a <a exist="101" noun="cloak">voluminous mist tartan cloak</a> lined in silver-tipped aquerne (registered) (marked)',
+        '      a <a exist="102" noun="cube">solid moonstone cube</a>',
+        '      a <a exist="103" noun="orb">shimmering indigo orb</a> (marked)',
+        ' ',
+        '(Items: 3)'
+      ]
+      expect(parse.inventory_flags(lines)).to eq(
+        '101' => { marked: true, registered: true, hidden: false },
+        '102' => { marked: false, registered: false, hidden: false },
+        '103' => { marked: true, registered: false, hidden: false }
+      )
+    end
+
     it "drops the game's uncommon tag from item types" do
       expect(parse.item_type('bronze-bound compendium', 'compendium')).to eq('unknown')
       expect(parse.item_type('indigo orb', 'orb')).to eq('magic')
