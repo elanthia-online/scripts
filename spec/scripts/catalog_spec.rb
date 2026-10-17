@@ -168,6 +168,21 @@ RSpec.describe 'catalog' do
       expect(parse.bank([line])).to eq([{ bank: 'Icemule Trace Bank', amount: 2000 }])
     end
 
+    it 'reads the locker town from LOCKER INFO, using the usual town name' do
+      lines = [
+        'Tysong, your locker information is as follows:',
+        ' ',
+        'Your locker is currently located in the town of Vornavis.',
+        ' ',
+        'You currently have unlimited access to locker runners.  This access will expire on 4/12/2031 11:17:08 CST.',
+        ' ',
+        'You have purchased the following permanent additional locker slots:',
+        'Vornavis: +750'
+      ]
+      expect(parse.locker(lines)).to eq('Solhaven')
+      expect(parse.locker(['You possess lockers in the following towns:'])).to eq('multi')
+    end
+
     it 'turns account types into subscriptions' do
       expect(%w[FREE NORMAL PREMIUM PLATINUM].map { |t| parse.subscription(t) }).to eq(%w[f2p standard premium premium])
     end
