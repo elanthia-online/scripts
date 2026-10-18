@@ -102,6 +102,26 @@ RSpec.describe 'alchemy guild travel time check' do
     end
   end
 
+  context 'when the character steps into the next room while path_to runs' do
+    let(:max_travel_time) { 10 }
+
+    before do
+      allow(map[0]).to receive(:path_to).and_wrap_original do |original, *args|
+        path = original.call(*args)
+        allow(map).to receive(:current).and_return(map[1])
+        path
+      end
+    end
+
+    it 'measures the whole trip from the room the check began in' do
+      # From room 0 the guild is 12 s away. Mixing in room 1 as the start
+      # would estimate [1, 1] and fall back to estimate_time's 0.2 default.
+      result = check_guild(1)
+      expect(result[:accepted]).to be(false)
+      expect(result[:messages]).to eq(['warning: nearest guild exceeds max travel time'])
+    end
+  end
+
   context 'with the path_to of Lich before 5.14, which also leaves out the destination' do
     let(:max_travel_time) { 10 }
 
