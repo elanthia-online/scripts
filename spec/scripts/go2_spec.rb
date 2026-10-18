@@ -80,6 +80,11 @@ end
 #
 # Room 0 is reachable so that a nil destination wrongly turned into room 0
 # (nil.to_i) would measure a real path instead of quietly finding none.
+#
+# Banks, for go2's choice of a bank it can afford to reach (fares are
+# silver-cost tags on the room the fare is paid from):
+#   700 -30 (fare 50)-> 710 -1-> 720 (bank)     700 -40-> 730 (bank)
+#   740 (bank)
 module Go2TravelTimeSpec
   SOURCE_PATH = find_lic_source('go2.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH)
@@ -89,8 +94,8 @@ module Go2TravelTimeSpec
 
   if MAP
     string_proc = Sandbox::Lich::Common::StringProc
-    add_room = lambda do |id, wayto, timeto|
-      MAP.new(id, ["[Room #{id}]"], ["Room #{id}."], ['Obvious paths: none.'], [], nil, nil, nil, wayto, timeto)
+    add_room = lambda do |id, wayto, timeto, tags = []|
+      MAP.new(id, ["[Room #{id}]"], ["Room #{id}."], ['Obvious paths: none.'], [], nil, nil, nil, wayto, timeto, nil, nil, tags)
     end
     add_room.call(0, {}, {})
     add_room.call(100, { '200' => 'east', '500' => 'climb ladder', '0' => 'north' }, { '200' => 12.0, '500' => string_proc.new('3.5'), '0' => 1.0 })
@@ -99,16 +104,57 @@ module Go2TravelTimeSpec
     add_room.call(400, {}, {})
     add_room.call(500, {}, {})
     add_room.call(600, {}, {})
+    add_room.call(700, { '710' => 'go ferry', '730' => 'west' }, { '710' => 30.0, '730' => 40.0 }, ['silver-cost:710:50'])
+    add_room.call(710, { '720' => 'east' }, { '720' => 1.0 })
+    add_room.call(720, {}, {}, ['bank'])
+    add_room.call(730, {}, {}, ['bank'])
+    add_room.call(740, {}, {}, ['bank'])
+    # Older Lich keeps rooms in an Array indexed by id and walks all of it in
+    # find_all_nearest_by_tag, calling nil.tags on the unused ids; the Lich
+    # runtime's NilClass patch absorbs that, but rspec does not load it. Fill
+    # the unused ids with unconnected rooms so the walk sees only real rooms.
+    (0..740).each { |id| add_room.call(id, {}, {}) unless MAP[id] }
   end
 
-  # The real Go2.estimate_travel_time, with Room and Map bound to the real
-  # map class. Built on demand so the caller examples below report a missing
-  # helper as an ordinary example failure.
+  # The real Go2.travel_path and Go2.estimate_travel_time, with Room and Map
+  # bound to the real map class. Built on demand so the caller examples below
+  # report a missing helper as an ordinary example failure.
   def self.go2
     @go2 ||= Module.new.tap do |go2|
       go2.const_set(:Room, MAP)
       go2.const_set(:Map, MAP)
-      go2.module_eval(extract_lic_method(SOURCE, 'estimate_travel_time', source_path: SOURCE_PATH), SOURCE_PATH)
+      %w[travel_path estimate_travel_time].each do |name|
+        go2.module_eval(extract_lic_method(SOURCE, name, source_path: SOURCE_PATH), SOURCE_PATH)
+      end
+    end
+  end
+
+  # go2's real get_silver_cost proc.
+  def self.get_silver_cost
+    source = extract_from_source(SOURCE, /^  get_silver_cost = proc \{.*?^  \}\n/m, label: 'get_silver_cost', source_path: SOURCE_PATH)
+    Object.new.instance_eval("#{source}\nget_silver_cost", SOURCE_PATH)
+  end
+
+  # go2's real choice of a bank to fetch silver from: the `unless (bank_id =
+  # ...)` block, with its echo and exit captured. Returns the chosen bank id,
+  # or :too_poor when go2 would have given up. go2 2.5.0 gives up with
+  # fail_trip.call instead of exit, so both are captured and this holds
+  # whichever of the two lands first.
+  def self.choose_bank(current_silvers)
+    block = extract_from_source(
+      SOURCE,
+      /^( +)(?:bank_origin = Room\.current\n\1)?unless \(bank_id = .*?^\1end\n/m,
+      label: 'bank choice', source_path: SOURCE_PATH
+    )
+    context = Object.new
+    context.define_singleton_method(:echo) { |_msg| nil }
+    context.define_singleton_method(:exit) { throw :go2_exit, :too_poor }
+    catch(:go2_exit) do
+      context.instance_eval(
+        "get_silver_cost = Go2TravelTimeSpec.get_silver_cost\nfail_trip = proc { |_reason| exit }\n" \
+        "current_silvers = #{Integer(current_silvers)}\n#{block}\nbank_id",
+        SOURCE_PATH
+      )
     end
   end
 end
@@ -184,6 +230,70 @@ RSpec.describe 'go2 travel time estimates' do
         allow(map[100]).to receive(:path_to).with(200).and_return([])
         expect(estimate(100, 200)).to eq(12.0)
       end
+    end
+  end
+
+  describe 'Go2.travel_path' do
+    def travel_path(origin, destination)
+      Go2TravelTimeSpec.go2.travel_path(origin, destination)
+    end
+
+    it 'starts at the origin and ends at the destination' do
+      expect(travel_path(100, 400)).to eq([100, 200, 300, 400])
+      expect(travel_path(100, 200)).to eq([100, 200])
+      expect(travel_path(100, '300')).to eq([100, 200, 300])
+    end
+
+    it 'is just the origin when already standing in the destination' do
+      expect(travel_path(100, 100)).to eq([100])
+      expect(travel_path(100, '100')).to eq([100])
+    end
+
+    it 'is nil when there is no path, or either room is missing' do
+      expect(travel_path(100, 600)).to be_nil
+      expect(travel_path(400, 100)).to be_nil
+      expect(travel_path(nil, 300)).to be_nil
+      expect(travel_path(999_999, 300)).to be_nil
+      expect(travel_path(100, nil)).to be_nil
+    end
+
+    it 'restores both ends of the path_to of Lich before 5.14' do
+      allow(map[100]).to receive(:path_to).with(400).and_return([200, 300])
+      allow(map[100]).to receive(:path_to).with(200).and_return([])
+      expect(travel_path(100, 400)).to eq([100, 200, 300, 400])
+      expect(travel_path(100, 200)).to eq([100, 200])
+    end
+  end
+
+  describe "go2's choice of a bank it can afford to reach" do
+    before do
+      stub_const('Go2', Go2TravelTimeSpec.go2)
+      stub_const('Room', map)
+      stub_const('Map', map)
+      stub_const('StringProc', Go2TravelTimeSpec::Sandbox::Lich::Common::StringProc)
+    end
+
+    it 'counts the fare out of the current room' do
+      allow(map).to receive(:current).and_return(map[700])
+      expect(Go2TravelTimeSpec.get_silver_cost.call([700, 710, 720])).to eq(50)
+      # 720 is nearer, but the 50 silver ferry out of 700 is out of reach.
+      expect(Go2TravelTimeSpec.choose_bank(20)).to eq(730)
+      expect(Go2TravelTimeSpec.choose_bank(50)).to eq(720)
+    end
+
+    it 'counts a fare on the last leg with the path_to of Lich before 5.14' do
+      allow(map).to receive(:current).and_return(map[710])
+      allow(map[710]).to receive(:path_to).with(720).and_return([])
+      map[710].tags.push('silver-cost:720:5')
+      expect(Go2TravelTimeSpec.choose_bank(4)).to eq(:too_poor)
+      expect(Go2TravelTimeSpec.choose_bank(5)).to eq(720)
+    ensure
+      map[710].tags.delete('silver-cost:720:5')
+    end
+
+    it 'chooses the bank you are standing in, at no cost' do
+      allow(map).to receive(:current).and_return(map[740])
+      expect(Go2TravelTimeSpec.choose_bank(0)).to eq(740)
     end
   end
 
