@@ -136,10 +136,8 @@ module Go2TravelTimeSpec
   end
 
   # go2's real choice of a bank to fetch silver from: the `unless (bank_id =
-  # ...)` block, with its echo and exit captured. Returns the chosen bank id,
-  # or :too_poor when go2 would have given up. go2 2.5.0 gives up with
-  # fail_trip.call instead of exit, so both are captured and this holds
-  # whichever of the two lands first.
+  # ...)` block, with its echo and fail_trip captured. Returns the chosen bank
+  # id, or :too_poor when go2 would have given up.
   def self.choose_bank(current_silvers)
     block = extract_from_source(
       SOURCE,
@@ -148,10 +146,9 @@ module Go2TravelTimeSpec
     )
     context = Object.new
     context.define_singleton_method(:echo) { |_msg| nil }
-    context.define_singleton_method(:exit) { throw :go2_exit, :too_poor }
     catch(:go2_exit) do
       context.instance_eval(
-        "get_silver_cost = Go2TravelTimeSpec.get_silver_cost\nfail_trip = proc { |_reason| exit }\n" \
+        "get_silver_cost = Go2TravelTimeSpec.get_silver_cost\nfail_trip = proc { |_reason| throw :go2_exit, :too_poor }\n" \
         "current_silvers = #{Integer(current_silvers)}\n#{block}\nbank_id",
         SOURCE_PATH
       )
@@ -334,15 +331,8 @@ RSpec.describe 'go2 travel time estimates' do
         label: 'recent-instabilities walk', source_path: Go2TravelTimeSpec::SOURCE_PATH
       )
       walked = []
-      script = Class.new
-      script.define_singleton_method(:run) do |name, target, **_opts|
-        raise ArgumentError, "expected a go2 run, got #{name}" unless name == 'go2'
-
-        walked << target.to_s
-      end
-      stub_const('Script', script)
-      # go2 2.5.0 walks there with Go2.run_nested instead of Script.run; stub
-      # that one method by name so this example holds whichever lands first.
+      # go2 walks there with Go2.run_nested; stub that one method by name and
+      # keep the real estimate_travel_time.
       real_go2 = Go2TravelTimeSpec.go2
       go2 = Module.new
       go2.define_singleton_method(:estimate_travel_time) { |*args| real_go2.estimate_travel_time(*args) }
