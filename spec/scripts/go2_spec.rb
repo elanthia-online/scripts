@@ -219,15 +219,29 @@ RSpec.describe 'go2 travel time estimates' do
       )
       walked = []
       script = Class.new
-      script.define_singleton_method(:run) { |name, target, **_opts| walked << [name, target] }
+      script.define_singleton_method(:run) do |name, target, **_opts|
+        raise ArgumentError, "expected a go2 run, got #{name}" unless name == 'go2'
+
+        walked << target.to_s
+      end
       stub_const('Script', script)
+      # go2 2.5.0 walks there with Go2.run_nested instead of Script.run; stub
+      # that one method by name so this example holds whichever lands first.
+      real_go2 = Go2TravelTimeSpec.go2
+      go2 = Module.new
+      go2.define_singleton_method(:estimate_travel_time) { |*args| real_go2.estimate_travel_time(*args) }
+      go2.define_singleton_method(:run_nested) do |target, _label|
+        walked << target.to_s
+        nil
+      end
+      stub_const('Go2', go2)
       stub_const('CharSettings', { 'element' => 'fire' })
       stub_const('GameSettings', { 'recent-instabilities' => [200, 300, 500, 600].map { |id| { room_id: id, element: 'fire' } } })
       allow(map).to receive(:current).and_return(map[100])
 
       Object.new.instance_eval("check_instability = proc { false }\n#{block}", Go2TravelTimeSpec::SOURCE_PATH)
       # 200 (12 s) and 300 (13 s) are too far; 600 has no path.
-      expect(walked).to eq([['go2', '500']])
+      expect(walked).to eq(['500'])
     end
   end
 end
