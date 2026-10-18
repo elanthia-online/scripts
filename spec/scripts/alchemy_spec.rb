@@ -106,7 +106,7 @@ RSpec.describe 'alchemy guild travel time check' do
     let(:max_travel_time) { 10 }
 
     it 'still counts the edge into an adjacent guild' do
-      allow(map[0]).to receive(:path_to).with(1).and_return([])
+      allow(map[0]).to receive(:path_to).and_return([])
       expect(check_guild(1)[:accepted]).to be(false)
     end
   end

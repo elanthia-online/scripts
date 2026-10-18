@@ -75,7 +75,11 @@ end
 #
 # Graph (timeto in seconds):
 #   100 -12-> 200 -1-> 300 -0.2-> 400     100 -3.5 (StringProc)-> 500
-#   200 -12-> 100                         600 is not connected to anything
+#   200 -12-> 100                         100 -1-> 0
+#   600 is not connected to anything
+#
+# Room 0 is reachable so that a nil destination wrongly turned into room 0
+# (nil.to_i) would measure a real path instead of quietly finding none.
 module Go2TravelTimeSpec
   SOURCE_PATH = find_lic_source('go2.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH)
@@ -88,7 +92,8 @@ module Go2TravelTimeSpec
     add_room = lambda do |id, wayto, timeto|
       MAP.new(id, ["[Room #{id}]"], ["Room #{id}."], ['Obvious paths: none.'], [], nil, nil, nil, wayto, timeto)
     end
-    add_room.call(100, { '200' => 'east', '500' => 'climb ladder' }, { '200' => 12.0, '500' => string_proc.new('3.5') })
+    add_room.call(0, {}, {})
+    add_room.call(100, { '200' => 'east', '500' => 'climb ladder', '0' => 'north' }, { '200' => 12.0, '500' => string_proc.new('3.5'), '0' => 1.0 })
     add_room.call(200, { '300' => 'east', '100' => 'west' }, { '300' => 1.0, '100' => 12.0 })
     add_room.call(300, { '400' => 'east' }, { '400' => 0.2 })
     add_room.call(400, {}, {})
@@ -141,7 +146,7 @@ RSpec.describe 'go2 travel time estimates' do
     it 'matches the graph distance dijkstra computes, for every reachable room' do
       # Indexed by room id: a Hash in current Lich, an Array before 5.14.
       _, distances = map[100].dijkstra
-      [200, 300, 400, 500].each do |id|
+      [0, 200, 300, 400, 500].each do |id|
         expect(estimate(100, id)).to be_within(1e-9).of(distances[id]), "room #{id}"
       end
     end
@@ -165,6 +170,7 @@ RSpec.describe 'go2 travel time estimates' do
     end
 
     it 'is nil for a missing destination instead of measuring a path to room 0' do
+      expect(estimate(100, 0)).to eq(1.0)
       expect(estimate(100, nil)).to be_nil
     end
 
