@@ -318,6 +318,30 @@ RSpec.describe 'lich5-update.lic' do
     end
   end
 
+  # Lich 5.5 and older ship no Lich::Util::Update (lib/update.rb first appears
+  # in 5.6.0), and on 5.6.x it is only loaded once the built-in command has run.
+  context 'when Lich::Util::Update is not defined (Lich 5.5 and older)' do
+    [['plain Ruby', false], ["Lich's NilClass patch", true]].each do |label, nil_patch|
+      it "--beta answers on Lich 5.5.0 without touching Lich::Util::Update (#{label})" do
+        skip 'no lich-5 checkout (set LICH5_PATH)' if nil_patch && !Lich5UpdateSpec::NIL_PATCH
+        script_end, user_end = client_with(';send Y')
+        $_CLIENT_ = script_end
+        $_DETACHABLE_CLIENT_ = nil
+        releases_url = 'https://api.github.com/repos/elanthia-online/lich-5/releases'
+        run = run_script(lich_version: '5.5.0', arg: '--beta', nil_patch: nil_patch,
+                         uri_bodies: { releases_url => Lich5UpdateSpec::BETA_RELEASES })
+        run.mod::Lich::Util.send(:remove_const, :Update)
+
+        expect { run.call }.not_to raise_error
+
+        expect(run.text).to include('Beta testing needs Lich 5.7.0 or newer.')
+        expect(run.text).to include('You are running Lich 5.5.0.')
+        expect(run.uri.opened).to be_empty
+        expect(unread(script_end, user_end)).to eq([';send Y'])
+      end
+    end
+  end
+
   context 'on Lich 5.7.0 and newer (Lich installs betas itself)' do
     ['5.7.0', '5.21.0'].each do |version|
       ['--beta', '--beta --confirm', '--test confirm', '--beta --library=foo.rb'].each do |arg|
