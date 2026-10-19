@@ -77,6 +77,17 @@ RSpec.describe 'loot-be-gone.lic gem stockpile bookkeeping' do
       expect(stored(result)).to eq(truth(result))
     end
 
+    it 'marks a jar started this run full when the last gem fills it exactly' do
+      result = LootBeGoneSpec.run(
+        'saved'    => { 'jars' => [], 'empty_jar_count' => 1 },
+        'locker'   => [{ 'id' => '202', 'capacity' => 3 }],
+        'lootsack' => LootBeGoneSpec.gems('ruby', 'ruby', 'ruby'),
+        'steps'    => [{ 'run' => 'stockpile' }]
+      )
+      expect(stored(result)).to eq(jars([{ gem: 'rubies', count: 3, full: true }]))
+      expect(stored(result)).to eq(truth(result))
+    end
+
     it 'saves a single-gem new jar (count 1 is what was pushed, so it is right before and after)' do
       result = LootBeGoneSpec.run(
         'saved'    => { 'jars' => [], 'empty_jar_count' => 1 },
@@ -160,6 +171,17 @@ RSpec.describe 'loot-be-gone.lic gem stockpile bookkeeping' do
         'steps'    => [{ 'run' => 'stockpile' }, { 'run' => 'raid', 'gem' => 'ruby', 'count' => 2 }]
       )
       expect(stored(result)).to eq(jars([{ gem: 'rubies', count: 3, full: false }]))
+      expect(stored(result)).to eq(truth(result))
+    end
+
+    it 'saves gems raided and then stockpiled back in the same run' do
+      result = LootBeGoneSpec.run(
+        'saved'    => { 'jars' => [{ 'gem' => 'rubies', 'count' => 4, 'full' => false }], 'empty_jar_count' => 0 },
+        'locker'   => [{ 'id' => '200', 'gem' => 'ruby', 'count' => 4, 'capacity' => 10 }],
+        'lootsack' => LootBeGoneSpec.gems('ruby'),
+        'steps'    => [{ 'run' => 'raid', 'gem' => 'ruby', 'count' => 2 }, { 'run' => 'stockpile' }]
+      )
+      expect(stored(result)).to eq(jars([{ gem: 'rubies', count: 5, full: false }]))
       expect(stored(result)).to eq(truth(result))
     end
   end

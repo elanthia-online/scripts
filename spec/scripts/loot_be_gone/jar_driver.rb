@@ -202,7 +202,7 @@ def dothistimeout(cmd, _timeout, _regex)
   when /\Ashake #(\d+)\z/
     jar = World.find(Regexp.last_match(1))
     jar.count -= 1
-    World.left_hand = FakeObj.new(id: "g#{rand(1_000_000)}", noun: jar.gem, name: jar.gem, type: 'gem')
+    World.left_hand = FakeObj.new(id: (700_000 + rand(200_000)).to_s, noun: jar.gem, name: jar.gem, type: 'gem')
     jar.after_name = nil if jar.count.zero?
     'You shake a gem out.'
   else
