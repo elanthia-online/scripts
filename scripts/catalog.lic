@@ -255,9 +255,12 @@ module CatalogDB
         db.create_table?(:lumnis) do
           foreign_key :character_id, :character, primary_key: true, on_delete: :cascade
           String :status, null: false, default: ''
+          Integer :quintuple, null: false, default: 0
+          Integer :quadruple, null: false, default: 0
           Integer :triple, null: false, default: 0
           Integer :double, null: false, default: 0
           Integer :total, null: false, default: 0
+          Integer :refresh_at, null: false, default: 0
           String :start_day, null: false, default: ''
           String :start_time, null: false, default: ''
           String :last_schedule, null: false, default: ''
@@ -374,8 +377,8 @@ module CatalogDB
 
   # Turns game output into rows. Nothing here talks to the game.
   module Parse
-    %i[LEADING_ARTICLE PLURALS TICKET_LINE ENTRY_LINE BANK_LINE BANK_SINGLE BANK_END LUMNIS_EXP LUMNIS_STATUS LUMNIS_SCHEDULED LUMNIS_LAST_SCHEDULE
-       RESOURCE_PAIR LOCKER_INFO LOCKER_TOWNS SOCIETIES GEMSTONE_LINE GEMSTONE_PROPERTY JAR_LOOK STACK_READ BOH_LINE OREMONGER_LINE
+    %i[LEADING_ARTICLE PLURALS TICKET_LINE ENTRY_LINE BANK_LINE BANK_SINGLE BANK_END LUMNIS_EXP LUMNIS_TIERS LUMNIS_REFRESH LUMNIS_SCHEDULED
+       LUMNIS_LAST_SCHEDULE LOCKER_INFO LOCKER_TOWNS SOCIETIES GEMSTONE_LINE GEMSTONE_PROPERTY JAR_LOOK STACK_READ BOH_LINE OREMONGER_LINE
        LOCKER_CONTAINER MANIFEST_COUNT MANIFEST_OUTSIDE MANIFEST_INSIDE MANIFEST NOUN_LONG NOUN_MEDIUM NOUN_SHORT].each { |name| remove_const(name) if const_defined?(name, false) }
 
     LEADING_ARTICLE = /\A(?:an?|some|the)\s+/i
@@ -393,12 +396,12 @@ module CatalogDB
     BANK_SINGLE = /You currently have an account with the (?<bank>.*?) in the amount of (?<amount>[\d,]+) silver/i
     BANK_END = /You can deposit up to a maximum of|You haven't opened a bank account yet/i
 
-    LUMNIS_EXP = /(?<value>\d[\d,]*) points of (?<key>triple|double)/
-    LUMNIS_STATUS = /Your Gift of Lumnis (?:has|will) (?<status>expired|restart)/
+    LUMNIS_EXP = /([\d,]+) points of (quintupled|quadrupled|tripled|doubled) experience/
+    # highest first
+    LUMNIS_TIERS = { 'quintupled' => :quintuple, 'quadrupled' => :quadruple, 'tripled' => :triple, 'doubled' => :double }.freeze
+    LUMNIS_REFRESH = /scheduled to refresh in ([^.]+)\./
     LUMNIS_SCHEDULED = /Your Gift of Lumnis is scheduled to start on (?<start_day>\w+)s at (?<start_time>\d\d:\d\d)/
     LUMNIS_LAST_SCHEDULE = /You last used a Lumnis scheduling option on (?<last_schedule>[^.]+)\./
-
-    RESOURCE_PAIR = /(?<key>[A-Z](?!old).*?:|\(Weekly\)) *(?<value>[^(]*?)(?: +|$)/
 
     GEMSTONE_LINE = /^Gemstone (?<slot>\d+): (?<jewel>.+?)(?<attrs>(?: \([^)]*\))*)\s*$/
     GEMSTONE_PROPERTY = /^\s*\*\s*(?<property>.+?)(?: \(Rank (?<rank>\d+) of (?<max>\d+)\))?\s*$/
@@ -465,43 +468,40 @@ module CatalogDB
       rows
     end
 
-    # @return [Hash] LUMNIS INFO as lumnis table columns
-    def self.lumnis(lines)
-      info = { status: '', triple: 0, double: 0, total: 0, start_day: '', start_time: '', last_schedule: '' }
-      lines.map { |line| text(line) }.each do |line|
-        if line =~ LUMNIS_EXP
-          line.scan(LUMNIS_EXP).each { |value, key| info[key.to_sym] = amount(value) }
-          info[:total] = (info[:triple] * 2) + info[:double]
-        elsif (m = LUMNIS_STATUS.match(line))
-          info[:status] = m[:status]
-          info.merge!(triple: 7300, double: 7300, total: 21_900) if m[:status] == 'restart'
-        elsif (m = LUMNIS_SCHEDULED.match(line))
-          info.merge!(start_day: m[:start_day], start_time: m[:start_time])
-        elsif (m = LUMNIS_LAST_SCHEDULE.match(line))
-          info[:last_schedule] = m[:last_schedule]
-        end
-      end
-      info
-    end
+    # Reads LUMNIS INFO. Each tier holds 7,300 points: queued lower tiers
+    # ("followed by additional cycles") are counted at 7,300, and a restart
+    # refills 2x and 3x, plus 4x and 5x after Temple donations.
+    #
+    # @param now [Integer] when it was read, for refresh_at
+    # @return [Hash] lumnis table columns
+    def self.lumnis(lines, now = Time.now.to_i)
+      all = lines.map { |line| text(line) }.join("\n")
+      tiers = LUMNIS_TIERS.values
+      info = { status: '', quintuple: 0, quadruple: 0, triple: 0, double: 0, total: 0, refresh_at: 0,
+               start_day: '', start_time: '', last_schedule: '' }
+      all.scan(LUMNIS_EXP) { |points, tier| info[LUMNIS_TIERS[tier]] = amount(points) }
 
-    # @return [Hash] RESOURCE as resource table columns
-    def self.resource(lines)
-      res = { energy: '', weekly: 0, total: 0, suffused: 0, favor: 0 }
-      lines.each do |line|
-        line.scan(RESOURCE_PAIR).each do |key, value|
-          value, max = text(value).split(%r{/|\(})
-          key = key.sub(/(Suffused).*$/, '\1').sub(/^Voln /, '').delete(':').downcase
-          if max == '50,000'
-            res[:energy] = key
-            res[:weekly] = amount(value)
-          elsif max == '200,000'
-            res[:total] = amount(value)
-          elsif %w[favor suffused].include?(key)
-            res[key.to_sym] = amount(value)
-          end
-        end
+      if all =~ /followed by (?:an )?additional cycles?/ && (top = tiers.index { |t| info[t].positive? })
+        tiers[(top + 1)..].each { |t| info[t] = 7300 if info[t].zero? }
       end
-      res
+      if all.include?('will restart as soon as you absorb experience')
+        info[:status] = 'restart'
+        donated = all.match?(/You have made [\d,]+ recent donations to the Temple of Lumnis/)
+        (donated ? tiers : %i[triple double]).each { |t| info[t] = 7300 }
+      elsif all.include?('has expired')
+        info[:status] = 'expired'
+      elsif tiers.any? { |t| info[t].positive? }
+        info[:status] = 'active'
+      end
+      info[:total] = tiers.sum { |t| info[t] }
+
+      if (m = LUMNIS_REFRESH.match(all))
+        seconds = { 'day' => 86_400, 'hour' => 3600, 'minute' => 60 }
+        info[:refresh_at] = now + m[1].scan(/(\d+) (day|hour|minute)/).sum { |n, unit| n.to_i * seconds[unit] }
+      end
+      info.merge!(start_day: m[:start_day], start_time: m[:start_time]) if (m = LUMNIS_SCHEDULED.match(all))
+      info[:last_schedule] = m[:last_schedule] if (m = LUMNIS_LAST_SCHEDULE.match(all))
+      info
     end
 
     # @return [Array<Hash>] a row per property of each gemstone in GEM LIST ALL,
@@ -827,8 +827,15 @@ module CatalogDB
       read('lumnis info', /^You have \d+|Your Gift of Lumnis|^Because your account is free/, :lumnis)
     end
 
+    # Infomon reads RESOURCE; Lich::Resources has what it read.
+    #
+    # @return [Hash, nil] resource table columns, nil when RESOURCE gave nothing
     def self.resource
-      read('resource', /^<output class="mono/, :resource)
+      Lich::Resources.check(true)
+      return nil if Lich::Resources.type.nil?
+
+      { energy: Lich::Resources.type.to_s.downcase, weekly: Lich::Resources.weekly.to_i, total: Lich::Resources.total.to_i,
+        suffused: Lich::Resources.suffused.to_i, favor: Lich::Resources.voln_favor.to_i }
     end
 
     # @return [Boolean] whether this opened it (false if it was already open)
@@ -1067,7 +1074,8 @@ module CatalogDB
       'entries'   => CHARACTER_COLUMNS.merge('event' => Sequel[:e][:event], 'amount' => Sequel[:e][:amount]),
       'gemstones' => CHARACTER_COLUMNS.merge('property' => Sequel[:g][:property], 'jewel' => Sequel[:g][:jewel], 'binding' => Sequel[:g][:binding],
                                              'equipped' => Sequel[:g][:equipped], 'rank' => Sequel[:g][:rank], 'rarity' => Sequel[:p][:rarity]),
-      'lumnis'    => CHARACTER_COLUMNS.merge('status' => Sequel[:u][:status], 'triple' => Sequel[:u][:triple],
+      'lumnis'    => CHARACTER_COLUMNS.merge('status' => Sequel[:u][:status], 'quintuple' => Sequel[:u][:quintuple],
+                                             'quadruple' => Sequel[:u][:quadruple], 'triple' => Sequel[:u][:triple],
                                              'double' => Sequel[:u][:double], 'total' => Sequel[:u][:total]),
       'resource'  => CHARACTER_COLUMNS.merge('energy' => Sequel[:r][:energy], 'weekly' => Sequel[:r][:weekly], 'total' => Sequel[:r][:total],
                                              'suffused' => Sequel[:r][:suffused], 'favor' => Sequel[:r][:favor])
@@ -1284,9 +1292,9 @@ module CatalogDB
 
     def self.query_lumnis(ds, _extras)
       u = Sequel[:u]
-      select(ds, account: Sequel[:a][:name], name: Sequel[:c][:name], status: u[:status], triple: u[:triple], double: u[:double],
-                 total: u[:total], start_day: u[:start_day], start_time: u[:start_time], last_schedule: u[:last_schedule],
-                 updated: u[:updated_at])
+      select(ds, account: Sequel[:a][:name], name: Sequel[:c][:name], status: u[:status], '5x': u[:quintuple], '4x': u[:quadruple],
+                 '3x': u[:triple], '2x': u[:double], total: u[:total], refresh: u[:refresh_at], start_day: u[:start_day],
+                 start_time: u[:start_time], last_schedule: u[:last_schedule], updated: u[:updated_at])
         .order(Sequel[:a][:name], Sequel[:c][:name])
     end
 
@@ -1329,19 +1337,31 @@ module CatalogDB
 
   # Tables in the game window, and files.
   module Output
-    %i[DATE_COLUMNS FLAG_COLUMNS].each { |name| remove_const(name) if const_defined?(name, false) }
+    %i[DATE_COLUMNS FLAG_COLUMNS COUNTDOWN_COLUMNS].each { |name| remove_const(name) if const_defined?(name, false) }
 
     DATE_COLUMNS = %i[updated first_seen last_seen].freeze
+    COUNTDOWN_COLUMNS = %i[refresh].freeze
     FLAG_COLUMNS = %i[m r h eq marked registered hidden equipped].freeze
 
     # @return [String] a cell's text
     def self.cell(header, value, date_format, dates = DATE_COLUMNS)
       return '' if value.nil?
+      return countdown(value) if COUNTDOWN_COLUMNS.include?(header)
       return (value == true || value == 1 ? 'Y' : '') if FLAG_COLUMNS.include?(header)
       return Time.at(value).strftime(date_format) if dates.include?(header) && value.is_a?(Integer) && value.positive?
       return value.with_commas if value.is_a?(Integer)
 
       value.to_s
+    end
+
+    # @return [String] time until +epoch+, e.g. "2d 02h 36m"; "" if unknown, "now" if past
+    def self.countdown(epoch, now = Time.now.to_i)
+      return '' unless epoch.to_i.positive?
+
+      left = epoch - now
+      return 'now' unless left.positive?
+
+      format('%dd %02dh %02dm', left / 86_400, left % 86_400 / 3600, left % 3600 / 60)
     end
 
     def self.escape(str)
@@ -1412,8 +1432,8 @@ module CatalogDB
     ACTIONS = %w[query refresh sum count export delete].freeze
     TARGETS = %w[all item inventory locker character bank tickets entries gemstones lumnis resource].freeze
     FILTERS = %w[account amount area bank binding character citizenship currency double event equipped favor game hidden jewel level
-                 location marked noun path prof property rarity registered race rank stack status society subscription source suffused type
-                 total triple weekly energy].freeze
+                 location marked noun path prof property quadruple quintuple rarity registered race rank stack status society
+                 subscription source suffused type total triple weekly energy].freeze
     FILTER_ALIASES = { 'char' => 'character', 'act' => 'account', 'qty' => 'amount', 'lvl' => 'level', 'pro' => 'prof',
                        'epf' => 'status', 'stk' => 'stack', 'loc' => 'location', 'name' => 'search', 'item' => 'search' }.freeze
     EXTRAS = %w[orderby groupby limit format dir file].freeze

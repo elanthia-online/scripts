@@ -179,6 +179,31 @@ RSpec.describe 'catalog' do
                                                                                                  ])
       end
 
+      it 'reads LUMNIS INFO on 5x with more cycles queued' do
+        lines = ['You have 7,299 points of quintupled experience remaining on your Gift of Lumnis, followed by additional cycles of increased experience.  It is scheduled to refresh in 2 days, 2 hours and 36 minutes.',
+                 ' ', 'Your Gift of Lumnis is scheduled to start on Wednesdays at 14:00, in-game time.',
+                 'You last used a Lumnis scheduling option on Wed Jun  3 13:46:25 ET 2026.  You must wait six months from then to use another Lumnis scheduling option.',
+                 'You have 3 available uses of LUMNIS SCHEDULE.', ' ', 'You have made 480 recent donations to the Temple of Lumnis.']
+        info = parse.lumnis(lines, 1000)
+        expect(info.values_at(:status, :quintuple, :quadruple, :triple, :double, :total)).to eq(['active', 7299, 7300, 7300, 7300, 29_199])
+        expect(info[:refresh_at]).to eq(1000 + (2 * 86_400) + (2 * 3600) + (36 * 60))
+        expect(info.values_at(:start_day, :start_time, :last_schedule)).to eq(['Wednesday', '14:00', 'Wed Jun  3 13:46:25 ET 2026'])
+      end
+
+      it 'reads LUMNIS INFO when expired' do
+        lines = ['Your Gift of Lumnis has expired for this week.  It is scheduled to refresh in 23 hours and 36 minutes.']
+        info = parse.lumnis(lines, 0)
+        expect(info.values_at(:status, :total, :refresh_at)).to eq(['expired', 0, (23 * 3600) + (36 * 60)])
+      end
+
+      it 'refills 2x and 3x on restart, and 4x and 5x only after Temple donations' do
+        restart = 'Your Gift of Lumnis will restart as soon as you absorb experience.'
+        none = parse.lumnis([restart, 'You have not made any recent donations to the Temple of Lumnis.'])
+        donated = parse.lumnis([restart, 'You have made 480 recent donations to the Temple of Lumnis.'])
+        expect(none.values_at(:status, :quintuple, :quadruple, :triple, :double)).to eq(['restart', 0, 0, 7300, 7300])
+        expect(donated.values_at(:quintuple, :quadruple, :triple, :double, :total)).to eq([7300, 7300, 7300, 7300, 29_200])
+      end
+
       it 'reads Legendary rarity from GEM INFO' do
         lines = ['', 'Property:    Charged Presence', 'Mnemonic:    charged', 'Description: Your attacks...', 'Rarity:      Legendary']
         expect(parse.gem_rarity(lines)).to eq('legendary')
@@ -511,6 +536,11 @@ RSpec.describe 'catalog' do
   end
 
   describe 'Output' do
+    it 'shows a refresh time as a countdown' do
+      expect(catalog::Output.countdown(1000 + 86_400 + 3600 + 120, 1000)).to eq('1d 01h 02m')
+      expect([catalog::Output.countdown(0, 1000), catalog::Output.countdown(500, 1000)]).to eq(['', 'now'])
+    end
+
     it 'shows change counts as numbers, not dates' do
       lines = catalog::Output.table(%i[table inserted updated deleted], [['lumnis', 0, 1, 0]], dates: [])
       expect(lines[3]).to eq('lumnis |        0 |       1 |       0')
