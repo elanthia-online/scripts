@@ -88,13 +88,15 @@ module Lich5UpdateSpec
   class Run
     attr_reader :mod, :output, :core, :uri, :dirs
 
-    def initialize(lich_version:, arg:, nil_patch: false, uri_bodies: {})
+    # ruby_version stands in for RUBY_VERSION as the script sees it, so the
+    # examples do not depend on the Ruby running rspec.
+    def initialize(lich_version:, arg:, nil_patch: false, uri_bodies: {}, ruby_version: '4.0.7')
       @output = []
       @core = CoreUpdate.new
       @uri = FakeURI.new(uri_bodies)
       @dirs = %w[SCRIPT_DIR LIB_DIR DATA_DIR TEMP_DIR BACKUP_DIR LICH_DIR].to_h { |c| [c, Dir.mktmpdir(c.downcase)] }
       @nil_patch = nil_patch
-      @mod = build_module(lich_version, arg)
+      @mod = build_module(lich_version, arg, ruby_version)
     end
 
     def call(timeout: 3)
@@ -121,9 +123,10 @@ module Lich5UpdateSpec
 
     private
 
-    def build_module(lich_version, arg)
+    def build_module(lich_version, arg, ruby_version)
       mod = Module.new
       mod.const_set(:LICH_VERSION, lich_version)
+      mod.const_set(:RUBY_VERSION, ruby_version)
       script = Struct.new(:vars).new(arg.nil? ? [] : [arg])
       mod.const_set(:Script, Module.new.tap { |s| s.define_singleton_method(:current) { script } })
       core = @core
@@ -192,18 +195,53 @@ RSpec.describe 'lich5-update.lic' do
   shared_examples 'legacy beta request' do |nil_patch|
     let(:releases_url) { 'https://api.github.com/repos/elanthia-online/lich-5/releases' }
 
-    def legacy_run(arg, nil_patch)
-      run_script(lich_version: '5.6.2', arg: arg, nil_patch: nil_patch,
+    let(:guide) { 'https://github.com/elanthia-online/lich-5/wiki/Documentation-for-Installing-and-Upgrading-Lich' }
+
+    def legacy_run(arg, nil_patch, ruby_version: '4.0.7')
+      run_script(lich_version: '5.6.2', arg: arg, nil_patch: nil_patch, ruby_version: ruby_version,
                  uri_bodies: { releases_url => Lich5UpdateSpec::BETA_RELEASES })
     end
 
-    def expect_refusal(run)
+    def expect_refusal(run, ruby_version: '4.0.7')
       expect(run.text).to include('Beta testing needs Lich 5.7.0 or newer.')
-      expect(run.text).to include('You are running Lich 5.6.2.')
-      expect(run.text).to include(";lich5-update --update")
+      expect(run.text).to include("You are running Lich 5.6.2 on Ruby #{ruby_version}.")
+      expect(run.text).to include(";lich5-update --update' to install the current release first")
+      expect(run.text).to include(guide)
       expect(run.text).not_to match(/;send/i)
       expect(run.core.calls).to be_empty
       expect(run.uri.opened).to be_empty
+    end
+
+    # Current Lich exits at startup on Ruby older than 4.0, so an older Ruby
+    # must not be pointed at --update.
+    def expect_ruby_refusal(run, ruby_version)
+      expect(run.text).to include('Beta testing needs Lich 5.7.0 or newer.')
+      expect(run.text).to include("You are running Lich 5.6.2 on Ruby #{ruby_version}.")
+      expect(run.text).to include('Current Lich releases need Ruby 4.0 or newer')
+      expect(run.text).to include(guide)
+      expect(run.text).not_to include('--update')
+      expect(run.text).not_to match(/;send/i)
+      expect(run.core.calls).to be_empty
+      expect(run.uri.opened).to be_empty
+    end
+
+    ['2.7.8', '3.4.1', '3.4.9'].each do |ruby_version|
+      ['--beta', '--test'].each do |arg|
+        it "#{arg} on Ruby #{ruby_version} sends the user to the install guide, not to --update" do
+          script_end, user_end = client_with(';send Y')
+          $_CLIENT_ = script_end
+          $_DETACHABLE_CLIENT_ = nil
+
+          run = legacy_run(arg, nil_patch, ruby_version: ruby_version).call
+
+          expect(unread(script_end, user_end)).to eq([';send Y'])
+          expect_ruby_refusal(run, ruby_version)
+        end
+      end
+    end
+
+    it '--beta on Ruby 4.0.0 (the boundary) still suggests --update' do
+      expect_refusal(legacy_run('--beta', nil_patch, ruby_version: '4.0.0').call, ruby_version: '4.0.0')
     end
 
     it '--beta leaves typed lines on the primary client unread and installs nothing' do
@@ -335,7 +373,7 @@ RSpec.describe 'lich5-update.lic' do
         expect { run.call }.not_to raise_error
 
         expect(run.text).to include('Beta testing needs Lich 5.7.0 or newer.')
-        expect(run.text).to include('You are running Lich 5.5.0.')
+        expect(run.text).to include('You are running Lich 5.5.0 on Ruby 4.0.7.')
         expect(run.uri.opened).to be_empty
         expect(unread(script_end, user_end)).to eq([';send Y'])
       end
