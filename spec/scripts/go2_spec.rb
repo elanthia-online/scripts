@@ -76,6 +76,7 @@ end
 # Graph (timeto in seconds):
 #   100 -12-> 200 -1-> 300 -0.2-> 400     100 -3.5 (StringProc)-> 500
 #   200 -12-> 100                         100 -1-> 0
+#   100 -10-> 800 (exactly at go2's 10-second "nearby instability" limit)
 #   600 is not connected to anything
 #
 # Room 0 is reachable so that a nil destination wrongly turned into room 0
@@ -98,7 +99,7 @@ module Go2TravelTimeSpec
       MAP.new(id, ["[Room #{id}]"], ["Room #{id}."], ['Obvious paths: none.'], [], nil, nil, nil, wayto, timeto, nil, nil, tags)
     end
     add_room.call(0, {}, {})
-    add_room.call(100, { '200' => 'east', '500' => 'climb ladder', '0' => 'north' }, { '200' => 12.0, '500' => string_proc.new('3.5'), '0' => 1.0 })
+    add_room.call(100, { '200' => 'east', '500' => 'climb ladder', '0' => 'north', '800' => 'south' }, { '200' => 12.0, '500' => string_proc.new('3.5'), '0' => 1.0, '800' => 10.0 })
     add_room.call(200, { '300' => 'east', '100' => 'west' }, { '300' => 1.0, '100' => 12.0 })
     add_room.call(300, { '400' => 'east' }, { '400' => 0.2 })
     add_room.call(400, {}, {})
@@ -109,11 +110,12 @@ module Go2TravelTimeSpec
     add_room.call(720, {}, {}, ['bank'])
     add_room.call(730, {}, {}, ['bank'])
     add_room.call(740, {}, {}, ['bank'])
+    add_room.call(800, {}, {})
     # Older Lich keeps rooms in an Array indexed by id and walks all of it in
     # find_all_nearest_by_tag, calling nil.tags on the unused ids; the Lich
     # runtime's NilClass patch absorbs that, but rspec does not load it. Fill
     # the unused ids with unconnected rooms so the walk sees only real rooms.
-    (0..740).each { |id| add_room.call(id, {}, {}) unless MAP[id] }
+    (0..800).each { |id| add_room.call(id, {}, {}) unless MAP[id] }
   end
 
   # The real Go2.travel_path and Go2.estimate_travel_time, with Room and Map
@@ -189,7 +191,7 @@ RSpec.describe 'go2 travel time estimates' do
     it 'matches the graph distance dijkstra computes, for every reachable room' do
       # Indexed by room id: a Hash in current Lich, an Array before 5.14.
       _, distances = map[100].dijkstra
-      [0, 200, 300, 400, 500].each do |id|
+      [0, 200, 300, 400, 500, 800].each do |id|
         expect(estimate(100, id)).to be_within(1e-9).of(distances[id]), "room #{id}"
       end
     end
@@ -342,12 +344,13 @@ RSpec.describe 'go2 travel time estimates' do
       end
       stub_const('Go2', go2)
       stub_const('CharSettings', { 'element' => 'fire' })
-      stub_const('GameSettings', { 'recent-instabilities' => [200, 300, 500, 600].map { |id| { room_id: id, element: 'fire' } } })
+      stub_const('GameSettings', { 'recent-instabilities' => [200, 300, 500, 600, 800].map { |id| { room_id: id, element: 'fire' } } })
       allow(map).to receive(:current).and_return(map[100])
 
       Object.new.instance_eval("check_instability = proc { false }\n#{block}", Go2TravelTimeSpec::SOURCE_PATH)
-      # 200 (12 s) and 300 (13 s) are too far; 600 has no path.
-      expect(walked).to eq(['500'])
+      # 200 (12 s) and 300 (13 s) are too far; 600 has no path; 800 is
+      # exactly 10 s away, which still counts as nearby.
+      expect(walked).to eq(%w[500 800])
     end
   end
 end
