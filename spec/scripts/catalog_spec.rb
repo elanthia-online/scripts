@@ -149,6 +149,42 @@ RSpec.describe 'catalog' do
       expect(parse.gemstones(['You have not yet unlocked Gemstones.'])).to eq([])
     end
 
+    describe 'real game captures' do
+      it 'reads BANK ACCOUNT with several banks, and with none' do
+        lines = ['You currently have the following amounts on deposit:', ' ', '     First Elanith Secured Bank: 94,617,567',
+                 '      Vornavis Bank of Solhaven: 153,346,435', "             Kraken's Fall Bank: 2,060,141",
+                 '                          Total: 250,024,143', ' ', 'You currently have 0 inter-town bank transfer options available.']
+        expect(parse.bank(lines).map { |r| r[:amount] }).to eq([94_617_567, 153_346_435, 2_060_141])
+        expect(parse.bank(['You currently have the following amounts on deposit:', '', 'You currently have no open bank accounts.'])).to eq([])
+      end
+
+      it 'reads TICKET BALANCE with none' do
+        expect(parse.tickets(["You take a moment to recall the alternative currencies you've collected...", '',
+                              "You haven't collected any alternative currencies."])).to eq([])
+      end
+
+      it 'reads EVENT ENTRIES with the options footer' do
+        lines = ['  Ebon Gate Entries:                13', 'To create physical entries, type EVENT ENTRIES {type} {amount}.',
+                 'Current options:', '    DUSKRUIN  RUMOR  EBON  LUMNIS  INQUISITOR']
+        expect(parse.entries(lines)).to eq([{ event: 'Ebon Gate', amount: 13 }])
+      end
+
+      it 'reads GEM LIST ALL with gaps, unbound gems, colons in names, and the footer' do
+        lines = ['', 'Gemstone 3: a broken silver-sheened jewel', "    * Slayer's Fortitude (Rank 1 of 5)",
+                 'Gemstone 9: a sinuous crystalline jewel', "    * Charl's Dominion: Perfect Conduction",
+                 '', 'See GEM SLOTS ALL to view your equipped Gemstones.']
+        rows = parse.gemstones(lines)
+        expect(rows.map { |r| r.values_at(:slot, :equipped, :binding, :property, :rank) }).to eq([
+                                                                                                   [3, false, '', "Slayer's Fortitude", 1], [9, false, '', "Charl's Dominion: Perfect Conduction", 0]
+                                                                                                 ])
+      end
+
+      it 'reads Legendary rarity from GEM INFO' do
+        lines = ['', 'Property:    Charged Presence', 'Mnemonic:    charged', 'Description: Your attacks...', 'Rarity:      Legendary']
+        expect(parse.gem_rarity(lines)).to eq('legendary')
+      end
+    end
+
     it 'reads BANK ACCOUNT without the total' do
       lines = [
         'You currently have the following amounts on deposit:',
