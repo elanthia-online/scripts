@@ -16,9 +16,10 @@ require_relative '../spec_helper'
 # through the returned container). Each read returns a fresh copy, and a
 # plain object handed to push is copied on the way in, so changing that
 # object afterwards stores nothing. As in lich-5, a write whose path holds a
-# negative Array index (CharSettings[:jars][-1]) stores nothing. lich-5 today stores such a change only
-# when a later write happens to save the whole array again, and not at all
-# once reads always come from the database, so a script must not rely on it.
+# negative Array index (CharSettings[:jars][-1]) stores nothing. lich-5
+# today stores such a change to the pushed object only when a later write
+# happens to save the whole array again, and not at all once reads always
+# come from the database, so a script must not rely on it.
 #
 # GameObj and CharSettings live nested inside SlootSpec::Runner rather than
 # at the top level, for the reason spec/spec_helper.rb gives: a top-level
