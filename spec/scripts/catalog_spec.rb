@@ -536,6 +536,14 @@ RSpec.describe 'catalog' do
   end
 
   describe 'Output' do
+    it 'highlights matches for XML front ends, and leaves plain text for Wizard' do
+      rows = [['Fry', 'pack > gift', 'weathered bronze disc']]
+      xml = catalog::Output.table(%i[name path item], rows, highlight: /disc/i)
+      plain = catalog::Output.table(%i[name path item], rows, highlight: /disc/i, xml: false)
+      expect(xml[3]).to eq('Fry  | pack &gt; gift | weathered bronze <preset id="whisper">disc</preset>')
+      expect(plain[3]).to eq('Fry  | pack > gift | weathered bronze disc')
+    end
+
     it 'shows a refresh time as a countdown' do
       expect(catalog::Output.countdown(1000 + 86_400 + 3600 + 120, 1000)).to eq('1d 01h 02m')
       expect([catalog::Output.countdown(0, 1000), catalog::Output.countdown(500, 1000)]).to eq(['', 'now'])
