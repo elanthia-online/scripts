@@ -1600,3 +1600,86 @@ RSpec.describe 'bigshot Effects command checks' do
     end
   end
 end
+
+# Spec for bigshot.lic's per-room reset of @COMMANDS_REGISTRY, which backs the
+# (room) and repeatdelay command checks. bs_wander clears it for the leader;
+# reset_registry_on_room_change covers followers, who never call bs_wander.
+module BigshotRoomRegistrySpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("
+", "
+")
+
+  RESET_SRC = extract_from_source(SOURCE, /^  def reset_registry_on_room_change
+.*?^  end$/m,
+                                  label: 'reset_registry_on_room_change', source_path: SOURCE_PATH)
+  REGISTER_SRC = extract_from_source(SOURCE, /^  def once_commands_register\(npc, command\).*?^  end$/m,
+                                     label: 'once_commands_register', source_path: SOURCE_PATH)
+
+  # Stand-in for Lich's Room; only .current.id is read.
+  module Room
+    Current = Struct.new(:id)
+    @current = Current.new(nil)
+
+    class << self
+      attr_reader :current
+    end
+  end
+
+  Npc = Struct.new(:id)
+
+  class Harness
+    attr_accessor :COMMANDS_REGISTRY
+
+    def initialize
+      @COMMANDS_REGISTRY = {}
+    end
+
+    def debug_msg(*); end
+
+    eval(RESET_SRC)
+    eval(REGISTER_SRC)
+
+    # Mirrors the (room) check in check_state_condition.
+    def ran_in_room?(command)
+      @COMMANDS_REGISTRY.any? { |_k, v| v.include?(command) }
+    end
+  end
+end
+
+RSpec.describe 'bigshot per-room command registry reset' do
+  let(:bs) { BigshotRoomRegistrySpec::Harness.new }
+  let(:room) { BigshotRoomRegistrySpec::Room.current }
+  let(:npc) { BigshotRoomRegistrySpec::Npc.new(101) }
+  let(:command) { 'incant 1120 open (mob2 room)' }
+
+  before { room.id = 1 }
+
+  it 'keeps the registry while the character stays in the same room' do
+    bs.reset_registry_on_room_change
+    bs.once_commands_register(npc, command)
+    bs.reset_registry_on_room_change
+
+    expect(bs.ran_in_room?(command)).to be true
+  end
+
+  it 'clears the registry when the character has been moved to another room' do
+    bs.reset_registry_on_room_change
+    bs.once_commands_register(npc, command)
+
+    room.id = 2
+    bs.reset_registry_on_room_change
+
+    expect(bs.ran_in_room?(command)).to be false
+  end
+
+  it 'does not clear the registry in an unmapped room (nil id)' do
+    bs.reset_registry_on_room_change
+    bs.once_commands_register(npc, command)
+
+    room.id = nil
+    bs.reset_registry_on_room_change
+
+    expect(bs.ran_in_room?(command)).to be true
+  end
+end
