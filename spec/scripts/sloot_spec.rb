@@ -347,6 +347,13 @@ RSpec.describe 'sloot.lic stockpile jar counts' do
         expect(stored_jars.last).to eq({ gem: 'opals', count: 3, full: true })
         expect(game.sack.items.count { |item| item.name == 'opal' }).to eq(2)
       end
+
+      it 'stores the full flag when the last gem fills the jar' do
+        game.add_gems('opal', 3)
+        run_stockpile
+        expect(stored_jars.last).to eq({ gem: 'opals', count: 3, full: true })
+        expect(game.sack.items.count { |item| item.name == 'opal' }).to eq(0)
+      end
     end
   end
 
