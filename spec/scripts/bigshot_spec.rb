@@ -1600,3 +1600,86 @@ RSpec.describe 'bigshot Effects command checks' do
     end
   end
 end
+
+# The once/room command registry is per-room state. It is cleared in
+# reset_variables(moved = true), which prepare_for_movement runs on the
+# leader and, via the :PREP_REST event, on every follower.
+module BigshotCommandRegistrySpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  RESET_VARIABLES_SRC = extract(/^  def reset_variables\(moved = true\).*?^  end$/m, 'reset_variables')
+  PREPARE_FOR_MOVEMENT_SRC = extract(/^  def prepare_for_movement\(move_signs = true\).*?^  end$/m,
+                                     'prepare_for_movement')
+  # Fails loudly if the follower loop stops routing :PREP_REST here.
+  extract(/^      elsif \(event\.type == :PREP_REST\)\n        bs\.prepare_for_movement$/, 'follower :PREP_REST handler')
+
+  class Followers
+    attr_reader :events
+
+    def initialize
+      @events = []
+    end
+
+    def add_event(type)
+      @events << type
+    end
+
+    def roundtime?
+      false
+    end
+  end
+
+  class Harness
+    attr_accessor :COMMANDS_REGISTRY, :leading, :followers
+
+    def initialize(leading:)
+      @leading = leading
+      @followers = Followers.new
+      @COMMANDS_REGISTRY = { 123 => { 'depress(room)' => Time.now } }
+      @DEBUG_SYSTEM = @DEBUG_COMBAT = false
+    end
+
+    def debug_msg(*); end
+    def change_stance(*); end
+    def cast_signs(*); end
+    def wait_while; end
+    def sleep(*); end
+
+    def leading?
+      @leading
+    end
+
+    def solo?
+      false
+    end
+
+    class_eval(RESET_VARIABLES_SRC)
+    class_eval(PREPARE_FOR_MOVEMENT_SRC)
+  end
+end
+
+RSpec.describe 'bigshot once/room command registry' do
+  it 'is cleared when a follower handles :PREP_REST' do
+    bs = BigshotCommandRegistrySpec::Harness.new(leading: false)
+    bs.prepare_for_movement
+    expect(bs.COMMANDS_REGISTRY).to eq({})
+  end
+
+  it 'is cleared on the leader, which sends :PREP_REST to followers' do
+    bs = BigshotCommandRegistrySpec::Harness.new(leading: true)
+    bs.prepare_for_movement
+    expect(bs.COMMANDS_REGISTRY).to eq({})
+    expect(bs.followers.events).to eq([:PREP_REST])
+  end
+
+  it 'is kept when only the target changes in the same room' do
+    bs = BigshotCommandRegistrySpec::Harness.new(leading: false)
+    bs.reset_variables(false)
+    expect(bs.COMMANDS_REGISTRY.keys).to eq([123])
+  end
+end
