@@ -52,6 +52,14 @@ module CatalogSpec
     LICH_DIR = Dir.tmpdir
     Settings = {}
 
+    # Lich::Messaging as it behaves for an XML front end
+    module Lich
+      module Messaging
+        def self.xml_encode(msg) = msg.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+        def self.msg_format(_type, msg, encode: true) = "<preset id='whisper'>#{encode ? xml_encode(msg) : msg}</preset>"
+      end
+    end
+
     # Types the specs need, by noun.
     class GameObj
       TYPES = { 'jar' => 'jar', 'compendium' => 'uncommon', 'orb' => 'magic,uncommon', 'diamond' => 'gem', 'sapphire' => 'gem', 'broadsword' => 'weapon', 'pouch' => 'container' }.freeze
@@ -536,11 +544,11 @@ RSpec.describe 'catalog' do
   end
 
   describe 'Output' do
-    it 'highlights matches for XML front ends, and leaves plain text for Wizard' do
+    it 'highlights matches through Lich::Messaging, and leaves plain text when the front end has no markup' do
       rows = [['Fry', 'pack > gift', 'weathered bronze disc']]
       xml = catalog::Output.table(%i[name path item], rows, highlight: /disc/i)
-      plain = catalog::Output.table(%i[name path item], rows, highlight: /disc/i, xml: false)
-      expect(xml[3]).to eq('Fry  | pack &gt; gift | weathered bronze <preset id="whisper">disc</preset>')
+      plain = catalog::Output.table(%i[name path item], rows, highlight: /disc/i, markup: false)
+      expect(xml[3]).to eq("Fry  | pack &gt; gift | weathered bronze <preset id='whisper'>disc</preset>")
       expect(plain[3]).to eq('Fry  | pack > gift | weathered bronze disc')
     end
 
