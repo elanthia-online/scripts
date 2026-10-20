@@ -89,8 +89,10 @@ module Lich5UpdateSpec
     attr_reader :mod, :output, :core, :uri, :dirs
 
     # ruby_version stands in for RUBY_VERSION as the script sees it, so the
-    # examples do not depend on the Ruby running rspec.
-    def initialize(lich_version:, arg:, nil_patch: false, uri_bodies: {}, ruby_version: '4.0.7')
+    # examples do not depend on the Ruby running rspec. Lich 5.6.2 and older
+    # alias String#untaint at startup, which Ruby 3.2 removed, so the legacy
+    # module only ever sees Ruby 3.1 or older; the default models one.
+    def initialize(lich_version:, arg:, nil_patch: false, uri_bodies: {}, ruby_version: '2.7.8')
       @output = []
       @core = CoreUpdate.new
       @uri = FakeURI.new(uri_bodies)
@@ -197,27 +199,19 @@ RSpec.describe 'lich5-update.lic' do
 
     let(:guide) { 'https://github.com/elanthia-online/lich-5/wiki/Documentation-for-Installing-and-Upgrading-Lich' }
 
-    def legacy_run(arg, nil_patch, ruby_version: '4.0.7')
+    def legacy_run(arg, nil_patch, ruby_version: '2.7.8')
       run_script(lich_version: '5.6.2', arg: arg, nil_patch: nil_patch, ruby_version: ruby_version,
                  uri_bodies: { releases_url => Lich5UpdateSpec::BETA_RELEASES })
     end
 
-    def expect_refusal(run, ruby_version: '4.0.7')
+    # Current Lich will not start on the Ruby this Lich runs on, and the
+    # updaters here do not check that, so the answer must never point at
+    # --update.
+    def expect_refusal(run, ruby_version: '2.7.8')
       expect(run.text).to include('Beta testing needs Lich 5.7.0 or newer.')
       expect(run.text).to include("You are running Lich 5.6.2 on Ruby #{ruby_version}.")
-      expect(run.text).to include(";lich5-update --update' to install the current release first")
-      expect(run.text).to include(guide)
-      expect(run.text).not_to match(/;send/i)
-      expect(run.core.calls).to be_empty
-      expect(run.uri.opened).to be_empty
-    end
-
-    # Current Lich exits at startup on Ruby older than 4.0, so an older Ruby
-    # must not be pointed at --update.
-    def expect_ruby_refusal(run, ruby_version)
-      expect(run.text).to include('Beta testing needs Lich 5.7.0 or newer.')
-      expect(run.text).to include("You are running Lich 5.6.2 on Ruby #{ruby_version}.")
-      expect(run.text).to include('Current Lich releases need Ruby 4.0 or newer')
+      expect(run.text).to include('Current Lich releases need a newer Ruby')
+      expect(run.text).to include('Upgrade Ruby and Lich together')
       expect(run.text).to include(guide)
       expect(run.text).not_to include('--update')
       expect(run.text).not_to match(/;send/i)
@@ -225,7 +219,7 @@ RSpec.describe 'lich5-update.lic' do
       expect(run.uri.opened).to be_empty
     end
 
-    ['2.7.8', '3.4.1', '3.4.9'].each do |ruby_version|
+    ['2.6.10', '3.0.7', '3.1.6'].each do |ruby_version|
       ['--beta', '--test'].each do |arg|
         it "#{arg} on Ruby #{ruby_version} sends the user to the install guide, not to --update" do
           script_end, user_end = client_with(';send Y')
@@ -235,13 +229,9 @@ RSpec.describe 'lich5-update.lic' do
           run = legacy_run(arg, nil_patch, ruby_version: ruby_version).call
 
           expect(unread(script_end, user_end)).to eq([';send Y'])
-          expect_ruby_refusal(run, ruby_version)
+          expect_refusal(run, ruby_version: ruby_version)
         end
       end
-    end
-
-    it '--beta on Ruby 4.0.0 (the boundary) still suggests --update' do
-      expect_refusal(legacy_run('--beta', nil_patch, ruby_version: '4.0.0').call, ruby_version: '4.0.0')
     end
 
     it '--beta leaves typed lines on the primary client unread and installs nothing' do
@@ -373,7 +363,7 @@ RSpec.describe 'lich5-update.lic' do
         expect { run.call }.not_to raise_error
 
         expect(run.text).to include('Beta testing needs Lich 5.7.0 or newer.')
-        expect(run.text).to include('You are running Lich 5.5.0 on Ruby 4.0.7.')
+        expect(run.text).to include('You are running Lich 5.5.0 on Ruby 2.7.8.')
         expect(run.uri.opened).to be_empty
         expect(unread(script_end, user_end)).to eq([';send Y'])
       end
