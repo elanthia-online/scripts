@@ -1606,12 +1606,9 @@ end
 # reset_registry_on_room_change covers followers, who never call bs_wander.
 module BigshotRoomRegistrySpec
   SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
-  SOURCE = File.read(SOURCE_PATH).gsub("
-", "
-")
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
 
-  RESET_SRC = extract_from_source(SOURCE, /^  def reset_registry_on_room_change
-.*?^  end$/m,
+  RESET_SRC = extract_from_source(SOURCE, /^  def reset_registry_on_room_change\n.*?^  end$/m,
                                   label: 'reset_registry_on_room_change', source_path: SOURCE_PATH)
   REGISTER_SRC = extract_from_source(SOURCE, /^  def once_commands_register\(npc, command\).*?^  end$/m,
                                      label: 'once_commands_register', source_path: SOURCE_PATH)
