@@ -1,0 +1,1860 @@
+# frozen_string_literal: true
+
+=begin
+  Cross-character catalog of your inventory, lockers, family vault, bank
+  accounts, ticket balances, event entries, Lumnis and resource, searchable
+  from any character.
+
+  Run ;catalog to update the current character, or add it to autostart:
+    ;autostart add --global catalog delay=6
+
+  ;catalog help      > commands and filters
+  ;catalog menu      > clickable examples
+
+  Based on Xanlin's invdb, which laid all the groundwork for this script.
+  Thanks to Xanlin, and to LostRanger and Tysong for the pieces invdb
+  borrowed from them.
+
+         author: elanthia-online
+   contributors: Xanlin, Tysong
+           game: Gemstone
+           tags: inventory, locker, vault, bank, tickets, database, utility
+       required: Lich >= 5.22.0
+        version: 1.0.0
+
+  changelog:
+    1.0.0 (2026-10-17)
+      first release, a rewrite of Xanlin's invdb with a fresh database
+      new: tracks event entries (;catalog q entries)
+      new: tracks gemstones and their properties (;catalog q gemstones)
+      new: remembers when each item was first and last seen
+      inventory scans no longer open and close your containers
+      fix: standard locker items saved their marked/registered flags in the wrong place
+=end
+
+require 'sequel'
+require 'csv'
+require 'fileutils'
+
+module CatalogDB
+  # Drop constants left by an earlier run this session so a restart loads the
+  # current definitions without already-initialized warnings.
+  %i[LICH_GEM_REQUIRES DB_FILE EXPORT_DIR HANDS INVENTORY ALONGSIDE LOCKER FAMILY_VAULT DEFAULT_SETTINGS].each { |name| remove_const(name) if const_defined?(name, false) }
+
+  LICH_GEM_REQUIRES = '5.22.0'
+  DB_FILE = File.join(DATA_DIR, 'catalog.db3')
+  EXPORT_DIR = File.join(LICH_DIR, 'catalog')
+
+  # location ids, see Store::LOCATIONS
+  HANDS = 1
+  INVENTORY = 2
+  ALONGSIDE = 6
+  LOCKER = 10
+  FAMILY_VAULT = 40
+
+  # name => [default, description]
+  DEFAULT_SETTINGS = {
+    'jar'                  => [true, 'look in jars to count what is in them'],
+    'stack'                => [false, 'read stacks of notes to count them'],
+    'lumnis'               => [true, "include Lumnis in ';catalog refresh all'"],
+    'resource'             => [true, "include resource in ';catalog refresh all'"],
+    'confirm_large_output' => [true, 'pause before printing more than 100 rows'],
+    'date_format'          => ['%m/%d/%y', 'date format, e.g. %m/%d/%y or %Y-%m-%d'],
+    'boh'                  => [['large treasure sack with a blood crystal clasp'], 'bags of holding to look in'],
+    'noopen'               => [['locket'], 'containers never to open'],
+  }.freeze
+
+  # @param name [String] a DEFAULT_SETTINGS key
+  # @return [Object] the saved setting, or its default
+  def self.setting(name)
+    value = Settings[name]
+    value.nil? ? DEFAULT_SETTINGS.fetch(name).first : value
+  end
+
+  # Shows a catalog message, colored for the front end by Lich::Messaging.
+  #
+  # @param type [String] a Lich::Messaging type: info, warn, error
+  def self.say(message, type = 'info', encode: true)
+    Lich::Messaging.msg(type, "catalog: #{message}", encode: encode)
+  end
+
+  # The database, for ;e queries: CatalogDB.db[:item].where(noun: 'jar').count
+  #
+  # @return [Sequel::Database]
+  def self.db
+    Store.db
+  end
+
+  # Database schema and writes.
+  module Store
+    %i[SCHEMA_VERSION LOCATIONS ITEM_KEY].each { |name| remove_const(name) if const_defined?(name, false) }
+
+    SCHEMA_VERSION = 1
+
+    # [id, type, name, abbr]; ids match the CatalogDB location constants.
+    LOCATIONS = [
+      [1, 'inv', 'hands', 'hands'],
+      [2, 'inv', 'inventory', 'inv'],
+      [6, 'inv', 'alongside', 'alongside'],
+      [10, 'locker', 'locker', 'locker'],
+      [11, 'locker', "Wehnimer's Landing", 'wl'],
+      [12, 'locker', 'Teras Isle', 'teras'],
+      [13, 'locker', 'Solhaven', 'sol'],
+      [14, 'locker', "River's Rest", 'rr'],
+      [15, 'locker', 'Icemule Trace', 'im'],
+      [16, 'locker', 'Zul Logoth', 'zul'],
+      [17, 'locker', "Ta'Illistim", 'ti'],
+      [18, 'locker', "Ta'Vaalor", 'tv'],
+      [19, 'locker', 'Mist Harbor', 'fwi'],
+      [20, 'locker', 'Cysaegir', 'cy'],
+      [21, 'locker', "Kraken's Fall", 'kf'],
+      [30, 'locker', 'Astral Vault', 'av'],
+      [40, 'locker', 'Family Vault', 'fam'],
+    ].freeze
+
+    # What makes two item rows the same item. Identical items are merged
+    # into one row whose amount is how many there are.
+    ITEM_KEY = %i[location_id path name stack marked registered hidden].freeze
+
+    class << self
+      attr_writer :db
+    end
+
+    # @return [Sequel::Database]
+    def self.db
+      @db ||= connect(DB_FILE)
+    end
+
+    # @param file [String, nil] database file, or nil for an in-memory one
+    # @return [Sequel::Database]
+    def self.connect(file = nil)
+      # LIKE ignores case as it does in plain SQLite, and so does REGEXP
+      regexes = Hash.new { |cache, source| cache[source] = Regexp.new(source, Regexp::IGNORECASE) }
+      opts = { case_sensitive_like: false, keep_reference: false,
+               setup_regexp_function: ->(source, value) { regexes[source].match?(value.to_s) } }
+      db = file ? Sequel.sqlite(file, **opts) : Sequel.sqlite(**opts)
+      create_schema(db)
+      db
+    end
+
+    def self.close
+      @db&.disconnect
+      @db = nil
+    end
+
+    # @param db [Sequel::Database]
+    def self.create_schema(db)
+      return if db.fetch('PRAGMA user_version').single_value.to_i >= SCHEMA_VERSION
+
+      # give space back to the disk as rows are deleted; only takes effect
+      # before the first table is created
+      db.run('PRAGMA auto_vacuum = FULL')
+      db.transaction do
+        db.create_table?(:account) do
+          primary_key :id
+          String :name, null: false, unique: true
+          String :subscription, null: false, default: ''
+          Integer :updated_at, null: false, default: 0
+        end
+
+        db.create_table?(:character) do
+          primary_key :id
+          foreign_key :account_id, :account, on_delete: :set_null
+          String :name, null: false
+          String :game, null: false
+          String :prof, null: false, default: ''
+          String :race, null: false, default: ''
+          Integer :level, null: false, default: 0
+          Integer :exp, null: false, default: 0
+          String :area, null: false, default: ''
+          String :locker, null: false, default: ''
+          String :citizenship, null: false, default: ''
+          String :society, null: false, default: ''
+          String :society_rank, null: false, default: ''
+          Integer :first_seen, null: false
+          Integer :last_seen, null: false
+          unique %i[name game]
+        end
+
+        db.create_table?(:location) do
+          Integer :id, primary_key: true
+          String :type, null: false
+          String :name, null: false, unique: true
+          String :abbr, null: false, unique: true
+        end
+        db[:location].import(%i[id type name abbr], LOCATIONS)
+
+        # character_id is null for account-wide places (the family vault)
+        db.create_table?(:item) do
+          primary_key :id
+          foreign_key :account_id, :account, null: false, on_delete: :cascade
+          foreign_key :character_id, :character, on_delete: :cascade
+          String :game, null: false
+          foreign_key :location_id, :location, null: false
+          Integer :level, null: false, default: 0
+          String :path, null: false, default: ''
+          String :type, null: false, default: ''
+          String :name, null: false
+          String :noun, null: false, default: ''
+          Integer :amount, null: false, default: 1
+          String :stack, null: false, default: ''
+          String :status, null: false, default: ''
+          TrueClass :marked, null: false, default: false
+          TrueClass :registered, null: false, default: false
+          TrueClass :hidden, null: false, default: false
+          Integer :first_seen, null: false
+          Integer :last_seen, null: false
+          index %i[character_id location_id]
+          index %i[account_id game location_id]
+          index :name
+        end
+
+        db.create_table?(:silver) do
+          foreign_key :character_id, :character, null: false, on_delete: :cascade
+          String :bank, null: false
+          Integer :amount, null: false
+          Integer :first_seen, null: false
+          Integer :last_seen, null: false
+          primary_key %i[character_id bank]
+        end
+
+        db.create_table?(:tickets) do
+          foreign_key :character_id, :character, null: false, on_delete: :cascade
+          String :source, null: false
+          String :currency, null: false
+          Integer :amount, null: false
+          Integer :first_seen, null: false
+          Integer :last_seen, null: false
+          primary_key %i[character_id source]
+        end
+
+        db.create_table?(:entries) do
+          foreign_key :character_id, :character, null: false, on_delete: :cascade
+          String :event, null: false
+          Integer :amount, null: false
+          Integer :first_seen, null: false
+          Integer :last_seen, null: false
+          primary_key %i[character_id event]
+        end
+
+        # one row per gemstone property ('' for a gemstone with none yet)
+        db.create_table?(:gemstone) do
+          foreign_key :character_id, :character, null: false, on_delete: :cascade
+          Integer :slot, null: false
+          String :jewel, null: false
+          TrueClass :equipped, null: false, default: false
+          String :binding, null: false, default: ''
+          String :property, null: false, default: ''
+          String :mnemonic, null: false, default: ''
+          Integer :rank, null: false, default: 0
+          Integer :max_rank, null: false, default: 0
+          Integer :first_seen, null: false
+          Integer :last_seen, null: false
+          primary_key %i[character_id slot jewel property]
+        end
+
+        # GEM INFO rarity, looked up once per property
+        db.create_table?(:gemstone_property) do
+          String :mnemonic, primary_key: true
+          String :rarity, null: false
+        end
+
+        db.create_table?(:lumnis) do
+          foreign_key :character_id, :character, primary_key: true, on_delete: :cascade
+          String :status, null: false, default: ''
+          Integer :quintuple, null: false, default: 0
+          Integer :quadruple, null: false, default: 0
+          Integer :triple, null: false, default: 0
+          Integer :double, null: false, default: 0
+          Integer :total, null: false, default: 0
+          Integer :refresh_at, null: false, default: 0
+          String :start_day, null: false, default: ''
+          String :start_time, null: false, default: ''
+          String :last_schedule, null: false, default: ''
+          Integer :updated_at, null: false
+        end
+
+        db.create_table?(:resource) do
+          foreign_key :character_id, :character, primary_key: true, on_delete: :cascade
+          String :energy, null: false, default: ''
+          Integer :weekly, null: false, default: 0
+          Integer :total, null: false, default: 0
+          Integer :suffused, null: false, default: 0
+          Integer :favor, null: false, default: 0
+          Integer :updated_at, null: false
+        end
+
+        db.run("PRAGMA user_version = #{SCHEMA_VERSION}")
+      end
+    end
+
+    # @return [Integer] the account's id
+    def self.save_account(name, subscription, now)
+      db[:account].insert_conflict(target: :name, update: { subscription: subscription, updated_at: now })
+                  .insert(name: name, subscription: subscription, updated_at: now)
+      db[:account].where(name: name).get(:id)
+    end
+
+    # @param fields [Hash] character columns; nil values keep what is saved
+    # @return [Integer] the character's id
+    def self.save_character(name, game, fields, now)
+      fields = fields.compact.merge(last_seen: now)
+      db[:character].insert_conflict(target: %i[name game], update: fields)
+                    .insert(fields.merge(name: name, game: game, first_seen: now))
+      db[:character].where(name: name, game: game).get(:id)
+    end
+
+    # Saves the one row a character has in a single-row table (lumnis, resource).
+    #
+    # @return [Hash{Symbol=>Integer}] :inserted, :updated and :deleted counts
+    def self.save_row(table, character_id, fields, now)
+      old = db[table].where(character_id: character_id).first
+      db[table].insert_conflict(:replace).insert(fields.merge(character_id: character_id, updated_at: now))
+      changed = old && fields.any? { |col, value| old[col] != value }
+      { inserted: old ? 0 : 1, updated: changed ? 1 : 0, deleted: 0 }
+    end
+
+    # Makes the rows saved for +owner+ match +rows+.
+    #
+    # Rows are matched on the +key+ columns, and rows sharing a key are merged
+    # by adding up their :amount. New rows get first_seen = now, rows that
+    # differ are updated, rows no longer there are deleted, and every row
+    # still there gets last_seen = now.
+    #
+    # @param table [Symbol]
+    # @param owner [Hash] columns that pick out whose rows these are
+    # @param key [Array<Symbol>]
+    # @param rows [Array<Hash>]
+    # @return [Hash{Symbol=>Integer}] :inserted, :updated and :deleted counts
+    def self.sync(table, owner, key, rows, now)
+      incoming = {}
+      rows.each do |row|
+        k = row.values_at(*key)
+        if incoming[k]
+          incoming[k][:amount] += row[:amount] if row[:amount]
+        else
+          incoming[k] = row.dup
+        end
+      end
+
+      counts = { inserted: 0, updated: 0, deleted: 0 }
+      scope = db[table].where(owner)
+      db.transaction do
+        existing = scope.all.to_h { |row| [row.values_at(*key), row] }
+        (existing.keys - incoming.keys).each do |k|
+          counts[:deleted] += scope.where(key.zip(k).to_h).delete
+        end
+        scope.update(last_seen: now)
+        incoming.each do |k, row|
+          old = existing[k]
+          if old.nil?
+            db[table].insert(owner.merge(row, first_seen: now, last_seen: now))
+            counts[:inserted] += 1
+          elsif (changed = row.reject { |col, value| old[col] == value }).any?
+            scope.where(key.zip(k).to_h).update(changed)
+            counts[:updated] += 1
+          end
+        end
+      end
+      counts
+    end
+
+    # Gives items whose flags are unknown (nil) the flags already saved for
+    # the same item, matched on path, name and stack, or false if there is
+    # no single saved answer.
+    #
+    # @param owner [Hash] item columns that pick out whose rows these are
+    def self.fill_flags(owner, rows)
+      saved = db[:item].where(owner).select_hash_groups(%i[path name stack], %i[marked registered hidden])
+      rows.each do |row|
+        next unless row[:marked].nil?
+
+        known = saved[row.values_at(:path, :name, :stack)]&.uniq || []
+        row.merge!(%i[marked registered hidden].zip(known.size == 1 ? known.first : [false, false, false]).to_h)
+      end
+    end
+
+    # The noun and type already saved for an item name, if any.
+    #
+    # @return [Array(String, String), nil]
+    def self.known_noun(name)
+      db[:item].where(name: name, stack: '').exclude(type: 'unknown').get(%i[noun type])
+    end
+  end
+
+  # Turns game output into rows. Nothing here talks to the game.
+  module Parse
+    %i[LEADING_ARTICLE PLURALS TICKET_LINE ENTRY_LINE BANK_LINE BANK_SINGLE BANK_END LUMNIS_EXP LUMNIS_TIERS LUMNIS_REFRESH LUMNIS_SCHEDULED
+       LUMNIS_LAST_SCHEDULE LOCKER_INFO LOCKER_TOWNS SOCIETIES GEMSTONE_LINE GEMSTONE_PROPERTY JAR_LOOK STACK_READ BOH_LINE OREMONGER_LINE
+       LOCKER_CONTAINER MANIFEST_COUNT MANIFEST_OUTSIDE MANIFEST_INSIDE MANIFEST NOUN_LONG NOUN_MEDIUM NOUN_SHORT].each { |name| remove_const(name) if const_defined?(name, false) }
+
+    LEADING_ARTICLE = /\A(?:an?|some|the)\s+/i
+
+    PLURALS = {
+      'blades' => 'blade', 'branches' => 'branch', 'cabochons' => 'cabochon',
+      'essences' => 'essence', 'fans' => 'fan', 'globes' => 'globe', 'motes' => 'mote',
+      'pieces' => 'piece', 'rose gold fire' => 'rose-gold fire', 'shards' => 'shard',
+      'slices' => 'slice', 'teeth' => 'tooth'
+    }.freeze
+
+    TICKET_LINE = /^\s*(?<source>\S.*?) - (?<amount>[\d,]+) (?<currency>.+?)\.\s*$/
+    ENTRY_LINE = /^\s*(?<event>\S.*?) Entries:\s+(?<amount>[\d,]+)\s*$/
+    BANK_LINE = /^\s*(?<bank>\w[^:]+):\s+(?<amount>[\d,]+)\s*$/
+    BANK_SINGLE = /You currently have an account with the (?<bank>.*?) in the amount of (?<amount>[\d,]+) silver/i
+    BANK_END = /You can deposit up to a maximum of|You haven't opened a bank account yet/i
+
+    LUMNIS_EXP = /([\d,]+) points of (quintupled|quadrupled|tripled|doubled) experience/
+    # highest first
+    LUMNIS_TIERS = { 'quintupled' => :quintuple, 'quadrupled' => :quadruple, 'tripled' => :triple, 'doubled' => :double }.freeze
+    LUMNIS_REFRESH = /scheduled to refresh in ([^.]+)\./
+    LUMNIS_SCHEDULED = /Your Gift of Lumnis is scheduled to start on (?<start_day>\w+)s at (?<start_time>\d\d:\d\d)/
+    LUMNIS_LAST_SCHEDULE = /You last used a Lumnis scheduling option on (?<last_schedule>[^.]+)\./
+
+    GEMSTONE_LINE = /^Gemstone (?<slot>\d+): (?<jewel>.+?)(?<attrs>(?: \([^)]*\))*)\s*$/
+    GEMSTONE_PROPERTY = /^\s*\*\s*(?<property>.+?)(?: \(Rank (?<rank>\d+) of (?<max>\d+)\))?\s*$/
+
+    LOCKER_INFO = /You (?:currently )?possess locker(?<multi>s)|Your locker(?<multi>s)? in .* are currently being swapped|Your locker is currently located in the town of (?<town>.*?)\./
+
+    # LOCKER INFO names some towns differently from the rest of the game
+    LOCKER_TOWNS = { "Kharag 'doth Dzulthu" => 'Zul Logoth', 'Vornavis' => 'Solhaven' }.freeze
+
+    SOCIETIES = { 'Council of Light' => 'CoL', 'Order of Voln' => 'Voln', 'Guardians of Sunfist' => 'GoS' }.freeze
+
+    JAR_LOOK = /you see (?<amount>\d+) portions? of (?<contents>.*?)\.\s*It is (?<status>[^.]+)\./
+    STACK_READ = /has (?<amount>[\d,]+) uses?|entitles the presenter to (?<amount>\d+)/
+    BOH_LINE = /^(?:<popBold\/>)?\d+\. +(?:an? )?(?<name>.*?)(?:<pushBold\/>)? \((?<amount>\d+|unlimited)(?<extra>.*?)$/
+    OREMONGER_LINE = /^\d+\.(?<extra> +)(?<amount>\d+|unlimited) pieces? of (?<name>.*?)$/
+
+    LOCKER_CONTAINER = /[IO]n a.*?(?:armor|weapon|clothing|deep|magical item) (?<noun>stand|rack|wardrobe|chest|bin)/i
+    MANIFEST_COUNT = /Obvious items?: *(?<count>\d+)/
+    MANIFEST_OUTSIDE = /^(?:<popBold\/>)?(?<depth> <d.*?d> +|  +)(?<pre>an |a )?(?<name>[^(]*?)(?:containing (?<post>[^(]*?))?(?<attrs>\(.*)?$/
+    MANIFEST_INSIDE = /^(?:<popBold\/>)?(?<depth> +)(?<pre>[^<]+ ?)?<a exist="(?<exist>-?\d+)" noun="(?<noun>[^"]*)">(?<name>[^<]*)<\/a>(?<post>[^(]*)?(?<attrs>\(.*)?/
+    MANIFEST = Regexp.union(MANIFEST_OUTSIDE, MANIFEST_INSIDE)
+
+    # invdb's noun guessing for manifest lines, which have no noun in them
+    NOUN_LONG = /^(?:pair of)?(?:[\w'\- ]{5})?.*? ([^ \n]+(?<! of| and)(?! reed| casting))((?: drawn by| of| set withi?n?| in| that| \(.*| [^ \n-]*?(?:ed (?:with|by)|-laced|ed|(?<!fletch|hunt|sl|drawstr|climb|smudg|fish)ing|[io]n an?|bound|held|hung|strung|strewn|caught|fraught|inset|inlaid|split|side-secured|aglisten|swept|woven|with ?a?n?|shot through|dripping|sporting)))(?: .*?)?$/
+    NOUN_MEDIUM = /^.*?(Hammer of Kai)$|^(?:[^ ]+[ \b])*([^ \b]*?)[ \b](?:with|an?|[io]n)[ \b]/
+    NOUN_SHORT = /^.*?(Hammer of Kai)$|^(?:.*?) ([^\s]+)$|^([^ ]+)$/
+
+    # @return [Integer] "12,345" => 12345
+    def self.amount(str)
+      str.to_s.delete(',').to_i
+    end
+
+    # @return [String] the line without XML tags
+    def self.text(line)
+      line.to_s.gsub(/<[^>]*>/, '')
+    end
+
+    # @return [Array<Hash>] :source, :currency, :amount for each TICKET BALANCE line
+    def self.tickets(lines)
+      lines.filter_map do |line|
+        m = TICKET_LINE.match(text(line)) or next
+        { source: m[:source], currency: m[:currency], amount: amount(m[:amount]) }
+      end
+    end
+
+    # @return [Array<Hash>] :event, :amount for each EVENT ENTRIES line
+    def self.entries(lines)
+      lines.filter_map do |line|
+        m = ENTRY_LINE.match(text(line)) or next
+        { event: m[:event], amount: amount(m[:amount]) }
+      end
+    end
+
+    # @return [Array<Hash>] :bank, :amount for each BANK ACCOUNT balance
+    def self.bank(lines)
+      rows = []
+      lines.each do |line|
+        line = text(line)
+        break if line =~ BANK_END
+
+        m = BANK_SINGLE.match(line) || BANK_LINE.match(line) or next
+        rows << { bank: m[:bank].strip, amount: amount(m[:amount]) } unless m[:bank].strip == 'Total'
+      end
+      rows
+    end
+
+    # Reads LUMNIS INFO. Each tier holds 7,300 points: queued lower tiers
+    # ("followed by additional cycles") are counted at 7,300, and a restart
+    # refills 2x and 3x, plus 4x and 5x after Temple donations.
+    #
+    # @param now [Integer] when it was read, for refresh_at
+    # @return [Hash] lumnis table columns
+    def self.lumnis(lines, now = Time.now.to_i)
+      all = lines.map { |line| text(line) }.join("\n")
+      tiers = LUMNIS_TIERS.values
+      info = { status: '', quintuple: 0, quadruple: 0, triple: 0, double: 0, total: 0, refresh_at: 0,
+               start_day: '', start_time: '', last_schedule: '' }
+      all.scan(LUMNIS_EXP) { |points, tier| info[LUMNIS_TIERS[tier]] = amount(points) }
+
+      if all =~ /followed by (?:an )?additional cycles?/ && (top = tiers.index { |t| info[t].positive? })
+        tiers[(top + 1)..].each { |t| info[t] = 7300 if info[t].zero? }
+      end
+      if all.include?('will restart as soon as you absorb experience')
+        info[:status] = 'restart'
+        donated = all.match?(/You have made [\d,]+ recent donations to the Temple of Lumnis/)
+        (donated ? tiers : %i[triple double]).each { |t| info[t] = 7300 }
+      elsif all.include?('has expired')
+        info[:status] = 'expired'
+      elsif tiers.any? { |t| info[t].positive? }
+        info[:status] = 'active'
+      end
+      info[:total] = tiers.sum { |t| info[t] }
+
+      if (m = LUMNIS_REFRESH.match(all))
+        seconds = { 'day' => 86_400, 'hour' => 3600, 'minute' => 60 }
+        info[:refresh_at] = now + m[1].scan(/(\d+) (day|hour|minute)/).sum { |n, unit| n.to_i * seconds[unit] }
+      end
+      info.merge!(start_day: m[:start_day], start_time: m[:start_time]) if (m = LUMNIS_SCHEDULED.match(all))
+      info[:last_schedule] = m[:last_schedule] if (m = LUMNIS_LAST_SCHEDULE.match(all))
+      info
+    end
+
+    # @return [Array<Hash>] a row per property of each gemstone in GEM LIST ALL,
+    #   and a row with property '' for a gemstone with no properties
+    def self.gemstones(lines)
+      rows = []
+      gem = nil
+      lines.each do |raw|
+        line = text(raw)
+        if (m = GEMSTONE_LINE.match(line))
+          gem = { slot: m[:slot].to_i, jewel: m[:jewel].sub(LEADING_ARTICLE, ''), equipped: m[:attrs].include?('(equipped)'),
+                  binding: m[:attrs][/\((\w+ binding)\)/, 1].to_s }
+          rows << gem.merge(property: '', mnemonic: '', rank: 0, max_rank: 0)
+        elsif gem && (m = GEMSTONE_PROPERTY.match(line))
+          rows.pop if rows.last[:slot] == gem[:slot] && rows.last[:property].empty?
+          rows << gem.merge(property: m[:property], mnemonic: raw[/gem info ([a-z]+)/, 1].to_s, rank: m[:rank].to_i, max_rank: m[:max].to_i)
+        end
+      end
+      rows
+    end
+
+    # @return [String, nil] a property's rarity from GEM INFO, e.g. "rare"
+    def self.gem_rarity(lines)
+      lines.map { |line| text(line) }.join("\n")[/^Rarity:\s+(\w+)/, 1]&.downcase
+    end
+
+    # @return [String] "multi", the locker's town, or "" from LOCKER INFO
+    def self.locker(lines)
+      m = LOCKER_INFO.match(lines.map { |line| text(line) }.join("\n")) or return ''
+      return 'multi' if m[:multi]
+
+      LOCKER_TOWNS.fetch(m[:town], m[:town])
+    end
+
+    # @return [String, nil] the account name from ACCOUNT
+    def self.account_name(lines)
+      lines.map { |line| text(line) }.join("\n")[/Account Name:\s*(\S+)/, 1]
+    end
+
+    # @return [String, nil] the account type from ACCOUNT
+    def self.account_type(lines)
+      lines.map { |line| text(line) }.join("\n")[/(?:Account Type|Subscription):\s*(\S+)/, 1]
+    end
+
+    # @param type [String, nil] Account.type / Account.subscription / ACCOUNT
+    # @return [String] "f2p", "standard" or "premium"
+    def self.subscription(type)
+      case type.to_s
+      when /free|f2p/i then 'f2p'
+      when /premium|platinum|internal/i then 'premium'
+      else 'standard'
+      end
+    end
+
+    # @return [String] e.g. "the town of Wehnimer's Landing" => "Wehnimer's Landing"
+    def self.area(location)
+      location.to_s.gsub(/(the )?(town|hamlet|city|village|plains|free port|lowlands|tunnels and caverns|foothills|holdings|southern part|northern slopes|northern reaches|environs|somewhere)( o[fn] )?|,.*$|^the /i, '').strip
+    end
+
+    # @return [String] the society's short name
+    def self.society(status)
+      SOCIETIES.fetch(status.to_s, status.to_s.empty? ? 'none' : status.to_s)
+    end
+
+    # @return [String] a plural item name made singular: "uncut diamonds" => "uncut diamond"
+    def self.singular(str)
+      str = str.to_s.strip
+      str = "#{$2}#{'y' if $3 == 'ies'}" if str =~ /^(containing )?(.*?)(ies|(?<=onyx)es|(?<=z)es|(?<!mos|glas)s)?$/
+      str.gsub(/\b(#{PLURALS.keys.join('|')})\b/, PLURALS)
+    end
+
+    # Guesses the noun of an item name, for lines that don't link the item.
+    #
+    # @return [String]
+    def self.noun_guess(name)
+      name = name.to_s.strip
+      noun = if name.length > 35
+               found = name.scan(NOUN_LONG).flatten.first
+               found.to_s.empty? ? name.scan(NOUN_MEDIUM).flatten.join : found
+             else
+               name =~ /lapis lazuli$/ ? 'lapis' : name.scan(NOUN_SHORT).flatten.join
+             end
+      noun.to_s.empty? ? name.split(' ').last.to_s : noun
+    end
+
+    # @return [String] the noun of a jar's contents: the last word, except lapis lazuli
+    def self.last_noun(name)
+      name =~ /lapis lazuli$/ ? 'lapis' : name.split.last.to_s
+    end
+
+    # @return [String] the item's type from GameObj data, or "unknown"
+    def self.item_type(name, noun)
+      types = GameObj.new(0, noun, name).type.to_s.split(',') - ['uncommon']
+      types.empty? ? 'unknown' : types.join(',')
+    end
+
+    # @return [Hash] an item table row with the defaults filled in
+    def self.item_row(location_id, path, name, noun, **fields)
+      {
+        location_id: location_id, level: path.size, path: path.join(' > '),
+        type: item_type(name, noun), name: name, noun: noun.to_s, amount: 1,
+        stack: '', status: '', marked: false, registered: false, hidden: false
+      }.merge(fields)
+    end
+
+    # Rows for an Inventory item and everything in it, depth first. Each row
+    # carries the Inventory item under :item until it is saved.
+    #
+    # @param item [Lich::Common::Inventory::Item]
+    # @return [Array<Hash>]
+    def self.tree_rows(item, location_id, path = [])
+      name = (item.long.to_s.empty? ? item.name : item.long).to_s.sub(LEADING_ARTICLE, '')
+      flags = item.flags
+      row = item_row(location_id, path, name, item.noun, item: item,
+                     marked: flags.include?('marked'), registered: flags.include?('registered'), hidden: flags.include?('hidden'))
+      [row] + item.contents.flat_map { |child| tree_rows(child, location_id, path + [item.noun]) }
+    end
+
+    # @return [Array<Array(String, String, String)>] id, noun and name of each
+    #   item linked after "you see" in a LOOK IN reply
+    def self.look_contents(lines)
+      seen = lines.join(' ')[/you see (.*)/m, 1].to_s
+      seen.scan(/<a exist="(-?\d+)" noun="([^"]+)">([^<]*)<\/a>/)
+    end
+
+    # Reads OPEN LOCKER.
+    #
+    # @return [Array(Integer, GameObj)] how many items the game says the locker
+    #   holds, and what holds them (nil, nil when there is no locker here)
+    def self.locker_open(lines)
+      all = lines.join("\n")
+      holding = all[/Your locker is currently holding ([\d,]+) items?/, 1]
+      return [nil, nil] unless holding
+
+      links = all.scan(/<a exist="(-?\d+)" noun="([^"]+)">([^<]*)<\/a>/).reject { |_id, noun, _name| noun == 'trapdoor' }
+      id, noun, name = links.find { |_id, n, _name| n == 'locker' } || links.last
+      [amount(holding), id && GameObj.new(id, noun, name)]
+    end
+
+    # @return [Hash{String=>Hash}] :marked, :registered, :hidden by item id,
+    #   from INVENTORY FULL
+    def self.inventory_flags(lines)
+      lines.each_with_object({}) do |line, flags|
+        id = line[/exist="(-?\d+)"/, 1] or next
+        tags = text(line).scan(/\((registered|marked|hidden)\)/).flatten
+        flags[id] = { marked: tags.include?('marked'), registered: tags.include?('registered'), hidden: tags.include?('hidden') }
+      end
+    end
+
+    # @return [Hash, nil] :amount, :status, :contents from LOOK IN a jar
+    def self.jar(lines)
+      m = JAR_LOOK.match(text(lines.join(' '))) or return nil
+      { amount: m[:amount].to_i, status: m[:status] =~ /^(full|empty)/ ? $1 : 'partial', contents: singular(m[:contents]) }
+    end
+
+    # @return [Integer, nil] how many notes READ says a stack holds
+    def self.stack(lines)
+      m = STACK_READ.match(text(lines.join(' '))) or return nil
+      amount(m[:amount])
+    end
+
+    # @return [Array<Hash>] :name, :amount, :type (nil if unknown) for each
+    #   line of LOOK IN / GAZE at a bag of holding
+    def self.boh(lines)
+      pattern = lines.first.to_s =~ /ores you have stored/ ? OREMONGER_LINE : BOH_LINE
+      lines.filter_map do |line|
+        m = pattern.match(line) or next
+        type = if m[:extra] =~ /(fishing \w*)/ then $1.sub(/s$/, '')
+               elsif m[:extra] =~ /specimen/ then 'specimen'
+               elsif lines.first =~ /gemstones/ then 'gemstone'
+               elsif pattern == OREMONGER_LINE then 'ore'
+               end
+        { name: text(m[:name]).strip, amount: m[:amount] =~ /\d/ ? m[:amount].to_i : 1, type: type }
+      end
+    end
+
+    # Parses LOCKER MANIFEST.
+    #
+    # @return [Array(Array<Hash>, Integer, Integer)] rows, the item count the
+    #   game shows, and how many item lines were read
+    def self.manifest(lines, location_id)
+      rows = []
+      shown = 0
+      read = 0
+      base = nil
+      path = []
+      prev_level = 0
+      prev_noun = ''
+
+      lines.each do |line|
+        if (m = MANIFEST_COUNT.match(line))
+          shown = m[:count].to_i
+        elsif (m = LOCKER_CONTAINER.match(line))
+          base = m[:noun]
+          path = [base]
+        elsif (m = MANIFEST.match(line))
+          read += 1
+          level = (text(m[:depth]).length - 6) / 2
+          name = text(m[:name]).strip
+          noun = m[:noun] || noun_guess(name)
+          path.push(prev_noun) if level > prev_level
+          if level < prev_level
+            (prev_level - level).times { path.pop }
+            path = [base].compact if path.empty?
+          end
+          prev_level = level
+          prev_noun = noun
+
+          pre = m[:pre].to_s.sub(/^an? ?/, '')
+          post = m[:post].to_s.strip
+          attrs = m[:attrs].to_s
+          name = "#{pre}#{name.sub(/^some /, '')}".strip
+          flags = { marked: attrs.include?('marked'), registered: attrs.include?('registered'), hidden: attrs.include?('hidden') }
+
+          row = item_row(location_id, path.dup, name, noun, **flags)
+          rows << row
+          next unless row[:type] =~ /\bjar\b/
+
+          count, max = attrs.match(/\((\d+)\/(\d+)\)/)&.captures&.map(&:to_i)
+          row[:status] = if count.nil? then 'empty' elsif count == max then 'full' else 'partial' end
+          next if count.to_i.zero? || post.empty?
+
+          row[:name] = "#{name} containing #{post}"
+          contents = singular(post)
+          rows << item_row(location_id, path + [noun], contents, last_noun(contents), amount: count, stack: 'jar')
+        end
+      end
+      [rows, shown, read]
+    end
+  end
+
+  # Game commands. Every command here is sent quietly.
+  module Scan
+    %i[PROMPT INVENTORY_START LOCKER_OPEN LOOK_START OPEN_START CLOSE_START NOT_OPENED BOH_START MANIFEST_START MANIFEST_SKIP].each { |name| remove_const(name) if const_defined?(name, false) }
+
+    PROMPT = /<prompt/
+    INVENTORY_START = /You are (?:currently )?(?:wearing|carrying|holding)|You are carrying nothing|You have nothing/
+    LOCKER_OPEN = /You open|already open|locker is currently holding|What were you referring|You (?:don't|do not|can't|cannot)|I could not find/
+    # a blank first line is LOOK IN at something that isn't a container,
+    # answered with its description
+    LOOK_START = /^\s*$|exist="|There is nothing|That is closed|could not find|You see the shifting form/
+    OPEN_START = /exist="|already open|open already|any way to do that|referring to|locked/
+    CLOSE_START = /exist="|already closed|any way to do that|referring to|You tie/
+    NOT_OPENED = /already open|open already|any way to do that|referring to|locked/
+    BOH_START = Regexp.union(/has multiple pockets/, /^Fashioned (?:from|of)/, /^Crafted from/, /^(?:<popBold\/>)?\d+\. +/,
+                             /^There is nothing in there\./, /^You realize/, /^Sifting through/, /^Glancing over your/)
+    MANIFEST_START = /^Thinking back, you recall|^Looking in front of you|^You must first visit|^You must have a Premium|Unknown town specified|You do not currently have a.*? vault|currently being swapped/
+    MANIFEST_SKIP = /^You must first visit|^You must have a Premium|Unknown town specified|You do not currently have a.*? vault|currently being swapped/
+
+    # @return [Array<String>] the response lines, without the prompt
+    def self.command(cmd, start, timeout: 5)
+      Lich::Util.issue_command(cmd, start, PROMPT, include_end: false, timeout: timeout, quiet: true, silent: true)
+    end
+
+    # Sends +cmd+ and parses the reply with Parse.+parser+.
+    #
+    # @return [Object, nil] nil when the game didn't answer, so nothing saved
+    #   gets wiped by a timeout
+    def self.read(cmd, start, parser)
+      lines = command(cmd, start)
+      lines.empty? ? nil : Parse.send(parser, lines)
+    end
+
+    # @return [Array(String, String)] account name and subscription
+    def self.account
+      name = Account.name
+      type = Account.type || Account.subscription
+      if name.to_s.empty? || type.nil?
+        lines = command('account', /Game Instance|Account Name|Account Type/i)
+        name = Parse.account_name(lines) if name.to_s.empty?
+        type ||= Account.type || Parse.account_type(lines)
+      end
+      [name.to_s.capitalize, Parse.subscription(type)]
+    end
+
+    # @return [Hash] character table columns Lich already knows
+    def self.character
+      {
+        prof: Stats.prof.to_s, race: Stats.race.to_s, level: XMLData.level.to_i, exp: Stats.exp.to_i,
+        area: area, citizenship: Char.citizenship.to_s,
+        society: Parse.society(Society.status), society_rank: Society.rank.to_s
+      }
+    end
+
+    # @return [String, nil] the area you are in; for rooms without one, the
+    #   nearest town's (as invdb did); nil keeps what was saved
+    def self.area
+      location = Room.current&.location || Room[Room.current&.find_nearest_by_tag('town')]&.location
+      area = Parse.area(location)
+      area.empty? ? nil : area
+    end
+
+    def self.locker_info
+      Parse.locker(command('locker info', /locker information is as follows|You possess locker|Your locker|You currently possess lockers/i))
+    end
+
+    def self.bank
+      read('bank account', /You currently have the following amounts on deposit|You currently have an account|You haven't opened a bank account yet/i, :bank)
+    end
+
+    def self.tickets
+      read('ticket balance', /You take a moment to recall the alternative currencies|You haven't collected any alternative currencies/, :tickets)
+    end
+
+    def self.entries
+      read('event entries', /Event Entries/, :entries)
+    end
+
+    def self.gemstones
+      read('gem list all', /^Gemstone \d+:|You have not yet unlocked Gemstones/, :gemstones)
+    end
+
+    # Looks up the rarity of properties not seen before, with GEM INFO.
+    def self.gem_rarities(rows)
+      known = Store.db[:gemstone_property].select_map(:mnemonic)
+      (rows.map { |row| row[:mnemonic] }.reject(&:empty?).uniq - known).each do |mnemonic|
+        rarity = read("gem info #{mnemonic}", /<output class="mono"/, :gem_rarity)
+        Store.db[:gemstone_property].insert(mnemonic: mnemonic, rarity: rarity) if rarity
+      end
+    end
+
+    def self.lumnis
+      read('lumnis info', /^You have \d+|Your Gift of Lumnis|^Because your account is free/, :lumnis)
+    end
+
+    # Infomon reads RESOURCE; Lich::Resources has what it read.
+    #
+    # @return [Hash, nil] resource table columns, nil when RESOURCE gave nothing
+    def self.resource
+      Lich::Resources.check(true)
+      return nil if Lich::Resources.type.nil?
+
+      { energy: Lich::Resources.type.to_s.downcase, weekly: Lich::Resources.weekly.to_i, total: Lich::Resources.total.to_i,
+        suffused: Lich::Resources.suffused.to_i, favor: Lich::Resources.voln_favor.to_i }
+    end
+
+    # @return [Boolean] whether this opened it (false if it was already open)
+    # +where+ says where the item is ("in sack in locker"); the game only
+    # finds an item in a locker by id with it
+
+    # @return [Boolean] whether this opened it (false if it was already open)
+    def self.open_container(id, where = nil)
+      command("open ##{id} #{where}".strip, OPEN_START, timeout: 3).join("\n") !~ NOT_OPENED
+    end
+
+    def self.close_container(id, where = nil)
+      command("close ##{id} #{where}".strip, CLOSE_START, timeout: 3)
+    end
+
+    def self.look_in(id, where = nil)
+      command("look in ##{id} #{where}".strip, LOOK_START, timeout: 3)
+    end
+
+    def self.noopen?(name)
+      CatalogDB.setting('noopen').any? { |n| name.to_s.downcase.end_with?(n.downcase) }
+    end
+
+    # Rows for everything in your hands, worn, and placed alongside you.
+    #
+    # @return [Hash{Integer=>Array<Hash>}, nil] rows by location id, or nil
+    #   when the inventory feed did not answer
+    def self.inventory
+      snap = Lich::Common::Inventory.refresh(timeout: 10) or return nil
+      by_location = {
+        HANDS     => [snap.right_hand, snap.left_hand].compact,
+        INVENTORY => snap.worn,
+        ALONGSIDE => snap.at_feet
+      }.to_h { |location_id, roots| [location_id, roots.flat_map { |root| Parse.tree_rows(root, location_id) }] }
+      # the feed has no registered/marked/hidden flags, so read them from
+      # INVENTORY FULL, which links each item by the same id. It leaves out
+      # what is in closed containers; those flags stay nil (unknown) here.
+      flags = inventory_flags
+      unknown = { marked: nil, registered: nil, hidden: nil }
+      by_location.each_value { |rows| rows.each { |row| row.merge!(flags[row[:item].id] || unknown) } }
+      add_contents(by_location.values.flatten)
+      by_location.transform_values { |rows| rows.map { |row| row.except(:item) } }
+    end
+
+    # @return [Hash{String=>Hash}] flags by item id, for worn and held items
+    def self.inventory_flags
+      lines = command('inventory full', INVENTORY_START, timeout: 10) + command('inventory hands full', INVENTORY_START, timeout: 10)
+      Parse.inventory_flags(lines)
+    end
+
+    # Counts what is in jars, note stacks and bags of holding, adding a row for
+    # their contents. Closed containers holding them are opened first and
+    # closed again after.
+    def self.add_contents(rows)
+      jar = CatalogDB.setting('jar')
+      stack = CatalogDB.setting('stack')
+      bohs = CatalogDB.setting('boh')
+      todo = rows.select do |row|
+        # a jar whose description doesn't say "containing" is empty
+        (jar && row[:type] =~ /\bjar\b/ && (row[:item].long.to_s.empty? || row[:item].long.include?('containing'))) ||
+          (stack && row[:name] =~ /\Astack of .* notes\z/i) ||
+          bohs.include?(row[:name])
+      end
+      return if todo.empty?
+
+      closed = todo.flat_map { |row| ancestors(row[:item]) }.uniq(&:id)
+                   .select { |c| c.closed? && !c.locked? && !noopen?(c.name) }
+                   .sort_by { |c| ancestors(c).size }
+      opened = []
+      begin
+        closed.each { |c| opened << c if open_container(c.id, where(c)) }
+        todo.each do |row|
+          place = where(row[:item])
+          added = if bohs.include?(row[:name]) then boh_rows(row, place)
+                  elsif row[:type] =~ /\bjar\b/ then jar_rows(row, place)
+                  else stack_rows(row, place)
+                  end
+          rows.concat(added)
+        end
+      ensure
+        opened.reverse_each { |c| close_container(c.id, where(c)) }
+      end
+    end
+
+    def self.ancestors(item)
+      list = []
+      list << item while (item = item.parent_item)
+      list
+    end
+
+    # @return [String] where an inventory item is, by container id, as invdb
+    #   sent it: "in #123 in #456" (innermost first), or "" at the top
+    def self.where(item)
+      ancestors(item).map { |container| "in ##{container.id}" }.join(' ')
+    end
+
+    def self.content_path(row)
+      row[:path].empty? ? [row[:noun]] : row[:path].split(' > ') + [row[:noun]]
+    end
+
+    def self.jar_rows(row, where = nil)
+      found = Parse.jar(look_in(row[:item].id, where))
+      row[:status] = found ? found[:status] : 'empty'
+      return [] unless found&.dig(:amount)&.positive?
+
+      [Parse.item_row(row[:location_id], content_path(row), found[:contents], Parse.last_noun(found[:contents]),
+                      amount: found[:amount], stack: 'jar')]
+    end
+
+    def self.stack_rows(row, where = nil)
+      id = row[:item].id
+      count = Parse.stack(command("read ##{id} #{where}".strip, /In the Common language|exist="#{id}"/, timeout: 3))
+      return [] unless count&.positive?
+
+      [Parse.item_row(row[:location_id], content_path(row), row[:name], row[:noun], amount: count, stack: 'stack')]
+    end
+
+    def self.boh_rows(row, where = nil)
+      id = row[:item].id
+      verb = row[:name] =~ /tackle/ ? 'gaze' : 'look in'
+      found = Parse.boh(command("#{verb} ##{id} #{where}".strip, BOH_START))
+      found = Parse.boh(command("gaze ##{id} #{where}".strip, BOH_START)) if found.empty? && verb != 'gaze'
+      found.map do |f|
+        noun, type = Store.known_noun(f[:name])
+        noun ||= Parse.noun_guess(f[:name])
+        Parse.item_row(row[:location_id], content_path(row), f[:name], noun, amount: f[:amount], stack: 'boh')
+             .tap { |r| r[:type] = f[:type] || type || r[:type] }
+      end
+    end
+
+    # Rows for the locker you are standing at. OPEN LOCKER reveals what holds
+    # the items (a trunk through a trapdoor, or the locker itself), so the
+    # locker is opened, closing it first if it was open, to see what that is.
+    #
+    # @return [Array<Hash>, nil] nil when there is no locker here
+    def self.standard_locker
+      lines = command('open locker', LOCKER_OPEN)
+      if lines.join =~ /already open/
+        command('close locker', CLOSE_START)
+        lines = command('open locker', LOCKER_OPEN)
+      end
+      holding, container = Parse.locker_open(lines)
+      opened = !holding.nil?
+      CatalogDB.say("opened your locker but couldn't tell what holds its items:\n#{lines.join("\n")}", 'warn') if opened && container.nil?
+      return nil unless container
+
+      sorter = Script.running?('sorter')
+      if sorter
+        Script.kill('sorter')
+        sleep 0.1 while Script.running?('sorter')
+      end
+      rows = locker_rows(container, [], look_in(container.id))
+      counted = rows.count { |row| row[:stack].empty? }
+      CatalogDB.say("read #{counted} locker items, the game says #{holding}", 'warn') if holding && counted != holding
+      rows
+    ensure
+      command('close locker', CLOSE_START) if opened
+      start_script('sorter') if sorter
+    end
+
+    # @param where [String] where +container+'s items are, e.g. "in sack in locker"
+    # @param look [Array<String>] the LOOK IN reply for +container+
+    def self.locker_rows(container, path, look, where = 'in locker')
+      contents(container, look).flat_map do |obj|
+        name = [obj.before_name, obj.name, obj.after_name].compact.join(' ').strip.sub(Parse::LEADING_ARTICLE, '')
+        row = Parse.item_row(LOCKER, path, name, obj.noun.to_s)
+        rows = [row]
+        if row[:type] =~ /\bjar\b/ && CatalogDB.setting('jar')
+          row[:item] = obj
+          rows.concat(jar_rows(row, where))
+          row.delete(:item)
+        elsif obj.type.to_s =~ /container|clothing/ && !noopen?(name)
+          opened = open_container(obj.id, where)
+          look = look_in(obj.id, where)
+          rows.concat(locker_rows(obj, path + [obj.noun], look, "in #{obj.noun} #{where}"))
+          close_container(obj.id, where) if opened
+        end
+        rows
+      end
+    end
+
+    # What a container holds: the items linked in its LOOK IN reply, or, when
+    # the reply links none, what Lich has for it (filled in a moment after
+    # the reply).
+    #
+    # @return [Array<GameObj>]
+    def self.contents(container, look)
+      linked = Parse.look_contents(look)
+      return linked.map { |id, noun, name| GameObj.new(id, noun, name) } unless linked.empty?
+
+      10.times do
+        break if container.contents
+        sleep 0.1
+      end
+      container.contents.to_a
+    end
+
+    # Rows for one LOCKER MANIFEST, trying up to three times when lines go missing.
+    #
+    # @return [Array<Hash>, nil] nil when there is no such locker or it could not be read
+    def self.manifest(location_id, town)
+      3.times do
+        lines = command("locker manifest #{town}", MANIFEST_START, timeout: 10)
+        return nil if lines.empty? || lines.any? { |line| line =~ MANIFEST_SKIP }
+
+        rows, shown, read = Parse.manifest(lines, location_id)
+        return rows if shown == read
+      end
+      CatalogDB.say("could not read all of the #{town} locker manifest, skipping it", 'warn')
+      nil
+    end
+  end
+
+  # Turns command-line filters into queries.
+  module Query
+    %i[CHARACTER_COLUMNS COLUMNS SEARCH BOOLEAN].each { |name| remove_const(name) if const_defined?(name, false) }
+
+    CHARACTER_COLUMNS = {
+      'account' => Sequel[:a][:name], 'subscription' => Sequel[:a][:subscription],
+      'character' => Sequel[:c][:name], 'game' => Sequel[:c][:game], 'prof' => Sequel[:c][:prof],
+      'race' => Sequel[:c][:race], 'level' => Sequel[:c][:level], 'area' => Sequel[:c][:area],
+      'citizenship' => Sequel[:c][:citizenship], 'society' => Sequel[:c][:society], 'rank' => Sequel[:c][:society_rank]
+    }.freeze
+
+    # filter name => column(s) it matches, by target
+    COLUMNS = {
+      'item'      => CHARACTER_COLUMNS.merge(
+        'game' => Sequel[:i][:game], 'type' => Sequel[:i][:type], 'noun' => Sequel[:i][:noun], 'path' => Sequel[:i][:path],
+        'stack' => Sequel[:i][:stack], 'status' => Sequel[:i][:status], 'marked' => Sequel[:i][:marked],
+        'registered' => Sequel[:i][:registered], 'hidden' => Sequel[:i][:hidden], 'amount' => Sequel[:i][:amount],
+        'location' => [Sequel[:l][:abbr], Sequel[:l][:name]], 'location_type' => Sequel[:l][:type]
+      ),
+      'character' => CHARACTER_COLUMNS,
+      'bank'      => CHARACTER_COLUMNS.merge('bank' => Sequel[:s][:bank], 'amount' => Sequel[:s][:amount]),
+      'tickets'   => CHARACTER_COLUMNS.merge('source' => Sequel[:t][:source], 'currency' => Sequel[:t][:currency], 'amount' => Sequel[:t][:amount]),
+      'entries'   => CHARACTER_COLUMNS.merge('event' => Sequel[:e][:event], 'amount' => Sequel[:e][:amount]),
+      'gemstones' => CHARACTER_COLUMNS.merge('property' => Sequel[:g][:property], 'jewel' => Sequel[:g][:jewel], 'binding' => Sequel[:g][:binding],
+                                             'equipped' => Sequel[:g][:equipped], 'rank' => Sequel[:g][:rank], 'rarity' => Sequel[:p][:rarity]),
+      'lumnis'    => CHARACTER_COLUMNS.merge('status' => Sequel[:u][:status], 'quintuple' => Sequel[:u][:quintuple],
+                                             'quadruple' => Sequel[:u][:quadruple], 'triple' => Sequel[:u][:triple],
+                                             'double' => Sequel[:u][:double], 'total' => Sequel[:u][:total]),
+      'resource'  => CHARACTER_COLUMNS.merge('energy' => Sequel[:r][:energy], 'weekly' => Sequel[:r][:weekly], 'total' => Sequel[:r][:total],
+                                             'suffused' => Sequel[:r][:suffused], 'favor' => Sequel[:r][:favor])
+    }.freeze
+
+    # columns plain search words are matched against, by target
+    SEARCH = {
+      'item' => [Sequel[:i][:name]], 'character' => [Sequel[:c][:name]], 'bank' => [Sequel[:s][:bank]],
+      'tickets' => [Sequel[:t][:source], Sequel[:t][:currency]], 'entries' => [Sequel[:e][:event]],
+      'gemstones' => [Sequel[:g][:property], Sequel[:g][:jewel]],
+      'lumnis' => [Sequel[:c][:name]], 'resource' => [Sequel[:c][:name]]
+    }.freeze
+
+    BOOLEAN = %w[marked registered hidden equipped].freeze
+
+    # @param target [String] a COLUMNS key
+    # @return [Sequel::Dataset] the target's tables, joined
+    def self.dataset(db, target)
+      if target == 'item'
+        return db[Sequel[:item].as(:i)]
+               .join(Sequel[:location].as(:l), id: Sequel[:i][:location_id])
+               .join(Sequel[:account].as(:a), id: Sequel[:i][:account_id])
+               .left_join(Sequel[:character].as(:c), id: Sequel[:i][:character_id])
+      end
+
+      table, as = { 'character' => %i[character c], 'bank' => %i[silver s], 'tickets' => %i[tickets t],
+                    'entries' => %i[entries e], 'gemstones' => %i[gemstone g], 'lumnis' => %i[lumnis u], 'resource' => %i[resource r] }.fetch(target)
+      ds = db[Sequel[table].as(as)]
+      ds = ds.left_join(Sequel[:gemstone_property].as(:p), mnemonic: Sequel[:g][:mnemonic]) if as == :g
+      ds = ds.join(Sequel[:character].as(:c), id: Sequel[as][:character_id]) unless as == :c
+      ds.left_join(Sequel[:account].as(:a), id: Sequel[:c][:account_id])
+    end
+
+    # One filter as a condition.
+    #
+    # @param columns [Sequel::SQL::Expression, Array] OR'd together when an Array
+    # @param op [String] "=", "!=", "<>", "<", "<=", ">" or ">="
+    # @param value [String, Integer, Array, Regexp, Boolean]
+    def self.condition(columns, op, value)
+      cond = Array(columns).map do |col|
+        case value
+        when Regexp then Sequel.like(col, value)
+        when Array, true, false then Sequel.expr(col => value)
+        when Integer then %w[= != <>].include?(op) ? Sequel.expr(col => value) : Sequel.expr(col).send(op, value)
+        else Sequel.like(col, value.tr('*', '%'))
+        end
+      end.reduce { |a, b| Sequel.|(a, b) }
+      %w[!= <>].include?(op) ? Sequel.~(cond) : cond
+    end
+
+    # @param filters [Array<Hash>] :name, :op, :value from CLI.parse_filter
+    # @return [Sequel::Dataset] +ds+ narrowed by each filter
+    def self.where(ds, target, filters)
+      filters.reduce(ds) do |acc, f|
+        columns = f[:name] == 'search' ? SEARCH.fetch(target) : COLUMNS.fetch(target).fetch(f[:name])
+        acc.where(condition(columns, f[:op], filter_value(f)))
+      end
+    end
+
+    # A filter's value as the query uses it.
+    def self.filter_value(filter)
+      value = filter[:value]
+      return value unless value.is_a?(String)
+      return %w[y yes true 1].include?(value.downcase) if BOOLEAN.include?(filter[:name])
+      return value.delete_prefix('=') if value.start_with?('=')
+
+      case filter[:name]
+      when 'search', 'type' then "%#{value}%"
+      when 'status' then "#{value}%"
+      else value
+      end
+    end
+
+    # @param extras [Hash] :orderby, :limit, :groupby
+    # @return [Array(Array<Symbol>, Array<Array>)] headers and rows
+    def self.run(db, action, target, filters, extras = {})
+      ds = where(dataset(db, target), target, filters)
+      ds = send("#{action}_#{target}", ds, extras)
+      ds = ds.order(Sequel.lit(extras[:orderby])) if extras[:orderby]
+      ds = ds.limit(extras[:limit]) if extras[:limit]
+      headers = ds.columns
+      rows = ds.naked.map { |row| row.values_at(*headers) }
+      rows = add_totals(rows, headers, action, target)
+      [headers, rows]
+    end
+
+    def self.select(ds, columns)
+      ds.select(*columns.map { |alias_name, expr| Sequel.as(expr, alias_name) })
+    end
+
+    def self.sum(expr)
+      Sequel.function(:sum, expr)
+    end
+
+    def self.names(expr)
+      Sequel.function(:replace, Sequel.function(:group_concat, expr).distinct, ',', ', ')
+    end
+
+    def self.owner_name
+      Sequel.function(:coalesce, Sequel[:c][:name], Sequel[:a][:name])
+    end
+
+    def self.query_item(ds, extras)
+      i = Sequel[:i]
+      columns = {
+        name: owner_name, loc: Sequel[:l][:abbr], path: i[:path], qty: i[:amount], type: i[:type],
+        stk: Sequel.function(:substr, i[:stack], 1, 3), epf: Sequel.function(:substr, i[:status], 1, 1),
+        m: i[:marked], r: i[:registered], h: i[:hidden]
+      }
+      columns[:noun] = i[:noun] if extras[:orderby].to_s.include?('noun')
+      columns[:item] = i[:name]
+      select(ds, columns).order(owner_name, Sequel[:l][:type], Sequel[:l][:id], i[:level], i[:path], i[:name])
+    end
+
+    def self.export_item(ds, _extras)
+      i = Sequel[:i]
+      select(ds, account: Sequel[:a][:name], name: owner_name, location: Sequel[:l][:name], level: i[:level], path: i[:path],
+                 qty: i[:amount], type: i[:type], noun: i[:noun], stack: i[:stack], status: i[:status], marked: i[:marked],
+                 registered: i[:registered], hidden: i[:hidden], item: i[:name], first_seen: i[:first_seen], last_seen: i[:last_seen])
+        .order(owner_name, Sequel[:l][:id], i[:level], i[:path], i[:name])
+    end
+
+    def self.sum_item(ds, extras)
+      i = Sequel[:i]
+      columns = { type: i[:type], qty: sum(i[:amount]) }
+      groups = [i[:type], i[:name]]
+      { 'char' => [:name, owner_name], 'loc' => [:loc, Sequel[:l][:abbr]], 'noun' => [:noun, i[:noun]] }.each do |word, (alias_name, expr)|
+        next unless extras[:groupby].to_s.include?(word)
+
+        columns[alias_name] = expr
+        groups << expr
+      end
+      columns[:item] = i[:name]
+      select(ds, columns).group(*groups).order(i[:type], Sequel.desc(:qty))
+    end
+
+    def self.count_item(ds, _extras)
+      i = Sequel[:i]
+      select(ds, name: owner_name, loc: Sequel[:l][:abbr],
+                 count: sum(Sequel.case({ { i[:stack] => '' } => i[:amount] }, 0)),
+                 boxes: sum(Sequel.case({ Sequel.like(i[:type], '%box%') => i[:amount] }, 0)))
+        .group(owner_name, Sequel[:l][:id], Sequel[:l][:abbr]).order(owner_name, Sequel[:l][:id])
+    end
+
+    def self.query_character(ds, _extras)
+      c = Sequel[:c]
+      carried = ds.db[:item].where(location_id: [HANDS, INVENTORY, ALONGSIDE], stack: '')
+                  .group(:character_id).select(:character_id, Sequel.as(sum(:amount), :inv))
+      select(ds.left_join(carried.as(:n), character_id: c[:id]),
+             account: Sequel[:a][:name], name: c[:name], game: Sequel.function(:lower, c[:game]),
+             pro: Sequel.function(:substr, c[:prof], 1, 3),
+             rc: Sequel.function(:substr, Sequel.function(:replace, c[:race], 'alf-', ''), 1, 2),
+             lvl: c[:level], area: c[:area], sub: Sequel.function(:substr, Sequel[:a][:subscription], 1, 3),
+             locker: c[:locker], citizenship: c[:citizenship], society: c[:society], rank: c[:society_rank],
+             inv: Sequel[:n][:inv], updated: c[:last_seen])
+        .order(c[:game], c[:name])
+    end
+    singleton_class.alias_method :export_character, :query_character
+
+    def self.query_bank(ds, _extras)
+      s = Sequel[:s]
+      select(ds, name: Sequel[:c][:name], bank: s[:bank], amount: s[:amount], updated: s[:last_seen]).order(Sequel[:c][:name], s[:bank])
+    end
+
+    def self.sum_bank(ds, _extras)
+      s = Sequel[:s]
+      select(ds, bank: s[:bank], amount: sum(s[:amount]), characters: names(Sequel[:c][:name])).group(s[:bank]).order(s[:bank])
+    end
+
+    def self.query_tickets(ds, _extras)
+      t = Sequel[:t]
+      select(ds, name: Sequel[:c][:name], source: t[:source], amount: t[:amount], currency: t[:currency], updated: t[:last_seen])
+        .order(t[:source], Sequel[:c][:name])
+    end
+
+    def self.sum_tickets(ds, _extras)
+      t = Sequel[:t]
+      select(ds, source: t[:source], amount: sum(t[:amount]), currency: t[:currency], characters: names(Sequel[:c][:name]))
+        .group(t[:source], t[:currency]).order(t[:source])
+    end
+
+    def self.query_entries(ds, _extras)
+      e = Sequel[:e]
+      select(ds, name: Sequel[:c][:name], event: e[:event], amount: e[:amount], updated: e[:last_seen]).order(e[:event], Sequel[:c][:name])
+    end
+
+    def self.sum_entries(ds, _extras)
+      e = Sequel[:e]
+      select(ds, event: e[:event], amount: sum(e[:amount]), characters: names(Sequel[:c][:name])).group(e[:event]).order(e[:event])
+    end
+
+    def self.query_gemstones(ds, _extras)
+      g = Sequel[:g]
+      property = Sequel.case({ { g[:rank] => 0 } => g[:property] }, Sequel.join([g[:property], ' (', g[:rank], '/', g[:max_rank], ')']))
+      select(ds, name: Sequel[:c][:name], gem: g[:slot], eq: g[:equipped], binding: Sequel.function(:replace, g[:binding], ' binding', ''),
+                 jewel: g[:jewel], properties: Sequel.function(:group_concat, property, ', '))
+        .group(Sequel[:c][:id], Sequel[:c][:name], g[:slot], g[:jewel], g[:equipped], g[:binding])
+        .order(Sequel[:c][:name], g[:slot])
+    end
+
+    def self.sum_gemstones(ds, _extras)
+      g = Sequel[:g]
+      select(ds.exclude(g[:property] => ''), property: g[:property], rarity: Sequel[:p][:rarity], count: Sequel.function(:count).*,
+                                              characters: names(Sequel[:c][:name]))
+        .group(g[:property], Sequel[:p][:rarity]).order(Sequel.desc(:count), g[:property])
+    end
+
+    def self.export_gemstones(ds, _extras)
+      g = Sequel[:g]
+      select(ds, name: Sequel[:c][:name], slot: g[:slot], jewel: g[:jewel], equipped: g[:equipped], binding: g[:binding],
+                 property: g[:property], mnemonic: g[:mnemonic], rarity: Sequel[:p][:rarity], rank: g[:rank], max_rank: g[:max_rank], first_seen: g[:first_seen], last_seen: g[:last_seen])
+        .order(Sequel[:c][:name], g[:slot], g[:property])
+    end
+
+    def self.query_lumnis(ds, _extras)
+      u = Sequel[:u]
+      select(ds, account: Sequel[:a][:name], name: Sequel[:c][:name], status: u[:status], '5x': u[:quintuple], '4x': u[:quadruple],
+                 '3x': u[:triple], '2x': u[:double], total: u[:total], refresh: u[:refresh_at], start_day: u[:start_day],
+                 start_time: u[:start_time], last_schedule: u[:last_schedule], updated: u[:updated_at])
+        .order(Sequel[:a][:name], Sequel[:c][:name])
+    end
+
+    def self.query_resource(ds, _extras)
+      r = Sequel[:r]
+      select(ds, account: Sequel[:a][:name], name: Sequel[:c][:name], pro: Sequel.function(:substr, Sequel[:c][:prof], 1, 3),
+                 lvl: Sequel[:c][:level], energy: r[:energy], weekly: r[:weekly], total: r[:total], suffused: r[:suffused],
+                 favor: r[:favor], updated: r[:updated_at])
+        .order(Sequel[:a][:name], Sequel[:c][:name])
+    end
+
+    %w[bank tickets entries lumnis resource].each do |target|
+      singleton_class.alias_method :"export_#{target}", :"query_#{target}"
+    end
+
+    # Adds the grand total to SUM BANK, and a total after each type with more
+    # than one item to SUM ITEM.
+    def self.add_totals(rows, headers, action, target)
+      return rows unless action == 'sum'
+
+      if target == 'bank'
+        return rows if rows.empty?
+
+        return rows + [['grand total', rows.sum { |row| row[1].to_i }, '']]
+      end
+      return rows unless target == 'item'
+
+      qty = headers.index(:qty)
+      rows.chunk { |row| row[0] }.flat_map do |type, group|
+        next group if group.size < 2
+
+        total = Array.new(headers.size, '')
+        total[0] = type
+        total[qty] = group.sum { |row| row[qty].to_i }
+        total[-1] = 'total'
+        group + [total]
+      end
+    end
+  end
+
+  # Tables in the game window, and files.
+  module Output
+    %i[DATE_COLUMNS FLAG_COLUMNS COUNTDOWN_COLUMNS].each { |name| remove_const(name) if const_defined?(name, false) }
+
+    DATE_COLUMNS = %i[updated first_seen last_seen].freeze
+    COUNTDOWN_COLUMNS = %i[refresh].freeze
+    FLAG_COLUMNS = %i[m r h eq marked registered hidden equipped].freeze
+
+    # @return [String] a cell's text
+    def self.cell(header, value, date_format, dates = DATE_COLUMNS)
+      return '' if value.nil?
+      return countdown(value) if COUNTDOWN_COLUMNS.include?(header)
+      return (value == true || value == 1 ? 'Y' : '') if FLAG_COLUMNS.include?(header)
+      return Time.at(value).strftime(date_format) if dates.include?(header) && value.is_a?(Integer) && value.positive?
+      return value.with_commas if value.is_a?(Integer)
+
+      value.to_s
+    end
+
+    # @return [String] time until +epoch+, e.g. "2d 02h 36m"; "" if unknown, "now" if past
+    def self.countdown(epoch, now = Time.now.to_i)
+      return '' unless epoch.to_i.positive?
+
+      left = epoch - now
+      return 'now' unless left.positive?
+
+      format('%dd %02dh %02dm', left / 86_400, left % 86_400 / 3600, left % 3600 / 60)
+    end
+
+    # @param highlight [Regexp, nil] highlighted in the item column
+    # @param dates [Array<Symbol>] columns holding timestamps to show as dates
+    # @param markup [Boolean] encode cells and highlight matches with
+    #   Lich::Messaging (XML presets, or Wizard/Avalon color codes); false for
+    #   front ends with neither, which get plain text
+    # @return [Array<String>] the table's lines
+    def self.table(headers, rows, date_format: '%m/%d/%y', highlight: nil, dates: DATE_COLUMNS, markup: true)
+      cells = rows.map { |row| row.each_with_index.map { |value, x| cell(headers[x], value, date_format, dates) } }
+      widths = headers.each_index.map { |x| ([headers[x].to_s] + cells.map { |row| row[x] }).map(&:length).max }
+      numeric = headers.each_index.map { |x| rows.all? { |row| row[x].nil? || row[x].is_a?(Numeric) } && !dates.include?(headers[x]) }
+      item = headers.index(:item)
+      line = widths.map { |w| '-' * w }.join('-+-')
+      format = lambda do |values|
+        values.each_with_index.map do |value, x|
+          padded = numeric[x] ? value.rjust(widths[x]) : value.ljust(widths[x])
+          next padded unless markup
+
+          padded = Lich::Messaging.xml_encode(padded)
+          padded = padded.sub(highlight) { |found| Lich::Messaging.msg_format('whisper', found, encode: false) } if highlight && x == item
+          padded
+        end.join(' | ').rstrip
+      end
+      [line, format.call(headers.map(&:to_s)), line, *cells.map(&format), line]
+    end
+
+    def self.print(headers, rows, target, highlight: nil)
+      if rows.empty?
+        CatalogDB.say("nothing found in #{target}")
+        return
+      end
+      if rows.size > 100 && CatalogDB.setting('confirm_large_output')
+        unpause = "#{$clean_lich_char}unpause #{Script.current.name}"
+        CatalogDB.say("#{rows.size} rows to show. #{Lich::Messaging.make_cmd_link(unpause, unpause)} to show them, or turn this off with " \
+                      "#{$clean_lich_char}catalog --confirm_large_output=off", encode: false)
+        pause_script
+      end
+      lines = table(headers, rows, date_format: CatalogDB.setting('date_format'), highlight: highlight,
+                                   markup: Lich::Common::Frontend.supports_xml? || Lich::Common::Frontend.supports_gsl?)
+      qty = headers.index(:qty)
+      total = qty ? " (#{rows.sum { |row| row[qty].is_a?(Integer) && row.last != 'total' ? row[qty] : 0 }.with_commas} items)" : ''
+      lines << "#{rows.size} row#{'s' unless rows.size == 1} from #{target}#{total}"
+      Lich::Messaging.mono(lines.join("\n"))
+    end
+
+    # @param format [String] csv, txt (tab separated) or pipe
+    # @return [String] the file written
+    def self.export(headers, rows, file, format)
+      rows = rows.map do |row|
+        row.each_with_index.map do |value, x|
+          DATE_COLUMNS.include?(headers[x]) && value.is_a?(Integer) ? Time.at(value).strftime('%Y-%m-%d %H:%M:%S') : value
+        end
+      end
+      if format == 'csv'
+        CSV.open(file, 'w') do |csv|
+          csv << headers
+          rows.each { |row| csv << row }
+        end
+      else
+        separator = format == 'pipe' ? '|' : "\t"
+        File.write(file, ([headers] + rows).map { |row| row.join(separator) }.join("\n") + "\n")
+      end
+      file
+    end
+  end
+
+  # ;catalog arguments, settings and help.
+  module CLI
+    %i[ACTIONS TARGETS FILTERS FILTER_ALIASES EXTRAS FILTER HELP].each { |name| remove_const(name) if const_defined?(name, false) }
+
+    # first match wins for abbreviations, so order matters
+    ACTIONS = %w[query refresh sum count export delete].freeze
+    TARGETS = %w[all item inventory locker character bank tickets entries gemstones lumnis resource].freeze
+    FILTERS = %w[account amount area bank binding character citizenship currency double event equipped favor game hidden jewel level
+                 location marked noun path prof property quadruple quintuple rarity registered race rank stack status society
+                 subscription source suffused type total triple weekly energy].freeze
+    FILTER_ALIASES = { 'char' => 'character', 'act' => 'account', 'qty' => 'amount', 'lvl' => 'level', 'pro' => 'prof',
+                       'epf' => 'status', 'stk' => 'stack', 'loc' => 'location', 'name' => 'search', 'item' => 'search' }.freeze
+    EXTRAS = %w[orderby groupby limit format dir file].freeze
+    FILTER = /\A(?<name>[a-z_]+)(?<op>!=|<>|<=|>=|=|<|>)(?<value>.*)\z/i
+
+    HELP = <<~HELP
+      ;catalog [action] [target] [filters] [search words]
+
+      With nothing after it, ;catalog updates everything for this character.
+      A target on its own lists it: ;catalog bank is ;catalog query bank.
+      Other words search item names: ;catalog golden glim
+
+      actions:
+        refresh   update this character (refresh all, refresh bank, refresh locker, ...)
+        query     list matches (the default)
+        sum       add up matches (items by type and name, bank by bank, ...)
+        count     items per character and place
+        export    save a query to a file in your Lich folder's catalog directory
+        delete    remove a character from the catalog, e.g. ;catalog delete char=Name
+        reset     start over with an empty catalog: ;catalog reset confirm
+
+      targets:
+        item      inventory and lockers (the default)
+        inv       inventory only: hands, worn, and alongside you
+        locker    lockers and the family vault only
+        char      characters
+        bank      bank accounts
+        tickets   ticket balances
+        entries   event entries
+        gemstones gemstones and their properties (sum gemstones counts each property)
+        lumnis    Lumnis
+        resource  resource, favor and suffused
+
+      filters (most can be abbreviated):
+        char=Name               * is a wildcard: char=xan*
+        account=Name
+        game=GSIV               defaults to the game you are in
+        type=gem                type contains gem; type==gem for exactly gem
+        noun=stone
+        path=backpack           path=*sack for anything in any sack
+        location=wl             location abbreviation or town name
+        qty>10                  also <, <=, >=, != on numbers
+        status=full             jars: empty, partial or full
+        stack=jar               contents of jars (jar), bags of holding (boh), note stacks (stack)
+        marked=y  registered=y  hidden=y
+        bank=Teras*  source=Ebon*  event=Duskruin*
+        property=Flare*  rarity=legendary  jewel=*cerulean*  equipped=y   gemstones
+        name=a|b                any of a list
+        name=/regex/            regular expression; != for no match
+        orderby="path, qty-"    sort by output columns, - for descending
+        groupby=char|loc|noun   sum item: also split totals by character, place or noun
+        limit=20
+        format=csv|txt|pipe dir=C:/somewhere file=name.csv   for export
+
+      search words match the item name (or bank, source, event); =words for an exact match.
+
+      settings:
+        ;catalog --settings             list them
+        ;catalog --jar=off              booleans take on/off
+        ;catalog --date_format=%Y-%m-%d
+        ;catalog +boh some bag name     add to a list; -boh to remove
+    HELP
+
+    def self.run(args)
+      args = args.dup
+      if (delay = args.find { |arg| arg =~ /\Adelay=\d+\z/i })
+        args.delete(delay)
+        sleep delay[/\d+/].to_i
+      end
+
+      return settings(args) if args.first =~ /\A(?:--|\+|-)\w/
+      return respond(HELP) if args.first =~ /\Ahelp\z/i
+      return menu if args.first =~ /\Amenu\z/i
+      return reset(args) if args.first =~ /\Areset\z/i
+      return refresh('all') if args.empty?
+
+      action, export_action, target = command(args)
+      return refresh(target) if action == 'refresh'
+
+      filters, extras = parse(args)
+      return delete(target, filters) if action == 'delete'
+
+      query(export_action || action, target, filters, extras, export: action == 'export')
+    end
+
+    # Takes the action and target off the front of +args+. A first word that
+    # is a whole target name ("bank", "item", "inv") means query that target;
+    # anything else not an action is searched for.
+    #
+    # @return [Array(String, String, String)] action, export action (or nil), target
+    def self.command(args)
+      action = take(args, ACTIONS)
+      export_action = take(args, %w[query sum count], exact: true) if action == 'export'
+      target = take(args, TARGETS) if action
+      target ||= take(args, TARGETS - ['all'] + %w[inv char], exact: true)
+      target = abbreviation(target, TARGETS) if target
+      action ||= 'query'
+      target ||= %w[refresh delete].include?(action) ? 'all' : 'item'
+      [action, export_action, target]
+    end
+
+    # Removes and returns the first argument when it names one of +words+.
+    #
+    # @return [String, nil] the word it names
+    def self.take(args, words, exact: false)
+      word = exact ? words.find { |w| w == args.first.to_s.downcase } : abbreviation(args.first, words)
+      args.shift if word
+      word
+    end
+
+    # @return [String, nil] the first word in +words+ that +input+ abbreviates
+    def self.abbreviation(input, words)
+      input = input.to_s.downcase
+      return nil if input.empty?
+      alias_word = { 'inv' => 'inventory', 'char' => 'character', 'silver' => 'bank', 'scrip' => 'tickets' }[input]
+      return alias_word if alias_word && words.include?(alias_word)
+
+      words.find { |word| word.start_with?(input) }
+    end
+
+    # Splits arguments into filters and extras. Words that are not filters
+    # become one search. A /regex/ may contain spaces.
+    #
+    # @return [Array(Array<Hash>, Hash)] filters (:name, :op, :value) and extras
+    def self.parse(args)
+      args = rejoin_regexes(args)
+      filters = []
+      extras = {}
+      search = []
+      args.each do |arg|
+        m = FILTER.match(arg)
+        name = m && (EXTRAS.find { |e| e == m[:name].downcase } || filter_name(m[:name]))
+        if m.nil?
+          search << arg
+        elsif name.nil?
+          abort_with("catalog: unknown filter #{m[:name]}, see ;catalog help")
+        elsif EXTRAS.include?(name)
+          extras[name.to_sym] = extra_value(name, m[:value])
+        else
+          filters << { name: name, op: m[:op], value: value(m[:value]) }
+        end
+      end
+      unless search.empty?
+        words = search.join(' ')
+        op = '='
+        op = '!=' if words.start_with?('!') && (words = words[1..])
+        regex = words.length > 1 && words.start_with?('/') && words.end_with?('/')
+        filters << { name: 'search', op: op, value: regex ? value(words) : words }
+      end
+      [filters, extras]
+    end
+
+    def self.rejoin_regexes(args)
+      args.each_with_object([]) do |arg, out|
+        if out.last&.match?(%r{(?:\A|=)/[^/]*\z}) && !out.last.end_with?('/')
+          out[-1] = "#{out.last} #{arg}"
+        else
+          out << arg
+        end
+      end
+    end
+
+    def self.filter_name(input)
+      input = input.downcase
+      FILTER_ALIASES[input] || FILTERS.find { |f| f.start_with?(input) }
+    end
+
+    # @return [String, Integer, Array<String>, Regexp]
+    def self.value(str)
+      str = str.delete_prefix('"').delete_suffix('"')
+      return Regexp.new(str[1..-2]) if str.length > 1 && str.start_with?('/') && str.end_with?('/')
+      return str.delete(',').to_i if str.match?(/\A\d[\d,]*\z/)
+      return str.split(/\s*\|\s*/) if str.include?('|')
+      return '' if str == "''"
+
+      str
+    end
+
+    def self.extra_value(name, str)
+      str = str.delete_prefix('"').delete_suffix('"')
+      case name
+      when 'limit' then str.to_i
+      when 'orderby'
+        order = str.gsub(/\s*-\s*(,|\z)/, ' desc\1').gsub(/\s*\+\s*(,|\z)/, ' asc\1')
+        abort_with("catalog: orderby takes output column names, e.g. orderby=\"path, qty-\"") unless order.match?(/\A[\w\s,]+\z/)
+        order
+      else str
+      end
+    end
+
+    def self.abort_with(message)
+      CatalogDB.say(message.delete_prefix('catalog: '), 'warn')
+      exit
+    end
+
+    def self.query(action, target, filters, extras, export: false)
+      action = 'export' if export && action == 'query'
+      abort_with("catalog: #{action} doesn't work with #{target}") unless Query.respond_to?("#{action}_#{query_target(target)}")
+      unknown = filters.map { |f| f[:name] } - ['search'] - Query::COLUMNS.fetch(query_target(target)).keys
+      abort_with("catalog: #{target} can't be filtered by #{unknown.join(', ')}") unless unknown.empty?
+
+      filters += [{ name: 'game', op: '=', value: XMLData.game }] unless filters.any? { |f| f[:name] == 'game' }
+      filters += [{ name: 'location_type', op: '=', value: target == 'inventory' ? 'inv' : 'locker' }] if %w[inventory locker].include?(target)
+      headers, rows = Query.run(Store.db, action, query_target(target), filters, extras)
+      return write_export(headers, rows, target, extras) if export
+
+      search = filters.find { |f| f[:name] == 'search' && f[:op] == '=' }
+      highlight = case search&.dig(:value)
+                  when Regexp then Regexp.new(search[:value].source, Regexp::IGNORECASE)
+                  when String then Regexp.new(search[:value].delete_prefix('=').split('*').map { |part| Regexp.escape(part) }.join('.*'), Regexp::IGNORECASE)
+                  end
+      Output.print(headers, rows, target, highlight: highlight)
+    end
+
+    def self.query_target(target)
+      %w[inventory locker].include?(target) ? 'item' : target
+    end
+
+    def self.write_export(headers, rows, target, extras)
+      abort_with("catalog: nothing to export from #{target}") if rows.empty?
+      format = extras[:format] || 'csv'
+      abort_with('catalog: format can be csv, txt or pipe') unless %w[csv txt pipe].include?(format)
+
+      dir = extras[:dir] || EXPORT_DIR
+      FileUtils.mkdir_p(dir)
+      file = File.join(dir, extras[:file] || "#{target}_#{Time.now.strftime('%Y-%m-%d_%H-%M-%S')}.#{format == 'csv' ? 'csv' : 'txt'}")
+      Output.export(headers, rows, file, format)
+      CatalogDB.say "exported #{rows.size} row#{'s' unless rows.size == 1} to #{file}"
+    end
+
+    def self.refresh(target)
+      now = Time.now.to_i
+      game = XMLData.game
+      account_name, subscription = Scan.account
+      account_id = Store.save_account(account_name, subscription, now)
+      fields = Scan.character.merge(account_id: account_id)
+      if %w[all character].include?(target)
+        fields[:locker] = subscription == 'premium' ? 'multi' : Scan.locker_info
+      end
+      character_id = Store.save_character(XMLData.name, game, fields, now)
+      owner = { character_id: character_id }
+      changes = Hash.new { |hash, key| hash[key] = Hash.new(0) }
+      record = ->(table, counts) { counts.each { |k, v| changes[table][k] += v } }
+      all = target == 'all'
+      free = subscription == 'f2p'
+
+      if !free && (target == 'lumnis' || (all && CatalogDB.setting('lumnis'))) && (lumnis = Scan.lumnis)
+        record.call(:lumnis, Store.save_row(:lumnis, character_id, lumnis, now))
+      end
+      if !free && (target == 'resource' || (all && CatalogDB.setting('resource'))) && (resource = Scan.resource)
+        # weekly resource starts over with the Lumnis week
+        resource[:weekly] = 0 if Store.db[:lumnis].where(character_id: character_id).get(:status) == 'restart'
+        record.call(:resource, Store.save_row(:resource, character_id, resource, now))
+      end
+      { silver: [:bank, %i[bank]], tickets: [:tickets, %i[source]], entries: [:entries, %i[event]],
+        gemstone: [:gemstones, %i[slot jewel property]] }.each do |table, (name, key)|
+        next unless all || target == name.to_s
+
+        rows = Scan.send(name)
+        next CatalogDB.say("no answer for #{name}, kept what was saved", 'warn') unless rows
+
+        record.call(table, Store.sync(table, owner, key, rows, now))
+        Scan.gem_rarities(rows) if table == :gemstone
+      end
+
+      item_owner = { account_id: account_id, character_id: character_id, game: game }
+      if %w[all item inventory].include?(target)
+        if (by_location = Scan.inventory)
+          by_location.each do |location_id, rows|
+            Store.fill_flags(item_owner.merge(location_id: location_id), rows)
+            record.call(:item, Store.sync(:item, item_owner.merge(location_id: location_id), Store::ITEM_KEY, rows, now))
+          end
+        else
+          CatalogDB.say('the game did not send your inventory, skipping it', 'warn')
+        end
+      end
+
+      if %w[all item locker].include?(target) && !(all && free)
+        lockers = if subscription == 'premium'
+                    Store::LOCATIONS.select { |id, type, _, _| type == 'locker' && id > LOCKER && id != FAMILY_VAULT }
+                                    .to_h { |id, _, name, _| [id, Scan.manifest(id, name)] }
+                  else
+                    { LOCKER => Scan.standard_locker }
+                  end
+        CatalogDB.say('go to your locker to update it', 'warn') if lockers[LOCKER].nil? && subscription != 'premium' && target == 'locker'
+        lockers.each do |location_id, rows|
+          record.call(:item, Store.sync(:item, item_owner.merge(location_id: location_id), Store::ITEM_KEY, rows, now)) if rows
+        end
+        unless free
+          vault = Scan.manifest(FAMILY_VAULT, 'family vault')
+          vault_owner = { account_id: account_id, character_id: nil, game: game, location_id: FAMILY_VAULT }
+          record.call(:item, Store.sync(:item, vault_owner, Store::ITEM_KEY, vault, now)) if vault
+        end
+      end
+
+      print_changes(changes)
+    end
+
+    def self.print_changes(changes)
+      changes = changes.select { |_table, counts| counts.values.any?(&:positive?) }
+      if changes.empty?
+        CatalogDB.say('up to date')
+        return
+      end
+      rows = changes.map { |table, counts| [table.to_s, counts[:inserted], counts[:updated], counts[:deleted]] }
+      Lich::Messaging.mono(Output.table(%i[table inserted updated deleted], rows, dates: []).join("\n"))
+    end
+
+    def self.delete(target, filters)
+      character = filters.find { |f| f[:name] == 'character' }
+      abort_with('catalog: say whose, e.g. ;catalog delete char=Name') unless character && character[:value].is_a?(String)
+
+      db = Store.db
+      game = filters.find { |f| f[:name] == 'game' }&.dig(:value) || XMLData.game
+      chars = db[:character].where(Sequel.like(:name, character[:value].tr('*', '%')), game: game)
+      names = chars.select_map(:name)
+      abort_with("catalog: no character matches #{character[:value]}") if names.empty?
+
+      ids = chars.select(:id)
+      case target
+      when 'all', 'character' then chars.delete
+      when 'bank' then db[:silver].where(character_id: ids).delete
+      when 'tickets', 'entries', 'lumnis', 'resource' then db[target.to_sym].where(character_id: ids).delete
+      when 'gemstones' then db[:gemstone].where(character_id: ids).delete
+      when 'item' then db[:item].where(character_id: ids).delete
+      when 'inventory', 'locker'
+        locations = db[:location].where(type: target == 'inventory' ? 'inv' : 'locker').select(:id)
+        db[:item].where(character_id: ids, location_id: locations).delete
+      end
+      CatalogDB.say "deleted #{target} for #{names.join(', ')}"
+    end
+
+    def self.reset(args)
+      abort_with("catalog: this empties the whole catalog. To go ahead: #{$clean_lich_char}catalog reset confirm") unless args[1] =~ /\Aconfirm\z/i
+      Store.close
+      FileUtils.rm_f(DB_FILE)
+      CatalogDB.say('catalog emptied')
+    end
+
+    def self.settings(args)
+      arg = args.join(' ')
+      if arg =~ /\A--settings\z/i
+        width = DEFAULT_SETTINGS.keys.map(&:length).max
+        lines = DEFAULT_SETTINGS.map do |name, (_default, description)|
+          value = CatalogDB.setting(name)
+          value = value.empty? ? '(none)' : value.join(', ') if value.is_a?(Array)
+          format("%-#{width}s  %-12s  %s", name, value, description)
+        end
+        return Lich::Messaging.mono(lines.join("\n"))
+      end
+
+      if (m = arg.match(/\A--(?<name>\w+)\s*[=: ]\s*(?<value>.+)\z/))
+        name = m[:name].downcase
+        default = DEFAULT_SETTINGS.dig(name, 0)
+        abort_with("catalog: no setting called #{name}") if default.nil? || default.is_a?(Array)
+        value = m[:value].strip
+        if [true, false].include?(default)
+          abort_with("catalog: #{name} takes on or off") unless value =~ /\A(?:on|off|true|false)\z/i
+          value = value =~ /\A(?:on|true)\z/i
+        end
+        Settings[name] = value
+        return CatalogDB.say("#{name} is now #{value}")
+      end
+
+      if (m = arg.match(/\A(?<op>[+-])(?<name>\w+)\s+(?<value>.+)\z/))
+        name = m[:name].downcase
+        abort_with("catalog: #{name} is not a list setting") unless DEFAULT_SETTINGS.dig(name, 0).is_a?(Array)
+        list = CatalogDB.setting(name)
+        value = m[:value].strip
+        Settings[name] = m[:op] == '+' ? (list + [value]).uniq : list - [value]
+        return CatalogDB.say("#{name} is now #{Settings[name].join(', ')}")
+      end
+
+      abort_with('catalog: try ;catalog --settings')
+    end
+
+    def self.menu
+      link = ->(args) { Lich::Messaging.make_cmd_link("#{$clean_lich_char}catalog #{args}", "#{$clean_lich_char}catalog #{args}") }
+      lines = [
+        'catalog examples (click one):',
+        "  #{link.call('')}                   update this character",
+        "  #{link.call('q char')}             your characters",
+        "  #{link.call('q bank')}             bank accounts",
+        "  #{link.call('sum bank')}           bank totals",
+        "  #{link.call('sum tickets')}        ticket totals",
+        "  #{link.call('q entries amount>0')} event entries",
+        "  #{link.call('q gemstones')}        gemstones",
+        "  #{link.call('sum gemstones')}      who has which gemstone property",
+        "  #{link.call('q inv type=gem')}     gems you are carrying",
+        "  #{link.call('q locker')}           everything in lockers",
+        "  #{link.call('type=jar status=empty')} empty jars",
+        "  #{link.call('sum type=gem')}       gems added up",
+        "  #{link.call('count')}              items per character and place",
+        "  #{link.call('q item path=*sack')}  anything in any sack"
+      ]
+      _respond lines
+    end
+  end
+end
+
+if Gem::Version.new(LICH_VERSION) < Gem::Version.new(CatalogDB::LICH_GEM_REQUIRES)
+  Lich::Messaging.msg 'error', "catalog needs Lich #{CatalogDB::LICH_GEM_REQUIRES} or newer. You are running #{LICH_VERSION}."
+  exit
+end
+
+unless XMLData.game =~ /^GS/
+  Lich::Messaging.msg 'error', 'catalog is for Gemstone IV.'
+  exit
+end
+
+before_dying { CatalogDB::Store.close }
+CatalogDB::CLI.run(Script.current.vars[1..] || [])
