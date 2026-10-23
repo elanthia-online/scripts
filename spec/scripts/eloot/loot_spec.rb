@@ -637,6 +637,7 @@ RSpec.describe 'ELoot disk-backed box routing' do
     sell.define_singleton_method(:dothistimeout) do |_command, _timeout, _match|
       'takes your box, totaling 150 silvers'
     end
+    sell.module_eval(extract_lic_method(source, 'pool_box_order', source_path: eloot_path))
     sell.module_eval(extract_lic_method(source, 'locksmith_pool', source_path: eloot_path))
 
     sell.locksmith_pool([])
@@ -3327,5 +3328,41 @@ RSpec.describe 'ELoot::Inventory.store_item into a container with stale contents
   it 'does not refresh while the item is still in hand' do
     expect(store(look_finds_item: true, in_hand: true)).to be false
     expect(sent.grep(/look in/)).to be_empty
+  end
+end
+
+# RSpec for ELoot::Sell.pool_box_order -- the drop-off order used by locksmith_pool.
+# v2.14.2 regression: a box already in hand was handed in on the first container box's
+# turn, then "Can't find" when its own turn came.
+RSpec.describe 'ELoot::Sell.pool_box_order' do
+  let(:order) do
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
+    body = extract_lic_method(File.read(path), 'pool_box_order', source_path: path)
+
+    Module.new { module_eval(body) }
+  end
+
+  let(:obj) { Struct.new(:id, :name, :type) }
+  let(:empty) { obj.new(nil, 'Empty', nil) }
+  let(:held_trunk) { obj.new('1', 'haon trunk', 'box') }
+  let(:sack_trunk) { obj.new('2', 'scarred maoral trunk', 'box') }
+  let(:weapon) { obj.new('3', 'drake falchion', 'weapon') }
+
+  it 'puts a box already in hand first' do
+    result = order.pool_box_order(held: [empty, held_trunk], found: [sack_trunk], passed: [held_trunk])
+
+    expect(result.map(&:id)).to eq(%w[1 2])
+  end
+
+  it 'ignores non-box items in hand' do
+    result = order.pool_box_order(held: [weapon, empty], found: [sack_trunk], passed: [])
+
+    expect(result.map(&:id)).to eq(%w[2])
+  end
+
+  it 'keeps container boxes ahead of passed-in boxes when nothing is held' do
+    result = order.pool_box_order(held: [empty, empty], found: [sack_trunk], passed: [held_trunk])
+
+    expect(result.map(&:id)).to eq(%w[2 1])
   end
 end
