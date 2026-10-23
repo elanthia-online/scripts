@@ -573,18 +573,24 @@ RSpec.describe 'ELoot disk-backed box routing' do
     expect(data.disk).to equal(disk_obj)
   end
 
-  it 'rescans boxes after the disk arrives at the locksmith pool' do
-    item_class = Struct.new(:id, :type, :name)
-    box = item_class.new('box-1', 'box', 'a waterlogged coffer')
-    empty = item_class.new(nil, '', 'Empty')
+  # Runs the real locksmith_pool against stubbed hands, containers and worker.
+  # `stashed` are the boxes find_boxes sees once the disk has arrived; only those can
+  # be dragged, like the game, where a box not in a container comes back "Get what?".
+  # Each give is recorded with the id of the box in the right hand at the time, and the
+  # confirmed give takes that box.
+  def run_pool(stashed:, passed: [], right: nil, left: nil)
+    box_obj = Struct.new(:id, :type, :name)
+    empty = box_obj.new(nil, '', 'Empty')
+    rec = Struct.new(:dragged, :gives, :find_boxes_calls).new([], [], 0)
 
     game_obj = Module.new
     game_obj.singleton_class.attr_accessor :right_hand, :left_hand
-    game_obj.right_hand = empty
-    game_obj.left_hand = empty
+    game_obj.right_hand = right || empty
+    game_obj.left_hand = left || empty
+
+    disk_ready = false
 
     inventory = Module.new
-    inventory.singleton_class.attr_accessor :dragged
     inventory.define_singleton_method(:free_hands) do |both: false|
       next unless both
 
@@ -592,8 +598,8 @@ RSpec.describe 'ELoot disk-backed box routing' do
       game_obj.left_hand = empty
     end
     inventory.define_singleton_method(:drag) do |item|
-      self.dragged = item
-      game_obj.right_hand = item
+      rec.dragged << item
+      game_obj.right_hand = item if disk_ready && stashed.include?(item)
     end
     inventory.define_singleton_method(:single_drag) { |_item| nil }
 
@@ -611,9 +617,6 @@ RSpec.describe 'ELoot disk-backed box routing' do
     )
 
     eloot = Module.new
-    eloot.singleton_class.attr_accessor :find_boxes_calls
-    eloot.find_boxes_calls = 0
-    disk_ready = false
     eloot.define_singleton_method(:data) { data }
     eloot.define_singleton_method(:f2p?) { false }
     eloot.define_singleton_method(:msg) { |**| nil }
@@ -624,8 +627,8 @@ RSpec.describe 'ELoot disk-backed box routing' do
     eloot.define_singleton_method(:wait_rt) { nil }
     eloot.define_singleton_method(:box_unphase) { |item| item }
     eloot.define_singleton_method(:find_boxes) do
-      self.find_boxes_calls += 1
-      disk_ready ? [box] : []
+      rec.find_boxes_calls += 1
+      disk_ready ? stashed : []
     end
 
     sell = Module.new
@@ -634,16 +637,47 @@ RSpec.describe 'ELoot disk-backed box routing' do
     sell.const_set(:GameObj, game_obj)
     sell.const_set(:Inventory, inventory)
     sell.const_set(:Loot, loot)
-    sell.define_singleton_method(:dothistimeout) do |_command, _timeout, _match|
+    sell.define_singleton_method(:fput) do |command|
+      next unless command == 'swap'
+
+      game_obj.right_hand, game_obj.left_hand = game_obj.left_hand, game_obj.right_hand
+    end
+    sell.define_singleton_method(:dothistimeout) do |command, _timeout, _match|
+      if command.end_with?('confirm')
+        game_obj.right_hand = empty
+      else
+        rec.gives << game_obj.right_hand.id
+      end
       'takes your box, totaling 150 silvers'
     end
     sell.module_eval(extract_lic_method(source, 'pool_box_order', source_path: eloot_path))
     sell.module_eval(extract_lic_method(source, 'locksmith_pool', source_path: eloot_path))
 
-    sell.locksmith_pool([])
+    sell.locksmith_pool(passed)
+    rec
+  end
 
-    expect(eloot.find_boxes_calls).to eq(1)
-    expect(inventory.dragged).to equal(box)
+  let(:box_class) { Struct.new(:id, :type, :name) }
+
+  it 'rescans boxes after the disk arrives at the locksmith pool' do
+    box = box_class.new('box-1', 'box', 'a waterlogged coffer')
+
+    rec = run_pool(stashed: [box])
+
+    expect(rec.find_boxes_calls).to eq(1)
+    expect(rec.dragged).to eq([box])
+  end
+
+  # v2.14.2: from a live log. The held haon trunk was handed in on the maoral trunk's
+  # turn, then its own turn failed to find it and gave with an empty hand.
+  it 'hands in a box already in hand on its own turn, then the stashed ones' do
+    held = box_class.new('haon', 'box', 'haon trunk')
+    stashed = box_class.new('maoral', 'box', 'scarred maoral trunk')
+
+    rec = run_pool(stashed: [stashed], passed: [held], left: held)
+
+    expect(rec.gives).to eq(%w[haon maoral])
+    expect(rec.dragged).to eq([stashed])
   end
 end
 
