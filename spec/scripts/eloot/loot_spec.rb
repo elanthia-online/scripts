@@ -89,7 +89,7 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
   let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
-  let(:item_class) { Struct.new(:id, :name) }
+  let(:item_class) { Struct.new(:id, :name, :noun) }
   let(:calls) { [] }
 
   # item name => Sell.check_items(items: [item]) result, so each context only has to
@@ -102,16 +102,54 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
   # Shops the current town hasn't got (ELoot.nearest_shop returns nil for these).
   let(:unavailable_shops) { [] }
 
+  # The box sits in the right hand; `hand` is whatever is in the left (at most one item).
+  # drag fills it unless the id is undraggable; a sale empties it unless the item is in
+  # unsold (appraise leaves it) or paid_in_note (a bond note replaces it).
+  let(:hand) { [] }
+  let(:undraggable) { [] }
+  let(:unsold) { [] }
+  let(:paid_in_note) { [] }
+  let(:wont_fit_back) { [] }
+  let(:notes_fit) { true }
+  let(:note) { item_class.new('note-1', 'a Northwatch bond note', 'note') }
+
   let(:harness) do
     recorder = calls
     routes = routing
     missing = unavailable_shops
+    left = hand
+    stuck = undraggable
+    kept = unsold
+    noted = paid_in_note
+    no_room = wont_fit_back
+    fits = notes_fit
+    bond = note
+    the_box = box
+    empty = item_class.new(nil, 'Empty')
+    settle = lambda do |item|
+      left.clear unless kept.include?(item.name)
+      left.replace([bond]) if noted.include?(item.name)
+    end
 
     mod = Module.new
     mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
+    mod.define_singleton_method(:in_hand?) { |item| item.id == the_box.id || left.any? { |h| h.id == item.id } }
+    mod.define_singleton_method(:get_command) do |cmd, _regex, **_kw|
+      recorder << [:put, cmd]
+      left.clear unless no_room.any? { |id| cmd.include?("##{id} ") }
+      []
+    end
+    data_obj = Object.new
+    data_obj.define_singleton_method(:put_regex) { /put/ }
+    mod.define_singleton_method(:data) { data_obj }
     # Mirrors ELoot.nearest_shop: nil when the town hasn't got the shop.
     mod.define_singleton_method(:nearest_shop) { |shop| missing.include?(shop) ? nil : "#{shop}-room" }
     mod.const_set(:ELoot, mod)
+
+    gameobj = Module.new
+    gameobj.define_singleton_method(:right_hand) { the_box }
+    gameobj.define_singleton_method(:left_hand) { left.first || empty }
+    mod.const_set(:GameObj, gameobj)
 
     room = Module.new
     current = Module.new
@@ -124,12 +162,26 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
     mod.const_set(:Room, room)
 
     inventory = Module.new
-    inventory.define_singleton_method(:drag) { |item| recorder << [:drag, item.name] }
+    inventory.define_singleton_method(:drag) do |item|
+      recorder << [:drag, item.name]
+      left.replace([item]) unless stuck.include?(item.id)
+    end
+    inventory.define_singleton_method(:single_drag) do |item, on_full: :pause|
+      recorder << [:single_drag, item.name, on_full]
+      left.clear if fits
+    end
     mod.const_set(:Inventory, inventory)
 
     mod.define_singleton_method(:check_items) { |items:| routes[items.first.name] || [] }
-    mod.define_singleton_method(:appraise) { |item, place, _data| recorder << [:appraise, item.name, place] }
-    mod.define_singleton_method(:sell_item) { |item, place, _data| recorder << [:sell_item, item.name, place] }
+    mod.define_singleton_method(:appraise) do |item, place, _data, stow: true|
+      recorder << [:appraise, item.name, place]
+      recorder << [:appraise_stowed] if stow
+      settle.call(item)
+    end
+    mod.define_singleton_method(:sell_item) do |item, place, _data|
+      recorder << [:sell_item, item.name, place]
+      settle.call(item)
+    end
     mod.const_set(:Sell, mod)
 
     mod.module_eval(extract_lic_method(source, 'sell_box_contents', source_path: eloot_path))
@@ -260,6 +312,85 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
       expect(calls).to be_empty
     end
   end
+
+  # The pool recovery could not put a stuck item back in the box, so it is sold
+  # straight out of hand rather than dragged (which would free the box's hand).
+  context 'an item already in hand' do
+    let(:orb) { item_class.new('1', 'a heavy quartz orb') }
+    let(:hand) { [orb] }
+    let(:routing) { { 'a heavy quartz orb' => ['gemshop'] } }
+
+    it 'sells it without dragging' do
+      harness.sell_box_contents(box, data, [orb])
+
+      expect(calls).to eq([[:go2, 'gemshop-room'], [:appraise, 'a heavy quartz orb', 'Gemshop']])
+    end
+  end
+
+  context 'an item that could not be picked up' do
+    let(:gone) { item_class.new('1', 'a gold ingot') }
+    let(:box_contents) { [gone] }
+    let(:undraggable) { ['1'] }
+    let(:routing) { { 'a gold ingot' => ['gemshop'] } }
+
+    it 'is not appraised' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls.map(&:first)).not_to include(:appraise)
+    end
+  end
+
+  # v2.14.2: an item over the appraisal limit was stowed into the full containers.
+  context 'an item that appraises above the limit' do
+    let(:plate) { item_class.new('1', 'some vultite full plate') }
+    let(:ring) { item_class.new('2', 'a gold ring') }
+    let(:box_contents) { [plate, ring] }
+    let(:unsold) { ['some vultite full plate'] }
+    let(:routing) { { 'some vultite full plate' => ['pawnshop'], 'a gold ring' => ['pawnshop'] } }
+
+    it 'goes back in the box instead of a container, and selling carries on' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).not_to include([:appraise_stowed])
+      expect(calls).to include([:put, 'put #1 in #box-1'], [:appraise, 'a gold ring', 'Pawnshop'])
+    end
+
+    context 'and will not fit back in the box' do
+      let(:wont_fit_back) { ['1'] }
+
+      it 'stops before the next drag can free the box hand' do
+        harness.sell_box_contents(box, data)
+
+        expect(calls).not_to include([:drag, 'a gold ring'])
+      end
+    end
+  end
+
+  # v2.14.2: a pawnshop short on silver pays with a bond note, left in hand.
+  context 'a sale paid with a bond note' do
+    let(:staff) { item_class.new('1', 'an orase runestaff') }
+    let(:dress) { item_class.new('2', 'a pink dress') }
+    let(:box_contents) { [staff, dress] }
+    let(:paid_in_note) { ['an orase runestaff'] }
+    let(:routing) { { 'an orase runestaff' => ['pawnshop'], 'a pink dress' => ['pawnshop'] } }
+
+    it 'stows the note, never putting it in the box' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).to include([:single_drag, 'a Northwatch bond note', :signal], [:drag, 'a pink dress'])
+      expect(calls).not_to include([:put, 'put #note-1 in #box-1'])
+    end
+
+    context 'when the note will not fit anywhere' do
+      let(:notes_fit) { false }
+
+      it 'stops selling with the note still in hand' do
+        harness.sell_box_contents(box, data)
+
+        expect(calls).not_to include([:drag, 'a pink dress'])
+      end
+    end
+  end
 end
 
 # RSpec for ELoot::Loot.pool_direct_sell_recovery -- the sell-in-place recovery itself.
@@ -272,7 +403,7 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
   let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
-  let(:hand_class) { Struct.new(:id, :name) }
+  let(:hand_class) { Struct.new(:id, :name, :noun) }
   let(:empty_hand) { hand_class.new(nil, 'Empty') }
   let(:box_contents) { [] }
   let(:box) { Struct.new(:id, :name, :contents).new('box-1', 'a strongbox', box_contents) }
@@ -282,6 +413,7 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
   # sell_box_contents removes whatever it sold from the box; the spec controls the
   # outcome directly by handing sell_box_contents a block that mutates box_contents.
   let(:drains_box) { true }
+  let(:right_hand) { empty_hand }
 
   let(:harness) do
     recorder = calls
@@ -289,6 +421,7 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
     contents = box_contents
     the_box = box
     empty = empty_hand
+    right = right_hand
 
     mod = Module.new
     mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
@@ -309,7 +442,7 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
     mod.const_set(:Room, room)
 
     gameobj = Module.new
-    gameobj.define_singleton_method(:right_hand) { empty }
+    gameobj.define_singleton_method(:right_hand) { right }
     gameobj.define_singleton_method(:left_hand) { empty }
     mod.const_set(:GameObj, gameobj)
 
@@ -324,8 +457,10 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
     script.define_singleton_method(:current) { current_script }
     mod.const_set(:Script, script)
 
-    mod.define_singleton_method(:sell_box_contents) do |b, _data|
-      recorder << [:sell_box_contents, b.name]
+    mod.define_singleton_method(:sell_box_contents) do |b, _data, items = nil|
+      recorder << (items ? [:sell_box_contents, b.name, items.map(&:name)] : [:sell_box_contents, b.name])
+      next if items
+
       contents.clear if drains
     end
     mod.define_singleton_method(:pool_sell_recovery) do |b, location, _data|
@@ -381,6 +516,28 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
       expect(result).to eq(:recovered)
       expect(calls).to include([:pool_sell_recovery, 'a strongbox', 'Icemule Trace'])
       expect(calls.map(&:first)).not_to include(:save_trash_box, :sell)
+    end
+  end
+
+  # v2.14.2: the stuck item would not go back in the box, leaving both hands full.
+  context 'the stuck item is still in hand after trying to return it' do
+    let(:right_hand) { hand_class.new('7', 'a heavy quartz orb') }
+
+    it 'sells the stuck item before the rest of the box' do
+      harness.pool_direct_sell_recovery(box, 'Icemule Trace', data)
+
+      sells = calls.select { |c| c.first == :sell_box_contents }
+      expect(sells).to eq([[:sell_box_contents, 'a strongbox', ['a heavy quartz orb']], [:sell_box_contents, 'a strongbox']])
+    end
+  end
+
+  context 'a bond note is in hand' do
+    let(:right_hand) { hand_class.new('8', 'a Northwatch bond note', 'note') }
+
+    it 'is not put in the box' do
+      harness.pool_direct_sell_recovery(box, 'Icemule Trace', data)
+
+      expect(calls).not_to include(a_collection_including(:get_command, 'put #8 in #box-1'))
     end
   end
 end
