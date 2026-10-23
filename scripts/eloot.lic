@@ -15,10 +15,18 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.22.0
-           version: 2.14.1
+           version: 2.14.2
 
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.14.2 (2026-10-22)
+    - fix: after unpausing eloot when your containers were full, it no longer keeps pausing
+      on every item until you restart it
+    - fix: the locksmith pool could pause with full containers when an item taken out of a
+      box wouldn't fit back in it, was worth more than your appraisal limit, or the
+      pawnshop paid with a bond note
+    - fix: a box already in hand at the locksmith pool could be handed in out of turn,
+      followed by failed attempts to hand it in again
   v2.14.1 (2026-10-20)
     - fix: selling at the furrier no longer sells skins (or your whole container) when skin is not a selling type
   v2.14.0 (2026-10-13)
@@ -4314,6 +4322,12 @@ module ELoot # Inventory methods
           ELoot.msg(type: "info", text: " ;unpause #{Script.current.name} after addressing to continue!")
 
           Script.current.pause
+
+          # The player made space by hand, so the full-container tracking is stale. Without
+          # this every later store skips those containers and pauses again immediately.
+          ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0], "unpause"] }
+          ELoot.reset_disk_full
+          return Inventory.single_drag(item, phase_thing) if ELoot.in_hand?(item)
         end
       end
     end
@@ -5947,8 +5961,8 @@ module ELoot # Room looting
     # @param box [GameObj] the box being looted, held in one hand
     # @param data [Hash] silver breakdown ledger, forwarded to appraise/sell_item
     # @return [void]
-    def self.sell_box_contents(box, data)
-      routed = box.contents.to_a.filter_map do |item|
+    def self.sell_box_contents(box, data, items = box.contents.to_a)
+      routed = items.filter_map do |item|
         next if $sell_ignore.include?(item.id)
 
         locations = Sell.check_items(items: [item])
@@ -5973,19 +5987,35 @@ module ELoot # Room looting
         ELoot.go2(room_id)
 
         items_here.each do |item, shop|
-          next unless box.contents.to_a.include?(item)
           next if $sell_ignore.include?(item.id)
 
-          Inventory.drag(item)
+          unless ELoot.in_hand?(item)
+            next unless box.contents.to_a.include?(item)
+            Inventory.drag(item)
+            next unless ELoot.in_hand?(item)
+          end
 
           case shop
           when "gemshop"
-            Sell.appraise(item, "Gemshop", data)
+            Sell.appraise(item, "Gemshop", data, stow: false)
           when "pawnshop"
-            Sell.appraise(item, "Pawnshop", data)
+            Sell.appraise(item, "Pawnshop", data, stow: false)
           else
             Sell.sell_item(item, shop, data)
           end
+
+          # Containers are full, so whatever is left in hand (an unsold item, a bond note)
+          # can't be stowed the usual way, and the next drag would free the box's hand
+          # instead. Unsold items go back in the box; notes never do, since it gets trashed.
+          leftover = [GameObj.right_hand, GameObj.left_hand].find { |held| held.id && held.id != box.id }
+          next unless leftover
+
+          if leftover.noun =~ /\b(?:note|scrip|chit)\b/
+            Inventory.single_drag(leftover, on_full: :signal)
+          else
+            ELoot.get_command("put ##{leftover.id} in ##{box.id}", ELoot.data.put_regex, silent: true, quiet: true)
+          end
+          return nil if ELoot.in_hand?(leftover)
         end
       end
     end
@@ -6010,12 +6040,17 @@ module ELoot # Room looting
       [GameObj.right_hand, GameObj.left_hand].each do |held|
         next if held.nil? || held.name == "Empty" || held.id.nil?
         next if held.id == box.id
+        next if held.noun =~ /\b(?:note|scrip|chit)\b/ # never into a box that gets trashed
         ELoot.msg(type: "debug", text: "pool_direct_sell_recovery: returning #{held.name} to box before selling")
         ELoot.get_command("put ##{held.id} in ##{box.id}", ELoot.data.put_regex, silent: true, quiet: true)
       end
 
       pool_room = Room.current.id
-      Loot.sell_box_contents(box, data)
+      # Anything still in hand would not go back in the box. Sell it first, otherwise
+      # freeing a hand for the box's items would try to stow the box itself and pause.
+      stray = [GameObj.right_hand, GameObj.left_hand].find { |held| held.id && held.id != box.id }
+      Loot.sell_box_contents(box, data, [stray]) if stray
+      Loot.sell_box_contents(box, data) unless stray && ELoot.in_hand?(stray)
 
       ELoot.go2(pool_room)
       Inventory.drag(box) unless ELoot.in_hand?(box)
@@ -6055,6 +6090,7 @@ module ELoot # Room looting
       [GameObj.right_hand, GameObj.left_hand].each do |held|
         next if held.nil? || held.name == "Empty" || held.id.nil?
         next if held.id == box.id
+        next if held.noun =~ /\b(?:note|scrip|chit)\b/ # never into a box that gets trashed
         ELoot.msg(type: "debug", text: "pool_sell_recovery: returning #{held.name} to box before selling")
         ELoot.get_command("put ##{held.id} in ##{box.id}", ELoot.data.put_regex, silent: true, quiet: true)
       end
@@ -6066,7 +6102,7 @@ module ELoot # Room looting
         ELoot.msg(type: "info", text: " Could not set the box on a disk. Pausing to handle it yourself.")
         ELoot.msg(type: "info", text: " ;unpause #{Script.current.name} after addressing to continue!")
         Script.current.pause
-        ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0]] }
+        ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0], "unpause"] }
         Inventory.drag(box) unless ELoot.in_hand?(box)
         ELoot.msg(type: "debug", text: "pool_sell_recovery: resumed after manual pause, re-looting box")
         Loot.box_loot(box, location, data, sell_recovered: true)
@@ -6478,7 +6514,7 @@ module ELoot # Sells the loot
       { raw: raw, amount: raw.delete(',').to_i }
     end
 
-    def self.appraise(item, location, _data = nil, skip_jewelry_guard: false, note: nil)
+    def self.appraise(item, location, _data = nil, skip_jewelry_guard: false, note: nil, stow: true)
       return if item.type =~ /jewelry/ && location == "Pawnshop" && !skip_jewelry_guard
 
       amount = 0
@@ -6530,7 +6566,9 @@ module ELoot # Sells the loot
           (ELoot.data.pawn_recheck ||= []) << item
         end
 
-        if container.to_s.empty?
+        if !stow
+          nil
+        elsif container.to_s.empty?
           Inventory.single_drag(item)
         else
           Inventory.store_item(container, item)
@@ -6541,10 +6579,10 @@ module ELoot # Sells the loot
         # sell attempt there instead of leaving it stuck in your loot forever.
         (ELoot.data.jewelry_wrong_shop ||= []) << item if item.sellable.include?("pawnshop")
 
-        Inventory.single_drag(item)
+        Inventory.single_drag(item) if stow
       elsif amount.positive? && amount <= limit.to_i
         Sell.sell_item(item, location, ELoot.data.silver_breakdown)
-      else
+      elsif stow
         Inventory.single_drag(item)
       end
     end
@@ -7887,6 +7925,17 @@ module ELoot # Sells the loot
       Loot.box_loot(box, "Town Locksmith", ELoot.data.silver_breakdown)
     end
 
+    # Order boxes for a locksmith pool drop-off. A box already in hand goes first;
+    # otherwise the drop-off loop hands it in on another box's turn, then fails to find
+    # it when its own turn comes. Pure (all state passed in) so it can be specced.
+    # @param held [Array<GameObj>] both hands
+    # @param found [Array<GameObj>] boxes found in containers
+    # @param passed [Array<GameObj>] boxes handed to locksmith_pool
+    # @return [Array<GameObj>]
+    def self.pool_box_order(held:, found:, passed:)
+      (held.select { |hand| hand.type =~ /box/ } + found + passed).uniq(&:id)
+    end
+
     def self.locksmith_pool(boxes, deposit = false)
       return if ELoot.f2p?
 
@@ -7921,7 +7970,7 @@ module ELoot # Sells the loot
 
       Inventory.free_hands(both: true) unless [GameObj.right_hand, GameObj.left_hand].find { |hand| hand.type =~ /box/ }
       ELoot.wait_for_disk
-      boxes = (ELoot.find_boxes + boxes).uniq { |box| box.id }
+      boxes = Sell.pool_box_order(held: [GameObj.right_hand, GameObj.left_hand], found: ELoot.find_boxes, passed: boxes)
 
       boxes.each do |box|
         Inventory.drag(box) unless [GameObj.right_hand, GameObj.left_hand].find { |hand| hand.type =~ /box/ }
