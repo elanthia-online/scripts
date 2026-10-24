@@ -1683,3 +1683,310 @@ RSpec.describe 'bigshot once/room command registry' do
     expect(bs.COMMANDS_REGISTRY.keys).to eq([123])
   end
 end
+
+# cast_signs walks the "signs" setting. Entries can carry extra spell options
+# after the number ("520 fire", "605 evoke"); those go out through cast_spell
+# as an incant. Group evokes need lore ranks, fall back to a plain cast when
+# solo, and spells with a group cooldown evoke while any member is ready
+# rather than while the spell is down on the caster.
+module BigshotCastSignsSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  CAST_SIGNS_SRC = extract(/^  def cast_signs\(single_cast = false\).*?^  end$/m, 'cast_signs')
+  CAST_SPELL_SRC = extract(/^  def cast_spell\(.*?^  end$/m, 'cast_spell')
+
+  HINDRANCE = '[Spell Hindrance for Robe is 5% with current Lore ranks.]'
+
+  class Harness
+    module Char
+      class << self
+        attr_accessor :mana
+      end
+    end
+
+    module Stats
+      class << self
+        attr_accessor :prof, :level
+      end
+    end
+
+    module Skills
+      class << self
+        attr_accessor :slblessings, :elair
+      end
+    end
+
+    module Group
+      class << self
+        attr_accessor :members, :ready
+
+        # Names a group casting would reach now; defaults to every member.
+        def spell_cooldown_ready(spell)
+          (ready || {}).fetch(spell.num) { members }
+        end
+      end
+    end
+
+    module Effects
+      class Registry
+        attr_accessor :names
+
+        def active?(name)
+          (names || []).include?(name)
+        end
+      end
+
+      Cooldowns = Registry.new
+      Buffs = Registry.new
+    end
+
+    # Spell double: records each cast call and spends the mana, so the
+    # hindrance retry loop sees mana drop the way it does in game.
+    class Spell
+      class << self
+        def book
+          @book ||= {}
+        end
+
+        def [](num)
+          book[num.to_i] ||= new(num.to_i)
+        end
+      end
+
+      attr_accessor :num, :name, :known, :active, :mana_cost, :affordable, :group_cooldown, :last_cast, :results
+      attr_reader :calls
+
+      def initialize(num)
+        @num = num
+        @name = "Spell #{num}"
+        @known = true
+        @active = false
+        @mana_cost = 5
+        @affordable = true
+        @last_cast = Time.at(0)
+        @calls = []
+        @results = []
+      end
+
+      def known? = known
+      def active? = active
+      def affordable? = affordable
+
+      def cast(*args)
+        record(:cast, *args)
+      end
+
+      def force_incant(extra = nil)
+        record(:force_incant, extra)
+      end
+
+      private
+
+      def record(*call)
+        @calls << call
+        Char.mana -= mana_cost
+        results.shift || 'You gesture.'
+      end
+    end
+
+    attr_accessor :SIGNS, :bard_renewal_cost
+
+    def initialize(signs)
+      @SIGNS = signs
+      @DEBUG_COMMANDS = false
+      @CHECK_FAVOR = false
+      @USE_WRACKING = false
+      @bard_renewal_cost = 0
+    end
+
+    def debug_msg(*); end
+    def wrack; end
+
+    def dead?
+      false
+    end
+
+    def bard_renewal
+      @bard_renewal_cost
+    end
+
+    class_eval(CAST_SPELL_SRC)
+    class_eval(CAST_SIGNS_SRC)
+  end
+end
+
+RSpec.describe 'bigshot cast_signs' do
+  let(:h) { BigshotCastSignsSpec::Harness }
+
+  before do
+    h::Spell.book.clear
+    h::Char.mana = 100
+    h::Stats.prof = 'Cleric'
+    h::Skills.slblessings = 0
+    h::Skills.elair = 0
+    h::Group.members = []
+    h::Group.ready = nil
+    h::Effects::Cooldowns.names = []
+  end
+
+  def cast_signs(*signs, single_cast: false)
+    h.new(signs).cast_signs(single_cast)
+  end
+
+  def calls(num)
+    h::Spell[num].calls
+  end
+
+  def group!(*names)
+    h::Group.members = names
+  end
+
+  context 'with a plain spell number' do
+    it 'casts it with no arguments, as before' do
+      cast_signs('9903')
+      expect(calls(9903)).to eq([[:cast]])
+    end
+
+    it 'skips a spell that is already active' do
+      h::Spell[9903].active = true
+      cast_signs('9903')
+      expect(calls(9903)).to be_empty
+    end
+
+    it 'stops after the first cast with single_cast' do
+      cast_signs('9903', '9904', single_cast: true)
+      expect(calls(9903)).to eq([[:cast]])
+      expect(calls(9904)).to be_empty
+    end
+  end
+
+  context 'with extra spell options' do
+    it 'incants the spell with them' do
+      cast_signs('520 fire')
+      expect(calls(520)).to eq([[:force_incant, 'fire']])
+    end
+
+    it 'applies the 515 mana check to the parsed spell number' do
+      h::Spell[597].active = true
+      h::Spell[520].mana_cost = 10
+      h::Char.mana = 12
+      cast_signs('520 fire')
+      expect(calls(520)).to be_empty
+    end
+  end
+
+  describe 'Barkskin (605) evoke' do
+    before { h::Skills.slblessings = 50 }
+
+    it 'evokes for the group with 50 SL:Blessings ranks' do
+      group!('Grhim')
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:force_incant, 'evoke']])
+    end
+
+    it 'plain-casts when solo' do
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:cast]])
+    end
+
+    it 'plain-casts when short on ranks' do
+      group!('Grhim')
+      h::Skills.slblessings = 49
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:cast]])
+    end
+
+    it 'skips the evoke under 15 mana' do
+      group!('Grhim')
+      h::Char.mana = 14
+      cast_signs('605 evoke')
+      expect(calls(605)).to be_empty
+    end
+
+    it 'skips while Barkskin is on cooldown' do
+      group!('Grhim')
+      h::Effects::Cooldowns.names = ['Barkskin']
+      cast_signs('605 evoke')
+      expect(calls(605)).to be_empty
+    end
+  end
+
+  describe 'group evokes with a group cooldown (211, 215, 219, 506)' do
+    {
+      211 => [:slblessings, 25],
+      215 => [:slblessings, 35],
+      219 => [:slblessings, 50],
+      506 => [:elair, 50]
+    }.each do |num, (lore, ranks)|
+      context "#{num} evoke" do
+        before do
+          h::Spell[num].group_cooldown = 180
+          h::Spell[num].active = true # our own long self-cast is up
+          h::Skills.public_send("#{lore}=", ranks)
+          group!('Grhim', 'Dicate')
+        end
+
+        it 'evokes while a member is off cooldown, even with our own self-cast up' do
+          h::Group.ready = { num => ['Dicate'] }
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to eq([[:force_incant, 'evoke']])
+        end
+
+        it 'waits while every member is on cooldown' do
+          h::Group.ready = { num => [] }
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to be_empty
+        end
+
+        it "plain-casts below #{ranks} ranks once our own cast is down" do
+          h::Skills.public_send("#{lore}=", ranks - 1)
+          h::Spell[num].active = false
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to eq([[:cast]])
+        end
+      end
+    end
+
+    it 'checks EL:Air, not SL:Blessings, for 506' do
+      h::Spell[506].group_cooldown = 240
+      h::Skills.slblessings = 100
+      group!('Grhim')
+      cast_signs('506 evoke')
+      expect(calls(506)).to eq([[:cast]])
+    end
+
+    it 'still skips 211 while we are on our own Bravery cooldown' do
+      h::Spell[211].group_cooldown = 180
+      h::Spell[211].name = 'Bravery'
+      h::Effects::Cooldowns.names = ['Bravery']
+      h::Skills.slblessings = 25
+      group!('Grhim')
+      cast_signs('211 evoke')
+      expect(calls(211)).to be_empty
+    end
+  end
+
+  describe 'hindrance retries' do
+    before { h::Spell[9903].results = [BigshotCastSignsSpec::HINDRANCE] * 5 }
+
+    it 'retries up to 3 times' do
+      cast_signs('9903')
+      expect(calls(9903).size).to eq(3)
+    end
+
+    it 'stops once mana would dip into the Bard song renewal reserve' do
+      h::Stats.prof = 'Bard'
+      h::Char.mana = 30
+      bs = h.new(['9903'])
+      bs.bard_renewal_cost = 20
+      bs.cast_signs
+      # 30 -> 25 (still covers 20 + 5), retry -> 20, below the reserve: stop
+      expect(calls(9903).size).to eq(2)
+    end
+  end
+end
