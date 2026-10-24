@@ -1908,6 +1908,15 @@ RSpec.describe 'bigshot cast_signs' do
       expect(calls(605)).to be_empty
     end
 
+    it 'stops retrying a hindered evoke below 15 mana, not 5' do
+      group!('Grhim')
+      h::Char.mana = 20
+      h::Spell[605].results = [BigshotCastSignsSpec::HINDRANCE] * 5
+      cast_signs('605 evoke')
+      # 20 -> 15 (still covers 15), retry -> 10, short for an evoke: stop
+      expect(calls(605).size).to eq(2)
+    end
+
     it 'skips while Barkskin is on cooldown' do
       group!('Grhim')
       h::Effects::Cooldowns.names = ['Barkskin']
