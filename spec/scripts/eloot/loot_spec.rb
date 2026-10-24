@@ -2085,10 +2085,18 @@ RSpec.describe 'ELoot::Sell.appraise' do
 
   let(:calls) { [] }
 
+  # '' means no appraisal container is set. When one is, store_item succeeds (the item
+  # leaves the hand) unless appraisal_container_full.
+  let(:appraisal_container) { '' }
+  let(:appraisal_container_full) { false }
+
   let(:harness) do
     recorder = calls
     reply = response
     data_obj = data
+    container = appraisal_container
+    container_full = appraisal_container_full
+    in_hand = [true]
 
     mod = Module.new
     mod.define_singleton_method(:get_command) do |command, _regex, **kw|
@@ -2098,15 +2106,23 @@ RSpec.describe 'ELoot::Sell.appraise' do
     mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
     mod.define_singleton_method(:ensure_items) { |**kw| recorder << [:ensure_items, kw] }
     mod.define_singleton_method(:data) { data_obj }
+    mod.define_singleton_method(:in_hand?) { |_item| in_hand.first }
     mod.const_set(:ELoot, mod)
 
     stow_list = Module.new
-    stow_list.define_singleton_method(:stow_list) { Hash.new('') }
+    stow_list.define_singleton_method(:stow_list) { Hash.new('').merge(appraisal_container: container) }
     mod.const_set(:StowList, stow_list)
 
     inventory = Module.new
-    inventory.define_singleton_method(:single_drag) { |item| recorder << [:single_drag, item.name] }
-    inventory.define_singleton_method(:store_item) { |container, item| recorder << [:store_item, container, item.name] }
+    inventory.define_singleton_method(:single_drag) do |item|
+      recorder << [:single_drag, item.name]
+      in_hand[0] = false
+    end
+    inventory.define_singleton_method(:store_item) do |bag, item|
+      recorder << [:store_item, bag, item.name]
+      in_hand[0] = container_full
+      !container_full
+    end
     mod.const_set(:Inventory, inventory)
 
     mod.module_eval(extract_lic_method(source, 'parse_appraisal', source_path: eloot_path))
@@ -2185,6 +2201,86 @@ RSpec.describe 'ELoot::Sell.appraise' do
       harness.appraise(necklace, 'Pawnshop', skip_jewelry_guard: true, note: 'gemshop declined (not jewelry), over pawnshop limit')
 
       expect(data.over_max.first[:note]).to eq('gemshop declined (not jewelry), over pawnshop limit')
+    end
+  end
+
+  # v2.14.2: the locksmith pool recovery appraises with stow: false because its regular
+  # bags are full. An item it doesn't sell must not be stowed there, but the appraisal
+  # container is a separate bag and is still tried.
+  context 'with stow: false (locksmith pool recovery)' do
+    let(:plate) { item_class.new('1', 'some vultite full plate', 'armor', 'gemshop,pawnshop') }
+
+    context 'an over-limit item and an appraisal container with room' do
+      let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+      let(:appraisal_container) { 'leather satchel' }
+
+      it 'stores it in the appraisal container and reports it as stowed there' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(calls).to include([:store_item, 'leather satchel', 'some vultite full plate'])
+        expect(calls.map(&:first)).not_to include(:single_drag)
+        expect(data.over_max.first[:stowed]).to eq('leather satchel')
+      end
+    end
+
+    context 'an over-limit item and a full appraisal container' do
+      let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+      let(:appraisal_container) { 'leather satchel' }
+      let(:appraisal_container_full) { true }
+
+      it 'leaves it in hand without claiming it was stowed' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(calls.map(&:first)).not_to include(:single_drag)
+        expect(data.over_max.first).not_to have_key(:stowed)
+      end
+    end
+
+    context 'an over-limit item with no appraisal container' do
+      let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+
+      it 'leaves it in hand' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(calls.map(&:first)).not_to include(:single_drag, :store_item)
+        expect(data.over_max.first).not_to have_key(:stowed)
+      end
+    end
+
+    context 'the gemshop refuses it as too valuable, with pawn recheck on' do
+      let(:response) { 'The jeweler says, "I\'m not buying anything this valuable today."' }
+      let(:settings) { { sell_appraise_gemshop: 14_999, sell_appraise_pawnshop: 4_999, sell_pawn_recheck: true } }
+
+      it 'does not queue it for the recheck while it is going back in the box' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(data.pawn_recheck).to be_empty
+      end
+    end
+
+    context 'the gemshop says it is not its specialty' do
+      let(:response) { 'The jeweler Etaenia says, "That\'s not quite my field, Renian.  I only deal in gems and jewelry."' }
+
+      it 'neither stows it nor queues it for the pawnshop retry' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(calls.map(&:first)).not_to include(:single_drag)
+        expect(data.jewelry_wrong_shop).to be_empty
+      end
+    end
+  end
+
+  # The same over-limit item through the normal sell trip (stow: true).
+  context 'an over-limit item when the appraisal container is full' do
+    let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+    let(:appraisal_container) { 'leather satchel' }
+    let(:appraisal_container_full) { true }
+    let(:plate) { item_class.new('1', 'some vultite full plate', 'armor', 'gemshop,pawnshop') }
+
+    it 'does not report it as stowed there' do
+      harness.appraise(plate, 'Gemshop')
+
+      expect(data.over_max.first).not_to have_key(:stowed)
     end
   end
 end
@@ -3272,6 +3368,115 @@ RSpec.describe 'ELoot::Inventory.single_drag while stunned' do
 
   it 'lets an error from store_item through instead of retrying it forever' do
     expect { harness_for(stunned_checks: 0, store_result: :raise).single_drag(item) }.to raise_error('boom')
+  end
+end
+
+# v2.14.2: after a manual ;unpause, sacks_full still listed every bag as full, so each
+# later item skipped them all and paused again without a store attempt. Runs the real
+# single_drag; the player frees space while paused (after `frees_after` pauses).
+RSpec.describe 'ELoot::Inventory.single_drag pause and unpause' do
+  let(:bag_class) { Struct.new(:name) }
+  let(:item_class) { Struct.new(:name, :type, :id) }
+  let(:backpack) { bag_class.new('backpack') }
+  let(:ruby) { item_class.new('ruby', 'gem', 'id-ruby') }
+  let(:pearl) { item_class.new('pearl', 'gem', 'id-pearl') }
+  let(:log) { { stored: [], attempts: [], pauses: 0 } }
+
+  def harness_for(frees_after:, held: [])
+    log = self.log
+    bag = backpack
+    space = [false]
+    data = Struct.new(:sacks_full).new({ 'last cleared' => ['earlier', 1, 'start'] })
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |**| nil }
+    eloot.define_singleton_method(:box_phase) { |_item| nil }
+    eloot.define_singleton_method(:data) { data }
+    eloot.define_singleton_method(:refuse_room_operation!) { |_reason| nil }
+    eloot.define_singleton_method(:reset_disk_full) { nil }
+    eloot.define_singleton_method(:in_hand?) { |item| held.include?(item) }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { default: bag } }
+
+    room = Module.new
+    current_room = Struct.new(:id, :tags).new(2400, ['town'])
+    room.define_singleton_method(:current) { current_room }
+
+    game_obj = Module.new
+    empty = item_class.new('Empty', nil, nil)
+    game_obj.define_singleton_method(:right_hand) { empty }
+    game_obj.define_singleton_method(:left_hand) { empty }
+
+    script = Module.new
+    current_script = Object.new
+    current_script.define_singleton_method(:name) { 'eloot' }
+    current_script.define_singleton_method(:vars) { ['sell'] }
+    current_script.define_singleton_method(:pause) do
+      log[:pauses] += 1
+      space[0] = true if log[:pauses] >= frees_after
+    end
+    script.define_singleton_method(:current) { current_script }
+
+    # Mirrors store_item: a "won't fit" marks the bag full in sacks_full.
+    mod = Module.new
+    mod.define_singleton_method(:single_drag_box) { |_item| false }
+    mod.define_singleton_method(:store_item) do |target, thing|
+      log[:attempts] << thing.name
+      unless space[0]
+        data.sacks_full[target.name] = ['now', 2400, thing.name]
+        next false
+      end
+
+      held.delete(thing)
+      log[:stored] << thing.name
+      true
+    end
+    mod.define_singleton_method(:stunned?) { false }
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Room, room)
+    mod.const_set(:GameObj, game_obj)
+    mod.const_set(:Script, script)
+    mod.const_set(:Inventory, mod)
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
+    mod.module_eval(extract_lic_method(File.read(path), 'single_drag', source_path: path))
+    [mod, data]
+  end
+
+  it 'retries the item after the unpause, then stores the next item without pausing' do
+    inventory, data = harness_for(frees_after: 1, held: [ruby, pearl])
+
+    inventory.single_drag(ruby)
+    inventory.single_drag(pearl)
+
+    expect(log[:pauses]).to eq(1)
+    expect(log[:stored]).to eq(%w[ruby pearl])
+    expect(data.sacks_full['last cleared'].last).to eq('unpause')
+  end
+
+  it 'pauses once per unpause while containers stay full, and stops once space appears' do
+    inventory, = harness_for(frees_after: 2, held: [ruby])
+
+    inventory.single_drag(ruby)
+
+    expect(log[:pauses]).to eq(2)
+    expect(log[:stored]).to eq(%w[ruby])
+  end
+
+  it 'does not retry an item the player already put away' do
+    inventory, = harness_for(frees_after: 1, held: [])
+
+    inventory.single_drag(ruby)
+
+    expect(log[:attempts]).to eq(%w[ruby])
+  end
+
+  it 'never pauses with on_full: :signal' do
+    inventory, = harness_for(frees_after: 1, held: [ruby])
+
+    expect(inventory.single_drag(ruby, on_full: :signal)).to eq(:full)
+    expect(log[:pauses]).to eq(0)
   end
 end
 
