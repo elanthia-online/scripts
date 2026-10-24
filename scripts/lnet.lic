@@ -8,9 +8,13 @@
       game: any
       tags: core
   required: Lich > 5.0.1
-   version: 1.15
+   version: 1.16
 
   changelog:
+    1.16 (2026-10-25):
+      Only unmarshal <data> payloads made of plain values (no arbitrary objects)
+      Escape LNet names/channels in XML output, strip control codes and line breaks
+      Stop sending each chat line to scripts twice on Wizard/Avalon
     1.15 (2026-03-29):
       Harden ssl criteria and set Timeout with rescue
     1.14 (2025-09-19):
@@ -394,6 +398,156 @@ class LNet
     @@last_send = Time.now
   end
 
+  # <data> payloads come from the server and from other players' clients, and
+  # Marshal.load will instantiate any class and run its marshal_load/_load
+  # hooks. Walk the stream first and only hand it to Marshal.load when every
+  # object in it is nil, true, false, an Integer, Float, String, Symbol, Array
+  # or Hash -- the only things LNet ever sends, none of which run code to load.
+  # Strings and symbols may only carry their encoding, and links back to an
+  # array/hash that is still being read are refused, so the result is always
+  # a finite tree of plain values.
+  MARSHAL_MAX_DEPTH = 32
+
+  def LNet.safe_unmarshal(bin)
+    bin = bin.b
+    raise ArgumentError, 'unsupported marshal format' unless bin.byteslice(0, 2) == "\x04\x08".b
+
+    pos = LNet.marshal_check(bin, 2, 0, { 'objects' => [], 'symbols' => [] })
+    raise ArgumentError, 'trailing marshal data' unless pos == bin.bytesize
+
+    Marshal.load(bin)
+  end
+
+  # seen mirrors Marshal.load's link tables: 'objects' has one entry per
+  # linkable object (false while an array/hash is still being read, the text
+  # of a string, true otherwise) and 'symbols' the name of each symbol read
+  def LNet.marshal_check(bin, pos, depth, seen)
+    raise ArgumentError, 'marshal data nested too deep' if depth > MARSHAL_MAX_DEPTH
+
+    type = bin.getbyte(pos) or raise ArgumentError, 'truncated marshal data'
+    pos += 1
+    case type.chr
+    when '0', 'T', 'F'
+      pos
+    when 'i'
+      LNet.marshal_long(bin, pos)[1]
+    when ':', ';'
+      LNet.marshal_symbol(bin, pos - 1, seen)[1]
+    when '@' # link to an earlier object
+      index, pos = LNet.marshal_long(bin, pos)
+      raise ArgumentError, 'bad or circular marshal link' unless index >= 0 and seen['objects'][index]
+
+      pos
+    when '"' # string
+      text, pos = LNet.marshal_string(bin, pos)
+      seen['objects'].push(text)
+      pos
+    when 'f' # float
+      seen['objects'].push(true)
+      LNet.marshal_string(bin, pos)[1]
+    when 'l' # bignum: sign, length in 16-bit words, digits
+      raise ArgumentError, 'bad bignum sign' unless ['+', '-'].include?(bin.byteslice(pos, 1))
+
+      seen['objects'].push(true)
+      len, pos = LNet.marshal_long(bin, pos + 1)
+      LNet.marshal_skip(bin, pos, len * 2)
+    when '[', '{', '}' # array, hash, hash with default value
+      index = seen['objects'].length
+      seen['objects'].push(false)
+      len, pos = LNet.marshal_count(bin, pos)
+      len *= 2 unless type.chr == '['
+      len += 1 if type.chr == '}'
+      len.times { pos = LNet.marshal_check(bin, pos, depth + 1, seen) }
+      seen['objects'][index] = true
+      pos
+    when 'I' # a string or symbol followed by its encoding
+      case bin.byteslice(pos, 1)
+      when '"'
+        text, pos = LNet.marshal_string(bin, pos + 1)
+        seen['objects'].push(text)
+      when ':'
+        pos = LNet.marshal_symbol(bin, pos, seen)[1]
+      else
+        raise ArgumentError, 'instance variables on unsupported type'
+      end
+      len, pos = LNet.marshal_count(bin, pos)
+      len.times {
+        raise ArgumentError, 'bad instance variable name' unless [':', ';'].include?(bin.byteslice(pos, 1))
+
+        name, pos = LNet.marshal_symbol(bin, pos, seen)
+        value = bin.byteslice(pos, 1)
+        if name == 'E' and ['T', 'F'].include?(value)
+          pos += 1
+        elsif name == 'encoding' and value == '"'
+          encoding, pos = LNet.marshal_string(bin, pos + 1)
+          seen['objects'].push(encoding)
+          Encoding.find(encoding)
+        elsif name == 'encoding' and value == '@' # the same encoding name as an earlier string
+          index, pos = LNet.marshal_long(bin, pos + 1)
+          encoding = seen['objects'][index] if index >= 0
+          raise ArgumentError, 'bad marshal encoding link' unless encoding.is_a?(String)
+
+          Encoding.find(encoding)
+        else
+          raise ArgumentError, "refusing instance variable #{name.inspect}"
+        end
+      }
+      pos
+    else
+      raise ArgumentError, "refusing to load marshal type #{type.chr.inspect}"
+    end
+  end
+
+  def LNet.marshal_long(bin, pos)
+    c = bin.getbyte(pos) or raise ArgumentError, 'truncated marshal data'
+    c -= 256 if c > 127
+    pos += 1
+    return [0, pos] if c == 0
+    return [c - 5, pos] if c > 4
+    return [c + 5, pos] if c < -4
+
+    n = c.abs
+    raise ArgumentError, 'truncated marshal data' if pos + n > bin.bytesize
+
+    x = 0
+    n.times { |i| x |= bin.getbyte(pos + i) << (8 * i) }
+    x -= 256**n if c < 0
+    [x, pos + n]
+  end
+
+  # a length-prefixed element count that the remaining bytes could hold
+  def LNet.marshal_count(bin, pos)
+    len, pos = LNet.marshal_long(bin, pos)
+    raise ArgumentError, 'bad marshal length' if len < 0 or len > bin.bytesize - pos
+
+    [len, pos]
+  end
+
+  def LNet.marshal_string(bin, pos)
+    len, pos = LNet.marshal_long(bin, pos)
+    [bin.byteslice(pos, len), LNet.marshal_skip(bin, pos, len)]
+  end
+
+  # a ':' symbol or ';' symbol link starting at pos; returns its name
+  def LNet.marshal_symbol(bin, pos, seen)
+    if bin.byteslice(pos, 1) == ';'
+      index, pos = LNet.marshal_long(bin, pos + 1)
+      raise ArgumentError, 'bad marshal symbol link' unless index >= 0 and index < seen['symbols'].length
+
+      [seen['symbols'][index], pos]
+    else
+      name, pos = LNet.marshal_string(bin, pos + 1)
+      seen['symbols'].push(name)
+      [name, pos]
+    end
+  end
+
+  def LNet.marshal_skip(bin, pos, len)
+    raise ArgumentError, 'bad marshal length' if len < 0 or pos + len > bin.bytesize
+
+    pos + len
+  end
+
   def LNet.tune_channel(channel)
     return false if @@server.closed?
     xml = REXML::Document.new
@@ -430,9 +584,25 @@ class LNet
     @@last_send = Time.now
   end
 
+  # Drops control characters (Wizard/Avalon \034GS codes among them) and,
+  # unless told otherwise, folds line breaks so one LNet message can't print
+  # what looks like a separate game line.
+  def LNet.clean_text(text, keep_newlines = false)
+    text = text.gsub(/\r\n?|\n/, ' ') unless keep_newlines
+    text.gsub(/[\x00-\x08\x0B-\x1F\x7F]/, '')
+  end
+
+  def LNet.xml_escape(text)
+    text.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+  end
+
   def LNet.echo_thought(from, message, channel)
-    aliased_from = (LNet.alias[from] || from)
+    aliased_from = LNet.clean_text(LNet.alias[from] || from)
+    message = LNet.clean_text(message, from == '[server]')
+    channel = LNet.clean_text(channel)
     channel = "[#{channel}]-" unless from == '[server]'
+    xml_from = LNet.xml_escape("#{channel}#{aliased_from}")
+    xml_message = LNet.xml_escape(message)
     if @@options['timestamps']
       timestamp = "  (#{Time.now.strftime('%X')})"
     else
@@ -445,9 +615,9 @@ class LNet
       preset_open = preset_close = ""
     end
     if @@options['fam_window']
-      xml_thought = "<pushStream id=\"familiar\" ifClosedStyle=\"watching\"/>#{channel}#{aliased_from}: \"#{message.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')}\"#{timestamp}\n<popStream/>\n"
+      xml_thought = "<pushStream id=\"familiar\" ifClosedStyle=\"watching\"/>#{xml_from}: \"#{xml_message}\"#{timestamp}\n<popStream/>\n"
     else
-      xml_thought = "<pushStream id=\"thoughts\"/>#{preset_open}#{channel}#{aliased_from}:#{preset_close} \"#{message.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')}\"#{timestamp}\n<popStream/>\n"
+      xml_thought = "<pushStream id=\"thoughts\"/>#{preset_open}#{xml_from}:#{preset_close} \"#{xml_message}\"#{timestamp}\n<popStream/>\n"
     end
     unless LNet.ignored?(from)
       if $frontend =~ /wizard|avalon/
@@ -456,7 +626,6 @@ class LNet
         else
           $_CLIENT_.puts("You hear the faint thoughts of #{channel}#{aliased_from} echo in your mind:\r\n\"#{message}\"#{timestamp}\r\n")
         end
-        Script.new_downstream("#{channel}#{aliased_from}: \"#{message}\"#{timestamp}")
       else
         if defined?(_respond)
           _respond(xml_thought)
@@ -786,8 +955,9 @@ class LNet
         end
       elsif (@active_tags.last == 'data')
         begin
-          data = Marshal.load(text.unpack('m').first)
+          data = LNet.safe_unmarshal(text.unpack('m').first)
         rescue
+          echo "ignoring <data> from #{@active_attributes.last['from']}: #{$!.message}" if $lnet_debug
           return
         end
         if @active_attributes.last['from'] and @active_attributes.last['type'] and (waiter = @@waiting.find { |w| (@active_attributes.last['from'] =~ /^#{Regexp.escape(w['name'])}/i) and (w['type'] == @active_attributes.last['type']) and w['data'] == :waiting })
