@@ -74,6 +74,14 @@ RSpec.describe 'ELoot::Sell.locksmith_pool_count' do
     end
   end
 
+  context 'when the results were cut between a box and its status line' do
+    let(:buffer) { list('waiting to be worked on', 'ready to be RETURNED') }
+
+    it 'takes the status from the buffer instead of counting the box as waiting' do
+      expect(count(list('waiting to be worked on', 'ready to be RETURNED').first(4))).to eq(1)
+    end
+  end
+
   context 'when the results never saw the header' do
     let(:buffer) { list('waiting to be worked on', 'ready to be RETURNED') }
 
