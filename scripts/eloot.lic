@@ -27,7 +27,8 @@
       pawnshop paid with a bond note
     - fix: a box already in hand at the locksmith pool could be handed in out of turn,
       followed by failed attempts to hand it in again
-    - fix: eloot could crash at the locksmith pool when you had a lot of boxes in the pool
+    - fix: eloot could crash at the locksmith pool, and miscount the pool, when the game was
+      slow to send the pool's box list
   v2.14.1 (2026-10-20)
     - fix: selling at the furrier no longer sells skins (or your whole container) when skin is not a selling type
   v2.14.0 (2026-10-13)
@@ -2975,7 +2976,7 @@ module ELoot # Script utility type methods
     [whole, decimal].compact.join('.')
   end
 
-  def self.get_command(command, regex, silent: nil, quiet: false)
+  def self.get_command(command, regex, silent: nil, quiet: false, timeout: 5)
     if ELoot.data.settings[:debug]
       silent = nil
       quiet = false
@@ -2986,7 +2987,7 @@ module ELoot # Script utility type methods
     regex = Regexp.union(regex, rt_regex)
 
     begin
-      lines = Lich::Util.issue_command(command, regex, usexml: true, silent: silent, quiet: quiet)
+      lines = Lich::Util.issue_command(command, regex, usexml: true, silent: silent, quiet: quiet, timeout: timeout)
 
       ELoot.msg(type: "debug", text: "command: #{command} | lines - #{lines}")
       raise if lines.any? { |l| l =~ rt_regex }
@@ -8087,21 +8088,38 @@ module ELoot # Sells the loot
       ELoot.data.silver_breakdown["Pool Depth"] = Sell.locksmith_pool_count(worker)
     end
 
+    POOL_LIST_HEADER = /here's the list of boxes we have for you\.|You haven't given us any boxes to be worked on\./.freeze unless defined?(POOL_LIST_HEADER)
+
+    # Boxes in the pool that are not yet ready to return. The list comes from the
+    # "ask about list" output; issue_command hands back what it has when it times out,
+    # so a list cut short falls back to the whole server buffer (reget), as long as
+    # this list's header was seen (otherwise the buffer's last list may be an old one).
     def self.locksmith_pool_count(worker)
-      current_box_amount = 0
-      list_match = /here's the list of boxes we have for you\.|You haven't given us any boxes to be worked on\.|^(\d+)\./
+      list_match = Regexp.union(POOL_LIST_HEADER, /^(\d+)\./)
+      results = ELoot.get_command("ask ##{worker.id} about list", list_match, silent: true, quiet: true, timeout: 15)
+      total, returned = Sell.pool_list_counts(results)
 
-      results = ELoot.get_command("ask ##{worker.id} about list", list_match, silent: true, quiet: true)
-
-      results.reverse.each do |line|
-        if line =~ /^\s*(?<amount>\d+)\.\s+An?/
-          current_box_amount = Regexp.last_match[:amount].to_i
-          break
+      unless results.last =~ /<prompt/
+        if results.any? { |line| line =~ POOL_LIST_HEADER }
+          buffered_total, buffered_returned = Sell.pool_list_counts(Array(reget))
+          total, returned = buffered_total, buffered_returned if buffered_total > total
         end
+        ELoot.msg(type: "info", text: " The locksmith pool list came back incomplete; pool depth may be off")
       end
 
-      # results holds the whole list; reget(300) could lose its header on a deep pool
-      current_box_amount - results.count { |line| line =~ /It is ready to be RETURNED\./ }
+      total - returned
+    end
+
+    # Count the boxes and the ones ready to return in the last pool list in lines.
+    # @param lines [Array<String>]
+    # @return [Array(Integer, Integer)] [boxes, ready to return]
+    def self.pool_list_counts(lines)
+      start = lines.rindex { |line| line =~ POOL_LIST_HEADER }
+      return [0, 0] unless start
+
+      list = lines.drop(start)
+      total = list.reverse_each.find { |line| line =~ /^\s*\d+\.\s+An?\s/ }.to_s[/\d+/].to_i
+      [total, list.count { |line| line =~ /It is ready to be RETURNED\./ }]
     end
 
     def self.locksmith_determine_tip(pool_count, boxes_length)
