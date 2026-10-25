@@ -1721,13 +1721,22 @@ module BigshotCastSignsSpec
       end
     end
 
-    module Group
-      class << self
-        attr_accessor :members, :ready
+    # Bigshot's own follower tracker. Inside Bigshot a bare Group means this,
+    # not the game group, so the code under test must name
+    # Lich::Gemstone::Group; a bare Group.members raises here as it does live.
+    class Group; end
 
-        # Names a group casting would reach now; defaults to every member.
-        def spell_cooldown_ready(spell)
-          (ready || {}).fetch(spell.num) { members }
+    module Lich
+      module Gemstone
+        module Group
+          class << self
+            attr_accessor :members, :ready
+
+            # Names a group casting would reach now; defaults to every member.
+            def spell_cooldown_ready(spell)
+              (ready || {}).fetch(spell.num) { members }
+            end
+          end
         end
       end
     end
@@ -1829,8 +1838,8 @@ RSpec.describe 'bigshot cast_signs' do
     h::Stats.prof = 'Cleric'
     h::Skills.slblessings = 0
     h::Skills.elair = 0
-    h::Group.members = []
-    h::Group.ready = nil
+    h::Lich::Gemstone::Group.members = []
+    h::Lich::Gemstone::Group.ready = nil
     h::Effects::Cooldowns.names = []
   end
 
@@ -1843,7 +1852,7 @@ RSpec.describe 'bigshot cast_signs' do
   end
 
   def group!(*names)
-    h::Group.members = names
+    h::Lich::Gemstone::Group.members = names
   end
 
   context 'with a plain spell number' do
@@ -1941,13 +1950,13 @@ RSpec.describe 'bigshot cast_signs' do
         end
 
         it 'evokes while a member is off cooldown, even with our own self-cast up' do
-          h::Group.ready = { num => ['Dicate'] }
+          h::Lich::Gemstone::Group.ready = { num => ['Dicate'] }
           cast_signs("#{num} evoke")
           expect(calls(num)).to eq([[:force_incant, 'evoke']])
         end
 
         it 'waits while every member is on cooldown' do
-          h::Group.ready = { num => [] }
+          h::Lich::Gemstone::Group.ready = { num => [] }
           cast_signs("#{num} evoke")
           expect(calls(num)).to be_empty
         end
