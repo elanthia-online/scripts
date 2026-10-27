@@ -143,14 +143,14 @@ end
 # A few specs need to test against real lich-5 API surface (small pure
 # logic, constants) pinned to a specific release, rather than hand-mirror it
 # and risk silently drifting from what that release actually implements.
-# See .github/workflows/rspec_tests.yaml for the pinned release CI checks
+# See .github/workflows/ci.yml for the pinned release CI checks
 # out into LICH5_PATH -- extract from it with extract_from_source above,
 # same as any other source string.
 
 # Locates a local lich-5 checkout, checked in order:
 #
 # 1. The LICH5_PATH env var -- set by CI after checking out the pinned
-#    lich-5 release (see .github/workflows/rspec_tests.yaml).
+#    lich-5 release (see .github/workflows/ci.yml).
 # 2. A sibling `lich-5` checkout next to this repo's own checkout -- this
 #    project's normal local multi-repo dev layout (lich-5, dr-scripts,
 #    scripts, and ProfanityFE as sibling directories).
