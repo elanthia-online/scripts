@@ -1,0 +1,3409 @@
+# frozen_string_literal: true
+
+=begin
+  analytics.lic: hunting analytics for GemStone IV
+
+  Records what each of your characters does while hunting (hunt / rest / dead
+  / idle cycles, kills, silver, bounties, experience, bank balances) into one
+  shared SQLite database, then reports on it three ways: a live web dashboard,
+  text reports in the game window, and Discord alerts plus a daily digest.
+
+            author: Tysong (horibu on PC)
+              game: Gemstone
+              tags: analytics, dashboard, hunting, silver, bounty, discord
+          required: Lich >= 5.22.0
+           version: 1.0.0
+
+  Usage (run the collector once on every character you want tracked):
+    ;analytics                        collect data for this character
+    ;analytics --dashboard[=PORT]     collect and also serve the dashboard
+    ;analytics serve [PORT] [lan]     serve the dashboard only (no collecting)
+    ;analytics report <name> [range]  text report: character, exp, bounty, cycle
+    ;analytics status                 what the collector is doing right now
+    ;analytics maintenance <task>     compact | vacuum | stats
+    ;analytics help
+
+  While the collector is running, the other commands above also work by
+  typing them as usual (for example ;analytics report exp weekly). Lich will
+  not start a second copy of a running script, so the collector catches them.
+
+  Settings live in <Lich data>/<game>/<character>/analytics.yaml and are
+  created with their defaults the first time the collector runs. The database
+  is <Lich data>/analytics.db and every row records its game and character.
+
+  Hooks for your own rest and selling scripts (all optional):
+    GS4Analytics::SilverManager.take_snapshot
+    GS4Analytics::SilverManager.record_vendor_silver(amount, vendor_type, vendor_name = nil)
+    GS4Analytics::SilverManager.record_vendor_visit(vendor, start_time, end_time, silver)
+
+  Discord alerts need ;discordhook set up and loaded first.
+
+  Improvements:
+  Major_change.feature_addition.bugfix
+  v1.0.0 (2026-10-27)
+    - initial release as a single script
+=end
+
+require 'date'
+require 'fileutils'
+require 'json'
+require 'monitor'
+require 'securerandom'
+require 'sequel'
+require 'socket'
+require 'timeout'
+require 'uri'
+require 'yaml'
+
+module GS4Analytics
+  # ==========================================================================
+  # Util: small pure helpers shared by everything
+  # ==========================================================================
+  module Util
+    module_function
+
+    # Game text can arrive as ASCII-8BIT. SQLite stores that as a BLOB, and a
+    # BLOB never equals a TEXT value, so such rows would be invisible to
+    # queries. Every string bound into SQL goes through here.
+    def norm(value)
+      return value unless value.is_a?(String)
+      return value if value.encoding == Encoding::UTF_8 && value.valid_encoding?
+
+      text = value.dup.force_encoding(Encoding::UTF_8)
+      text.valid_encoding? ? text : text.scrub('')
+    end
+
+    # 1234567 -> "1,234,567"
+    def fmt(number)
+      number.to_i.to_s.gsub(/\B(?=(\d{3})+(?!\d))/, ',')
+    end
+
+    # 4500 -> "1.1B"-style short form for dashboards
+    def short(number)
+      value = number.to_f.abs
+      text = if value >= 1e9 then format('%.2fB', value / 1e9)
+             elsif value >= 1e6 then format('%.1fM', value / 1e6)
+             elsif value >= 1e4 then format('%.1fK', value / 1e3)
+             else value.round.to_s
+             end
+      number.to_f.negative? ? "-#{text}" : text
+    end
+
+    def hms(seconds)
+      secs = seconds.to_i
+      format('%d:%02d:%02d', secs / 3600, secs % 3600 / 60, secs % 60)
+    end
+
+    def hm(seconds)
+      secs = seconds.to_i
+      secs.positive? ? format('%d:%02d', secs / 3600, secs % 3600 / 60) : '0:00'
+    end
+
+    def minutes(seconds)
+      seconds.to_f.positive? ? "#{(seconds / 60.0).round(1)} min" : '0:00'
+    end
+
+    # Unix time of local midnight for a Date, Time or "YYYY-MM-DD" string
+    def midnight(day = Date.today)
+      day = Date.parse(day) if day.is_a?(String)
+      Time.new(day.year, day.month, day.day, 0, 0, 0).to_i
+    end
+
+    def mean(values)
+      values = values.compact
+      values.empty? ? nil : values.sum.to_f / values.size
+    end
+
+    def median(values)
+      values = values.compact.sort
+      return nil if values.empty?
+
+      mid = values.size / 2
+      values.size.odd? ? values[mid].to_f : (values[mid - 1] + values[mid]) / 2.0
+    end
+
+    def mode(values)
+      values = values.compact
+      return nil if values.empty?
+
+      tally = values.tally
+      top = tally.values.max
+      tally.select { |_, count| count == top }.keys.sum.to_f / tally.count { |_, count| count == top }
+    end
+
+    def percent(part, whole, digits = 1)
+      whole.to_f.positive? ? (part * 100.0 / whole).round(digits) : nil
+    end
+
+    # Run the block, returning +fallback+ when the game state isn't readable
+    def safely(fallback = nil)
+      yield
+    rescue StandardError
+      fallback
+    end
+  end
+
+  # ==========================================================================
+  # Who: a character is identified by game *and* name (GS3, GSF, ...)
+  # ==========================================================================
+  class Who
+    attr_reader :game, :name
+
+    def self.current
+      new(XMLData.game, XMLData.name)
+    end
+
+    # Parses the "GS3:Name" form produced by #to_s
+    def self.parse(id)
+      new(*id.to_s.split(':', 2))
+    end
+
+    def initialize(game, name)
+      @game = Util.norm(game.to_s).freeze
+      @name = Util.norm(name.to_s).freeze
+    end
+
+    def to_s = "#{game}:#{name}"
+    def to_a = [game, name]
+    def hash = to_a.hash
+    def ==(other) = other.is_a?(Who) && to_a == other.to_a
+    alias eql? ==
+  end
+
+  # ==========================================================================
+  # Log: output that is safe from hook procs and any thread
+  # ==========================================================================
+  module Log
+    @seen = {}
+    @verbose = false
+
+    class << self
+      attr_accessor :verbose
+
+      def info(message)
+        respond("[analytics] #{message}")
+      end
+
+      def debug(message)
+        info(message) if verbose
+      end
+
+      # Each distinct failure is shown once so a broken hook cannot spam
+      def error(where, err)
+        key = "#{where}:#{err.class}:#{err.message}"
+        return if @seen[key]
+
+        @seen[key] = true
+        info("ERROR (#{where}): #{err.class}: #{err.message}")
+        debug(err.backtrace.first(4).join(' | '))
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Settings: per-character YAML under <Lich data>/<game>/<character>
+  # ==========================================================================
+  module Settings
+    # Drop constants left by an earlier run this session so a restart loads the
+    # current definitions without already-initialized warnings.
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    DEFAULTS = {
+      # Scripts whose running state defines the cycle. A String or an Array.
+      hunt_script: 'bigshot',
+      rest_script: nil,
+      death_script: nil,
+      # nil turns a feature off
+      max_hunt_minutes: nil,
+      idle_warn_minutes: 8,
+      idle_recover_minutes: nil,
+      verbose: false,
+      discord: true,
+      # While resting, time is credited to the first running script listed
+      rest_steps: {
+        'go2'     => 'travel',
+        'eloot'   => 'eloot',
+        'ebounty' => 'bounty',
+        'eherbs'  => 'healing',
+        'ewaggle' => 'spells'
+      },
+      # Where idle recovery walks to, by bigshot profile name: { 'profile' => room }
+      profile_room_map: {},
+      # Re-arm check: { right: 'scepter', left: nil, gird: true, get_right: nil, get_left: nil }
+      weapon_loadout: nil,
+      alerts: {
+        no_kill_minutes: 10,
+        silver_drop_pct: 50,
+        silver_check_after_hours: 2,
+        daily_digest: true
+      },
+      dashboard: { port: 8080, lan: false }
+    }.freeze
+
+    HEADER = <<~TEXT
+      # analytics.lic settings. Unlisted keys use the defaults shown here.
+      # Restart ;analytics after editing.
+      #
+      # rest_script / death_script: names of your own scripts. Without a
+      #   rest_script, resting is not detected (stock bigshot rests inside itself).
+      # max_hunt_minutes, idle_recover_minutes, weapon_loadout: leave null to
+      #   disable. Hunt timeout sets $bigshot_should_rest; idle recovery walks to
+      #   profile_room_map[profile] and starts rest_script.
+    TEXT
+
+    @current = DEFAULTS
+
+    class << self
+      attr_reader :current
+
+      def path(who)
+        File.join(DATA_DIR, who.game, who.name, 'analytics.yaml')
+      end
+
+      # Loads the character's file over the defaults, writing the defaults out
+      # the first time so the available keys are visible.
+      def load(who)
+        file = path(who)
+        write_defaults(file) unless File.exist?(file)
+        saved = YAML.safe_load_file(file, symbolize_names: true) || {}
+        @current = merge(DEFAULTS, saved)
+        @current[:rest_steps] = stringify(@current[:rest_steps])
+        @current[:profile_room_map] = stringify(@current[:profile_room_map])
+        Log.verbose = @current[:verbose] ? true : false
+        @current
+      rescue StandardError => e
+        Log.error('settings', e)
+        @current = DEFAULTS
+      end
+
+      private
+
+      def write_defaults(file)
+        FileUtils.mkdir_p(File.dirname(file))
+        File.write(file, HEADER + YAML.dump(JSON.parse(JSON.generate(DEFAULTS))))
+      end
+
+      def merge(base, over)
+        base.merge(over) do |_key, old, new|
+          old.is_a?(Hash) && new.is_a?(Hash) ? merge(old, new) : new
+        end
+      end
+
+      def stringify(hash)
+        (hash || {}).to_h { |key, value| [key.to_s, value] }
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Notifier: in-game bold message plus Discord (through discordhook.lic)
+  # ==========================================================================
+  module Notifier
+    class << self
+      def alert(title, text)
+        Lich::Messaging.msg('bold', "[Analytics] #{title}: #{text}")
+        discord("#{title} | #{text}")
+      end
+
+      def discord(text)
+        return unless Settings.current[:discord] && defined?(LichDiscordHook)
+
+        # The webhook call is a network round trip; keep it off the caller
+        Thread.new do
+          LichDiscordHook.msg(text)
+        rescue StandardError => e
+          Log.error('discord', e)
+        end
+      end
+    end
+  end
+end
+
+module GS4Analytics
+  # ==========================================================================
+  # Database: one SQLite file shared by every character and game, through Sequel
+  # ==========================================================================
+  module Database
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    class Missing < StandardError; end
+
+    # Cycles shorter than this are state flapping, not real hunts or rests
+    MIN_CYCLE_SECONDS = 10
+    SCHEMA_VERSION    = '3'
+    BUSY_TIMEOUT_MS   = 15_000
+    # Rows from our own reads are keyed by column name as a String, which is
+    # how every report and manager indexes them
+    STRING_KEYS       = ->(row) { row.transform_keys(&:to_s) }
+
+    # Raw-SQL reads for the report aggregates, mixed into the Sequel database.
+    # Values are UTF-8 normalized, since a BLOB never equals a TEXT value.
+    module Queries
+      def all(sql, *params)
+        fetch(sql, *params.flatten.map { |value| Util.norm(value) }).with_row_proc(STRING_KEYS).all
+      end
+
+      # First row, or an empty Hash so callers can index it without a nil check
+      def one(sql, *params)
+        all(sql, *params).first || {}
+      end
+    end
+
+    class << self
+      def file
+        File.join(DATA_DIR, 'analytics.db')
+      end
+
+      def new_id
+        SecureRandom.hex(8)
+      end
+
+      # ----- connection ------------------------------------------------------
+
+      # Opens the shared database for writing, creating it on first use
+      def connect!(path = file)
+        close
+        FileUtils.mkdir_p(File.dirname(path))
+        @db = open_database(path, readonly: false)
+        @db.run('PRAGMA journal_mode=WAL')
+        columns = @db.table_exists?(:cycles) ? @db.all('PRAGMA table_info(cycles)').map { |col| col['name'] } : nil
+        if columns && !columns.include?('game')
+          raise "#{path} is an older analytics database without a game column; move it aside and restart"
+        end
+
+        create_schema
+        set_metadata('schema_version', SCHEMA_VERSION)
+        @sessions = {}
+        @session_lock = Mutex.new
+        start_writer
+        Log.info("Database ready: #{path}")
+      end
+
+      def connected?
+        !@db.nil?
+      end
+
+      def db
+        @db or raise Missing, 'the analytics database is not open for writing'
+      end
+
+      # A database for reading. The collector's own connection is reused;
+      # otherwise a read-only one is opened, which needs the file to exist.
+      def reader(path = file)
+        conn = @db || (@reader ||= open_reader(path))
+        block_given? ? yield(conn) : conn
+      end
+
+      def close
+        stop_writer
+        [@db, @reader].compact.each(&:disconnect)
+        @db = @reader = nil
+        @sessions = {}
+      end
+
+      def all(sql, *params) = db.all(sql, *params)
+      def one(sql, *params) = db.one(sql, *params)
+
+      # ----- async writes ----------------------------------------------------
+      # DownstreamHook procs run on the game-text thread and must never wait
+      # on the database, so they queue their writes here.
+
+      def async(&job)
+        if @writer&.alive?
+          @queue << job
+        else
+          job.call
+        end
+      rescue StandardError => e
+        Log.error('async write', e)
+      end
+
+      # ----- metadata --------------------------------------------------------
+
+      def metadata(key)
+        db[:metadata].where(key: key).get(:value)
+      end
+
+      def set_metadata(key, value)
+        db[:metadata].insert_conflict(:replace).insert(key: key, value: value.to_s, updated_at: Time.now.to_i)
+      end
+
+      # ----- sessions and cycles ---------------------------------------------
+
+      # One session per character per day, cached so the 2 s bounty poll and
+      # every kill don't query for it
+      def session_for(who)
+        date = Date.today.to_s
+        cached = @sessions[who]
+        return cached[:id] if cached && cached[:date] == date
+
+        @session_lock.synchronize do
+          sessions = db[:sessions]
+          sessions.insert_ignore.insert(session_id: new_id, game: who.game, character: who.name, start_date: date,
+                                        midnight_timestamp: Util.midnight(date), start_time: Time.now.to_i)
+          id = sessions.where(game: who.game, character: who.name, start_date: date).get(:session_id)
+          @sessions[who] = { date: date, id: id }
+          id
+        end
+      end
+
+      def start_cycle(who, session_id, type, trigger, profile, vitals)
+        id = new_id
+        db[:cycles].insert(clean(cycle_id: id, session_id: session_id, game: who.game, character: who.name,
+                                 cycle_type: type.to_s, start_time: Time.now.to_i, profile: profile,
+                                 trigger_script: trigger, exp_total_start: vitals[:exp_total],
+                                 exp_field_start: vitals[:exp_field], exp_field_max: vitals[:exp_max],
+                                 fame_start: vitals[:fame], encumbrance_start: vitals[:encumbrance]))
+        id
+      end
+
+      # Closes a cycle and returns its row, or nil when it was too short to
+      # keep. A rest keeps the reason it started with; other cycles only take
+      # a non-empty reason, so 'unhandled exit' is never overwritten.
+      def end_cycle(cycle_id, vitals, rest_reason)
+        now = Time.now.to_i
+        reason = rest_reason.to_s.empty? ? nil : Util.norm(rest_reason)
+        cycles = db[:cycles].where(cycle_id: cycle_id)
+        cycles.update(end_time: now, duration_seconds: Sequel.expr(now) - :start_time,
+                      exp_total_end: vitals[:exp_total], exp_field_end: vitals[:exp_field], fame_end: vitals[:fame],
+                      encumbrance_end: vitals[:encumbrance],
+                      exp_field_max: Sequel.function(:coalesce, vitals[:exp_max], :exp_field_max),
+                      rest_reason: Sequel.case({ { cycle_type: 'rest' } => :rest_reason },
+                                               Sequel.function(:coalesce, reason, :rest_reason)))
+        row = cycles.select(:cycle_type, :start_time, :duration_seconds).with_row_proc(STRING_KEYS).first
+        return row if row && row['duration_seconds'].to_i >= MIN_CYCLE_SECONDS
+
+        cycles.delete
+        nil
+      end
+
+      def set_rest_reason(cycle_id, reason)
+        db[:cycles].where(cycle_id: cycle_id).update(rest_reason: Util.norm(reason))
+      end
+
+      # Ends a cycle that a crash left open
+      def close_cycle(cycle_id, start_time, finish)
+        db[:cycles].where(cycle_id: cycle_id).update(end_time: finish, duration_seconds: finish - start_time.to_i)
+      end
+
+      def record_rest_steps(who, cycle_id, rest_start, steps)
+        steps.each do |step, seconds|
+          next unless seconds.to_f.positive?
+
+          db[:rest_steps].insert_conflict(:replace).insert(cycle_id: cycle_id, game: who.game, character: who.name,
+                                                           step: step.to_s, seconds: seconds.to_f.round(1),
+                                                           rest_start: rest_start.to_i)
+        end
+      end
+
+      def record_vendor_visit(who, cycle_id, vendor, start_time, end_time, silver)
+        db[:vendor_visits].insert(clean(visit_id: new_id, game: who.game, character: who.name, cycle_id: cycle_id,
+                                        vendor: vendor.to_s, start_time: start_time.to_i, end_time: end_time.to_i,
+                                        duration_seconds: (end_time - start_time).to_i, silver: silver))
+      end
+
+      # ----- kills and silver ------------------------------------------------
+
+      def record_kill(who, creature, profile, silver)
+        kills = Sequel[:kill_stats]
+        db[:kill_stats].insert_conflict(
+          target: %i[game character date profile creature],
+          update: { kill_count: kills[:kill_count] + 1, total_silver: kills[:total_silver] + Sequel[:excluded][:total_silver],
+                    last_kill_at: Sequel[:excluded][:last_kill_at] }
+        ).insert(clean(game: who.game, character: who.name, date: Date.today.to_s, profile: profile.to_s,
+                       creature: creature, kill_count: 1, total_silver: silver.to_i, last_kill_at: Time.now.to_i))
+      end
+
+      # category: 'box', 'sale' or 'bounty'
+      def record_silver(who, session_id, cycle_id, category, amount, vendor_type: nil, vendor_name: nil,
+                        bounty_type: nil)
+        return unless amount.to_i.positive?
+
+        db[:silver_events].insert(clean(event_id: new_id, session_id: session_id, cycle_id: cycle_id, game: who.game,
+                                        character: who.name, timestamp: Time.now.to_i, source_category: category,
+                                        amount: amount.to_i, vendor_type: vendor_type, vendor_name: vendor_name,
+                                        bounty_type: bounty_type))
+      end
+
+      # Available to custom selling scripts
+      def record_item_sale(who, session_id, item_name, item_noun, total_price, vendor_type, vendor_name = nil,
+                           quantity = 1)
+        unit = quantity.to_i.positive? ? total_price / quantity : total_price
+        db[:item_sales].insert(clean(sale_id: new_id, session_id: session_id, game: who.game, character: who.name,
+                                     timestamp: Time.now.to_i, item_name: item_name, item_noun: item_noun,
+                                     quantity: quantity, unit_price: unit, total_price: total_price,
+                                     vendor_type: vendor_type, vendor_name: vendor_name))
+      end
+
+      # ----- bounties --------------------------------------------------------
+
+      def start_bounty(who, session_id, cycle_id, type, creature, area, count_required = nil)
+        id = new_id
+        db[:bounties].insert(clean(bounty_id: id, session_id: session_id, cycle_id: cycle_id, game: who.game,
+                                   character: who.name, received_time: Time.now.to_i, bounty_type: type,
+                                   creature: creature, area: area, count_required: count_required, status: 'active'))
+        id
+      end
+
+      def complete_bounty(bounty_id, silver, exp, bp)
+        db[:bounties].where(bounty_id: bounty_id).update(status: 'completed', completed_time: Time.now.to_i,
+                                                         silver_reward: silver, exp_reward: exp, bp_reward: bp)
+      end
+
+      def abandon_bounty(bounty_id)
+        db[:bounties].where(bounty_id: bounty_id).update(status: 'abandoned')
+      end
+
+      # Outcome unknown (left 'active' by a crash or restart): kept out of the
+      # completed and abandoned counts so it can't skew success rates
+      def expire_bounty(bounty_id)
+        db[:bounties].where(bounty_id: bounty_id, status: 'active').update(status: 'expired')
+      end
+
+      # A task that turned into its spawned form is the same bounty continuing
+      def retype_bounty(bounty_id, type, creature)
+        db[:bounties].where(bounty_id: bounty_id).update(clean(bounty_type: type, creature: creature))
+      end
+
+      def active_bounties(who)
+        db[:bounties].where(game: who.game, character: who.name, status: 'active')
+                     .order(Sequel.desc(:received_time), Sequel.desc(:rowid)).with_row_proc(STRING_KEYS).all
+      end
+
+      # ----- bank ------------------------------------------------------------
+
+      # +results+ maps bank name to balance and carries a '__total__' entry.
+      # Individual banks are written only when their balance changed; the
+      # total always is, since it carries the silver-per-hour deltas.
+      def store_bank_snapshot(who, session_id, cycle_id, snapshot_type, results)
+        now = Time.now.to_i
+        previous = all('SELECT s.bank_name, s.balance FROM bank_snapshots s ' \
+                       'JOIN (SELECT bank_name, MAX(timestamp) AS ts FROM bank_snapshots ' \
+                       '      WHERE game = ? AND character = ? GROUP BY bank_name) m ' \
+                       'ON s.bank_name = m.bank_name AND s.timestamp = m.ts ' \
+                       'WHERE s.game = ? AND s.character = ?', *who, *who)
+                   .to_h { |row| [row['bank_name'], row['balance'].to_i] }
+
+        # A bank emptied to zero drops out of BANK ACCOUNT. Record the zero so a
+        # stale 2B balance doesn't keep warning, but only when the banks that
+        # were parsed add up to the total (a partial capture proves nothing).
+        banks = results.except('__total__')
+        if results['__total__'] && banks.values.sum == results['__total__']
+          previous.each { |bank, balance| results[bank] = 0 if balance.positive? && !results.key?(bank) }
+        end
+
+        db.transaction do
+          results.each do |bank, balance|
+            prior = previous[bank]
+            next if bank != '__total__' && prior == balance
+
+            db[:bank_snapshots].insert(clean(snapshot_id: new_id, session_id: session_id, cycle_id: cycle_id,
+                                             game: who.game, character: who.name, timestamp: now, bank_name: bank,
+                                             balance: balance, delta_silver: prior && balance - prior,
+                                             snapshot_type: snapshot_type))
+          end
+        end
+      end
+
+      # ----- maintenance (run with ;analytics maintenance <task>) ------------
+
+      def compact_bank_snapshots
+        removed = db[:bank_snapshots].exclude(bank_name: '__total__').where(delta_silver: 0).delete
+        "Removed #{removed} unchanged bank rows"
+      end
+
+      def vacuum
+        db.run('VACUUM')
+        "Vacuumed (#{(File.size(file) / 1_048_576.0).round(1)} MB)"
+      end
+
+      def statistics
+        counts = %i[sessions cycles kill_stats bounties silver_events item_sales bank_snapshots rest_steps
+                    vendor_visits].map { |table| "#{table}: #{Util.fmt(db[table].count)}" }
+        counts << "size: #{(File.size(file) / 1_048_576.0).round(2)} MB"
+      end
+
+      private
+
+      # Strings from the game can be ASCII-8BIT, which would be stored as BLOBs
+      def clean(row)
+        row.transform_values { |value| Util.norm(value) }
+      end
+
+      def open_reader(path)
+        raise Missing, "No analytics data yet at #{path}" unless File.exist?(path)
+
+        open_database(path, readonly: true)
+      end
+
+      # Lich's helper gives the writer its busy handling (a lock wait that lets
+      # the rest of the process run); readers use plain Sequel.
+      def open_database(path, readonly:)
+        conn = if readonly
+                 Sequel.sqlite(path, readonly: true, timeout: BUSY_TIMEOUT_MS)
+               elsif Lich.respond_to?(:open_sequel_sqlite)
+                 Lich.open_sequel_sqlite(path)
+               else
+                 Sequel.sqlite(path, timeout: BUSY_TIMEOUT_MS)
+               end
+        conn.extend(Queries)
+        conn
+      end
+
+      def start_writer
+        @queue = Queue.new
+        @writer = Thread.new do
+          while (job = @queue.pop) != :stop
+            begin
+              job.call
+            rescue StandardError => e
+              Log.error('queued write', e)
+            end
+          end
+        end
+      end
+
+      def stop_writer
+        return unless @writer&.alive?
+
+        @queue << :stop
+        @writer.join(10)
+        @writer = nil
+      end
+
+      # ----- schema ----------------------------------------------------------
+
+      def create_schema
+        db.create_table?(:sessions) do
+          String :session_id, primary_key: true
+          String :game, null: false
+          String :character, null: false
+          String :start_date, null: false
+          Integer :midnight_timestamp, null: false
+          Integer :start_time, null: false
+          Integer :end_time
+          String :status, default: 'active'
+          unique %i[game character start_date]
+        end
+
+        db.create_table?(:cycles) do
+          String :cycle_id, primary_key: true
+          String :session_id, null: false
+          String :game, null: false
+          String :character, null: false
+          String :cycle_type, null: false # hunt, rest, dead, idle
+          Integer :start_time, null: false
+          Integer :end_time
+          Integer :duration_seconds
+          String :profile
+          String :trigger_script
+          String :rest_reason
+          Integer :exp_total_start
+          Integer :exp_total_end
+          Integer :exp_field_start
+          Integer :exp_field_end
+          Integer :exp_field_max
+          Integer :fame_start
+          Integer :fame_end
+          Float :encumbrance_start
+          Float :encumbrance_end
+          index %i[game character start_time]
+          index %i[game character end_time]
+        end
+
+        db.create_table?(:kill_stats) do
+          String :game, null: false
+          String :character, null: false
+          String :date, null: false
+          String :profile, null: false
+          String :creature, null: false
+          Integer :kill_count, default: 0
+          Integer :total_silver, default: 0
+          Integer :last_kill_at
+          primary_key %i[game character date profile creature]
+        end
+
+        db.create_table?(:bounties) do
+          String :bounty_id, primary_key: true
+          String :session_id, null: false
+          String :cycle_id
+          String :game, null: false
+          String :character, null: false
+          Integer :received_time, null: false
+          Integer :completed_time
+          String :bounty_type
+          String :creature
+          String :area
+          Integer :count_required
+          Integer :count_completed, default: 0
+          Integer :silver_reward
+          Integer :exp_reward
+          Integer :bp_reward
+          String :status, default: 'active'
+          index %i[game character status]
+          index %i[game character completed_time]
+        end
+
+        db.create_table?(:silver_events) do
+          String :event_id, primary_key: true
+          String :session_id, null: false
+          String :cycle_id
+          String :game, null: false
+          String :character, null: false
+          Integer :timestamp, null: false
+          String :source_category, null: false
+          Integer :amount, null: false
+          String :vendor_type
+          String :vendor_name
+          String :bounty_type
+          index %i[game character timestamp]
+        end
+
+        db.create_table?(:item_sales) do
+          String :sale_id, primary_key: true
+          String :session_id, null: false
+          String :game, null: false
+          String :character, null: false
+          Integer :timestamp, null: false
+          String :item_name, null: false
+          String :item_noun
+          Integer :quantity, default: 1
+          Integer :unit_price
+          Integer :total_price, null: false
+          String :vendor_type
+          String :vendor_name
+          index %i[game character item_name]
+        end
+
+        db.create_table?(:bank_snapshots) do
+          String :snapshot_id, primary_key: true
+          String :session_id, null: false
+          String :cycle_id
+          String :game, null: false
+          String :character, null: false
+          Integer :timestamp, null: false
+          String :bank_name, null: false
+          Integer :balance, null: false
+          Integer :delta_silver
+          String :snapshot_type
+          index %i[game character bank_name timestamp]
+          index :timestamp
+        end
+
+        db.create_table?(:rest_steps) do
+          String :cycle_id, null: false
+          String :game, null: false
+          String :character, null: false
+          String :step, null: false
+          Float :seconds, null: false
+          Integer :rest_start, null: false
+          primary_key %i[cycle_id step]
+          index %i[game character rest_start]
+        end
+
+        db.create_table?(:vendor_visits) do
+          String :visit_id, primary_key: true
+          String :game, null: false
+          String :character, null: false
+          String :cycle_id
+          String :vendor, null: false
+          Integer :start_time, null: false
+          Integer :end_time, null: false
+          Integer :duration_seconds, null: false
+          Integer :silver
+          index %i[game character start_time]
+        end
+
+        db.create_table?(:metadata) do
+          String :key, primary_key: true
+          String :value
+          Integer :updated_at
+        end
+      end
+    end
+  end
+end
+
+module GS4Analytics
+  # ==========================================================================
+  # Vitals: the character numbers stored at the start and end of a cycle
+  # ==========================================================================
+  module Vitals
+    module_function
+
+    def read
+      exp = defined?(Experience) ? Experience : Util.safely { Lich::Gemstone::Experience }
+      {
+        exp_total: Util.safely(0) { exp.txp },
+        exp_field: Util.safely(0) { exp.fxp_current },
+        # nil when Lich can't say, so a stored capacity is never overwritten by 0
+        exp_max: Util.safely { exp.fxp_max.to_i.then { |max| max.positive? ? max : nil } },
+        fame: Util.safely(0) { exp.fame },
+        encumbrance: Util.safely(0.0) { Char.percent_encumbrance }
+      }
+    end
+  end
+
+  # ==========================================================================
+  # SilverManager: kills and box silver from the game text, bank snapshots
+  # ==========================================================================
+  module SilverManager
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    HOOK       = 'GS4Analytics::SilverManager'
+    BANK_CAP   = 2_000_000_000
+    TAGS       = /<[^>]+>/
+    SEARCH_RE  = /You search the (.+)\./
+    SILVER_RE  = /had ([\d,]+) silvers? on/
+    DECAY_RE   = /rots away|shrivels|fragments into|dries into|crumbles|dissolves|fades away|sinks into/i
+    CHARM_RE   = /They locate a pile of ([\d,]+) coins?, reclaiming them/
+    DIRECT_RE  = /You gather the remaining ([\d,]+) coins? from inside your/
+    BANK_SKIP  = /amounts on deposit|inter-town|urchin/i
+
+    class << self
+      attr_reader :last_kill_at
+
+      def start(who)
+        @who = who
+        @session_id = nil
+        @cycle_id = nil
+        @kill = nil
+        @last_kill_at = nil
+        DownstreamHook.remove(HOOK)
+        DownstreamHook.add(HOOK, proc { |line| on_line(line) })
+      end
+
+      def stop
+        DownstreamHook.remove(HOOK)
+        @who = nil
+      end
+
+      # Keeps silver events linked to the live cycle and session
+      def link(cycle_id, session_id)
+        @cycle_id = cycle_id
+        @session_id = session_id
+      end
+
+      # Call from your rest script once a rest finishes
+      def take_snapshot(snapshot_type = 'rest_cycle')
+        return unless @who
+
+        banks = parse_bank(Lich::Util.quiet_command_xml('bank account', /amounts on deposit/, /Total:\s+[\d,]+/))
+        return Log.info('Bank snapshot: no data captured') if banks.empty?
+
+        banks.each do |bank, balance|
+          next if bank == '__total__' || balance < BANK_CAP
+
+          Log.info("WARNING: #{bank} is #{Util.fmt(balance)}, at or over 2.0B")
+        end
+        Database.store_bank_snapshot(@who, Database.session_for(@who), @cycle_id, snapshot_type, banks)
+        Log.info("Bank snapshot recorded (#{banks.size - 1} banks, total #{Util.fmt(banks['__total__'])})")
+      rescue StandardError => e
+        Log.error('bank snapshot', e)
+      end
+
+      # Call from your selling script after each sale
+      def record_vendor_silver(amount, vendor_type, vendor_name = nil)
+        return unless @who && amount.to_i.positive?
+
+        Database.record_silver(@who, Database.session_for(@who), @cycle_id, 'sale', amount,
+                               vendor_type: vendor_type, vendor_name: vendor_name)
+        Log.debug("Recorded #{vendor_type} sale: #{Util.fmt(amount)} silver")
+      end
+
+      # Call from your selling script after each vendor section
+      def record_vendor_visit(vendor, start_time, end_time, silver)
+        return unless @who
+
+        Database.record_vendor_visit(@who, @cycle_id, vendor, start_time, end_time, silver)
+      end
+
+      private
+
+      def digits(text)
+        text.delete(',').to_i
+      end
+
+      def parse_bank(lines)
+        lines.each_with_object({}) do |line, banks|
+          text = line.encode('UTF-8', invalid: :replace, undef: :replace, replace: '').gsub(TAGS, '').strip
+          next if text.empty? || text.match?(BANK_SKIP)
+
+          if (total = text.match(/\ATotal:\s+([\d,]+)/i))
+            banks['__total__'] = digits(total[1])
+          elsif text.include?(':')
+            name, amount = text.split(': ', 2)
+            balance = amount && digits(amount)
+            banks[name.strip] = balance if balance&.positive? && !name.strip.empty?
+          end
+        end
+      end
+
+      # Runs on the game-text thread: parse and queue, never touch the database
+      # directly, and never let an exception escape (Lich drops a hook that raises).
+      def on_line(line)
+        text = line.gsub(TAGS, '')
+        if (found = text.match(SEARCH_RE))
+          flush_kill
+          @kill = { creature: found[1].strip, silver: 0 }
+          @last_kill_at = Time.now.to_i
+        elsif @kill && (found = text.match(SILVER_RE))
+          @kill[:silver] = digits(found[1])
+        elsif @kill && text.match?(DECAY_RE)
+          flush_kill
+        end
+
+        if (found = text.match(CHARM_RE))
+          record_box(digits(found[1]), 'charm')
+        elsif (found = text.match(DIRECT_RE))
+          record_box(digits(found[1]), 'direct')
+        end
+        line
+      rescue StandardError => e
+        Log.error('silver hook', e)
+        line
+      end
+
+      def flush_kill
+        return unless @kill
+
+        kill = @kill
+        @kill = nil
+        who = @who
+        profile = Util.safely('') { UserVars.op['profile_current'].to_s }
+        Database.async { Database.record_kill(who, kill[:creature], profile, kill[:silver]) }
+      end
+
+      def record_box(amount, method)
+        return unless amount.positive?
+
+        who = @who
+        cycle_id = @cycle_id
+        Database.async do
+          Database.record_silver(who, Database.session_for(who), cycle_id, 'box', amount, vendor_name: method)
+        end
+        Log.debug("Box silver (#{method}): #{Util.fmt(amount)}")
+      end
+    end
+  end
+
+  # ==========================================================================
+  # BountyManager: bounty start, turn-in, abandon and replacement
+  # ==========================================================================
+  module BountyManager
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    HOOK = 'GS4Analytics::BountyManager'
+    TRACKABLE_TYPES = %i[cull dangerous dangerous_spawned bandit heirloom rescue rescue_spawned gem herb skin
+                         escort].freeze
+    # A task that turns into its spawned form is the same bounty continuing
+    CONTINUATIONS = { 'dangerous' => 'dangerous_spawned', 'rescue' => 'rescue_spawned' }.freeze
+    # [You have earned 1106 bounty points, 1100 experience points, and 11066 silver.]
+    REWARD_RE = /You have earned ([\d,]+) bounty points?(?:(?:, | and )([\d,]+) experience points?)?(?:,? and ([\d,]+) silver)?/i
+    ABANDON_RE = /You have abandoned your current task/i
+    LOOP_INTERVAL = 0.5
+    TASK_EVERY = 4 # loops, so every 2 seconds
+
+    class << self
+      def start(who, cfg)
+        @who = who
+        @hunt_script = cfg[:hunt_script]
+        @events = Queue.new
+        @active = true
+        clear_tracking
+        reconcile_active_bounties
+        install_hook
+        @thread = Thread.new { monitor }
+      end
+
+      def stop
+        @active = false
+        DownstreamHook.remove(HOOK)
+        @thread&.join(2)
+      end
+
+      def current_bounty_id = @bounty_id
+
+      private
+
+      # Keeps only the newest 'active' row. Older ones were left by crashes or
+      # restarts; their outcome is unknown, so they expire instead of counting
+      # as abandoned.
+      def reconcile_active_bounties
+        actives = Database.active_bounties(@who)
+        return if actives.empty?
+
+        task = task_info
+        keep = task ? actives.find { |row| matches_row?(row, task) } : actives.first
+        stale = actives.reject { |row| row['bounty_id'] == keep&.[]('bounty_id') }
+        stale.each { |row| Database.expire_bounty(row['bounty_id']) }
+        Log.debug("Expired #{stale.size} stale active bounty row(s)") if stale.any?
+        adopt(keep) if keep
+      rescue StandardError => e
+        Log.error('bounty reconcile', e)
+      end
+
+      # Parse only; the monitor thread owns all state and all writes
+      def install_hook
+        DownstreamHook.remove(HOOK)
+        DownstreamHook.add(HOOK, proc { |line|
+          begin
+            if line.include?('You have earned') || line.include?('abandoned your current task')
+              text = line.gsub(/<[^>]+>/, '')
+              if (reward = text.match(REWARD_RE))
+                @events << [:reward, *reward.captures.map { |part| part.to_s.delete(',').to_i }]
+              elsif text.match?(ABANDON_RE)
+                @events << [:abandon]
+              end
+            end
+          rescue StandardError => e
+            Log.error('bounty hook', e)
+          end
+          line
+        })
+      end
+
+      def monitor
+        loops = 0
+        while @active
+          begin
+            drain_events
+            check_task if (loops % TASK_EVERY).zero?
+          rescue StandardError => e
+            Log.error('bounty monitor', e)
+          end
+          loops += 1
+          sleep LOOP_INTERVAL
+        end
+      end
+
+      def drain_events
+        until @events.empty?
+          event, *args = @events.pop(true)
+          event == :reward ? handle_reward(*args) : handle_abandon
+        end
+      rescue ThreadError
+        nil
+      end
+
+      def handle_reward(bp, exp, silver)
+        session = Database.session_for(@who)
+        cycle = cycle_id
+        # A reward for a bounty we never saw start (analytics began mid-bounty)
+        # still counts, so reward totals stay complete
+        unless @bounty_id
+          @bounty_id = Database.start_bounty(@who, session, cycle, 'untracked', '', '')
+          @type = 'untracked'
+        end
+        Database.complete_bounty(@bounty_id, silver, exp, bp)
+        Database.record_silver(@who, session, cycle, 'bounty', silver, bounty_type: @type)
+        Log.debug("Bounty completed: #{@type} (#{silver} silver, #{exp} exp, #{bp} BP)")
+        clear_tracking
+      end
+
+      def handle_abandon
+        return unless @bounty_id
+
+        Database.abandon_bounty(@bounty_id)
+        Log.debug("Bounty abandoned: #{@type}")
+        clear_tracking
+      end
+
+      def check_task
+        task = task_info
+        if @bounty_id
+          # Taskmaster, guard, assignment and "none" states are steps of the
+          # turn-in; hold and wait for the reward line
+          return unless task
+          return if task_matches_tracked?(task)
+
+          if CONTINUATIONS[@type] == task[:type] && task[:area] == @area
+            Database.retype_bounty(@bounty_id, task[:type], task[:creature])
+            @type = task[:type]
+            @creature = task[:creature]
+            return
+          end
+
+          # Replaced without a reward line: waived, removed or reassigned
+          Database.abandon_bounty(@bounty_id)
+          clear_tracking
+        end
+
+        # Only record once hunting starts; during the bounty step the task may
+        # still be waived and replaced
+        return unless task && Array(@hunt_script).any? { |name| Script.running?(name) }
+
+        last = Database.active_bounties(@who).first
+        if last && matches_row?(last, task)
+          adopt(last)
+        else
+          record_new(task)
+        end
+      end
+
+      def record_new(task)
+        @bounty_id = Database.start_bounty(@who, Database.session_for(@who), cycle_id, task[:type],
+                                           task[:creature], task[:area], task[:count])
+        @type = task[:type]
+        @creature = task[:creature]
+        @area = task[:area]
+        Log.debug("New bounty: #{task[:type]} #{task[:creature]} #{task[:area]} #{task[:count]}")
+      end
+
+      def adopt(row)
+        @bounty_id = row['bounty_id']
+        @type = row['bounty_type'].to_s
+        @creature = row['creature'].to_s
+        @area = row['area'].to_s
+        Log.debug("Tracking bounty: #{@type} #{@creature}")
+      end
+
+      def clear_tracking
+        @bounty_id = @type = @creature = @area = nil
+      end
+
+      def task_matches_tracked?(task)
+        task[:type] == @type && task[:creature] == @creature && task[:area] == @area
+      end
+
+      def matches_row?(row, task)
+        continuing = CONTINUATIONS[row['bounty_type'].to_s] == task[:type]
+        (row['bounty_type'].to_s == task[:type] || continuing) && row['area'].to_s == task[:area] &&
+          (row['creature'].to_s == task[:creature] || continuing)
+      end
+
+      # The current trackable bounty, or nil
+      def task_info
+        return unless defined?(Bounty) && Bounty.respond_to?(:task)
+
+        task = Bounty.task
+        return if task.nil? || task.none? || !TRACKABLE_TYPES.include?(task.type)
+
+        {
+          type: task.type.to_s,
+          creature: Util.norm(task.creature.to_s),
+          area: Util.norm((task.requirements[:area] || task.town).to_s),
+          count: task.requirements[:number]
+        }
+      rescue StandardError => e
+        Log.error('bounty task', e)
+        nil
+      end
+
+      def cycle_id
+        CycleManager.current_cycle_id ||
+          Database.one('SELECT cycle_id FROM cycles WHERE game = ? AND character = ? AND end_time IS NULL ' \
+                       'ORDER BY start_time DESC LIMIT 1', *@who)['cycle_id']
+      end
+    end
+  end
+
+  # ==========================================================================
+  # CycleManager: turns "which scripts are running" into hunt/rest/dead/idle
+  # cycles, with rest-step timing, hunt timeout, weapon check and idle recovery
+  # ==========================================================================
+  module CycleManager
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    DEBOUNCE_SECONDS = 3.0
+    POLL_INTERVAL = 0.5
+    SCRIPT_KEYS = { hunt: :hunt_script, rest: :rest_script, dead: :death_script }.freeze
+    # Bigshot rest reasons that mention items mean the item limit was hit
+    ITEM_LIMIT_REASON = /\bitems?\b/i
+    WEAPON_CHECK_EVERY = 6 # polls
+    WEAPON_GRACE = 60 # polls after a hunt starts
+    WEAPON_RETRIES = 3
+
+    class << self
+      attr_reader :current_state, :current_cycle_id, :hunt_start_time
+
+      def start(who, cfg)
+        @who = who
+        @cfg = cfg
+        @current_state = :idle
+        @current_cycle_id = nil
+        @hunt_start_time = nil
+        @last_flip = -DEBOUNCE_SECONDS
+        @rest_steps = Hash.new(0.0)
+        @rest_cycle = nil
+        @idle = { since: nil, warned: false, recovering: false }
+        @weapon = { polls: 0, retries: 0 }
+        @session_id = Database.session_for(who)
+        @session_date = Date.today.to_s
+        link_silver
+        close_stale_cycles
+        @running = true
+        @thread = Thread.new { watch }
+        Log.info("Cycle manager watching #{describe_scripts}")
+      end
+
+      def stop
+        @running = false
+        @thread&.join(2)
+        end_current_cycle
+      end
+
+      def status
+        names = SCRIPT_KEYS.map { |state, key| "#{state}: #{Array(@cfg[key]).join(', ').then { |s| s.empty? ? '(not set)' : s }}" }
+        ["State: #{@current_state}", "Cycle: #{@current_cycle_id || 'none'}", "Session: #{@session_id}",
+         "Scripts: #{names.join('; ')}"]
+      end
+
+      private
+
+      def describe_scripts
+        SCRIPT_KEYS.map { |state, key| "#{state}=#{Array(@cfg[key]).join('/')}" unless Array(@cfg[key]).empty? }
+                   .compact.join(' ')
+      end
+
+      def watch
+        while @running
+          begin
+            tick
+          rescue StandardError => e
+            Log.error('cycle watcher', e)
+            sleep 1
+          end
+          sleep POLL_INTERVAL
+        end
+      end
+
+      def tick
+        roll_over_midnight
+        signals = { dead: dead?, rest: running?(@cfg[:rest_script]), hunt: running?(@cfg[:hunt_script]) }
+        track_rest_step if @current_state == :rest
+        check_hunt_timeout
+        check_weapons if @current_state == :hunt && @cfg[:weapon_loadout]
+        check_idle(signals.values.any?)
+        update_state(signals)
+      end
+
+      def update_state(signals)
+        target = %i[dead rest hunt].find { |state| signals[state] } || :idle
+        return if target == @current_state || monotonic - @last_flip < DEBOUNCE_SECONDS
+
+        transition_to(target)
+        @last_flip = monotonic
+      end
+
+      def transition_to(target)
+        Log.debug("State #{@current_state} -> #{target}")
+        # A hunt that ends with neither a rest nor a death was cut off, but
+        # that can only be told when a rest script is configured at all
+        if @current_state == :hunt && target == :idle && @current_cycle_id && !Array(@cfg[:rest_script]).empty?
+          Database.set_rest_reason(@current_cycle_id, 'unhandled exit')
+        end
+        end_current_cycle
+        @current_state = target
+        @hunt_start_time = target == :hunt ? Time.now.to_i : nil
+        @weapon = { polls: 0, retries: 0 }
+        start_new_cycle(target)
+      end
+
+      def roll_over_midnight
+        today = Date.today.to_s
+        return if today == @session_date
+
+        Log.info("Midnight rollover: #{@session_date} -> #{today}")
+        end_current_cycle
+        @session_id = Database.session_for(@who)
+        @session_date = today
+        link_silver
+        start_new_cycle(@current_state)
+      end
+
+      def start_new_cycle(type)
+        trigger = Array(@cfg[SCRIPT_KEYS[type]]).find { |name| running?(name) } || type.to_s
+        @current_cycle_id = Database.start_cycle(@who, @session_id, type, trigger, profile, Vitals.read)
+        start_rest(@current_cycle_id) if type == :rest
+        link_silver
+        Log.debug("Started #{type} cycle")
+      rescue StandardError => e
+        Log.error('start cycle', e)
+      end
+
+      def start_rest(cycle_id)
+        @rest_steps = Hash.new(0.0)
+        @rest_cycle = cycle_id
+        @rest_tick = monotonic
+        # Normally bigshot's $rest_reason; if it's blank (rest script started
+        # by hand, or bigshot already cleared it) use the hunt that just ended
+        reason = rest_reason
+        reason = recent_hunt_reason if reason.empty?
+        return if reason.empty?
+
+        Database.set_rest_reason(cycle_id, reason)
+        Log.debug("Rest reason: #{reason}")
+        Notifier.alert('ITEM LIMIT', "check inventory (#{reason})") if reason.match?(ITEM_LIMIT_REASON)
+      end
+
+      def end_current_cycle
+        id = @current_cycle_id or return
+
+        @current_cycle_id = nil
+        link_silver
+        row = Database.end_cycle(id, Vitals.read, rest_reason)
+        save_rest_steps(id, row['start_time']) if row && @rest_cycle == id
+        @rest_cycle = nil if @rest_cycle == id
+        Log.debug(row ? "Ended cycle (#{Util.hm(row['duration_seconds'])})" : 'Dropped a cycle too short to keep')
+      rescue StandardError => e
+        Log.error('end cycle', e)
+      end
+
+      # Closes cycles left open by a crash. The real end is unknown, so use the
+      # start of the next cycle; with none, close at the start so it adds no time.
+      def close_stale_cycles
+        stale = Database.all('SELECT cycle_id, start_time FROM cycles WHERE game = ? AND character = ? ' \
+                             'AND end_time IS NULL AND start_time < ?', *@who, Time.now.to_i - 3600)
+        stale.each do |cycle|
+          following = Database.one('SELECT MIN(start_time) AS t FROM cycles WHERE game = ? AND character = ? ' \
+                                   'AND start_time > ?', *@who, cycle['start_time'])['t']
+          finish = (following || cycle['start_time']).to_i
+          Database.close_cycle(cycle['cycle_id'], cycle['start_time'], finish)
+        end
+        Log.info("Closed #{stale.size} stale open cycle(s)") if stale.any?
+      end
+
+      def check_hunt_timeout
+        limit = @cfg[:max_hunt_minutes]
+        return unless limit && @current_state == :hunt && @hunt_start_time
+        return if Time.now.to_i - @hunt_start_time < limit * 60
+
+        Log.info("Hunt timeout reached (#{limit} min), asking for a rest")
+        fput 'release'
+        $bigshot_should_rest = true
+        $rest_reason = 'hunt timeout'
+        @hunt_start_time = nil
+      end
+
+      # ----- rest step timing ------------------------------------------------
+
+      # Credits the time since the last poll to the first listed script running
+      def track_rest_step
+        return unless @rest_cycle && @rest_cycle == @current_cycle_id
+
+        now = monotonic
+        elapsed = now - @rest_tick.to_f
+        @rest_tick = now
+        return if elapsed <= 0 || elapsed > 10 # skip stalls
+
+        label = @cfg[:rest_steps].find { |script, _| running?(script) }&.last || 'waiting'
+        @rest_steps[label] += elapsed
+      end
+
+      def save_rest_steps(cycle_id, start_time)
+        return if @rest_steps.empty?
+
+        Database.record_rest_steps(@who, cycle_id, start_time, @rest_steps)
+        summary = @rest_steps.sort_by { |_, secs| -secs }.map { |step, secs| "#{step} #{(secs / 60).round(1)}m" }
+        Log.debug("Rest breakdown: #{summary.join(', ')}")
+      end
+
+      def recent_hunt_reason
+        Database.one("SELECT rest_reason FROM cycles WHERE game = ? AND character = ? AND cycle_type = 'hunt' " \
+                     "AND end_time >= ? AND rest_reason IS NOT NULL AND rest_reason != '' " \
+                     'ORDER BY end_time DESC LIMIT 1', *@who, Time.now.to_i - 60)['rest_reason'].to_s
+      end
+
+      # ----- idle warning and recovery ---------------------------------------
+
+      def check_idle(busy)
+        if busy
+          @idle = { since: nil, warned: false, recovering: false }
+          return
+        end
+        return if @idle[:recovering]
+
+        @idle[:since] ||= Time.now.to_i
+        idle_for = Time.now.to_i - @idle[:since]
+        recover_after = @cfg[:idle_recover_minutes]
+        warn_after = @cfg[:idle_warn_minutes]
+        if recover_after && !Array(@cfg[:rest_script]).empty? && idle_for >= recover_after * 60
+          @idle[:recovering] = true
+          recover_from_idle(idle_for)
+        elsif warn_after && !@idle[:warned] && idle_for >= warn_after * 60
+          @idle[:warned] = true
+          Notifier.alert('IDLE WARNING', "#{@who.name} has been idle for #{(idle_for / 60.0).round(1)} minutes")
+        end
+      end
+
+      def recover_from_idle(idle_for)
+        Notifier.alert('IDLE RECOVERY', "#{@who.name} idle for #{idle_for / 60} minutes, starting a rest")
+        room = recovery_room
+        Script.run('go2', room.to_s) if room
+        $rest_reason = 'idle recovery' if rest_reason.empty?
+        # Start without waiting: Script.run would hold this thread for the
+        # whole rest, so the rest would never be recorded as a cycle
+        Script.start(Array(@cfg[:rest_script]).first)
+      rescue StandardError => e
+        Log.error('idle recovery', e)
+      end
+
+      # Room for the current bigshot profile, e.g. "name_crags" or just "crags"
+      def recovery_room
+        name = profile.to_s.downcase
+        return if name.empty?
+
+        short = name.delete_prefix("#{@who.name.downcase}_")
+        @cfg[:profile_room_map][short] || @cfg[:profile_room_map][name]
+      end
+
+      # ----- weapon check ----------------------------------------------------
+
+      def check_weapons
+        @weapon[:polls] += 1
+        return unless @weapon[:polls] > WEAPON_GRACE && (@weapon[:polls] % WEAPON_CHECK_EVERY).zero?
+
+        loadout = @cfg[:weapon_loadout]
+        return if armed?(loadout)
+
+        @weapon[:retries] += 1
+        Log.info("Weapon check failed (attempt #{@weapon[:retries]}/#{WEAPON_RETRIES}): " \
+                 "right=#{checkright.inspect} left=#{checkleft.inspect}")
+        hunt = Array(@cfg[:hunt_script]).find { |name| running?(name) }
+        Script.pause(hunt) if hunt
+        begin
+          if rearm(loadout)
+            @weapon[:retries] = 0
+          elsif @weapon[:retries] >= WEAPON_RETRIES
+            Notifier.alert('MISSING ARMAMENTS', "#{@who.name} could not re-arm after #{WEAPON_RETRIES} attempts")
+            $rest_reason = 'missing armaments'
+            $bigshot_should_rest = true
+            @weapon[:retries] = 0
+          end
+        ensure
+          Script.unpause(hunt) if hunt
+        end
+      rescue StandardError => e
+        Log.error('weapon check', e)
+      end
+
+      def armed?(loadout)
+        checkright == loadout[:right] && (loadout[:left].nil? || checkleft == loadout[:left])
+      end
+
+      def rearm(loadout)
+        waitcastrt?
+        waitrt?
+        stow_unexpected(GameObj.right_hand, loadout[:right])
+        stow_unexpected(GameObj.left_hand, loadout[:left])
+        if loadout[:gird]
+          fput 'gird'
+          waitrt?
+          pause 0.3
+          return true if armed?(loadout)
+        end
+        fput loadout[:get_right] if loadout[:get_right] && GameObj.right_hand&.id.nil?
+        fput loadout[:get_left] if loadout[:get_left] && GameObj.left_hand&.id.nil?
+        pause 0.3
+        armed?(loadout)
+      end
+
+      # Stows what is in a hand unless it's the wanted noun; drops it if there is no room
+      def stow_unexpected(item, wanted)
+        return if item.nil? || item.id.nil? || item.noun == wanted
+
+        result = dothistimeout("stow ##{item.id}", 4, /put|don't seem|can't|no room/i)
+        fput "drop ##{item.id}" if result.to_s.match?(/don't seem|can't|no room/i)
+        waitrt?
+      end
+
+      # ----- small helpers ---------------------------------------------------
+
+      def dead?
+        running?(@cfg[:death_script]) || checkdead
+      end
+
+      def running?(names)
+        Array(names).any? { |name| Script.running?(name) }
+      end
+
+      def profile
+        value = Util.safely('') { UserVars.op['profile_current'].to_s.strip }
+        value.empty? ? nil : value
+      end
+
+      def rest_reason
+        $rest_reason.to_s.strip
+      end
+
+      def link_silver
+        SilverManager.link(@current_cycle_id, @session_id)
+      end
+
+      def monotonic
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # AlertManager: no-kill and silver-drop alerts, plus a daily digest
+  # ==========================================================================
+  module AlertManager
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    CHECK_SECONDS = 30
+    SILVER_CHECK_SECONDS = 1800
+
+    class << self
+      def start(who, cfg)
+        @who = who
+        @cfg = cfg[:alerts]
+        @active = true
+        @alerted_hunt = nil
+        @silver_alerted_on = nil
+        @last_silver_check = 0
+        set_digest_marker((Date.today - 1).to_s) if @cfg[:daily_digest] && digest_marker.nil?
+        @thread = Thread.new { watch }
+      end
+
+      def stop
+        @active = false
+        @thread&.join(2)
+      end
+
+      private
+
+      def watch
+        while @active
+          begin
+            check_no_kills
+            check_silver_rate if Time.now.to_i - @last_silver_check >= SILVER_CHECK_SECONDS
+            check_digest if @cfg[:daily_digest]
+          rescue StandardError => e
+            Log.error('alerts', e)
+          end
+          CHECK_SECONDS.times do
+            break unless @active
+
+            sleep 1
+          end
+        end
+      end
+
+      # ----- no kills --------------------------------------------------------
+
+      def check_no_kills
+        limit = @cfg[:no_kill_minutes]
+        started = CycleManager.hunt_start_time
+        cycle = CycleManager.current_cycle_id
+        return unless limit && CycleManager.current_state == :hunt && started && cycle && @alerted_hunt != cycle
+
+        quiet = Time.now.to_i - [started.to_i, SilverManager.last_kill_at.to_i].max
+        return if quiet < limit * 60
+
+        @alerted_hunt = cycle
+        profile = Util.safely('') { UserVars.op['profile_current'].to_s }
+        Notifier.alert('NO KILLS', "#{@who.name} has hunted #{quiet / 60} minutes without a kill" \
+                                   "#{profile.empty? ? '' : " (profile #{profile})"}")
+      end
+
+      # ----- silver drop -----------------------------------------------------
+      # Silver per hunt hour, so a day with less play time isn't flagged
+
+      def check_silver_rate
+        @last_silver_check = Time.now.to_i
+        today = Date.today
+        return if @silver_alerted_on == today.to_s
+
+        midnight = Util.midnight(today)
+        week_start = Util.midnight(today - 7)
+        today_hours = hunt_seconds(midnight, Time.now.to_i) / 3600.0
+        week_hours = hunt_seconds(week_start, midnight) / 3600.0
+        return if today_hours < @cfg[:silver_check_after_hours] || week_hours < 1
+
+        today_rate = bank_change(midnight, Time.now.to_i) / today_hours
+        week_rate = bank_change(week_start, midnight) / week_hours
+        return if week_rate <= 0 || today_rate >= week_rate * (1 - @cfg[:silver_drop_pct] / 100.0)
+
+        @silver_alerted_on = today.to_s
+        Notifier.alert('SILVER DROP', "#{@who.name} silver per hunt hour today is #{Util.fmt(today_rate)}, " \
+                                      "#{((1 - today_rate / week_rate) * 100).round}% below the 7-day average of " \
+                                      "#{Util.fmt(week_rate)}")
+      end
+
+      # ----- daily digest ----------------------------------------------------
+
+      def check_digest
+        yesterday = Date.today - 1
+        last = digest_marker
+        return if last && last >= yesterday.to_s
+
+        post_digest(yesterday)
+        set_digest_marker(yesterday.to_s)
+      end
+
+      def post_digest(date)
+        from = Util.midnight(date)
+        to = Util.midnight(date + 1)
+        cycles = Database.one(
+          "SELECT SUM(CASE WHEN cycle_type = 'hunt' THEN duration_seconds ELSE 0 END) AS hunt_s, " \
+          "SUM(duration_seconds) AS total_s, SUM(CASE WHEN cycle_type = 'dead' THEN 1 ELSE 0 END) AS deaths, " \
+          'MIN(exp_total_start) AS exp_first, MAX(exp_total_end) AS exp_last FROM cycles ' \
+          'WHERE game = ? AND character = ? AND end_time IS NOT NULL AND start_time >= ? AND start_time < ?',
+          *@who, from, to
+        )
+        total = cycles['total_s'].to_i
+        return if total.zero? # not played that day
+
+        kills = Database.one('SELECT COALESCE(SUM(kill_count), 0) AS n FROM kill_stats ' \
+                             'WHERE game = ? AND character = ? AND date = ?', *@who, date.to_s)['n']
+        bounties = Database.one(
+          "SELECT COUNT(*) AS n, COALESCE(SUM(bp_reward), 0) AS bp, COALESCE(SUM(silver_reward), 0) AS silver " \
+          "FROM bounties WHERE game = ? AND character = ? AND status = 'completed' " \
+          'AND completed_time >= ? AND completed_time < ?', *@who, from, to
+        )
+        exp = cycles['exp_first'] && cycles['exp_last'] ? cycles['exp_last'] - cycles['exp_first'] : 0
+        change = bank_change(from, to)
+        lines = [
+          "Daily summary for #{@who.name}, #{date}",
+          "Hunting #{format('%.1f', cycles['hunt_s'].to_i / 3600.0)}h of #{format('%.1f', total / 3600.0)}h " \
+          "tracked (#{(cycles['hunt_s'].to_i * 100.0 / total).round}% uptime)",
+          "Exp #{Util.fmt(exp)} | Kills #{Util.fmt(kills)} | Deaths #{cycles['deaths'].to_i}",
+          "Bounties #{bounties['n']} completed, #{Util.fmt(bounties['bp'])} BP, #{Util.fmt(bounties['silver'])} silver",
+          "Bank change #{change.negative? ? '-' : '+'}#{Util.fmt(change.abs)}"
+        ]
+        lines.each { |line| Log.info(line) }
+        Notifier.discord(lines.join("\n"))
+      end
+
+      def hunt_seconds(from, to)
+        Database.one("SELECT COALESCE(SUM(duration_seconds), 0) AS s FROM cycles WHERE game = ? AND character = ? " \
+                     "AND cycle_type = 'hunt' AND end_time IS NOT NULL AND start_time >= ? AND start_time < ?",
+                     *@who, from, to)['s'].to_i
+      end
+
+      def bank_change(from, to)
+        Database.one("SELECT COALESCE(SUM(delta_silver), 0) AS s FROM bank_snapshots WHERE game = ? " \
+                     "AND character = ? AND bank_name = '__total__' AND delta_silver IS NOT NULL " \
+                     'AND timestamp >= ? AND timestamp < ?', *@who, from, to)['s'].to_i
+      end
+
+      def digest_marker
+        Database.metadata("digest_last_#{@who}")
+      end
+
+      def set_digest_marker(date)
+        Database.set_metadata("digest_last_#{@who}", date)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Collector: starts and stops the managers for this character
+  # ==========================================================================
+  module Collector
+    class << self
+      def start(who, cfg)
+        Database.connect!
+        SilverManager.start(who)
+        CycleManager.start(who, cfg)
+        BountyManager.start(who, cfg)
+        AlertManager.start(who, cfg)
+        @running = true
+        Log.info("Collecting for #{who.name} (#{who.game})")
+      end
+
+      def running?
+        @running ? true : false
+      end
+
+      def stop
+        return unless @running
+
+        @running = false
+        AlertManager.stop
+        BountyManager.stop
+        CycleManager.stop
+        SilverManager.stop
+        Database.close
+      end
+    end
+  end
+end
+
+module GS4Analytics
+  # ==========================================================================
+  # Report: shared read-side helpers, then the four text reports
+  # ==========================================================================
+  module Report
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    # SQL expression that identifies a character across games, e.g. "GS3:Name"
+    WHO_SQL = "(game || ':' || character)"
+    BANK_CAP = 2_000_000_000
+
+    module_function
+
+    # Standard windows: [label, start_ts], each ending now
+    def windows(now = Time.now)
+      day = Util.midnight(now.to_date)
+      [
+        ['Today', day],
+        ['This Week', day - (6 * 86_400)],
+        ['This Month', day - (29 * 86_400)],
+        ['YTD', Util.midnight(Date.new(now.year, 1, 1))]
+      ]
+    end
+
+    # [label, start_ts] for a report argument, or nil when it's unknown
+    def range_from_arg(arg)
+      today, week, month, year = windows
+      case arg.to_s.downcase
+      when '', 'daily', 'day', 'today' then today
+      when 'weekly', 'week' then week
+      when 'monthly', 'month' then month
+      when 'ytd', 'year' then year
+      when 'total', 'all', 'alltime' then ['All Time', 0]
+      end
+    end
+
+    def date_of(timestamp)
+      Time.at(timestamp).strftime('%Y-%m-%d')
+    end
+
+    # { "GS3:Name" => "Name" } for every character with data. The game is
+    # appended only when more than one game is in the database.
+    def labels(conn)
+      rows = conn.all('SELECT game, character FROM cycles UNION SELECT game, character FROM bank_snapshots')
+      multi = rows.map { |row| row['game'] }.uniq.size > 1
+      rows.to_h do |row|
+        ["#{row['game']}:#{row['character']}", multi ? "#{row['character']} (#{row['game']})" : row['character']]
+      end.sort_by { |_, label| label.downcase }.to_h
+    end
+
+    # Drops the "charname_" prefix that bigshot profile names carry
+    def short_profile(profile, name)
+      text = Util.norm(profile.to_s)
+      text.downcase.start_with?("#{name.downcase}_") ? text[(name.length + 1)..] : text
+    end
+
+    # Every bank that's growing and still under +cap+: current balance, growth
+    # per day over +days+, and days until it reaches the cap, soonest first.
+    def bank_forecast(conn, cap = BANK_CAP, days = 7)
+      now = Time.now.to_i
+      cutoff = now - (days * 86_400)
+      latest = lambda do |agg, extra = '', *params|
+        conn.all("SELECT s.game, s.character, s.bank_name, s.balance, s.timestamp FROM bank_snapshots s " \
+                 "JOIN (SELECT game, character, bank_name, #{agg}(timestamp) AS ts FROM bank_snapshots " \
+                 "WHERE bank_name != '__total__' #{extra} GROUP BY game, character, bank_name) m " \
+                 'ON s.game = m.game AND s.character = m.character AND s.bank_name = m.bank_name ' \
+                 'AND s.timestamp = m.ts', *params)
+            .to_h { |row| [["#{row['game']}:#{row['character']}", row['bank_name']], row] }
+      end
+      current = latest.call('MAX')
+      baseline = latest.call('MAX', 'AND timestamp <= ?', cutoff)
+      earliest = latest.call('MIN')
+
+      current.filter_map do |key, now_row|
+        # The latest row at or before the cutoff is the balance at the cutoff
+        # (rows are only written on change), so its span is exactly +days+
+        base = baseline[key] || earliest[key]
+        balance = now_row['balance'].to_i
+        next if base.nil? || balance <= 0 || balance >= cap
+
+        span = baseline[key] ? days.to_f : (now - base['timestamp'].to_i) / 86_400.0
+        per_day = (balance - base['balance'].to_i) / span
+        next if span < 1 || per_day <= 0
+
+        { id: key[0], bank: key[1], balance: balance, per_day: per_day.round,
+          days_to_cap: ((cap - balance) / per_day).round(1) }
+      end.sort_by { |row| row[:days_to_cap] }
+    end
+
+    # ========================================================================
+    # Text: boxed ASCII tables for the in-game window
+    # ========================================================================
+    module Text
+      constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+      module_function
+
+      # Rows of cells in a ruled box. The first column is left aligned and the
+      # rest right aligned unless +aligns+ says otherwise.
+      def table(headers, rows, footer: nil, aligns: nil)
+        aligns ||= [:left] + ([:right] * (headers.size - 1))
+        all = [headers, *rows, *footer]
+        widths = headers.each_index.map { |i| all.map { |row| row[i].to_s.length }.max }
+        line = lambda do |row|
+          cells = row.each_with_index.map do |cell, i|
+            aligns[i] == :left ? cell.to_s.ljust(widths[i]) : cell.to_s.rjust(widths[i])
+          end
+          "| #{cells.join(' | ')} |"
+        end
+        rule = "+-#{widths.map { |w| '-' * w }.join('-+-')}-+"
+        out = [rule, line.call(headers), rule, *rows.map(&line)]
+        out.push(rule, line.call(footer)) if footer
+        out << rule
+      end
+
+      def banner(title, *subtitles)
+        width = [title, *subtitles].map(&:length).max + 4
+        bar = "+#{'=' * width}+"
+        [bar, *[title, *subtitles].map { |text| "|#{text.center(width)}|" }, bar]
+      end
+
+      def heading(text)
+        ['', "== #{text} =="]
+      end
+
+      # ----- all characters, four windows ------------------------------------
+
+      WINDOW_HEAD = ['Character', 'Today', 'This Week', 'This Month', 'YTD'].freeze
+
+      # AGG(CASE WHEN col >= start THEN value END) AS w0..w3 (integers and
+      # generated date strings only are ever interpolated)
+      def win_cols(agg, value, col, starts, prefix = 'w')
+        starts.each_with_index.map do |start, i|
+          bound = start.is_a?(String) ? "'#{start}'" : start.to_i
+          "#{agg}(CASE WHEN #{col} >= #{bound} THEN #{value} END) AS #{prefix}#{i}"
+        end.join(', ')
+      end
+
+      # { "GS3:Name" => [w0, w1, w2, w3] }
+      def by_who(rows, prefix = 'w')
+        rows.to_h { |row| [row['who'], Array.new(4) { |i| row["#{prefix}#{i}"] }] }
+      end
+
+      def window_section(title, people, values, shown, total: false)
+        rows = people.map { |id, label| [label, *values.call(id).map(&shown)] }
+        footer = nil
+        if total
+          sums = Array.new(4) { |i| people.keys.sum { |id| values.call(id)[i].to_i } }
+          footer = ['TOTAL', *sums.map(&shown)]
+        end
+        [*heading(title), *table(WINDOW_HEAD, rows, footer: footer)]
+      end
+
+      def character_summary(conn)
+        people = Report.labels(conn)
+        return ['No data found. Complete a rest cycle first.'] if people.empty?
+
+        now = Time.now.to_i
+        starts = Report.windows.map(&:last)
+        lower = starts.min # the month window can start before Jan 1
+        hours = starts.map { |start| (now - start) / 3600.0 }
+        dates = starts.map { |start| Report.date_of(start) }
+        blank = Array.new(4)
+        q = lambda do |cols, table, where, bounds = [lower, now]|
+          by_who(conn.all("SELECT #{Report::WHO_SQL} AS who, #{cols} FROM #{table} WHERE #{where} GROUP BY 1", *bounds))
+        end
+
+        silver = q.call(win_cols('SUM', 'delta_silver', 'timestamp', starts), 'bank_snapshots',
+                        "bank_name = '__total__' AND delta_silver IS NOT NULL AND timestamp >= ? AND timestamp <= ?")
+        exp_rows = conn.all("SELECT #{Report::WHO_SQL} AS who, #{win_cols('MIN', 'exp_total_start', 'start_time', starts, 'mn')}, " \
+                            "#{win_cols('MAX', 'exp_total_end', 'start_time', starts, 'mx')} FROM cycles " \
+                            'WHERE exp_total_start IS NOT NULL AND exp_total_end IS NOT NULL ' \
+                            'AND start_time >= ? AND start_time <= ? GROUP BY 1', lower, now)
+        exp_min = by_who(exp_rows, 'mn')
+        exp_max = by_who(exp_rows, 'mx')
+        bounties = q.call(win_cols('COUNT', '1', 'completed_time', starts), 'bounties',
+                          "status = 'completed' AND completed_time >= ? AND completed_time <= ?")
+        hunt_secs = q.call(win_cols('SUM', 'duration_seconds', 'start_time', starts), 'cycles',
+                           "cycle_type = 'hunt' AND end_time IS NOT NULL AND duration_seconds >= 10 " \
+                           'AND start_time >= ? AND start_time <= ?')
+        kills = q.call(win_cols('SUM', 'kill_count', 'date', dates), 'kill_stats', 'date >= ? AND date <= ?',
+                       [dates.min, dates.max])
+        idle = q.call(win_cols('SUM', 'duration_seconds', 'start_time', starts), 'cycles',
+                      "cycle_type = 'idle' AND start_time >= ? AND start_time <= ?")
+        encumbrance = q.call(win_cols('AVG', 'encumbrance_start', 'start_time', starts), 'cycles',
+                             "cycle_type = 'hunt' AND encumbrance_start IS NOT NULL AND start_time >= ? AND start_time <= ?")
+        item_limit = q.call(win_cols('COUNT', '1', 'start_time', starts), 'cycles',
+                            "cycle_type = 'rest' AND rest_reason LIKE '%item%' AND start_time >= ? AND start_time <= ?")
+        uptime_rows = conn.all("SELECT #{Report::WHO_SQL} AS who, " \
+                               "#{win_cols('SUM', "(CASE WHEN cycle_type = 'hunt' THEN duration_seconds END)", 'start_time', starts, 'h')}, " \
+                               "#{win_cols('SUM', 'duration_seconds', 'start_time', starts, 't')} FROM cycles " \
+                               'WHERE end_time IS NOT NULL AND start_time >= ? AND start_time <= ? GROUP BY 1', lower, now)
+        up_hunt = by_who(uptime_rows, 'h')
+        up_total = by_who(uptime_rows, 't')
+        deaths = q.call(win_cols('COUNT', '1', 'start_time', starts), 'cycles',
+                        "cycle_type = 'dead' AND start_time >= ? AND start_time <= ?")
+
+        get = ->(data, id) { data[id] || blank }
+        number = ->(value) { value.to_i.positive? ? Util.fmt(value) : '--' }
+        out = Text.banner('GS4 Analytics - Character Dashboard', Time.now.strftime('%Y-%m-%d %H:%M'))
+
+        out += window_section('Silver / Hour', people,
+                              ->(id) { get.call(silver, id).each_with_index.map { |v, i| hours[i].positive? ? (v.to_i / hours[i]).round : 0 } },
+                              ->(v) { Util.fmt(v) }, total: true)
+        out += window_section('Experience / Hour', people,
+                              lambda { |id|
+                                Array.new(4) do |i|
+                                  low = get.call(exp_min, id)[i]
+                                  high = get.call(exp_max, id)[i]
+                                  gained = low && high ? high.to_i - low.to_i : 0
+                                  gained.positive? && hours[i].positive? ? (gained / hours[i]).round : nil
+                                end
+                              },
+                              ->(v) { v ? Util.fmt(v) : '--' }, total: true)
+        out += window_section('Bounties / Hunt Hour', people,
+                              lambda { |id|
+                                Array.new(4) do |i|
+                                  hunt_h = get.call(hunt_secs, id)[i].to_i / 3600.0
+                                  hunt_h.positive? ? (get.call(bounties, id)[i].to_i / hunt_h).round(2) : nil
+                                end
+                              },
+                              ->(v) { v ? v.to_s : '--' })
+        out += window_section('Total Kills', people, ->(id) { get.call(kills, id) }, number, total: true)
+        out += window_section('Uptime (hunt share of tracked time)', people,
+                              lambda { |id|
+                                Array.new(4) { |i| Util.percent(get.call(up_hunt, id)[i].to_i, get.call(up_total, id)[i].to_i) }
+                              },
+                              ->(v) { v ? "#{v}%" : '--' })
+        out += window_section('Deaths', people, ->(id) { get.call(deaths, id) }, ->(v) { v.to_i.to_s }, total: true)
+        out += bank_section(conn, people)
+        out += window_section('Idle Time', people, ->(id) { get.call(idle, id) }, ->(v) { Util.hms(v) })
+        out += window_section('Avg Hunt Start Encumbrance', people, ->(id) { get.call(encumbrance, id) },
+                              ->(v) { v ? v.to_f.round(1).to_s : '--' })
+        out + window_section('Item Limit Rests', people, ->(id) { get.call(item_limit, id) }, ->(v) { v.to_i.to_s })
+      end
+
+      def bank_section(conn, people)
+        warnings = conn.all("SELECT (s.game || ':' || s.character) AS who, s.bank_name, s.balance FROM bank_snapshots s " \
+                            'JOIN (SELECT game, character, bank_name, MAX(timestamp) AS ts FROM bank_snapshots ' \
+                            "WHERE bank_name != '__total__' GROUP BY game, character, bank_name) m " \
+                            'ON s.game = m.game AND s.character = m.character AND s.bank_name = m.bank_name ' \
+                            'AND s.timestamp = m.ts WHERE s.balance >= ? ORDER BY s.balance DESC', Report::BANK_CAP)
+        soon = Report.bank_forecast(conn).select { |bank| bank[:days_to_cap] <= 7 }
+        out = heading('Bank Warnings (>= 2.0B)')
+        out += warnings.empty? ? ['No banks over threshold.'] : table(%w[Character Bank Balance],
+                                                                      warnings.map { |w| [people[w['who']] || w['who'], w['bank_name'], Util.fmt(w['balance'])] },
+                                                                      aligns: %i[left left right])
+        return out if soon.empty?
+
+        out + ['', 'Reaching 2.0B within 7 days (at the last 7 days rate):'] +
+          table(['Character', 'Bank', 'Days'], soon.map { |b| [people[b[:id]] || b[:id], b[:bank], format('%.1f', b[:days_to_cap])] },
+                aligns: %i[left left right])
+      end
+
+      # ----- experience ------------------------------------------------------
+
+      def exp_summary(conn, arg)
+        label, from = Report.range_from_arg(arg)
+        return ['Usage: ;analytics report exp [daily|weekly|monthly|ytd|total]'] unless label
+
+        now = Time.now.to_i
+        people = Report.labels(conn)
+        exp = conn.all("SELECT #{Report::WHO_SQL} AS who, MIN(exp_total_start) AS exp_a, MAX(exp_total_end) AS exp_b, " \
+                       'MIN(fame_start) AS fame_a, MAX(fame_end) AS fame_b, ' \
+                       "SUM(CASE WHEN cycle_type = 'hunt' AND end_time IS NOT NULL THEN duration_seconds ELSE 0 END) AS hunt_s " \
+                       'FROM cycles WHERE exp_total_start IS NOT NULL AND exp_total_end IS NOT NULL ' \
+                       'AND start_time >= ? AND start_time <= ? GROUP BY 1', from, now).to_h { |row| [row['who'], row] }
+        return ["No experience data for #{label}."] if exp.empty?
+
+        bounty_exp = conn.all("SELECT #{Report::WHO_SQL} AS who, SUM(exp_reward) AS total FROM bounties " \
+                              "WHERE status = 'completed' AND completed_time >= ? AND completed_time <= ? GROUP BY 1",
+                              from, now).to_h { |row| [row['who'], row['total'].to_i] }
+        # "total" has no fixed start, so it counts from the first cycle with experience
+        start = from.zero? ? conn.one('SELECT MIN(start_time) AS t FROM cycles WHERE exp_total_start IS NOT NULL')['t'] : from
+        hours = (now - (start || now)) / 3600.0
+
+        gain = ->(low, high) { low && high && high.to_i > low.to_i ? high.to_i - low.to_i : 0 }
+        rate = ->(amount, hrs) { hrs.positive? && amount.positive? ? Util.fmt((amount / hrs).round) : '--' }
+        totals = { exp: 0, fame: 0, bounty: 0, hunt: 0 }
+        rows = exp.sort_by { |id, _| (people[id] || id).downcase }.map do |id, row|
+          earned = gain.call(row['exp_a'], row['exp_b'])
+          fame = gain.call(row['fame_a'], row['fame_b'])
+          bounty = bounty_exp[id].to_i
+          hunt_h = row['hunt_s'].to_i / 3600.0
+          totals[:exp] += earned
+          totals[:fame] += fame
+          totals[:bounty] += bounty
+          totals[:hunt] += row['hunt_s'].to_i
+          [people[id] || id, Util.fmt(earned), Util.fmt(fame), Util.fmt(bounty), format('%.1f', hunt_h),
+           rate.call(earned, hours), rate.call(earned, hunt_h)]
+        end
+        hunt_h = totals[:hunt] / 3600.0
+        footer = ['TOTAL', Util.fmt(totals[:exp]), Util.fmt(totals[:fame]), Util.fmt(totals[:bounty]),
+                  format('%.1f', hunt_h), rate.call(totals[:exp], hours), rate.call(totals[:exp], hunt_h)]
+        banner('GS4 Analytics - Experience', label, "#{format('%.1f', hours)} hours in range") +
+          table(['Character', 'Exp Gained', 'Fame', 'Bounty Exp', 'Hunt Hrs', 'Exp/Hr', 'Exp/HuntHr'], rows, footer: footer) +
+          ['Bounty Exp is shown for reference; it is already part of Exp Gained.']
+      end
+
+      # ----- bounties --------------------------------------------------------
+
+      def bounty_summary(conn, who, arg)
+        label, from = Report.range_from_arg(arg)
+        return ['Usage: ;analytics report bounty [daily|weekly|monthly|ytd|total]'] unless label
+
+        now = Time.now.to_i
+        rows = conn.all('SELECT * FROM bounties WHERE game = ? AND character = ? AND (' \
+                        "(status = 'completed' AND completed_time >= ? AND completed_time <= ?) OR " \
+                        "(status = 'abandoned' AND received_time >= ? AND received_time <= ?) OR status = 'active') " \
+                        'ORDER BY received_time DESC', *who, from, now, from, now)
+        done = rows.select { |row| row['status'] == 'completed' }
+        abandoned = rows.count { |row| row['status'] == 'abandoned' }
+        active = rows.count { |row| row['status'] == 'active' }
+        finished = done.size + abandoned
+        hunt_h = conn.one("SELECT SUM(duration_seconds) AS s FROM cycles WHERE game = ? AND character = ? " \
+                          "AND cycle_type = 'hunt' AND end_time IS NOT NULL AND duration_seconds >= 10 " \
+                          'AND start_time >= ? AND start_time <= ?', *who, from, now)['s'].to_i / 3600.0
+        sum = ->(list, key) { list.sum { |row| row[key].to_i } }
+        average = ->(list, key) { list.empty? ? 0 : (sum.call(list, key) / list.size.to_f).round }
+        took = ->(row) { row['completed_time'].to_i - row['received_time'].to_i }
+        avg_time = done.empty? ? 0 : done.sum(&took) / done.size
+
+        out = banner('GS4 Analytics - Bounty Summary', label, who.name)
+        out += heading('Overview')
+        out += table(%w[Status Count], [['Completed', done.size], ['Abandoned', abandoned], ['Active', active],
+                                        ['Total', rows.size],
+                                        ['Success rate', "#{Util.percent(done.size, finished) || 0}%"],
+                                        ['Abandon rate', "#{Util.percent(abandoned, finished) || 0}%"],
+                                        ['Avg completion', Util.minutes(avg_time)],
+                                        ['Bounties / hunt hr', hunt_h.positive? ? (done.size / hunt_h).round(2) : 0]])
+        out += table(%w[Reward Average Total],
+                     [['Silver', Util.fmt(average.call(done, 'silver_reward')), Util.fmt(sum.call(done, 'silver_reward'))],
+                      ['Experience', Util.fmt(average.call(done, 'exp_reward')), Util.fmt(sum.call(done, 'exp_reward'))],
+                      ['Bounty points', Util.fmt(average.call(done, 'bp_reward')), Util.fmt(sum.call(done, 'bp_reward'))]])
+        return out if done.empty?
+
+        breakdown = lambda do |title, groups, limit, first_head|
+          list = groups.sort_by { |_, group| -group.size }.first(limit).map do |key, group|
+            [Array(key).join(' / ')[0, 34], group.size, Util.fmt(average.call(group, 'silver_reward')),
+             Util.fmt(average.call(group, 'exp_reward')), Util.fmt(average.call(group, 'bp_reward')),
+             Util.minutes(group.sum(&took) / group.size)]
+          end
+          heading(title) + table([first_head, 'Count', 'Avg Silver', 'Avg Exp', 'Avg BP', 'Avg Time'], list)
+        end
+        out += breakdown.call('By type', done.group_by { |row| row['bounty_type'] || 'unknown' }, 99, 'Type')
+        with_creature = done.reject { |row| row['creature'].to_s.empty? }
+        unless with_creature.empty?
+          out += breakdown.call('Top creatures', with_creature.group_by { |row| row['creature'] }, 10, 'Creature')
+          out += breakdown.call('Top type + creature combinations',
+                                with_creature.group_by { |row| [row['bounty_type'], row['creature']] }, 20, 'Type / creature')
+        end
+        out + value_per_hour(rows.reject { |row| row['status'] == 'active' })
+      end
+
+      # Rewards per hour spent on the bounty (received to turn-in), so types
+      # can be compared on what an hour spent on them returns
+      def value_per_hour(finished)
+        value_of = lambda do |list|
+          timed = list.select { |row| row['status'] == 'completed' && row['completed_time'].to_i > row['received_time'].to_i }
+          secs = timed.sum { |row| row['completed_time'].to_i - row['received_time'].to_i }
+          hrs = secs / 3600.0
+          per_hour = ->(key) { hrs.positive? ? (timed.sum { |row| row[key].to_i } / hrs).round : nil }
+          done = list.count { |row| row['status'] == 'completed' }
+          dropped = list.count { |row| row['status'] == 'abandoned' }
+          { done: done, timed: timed.size, bp_hr: per_hour.call('bp_reward'), exp_hr: per_hour.call('exp_reward'),
+            silver_hr: per_hour.call('silver_reward'), avg_min: timed.empty? ? nil : (secs / 60.0 / timed.size).round(1),
+            abandon_pct: Util.percent(dropped, done + dropped) || 0.0 }
+        end
+        show = ->(value) { value.nil? ? '--' : Util.fmt(value) }
+
+        by_type = finished.group_by { |row| row['bounty_type'] || 'unknown' }.transform_values(&value_of)
+        out = []
+        unless by_type.empty?
+          out += heading('Bounty value per hour (rewards / time from receiving to turn-in)')
+          out += table(['Type', 'Done', 'Abnd %', 'Avg Min', 'BP/Hr', 'Exp/Hr', 'Silver/Hr'],
+                       by_type.sort_by { |_, v| -(v[:bp_hr] || -1) }.map do |type, v|
+                         [type, v[:done], "#{v[:abandon_pct]}%", v[:avg_min] || '--', show.call(v[:bp_hr]),
+                          show.call(v[:exp_hr]), show.call(v[:silver_hr])]
+                       end)
+        end
+
+        # Gem, herb and other non-creature bounties are grouped by area instead
+        target = ->(row) { row['creature'].to_s.empty? ? row['area'].to_s : row['creature'].to_s }
+        combos = finished.reject { |row| row['bounty_type'].to_s == 'untracked' || target.call(row).empty? }
+                         .group_by { |row| [row['bounty_type'].to_s, target.call(row)] }
+                         .transform_values(&value_of).select { |_, v| v[:timed] >= 3 && v[:bp_hr] }
+        return out if combos.size < 2
+
+        best = combos.max_by { |_, v| v[:bp_hr] }
+        out += heading('Waive candidates - lowest BP per hour (3+ completed)')
+        out += table(['Type', 'Creature / area', 'Done', 'Abnd %', 'Avg Min', 'BP/Hr'],
+                     combos.sort_by { |_, v| v[:bp_hr] }.first(5).map do |(type, name), v|
+                       [type, name[0, 24], v[:done], "#{v[:abandon_pct]}%", v[:avg_min], show.call(v[:bp_hr])]
+                     end, aligns: %i[left left right right right right])
+        out << "Best for comparison: #{best[0].join(' / ')} at #{show.call(best[1][:bp_hr])} BP/Hr"
+      end
+
+      # ----- cycles ----------------------------------------------------------
+
+      def cycle_summary(conn, who, arg)
+        label, from = Report.range_from_arg(arg)
+        return ['Usage: ;analytics report cycle [daily|weekly|monthly|ytd|total]'] unless label
+
+        now = Time.now.to_i
+        cycles = conn.all('SELECT * FROM cycles WHERE game = ? AND character = ? AND start_time >= ? AND start_time <= ?',
+                          *who, from, now)
+        return ["No cycle data for #{who.name} in #{label}. Start hunting to generate analytics!"] if cycles.empty?
+
+        by_type = cycles.group_by { |row| row['cycle_type'] }
+        seconds = ->(type) { (by_type[type] || []).sum { |row| row['duration_seconds'].to_i } }
+        tracked = cycles.sum { |row| row['duration_seconds'].to_i }
+        hunt_time = seconds.call('hunt')
+        elapsed = label == 'Today' ? now - Util.midnight : tracked
+        silver = conn.one("SELECT COALESCE(SUM(delta_silver), 0) AS s FROM bank_snapshots WHERE game = ? AND character = ? " \
+                          "AND bank_name = '__total__' AND delta_silver IS NOT NULL AND timestamp >= ? AND timestamp <= ?",
+                          *who, from, now)['s'].to_i
+        silver_hr = elapsed.positive? ? (silver / (elapsed / 3600.0)).round : 0
+
+        out = banner('GS4 Analytics - Summary', label, who.name)
+        out += heading("Uptime: #{Util.percent(hunt_time, tracked, 2) || 0}%")
+        out += table(%w[Cycle Count Duration Mean Median Mode Shortest Longest],
+                     %w[hunt rest dead idle].filter_map do |type|
+                       list = by_type[type] or next
+                       durations = list.filter_map { |row| row['duration_seconds'] }
+                       [type.capitalize, list.size, Util.hm(seconds.call(type)), *%i[mean median mode].map { |stat| Util.minutes(Util.public_send(stat, durations)) },
+                        Util.minutes(durations.min), Util.minutes(durations.max)]
+                     end)
+        out += exp_section(cycles, hunt_time, by_type['hunt'] || [])
+        out += encumbrance_section(by_type['hunt'] || [])
+        out += reason_section(cycles)
+        out += efficiency_section(by_type['hunt'] || [])
+        out + heading('Time and silver') +
+          table(['Metric', 'Value'], [[label == 'Today' ? 'Since midnight' : 'Total tracked time', Util.hm(elapsed)],
+                                      ['Silver / hour', Util.fmt(silver_hr)]], aligns: %i[left right])
+      end
+
+      def exp_section(cycles, hunt_time, hunts)
+        starts = cycles.filter_map { |row| row['exp_total_start'] }
+        return [] if starts.empty?
+
+        gained = cycles.filter_map { |row| row['exp_total_end'] }.max.to_i - starts.min
+        fame = cycles.filter_map { |row| row['fame_end'] }.max.to_i - cycles.filter_map { |row| row['fame_start'] }.min.to_i
+        field = cycles.filter_map { |row| row['exp_field_end'] }
+        return [] unless gained.positive? || fame.positive? || field.any?
+
+        per_hour = hunt_time.positive? ? (gained.to_f / hunt_time * 3600).round : 0
+        per_hunt = hunts.empty? ? 0 : (gained.to_f / hunts.size).round
+        dash = ->(value) { value.to_i.positive? ? Util.fmt(value) : '--' }
+        heading('Experience and fame') +
+          table(%w[Metric Value], [['Total exp', dash.call(gained)], ['Fame', dash.call(fame)], ['Exp / hour', dash.call(per_hour)],
+                                   ['Exp / hunt', dash.call(per_hunt)],
+                                   ['Field exp mean', field.empty? ? '--' : Util.fmt(Util.mean(field))],
+                                   ['Field exp median', field.empty? ? '--' : Util.fmt(Util.median(field))],
+                                   ['Field exp mode', field.empty? ? '--' : Util.fmt(Util.mode(field))]], aligns: %i[left right])
+      end
+
+      def encumbrance_section(hunts)
+        rows = { 'Hunt start' => 'encumbrance_start', 'Hunt end' => 'encumbrance_end' }.filter_map do |name, key|
+          values = hunts.filter_map { |row| row[key] }
+          next if values.empty?
+
+          [name, *[Util.mean(values), Util.median(values), Util.mode(values)].map { |stat| "#{stat.round(1)}%" }]
+        end
+        rows.empty? ? [] : heading('Encumbrance') + table(%w[When Mean Median Mode], rows)
+      end
+
+      def reason_section(cycles)
+        counted = cycles.reject { |row| row['rest_reason'].to_s.empty? }.group_by { |row| row['rest_reason'] }
+        return [] if counted.empty?
+
+        top = counted.sort_by { |_, list| -list.size }.first(5)
+        total = top.sum { |_, list| list.size }
+        heading('Rest reasons (why hunting stopped)') +
+          table(['Reason', 'Count', '%', 'Avg duration'],
+                top.map do |reason, list|
+                  [reason[0, 28], list.size, "#{Util.percent(list.size, total)}%",
+                   Util.minutes(Util.mean(list.filter_map { |row| row['duration_seconds'] }))]
+                end)
+      end
+
+      def efficiency_section(hunts)
+        finished = hunts.select { |row| row['duration_seconds'].to_i.positive? }
+        return [] if finished.empty?
+
+        buckets = { 'Short (< 5 min)' => ->(s) { s < 300 }, 'Medium (5-15 min)' => ->(s) { s >= 300 && s < 900 },
+                    'Long (15+ min)' => ->(s) { s >= 900 } }
+        rows = buckets.map do |name, test|
+          count = finished.count { |row| test.call(row['duration_seconds']) }
+          [name, count, "#{Util.percent(count, finished.size)}%"]
+        end
+        longest, shortest = finished.minmax_by { |row| -row['duration_seconds'] }
+        heading('Hunt efficiency') + table(['Duration range', 'Count', '%'], rows) +
+          ["Longest hunt:  #{Util.minutes(longest['duration_seconds'])} (#{longest['rest_reason'] || 'unknown'})",
+           "Shortest hunt: #{Util.minutes(shortest['duration_seconds'])} (#{shortest['rest_reason'] || 'unknown'})"]
+      end
+    end
+  end
+end
+
+module GS4Analytics
+  # ==========================================================================
+  # Dashboard: a read-only web page served from this computer. Run it as
+  # ;analytics --dashboard (with the collector) or ;analytics serve.
+  # ==========================================================================
+  module Dashboard
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    RANGES        = { 'daily' => 'Today', 'weekly' => 'This Week', 'monthly' => 'This Month' }.freeze
+    CACHE_SECS    = 3
+    IDLE_WARN     = 480    # seconds idle before amber/red, matches the cycle manager
+    STALE_OPEN    = 7200   # an open cycle older than this means the character isn't running
+    NO_KILL_WARN  = 900    # seconds hunting without a kill before red
+    DAY_HUNT      = 7200   # hunting seconds for a day to count toward "typical"
+    HOUR_HUNT     = 1200   # hunting seconds for an hour to count toward "typical"
+    BASE_DAYS     = 30
+    MIN_SAMPLES   = 5
+    CRASH_REASONS = ['unhandled exit', 'idle recovery'].freeze
+    MAX_LINE      = 4096   # longest request line or header read
+    WHO           = Report::WHO_SQL
+
+    @cache = {}
+    @lock = Monitor.new # re-entrant: the character view reuses the overview
+
+    class << self
+      def start(port, host)
+        stop
+        @server = TCPServer.new(host, port)
+        @thread = Thread.new do
+          loop do
+            client = @server.accept
+            Thread.new(client) { |socket| serve(socket) }
+          end
+        rescue IOError, Errno::EBADF
+          nil
+        end
+        @port = port
+      end
+
+      def stop
+        @server&.close
+        @thread&.kill
+        @server = @thread = nil
+      rescue IOError
+        nil
+      end
+
+      def running? = !@server.nil?
+      attr_reader :port
+
+      # Cached so several open tabs don't multiply the database work
+      def memo(key)
+        @lock.synchronize do
+          hit = @cache[key]
+          return hit[:val] if hit && Time.now.to_f - hit[:at] < CACHE_SECS
+
+          val = yield
+          @cache[key] = { at: Time.now.to_f, val: val }
+          val
+        end
+      end
+
+      def overview
+        memo(:overview) { build_overview }
+      end
+
+      # One character: the overview entry plus range figures and tables
+      def character(id, range)
+        range = 'daily' unless RANGES.key?(range)
+        memo([:char, id, range]) do
+          ov = overview
+          base = ov['characters'].find { |entry| entry['id'].casecmp?(id) }
+          next nil unless base
+
+          base.merge(range_figures(base['id'], range)).merge(
+            'generated_at' => ov['generated_at'], 'day_start' => ov['day_start'], 'range' => range, 'ranges' => RANGES
+          )
+        end
+      end
+
+      private
+
+      # ----- SQL fragments ---------------------------------------------------
+
+      def local(col) = "#{col}, 'unixepoch', 'localtime'"
+      def day(col) = "strftime('%Y-%m-%d', #{local(col)})"
+
+      # Seconds since local midnight for a timestamp column
+      def tod(col)
+        "(CAST(strftime('%H', #{local(col)}) AS INTEGER) * 3600 + CAST(strftime('%M', #{local(col)}) AS INTEGER) * 60 " \
+          "+ CAST(strftime('%S', #{local(col)}) AS INTEGER))"
+      end
+
+      # ======================================================================
+      # OVERVIEW: today, every character
+      # ======================================================================
+
+      def build_overview
+        now = Time.now.to_i
+        today = Date.today
+        day_start = Util.midnight(today)
+        ctx = { now: now, day_start: day_start, today_s: today.to_s, tod_now: now - day_start,
+                base_from: Util.midnight(today - BASE_DAYS) }
+        data = Database.reader { |conn| overview_data(conn, ctx) }
+
+        names = (data[:rows].keys + data[:latest].select { |_, row| now - row['start_time'].to_i < 86_400 }.keys).uniq
+        chars = names.sort_by { |id| data[:labels][id].to_s.downcase }.map do |id|
+          build_status(id, data[:labels][id] || id, ctx, data)
+        end
+        alerts = chars.flat_map do |char|
+          char['light']['reasons'].map { |r| { 'id' => char['id'], 'character' => char['name'], 'level' => r['level'], 'text' => r['text'] } }
+        end.sort_by { |alert| [alert['level'] == 'red' ? 0 : 1, alert['character']] }
+
+        { 'generated_at' => now, 'day_start' => day_start, 'characters' => chars, 'alerts' => alerts,
+          'names' => chars.map { |char| char['id'] } }
+      end
+
+      def overview_data(conn, ctx)
+        now, day_start, base_from, tod_now = ctx.values_at(:now, :day_start, :base_from, :tod_now)
+        today = Date.today
+        data = { labels: Report.labels(conn) }
+
+        # cycles touching today (timeline and today's figures)
+        data[:rows] = conn.all("SELECT #{WHO} AS who, cycle_type, start_time, end_time, duration_seconds, rest_reason, " \
+                               'profile, exp_total_start, exp_total_end, exp_field_start, exp_field_end, exp_field_max, ' \
+                               'encumbrance_start FROM cycles WHERE start_time >= ? AND (end_time IS NULL OR end_time >= ?) ' \
+                               'ORDER BY start_time', day_start - 86_400, day_start).group_by { |row| row['who'] }
+
+        # latest cycle per character, for state (covers characters not seen today)
+        data[:latest] = conn.all("SELECT #{WHO} AS who, cycle_type, start_time, end_time, rest_reason, profile FROM cycles " \
+                                 'WHERE start_time >= ? AND start_time = (SELECT MAX(c2.start_time) FROM cycles c2 ' \
+                                 'WHERE c2.game = cycles.game AND c2.character = cycles.character)',
+                                 now - (7 * 86_400)).to_h { |row| [row['who'], row] }
+
+        # per-day totals for pace: the full day, and up to this time of day
+        daily = Hash.new { |h, id| h[id] = Hash.new { |h2, metric| h2[metric] = {} } }
+        per_day = lambda do |metric, value, table, ts, where|
+          conn.all("SELECT #{WHO} AS who, #{day(ts)} AS d, SUM(#{value}) AS f, " \
+                   "SUM(CASE WHEN #{tod(ts)} < ? THEN #{value} ELSE 0 END) AS u FROM #{table} " \
+                   "WHERE #{where} AND #{ts} >= ? AND #{ts} <= ? GROUP BY 1, 2", tod_now, base_from, now).each do |row|
+            daily[row['who']][metric][row['d'].to_s] = [row['f'].to_f, row['u'].to_f]
+          end
+        end
+        per_day.call('hunt', 'duration_seconds', 'cycles', 'start_time',
+                     "cycle_type = 'hunt' AND end_time IS NOT NULL AND duration_seconds >= 10")
+        per_day.call('silver', 'delta_silver', 'bank_snapshots', 'timestamp',
+                     "bank_name = '__total__' AND delta_silver IS NOT NULL")
+        per_day.call('exp', '(exp_total_end - exp_total_start)', 'cycles', 'start_time', 'exp_total_end > exp_total_start')
+        per_day.call('bounties', '1', 'bounties', 'completed_time', "status = 'completed'")
+        data[:daily] = daily
+
+        # rest reasons up to this time of day, per day
+        reasons = Hash.new { |h, id| h[id] = Hash.new { |h2, d| h2[d] = Hash.new(0) } }
+        conn.all("SELECT #{WHO} AS who, #{day('start_time')} AS d, LOWER(TRIM(rest_reason)) AS reason, COUNT(*) AS n " \
+                 "FROM cycles WHERE cycle_type = 'rest' AND start_time >= ? AND start_time <= ? " \
+                 "AND #{tod('start_time')} < ? GROUP BY 1, 2, 3", base_from, now, tod_now).each do |row|
+          reason = row['reason'].to_s.sub(/[.!]+\z/, '')
+          reasons[row['who']][row['d'].to_s][reason.empty? ? '(none)' : reason] += row['n'].to_i
+        end
+        data[:reasons] = reasons
+
+        data[:enc_base] = conn.all("SELECT #{WHO} AS who, AVG(encumbrance_start) AS a, COUNT(*) AS n FROM cycles " \
+                                   "WHERE cycle_type = 'hunt' AND encumbrance_start IS NOT NULL " \
+                                   'AND start_time >= ? AND start_time < ? GROUP BY 1', base_from, day_start)
+                              .to_h { |row| [row['who'], [row['a'].to_f, row['n'].to_i]] }
+        data[:last_kill] = conn.all("SELECT #{WHO} AS who, MAX(last_kill_at) AS t FROM kill_stats WHERE date >= ? GROUP BY 1",
+                                    (today - 1).to_s).to_h { |row| [row['who'], row['t']&.to_i] }
+        data[:last_bounty] = conn.all("SELECT #{WHO} AS who, MAX(completed_time) AS t FROM bounties " \
+                                      "WHERE status = 'completed' AND completed_time >= ? GROUP BY 1",
+                                      base_from).to_h { |row| [row['who'], row['t']&.to_i] }
+        data[:kills_today] = conn.all("SELECT #{WHO} AS who, SUM(kill_count) AS t FROM kill_stats WHERE date = ? GROUP BY 1",
+                                      ctx[:today_s]).to_h { |row| [row['who'], row['t'].to_i] }
+
+        # the active bounty, and how long each bounty type usually takes
+        data[:active] = conn.all("SELECT #{WHO} AS who, bounty_type, creature, area, count_required, count_completed, " \
+                                 "received_time FROM bounties WHERE status = 'active' AND received_time >= ? " \
+                                 'ORDER BY received_time', now - 86_400).to_h { |row| [row['who'], row] }
+        took = Hash.new { |h, key| h[key] = [] }
+        conn.all("SELECT #{WHO} AS who, bounty_type AS type, completed_time - received_time AS secs FROM bounties " \
+                 "WHERE status = 'completed' AND completed_time >= ? AND received_time IS NOT NULL", base_from).each do |row|
+          next unless row['secs'].to_i.positive?
+
+          took[[row['who'], row['type'].to_s]] << row['secs'].to_i
+          took[[nil, row['type'].to_s]] << row['secs'].to_i
+        end
+        data[:took] = took
+        data
+      end
+
+      def build_status(id, label, ctx, data)
+        now, day_start, today_s = ctx.values_at(:now, :day_start, :today_s)
+        name = Who.parse(id).name
+        last = data[:latest][id]
+        daily = data[:daily][id]
+        reasons = data[:reasons][id]
+        last_kill = data[:last_kill][id]
+
+        # ---- state ----
+        state = { 'type' => 'offline', 'since' => nil, 'reason' => nil, 'profile' => nil }
+        if last
+          if last['end_time'].nil? && now - last['start_time'].to_i < STALE_OPEN
+            state = { 'type' => last['cycle_type'].to_s, 'since' => last['start_time'].to_i,
+                      'reason' => last['rest_reason'].to_s, 'profile' => Report.short_profile(last['profile'], name) }
+          else
+            state['since'] = (last['end_time'] || last['start_time']).to_i
+          end
+        end
+
+        # ---- timeline segments, clipped to today ----
+        rows = data[:rows][id] || []
+        timeline = rows.filter_map do |row|
+          from = [row['start_time'].to_i, day_start].max
+          to = row['end_time']&.to_i || (now if now - row['start_time'].to_i < STALE_OPEN)
+          [row['cycle_type'].to_s, from, to, row['rest_reason'].to_s] if to && to > from
+        end
+
+        # ---- today's figures (cycles that started today) ----
+        started = rows.select { |row| row['start_time'].to_i >= day_start }
+        hunts = started.select { |row| row['cycle_type'] == 'hunt' && row['end_time'] && row['duration_seconds'].to_i >= 10 }
+        rests = started.select { |row| row['cycle_type'] == 'rest' && row['end_time'] && row['duration_seconds'].to_i.positive? }
+        hunt_s = hunts.sum { |row| row['duration_seconds'].to_i }
+        rest_s = rests.sum { |row| row['duration_seconds'].to_i }
+        idle_s = started.select { |row| row['cycle_type'] == 'idle' }.sum { |row| row['duration_seconds'].to_i }
+        deaths = started.count { |row| row['cycle_type'] == 'dead' }
+        crashes = started.select { |row| CRASH_REASONS.include?(row['rest_reason'].to_s.strip.downcase) }
+                         .map { |row| { 'at' => row['start_time'].to_i, 'reason' => row['rest_reason'].to_s } }
+        item_rests = rests.count { |row| row['rest_reason'].to_s.match?(/\bitems?\b/i) }
+
+        # mind (field exp) as a percent of capacity, where capacity is known
+        percent = ->(value, max) { value && max && max.to_i.positive? ? (value.to_f * 100 / max.to_i).round(1) : nil }
+        hunt_rows = started.select { |row| row['cycle_type'] == 'hunt' }
+        mind_start = hunt_rows.filter_map { |row| percent.call(row['exp_field_start'], row['exp_field_max']) }
+        mind_end = hunt_rows.filter_map { |row| row['end_time'] && percent.call(row['exp_field_end'], row['exp_field_max']) }
+        absorbed = rests.filter_map do |row|
+          before = row['exp_field_start']
+          after = row['exp_field_end']
+          [before.to_i - after.to_i, row['duration_seconds'].to_i] if before && after && before.to_i >= after.to_i
+        end
+        enc_today = hunt_rows.filter_map { |row| row['encumbrance_start']&.to_f }
+
+        pace = pace_for(daily, today_s)
+        reason_rows = reason_rows_for(reasons, today_s, pace[:active_days])
+        pace = pace[:metrics]
+        bounty = bounty_for(id, data, now)
+
+        reds, ambers = lights(state, now, last_kill, hunt_s, pace, deaths, item_rests, crashes, bounty, reason_rows,
+                              data[:enc_base][id], enc_today, mind_start)
+        level = if state['type'] == 'offline' then 'gray'
+                elsif reds.any? then 'red'
+                elsif ambers.any? then 'amber'
+                else 'green'
+                end
+        {
+          'id' => id, 'name' => label, 'state' => state, 'timeline' => timeline,
+          'light' => { 'level'   => level,
+                       'reasons' => reds.map { |t| { 'level' => 'red', 'text' => t } } +
+                         ambers.map { |t| { 'level' => 'amber', 'text' => t } } },
+          'pace' => pace, 'last_kill' => last_kill, 'last_bounty' => data[:last_bounty][id],
+          'today' => { 'hunt_s' => hunt_s, 'rest_s' => rest_s, 'idle_s' => idle_s, 'deaths' => deaths,
+                       'kills' => data[:kills_today][id].to_i, 'hunts' => hunts.size, 'rests' => rests.size,
+                       'item_rests' => item_rests, 'uptime_pct' => Util.percent(hunt_s, hunt_s + rest_s) },
+          'crashes' => crashes, 'bounty' => bounty, 'rest_reasons' => reason_rows.first(8),
+          'mind' => { 'start_avg' => Util.mean(mind_start)&.round(1), 'end_avg' => Util.mean(mind_end)&.round(1),
+                      'samples' => mind_end.size,
+                      'absorbed_per_min' => absorbed.sum { |a| a[1] }.zero? ? nil : (absorbed.sum { |a| a[0] } * 60.0 / absorbed.sum { |a| a[1] }).round(1),
+                      'absorbed_per_rest' => absorbed.empty? ? nil : Util.mean(absorbed.map(&:first)).round },
+          'encumbrance' => { 'today' => Util.mean(enc_today)&.round(1), 'typical' => data[:enc_base][id]&.first&.round(1) }
+        }
+      end
+
+      # Silver, exp and bounties so far today against what this character
+      # typically has by this time of day, and the projected end of day
+      def pace_for(daily, today_s)
+        active_days = (daily['hunt'] || {}).select { |d, (full, _)| d != today_s && full >= DAY_HUNT }.keys
+        metrics = %w[silver exp bounties].to_h do |metric|
+          series = daily[metric] || {}
+          so_far = (series[today_s] || [0, 0])[0]
+          typical_now = Util.mean(active_days.map { |d| (series[d] || [0, 0])[1] })
+          typical_day = Util.mean(active_days.map { |d| (series[d] || [0, 0])[0] })
+          ok = active_days.size >= MIN_SAMPLES && typical_now&.positive?
+          [metric, { 'so_far' => so_far.round(1), 'typical_now' => typical_now&.round(1),
+                     'typical_day' => typical_day&.round(1),
+                     'projected' => ok ? (so_far / typical_now * typical_day).round(1) : nil,
+                     'pct' => ok ? ((so_far / typical_now - 1) * 100).round(1) : nil, 'samples' => active_days.size }]
+        end
+        { metrics: metrics, active_days: active_days }
+      end
+
+      # Rest reasons today against the typical count by this time of day
+      def reason_rows_for(reasons, today_s, active_days)
+        (reasons.values.flat_map(&:keys) + reasons[today_s].keys).uniq.map do |reason|
+          typical = active_days.empty? ? nil : (active_days.sum { |d| reasons[d][reason] }.to_f / active_days.size).round(1)
+          { 'reason' => reason, 'today' => reasons[today_s][reason], 'typical' => typical }
+        end.select { |row| row['today'].positive? || row['typical'].to_f >= 0.5 }
+           .sort_by { |row| [-row['today'], -row['typical'].to_f] }
+      end
+
+      # The active bounty's age against how long that type usually takes
+      def bounty_for(id, data, now)
+        active = data[:active][id] or return nil
+
+        type = active['bounty_type'].to_s
+        durations = data[:took][[id, type]].size >= MIN_SAMPLES ? data[:took][[id, type]] : data[:took][[nil, type]]
+        typical = durations.size >= MIN_SAMPLES ? Util.median(durations).round : nil
+        age = now - active['received_time'].to_i
+        { 'type' => type, 'target' => active['creature'].to_s.empty? ? active['area'].to_s : active['creature'].to_s,
+          'done' => active['count_completed'].to_i, 'need' => active['count_required'].to_i,
+          'received' => active['received_time'].to_i, 'age' => age, 'typical' => typical,
+          'stuck' => typical ? age > [typical * 2, 600].max : false }
+      end
+
+      # The status light: what turns a character amber or red
+      def lights(state, now, last_kill, hunt_s, pace, deaths, item_rests, crashes, bounty, reason_rows, enc_base, enc_today, mind_start)
+        reds = []
+        ambers = []
+        since = state['since'] ? now - state['since'] : 0
+        reds << "Dead for #{since / 60} min" if state['type'] == 'dead'
+        (since > IDLE_WARN * 2 ? reds : ambers) << "Idle for #{since / 60} min" if state['type'] == 'idle' && since > IDLE_WARN
+        if state['type'] == 'hunt' && since > NO_KILL_WARN && last_kill && now - last_kill > NO_KILL_WARN
+          reds << "No kills for #{(now - last_kill) / 60} min while hunting"
+        end
+        if hunt_s >= 3600
+          { 'silver' => 'Silver', 'exp' => 'Exp' }.each do |metric, label|
+            pct = pace[metric]['pct'] or next
+            if pct <= -50 then reds << "#{label} #{pct.round}% vs typical by this time"
+            elsif pct <= -20 then ambers << "#{label} #{pct.round}% vs typical by this time"
+            end
+          end
+        end
+        ambers << "#{deaths} death#{'s' unless deaths == 1} today" if deaths.positive?
+        ambers << "#{item_rests} item limit rest#{'s' unless item_rests == 1} today" if item_rests.positive?
+        ambers << "#{crashes.size} crash / idle recovery today" if crashes.any?
+        ambers << "Bounty running #{bounty['age'] / 60} min (typical #{bounty['typical'] / 60} min)" if bounty && bounty['stuck']
+        reason_rows.each do |row|
+          next if row['reason'] == '(none)' || row['typical'].nil?
+
+          if row['today'] >= 3 && row['today'] >= (row['typical'] * 2) + 1
+            ambers << "#{row['reason']}: #{row['today']} rests today (typical #{row['typical']} by now)"
+          end
+        end
+        if enc_base && enc_base[1] >= 10 && enc_today.size >= 3 && Util.mean(enc_today) >= enc_base[0] + 10
+          ambers << "Starting hunts at #{Util.mean(enc_today).round}% encumbrance (typical #{enc_base[0].round}%)"
+        end
+        ambers << "Starting hunts with mind #{Util.mean(mind_start).round}% full" if mind_start.size >= 3 && Util.mean(mind_start) >= 90
+        [reds, ambers]
+      end
+
+      # ======================================================================
+      # ONE CHARACTER: range figures and the deep-dive tables
+      # ======================================================================
+
+      def range_figures(id, range)
+        label, from = Report.range_from_arg(range)
+        who = Who.parse(id)
+        now = Time.now.to_i
+        hours = [(now - from) / 3600.0, 0.01].max
+        Database.reader do |conn|
+          k = conn.one("SELECT SUM(CASE WHEN cycle_type = 'hunt' AND end_time IS NOT NULL AND duration_seconds >= 10 THEN duration_seconds ELSE 0 END) AS hunt_s, " \
+                       "SUM(CASE WHEN cycle_type = 'hunt' AND end_time IS NOT NULL AND duration_seconds >= 10 THEN 1 ELSE 0 END) AS hunt_n, " \
+                       "SUM(CASE WHEN cycle_type = 'rest' AND end_time IS NOT NULL AND duration_seconds > 0 THEN duration_seconds ELSE 0 END) AS rest_s, " \
+                       "SUM(CASE WHEN cycle_type = 'rest' AND end_time IS NOT NULL AND duration_seconds > 0 THEN 1 ELSE 0 END) AS rest_n, " \
+                       "SUM(CASE WHEN cycle_type = 'dead' THEN 1 ELSE 0 END) AS deaths, MIN(exp_total_start) AS exp_a, " \
+                       'MAX(exp_total_end) AS exp_b FROM cycles WHERE game = ? AND character = ? AND start_time >= ? AND start_time <= ?',
+                       *who, from, now)
+          silver = conn.one("SELECT SUM(delta_silver) AS t FROM bank_snapshots WHERE game = ? AND character = ? AND bank_name = '__total__' " \
+                            'AND delta_silver IS NOT NULL AND timestamp >= ? AND timestamp <= ?', *who, from, now)['t'].to_i
+          kills = conn.one('SELECT SUM(kill_count) AS t FROM kill_stats WHERE game = ? AND character = ? AND date >= ? AND date <= ?',
+                           *who, Report.date_of(from), Report.date_of(now))['t'].to_i
+          done = conn.one("SELECT COUNT(*) AS n, SUM(silver_reward) AS s, SUM(exp_reward) AS e FROM bounties WHERE game = ? AND character = ? " \
+                          "AND status = 'completed' AND completed_time >= ? AND completed_time <= ?", *who, from, now)
+          dropped = conn.one("SELECT SUM(CASE WHEN status = 'abandoned' THEN 1 ELSE 0 END) AS a, " \
+                             "SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) AS x FROM bounties " \
+                             'WHERE game = ? AND character = ? AND received_time >= ? AND received_time <= ?', *who, from, now)
+          step_secs = conn.all('SELECT step, SUM(seconds) AS s FROM rest_steps WHERE game = ? AND character = ? ' \
+                               'AND rest_start >= ? AND rest_start <= ? GROUP BY 1', *who, from, now)
+                          .to_h { |row| [row['step'].to_s, row['s'].to_f] }
+          covered = conn.one('SELECT COUNT(DISTINCT cycle_id) AS n FROM rest_steps WHERE game = ? AND character = ? ' \
+                             'AND rest_start >= ? AND rest_start <= ?', *who, from, now)['n'].to_i
+          trends, trend_meta = trends_for(conn, who, range, now)
+
+          hs = k['hunt_s'].to_i
+          hn = k['hunt_n'].to_i
+          rs = k['rest_s'].to_i
+          rn = k['rest_n'].to_i
+          hunt_h = hs / 3600.0
+          gain = k['exp_a'] && k['exp_b'] && k['exp_b'].to_i > k['exp_a'].to_i ? k['exp_b'].to_i - k['exp_a'].to_i : 0
+          {
+            'label' => label, 'hours' => hours.round(2),
+            'range_stats' => {
+              'silver' => silver, 'silver_hr' => (silver / hours).round,
+              'silver_hunt_hr' => hunt_h.positive? ? (silver / hunt_h).round : nil,
+              'exp' => gain, 'exp_hr' => (gain / hours).round, 'exp_hunt_hr' => hunt_h.positive? ? (gain / hunt_h).round : nil,
+              'bounties' => done['n'].to_i, 'bounties_hunt_hr' => hunt_h.positive? ? (done['n'].to_i / hunt_h).round(2) : nil,
+              'bounty_silver' => done['s'].to_i, 'bounty_exp' => done['e'].to_i,
+              'abandoned' => dropped['a'].to_i, 'expired' => dropped['x'].to_i,
+              'kills' => kills, 'deaths' => k['deaths'].to_i,
+              'hunt_avg' => hn.zero? ? nil : (hs.to_f / hn).round, 'rest_avg' => rn.zero? ? nil : (rs.to_f / rn).round,
+              'hunts' => hn, 'rests' => rn, 'uptime_pct' => Util.percent(hs, hs + rs)
+            },
+            'steps' => covered.zero? ? {} : step_secs.transform_values { |v| (v / covered).round(1) },
+            'steps_covered' => covered,
+            'trends' => trends, 'trend' => trend_meta,
+            'grounds' => hunting_grounds(conn, who), 'recent_bounties' => recent_bounties(conn, who)
+          }
+        end
+      end
+
+      # Each profile ranked by exp per hunt hour over the last 30 days
+      def hunting_grounds(conn, who)
+        from = Util.midnight(Date.today - (BASE_DAYS - 1))
+        grounds = Hash.new { |h, profile| h[profile] = { 'hunt_s' => 0, 'hunts' => 0, 'exp' => 0, 'kills' => 0, 'silver' => 0, 'deaths' => 0 } }
+        conn.all("SELECT profile, SUM(CASE WHEN cycle_type = 'hunt' THEN duration_seconds ELSE 0 END) AS hs, " \
+                 "SUM(CASE WHEN cycle_type = 'hunt' THEN 1 ELSE 0 END) AS n, " \
+                 "SUM(CASE WHEN cycle_type = 'hunt' AND exp_total_end > exp_total_start THEN exp_total_end - exp_total_start ELSE 0 END) AS xp, " \
+                 "SUM(CASE WHEN cycle_type = 'dead' THEN 1 ELSE 0 END) AS d FROM cycles " \
+                 'WHERE game = ? AND character = ? AND end_time IS NOT NULL AND profile IS NOT NULL AND start_time >= ? GROUP BY 1',
+                 *who, from).each do |row|
+          ground = grounds[Report.short_profile(row['profile'], who.name)]
+          ground['hunt_s'] += row['hs'].to_i
+          ground['hunts'] += row['n'].to_i
+          ground['exp'] += row['xp'].to_i
+          ground['deaths'] += row['d'].to_i
+        end
+        conn.all('SELECT profile, SUM(kill_count) AS k, SUM(total_silver) AS s FROM kill_stats ' \
+                 'WHERE game = ? AND character = ? AND date >= ? GROUP BY 1', *who, Report.date_of(from)).each do |row|
+          ground = grounds[Report.short_profile(row['profile'], who.name)]
+          ground['kills'] += row['k'].to_i
+          ground['silver'] += row['s'].to_i
+        end
+        grounds.select { |_, g| g['hunt_s'] >= 3600 }.map do |profile, g|
+          hours = g['hunt_s'] / 3600.0
+          { 'profile' => profile, 'hours' => hours.round(1), 'hunts' => g['hunts'], 'exp_hr' => (g['exp'] / hours).round,
+            'kills_hr' => (g['kills'] / hours).round(1), 'silver_hr' => (g['silver'] / hours).round, 'deaths' => g['deaths'] }
+        end.sort_by { |ground| -ground['exp_hr'] }
+      end
+
+      def recent_bounties(conn, who)
+        conn.all('SELECT bounty_type AS type, creature, area, status, received_time, completed_time, silver_reward, exp_reward ' \
+                 'FROM bounties WHERE game = ? AND character = ? ORDER BY received_time DESC LIMIT 12', *who).map do |row|
+          { 'type' => row['type'].to_s, 'target' => row['creature'].to_s.empty? ? row['area'].to_s : row['creature'].to_s,
+            'status' => row['status'].to_s, 'received' => row['received_time'].to_i,
+            'took' => row['completed_time'] ? row['completed_time'].to_i - row['received_time'].to_i : nil,
+            'silver' => row['silver_reward'], 'exp' => row['exp_reward'] }
+        end
+      end
+
+      # Per-bucket values against the character's own baseline. Today is shown
+      # by hour (baseline: last 14 days of hours with real hunting); week and
+      # month by day (baseline: last 30 days of days with real hunting). The
+      # current, unfinished hour or day is plotted but left out of the baseline.
+      def trends_for(conn, who, range, now)
+        hourly = range == 'daily'
+        pattern = hourly ? '%Y-%m-%d %H' : '%Y-%m-%d'
+        today = Date.today
+        base_days = hourly ? 14 : BASE_DAYS
+        base_from = Util.midnight(today - (base_days - 1))
+        min_hunt = hourly ? HOUR_HUNT : DAY_HUNT
+        hours = ->(date) { (0..23).map { |h| Time.new(date.year, date.month, date.day, h).strftime(pattern) } }
+        if hourly
+          labels = hours.call(today)
+          current = Time.now.strftime(pattern)
+          base_keys = (0...base_days).flat_map { |d| hours.call(today - (base_days - 1 - d)) }
+        else
+          days = range == 'weekly' ? 7 : 30
+          labels = (0...days).map { |i| (today - (days - 1 - i)).to_s }
+          current = today.to_s
+          base_keys = (0...base_days).map { |i| (today - (base_days - 1 - i)).to_s }
+        end
+
+        data = Hash.new { |h, metric| h[metric] = Hash.new(0.0) }
+        bucket = ->(col) { "strftime('#{pattern}', #{local(col)})" }
+        grab = lambda do |metric, sql, *params|
+          conn.all(sql, *params).each { |row| data[metric][row['b'].to_s] += row['t'].to_f }
+        end
+        hunt_where = "cycle_type = 'hunt' AND game = ? AND character = ? AND start_time >= ? AND start_time <= ?"
+        grab.call('hunt', "SELECT #{bucket.call('start_time')} AS b, SUM(duration_seconds) AS t FROM cycles WHERE #{hunt_where} " \
+                          'AND end_time IS NOT NULL AND duration_seconds >= 10 GROUP BY 1', *who, base_from, now)
+        grab.call('silver', "SELECT #{bucket.call('timestamp')} AS b, SUM(delta_silver) AS t FROM bank_snapshots WHERE game = ? AND character = ? " \
+                            "AND bank_name = '__total__' AND delta_silver IS NOT NULL AND timestamp >= ? AND timestamp <= ? GROUP BY 1",
+                  *who, base_from, now)
+        grab.call('exp', "SELECT #{bucket.call('start_time')} AS b, SUM(exp_total_end - exp_total_start) AS t FROM cycles WHERE game = ? AND character = ? " \
+                         'AND exp_total_end > exp_total_start AND start_time >= ? AND start_time <= ? GROUP BY 1', *who, base_from, now)
+        grab.call('bounties', "SELECT #{bucket.call('completed_time')} AS b, COUNT(*) AS t FROM bounties WHERE game = ? AND character = ? " \
+                              "AND status = 'completed' AND completed_time >= ? AND completed_time <= ? GROUP BY 1", *who, base_from, now)
+        unless hourly # kills are stored per day
+          grab.call('kills', 'SELECT date AS b, SUM(kill_count) AS t FROM kill_stats WHERE game = ? AND character = ? ' \
+                             'AND date >= ? AND date <= ? GROUP BY 1', *who, Report.date_of(base_from), Report.date_of(now))
+        end
+        { 'enc'  => ['encumbrance_start', 'encumbrance_start IS NOT NULL'],
+          'mind' => ['(exp_field_end * 100.0 / exp_field_max)', 'exp_field_end IS NOT NULL AND exp_field_max > 0'] }.each do |metric, (expr, cond)|
+          grab.call("#{metric}_sum", "SELECT #{bucket.call('start_time')} AS b, SUM(#{expr}) AS t FROM cycles WHERE #{hunt_where} AND #{cond} GROUP BY 1",
+                    *who, base_from, now)
+          grab.call("#{metric}_n", "SELECT #{bucket.call('start_time')} AS b, COUNT(*) AS t FROM cycles WHERE #{hunt_where} AND #{cond} GROUP BY 1",
+                    *who, base_from, now)
+        end
+
+        per = hourly ? 'per hour' : 'per day'
+        specs = [['silver', "Silver #{per}", :sum], ['exp', "Experience #{per}", :sum], ['bounties', "Bounties #{per}", :sum]]
+        specs << ['kills', 'Kills per day', :sum] unless hourly
+        specs << ['enc', 'Encumbrance at hunt start (%)', :avg] << ['mind', 'Mind at hunt end (%)', :avg]
+
+        value = lambda do |metric, kind, key|
+          if kind == :sum
+            data[metric][key]
+          else
+            count = data["#{metric}_n"][key]
+            count.positive? ? data["#{metric}_sum"][key] / count : nil
+          end
+        end
+        active = ->(key) { data['hunt'][key] >= min_hunt }
+
+        trends = specs.to_h do |metric, title, kind|
+          baseline = base_keys.reject { |key| key == current }.select { |key| active.call(key) }.filter_map { |key| value.call(metric, kind, key) }
+          mean = Util.mean(baseline) || 0.0
+          sd = baseline.size < 2 ? 0.0 : Math.sqrt(baseline.sum { |v| (v - mean)**2 } / baseline.size)
+          shown = labels.map do |label|
+            v = value.call(metric, kind, label)
+            if label == current then data['hunt'][label].positive? && v ? v.round(1) : nil
+            elsif label > current then nil
+            else active.call(label) && v ? v.round(1) : nil
+            end
+          end
+          complete = labels.each_index.filter_map { |i| shown[i] if labels[i] != current }
+          avg = Util.mean(complete)
+          [metric, { 'title' => title, 'kind' => kind.to_s, 'values' => shown, 'mean' => mean.round(2), 'sd' => sd.round(2),
+                     'n' => baseline.size, 'shown_avg' => avg&.round(2),
+                     'vs_pct' => avg && mean.positive? ? ((avg - mean) * 100.0 / mean).round(1) : nil,
+                     'partial_index' => labels.index(current) }]
+        end
+        [trends, { 'labels' => labels, 'hourly' => hourly, 'baseline_days' => base_days, 'min_hunt_minutes' => min_hunt / 60 }]
+      end
+
+      # ======================================================================
+      # HTTP
+      # ======================================================================
+
+      def serve(client)
+        request = Timeout.timeout(5) do
+          line = client.gets(MAX_LINE).to_s
+          nil while (header = client.gets(MAX_LINE)) && !header.strip.empty? # drain the headers
+          line
+        end
+        verb, target = request.split
+        return reply(client, 405, 'text/plain', 'Method not allowed') unless verb == 'GET'
+
+        route, query = target.to_s.split('?', 2)
+        params = decode_params(query)
+        case route
+        when '/', '/index.html'
+          reply(client, 200, 'text/html; charset=utf-8', PAGE)
+        when '/api/overview'
+          reply(client, 200, 'application/json', JSON.generate(overview))
+        when '/api/character'
+          data = character(params['name'].to_s, params['range'].to_s)
+          data ? reply(client, 200, 'application/json', JSON.generate(data)) : reply(client, 404, 'application/json', '{"error":"unknown character"}')
+        else
+          reply(client, 404, 'text/plain', 'Not found')
+        end
+      rescue Timeout::Error
+        reply(client, 400, 'text/plain', 'Bad request')
+      rescue StandardError => e
+        Log.error('dashboard', e)
+        reply(client, 500, 'text/plain', 'Internal error')
+      ensure
+        client.close unless client.closed?
+      end
+
+      def decode_params(query)
+        URI.decode_www_form(query.to_s).to_h
+      rescue ArgumentError
+        {}
+      end
+
+      def reply(client, code, type, body)
+        status = { 200 => 'OK', 400 => 'Bad Request', 404 => 'Not Found', 405 => 'Method Not Allowed',
+                   500 => 'Internal Server Error' }[code]
+        body = body.dup.force_encoding(Encoding::UTF_8)
+        client.write("HTTP/1.1 #{code} #{status}\r\nContent-Type: #{type}\r\nContent-Length: #{body.bytesize}\r\n" \
+                     "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n" \
+                     "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " \
+                     "connect-src 'self'\r\nConnection: close\r\n\r\n#{body}")
+      rescue IOError, SystemCallError
+        nil
+      end
+    end
+
+    PAGE = <<~'HTML'
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GS4 Analytics</title>
+    <style>
+      :root {
+        --bg: #f4f5f7; --card: #ffffff; --ink: #1c2330; --muted: #667085; --line: #e3e6ec; --soft: #eef0f4;
+        --hunt: #1f9d55; --rest: #2f6fdb; --idle: #d98a00; --dead: #d13b3b; --off: #8b93a1;
+        --green: #1f9d55; --amber: #d98a00; --red: #d13b3b; --gray: #8b93a1;
+        --c0: #2f6fdb; --c1: #e0662b; --c2: #1f9d55; --c3: #8a4fd6; --c4: #c2338a; --c5: #0d9aa8;
+        --s0: #2f6fdb; --s1: #e0662b; --s2: #1f9d55; --s3: #8a4fd6; --s4: #c2338a; --s5: #0d9aa8; --s6: #8b93a1;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme="light"]) {
+          --bg: #0f131a; --card: #171d27; --ink: #e8ecf3; --muted: #93a0b5; --line: #263041; --soft: #1e2532;
+          --hunt: #3ccf7a; --rest: #5b97ff; --idle: #f0ad2e; --dead: #ff6b6b; --off: #6d7789;
+          --green: #3ccf7a; --amber: #f0ad2e; --red: #ff6b6b; --gray: #6d7789;
+          --c0: #5b97ff; --c1: #ff8a52; --c2: #3ccf7a; --c3: #b085ff; --c4: #ff6fb5; --c5: #3dd3e0;
+          --s0: #5b97ff; --s1: #ff8a52; --s2: #3ccf7a; --s3: #b085ff; --s4: #ff6fb5; --s5: #3dd3e0; --s6: #6d7789;
+        }
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--ink);
+             font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      .wrap { max-width: 1280px; margin: 0 auto; padding: 16px; }
+      header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 14px; }
+      h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
+      .sub { color: var(--muted); font-size: 12px; }
+      .spacer { flex: 1; }
+      select { font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink); min-width: 160px; }
+      .tabs { display: inline-flex; }
+      .tabs button { background: var(--card); color: var(--ink); border: 1px solid var(--line); padding: 5px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+      .tabs button:first-child { border-radius: 8px 0 0 8px; } .tabs button:last-child { border-radius: 0 8px 8px 0; }
+      .tabs button.on { background: var(--rest); border-color: var(--rest); color: #fff; }
+      .live { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--hunt); margin-right: 6px; }
+      .live.stale { background: var(--dead); }
+      .grid { display: grid; gap: 12px; }
+      .g-status { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+      .g-2 { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+      .g-trend { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+      .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+      .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+      section { margin-top: 12px; }
+      .click { cursor: pointer; transition: border-color .15s; } .click:hover { border-color: var(--rest); }
+      .name { font-weight: 650; font-size: 16px; }
+      .row { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; }
+      .light { width: 14px; height: 14px; border-radius: 50%; display: inline-block; flex: none; }
+      .l-green { background: var(--green); } .l-amber { background: var(--amber); } .l-red { background: var(--red); } .l-gray { background: var(--gray); }
+      .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; color: #fff; }
+      .b-hunt { background: var(--hunt); } .b-rest { background: var(--rest); } .b-idle { background: var(--idle); }
+      .b-dead { background: var(--dead); } .b-offline { background: var(--off); }
+      .timer { font-variant-numeric: tabular-nums; color: var(--muted); }
+      .head { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+      .muted { color: var(--muted); } .small { font-size: 12px; }
+      .reasons { margin: 8px 0 4px; padding: 0; list-style: none; font-size: 12.5px; }
+      .reasons li { padding: 3px 8px; border-radius: 6px; margin-bottom: 3px; background: var(--soft); border-left: 3px solid var(--amber); }
+      .reasons li.red { border-left-color: var(--red); }
+      .pace { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+      .pace div { background: var(--soft); border-radius: 8px; padding: 7px 9px; }
+      .pace .lab { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+      .pace .val { font-weight: 700; font-size: 17px; font-variant-numeric: tabular-nums; }
+      .up { color: var(--green); } .down { color: var(--red); }
+      .chips { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 10px; }
+      .chip { border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; }
+      .chip .lab { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+      .chip .val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.25; }
+      table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+      th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+      th:first-child, td:first-child { text-align: left; }
+      th { color: var(--muted); font-weight: 600; font-size: 12px; }
+      tr.mark td { font-weight: 650; }
+      .scroll { overflow-x: auto; }
+      .bar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: var(--line); }
+      .bar span { display: block; height: 100%; }
+      .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+      .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+      .chartbox { border: 1px solid var(--line); border-radius: 10px; padding: 10px 10px 6px; }
+      .chartbox h3 { font-size: 12px; margin: 0 0 4px; color: var(--muted); font-weight: 600; }
+      .alert { padding: 7px 10px; border-radius: 8px; margin-bottom: 6px; border-left: 4px solid var(--amber); background: var(--soft); cursor: pointer; }
+      .alert.red { border-left-color: var(--red); }
+      svg text { fill: var(--muted); font-size: 10px; }
+      .tl-name { font-size: 12px; fill: var(--ink); }
+      .empty { color: var(--muted); padding: 14px 0; text-align: center; }
+      .back { background: none; border: 0; color: var(--rest); cursor: pointer; font: inherit; padding: 0; }
+      @media (max-width: 520px) { .pace { grid-template-columns: 1fr; } }
+    </style>
+    </head>
+    <body>
+    <div class="wrap">
+      <header>
+        <h1>GS4 Analytics</h1>
+        <span class="sub"><span class="live" id="liveDot"></span><span id="statusText">connecting</span></span>
+        <span class="spacer"></span>
+        <label class="sub" for="who">View</label>
+        <select id="who"><option value="">Everyone</option></select>
+      </header>
+      <div id="overview"></div>
+      <div id="detail" hidden></div>
+      <p class="sub" style="text-align:center;margin-top:16px">Updates every 5 seconds. Read only.</p>
+    </div>
+
+    <script>
+    (function () {
+      var who = decodeURIComponent(location.hash.slice(1)), range = 'daily';
+      var ov = null, det = null, offset = 0, failed = 0;
+      var CH = ['--c0','--c1','--c2','--c3','--c4','--c5'];
+      var STEP_ORDER = ['travel','selling','eloot','bounty','healing','spells','other scripts','waiting'];
+      var STEP_COL = {travel:'--s0',selling:'--s1',eloot:'--s2',bounty:'--s3',healing:'--s4',spells:'--s5','other scripts':'--s6',waiting:'--off'};
+      var STATE_COL = {hunt:'--hunt', rest:'--rest', idle:'--idle', dead:'--dead'};
+
+      function $(id) { return document.getElementById(id); }
+      function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+      function css(v) { return 'var(' + v + ')'; }
+      function num(n) { return n == null ? '--' : Math.round(n).toLocaleString('en-US'); }
+      function short(n) {
+        if (n == null) return '--';
+        var a = Math.abs(n), s = n < 0 ? '-' : '';
+        if (a >= 1e9) return s + (a / 1e9).toFixed(2) + 'B';
+        if (a >= 1e6) return s + (a / 1e6).toFixed(1) + 'M';
+        if (a >= 1e4) return s + (a / 1e3).toFixed(1) + 'K';
+        if (a > 0 && a < 10 && a % 1) return s + a.toFixed(1);
+        return s + Math.round(a).toLocaleString('en-US');
+      }
+      function dur(sec) {
+        if (sec == null) return '--';
+        sec = Math.max(0, Math.round(sec));
+        var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+        if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm';
+        return m + ':' + String(s).padStart(2, '0');
+      }
+      function nowSrv() { return Date.now() / 1000 + offset; }
+      function ago(ts) {
+        if (!ts) return '--';
+        var s = Math.max(0, nowSrv() - ts);
+        if (s < 60) return Math.round(s) + 's ago';
+        if (s < 3600) return Math.floor(s / 60) + ' min ago';
+        return Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm ago';
+      }
+      function clock(ts) { return new Date(ts * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+      function pctSpan(p, suffix, highBad) {
+        if (p == null) return '';
+        var r = Math.round(p), cls = r === 0 ? 'muted' : ((r > 0) !== !!highBad ? 'up' : 'down');
+        return '<span class="' + cls + '">' + (r > 0 ? '+' : '') + r + '%</span>' + (suffix || '');
+      }
+      function colorOf(name) { var i = ov ? ov.names.indexOf(name) : 0; return CH[(i < 0 ? 0 : i) % 6]; }
+      function stateHtml(st) {
+        return '<span class="badge b-' + esc(st.type) + '">' + esc(st.type) + '</span> <span class="timer" data-since="' + (st.since || '') +
+               '" data-type="' + esc(st.type) + '"></span>';
+      }
+
+      // ---------------- shared pieces ----------------
+      function paceHtml(p) {
+        var lab = { silver: 'Silver today', exp: 'Exp today', bounties: 'Bounties today' };
+        return '<div class="pace">' + ['silver', 'exp', 'bounties'].map(function (k) {
+          var m = p[k];
+          var sub = m.pct == null ? '<div class="small muted">typical builds after 5 days</div>' :
+            '<div class="small">' + pctSpan(m.pct, ' <span class="muted">vs typical by now</span>') + '</div>' +
+            '<div class="small muted">pace ' + short(m.projected) + ' / day (typ ' + short(m.typical_day) + ')</div>';
+          return '<div><div class="lab">' + lab[k] + '</div><div class="val">' + short(m.so_far) + '</div>' + sub + '</div>';
+        }).join('') + '</div>';
+      }
+      function reasonsHtml(light) {
+        if (!light.reasons.length) return light.level === 'gray' ? '<div class="small muted" style="margin-top:6px">Not running</div>' :
+          '<div class="small muted" style="margin-top:6px">All normal</div>';
+        return '<ul class="reasons">' + light.reasons.map(function (r) { return '<li class="' + r.level + '">' + esc(r.text) + '</li>'; }).join('') + '</ul>';
+      }
+
+      function timeline(chars, dayStart) {
+        var rowH = 24, L = chars.length > 1 ? 70 : 8, W = 1000, R = 8, top = 4, n = chars.length, H = top + n * rowH + 18;
+        var span = 86400, now = nowSrv();
+        function x(t) { return L + (W - L - R) * Math.min(Math.max((t - dayStart) / span, 0), 1); }
+        var svg = '';
+        for (var h = 0; h <= 24; h += 3) {
+          var hx = x(dayStart + h * 3600);
+          svg += '<line x1="' + hx + '" x2="' + hx + '" y1="' + top + '" y2="' + (top + n * rowH) + '" stroke="var(--line)"/>' +
+                 '<text x="' + hx + '" y="' + (H - 4) + '" text-anchor="' + (h === 24 ? 'end' : h === 0 ? 'start' : 'middle') + '">' + (h === 24 ? '24' : String(h).padStart(2, '0')) + ':00</text>';
+        }
+        chars.forEach(function (c, i) {
+          var y = top + i * rowH + 4;
+          if (n > 1) svg += '<text class="tl-name" x="0" y="' + (y + 12) + '">' + esc(c.name) + '</text>';
+          svg += '<rect x="' + L + '" y="' + y + '" width="' + (x(now) - L) + '" height="' + (rowH - 8) + '" rx="3" fill="var(--soft)"/>';
+          c.timeline.forEach(function (s) {
+            var x1 = x(s[1]), x2 = x(s[2]);
+            var tip = s[0] + ' ' + clock(s[1]) + ' - ' + clock(s[2]) + ' (' + dur(s[2] - s[1]) + ')' + (s[3] ? ' - ' + s[3] : '');
+            svg += '<rect x="' + x1 + '" y="' + y + '" width="' + Math.max(1, x2 - x1) + '" height="' + (rowH - 8) + '" fill="' + css(STATE_COL[s[0]] || '--off') + '"><title>' + esc(tip) + '</title></rect>';
+          });
+        });
+        var nx = x(now);
+        svg += '<line x1="' + nx + '" x2="' + nx + '" y1="' + top + '" y2="' + (top + n * rowH) + '" stroke="var(--ink)" stroke-width="1.5" stroke-dasharray="3 3"/>';
+        var leg = [['hunt','Hunting'],['rest','Resting'],['idle','Idle'],['dead','Dead']].map(function (p) {
+          return '<span><i style="background:' + css(STATE_COL[p[0]]) + '"></i>' + p[1] + '</span>'; }).join('') +
+          '<span><i style="background:var(--soft);border:1px solid var(--line)"></i>No data</span>';
+        return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="Timeline for today">' + svg + '</svg><div class="legend">' + leg + '</div>';
+      }
+
+      // ---------------- everyone ----------------
+      function renderOverview() {
+        if (!ov.characters.length) { $('overview').innerHTML = '<div class="card empty">No characters with data in the last day.</div>'; return; }
+        var cards = ov.characters.map(function (c) {
+          return '<div class="card click" data-who="' + esc(c.id) + '"><div class="head"><span class="light l-' + c.light.level + '"></span>' +
+            '<span class="name">' + esc(c.name) + '</span>' + stateHtml(c.state) + '</div>' + reasonsHtml(c.light) + paceHtml(c.pace) +
+            '<div class="row small" style="margin-top:8px"><span class="muted">Last kill</span><span data-ago="' + (c.last_kill || '') + '">' + ago(c.last_kill) + '</span></div>' +
+            '<div class="row small"><span class="muted">Last bounty</span><span data-ago="' + (c.last_bounty || '') + '">' + ago(c.last_bounty) + '</span></div>' +
+            (c.bounty ? '<div class="row small"><span class="muted">Active bounty</span><span>' + esc(c.bounty.target || c.bounty.type) +
+              (c.bounty.need ? ' ' + c.bounty.done + '/' + c.bounty.need : '') + ', ' + dur(c.bounty.age) + '</span></div>' : '') + '</div>';
+        }).join('');
+        var rows = ov.characters.map(function (c) {
+          var t = c.today;
+          return '<tr><td>' + esc(c.name) + '</td><td>' + short(c.pace.silver.so_far) + '</td><td>' + short(c.pace.exp.so_far) + '</td><td>' + num(c.pace.bounties.so_far) +
+            '</td><td>' + num(t.kills) + '</td><td>' + dur(t.hunt_s) + '</td><td>' + (t.uptime_pct == null ? '--' : t.uptime_pct + '%') +
+            '</td><td>' + t.deaths + '</td><td>' + c.crashes.length + '</td><td>' + t.item_rests + '</td></tr>';
+        }).join('');
+        var alerts = ov.alerts.length ? ov.alerts.map(function (a) {
+          return '<div class="alert ' + a.level + '" data-who="' + esc(a.id) + '"><b>' + esc(a.character) + '</b> - ' + esc(a.text) + '</div>'; }).join('')
+          : '<div class="muted">Nothing to flag.</div>';
+        $('overview').innerHTML = '<div class="grid g-status">' + cards + '</div>' +
+          '<section class="card"><h2>Today</h2>' + timeline(ov.characters, ov.day_start) + '</section>' +
+          '<section class="card"><h2>Alerts</h2>' + alerts + '</section>' +
+          '<section class="card"><h2>Today side by side</h2><div class="scroll"><table><thead><tr><th>Character</th><th>Silver</th><th>Exp</th><th>Bounties</th>' +
+          '<th>Kills</th><th>Hunt time</th><th>Uptime</th><th>Deaths</th><th>Crashes</th><th>Item limit</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>';
+        bindWho($('overview'));
+      }
+
+      // ---------------- one character ----------------
+      var FMT = { silver: short, exp: short, bounties: function (v) { return (Math.round(v * 10) / 10).toString(); }, kills: num,
+                  enc: function (v) { return Math.round(v) + '%'; }, mind: function (v) { return Math.round(v) + '%'; } };
+
+      function trendChart(m, color, fmtv, labels, hourly) {
+        var W = 420, H = 170, L = 44, R = 8, T = 10, B = 22, n = labels.length;
+        var vals = m.values.filter(function (v) { return v != null; });
+        if (!vals.length && !m.n) return '<div class="empty small">No data yet</div>';
+        var hi = Math.max.apply(null, vals.concat([m.mean + m.sd, 1])) * 1.08;
+        function x(i) { return L + (W - L - R) * (n === 1 ? 0.5 : i / (n - 1)); }
+        function y(v) { return T + (H - T - B) * (1 - Math.min(v, hi) / hi); }
+        var svg = '';
+        for (var g = 0; g <= 3; g++) {
+          var gy = T + (H - T - B) * (1 - g / 3);
+          svg += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + gy + '" y2="' + gy + '" stroke="var(--line)"/><text x="' + (L - 4) + '" y="' + (gy + 3) + '" text-anchor="end">' + fmtv(hi * g / 3) + '</text>';
+        }
+        var band = m.n >= 5;
+        if (band) {
+          var top = y(m.mean + m.sd), bot = y(Math.max(0, m.mean - m.sd));
+          svg += '<rect x="' + L + '" y="' + top + '" width="' + (W - L - R) + '" height="' + Math.max(0, bot - top) + '" fill="' + css(color) + '" opacity=".13"/>';
+        }
+        if (m.n >= 1) svg += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(m.mean) + '" y2="' + y(m.mean) + '" stroke="' + css(color) + '" stroke-width="1.3" stroke-dasharray="5 4"/>';
+        var path = '', pen = false;
+        m.values.forEach(function (v, i) {
+          if (v == null) { pen = false; return; }
+          path += (pen ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1) + ' '; pen = true;
+        });
+        if (path) svg += '<path d="' + path + '" fill="none" stroke="' + css(color) + '" stroke-width="2" stroke-linejoin="round"/>';
+        // For encumbrance and mind, high is the bad direction
+        var highBad = m.kind === 'avg';
+        m.values.forEach(function (v, i) {
+          if (v == null) return;
+          var partial = i === m.partial_index, fill = css(color);
+          if (band && v > m.mean + m.sd) fill = css(highBad ? '--red' : '--green'); else if (band && v < m.mean - m.sd) fill = css(highBad ? '--green' : '--red');
+          var tip = labels[i] + ': ' + fmtv(v) + (band ? ' (' + (v >= m.mean ? '+' : '') + Math.round((v - m.mean) * 100 / (m.mean || 1)) + '% vs avg)' : '') + (partial ? ' - still in progress' : '');
+          svg += '<circle cx="' + x(i) + '" cy="' + y(v) + '" r="3.4" fill="' + (partial ? css('--card') : fill) + '" stroke="' + fill + '" stroke-width="' + (partial ? 2 : 1) + '"><title>' + esc(tip) + '</title></circle>';
+        });
+        var step = hourly ? 3 : (n > 10 ? 5 : 1);
+        labels.forEach(function (lb, i) {
+          if (i % step === 0) svg += '<text x="' + x(i) + '" y="' + (H - 7) + '" text-anchor="' + (x(i) > W - R - 16 ? 'end' : 'middle') + '">' + esc(hourly ? lb.slice(11) : lb.slice(5)) + '</text>';
+        });
+        return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="' + esc(m.title) + '">' + svg + '</svg>' +
+          '<div class="small muted">' + (band ? 'Dashed = typical ' + fmtv(m.mean) + ', shaded = +/-1 std dev (' + fmtv(m.sd) + '), ' + m.n + ' samples'
+                                              : 'Baseline building: ' + m.n + ' of 5 samples') + '</div>';
+      }
+
+      function stepBar(steps) {
+        var keys = Object.keys(steps).sort(function (a, b) {
+          var ia = STEP_ORDER.indexOf(a), ib = STEP_ORDER.indexOf(b); return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib); });
+        var total = keys.reduce(function (a, k) { return a + steps[k]; }, 0);
+        if (!total) return '<div class="small muted">No step timing in this window yet.</div>';
+        return '<div class="bar">' + keys.map(function (k) {
+            return '<span title="' + esc(k) + ' ' + dur(steps[k]) + '" style="width:' + (steps[k] * 100 / total) + '%;background:' + css(STEP_COL[k] || '--s6') + '"></span>'; }).join('') +
+          '</div><div class="legend">' + keys.map(function (k) {
+            return '<span><i style="background:' + css(STEP_COL[k] || '--s6') + '"></i>' + esc(k) + ' ' + dur(steps[k]) + ' (' + Math.round(steps[k] * 100 / total) + '%)</span>'; }).join('') + '</div>';
+      }
+
+      function chip(lab, val, sub) {
+        return '<div class="chip"><div class="lab">' + lab + '</div><div class="val">' + val + '</div><div class="small muted">' + (sub || '') + '</div></div>';
+      }
+
+      function renderDetail() {
+        var c = det, color = colorOf(c.id), t = c.trend, rs = c.range_stats;
+        var tabs = Object.keys(c.ranges).map(function (k) {
+          return '<button data-r="' + k + '" class="' + (k === range ? 'on' : '') + '">' + esc(c.ranges[k]) + '</button>'; }).join('');
+        var basis = t.hourly ? 'hours with ' + t.min_hunt_minutes + '+ min of hunting, last ' + t.baseline_days + ' days'
+                             : 'days with ' + (t.min_hunt_minutes / 60) + '+ hours of hunting, last ' + t.baseline_days + ' days';
+        var b = c.bounty;
+        var bountyLine = b ? esc(b.target || b.type) + (b.need ? ' ' + b.done + '/' + b.need : '') + ', running ' + dur(b.age) +
+          (b.typical ? ' (typical ' + dur(b.typical) + ')' : '') : 'None active';
+
+        var head = '<section class="card" style="margin-top:0"><div class="head"><button class="back" id="back">Everyone</button><span class="muted">/</span>' +
+          '<span class="light l-' + c.light.level + '"></span><span class="name">' + esc(c.name) + '</span>' + stateHtml(c.state) +
+          (c.state.profile ? '<span class="small muted">' + esc(c.state.profile) + '</span>' : '') +
+          (c.state.type === 'rest' && c.state.reason ? '<span class="small muted">rest reason: ' + esc(c.state.reason) + '</span>' : '') + '</div>' +
+          reasonsHtml(c.light) + paceHtml(c.pace) +
+          '<div class="chips" style="margin-top:10px">' +
+          chip('Last kill', '<span data-ago="' + (c.last_kill || '') + '">' + ago(c.last_kill) + '</span>', c.last_kill ? clock(c.last_kill) : 'recorded from this update on') +
+          chip('Last bounty', '<span data-ago="' + (c.last_bounty || '') + '">' + ago(c.last_bounty) + '</span>', c.last_bounty ? clock(c.last_bounty) : '') +
+          chip('Active bounty', b ? (b.need ? b.done + '/' + b.need : esc(b.type)) : '--', bountyLine) +
+          chip('Crashes today', c.crashes.length, c.crashes.map(function (x) { return clock(x.at) + ' ' + esc(x.reason); }).join(', ') || 'none') +
+          '</div><div style="margin-top:12px">' + timeline([c], c.day_start) + '</div></section>';
+
+        var summary = '<section class="card"><div class="head" style="margin-bottom:10px"><h2 style="margin:0">' + esc(c.label) + '</h2><span class="spacer"></span><div class="tabs" id="tabs">' + tabs + '</div></div>' +
+          '<div class="chips">' +
+          chip('Silver', short(rs.silver), short(rs.silver_hr) + ' / hr, ' + short(rs.silver_hunt_hr) + ' / hunt hr') +
+          chip('Experience', short(rs.exp), short(rs.exp_hr) + ' / hr, ' + short(rs.exp_hunt_hr) + ' / hunt hr') +
+          chip('Bounties', num(rs.bounties), (rs.bounties_hunt_hr == null ? '--' : rs.bounties_hunt_hr) + ' / hunt hr, ' + rs.abandoned + ' abandoned') +
+          chip('Kills', num(rs.kills), rs.deaths + ' death' + (rs.deaths === 1 ? '' : 's')) +
+          chip('Avg hunt / rest', dur(rs.hunt_avg) + ' / ' + dur(rs.rest_avg), rs.hunts + ' hunts, ' + (rs.uptime_pct == null ? '--' : rs.uptime_pct + '%') + ' hunting') +
+          '</div><div class="small muted" style="margin:12px 0 8px">Typical = average of ' + esc(basis) + '</div>' +
+          '<div class="grid g-trend">' + Object.keys(c.trends).map(function (k) {
+            var m = c.trends[k];
+            return '<div class="chartbox"><h3>' + esc(m.title) + (m.vs_pct == null ? '' : ' <span class="small">' + pctSpan(m.vs_pct, ' <span class="muted">vs typical</span>', m.kind === 'avg') + '</span>') +
+              '</h3>' + trendChart(m, color, FMT[k], t.labels, t.hourly) + '</div>'; }).join('') + '</div></section>';
+
+        var mind = c.mind, enc = c.encumbrance;
+        var reasonRows = c.rest_reasons.length ? c.rest_reasons.map(function (r) {
+          var hot = r.typical != null && r.today >= 3 && r.today >= r.typical * 2 + 1;
+          return '<tr' + (hot ? ' class="mark"' : '') + '><td>' + esc(r.reason) + '</td><td>' + r.today + '</td><td>' + (r.typical == null ? '--' : r.typical) + '</td></tr>'; }).join('')
+          : '<tr><td colspan="3" class="muted">No rests yet today</td></tr>';
+        var health = '<section class="grid g-2">' +
+          '<div class="card"><h2>Rest steps (' + esc(c.label) + ')</h2>' + stepBar(c.steps) +
+            '<h2 style="margin-top:16px">Rest reasons today</h2><table><thead><tr><th>Reason</th><th>Today</th><th>Typical by now</th></tr></thead><tbody>' + reasonRows + '</tbody></table></div>' +
+          '<div class="card"><h2>Mind and load (today)</h2><div class="chips">' +
+            chip('Mind at hunt start', mind.start_avg == null ? '--' : Math.round(mind.start_avg) + '%', 'average') +
+            chip('Mind at hunt end', mind.end_avg == null ? '--' : Math.round(mind.end_avg) + '%', mind.samples + ' hunts') +
+            chip('Absorbed per rest', mind.absorbed_per_rest == null ? '--' : num(mind.absorbed_per_rest), mind.absorbed_per_min == null ? 'field exp' : mind.absorbed_per_min + ' per minute of rest') +
+            chip('Encumbrance at hunt start', enc.today == null ? '--' : Math.round(enc.today) + '%', enc.typical == null ? '' : 'typical ' + Math.round(enc.typical) + '%') +
+          '</div><div class="small muted" style="margin-top:10px">Mind percentages need mind capacity, recorded from this update on.</div></div></section>';
+
+        var grounds = c.grounds.length ? '<div class="scroll"><table><thead><tr><th>Profile</th><th>Hours</th><th>Exp / hunt hr</th><th>Kills / hunt hr</th><th>Creature silver / hr</th><th>Deaths</th></tr></thead><tbody>' +
+          c.grounds.map(function (g) {
+            var cur = c.state.profile && g.profile === c.state.profile;
+            return '<tr' + (cur ? ' class="mark"' : '') + '><td>' + esc(g.profile) + (cur ? ' (now)' : '') + '</td><td>' + g.hours + '</td><td>' + num(g.exp_hr) + '</td><td>' + g.kills_hr +
+              '</td><td>' + short(g.silver_hr) + '</td><td>' + g.deaths + '</td></tr>'; }).join('') + '</tbody></table></div>'
+          : '<div class="muted">Needs at least an hour of hunting in a profile.</div>';
+        var recent = c.recent_bounties.length ? '<div class="scroll"><table><thead><tr><th>Received</th><th style="text-align:left">Type</th><th style="text-align:left">Target</th><th style="text-align:left">Status</th><th>Took</th><th>Silver</th><th>Exp</th></tr></thead><tbody>' +
+          c.recent_bounties.map(function (r) {
+            return '<tr><td>' + clock(r.received) + '</td><td style="text-align:left">' + esc(r.type) + '</td><td style="text-align:left">' + esc(r.target) + '</td><td style="text-align:left">' + esc(r.status) + '</td><td>' + dur(r.took) +
+              '</td><td>' + short(r.silver) + '</td><td>' + short(r.exp) + '</td></tr>'; }).join('') + '</tbody></table></div>'
+          : '<div class="muted">No bounties yet.</div>';
+
+        $('detail').innerHTML = head + summary + health +
+          '<section class="card"><h2>Hunting grounds - last 30 days, best exp first</h2>' + grounds + '</section>' +
+          '<section class="card"><h2>Recent bounties</h2>' + recent + '</section>';
+        $('back').onclick = function () { setWho(''); };
+        Array.prototype.forEach.call($('tabs').querySelectorAll('button'), function (bt) {
+          bt.onclick = function () { range = bt.getAttribute('data-r'); loadDetail(); };
+        });
+      }
+
+      // ---------------- plumbing ----------------
+      function bindWho(root) {
+        Array.prototype.forEach.call(root.querySelectorAll('[data-who]'), function (el) {
+          el.onclick = function () { setWho(el.getAttribute('data-who')); };
+        });
+      }
+      function setWho(name) {
+        who = name; history.replaceState(null, '', name ? '#' + encodeURIComponent(name) : location.pathname);
+        $('who').value = name; det = null; show(); if (name) loadDetail(); window.scrollTo(0, 0);
+      }
+      function fillSelect() {
+        var sel = $('who'), want = [''].concat(ov.names);
+        var have = Array.prototype.map.call(sel.options, function (o) { return o.value; });
+        if (have.join('|') !== want.join('|')) {
+          sel.innerHTML = '<option value="">Everyone</option>' + ov.characters.map(function (c) { return '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>'; }).join('');
+        }
+        sel.value = who;
+      }
+      function show() {
+        $('overview').hidden = !!who; $('detail').hidden = !who;
+        if (who && !det) $('detail').innerHTML = '<div class="card empty">Loading ' + esc(who) + '...</div>';
+      }
+      function tick() {
+        Array.prototype.forEach.call(document.querySelectorAll('.timer'), function (el) {
+          var s = el.getAttribute('data-since'), off = el.getAttribute('data-type') === 'offline';
+          var secs = s ? nowSrv() - Number(s) : 0;
+          el.textContent = !s ? '' : off ? 'last seen ' + ago(Number(s)) : 'for ' + dur(secs);
+        });
+        Array.prototype.forEach.call(document.querySelectorAll('[data-ago]'), function (el) {
+          var ts = Number(el.getAttribute('data-ago')); if (ts) el.textContent = ago(ts);
+        });
+        if (ov) {
+          $('statusText').textContent = failed ? 'connection lost - retrying' : 'updated ' + Math.round(nowSrv() - ov.generated_at) + 's ago';
+          $('liveDot').className = 'live' + (failed ? ' stale' : '');
+        }
+      }
+      function get(url) {
+        return fetch(url, { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
+      }
+      function loadOverview() {
+        return get('/api/overview').then(function (d) {
+          ov = d; failed = 0; offset = d.generated_at - Date.now() / 1000; fillSelect(); if (!who) renderOverview(); tick();
+        }).catch(function () { failed++; tick(); });
+      }
+      function loadDetail() {
+        if (!who) return;
+        var asked = who;
+        get('/api/character?name=' + encodeURIComponent(who) + '&range=' + range).then(function (d) {
+          if (asked !== who) return;
+          det = d; renderDetail(); tick();
+        }).catch(function () {
+          if (asked === who && !det) $('detail').innerHTML = '<div class="card empty">No data for ' + esc(who) + '. <button class="back" id="back">Back to everyone</button></div>';
+          var bk = $('back'); if (bk && !det) bk.onclick = function () { setWho(''); };
+        });
+      }
+      function refresh() { if (document.hidden) return; loadOverview(); loadDetail(); }
+
+      $('who').onchange = function () { setWho(this.value); };
+      show();
+      loadOverview().then(function () { if (!who) renderOverview(); });
+      loadDetail();
+      setInterval(refresh, 5000);
+      setInterval(tick, 1000);
+      document.addEventListener('visibilitychange', refresh);
+    })();
+    </script>
+    </body>
+    </html>
+    HTML
+  end
+end
+
+module GS4Analytics
+  # ==========================================================================
+  # CLI: argument handling for ;analytics and the in-session command hook
+  # ==========================================================================
+  module CLI
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    HOOK = 'GS4Analytics::CLI'
+    # Commands that also work while the collector is running (they are caught
+    # from the upstream, since Lich won't start a second copy of the script)
+    COMMANDS = %w[report serve dashboard status maintenance help].freeze
+    USAGE = <<~TEXT
+      Usage:
+        ;analytics                         collect data for this character
+        ;analytics --dashboard[=PORT] [--lan]   collect and serve the dashboard
+        ;analytics serve [PORT] [lan]      serve the dashboard only
+        ;analytics report character        all characters, four time windows
+        ;analytics report exp [range]      experience per character
+        ;analytics report bounty [range]   this character's bounties
+        ;analytics report cycle [range]    this character's hunt/rest cycles
+        ;analytics status                  what the collector is doing
+        ;analytics maintenance compact|vacuum|stats
+      Ranges: daily (default), weekly, monthly, ytd, total
+      Settings: <Lich data>/<game>/<character>/analytics.yaml
+    TEXT
+
+    @commands = Queue.new
+
+    class << self
+      def main(args)
+        command = args.first.to_s.downcase
+        if command.empty? || command.start_with?('-')
+          collect(args)
+        elsif command == 'collect'
+          collect(args.drop(1))
+        else
+          execute(args)
+          sleep 3600 while Dashboard.running? # serve keeps the script alive until it is killed
+        end
+      rescue StandardError => e
+        Log.error('main', e)
+      end
+
+      def shutdown
+        UpstreamHook.remove(HOOK)
+        Dashboard.stop
+        Collector.stop
+        Database.close
+      end
+
+      private
+
+      # ----- collecting ------------------------------------------------------
+
+      def collect(args)
+        who = identity
+        cfg = Settings.load(who)
+        Collector.start(who, cfg)
+        flag = args.find { |arg| arg.match?(/\A--dashboard(=\d+)?\z/) }
+        start_dashboard(flag[/\d+/]&.to_i || cfg[:dashboard][:port], args.include?('--lan') || cfg[:dashboard][:lan]) if flag
+        install_hook
+        Log.info("Ready. ;#{Script.current.name} help lists the commands that also work while this runs.")
+        loop { execute(@commands.pop) }
+      end
+
+      # Catches ;analytics <command> typed while the collector runs
+      def install_hook
+        pattern = /\A(?:<c>)?#{$lich_char_regex}#{Regexp.escape(Script.current.name)}\s+(\S.*)\z/i
+        UpstreamHook.add(HOOK, proc { |line|
+          words = line.match(pattern)&.[](1)&.split
+          next line unless words && COMMANDS.include?(words.first.downcase)
+
+          @commands << words
+          nil
+        })
+      end
+
+      # ----- commands --------------------------------------------------------
+
+      # Runs one command, from the command line or the collector's queue
+      def execute(args)
+        command, *rest = args
+        case command.to_s.downcase
+        when 'report' then report(rest)
+        when 'serve', 'dashboard' then serve(rest)
+        when 'status' then status
+        when 'maintenance' then maintenance(rest)
+        else respond(USAGE)
+        end
+      rescue Database::Missing => e
+        Log.info("#{e.message}. Run ;#{Script.current.name} on a character first.")
+      rescue StandardError => e
+        Log.error('command', e)
+      end
+
+      def report(args)
+        name = args.first.to_s.downcase
+        range = args[1]
+        Database.reader do |conn|
+          lines = case name
+                  when '', 'character', 'characters' then Report::Text.character_summary(conn)
+                  when 'exp' then Report::Text.exp_summary(conn, range)
+                  when 'bounty', 'bounties' then Report::Text.bounty_summary(conn, Who.current, range)
+                  when 'cycle', 'cycles' then Report::Text.cycle_summary(conn, Who.current, range)
+                  else [USAGE]
+                  end
+          respond(lines.join("\n"))
+        end
+      end
+
+      def serve(args)
+        Settings.load(Who.current) unless Collector.running?
+        defaults = Settings.current[:dashboard]
+        port = args.find { |arg| arg.match?(/\A\d+\z/) }&.to_i || defaults[:port]
+        start_dashboard(port, args.include?('lan') || defaults[:lan])
+      end
+
+      def start_dashboard(port, lan)
+        return Log.info("Dashboard already running at http://localhost:#{Dashboard.port}") if Dashboard.running?
+
+        Dashboard.start(port, lan ? '0.0.0.0' : '127.0.0.1')
+        Log.info("Dashboard at http://localhost:#{port}#{lan ? ' (also reachable from your network, no password)' : ' (this computer only)'}")
+      rescue Errno::EADDRINUSE
+        Log.info("Port #{port} is already in use. Try ;#{Script.current.name} serve <other port>.")
+      end
+
+      def status
+        lines = Collector.running? ? CycleManager.status : ['The collector is not running in this session.']
+        lines << "Dashboard: #{Dashboard.running? ? "http://localhost:#{Dashboard.port}" : 'not running'}"
+        lines << "Database: #{Database.file}"
+        respond(lines.map { |line| "[analytics] #{line}" }.join("\n"))
+      end
+
+      def maintenance(args)
+        task = args.first.to_s.downcase
+        standalone = !Database.connected?
+        Database.connect! if standalone
+        lines = case task
+                when 'compact' then [Database.compact_bank_snapshots]
+                when 'vacuum' then [Database.vacuum]
+                when 'stats' then Database.statistics
+                else ["Usage: ;#{Script.current.name} maintenance compact|vacuum|stats"]
+                end
+        lines.each { |line| Log.info(line) }
+      ensure
+        Database.close if standalone
+      end
+
+      # At autostart the game identity can arrive after the script starts
+      def identity
+        60.times do
+          break unless XMLData.game.to_s.empty? || XMLData.name.to_s.empty?
+
+          sleep 1
+        end
+        who = Who.current
+        raise 'could not identify the game and character' if who.game.empty? || who.name.empty?
+
+        who
+      end
+    end
+  end
+end
+
+# ============================================================================
+# Entry point
+# ============================================================================
+before_dying { GS4Analytics::CLI.shutdown }
+GS4Analytics::CLI.main(Script.current.vars.drop(1))
