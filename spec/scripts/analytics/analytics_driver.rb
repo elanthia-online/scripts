@@ -244,16 +244,23 @@ when 'collector'
   DownstreamHook.run('You search the halfling cannibal.')
   DownstreamHook.run('<pushBold/>The halfling cannibal had 1,234 silvers on him.')
   DownstreamHook.run('The halfling cannibal rots away.')
+  # Lines as the XML frontend sends them; this kill ends at the prompt, not at a decay line
+  DownstreamHook.run('You search the <pushBold/><a exist="1" noun="sentinel">veiled sentinel</a><popBold/>.')
+  DownstreamHook.run('<pushBold/><a exist="1" noun="sentinel">She</a><popBold/> had 345 silvers on <pushBold/>her<popBold/>.')
+  DownstreamHook.run('<prompt time="1793074672">&gt;</prompt>')
+  DownstreamHook.run('You search the <pushBold/><a exist="2" noun="lurk">shambling lurk</a><popBold/>.')
+  DownstreamHook.run("It didn't carry any silver.")
+  DownstreamHook.run('Decay rapidly races over a shambling lurk\'s form as it collapses into foul-smelling compost.')
   DownstreamHook.run('They locate a pile of 500 coins, reclaiming them')
   DownstreamHook.run('You gather the remaining 250 coins from inside your box')
   A::SilverManager.record_vendor_silver(12_345, 'gemshop', 'Bob')
   A::SilverManager.record_vendor_visit('gemshop', NOW - 100, NOW - 50, 12_345)
   A::Database.record_item_sale(WHO, A::Database.session_for(WHO), 'a black opal', 'opal', 5000, 'gemshop', 'Bob', 2)
   sleep 0.5
-  kill = A::Database.one('SELECT * FROM kill_stats')
+  kills = A::Database.all('SELECT creature, total_silver, game, character FROM kill_stats ORDER BY creature')
   result = {
     'hook_registered' => hook, 'cfg_hunt' => cfg[:hunt_script],
-    'kill' => [kill['creature'], kill['total_silver'], kill['game'], kill['character']],
+    'kills' => kills.map(&:values),
     'box' => A::Database.all("SELECT amount FROM silver_events WHERE source_category = 'box' ORDER BY amount").map { |r| r['amount'] },
     'sale' => A::Database.one("SELECT amount, vendor_type FROM silver_events WHERE source_category = 'sale'").values,
     'visit_seconds' => A::Database.one('SELECT duration_seconds FROM vendor_visits')['duration_seconds'],

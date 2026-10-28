@@ -193,8 +193,11 @@ RSpec.describe 'analytics.lic' do
       expect(collector.values_at('hook_registered', 'hook_removed')).to eq([true, true])
     end
 
-    it 'records a kill and its creature silver for the right game and character' do
-      expect(collector['kill']).to eq(['halfling cannibal', 1234, 'GS3', 'Torvek'])
+    it 'records each kill and its creature silver for the right game and character' do
+      expect(collector['kills']).to eq(
+        [['halfling cannibal', 1234, 'GS3', 'Torvek'], ['shambling lurk', 0, 'GS3', 'Torvek'],
+         ['veiled sentinel', 345, 'GS3', 'Torvek']]
+      )
     end
 
     it 'records box silver' do
