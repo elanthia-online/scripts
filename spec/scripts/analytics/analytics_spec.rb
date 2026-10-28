@@ -114,6 +114,54 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'a hunt interrupted by another script' do
+    subject(:trip) { result('interrupted_hunt') }
+
+    it 'counts a rest-step script running after a hunt as resting' do
+      expect(trip.values_at('hunt_then_trip', 'hunt_nothing_running')).to eq([[true, false], [true, false]])
+    end
+
+    it 'keeps hunting while the hunt script runs, even with eloot running' do
+      expect(trip['hunt_running']).to eq([false, true])
+    end
+
+    it 'stops counting the trip once no step has run for a while' do
+      expect(trip['grace_expired']).to eq([false, false])
+    end
+
+    it 'does not start a rest from a script run by hand while idle' do
+      expect(trip['idle_manual_script']).to eq([false, false])
+    end
+
+    it 'names the script that stopped the hunt, on the hunt and on the rest' do
+      expect(trip['reasons']).to eq(['stopped by ebounty', 'rest', 'stopped by ebounty'])
+    end
+
+    it 'keeps bigshot\'s own reason when it rested by itself' do
+      expect(trip['own_rest_reason']).to eq('encumbered.')
+    end
+  end
+
+  describe 'bounties finished in town' do
+    subject(:town) { result('town_bounty') }
+
+    it 'does not record a task before a hunt starts' do
+      expect(town['recorded_while_not_hunting']).to eq(0)
+    end
+
+    it 'describes the reward from the task last seen' do
+      expect(town['gem']).to eq(['gem', '', 'Solhaven', 9, 'completed', 4812])
+    end
+
+    it 'dates the bounty from when the task was first seen' do
+      expect(town['received_before_completed']).to be(true)
+    end
+
+    it 'falls back to untracked when the task is too old or was never seen' do
+      expect(town['untracked']).to eq([9, 100])
+    end
+  end
+
   describe 'Database' do
     subject(:database) { result('database') }
 

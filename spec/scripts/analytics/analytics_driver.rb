@@ -97,6 +97,23 @@ module Lich
   end
 end
 
+class TaskStub
+  attr_reader :type, :creature, :town, :requirements
+
+  def initialize(type, creature, area, number)
+    @type = type
+    @creature = creature
+    @town = area
+    @requirements = { area: area, number: number }
+  end
+
+  def none? = false
+end
+
+module Bounty
+  def self.task = $task
+end
+
 source = File.read(lic_path).gsub("\r\n", "\n")
 cut = source.index(/^# =+\n# Entry point/) or abort 'analytics.lic: entry point marker not found'
 $VERBOSE = nil
@@ -477,6 +494,92 @@ when 'bigshot_status'
   $running = ['bigshot']
   $bigshot_status = :resting
   result['status_line'] = manager.status.last
+
+when 'interrupted_hunt'
+  # Another script (ebounty) stops bigshot to turn in a bounty: the trip is a rest, not idle
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::CycleManager
+  session = A::Database.session_for(WHO)
+  set = ->(name, value) { manager.instance_variable_set(name, value) }
+  start_state = lambda do |state, cycle_type|
+    set.call(:@who, WHO)
+    set.call(:@cfg, cfg)
+    set.call(:@session_id, session)
+    set.call(:@current_state, state)
+    set.call(:@rest_steps, Hash.new(0.0))
+    set.call(:@last_step_at, nil)
+    set.call(:@last_bigshot_status, nil)
+    set.call(:@current_cycle_id, A::Database.start_cycle(WHO, session, cycle_type, 'bigshot', 'torvek_crags', {}))
+    run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, manager.current_cycle_id)
+  end
+  signals = lambda do |running|
+    $running = running
+    manager.send(:read_signals).slice(:rest, :hunt).values
+  end
+
+  start_state.call(:hunt, :hunt)
+  result['hunt_then_trip'] = signals.call(['ebounty'])
+  result['hunt_nothing_running'] = signals.call([])
+  result['hunt_running'] = signals.call(%w[bigshot eloot])
+  set.call(:@last_step_at, Process.clock_gettime(Process::CLOCK_MONOTONIC) - 30)
+  result['grace_expired'] = signals.call([])
+
+  hunt_id = manager.current_cycle_id
+  $running = ['ebounty']
+  $rest_reason = nil
+  manager.send(:transition_to, :rest)
+  rest = A::Database.one('SELECT cycle_type, rest_reason FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)
+  result['reasons'] = [A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', hunt_id)['rest_reason'],
+                       rest['cycle_type'], rest['rest_reason']]
+
+  # Not after bigshot said it was resting itself
+  start_state.call(:hunt, :hunt)
+  set.call(:@last_bigshot_status, :resting)
+  hunt_id = manager.current_cycle_id
+  $rest_reason = 'encumbered.'
+  manager.send(:transition_to, :rest)
+  result['own_rest_reason'] = A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', hunt_id)['rest_reason']
+
+  # An idle character running a script by hand does not start a rest
+  start_state.call(:idle, :idle)
+  result['idle_manual_script'] = signals.call(['go2'])
+
+when 'town_bounty'
+  # A bounty finished in town, with no hunt running, still gets its type and area
+  A::Database.connect!
+  A::Settings.load(WHO)
+  manager = A::BountyManager
+  manager.instance_variable_set(:@who, WHO)
+  $running = []
+  task = lambda do |type, creature, area, number|
+    $task = TaskStub.new(type, creature, area, number)
+  end
+  row = ->(label) { A::Database.one("SELECT bounty_type, creature, area, count_required, status, silver_reward, received_time, completed_time FROM bounties WHERE bounty_type = '#{label}'") }
+
+  task.call(:gem, '', 'Solhaven', 9)
+  manager.send(:check_task)
+  recorded_while_not_hunting = A::Database.all('SELECT 1 FROM bounties').size
+  $task = nil
+  manager.send(:handle_reward, 1250, 1000, 4812)
+  gem = row.call('gem')
+
+  # Seen long ago: too old to explain a reward
+  task.call(:herb, 'moss', 'Vornavis', 4)
+  manager.send(:check_task)
+  $task = nil
+  manager.instance_variable_get(:@seen)[:at] -= 700
+  manager.send(:handle_reward, 100, 100, 100)
+
+  # Never seen
+  manager.send(:handle_reward, 7, 8, 9)
+
+  result = {
+    'recorded_while_not_hunting' => recorded_while_not_hunting,
+    'gem' => gem.values_at('bounty_type', 'creature', 'area', 'count_required', 'status', 'silver_reward'),
+    'received_before_completed' => gem['received_time'] <= gem['completed_time'],
+    'untracked' => A::Database.all("SELECT silver_reward FROM bounties WHERE bounty_type = 'untracked' ORDER BY silver_reward").map { |r| r['silver_reward'] }
+  }
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

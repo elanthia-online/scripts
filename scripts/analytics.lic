@@ -321,6 +321,10 @@ module GS4Analytics
       #                        and the dashboard shows time per label. Time with
       #                        none of them running is labeled "waiting". Add your
       #                        own scripts here, for example  my_sell: selling
+      #                        These scripts also mark a trip as resting when the hunt
+      #                        was stopped by another script (for example ebounty
+      #                        turning in a bounty): while one of them runs, right
+      #                        after a hunt or rest, the time is a rest, not idle.
       #
       # ---------------------------------------------------------------------------
       # Alerts (in the game window, and Discord when discord is true)
@@ -639,10 +643,10 @@ module GS4Analytics
 
       # ----- bounties --------------------------------------------------------
 
-      def start_bounty(who, session_id, cycle_id, type, creature, area, count_required = nil)
+      def start_bounty(who, session_id, cycle_id, type, creature, area, count_required = nil, received_at: nil)
         id = new_id
         db[:bounties].insert(clean(bounty_id: id, session_id: session_id, cycle_id: cycle_id, game: who.game,
-                                   character: who.name, received_time: Time.now.to_i, bounty_type: type,
+                                   character: who.name, received_time: received_at || Time.now.to_i, bounty_type: type,
                                    creature: creature, area: area, count_required: count_required, status: 'active'))
         id
       end
@@ -1202,6 +1206,7 @@ module GS4Analytics
     ABANDON_RE = /You have abandoned your current task/i
     LOOP_INTERVAL = 0.5
     TASK_EVERY = 4 # loops, so every 2 seconds
+    SEEN_FOR = 600 # seconds a task seen while not hunting can still explain a reward
 
     class << self
       def start(who, cfg)
@@ -1291,13 +1296,26 @@ module GS4Analytics
         # A reward for a bounty we never saw start (analytics began mid-bounty)
         # still counts, so reward totals stay complete
         unless @bounty_id
-          @bounty_id = Database.start_bounty(@who, session, cycle, 'untracked', '', '')
-          @type = 'untracked'
+          # Gem, herb and skin tasks are often finished in town without hunting,
+          # so describe it from the task the poll last saw
+          task, received_at = untracked_task
+          @type = task ? task[:type] : 'untracked'
+          @bounty_id = Database.start_bounty(@who, session, cycle, @type, task ? task[:creature] : '',
+                                             task ? task[:area] : '', task&.[](:count), received_at: received_at)
         end
         Database.complete_bounty(@bounty_id, silver, exp, bp)
         Database.record_silver(@who, session, cycle, 'bounty', silver, bounty_type: @type)
         Log.debug("Bounty completed: #{@type} (#{silver} silver, #{exp} exp, #{bp} BP)")
         clear_tracking
+      end
+
+      # [task, when it was first seen] for a reward that arrived with no tracked bounty
+      def untracked_task
+        live = task_info
+        return [live, @seen&.[](:at) || Time.now.to_i] if live
+        return [@seen[:task], @seen[:at]] if @seen && Time.now.to_i - @seen[:at] < SEEN_FOR
+
+        [nil, nil]
       end
 
       def handle_abandon
@@ -1310,6 +1328,7 @@ module GS4Analytics
 
       def check_task
         task = task_info
+        remember(task)
         if @bounty_id
           # Taskmaster, guard, assignment and "none" states are steps of the
           # turn-in; hold and wait for the reward line
@@ -1358,7 +1377,15 @@ module GS4Analytics
       end
 
       def clear_tracking
-        @bounty_id = @type = @creature = @area = nil
+        @bounty_id = @type = @creature = @area = @seen = nil
+      end
+
+      # Keeps the first time each task was seen, even while not hunting
+      def remember(task)
+        return unless task
+
+        same = @seen && @seen[:task].values_at(:type, :creature, :area) == task.values_at(:type, :creature, :area)
+        @seen = { task: task, at: same ? @seen[:at] : Time.now.to_i }
       end
 
       def task_matches_tracked?(task)
@@ -1416,6 +1443,9 @@ module GS4Analytics
     # :resting is set when a rest reason was found, :rest_stop when it exits to rest.
     # The others are :hunting, :ready, :boundary_building, and nil once it exits.
     BIGSHOT_REST_STATUSES = %i[resting rest_stop].freeze
+    # With no hunt running, a rest-step script (go2, ebounty, ...) counts as resting
+    # until none has run for this long
+    REST_STEP_GRACE = 20
 
     class << self
       attr_reader :current_state, :current_cycle_id, :hunt_start_time
@@ -1428,6 +1458,7 @@ module GS4Analytics
         @hunt_start_time = nil
         @last_flip = -DEBOUNCE_SECONDS
         @last_bigshot_status = nil
+        @last_step_at = nil
         @rest_steps = Hash.new(0.0)
         @rest_cycle = nil
         @idle = { since: nil, warned: false, recovering: false }
@@ -1485,8 +1516,23 @@ module GS4Analytics
       def read_signals
         status = bigshot_status
         @last_bigshot_status = status if status
-        { dead: dead?, rest: running?(@cfg[:rest_script]) || BIGSHOT_REST_STATUSES.include?(status),
-          hunt: running?(@cfg[:hunt_script]) }
+        hunting = running?(@cfg[:hunt_script])
+        { dead: dead?, rest: running?(@cfg[:rest_script]) || BIGSHOT_REST_STATUSES.include?(status) || stepping?(hunting),
+          hunt: hunting }
+      end
+
+      # A hunt cut short by another script (ebounty stopping bigshot to turn in a
+      # bounty) shows no resting status, but the trip that follows is a rest:
+      # rest-step scripts running while no hunt is, directly after a hunt or rest
+      def stepping?(hunting)
+        return false if hunting || @current_state == :idle
+
+        @last_step_at = monotonic if running_steps.any?
+        !@last_step_at.nil? && monotonic - @last_step_at < REST_STEP_GRACE
+      end
+
+      def running_steps
+        @cfg[:rest_steps].keys.select { |script| running?(script) }
       end
 
       # Bigshot's own status, or nil when it isn't running: the global keeps
@@ -1515,11 +1561,23 @@ module GS4Analytics
           Database.set_rest_reason(@current_cycle_id, 'unhandled exit')
         end
         @last_bigshot_status = nil
+        name_interrupting_scripts if @current_state == :hunt && target == :rest
+        @last_step_at = nil
         end_current_cycle
         @current_state = target
         @hunt_start_time = target == :hunt ? Time.now.to_i : nil
         @weapon = { polls: 0, retries: 0 }
         start_new_cycle(target)
+      end
+
+      # A hunt that ended with no rest reason of its own was stopped from outside
+      def name_interrupting_scripts
+        return unless @current_cycle_id && rest_reason.empty? && !BIGSHOT_REST_STATUSES.include?(@last_bigshot_status)
+
+        scripts = running_steps
+        return if scripts.empty?
+
+        Database.set_rest_reason(@current_cycle_id, "stopped by #{scripts.join('/')}")
       end
 
       def roll_over_midnight
