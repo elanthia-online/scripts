@@ -50,7 +50,7 @@ RSpec.describe 'ELoot disk contents' do
   before do
     stub_const('ELoot', eloot)
     stub_const('Inventory', Module.new)
-    eloot.module_eval(%w[disk_contents find_boxes].map { |m| extract_lic_method(source, m, source_path: eloot_path) }.join("\n"))
+    eloot.module_eval(%w[fresh_contents disk_contents find_boxes].map { |m| extract_lic_method(source, m, source_path: eloot_path) }.join("\n"))
   end
 
   it 'looks in the disk fresh instead of trusting the cached contents' do
