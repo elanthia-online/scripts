@@ -204,8 +204,56 @@ RSpec.describe 'analytics.lic' do
       expect(collector['box']).to eq([250, 500])
     end
 
-    it 'records a vendor sale, its visit and the price per item' do
-      expect(collector.values_at('sale', 'visit_seconds', 'unit_price')).to eq([[12_345, 'gemshop'], 50, 2500])
+    it 'records a vendor visit and the price per item' do
+      expect(collector.values_at('visit_seconds', 'unit_price')).to eq([50, 2500])
+    end
+  end
+
+  describe 'sales and bank balances read from the game text' do
+    subject(:game_text) { result('game_text') }
+
+    it 'records each vendor sale as silver, with the vendor split into type and name' do
+      expect(game_text['sales']).to eq(
+        [['pawnbroker', nil, 77], ['vendor', 'Walsor Gryhm', 410], ['jeweler', 'Kahlyr', 1250]]
+      )
+    end
+
+    it 'records the item sold, its noun and its price' do
+      expect(game_text['items']).to eq(
+        [['ayanad crystal', 'crystal', 77, 'pawnbroker', nil], ['quartz orb', 'orb', 410, 'vendor', 'Walsor Gryhm'],
+         ['gold ingot', 'ingot', 1250, 'jeweler', 'Kahlyr']]
+      )
+    end
+
+    it 'does not count locksmith fees or the teller as sales' do
+      expect(game_text['sales'].size).to eq(3)
+    end
+
+    it 'keeps only the total when a withdrawal comes before any BANK ACCOUNT' do
+      expect(game_text['withdraw_total_only']).to eq([357_850_148, 'withdraw'])
+    end
+
+    it 'records a BANK ACCOUNT listing, then updates that bank on a deposit' do
+      expect(game_text['one_bank']).to eq(
+        [['Vornavis Bank of Solhaven', 422_471_304, nil, 'bank_account'], ['__total__', 422_471_304, 64_621_156, 'bank_account'],
+         ['Vornavis Bank of Solhaven', 422_476_116, 4812, 'deposit'], ['__total__', 422_476_116, 4812, 'deposit']]
+      )
+    end
+
+    it 'records nothing for a deposit that cannot be placed among several banks' do
+      expect(game_text['ambiguous_rows']).to eq(0)
+    end
+
+    it 'does not record the output of its own BANK ACCOUNT command twice' do
+      expect(game_text['command_rows']).to eq(2)
+    end
+
+    it 'ignores vendor_silver calls from scripts while sales are read from the game text' do
+      expect(game_text['hook_ignored']).to eq(3)
+    end
+
+    it 'can be turned off, and then record_vendor_silver works again' do
+      expect(game_text.values_at('disabled', 'hook_when_off')).to eq([true, 1])
     end
   end
 

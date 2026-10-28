@@ -215,6 +215,9 @@ module GS4Analytics
       death_script: nil,
       # Read bigshot's $bigshot_status to see when it is resting
       bigshot_status: true,
+      # Read vendor sales and bank balances from the game text
+      parse_sales: true,
+      parse_bank: true,
       # nil turns a feature off
       max_hunt_minutes: nil,
       idle_warn_minutes: 8,
@@ -275,6 +278,11 @@ module GS4Analytics
       #                        while bigshot is running, because the value can be
       #                        stale otherwise. Set false if you hunt with
       #                        something other than bigshot. Default: true
+      # parse_sales            true: vendor sales ("X takes your item ... hands you N
+      #                        silver") are recorded from the game text, so your
+      #                        selling script needs no changes. Default: true
+      # parse_bank             true: BANK ACCOUNT output and deposit / withdraw
+      #                        messages are recorded as bank balances. Default: true
       # death_script           Your own death-recovery script. While it runs, the
       #                        cycle is "dead". Death is also read from the game's
       #                        dead indicator, so this can stay null.
@@ -669,14 +677,19 @@ module GS4Analytics
       # +results+ maps bank name to balance and carries a '__total__' entry.
       # Individual banks are written only when their balance changed; the
       # total always is, since it carries the silver-per-hour deltas.
+      # { bank name => balance } as of each bank's newest snapshot, '__total__' included
+      def latest_balances(who)
+        all('SELECT s.bank_name, s.balance FROM bank_snapshots s ' \
+            'JOIN (SELECT bank_name, MAX(timestamp) AS ts FROM bank_snapshots ' \
+            '      WHERE game = ? AND character = ? GROUP BY bank_name) m ' \
+            'ON s.bank_name = m.bank_name AND s.timestamp = m.ts ' \
+            'WHERE s.game = ? AND s.character = ?', *who, *who)
+          .to_h { |row| [row['bank_name'], row['balance'].to_i] }
+      end
+
       def store_bank_snapshot(who, session_id, cycle_id, snapshot_type, results)
         now = Time.now.to_i
-        previous = all('SELECT s.bank_name, s.balance FROM bank_snapshots s ' \
-                       'JOIN (SELECT bank_name, MAX(timestamp) AS ts FROM bank_snapshots ' \
-                       '      WHERE game = ? AND character = ? GROUP BY bank_name) m ' \
-                       'ON s.bank_name = m.bank_name AND s.timestamp = m.ts ' \
-                       'WHERE s.game = ? AND s.character = ?', *who, *who)
-                   .to_h { |row| [row['bank_name'], row['balance'].to_i] }
+        previous = latest_balances(who)
 
         # A bank emptied to zero drops out of BANK ACCOUNT. Record the zero so a
         # stale 2B balance doesn't keep warning, but only when the banks that
@@ -953,6 +966,13 @@ module GS4Analytics
     CHARM_RE   = /They locate a pile of ([\d,]+) coins?, reclaiming them/
     DIRECT_RE  = /You gather the remaining ([\d,]+) coins? from inside your/
     BANK_SKIP  = /amounts on deposit|inter-town|urchin/i
+    BANK_START = /amounts on deposit/
+    # "<vendor> takes your <item>, ... hands you N silver ..." (also "takes the <item>")
+    SALE_RE    = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), .*?\bhands you (?<amount>[\d,]+) silvers?/
+    NOUN_RE    = /takes (?:your|the) <a [^>]*noun="([^"]+)"/
+    DEPOSIT_RE = /You deposit ([\d,]+) silvers? into your account\..*?brings your total to ([\d,]+) silvers?/
+    WITHDRAW_RE = /hands you ([\d,]+) silvers?, and says, "This brings your total to ([\d,]+) silvers?/
+    BANK_CAPTURE_MAX = 14 # lines to wait for the Total line
 
     class << self
       attr_reader :last_kill_at
@@ -963,6 +983,8 @@ module GS4Analytics
         @cycle_id = nil
         @kill = nil
         @last_kill_at = nil
+        @bank_lines = nil
+        @snapshotting = false
         DownstreamHook.remove(HOOK)
         DownstreamHook.add(HOOK, proc { |line| on_line(line) })
       end
@@ -979,27 +1001,28 @@ module GS4Analytics
         @session_id = session_id
       end
 
-      # Call from your rest script once a rest finishes
+      # Reads the bank balances now. The game text is also read as it passes
+      # (see parse_bank in the settings), so calling this is optional.
       def take_snapshot(snapshot_type = 'rest_cycle')
         return unless @who
 
+        # The command's own output passes the game-text hook too; don't record it twice
+        @snapshotting = true
         banks = parse_bank(Lich::Util.quiet_command_xml('bank account', /amounts on deposit/, /Total:\s+[\d,]+/))
         return Log.info('Bank snapshot: no data captured') if banks.empty?
 
-        banks.each do |bank, balance|
-          next if bank == '__total__' || balance < BANK_CAP
-
-          Log.info("WARNING: #{bank} is #{Util.fmt(balance)}, at or over 2.0B")
-        end
-        Database.store_bank_snapshot(@who, Database.session_for(@who), @cycle_id, snapshot_type, banks)
+        record_banks(@who, @cycle_id, snapshot_type, banks)
         Log.info("Bank snapshot recorded (#{banks.size - 1} banks, total #{Util.fmt(banks['__total__'])})")
       rescue StandardError => e
         Log.error('bank snapshot', e)
+      ensure
+        @snapshotting = false
       end
 
       # Call from your selling script after each sale
       def record_vendor_silver(amount, vendor_type, vendor_name = nil)
-        return unless @who && amount.to_i.positive?
+        # Sales are read from the game text already; recording them here too would count them twice
+        return unless @who && amount.to_i.positive? && !Settings.current[:parse_sales]
 
         Database.record_silver(@who, Database.session_for(@who), @cycle_id, 'sale', amount,
                                vendor_type: vendor_type, vendor_name: vendor_name)
@@ -1055,10 +1078,89 @@ module GS4Analytics
         elsif (found = text.match(DIRECT_RE))
           record_box(digits(found[1]), 'direct')
         end
+        read_sale(line, text) if Settings.current[:parse_sales]
+        read_bank(text) if Settings.current[:parse_bank]
         line
       rescue StandardError => e
         Log.error('silver hook', e)
         line
+      end
+
+      # A vendor buying an item: one silver event and one item sale
+      def read_sale(line, text)
+        found = text.match(SALE_RE)
+        return unless found
+
+        vendor_type, vendor_name = split_vendor(found[:vendor].strip)
+        item = found[:item].strip
+        noun = line[NOUN_RE, 1] || item.split.last
+        amount = digits(found[:amount])
+        who = @who
+        cycle_id = @cycle_id
+        Database.async do
+          session = Database.session_for(who)
+          Database.record_silver(who, session, cycle_id, 'sale', amount, vendor_type: vendor_type,
+                                                                         vendor_name: vendor_name)
+          Database.record_item_sale(who, session, item, noun, amount, vendor_type, vendor_name)
+        end
+        Log.debug("Sale: #{item} for #{Util.fmt(amount)} (#{vendor_type})")
+      end
+
+      # "jeweler Kahlyr" -> ["jeweler", "Kahlyr"], "pawnbroker" -> ["pawnbroker", nil],
+      # "Walsor Gryhm" -> ["vendor", "Walsor Gryhm"]
+      def split_vendor(text)
+        first, *rest = text.split
+        return ['vendor', text] unless first&.match?(/\A[a-z]/)
+
+        [first, (rest.join(' ') unless rest.empty?)]
+      end
+
+      # BANK ACCOUNT output, then deposit and withdraw messages
+      def read_bank(text)
+        return if @snapshotting
+
+        if text.match?(BANK_START)
+          @bank_lines = []
+        elsif @bank_lines
+          @bank_lines << text
+          finish_bank_capture if text.strip.start_with?('Total:') || @bank_lines.size > BANK_CAPTURE_MAX
+        elsif (found = text.match(DEPOSIT_RE) || text.match(WITHDRAW_RE))
+          record_total(digits(found[2]), text.match?(DEPOSIT_RE) ? 'deposit' : 'withdraw')
+        end
+      end
+
+      def finish_bank_capture
+        banks = parse_bank(@bank_lines)
+        @bank_lines = nil
+        return unless banks['__total__']
+
+        who = @who
+        cycle_id = @cycle_id
+        Database.async { record_banks(who, cycle_id, 'bank_account', banks) }
+      end
+
+      # A deposit or withdrawal names no bank, only the new balance. With one
+      # known bank it is that bank's balance; with none, only the total is
+      # kept; with several it can't be placed, and BANK ACCOUNT will fix it.
+      def record_total(total, type)
+        who = @who
+        cycle_id = @cycle_id
+        Database.async do
+          known = Database.latest_balances(who).except('__total__').select { |_, balance| balance.positive? }.keys
+          next Log.debug("#{type}: several banks, waiting for BANK ACCOUNT") if known.size > 1
+
+          banks = known.to_h { |name| [name, total] }.merge('__total__' => total)
+          record_banks(who, cycle_id, type, banks)
+        end
+      end
+
+      def record_banks(who, cycle_id, type, banks)
+        banks.each do |bank, balance|
+          next if bank == '__total__' || balance < BANK_CAP
+
+          Log.info("WARNING: #{bank} is #{Util.fmt(balance)}, at or over 2.0B")
+        end
+        Database.store_bank_snapshot(who, Database.session_for(who), cycle_id, type, banks)
       end
 
       def flush_kill

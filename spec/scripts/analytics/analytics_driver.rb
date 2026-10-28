@@ -90,7 +90,10 @@ module Lich
   end
 
   module Util
-    def self.quiet_command_xml(*) = $bank_lines
+    def self.quiet_command_xml(*)
+      $bank_lines.each { |line| DownstreamHook.run(line) } if $feed_hook
+      $bank_lines
+    end
   end
 end
 
@@ -251,7 +254,6 @@ when 'collector'
   DownstreamHook.run("It didn't carry any silver.")
   DownstreamHook.run('They locate a pile of 500 coins, reclaiming them')
   DownstreamHook.run('You gather the remaining 250 coins from inside your box')
-  A::SilverManager.record_vendor_silver(12_345, 'gemshop', 'Bob')
   A::SilverManager.record_vendor_visit('gemshop', NOW - 100, NOW - 50, 12_345)
   A::Database.record_item_sale(WHO, A::Database.session_for(WHO), 'a black opal', 'opal', 5000, 'gemshop', 'Bob', 2)
   A::SilverManager.stop # records the kill still being read
@@ -261,7 +263,6 @@ when 'collector'
     'hook_registered' => hook, 'cfg_hunt' => cfg[:hunt_script],
     'kills' => kills.map(&:values),
     'box' => A::Database.all("SELECT amount FROM silver_events WHERE source_category = 'box' ORDER BY amount").map { |r| r['amount'] },
-    'sale' => A::Database.one("SELECT amount, vendor_type FROM silver_events WHERE source_category = 'sale'").values,
     'visit_seconds' => A::Database.one('SELECT duration_seconds FROM vendor_visits')['duration_seconds'],
     'unit_price' => A::Database.one('SELECT unit_price FROM item_sales')['unit_price']
   }
@@ -378,6 +379,77 @@ when 'standalone'
   rescue A::Database::Missing
     true
   end
+
+when 'game_text'
+  # Vendor sales and bank balances read from the game text, in the XML frontend's format
+  A::Database.connect!
+  A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  feed = ->(*lines) { lines.each { |line| DownstreamHook.run(line) } }
+  count = ->(table) { A::Database.one("SELECT COUNT(*) AS n FROM #{table}")['n'] }
+  settle = -> { sleep 0.4 }
+
+  feed.call(
+    'The <pushBold/><a exist="1" noun="Kahlyr">jeweler Kahlyr</a><popBold/> takes the <a exist="2" noun="ingot">gold ingot</a>, ' \
+    'gives it a careful examination and hands you 1,250 silver for it.',
+    'Walsor Gryhm takes your <a exist="3" noun="orb">quartz orb</a>, glances at it briefly, then hands you 410 silver coins.',
+    'The pawnbroker takes your <a exist="4" noun="crystal">ayanad crystal</a>, glances at it briefly, then hands you 77 silver coins.',
+    'The <pushBold/><a exist="5" noun="Jyhm">locksmith Jyhm</a><popBold/> accepts your silvers.',
+    'The teller carefully records the transaction, hands you 2,500 silvers, and says, "This brings your total to 357,850,148 silvers."'
+  )
+  settle.call
+  sales = A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY amount")
+  items = A::Database.all('SELECT item_name, item_noun, total_price, vendor_type, vendor_name FROM item_sales ORDER BY total_price')
+  withdraw = A::Database.one("SELECT balance, snapshot_type FROM bank_snapshots WHERE bank_name = '__total__'")
+  hook_ignored = (A::SilverManager.record_vendor_silver(999, 'gemshop', 'Bob'); count.call('silver_events'))
+
+  # A BANK ACCOUNT block names the bank, so later deposits update it
+  feed.call('You currently have the following amounts on deposit:', '', '<output class="mono"/>',
+            '      Vornavis Bank of Solhaven: 422,471,304', '                          Total: 422,471,304',
+            '<output class=""/>', 'You currently have 0 inter-town bank transfer options available.')
+  settle.call
+  feed.call('You deposit 4,812 silvers into your account.  The teller carefully records the transaction and says, ' \
+            '"Thank you, <a exist="-1" noun="Tysong">Tysong</a>.  This brings your total to 422,476,116 silvers.  Have a nice day!"')
+  settle.call
+  one_bank = A::Database.all("SELECT bank_name, balance, delta_silver, snapshot_type FROM bank_snapshots WHERE snapshot_type != 'withdraw' ORDER BY timestamp, rowid, bank_name").map(&:values)
+
+  # With two banks a deposit can't be placed, so nothing is recorded
+  feed.call('You currently have the following amounts on deposit:', '      Bank A: 100', '      Bank B: 200', '      Total: 300')
+  settle.call
+  rows_before = count.call('bank_snapshots')
+  feed.call('You deposit 50 silvers into your account.  The teller carefully records the transaction and says, ' \
+            '"Thank you, Tysong.  This brings your total to 350 silvers.  Have a nice day!"')
+  settle.call
+  ambiguous_rows = count.call('bank_snapshots') - rows_before
+
+  # take_snapshot reads the same output the hook sees, and must not record it twice
+  $bank_lines = ['You currently have the following amounts on deposit:', '      Bank A: 100', '      Bank B: 250', '      Total: 350']
+  $feed_hook = true
+  rows_before = count.call('bank_snapshots')
+  A::SilverManager.take_snapshot
+  settle.call
+  command_rows = count.call('bank_snapshots') - rows_before
+  $feed_hook = false
+
+  # Both readers can be turned off
+  A::Settings.current[:parse_sales] = false
+  A::Settings.current[:parse_bank] = false
+  before = [count.call('silver_events'), count.call('item_sales'), count.call('bank_snapshots')]
+  feed.call('The pawnbroker takes your <a exist="4" noun="crystal">ayanad crystal</a>, glances at it briefly, then hands you 77 silver coins.',
+            'You deposit 50 silvers into your account.  The teller carefully records the transaction and says, ' \
+            '"Thank you, Tysong.  This brings your total to 999 silvers.  Have a nice day!"')
+  settle.call
+  disabled = [count.call('silver_events'), count.call('item_sales'), count.call('bank_snapshots')] == before
+  A::SilverManager.record_vendor_silver(999, 'gemshop', 'Bob')
+  hook_when_off = count.call('silver_events') - before.first
+
+  result = {
+    'sales' => sales.map(&:values), 'items' => items.map(&:values),
+    'withdraw_total_only' => withdraw.values, 'hook_ignored' => hook_ignored,
+    'one_bank' => one_bank, 'ambiguous_rows' => ambiguous_rows, 'command_rows' => command_rows,
+    'disabled' => disabled, 'hook_when_off' => hook_when_off
+  }
+  A::SilverManager.stop
 
 when 'bigshot_status'
   # Bigshot's own status marks a rest, but only while the script is running
