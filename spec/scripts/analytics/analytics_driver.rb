@@ -45,7 +45,7 @@ end
 
 class Script
   Current = Struct.new(:name, :vars)
-  def self.running?(_name) = false
+  def self.running?(name) = ($running ||= []).include?(name.to_s)
   def self.current = Current.new('analytics', [''])
   def self.start(*) = nil
   def self.run(*) = nil
@@ -365,6 +365,33 @@ when 'standalone'
   rescue A::Database::Missing
     true
   end
+
+when 'bigshot_status'
+  # Bigshot's own status marks a rest, but only while the script is running
+  A::Database.connect!
+  manager = A::CycleManager
+  manager.instance_variable_set(:@cfg, A::Settings.load(WHO).merge(rest_script: nil))
+  signals = lambda do |running, status|
+    $running = running
+    $bigshot_status = status
+    manager.send(:read_signals).slice(:rest, :hunt).values
+  end
+  result = {
+    'hunting' => signals.call(['bigshot'], :hunting),
+    'ready' => signals.call(['bigshot'], :ready),
+    'resting' => signals.call(['bigshot'], :resting),
+    'rest_stop' => signals.call(['bigshot'], :rest_stop),
+    'stale_after_exit' => signals.call([], :resting),
+    'nil_status' => signals.call(['bigshot'], nil)
+  }
+  manager.instance_variable_get(:@cfg)[:bigshot_status] = false
+  result['disabled'] = signals.call(['bigshot'], :resting)
+  manager.instance_variable_set(:@cfg, manager.instance_variable_get(:@cfg).merge(bigshot_status: true, rest_script: 'my_rest'))
+  result['rest_script_still_works'] = signals.call(['my_rest'], nil)
+  manager.instance_variable_get(:@cfg)[:rest_script] = nil
+  $running = ['bigshot']
+  $bigshot_status = :resting
+  result['status_line'] = manager.status.last
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

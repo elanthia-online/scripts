@@ -213,6 +213,8 @@ module GS4Analytics
       hunt_script: 'bigshot',
       rest_script: nil,
       death_script: nil,
+      # Read bigshot's $bigshot_status to see when it is resting
+      bigshot_status: true,
       # nil turns a feature off
       max_hunt_minutes: nil,
       idle_warn_minutes: 8,
@@ -263,9 +265,16 @@ module GS4Analytics
       #                        "hunting". Default: bigshot
       #                        A list looks like:  hunt_script: [bigshot, my_hunter]
       # rest_script            Your own script that rests (sells, loots, banks,
-      #                        returns). While it runs, the cycle is "rest". Without
-      #                        one, resting is NOT detected, because stock bigshot
-      #                        rests inside itself. Also used by idle_recover_minutes.
+      #                        returns). While it runs, the cycle is "rest". Bigshot
+      #                        resting is detected on its own (see bigshot_status);
+      #                        this adds your script's time. Also used by
+      #                        idle_recover_minutes.
+      # bigshot_status         true: while bigshot is running, its own status
+      #                        ($bigshot_status) says when it is resting, so a rest
+      #                        is detected even without a rest_script. Only read
+      #                        while bigshot is running, because the value can be
+      #                        stale otherwise. Set false if you hunt with
+      #                        something other than bigshot. Default: true
       # death_script           Your own death-recovery script. While it runs, the
       #                        cycle is "dead". Death is also read from the game's
       #                        dead indicator, so this can stay null.
@@ -1298,6 +1307,10 @@ module GS4Analytics
     WEAPON_CHECK_EVERY = 6 # polls
     WEAPON_GRACE = 60 # polls after a hunt starts
     WEAPON_RETRIES = 3
+    # Values of bigshot's $bigshot_status that mean it is resting (see bigshot.lic):
+    # :resting is set when a rest reason was found, :rest_stop when it exits to rest.
+    # The others are :hunting, :ready, :boundary_building, and nil once it exits.
+    BIGSHOT_REST_STATUSES = %i[resting rest_stop].freeze
 
     class << self
       attr_reader :current_state, :current_cycle_id, :hunt_start_time
@@ -1309,6 +1322,7 @@ module GS4Analytics
         @current_cycle_id = nil
         @hunt_start_time = nil
         @last_flip = -DEBOUNCE_SECONDS
+        @last_bigshot_status = nil
         @rest_steps = Hash.new(0.0)
         @rest_cycle = nil
         @idle = { since: nil, warned: false, recovering: false }
@@ -1331,7 +1345,7 @@ module GS4Analytics
       def status
         names = SCRIPT_KEYS.map { |state, key| "#{state}: #{Array(@cfg[key]).join(', ').then { |s| s.empty? ? '(not set)' : s }}" }
         ["State: #{@current_state}", "Cycle: #{@current_cycle_id || 'none'}", "Session: #{@session_id}",
-         "Scripts: #{names.join('; ')}"]
+         "Scripts: #{names.join('; ')}", "Bigshot status: #{bigshot_status.inspect}"]
       end
 
       private
@@ -1355,12 +1369,28 @@ module GS4Analytics
 
       def tick
         roll_over_midnight
-        signals = { dead: dead?, rest: running?(@cfg[:rest_script]), hunt: running?(@cfg[:hunt_script]) }
+        signals = read_signals
         track_rest_step if @current_state == :rest
         check_hunt_timeout
         check_weapons if @current_state == :hunt && @cfg[:weapon_loadout]
         check_idle(signals.values.any?)
         update_state(signals)
+      end
+
+      def read_signals
+        status = bigshot_status
+        @last_bigshot_status = status if status
+        { dead: dead?, rest: running?(@cfg[:rest_script]) || BIGSHOT_REST_STATUSES.include?(status),
+          hunt: running?(@cfg[:hunt_script]) }
+      end
+
+      # Bigshot's own status, or nil when it isn't running: the global keeps
+      # its last value only until bigshot's teardown, so it is trusted only
+      # while the script is alive
+      def bigshot_status
+        return unless @cfg[:bigshot_status] && Script.running?('bigshot')
+
+        $bigshot_status if defined?($bigshot_status)
       end
 
       def update_state(signals)
@@ -1374,10 +1404,12 @@ module GS4Analytics
       def transition_to(target)
         Log.debug("State #{@current_state} -> #{target}")
         # A hunt that ends with neither a rest nor a death was cut off, but
-        # that can only be told when a rest script is configured at all
-        if @current_state == :hunt && target == :idle && @current_cycle_id && !Array(@cfg[:rest_script]).empty?
+        # that can only be told when something reports resting at all
+        if @current_state == :hunt && target == :idle && @current_cycle_id && rest_detectable? &&
+           !BIGSHOT_REST_STATUSES.include?(@last_bigshot_status)
           Database.set_rest_reason(@current_cycle_id, 'unhandled exit')
         end
+        @last_bigshot_status = nil
         end_current_cycle
         @current_state = target
         @hunt_start_time = target == :hunt ? Time.now.to_i : nil
@@ -1594,6 +1626,10 @@ module GS4Analytics
       end
 
       # ----- small helpers ---------------------------------------------------
+
+      def rest_detectable?
+        !Array(@cfg[:rest_script]).empty? || (@cfg[:bigshot_status] && !@last_bigshot_status.nil?)
+      end
 
       def dead?
         running?(@cfg[:death_script]) || checkdead

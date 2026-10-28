@@ -86,6 +86,34 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'CycleManager bigshot status' do
+    subject(:signals) { result('bigshot_status') }
+
+    it 'counts bigshot as hunting, not resting, while it hunts or is ready' do
+      expect(signals.values_at('hunting', 'ready')).to eq([[false, true], [false, true]])
+    end
+
+    it 'counts bigshot as resting when its status is resting or rest_stop' do
+      expect(signals.values_at('resting', 'rest_stop')).to eq([[true, true], [true, true]])
+    end
+
+    it 'ignores a stale status once bigshot is no longer running' do
+      expect(signals.values_at('stale_after_exit', 'nil_status')).to eq([[false, false], [false, true]])
+    end
+
+    it 'can be turned off for characters that hunt with something else' do
+      expect(signals['disabled']).to eq([false, true])
+    end
+
+    it 'still detects a rest script' do
+      expect(signals['rest_script_still_works']).to eq([true, false])
+    end
+
+    it 'shows the status in ;analytics status' do
+      expect(signals['status_line']).to eq('Bigshot status: :resting')
+    end
+  end
+
   describe 'Database' do
     subject(:database) { result('database') }
 
