@@ -286,6 +286,10 @@ RSpec.describe 'analytics.lic' do
       expect(cli.values_at('caught', 'queued')).to eq([[nil, nil], 2])
     end
 
+    it 'starts the dashboard in the running collector when --dashboard is typed' do
+      expect(cli['dashboard']).to eq([[nil, ['serve']], [nil, %w[serve 9000 lan]], [';analytics --lan', nil]])
+    end
+
     it 'lets every other line through, including a bare ;analytics' do
       expect(cli['passed']).to eq(['look', ';other thing', ';analytics'])
     end

@@ -338,11 +338,19 @@ when 'cli'
   help = lines(OUT)
   cli.send(:install_hook)
   caught = [UpstreamHook.run(';analytics report exp'), UpstreamHook.run('<c>;analytics status')]
+  queue = cli.instance_variable_get(:@commands)
+  queue.clear
+  dashboard = [';analytics --dashboard', ';analytics --dashboard=9000 --lan', ';analytics --lan'].map do |line|
+    [UpstreamHook.run(line), (queue.empty? ? nil : queue.pop)]
+  end
+  queue.clear
+  UpstreamHook.run(';analytics report exp')
+  UpstreamHook.run('<c>;analytics status')
   passed = ['look', ';other thing', ';analytics'].map { |line| UpstreamHook.run(line) }
   result = {
     'report' => report.include?('Summary'), 'status' => status.include?('Database:'),
     'stats' => stats.include?('cycles:'), 'help' => help.include?('Usage'),
-    'caught' => caught, 'passed' => passed,
+    'caught' => caught, 'dashboard' => dashboard, 'passed' => passed,
     'queued' => cli.instance_variable_get(:@commands).size
   }
 
