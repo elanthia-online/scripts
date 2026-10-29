@@ -126,20 +126,20 @@ def run_sql(statement, *params) = A::Database.db.run(Sequel.lit(statement, *para
 def lines(result) = result.join("\n")
 
 # One completed hunt cycle (and, with +rest+, the rest after it) starting at +start+
-def seed_cycles(who, session, start, rest: true)
+def seed_cycles(who, session, start, rest: true, hunt_secs: 2700)
   hunt = A::Database.start_cycle(who, session, :hunt, 'bigshot', 'torvek_crags',
                                  exp_total: 1_000_000, exp_field: 100, exp_max: 800, fame: 10, encumbrance: 20.0)
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', start, hunt)
   A::Database.end_cycle(hunt, { exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0 },
                         'Too many items')
-  run_sql('UPDATE cycles SET end_time = ?, duration_seconds = 2700 WHERE cycle_id = ?', start + 2700, hunt)
+  run_sql('UPDATE cycles SET end_time = ?, duration_seconds = ? WHERE cycle_id = ?', start + hunt_secs, hunt_secs, hunt)
   return unless rest
 
   rest_id = A::Database.start_cycle(who, session, :rest, 'my_rest', 'torvek_crags',
                                     exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0)
   run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 400, ' \
-          'exp_total_end = 1100000, rest_reason = ? WHERE cycle_id = ?', start + 2700, start + 3100, 'Too many items', rest_id)
-  A::Database.record_rest_steps(who, rest_id, start + 2700, { 'travel' => 120.0, 'selling' => 80.5 })
+          'exp_total_end = 1100000, rest_reason = ? WHERE cycle_id = ?', start + hunt_secs, start + hunt_secs + 400, 'Too many items', rest_id)
+  A::Database.record_rest_steps(who, rest_id, start + hunt_secs, { 'travel' => 120.0, 'selling' => 80.5 })
 end
 
 # Three characters over the last few days: two games, one shared name
@@ -147,7 +147,10 @@ def seed_history
   [WHO, A::Who.new('GS3', 'Ashur'), A::Who.new('GSF', 'Torvek')].each do |who|
     session = A::Database.session_for(who)
     midnight = A::Util.midnight(Date.today)
-    seed_cycles(who, session, NOW - 5000) # finished within the last 24 hours, so it shows on the dashboard
+    # A hunt (and rest, when there is room) earlier today, whatever the time of day, so it shows on the dashboard
+    recent = [A::Util.midnight(Date.today), NOW - 5000].max
+    hunt_secs = [2700, NOW - recent - 30].min
+    seed_cycles(who, session, recent, rest: NOW - recent > 3200, hunt_secs: hunt_secs) if hunt_secs > 60
     3.downto(1) do |ago|
       seed_cycles(who, session, midnight - (ago * 86_400) + (8 * 3600))
       run_sql('INSERT INTO kill_stats (game, character, date, profile, creature, kill_count, total_silver, last_kill_at) ' \
@@ -306,7 +309,7 @@ when 'reports'
       'ascii'              => texts.values.all? { |text| text.join.ascii_only? },
       'widest'             => texts.values.flatten.map(&:length).max,
       'names_in_character' => texts['character'].join.scan(/Torvek|Ashur/).uniq.sort,
-      'min_range_lines'    => ranges.values.min,
+      'range_lines'        => ranges,
       'bad_range'          => A::Report::Text.exp_summary(conn, 'bogus').first
     }
   end
@@ -481,12 +484,12 @@ when 'bigshot_status'
     manager.send(:read_signals).slice(:rest, :hunt).values
   end
   result = {
-    'hunting' => signals.call(['bigshot'], :hunting),
-    'ready' => signals.call(['bigshot'], :ready),
-    'resting' => signals.call(['bigshot'], :resting),
-    'rest_stop' => signals.call(['bigshot'], :rest_stop),
+    'hunting'          => signals.call(['bigshot'], :hunting),
+    'ready'            => signals.call(['bigshot'], :ready),
+    'resting'          => signals.call(['bigshot'], :resting),
+    'rest_stop'        => signals.call(['bigshot'], :rest_stop),
     'stale_after_exit' => signals.call([], :resting),
-    'nil_status' => signals.call(['bigshot'], nil)
+    'nil_status'       => signals.call(['bigshot'], nil)
   }
   manager.instance_variable_get(:@cfg)[:bigshot_status] = false
   result['disabled'] = signals.call(['bigshot'], :resting)
@@ -578,9 +581,9 @@ when 'town_bounty'
 
   result = {
     'recorded_while_not_hunting' => recorded_while_not_hunting,
-    'gem' => gem.values_at('bounty_type', 'creature', 'area', 'count_required', 'status', 'silver_reward'),
-    'received_before_completed' => gem['received_time'] <= gem['completed_time'],
-    'untracked' => A::Database.all("SELECT silver_reward FROM bounties WHERE bounty_type = 'untracked' ORDER BY silver_reward").map { |r| r['silver_reward'] }
+    'gem'                        => gem.values_at('bounty_type', 'creature', 'area', 'count_required', 'status', 'silver_reward'),
+    'received_before_completed'  => gem['received_time'] <= gem['completed_time'],
+    'untracked'                  => A::Database.all("SELECT silver_reward FROM bounties WHERE bounty_type = 'untracked' ORDER BY silver_reward").map { |r| r['silver_reward'] }
   }
 
 when 'reload'

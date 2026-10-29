@@ -327,7 +327,11 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'handles every range' do
-      expect(reports['min_range_lines']).to be > 3
+      expect(reports['range_lines'].except('daily').values).to all(be > 3)
+    end
+
+    it 'still answers for today shortly after midnight, when there may be nothing yet' do
+      expect(reports['range_lines']['daily']).to be >= 1
     end
 
     it 'gives usage for an unknown range' do
