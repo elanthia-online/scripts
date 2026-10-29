@@ -107,7 +107,7 @@ class TaskStub
     @requirements = { area: area, number: number, type => item }.compact
   end
 
-  def none? = false
+  def none? = type == :none
 end
 
 module Bounty
@@ -557,35 +557,51 @@ when 'town_bounty'
   manager = A::BountyManager
   manager.instance_variable_set(:@who, WHO)
   $running = []
-  task = lambda do |type, creature, area, number, item = nil|
+  task = lambda do |type, creature = '', area = '', number = nil, item = nil|
     $task = TaskStub.new(type, creature, area, number, item)
   end
-  row = ->(label) { A::Database.one("SELECT bounty_type, creature, area, count_required, status, silver_reward, received_time, completed_time FROM bounties WHERE bounty_type = '#{label}'") }
+  row = lambda do |silver|
+    A::Database.one('SELECT bounty_type, creature, area, count_required, status, silver_reward, received_time, completed_time ' \
+                    "FROM bounties WHERE silver_reward = #{silver}")
+  end
+  age_seen = ->(seconds) { manager.instance_variable_get(:@seen)[:at] -= seconds }
 
+  # Seen while the work was still to do, then done and left waiting for the turn-in
+  # for a long time (the log's 05:32 gem task: finished in seconds, rewarded 17 minutes later)
   task.call(:gem, '', 'Solhaven', 9, 'piece of leopard skin jasper')
   manager.send(:check_task)
   recorded_while_not_hunting = A::Database.all('SELECT 1 FROM bounties').size
-  $task = nil
-  manager.send(:handle_reward, 1250, 1000, 4812)
-  gem = row.call('gem')
-
-  # Seen long ago: too old to explain a reward
-  task.call(:herb, 'moss', 'Vornavis', 4)
+  task.call(:taskmaster)
   manager.send(:check_task)
-  $task = nil
-  manager.instance_variable_get(:@seen)[:at] -= 700
+  age_seen.call(1000)
+  manager.send(:handle_reward, 1250, 1000, 4812)
+  gem = row.call(4812)
+
+  # Seen, then removed (no task): the reward cannot be for it
+  task.call(:herb, '', 'Vornavis', 4, 'blue moss')
+  manager.send(:check_task)
+  task.call(:none)
+  manager.send(:check_task)
   manager.send(:handle_reward, 100, 100, 100)
 
+  # Seen, then replaced by a new assignment that is not trackable yet
+  task.call(:cull, 'kobold', 'Icemule', 20)
+  manager.send(:check_task)
+  task.call(:gem_assignment)
+  manager.send(:check_task)
+  manager.send(:handle_reward, 55, 55, 55)
+
   # Never seen
+  $task = nil
   manager.send(:handle_reward, 7, 8, 9)
 
   result = {
     'recorded_while_not_hunting' => recorded_while_not_hunting,
     'gem'                        => gem.values_at('bounty_type', 'creature', 'area', 'count_required', 'status', 'silver_reward'),
+    'received_before_completed'  => gem['received_time'] <= gem['completed_time'] - 900,
     'targets'                    => [A::Util.bounty_target('gem', gem['creature'], gem['area']), A::Util.bounty_target('gem', '', 'Solhaven'),
                                      A::Util.bounty_target('herb', 'blue moss', 'Vornavis'), A::Util.bounty_target('cull', 'kobold', 'Icemule'),
                                      A::Util.bounty_target('gem', 'opal', ''), A::Util.bounty_target('escort', '', "Ta'Vaalor")],
-    'received_before_completed'  => gem['received_time'] <= gem['completed_time'],
     'untracked'                  => A::Database.all("SELECT silver_reward FROM bounties WHERE bounty_type = 'untracked' ORDER BY silver_reward").map { |r| r['silver_reward'] }
   }
 

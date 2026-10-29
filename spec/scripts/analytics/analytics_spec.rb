@@ -159,12 +159,12 @@ RSpec.describe 'analytics.lic' do
       )
     end
 
-    it 'dates the bounty from when the task was first seen' do
+    it 'dates the bounty from when the task was first seen, even if the reward came much later' do
       expect(town['received_before_completed']).to be(true)
     end
 
-    it 'falls back to untracked when the task is too old or was never seen' do
-      expect(town['untracked']).to eq([9, 100])
+    it 'falls back to untracked when the task was removed, replaced or never seen' do
+      expect(town['untracked']).to eq([9, 55, 100])
     end
   end
 
