@@ -100,11 +100,11 @@ end
 class TaskStub
   attr_reader :type, :creature, :town, :requirements
 
-  def initialize(type, creature, area, number)
+  def initialize(type, creature, area, number, item = nil)
     @type = type
     @creature = creature
     @town = area
-    @requirements = { area: area, number: number }
+    @requirements = { area: area, number: number, type => item }.compact
   end
 
   def none? = false
@@ -557,12 +557,12 @@ when 'town_bounty'
   manager = A::BountyManager
   manager.instance_variable_set(:@who, WHO)
   $running = []
-  task = lambda do |type, creature, area, number|
-    $task = TaskStub.new(type, creature, area, number)
+  task = lambda do |type, creature, area, number, item = nil|
+    $task = TaskStub.new(type, creature, area, number, item)
   end
   row = ->(label) { A::Database.one("SELECT bounty_type, creature, area, count_required, status, silver_reward, received_time, completed_time FROM bounties WHERE bounty_type = '#{label}'") }
 
-  task.call(:gem, '', 'Solhaven', 9)
+  task.call(:gem, '', 'Solhaven', 9, 'piece of leopard skin jasper')
   manager.send(:check_task)
   recorded_while_not_hunting = A::Database.all('SELECT 1 FROM bounties').size
   $task = nil
@@ -582,6 +582,9 @@ when 'town_bounty'
   result = {
     'recorded_while_not_hunting' => recorded_while_not_hunting,
     'gem'                        => gem.values_at('bounty_type', 'creature', 'area', 'count_required', 'status', 'silver_reward'),
+    'targets'                    => [A::Util.bounty_target('gem', gem['creature'], gem['area']), A::Util.bounty_target('gem', '', 'Solhaven'),
+                                     A::Util.bounty_target('herb', 'blue moss', 'Vornavis'), A::Util.bounty_target('cull', 'kobold', 'Icemule'),
+                                     A::Util.bounty_target('gem', 'opal', ''), A::Util.bounty_target('escort', '', "Ta'Vaalor")],
     'received_before_completed'  => gem['received_time'] <= gem['completed_time'],
     'untracked'                  => A::Database.all("SELECT silver_reward FROM bounties WHERE bounty_type = 'untracked' ORDER BY silver_reward").map { |r| r['silver_reward'] }
   }

@@ -150,7 +150,13 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'describes the reward from the task last seen' do
-      expect(town['gem']).to eq(['gem', '', 'Solhaven', 9, 'completed', 4812])
+      expect(town['gem']).to eq(['gem', 'piece of leopard skin jasper', 'Solhaven', 9, 'completed', 4812])
+    end
+
+    it 'shows a gem or herb with its town, and other bounties by creature or area' do
+      expect(town['targets']).to eq(
+        ['piece of leopard skin jasper (Solhaven)', 'Solhaven', 'blue moss (Vornavis)', 'kobold', 'opal', "Ta'Vaalor"]
+      )
     end
 
     it 'dates the bounty from when the task was first seen' do
