@@ -358,6 +358,10 @@ RSpec.describe 'analytics.lic' do
       expect(dashboard['http_index']).to eq(['200', true, true])
     end
 
+    it 'serves the page with the save-image button, and allows the data image it draws from' do
+      expect(dashboard['export_button']).to eq([true, true, true])
+    end
+
     it 'serves the JSON API' do
       expect(dashboard.values_at('http_api', 'http_character', 'http_unknown')).to eq([3, '200', '404'])
     end

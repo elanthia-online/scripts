@@ -330,6 +330,8 @@ when 'dashboard'
     'detail_id' => detail['id'], 'steps' => detail['steps'].keys.sort,
     'unknown' => A::Dashboard.character('GS3:Nobody', 'daily').nil?,
     'http_index' => [index.code, index.body.include?('GS4 Analytics'), index['content-security-policy'].to_s.include?("default-src 'none'")],
+    'export_button' => [index.body.include?('id="export"'), index.body.include?('function exportImage'),
+                        index['content-security-policy'].to_s.include?('img-src data:')],
     'http_api' => api['characters'].size,
     'http_character' => http.get('/api/character?name=GS3%3ATorvek&range=weekly').code,
     'http_unknown' => http.get('/api/character?name=nobody').code,
