@@ -15,10 +15,28 @@
               game: Gemstone
               tags: loot
           required: Lich >= 5.22.0
-           version: 2.14.1
+           version: 2.14.2
 
   Improvements:
   Major_change.feature_addition.bugfix
+  v2.14.2 (2026-10-25)
+    - fix: after unpausing eloot when your containers were full, it no longer keeps pausing
+      on every item until you restart it
+    - fix: the locksmith pool could pause with full containers when an item taken out of a
+      box wouldn't fit back in it, was worth more than your appraisal limit, or the
+      pawnshop paid with a bond note
+    - fix: a box already in hand at the locksmith pool could be handed in out of turn,
+      followed by failed attempts to hand it in again
+    - fix: when the game lagged at the locksmith pool, eloot could crash or miscount the pool,
+      and a box handed back late was left in your hand unopened
+    - fix: boxes already taken out of your disk could be looked for again, with
+      "could not find" errors and boxes carried to the locksmith that were already gone
+    - fix: after the furrier bought your skins, eloot tried to sell each of them again,
+      about 5 seconds per skin, and kept doing so on later runs
+    - fix: creatures whose skin is always ruined, like OSA ship captains, are no longer
+      skinned again every time (clear with ;eloot reset unskinnable)
+    - fix: eloot could lose track of a container after it came back from your locker,
+      reporting "Can't find" for a container you were wearing
   v2.14.1 (2026-10-20)
     - fix: selling at the furrier no longer sells skins (or your whole container) when skin is not a selling type
   v2.14.0 (2026-10-13)
@@ -2388,6 +2406,27 @@ module ELoot # Sets Inventory
     end
   end
 
+  # eloot stays loaded between runs, so set_inventory only runs on its first start. A stow
+  # container whose id changed since (taken back out of a locker) leaves StowList, and the
+  # overflow and appraisal keys eloot adds to it, pointing at an object that is gone.
+  # A stow container that was taken off (left in a locker) stays in the stow list but not
+  # in your inventory, so it is still invalid after a refresh; refresh once for that, not
+  # on every run, until the stow list or what you wear changes.
+  def self.refresh_stale_inventory
+    return if StowList.valid?
+    return if ELoot.stow_snapshot == @unseen_stow_snapshot
+
+    ELoot.msg(type: "debug", text: "stow list no longer matches your inventory, checking it again")
+    ELoot.set_inventory
+    # Only remember a list the game sent back; valid? clears checked?, so read it first
+    @unseen_stow_snapshot = StowList.checked? && !StowList.valid? ? ELoot.stow_snapshot : nil
+  end
+
+  # @return [Array<Array<String>>] the stow list's ids and the ids of what you wear
+  def self.stow_snapshot
+    [StowList.stow_list.values.compact.map(&:id).sort, GameObj.inv.map(&:id).sort]
+  end
+
   def self.set_inventory # main start up inventory method
     @room_inventory_ready = false
     # Check account type
@@ -2397,9 +2436,9 @@ module ELoot # Sets Inventory
     ELoot.get_command("flag righthand off", /You will not attempt to pick\s?up treasure using your right hand/, silent: true, quiet: true)
     ELoot.get_command("flag lefthand off", /You will not attempt to pick\s?up treasure using your left hand/, silent: true, quiet: true)
 
-    # Make sure StowList and ReadyList are populated
-    ReadyList.check(silent: true, quiet: true) unless ReadyList.checked?
-    StowList.check(silent: true, quiet: true) unless StowList.checked?
+    # Make sure StowList and ReadyList are populated, and that what they hold still exists
+    ReadyList.check(silent: true, quiet: true) unless ReadyList.checked? && ReadyList.valid?
+    StowList.check(silent: true, quiet: true) unless StowList.checked? && StowList.valid?
 
     # Remove any extra keys and repopulate them
     ReadyList.ready_list.delete_if { |k, _| [:skin_weapon, :skin_weapon_blunt, :skin_sheath, :skin_sheath_blunt].include?(k) }
@@ -2966,7 +3005,7 @@ module ELoot # Script utility type methods
     [whole, decimal].compact.join('.')
   end
 
-  def self.get_command(command, regex, silent: nil, quiet: false)
+  def self.get_command(command, regex, silent: nil, quiet: false, timeout: 5)
     if ELoot.data.settings[:debug]
       silent = nil
       quiet = false
@@ -2977,7 +3016,7 @@ module ELoot # Script utility type methods
     regex = Regexp.union(regex, rt_regex)
 
     begin
-      lines = Lich::Util.issue_command(command, regex, usexml: true, silent: silent, quiet: quiet)
+      lines = Lich::Util.issue_command(command, regex, usexml: true, silent: silent, quiet: quiet, timeout: timeout)
 
       ELoot.msg(type: "debug", text: "command: #{command} | lines - #{lines}")
       raise if lines.any? { |l| l =~ rt_regex }
@@ -3387,11 +3426,7 @@ module ELoot # Game utility type methods
 
     if ELoot.data.settings[:use_disk]
       ELoot.wait_rt
-      ELoot.wait_for_disk
-      unless ELoot.data.disk.nil?
-        Inventory.open_single_container(ELoot.data.disk)
-        items += ELoot.data.disk.contents.to_a.find_all { |obj| obj.type =~ /box/ }
-      end
+      items += ELoot.disk_contents.find_all { |obj| obj.type =~ /box/ }
     end
 
     ELoot.msg(type: "debug", text: "box_list before: #{items}")
@@ -3403,7 +3438,13 @@ module ELoot # Game utility type methods
     box_list.reject! { |box| box.contents.empty? }
 
     box_list.dup.each do |box|
-      lines = ELoot.get_command("look in ##{box.id}", /<container|That is closed|You see the shifting form/, silent: true, quiet: true)
+      lines = ELoot.get_command("look in ##{box.id}", /<container|That is closed|You see the shifting form|I could not find what you were referring to/, silent: true, quiet: true)
+
+      # Gone since the contents were cached (already looted and trashed)
+      if lines.any? { |line| line =~ /I could not find what you were referring to/ }
+        box_list.delete(box)
+        next
+      end
 
       if lines.any? { |line| line =~ /In the|There is nothing/i }
         if box.contents.length.positive?
@@ -3940,6 +3981,24 @@ module ELoot # Game utility type methods
       ELoot.data.disk = nil
     end
   end
+
+  # Lich only updates a container's contents when the game sends a refresh, and some
+  # containers never get one (a disk, a skin sack emptied by the furrier), so the cached
+  # contents can still list whatever has since been taken out. Look in fresh.
+  # @param container [GameObj, nil]
+  # @return [Array<GameObj>] the container's contents, or [] with no container
+  def self.fresh_contents(container)
+    return [] if container.nil?
+
+    ELoot.get_command("look in ##{container.id}", ELoot.data.look_regex, silent: true, quiet: true)
+    container.contents.to_a
+  end
+
+  # @return [Array<GameObj>] the disk's contents, or [] with no disk
+  def self.disk_contents
+    ELoot.wait_for_disk
+    ELoot.fresh_contents(ELoot.data.disk)
+  end
 end
 
 module ELoot # Inventory methods
@@ -4058,6 +4117,15 @@ module ELoot # Inventory methods
         sleep 0.1
       }
 
+      # The first line back can be room chatter instead of the drag's reply, so give an
+      # unanswered drag as long as sell_item waits before calling it a miss
+      unless line =~ /Get what|I could not find what you were referring to|You are unable to handle the additional load/
+        30.times {
+          return true if ELoot.in_hand?(item)
+          sleep 0.1
+        }
+      end
+
       if line =~ /You are unable to handle the additional load/
         ELoot.msg(type: "yellow", text: " Unable to pick up the #{item.name}. Exiting...")
         exit
@@ -4070,7 +4138,7 @@ module ELoot # Inventory methods
 
         lost_item = Sell.check_inventory.find { |obj| obj.id == item.id }
         if lost_item
-          Inventory.drag(lost_item, to)
+          return Inventory.drag(lost_item, to)
         else
           ELoot.msg(type: "info", text: " Can't find #{item.name}. Looked in all the bags in case it got misplaced.")
         end
@@ -4314,6 +4382,12 @@ module ELoot # Inventory methods
           ELoot.msg(type: "info", text: " ;unpause #{Script.current.name} after addressing to continue!")
 
           Script.current.pause
+
+          # The player made space by hand, so the full-container tracking is stale. Without
+          # this every later store skips those containers and pauses again immediately.
+          ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0], "unpause"] }
+          ELoot.reset_disk_full
+          return Inventory.single_drag(item, phase_thing) if ELoot.in_hand?(item)
         end
       end
     end
@@ -5947,8 +6021,8 @@ module ELoot # Room looting
     # @param box [GameObj] the box being looted, held in one hand
     # @param data [Hash] silver breakdown ledger, forwarded to appraise/sell_item
     # @return [void]
-    def self.sell_box_contents(box, data)
-      routed = box.contents.to_a.filter_map do |item|
+    def self.sell_box_contents(box, data, items = box.contents.to_a)
+      routed = items.filter_map do |item|
         next if $sell_ignore.include?(item.id)
 
         locations = Sell.check_items(items: [item])
@@ -5973,19 +6047,35 @@ module ELoot # Room looting
         ELoot.go2(room_id)
 
         items_here.each do |item, shop|
-          next unless box.contents.to_a.include?(item)
           next if $sell_ignore.include?(item.id)
 
-          Inventory.drag(item)
+          unless ELoot.in_hand?(item)
+            next unless box.contents.to_a.include?(item)
+            Inventory.drag(item)
+            next unless ELoot.in_hand?(item)
+          end
 
           case shop
           when "gemshop"
-            Sell.appraise(item, "Gemshop", data)
+            Sell.appraise(item, "Gemshop", data, stow: false)
           when "pawnshop"
-            Sell.appraise(item, "Pawnshop", data)
+            Sell.appraise(item, "Pawnshop", data, stow: false)
           else
             Sell.sell_item(item, shop, data)
           end
+
+          # Containers are full, so whatever is left in hand (an unsold item, a bond note)
+          # can't be stowed the usual way, and the next drag would free the box's hand
+          # instead. Unsold items go back in the box; notes never do, since it gets trashed.
+          leftover = [GameObj.right_hand, GameObj.left_hand].find { |held| held.id && held.id != box.id }
+          next unless leftover
+
+          if leftover.noun =~ /\b(?:note|scrip|chit)\b/
+            Inventory.single_drag(leftover, on_full: :signal)
+          else
+            ELoot.get_command("put ##{leftover.id} in ##{box.id}", ELoot.data.put_regex, silent: true, quiet: true)
+          end
+          return nil if ELoot.in_hand?(leftover)
         end
       end
     end
@@ -6010,12 +6100,17 @@ module ELoot # Room looting
       [GameObj.right_hand, GameObj.left_hand].each do |held|
         next if held.nil? || held.name == "Empty" || held.id.nil?
         next if held.id == box.id
+        next if held.noun =~ /\b(?:note|scrip|chit)\b/ # never into a box that gets trashed
         ELoot.msg(type: "debug", text: "pool_direct_sell_recovery: returning #{held.name} to box before selling")
         ELoot.get_command("put ##{held.id} in ##{box.id}", ELoot.data.put_regex, silent: true, quiet: true)
       end
 
       pool_room = Room.current.id
-      Loot.sell_box_contents(box, data)
+      # Anything still in hand would not go back in the box. Sell it first, otherwise
+      # freeing a hand for the box's items would try to stow the box itself and pause.
+      stray = [GameObj.right_hand, GameObj.left_hand].find { |held| held.id && held.id != box.id }
+      Loot.sell_box_contents(box, data, [stray]) if stray
+      Loot.sell_box_contents(box, data) unless stray && ELoot.in_hand?(stray)
 
       ELoot.go2(pool_room)
       Inventory.drag(box) unless ELoot.in_hand?(box)
@@ -6055,6 +6150,7 @@ module ELoot # Room looting
       [GameObj.right_hand, GameObj.left_hand].each do |held|
         next if held.nil? || held.name == "Empty" || held.id.nil?
         next if held.id == box.id
+        next if held.noun =~ /\b(?:note|scrip|chit)\b/ # never into a box that gets trashed
         ELoot.msg(type: "debug", text: "pool_sell_recovery: returning #{held.name} to box before selling")
         ELoot.get_command("put ##{held.id} in ##{box.id}", ELoot.data.put_regex, silent: true, quiet: true)
       end
@@ -6066,7 +6162,7 @@ module ELoot # Room looting
         ELoot.msg(type: "info", text: " Could not set the box on a disk. Pausing to handle it yourself.")
         ELoot.msg(type: "info", text: " ;unpause #{Script.current.name} after addressing to continue!")
         Script.current.pause
-        ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0]] }
+        ELoot.data.sacks_full = { "last cleared" => [Time.now.strftime('%Y-%m-%d %H:%M:%S'), Room.current.id, Script.current.vars[0], "unpause"] }
         Inventory.drag(box) unless ELoot.in_hand?(box)
         ELoot.msg(type: "debug", text: "pool_sell_recovery: resumed after manual pause, re-looting box")
         Loot.box_loot(box, location, data, sell_recovered: true)
@@ -6405,7 +6501,8 @@ module ELoot # Room looting
       # Skin em
       objs.each do |obj|
         res = dothistimeout("skin ##{obj.id} #{skinner_hand}", 2, skin_match)
-        if res =~ /You cannot skin/
+        # e.g. OSA ship captains: "The Krolvin Captain's skin has been ruined with alchemical components"
+        if res =~ /You cannot skin|ruined with alchemical components/
           ELoot.data.settings[:unskinnable].push(obj.name)
           ELoot.save_profile()
         elsif res =~ break_match
@@ -6478,7 +6575,7 @@ module ELoot # Sells the loot
       { raw: raw, amount: raw.delete(',').to_i }
     end
 
-    def self.appraise(item, location, _data = nil, skip_jewelry_guard: false, note: nil)
+    def self.appraise(item, location, _data = nil, skip_jewelry_guard: false, note: nil, stow: true)
       return if item.type =~ /jewelry/ && location == "Pawnshop" && !skip_jewelry_guard
 
       amount = 0
@@ -6510,6 +6607,16 @@ module ELoot # Sells the loot
 
         container = StowList.stow_list[:appraisal_container]
 
+        # The appraisal container is its own bag, so it is tried even with stow: false
+        # (the pool recovery, whose regular bags are full). Otherwise stow: false leaves
+        # the item in hand for the caller to put back in the box.
+        if !container.to_s.empty?
+          Inventory.store_item(container, item)
+        elsif stow
+          Inventory.single_drag(item)
+        end
+        in_appraisal_container = !container.to_s.empty? && !ELoot.in_hand?(item)
+
         # Record items that beat the user's configured limit so the breakdown can
         # list them (with values) as candidates for the locker / further review.
         if amount > limit.to_i
@@ -6518,33 +6625,29 @@ module ELoot # Sells the loot
             value: amount,
             raw: raw,
             shop: location,
-            stowed: (container.to_s.empty? ? nil : container),
+            stowed: (in_appraisal_container ? container : nil),
             note: note
           }.compact
         end
 
         # The gemshop wouldn't even quote a price ("not buying anything this
         # valuable today"). If enabled, flag the item to be re-appraised at the
-        # pawnshop later so we can learn (and report) its real value.
-        if gemshop_refused && ELoot.data.settings[:sell_pawn_recheck]
+        # pawnshop later so we can learn (and report) its real value. Not when it
+        # is going back in a box: it gets appraised again once that box is looted.
+        if gemshop_refused && ELoot.data.settings[:sell_pawn_recheck] && (stow || !ELoot.in_hand?(item))
           (ELoot.data.pawn_recheck ||= []) << item
-        end
-
-        if container.to_s.empty?
-          Inventory.single_drag(item)
-        else
-          Inventory.store_item(container, item)
         end
       elsif wrong_specialty_refused
         # The loot data may still list the pawnshop as a valid market for this
         # item even though the jeweler won't touch it -- queue it for a real
         # sell attempt there instead of leaving it stuck in your loot forever.
-        (ELoot.data.jewelry_wrong_shop ||= []) << item if item.sellable.include?("pawnshop")
+        # Not with stow: false: it goes back in a box and is retried once looted.
+        (ELoot.data.jewelry_wrong_shop ||= []) << item if stow && item.sellable.include?("pawnshop")
 
-        Inventory.single_drag(item)
+        Inventory.single_drag(item) if stow
       elsif amount.positive? && amount <= limit.to_i
         Sell.sell_item(item, location, ELoot.data.silver_breakdown)
-      else
+      elsif stow
         Inventory.single_drag(item)
       end
     end
@@ -6877,6 +6980,7 @@ module ELoot # Sells the loot
 
       # need to check all the sacks that might have skins in them
       skin_sacks = ELoot.set_selling_containers(type: 'skin')
+      skin_sacks.each { |sack| ELoot.fresh_contents(sack) }
 
       skin_sacks.each do |sack|
         next if sack&.contents&.none? { |obj| obj.name =~ /#{skin}|#{bundled_skins}/i }
@@ -6915,7 +7019,7 @@ module ELoot # Sells the loot
           ELoot.msg(type: "debug", text: "bulk_sell: #{bulk_sell} using sack: #{sack}")
           Inventory.drag(sack) if [checkleft, checkright].index(sack.noun).nil?
 
-          dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
+          dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully|Realizing it's empty/)
           Inventory.wear(sack)
 
           if (bulk_note = ELoot.read_note.to_i).positive?
@@ -6934,7 +7038,7 @@ module ELoot # Sells the loot
             next unless item.name =~ /#{skin}|#{bundled_skins}/i
 
             $sell_ignore.push(item.id)
-            Inventory.drag(item)
+            next unless Inventory.drag(item)
 
             if item.name =~ /bundle/
               until !ELoot.in_hand?(item)
@@ -6974,6 +7078,7 @@ module ELoot # Sells the loot
       gem = Bounty.requirements[:gem]
 
       gem_sacks = ELoot.set_selling_containers(type: 'gem')
+      gem_sacks.each { |sack| ELoot.fresh_contents(sack) }
 
       gem_sacks.each do |sack|
         next if sack&.contents&.none? { |obj| obj.name =~ /#{gem}/ }
@@ -7025,8 +7130,8 @@ module ELoot # Sells the loot
           sack.contents.each do |item|
             break if Bounty.task.done?
             next unless item.name =~ /#{gem}/
+            next unless Inventory.drag(item)
 
-            Inventory.drag(item)
             Sell.sell_item(item, "Gemshop", ELoot.data.silver_breakdown)
             Inventory.free_hands(both: true)
           end
@@ -7100,13 +7205,7 @@ module ELoot # Sells the loot
         all_contents += container.contents.to_a
       end
 
-      if ELoot.data.settings[:use_disk]
-        ELoot.wait_for_disk
-        unless ELoot.data.disk.nil?
-          Inventory.open_single_container(ELoot.data.disk)
-          all_contents += ELoot.data.disk.contents.to_a
-        end
-      end
+      all_contents += ELoot.disk_contents if ELoot.data.settings[:use_disk]
 
       # Remove items from all_contents if their id is in the $sell_ignore array
       all_contents.reject! { |thing| $sell_ignore.include?(thing.id) }
@@ -7426,7 +7525,7 @@ module ELoot # Sells the loot
       skin_sacks.each do |sack|
         ELoot.msg(type: "debug", text: " Beginning: #{sack}")
         next if sack.nil?
-        next if sack.contents.none? { |obj| wanted.call(obj) }
+        next if ELoot.fresh_contents(sack).none? { |obj| wanted.call(obj) }
 
         ELoot.msg(type: "debug", text: "Contents after next: #{sack.contents} using sack: #{sack}")
         bulk_sell = true
@@ -7444,7 +7543,7 @@ module ELoot # Sells the loot
 
           ELoot.silver_check
 
-          dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully/)
+          dothistimeout("sell ##{sack.id}", 3, /inspects the contents carefully|Realizing it's empty/)
           Inventory.wear(sack)
 
           bulk_note = ELoot.read_note.to_i
@@ -7458,6 +7557,9 @@ module ELoot # Sells the loot
 
         Inventory.free_hands(both: true)
 
+        # The furrier takes the skins without the game refreshing the sack's contents
+        ELoot.fresh_contents(sack) if bulk_sell
+
         sack.contents.each do |item|
           next if $sell_ignore.include?(item.id)
           next unless wanted.call(item)
@@ -7467,7 +7569,7 @@ module ELoot # Sells the loot
             next if item.name =~ /#{Vars.needed_reagents}/ && Vars.needed_reagents.length.to_i > 0
           end
           $sell_ignore.push(item.id)
-          Inventory.drag(item)
+          next unless Inventory.drag(item)
 
           if item.name =~ /bundle/
             # grab the bundle ID
@@ -7517,7 +7619,7 @@ module ELoot # Sells the loot
 
       gem_sacks.each do |sack|
         next if sack.nil?
-        next unless sack.contents.any? { |obj| obj.sellable.include?("gemshop") }
+        next unless ELoot.fresh_contents(sack).any? { |obj| obj.sellable.include?("gemshop") }
 
         # Bulk sell sack if it has gems and no exclusions
         if sack.contents.any? { |obj| obj.type =~ /gem/ } &&
@@ -7538,6 +7640,7 @@ module ELoot # Sells the loot
             end
 
             Inventory.free_hands(both: true)
+            ELoot.fresh_contents(sack)
           end
         end
 
@@ -7569,8 +7672,7 @@ module ELoot # Sells the loot
           end
 
           next if ELoot.data.settings[:keep_transmogs] && Inventory.is_transmog?(item)
-
-          Inventory.drag(item)
+          next unless Inventory.drag(item)
 
           if item.type =~ /#{ELoot.data.settings[:sell_appraise_types].join('|')}/ && !ELoot.data.settings[:sell_appraise_types].empty?
             Sell.appraise(item, "Gemshop", ELoot.data.silver_breakdown)
@@ -7887,6 +7989,17 @@ module ELoot # Sells the loot
       Loot.box_loot(box, "Town Locksmith", ELoot.data.silver_breakdown)
     end
 
+    # Order boxes for a locksmith pool drop-off. A box already in hand goes first;
+    # otherwise the drop-off loop hands it in on another box's turn, then fails to find
+    # it when its own turn comes. Pure (all state passed in) so it can be specced.
+    # @param held [Array<GameObj>] both hands
+    # @param found [Array<GameObj>] boxes found in containers
+    # @param passed [Array<GameObj>] boxes handed to locksmith_pool
+    # @return [Array<GameObj>]
+    def self.pool_box_order(held:, found:, passed:)
+      (held.select { |hand| hand.type =~ /box/ } + found + passed).uniq(&:id)
+    end
+
     def self.locksmith_pool(boxes, deposit = false)
       return if ELoot.f2p?
 
@@ -7921,7 +8034,7 @@ module ELoot # Sells the loot
 
       Inventory.free_hands(both: true) unless [GameObj.right_hand, GameObj.left_hand].find { |hand| hand.type =~ /box/ }
       ELoot.wait_for_disk
-      boxes = (ELoot.find_boxes + boxes).uniq { |box| box.id }
+      boxes = Sell.pool_box_order(held: [GameObj.right_hand, GameObj.left_hand], found: ELoot.find_boxes, passed: boxes)
 
       boxes.each do |box|
         Inventory.drag(box) unless [GameObj.right_hand, GameObj.left_hand].find { |hand| hand.type =~ /box/ }
@@ -7991,8 +8104,9 @@ module ELoot # Sells the loot
       lighten_load = false
 
       loop do
-        match = /We don't have any boxes ready for you|We don't seem to have that box|Alright, here's your|You need to lighten your load first/
-        res = dothistimeout("ask ##{worker.id} for return", 3, match)
+        match = /We don't have any boxes ready for you|We don't seem to have that box|Alright, here's your|You need to lighten your load first|You can't hold anymore items/
+        # long enough to outlast lag; a reply that comes after giving up hands back a box nothing opens
+        res = dothistimeout("ask ##{worker.id} for return", 15, match)
 
         break if res !~ /Alright, here's your|You need to lighten your load first/
 
@@ -8033,22 +8147,40 @@ module ELoot # Sells the loot
       ELoot.data.silver_breakdown["Pool Depth"] = Sell.locksmith_pool_count(worker)
     end
 
+    POOL_LIST_HEADER = /here's the list of boxes we have for you\.|You haven't given us any boxes to be worked on\./.freeze unless defined?(POOL_LIST_HEADER)
+
+    # Boxes in the pool that are not yet ready to return. The list comes from the
+    # "ask about list" output; issue_command hands back what it has when it times out,
+    # so a list cut short falls back to the whole server buffer (reget), as long as
+    # this list's header was seen (otherwise the buffer's last list may be an old one).
     def self.locksmith_pool_count(worker)
-      current_box_amount = 0
-      list_match = /here's the list of boxes we have for you\.|You haven't given us any boxes to be worked on\.|^(\d+)\./
+      list_match = Regexp.union(POOL_LIST_HEADER, /^(\d+)\./)
+      results = ELoot.get_command("ask ##{worker.id} about list", list_match, silent: true, quiet: true, timeout: 15)
+      total, returned = Sell.pool_list_counts(results)
 
-      results = ELoot.get_command("ask ##{worker.id} about list", list_match, silent: true, quiet: true)
-      previous_buffer = reget(300)
-
-      results.reverse.each do |line|
-        if line =~ /^\s*(?<amount>\d+)\.\s+An?/
-          current_box_amount = Regexp.last_match[:amount].to_i
-          break
+      unless results.last =~ /<prompt/
+        if results.any? { |line| line =~ POOL_LIST_HEADER }
+          buffered_total, buffered_returned = Sell.pool_list_counts(Array(reget))
+          # >=: Lich buffers each line before the script reads it, so the buffer is at least as
+          # complete; on a tie it may still hold the last box's status the results were cut before
+          total, returned = buffered_total, buffered_returned if buffered_total >= total
         end
+        ELoot.msg(type: "info", text: " The locksmith pool list came back incomplete; pool depth may be off")
       end
 
-      start_index = previous_buffer.reverse.find_index { |value| value =~ /here's the list of boxes we have for you\.|You haven't given us any boxes to be worked on\./ }
-      current_box_amount = current_box_amount - (previous_buffer.drop(previous_buffer.size - start_index - 1).select { |line| line =~ /It is ready to be RETURNED\./ }.count)
+      total - returned
+    end
+
+    # Count the boxes and the ones ready to return in the last pool list in lines.
+    # @param lines [Array<String>]
+    # @return [Array(Integer, Integer)] [boxes, ready to return]
+    def self.pool_list_counts(lines)
+      start = lines.rindex { |line| line =~ POOL_LIST_HEADER }
+      return [0, 0] unless start
+
+      list = lines.drop(start)
+      total = list.reverse_each.find { |line| line =~ /^\s*\d+\.\s+An?\s/ }.to_s[/\d+/].to_i
+      [total, list.count { |line| line =~ /It is ready to be RETURNED\./ }]
     end
 
     def self.locksmith_determine_tip(pool_count, boxes_length)
@@ -8081,13 +8213,7 @@ module ELoot # Sells the loot
         all_contents += StowList.stow_list[item].contents.to_a
       end
 
-      if ELoot.data.settings[:use_disk]
-        ELoot.wait_for_disk
-        unless ELoot.data.disk.nil?
-          Inventory.open_single_container(ELoot.data.disk)
-          all_contents += ELoot.data.disk.contents.to_a
-        end
-      end
+      all_contents += ELoot.disk_contents if ELoot.data.settings[:use_disk]
 
       # Lousy autoclosers
       if ELoot.time_between(:autoclosers, 30)
@@ -8420,9 +8546,9 @@ module ELoot # Sells the loot
     def self.sell_item(item, place = nil, data = nil)
       return if item.nil? || item.name == "Empty"
 
-      lines = ELoot.get_command("sell ##{item.id}", /You (offer to sell|ask)/)
+      lines = ELoot.get_command("sell ##{item.id}", /You (offer to sell|ask)|What were you referring to\?/)
 
-      return if lines.any?(/That's not quite my field|That's basically worthless here|Can't say I'm interested in that|This is a pawnshop, sir, not a junkshop|The company don't buy trash|as if you were a lunatic/)
+      return if lines.any?(/What were you referring to\?|That's not quite my field|That's basically worthless here|Can't say I'm interested in that|This is a pawnshop, sir, not a junkshop|The company don't buy trash|as if you were a lunatic/)
 
       20.times {
         break if !ELoot.in_hand?(item)
@@ -8470,7 +8596,9 @@ module ELoot # Starts the script
   sleep 2 if Script.current.vars[1] =~ /start/
 
   # Initialize/Load settings
-  unless ELoot.data && ELoot.data.respond_to?(:version) && ELoot.data.version == ELoot.get_script_version
+  if ELoot.data && ELoot.data.respond_to?(:version) && ELoot.data.version == ELoot.get_script_version
+    ELoot.refresh_stale_inventory
+  else
     waitrt?
     ELoot.load(ELoot.load_profile)
     ELoot.set_inventory
