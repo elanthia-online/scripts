@@ -14,16 +14,12 @@ RSpec.describe 'ELoot stale stow list' do
   let(:list_class) do
     Class.new do
       attr_reader :checks
-      attr_accessor :fixed_by_check
 
       def initialize(checked:, valid:)
         @checked = checked
         @valid = valid
         @checks = 0
-        @fixed_by_check = true
       end
-
-      def stow_list = { default: Struct.new(:id).new('1149885643') }
 
       def checked? = @checked
 
@@ -34,14 +30,39 @@ RSpec.describe 'ELoot stale stow list' do
 
       def check(**)
         @checks += 1
-        @checked = true
-        @valid = fixed_by_check
+        @checked = @valid = true
       end
     end
   end
 
   describe 'ELoot.refresh_stale_inventory' do
+    # A fake game: the stow list it reports, what you wear, and whether a stow list read
+    # comes back before the timeout
+    let(:game) { { stow: %w[1149885643], worn: %w[1149885643], read_ok: true } }
     let(:inventory_runs) { [] }
+
+    # A stand-in for Lich's StowList: check re-reads the game's list (checked stays false
+    # when the read times out), and valid? clears checked when a cached id isn't worn
+    let(:stow) do
+      game = self.game
+      Class.new do
+        define_method(:initialize) do
+          @ids = game[:stow].dup
+          @checked = true
+        end
+        define_method(:stow_list) { @ids.each_with_index.to_h { |id, i| [:"c#{i}", Struct.new(:id).new(id)] } }
+        define_method(:checked?) { @checked }
+        define_method(:valid?) do
+          @checked = false unless (@ids - game[:worn]).empty?
+          @checked
+        end
+        define_method(:check) do |**|
+          @checked = game[:read_ok]
+          @ids = game[:stow].dup if @checked
+        end
+      end.new
+    end
+
     let(:eloot) do
       runs = inventory_runs
       Module.new do
@@ -54,35 +75,64 @@ RSpec.describe 'ELoot stale stow list' do
     end
 
     before do
+      game = self.game
       stub_const('ELoot', eloot)
-      eloot.module_eval(extract_lic_method(source, 'refresh_stale_inventory', source_path: eloot_path))
+      stub_const('StowList', stow)
+      stub_const('GameObj', Module.new { define_singleton_method(:inv) { game[:worn].map { |id| Struct.new(:id).new(id) } } })
+      eloot.module_eval(%w[refresh_stale_inventory stow_snapshot].map do |m|
+        extract_lic_method(source, m, source_path: eloot_path)
+      end.join("\n"))
     end
 
-    it 'sets up the inventory again when a stow container is gone' do
-      stub_const('StowList', list_class.new(checked: true, valid: false))
+    def cached_ids = StowList.stow_list.values.map(&:id)
+
+    it 'sets up the inventory again when a stow container changed id' do
+      game.merge!(stow: %w[1150702446], worn: %w[1150702446])
 
       eloot.refresh_stale_inventory
 
       expect(inventory_runs).to eq([:set_inventory])
+      expect(cached_ids).to eq(%w[1150702446])
     end
 
     it 'leaves the inventory alone when the stow list still matches' do
-      stub_const('StowList', list_class.new(checked: true, valid: true))
-
       eloot.refresh_stale_inventory
 
       expect(inventory_runs).to be_empty
     end
 
-    # stow targets must be worn, but one taken off can still be listed
-    it 'refreshes once, not every run, for a stow container that was taken off' do
-      stow = list_class.new(checked: true, valid: false)
-      stow.fixed_by_check = false
-      stub_const('StowList', stow)
+    context 'when a stow container is left in the locker' do
+      before { game[:worn] = [] }
 
-      3.times { eloot.refresh_stale_inventory }
+      it 'refreshes once, not every run' do
+        3.times { eloot.refresh_stale_inventory }
 
-      expect(inventory_runs).to eq([:set_inventory])
+        expect(inventory_runs).to eq([:set_inventory])
+      end
+
+      it 'refreshes again when it comes back with a new id' do
+        2.times { eloot.refresh_stale_inventory }
+        game.merge!(stow: %w[1150702446], worn: %w[1150702446])
+
+        eloot.refresh_stale_inventory
+
+        expect(inventory_runs).to eq(%i[set_inventory set_inventory])
+        expect(cached_ids).to eq(%w[1150702446])
+      end
+    end
+
+    context 'when the stow list read times out' do
+      before { game.merge!(stow: %w[1150702446], worn: %w[1150702446], read_ok: false) }
+
+      it 'tries again on the next run' do
+        eloot.refresh_stale_inventory
+        game[:read_ok] = true
+
+        eloot.refresh_stale_inventory
+
+        expect(inventory_runs).to eq(%i[set_inventory set_inventory])
+        expect(cached_ids).to eq(%w[1150702446])
+      end
     end
   end
 
