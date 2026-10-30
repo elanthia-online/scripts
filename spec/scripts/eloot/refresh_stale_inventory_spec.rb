@@ -14,12 +14,16 @@ RSpec.describe 'ELoot stale stow list' do
   let(:list_class) do
     Class.new do
       attr_reader :checks
+      attr_accessor :fixed_by_check
 
       def initialize(checked:, valid:)
         @checked = checked
         @valid = valid
         @checks = 0
+        @fixed_by_check = true
       end
+
+      def stow_list = { default: Struct.new(:id).new('1149885643') }
 
       def checked? = @checked
 
@@ -30,7 +34,8 @@ RSpec.describe 'ELoot stale stow list' do
 
       def check(**)
         @checks += 1
-        @checked = @valid = true
+        @checked = true
+        @valid = fixed_by_check
       end
     end
   end
@@ -41,7 +46,10 @@ RSpec.describe 'ELoot stale stow list' do
       runs = inventory_runs
       Module.new do
         define_singleton_method(:msg) { |**| nil }
-        define_singleton_method(:set_inventory) { runs << :set_inventory }
+        define_singleton_method(:set_inventory) do
+          runs << :set_inventory
+          StowList.check
+        end
       end
     end
 
@@ -64,6 +72,56 @@ RSpec.describe 'ELoot stale stow list' do
       eloot.refresh_stale_inventory
 
       expect(inventory_runs).to be_empty
+    end
+
+    # Lich's valid? only looks at worn containers
+    it 'refreshes once, not every run, for a stow container that is never worn' do
+      stow = list_class.new(checked: true, valid: false)
+      stow.fixed_by_check = false
+      stub_const('StowList', stow)
+
+      3.times { eloot.refresh_stale_inventory }
+
+      expect(inventory_runs).to eq([:set_inventory])
+    end
+  end
+
+  describe 'the main start-up gate' do
+    # eloot.lic's top-level "Initialize/Load settings" block, run against stubs
+    let(:gate) do
+      start = source.index("  # Initialize/Load settings\n")
+      finish = source.index("\n  end\n", start) + "\n  end\n".length
+      source[start...finish]
+    end
+
+    let(:calls) { [] }
+
+    def run_gate(loaded_version)
+      calls = self.calls
+      data = loaded_version && Struct.new(:version).new(loaded_version)
+      stub_const('ELoot', Module.new do
+        define_singleton_method(:data) { data }
+        define_singleton_method(:get_script_version) { '2.14.2' }
+        %i[refresh_stale_inventory set_inventory disk_usage].each do |m|
+          define_singleton_method(m) { calls << m }
+        end
+        define_singleton_method(:load) { |_| calls << :load }
+        define_singleton_method(:load_profile) { {} }
+      end)
+      stub_const('Script', Struct.new(:vars).new(['sell']).tap { |s| s.define_singleton_method(:current) { s } })
+      Object.new.tap { |o| o.define_singleton_method(:waitrt?) { nil } }.instance_eval(gate)
+    end
+
+    it 'checks the stow list on a run after eloot is loaded' do
+      run_gate('2.14.2')
+
+      expect(calls).to eq([:refresh_stale_inventory])
+    end
+
+    it 'loads everything on the first run' do
+      run_gate(nil)
+
+      expect(calls).to eq(%i[load set_inventory disk_usage])
     end
   end
 
