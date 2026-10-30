@@ -74,8 +74,8 @@ RSpec.describe 'ELoot stale stow list' do
       expect(inventory_runs).to be_empty
     end
 
-    # Lich's valid? only looks at worn containers
-    it 'refreshes once, not every run, for a stow container that is never worn' do
+    # stow targets must be worn, but one taken off can still be listed
+    it 'refreshes once, not every run, for a stow container that was taken off' do
       stow = list_class.new(checked: true, valid: false)
       stow.fixed_by_check = false
       stub_const('StowList', stow)
