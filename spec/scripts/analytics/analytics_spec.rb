@@ -303,19 +303,19 @@ RSpec.describe 'analytics.lic' do
       expect(game_text['sales'].size).to eq(3)
     end
 
-    it 'keeps only the total when a withdrawal comes before any BANK ACCOUNT' do
-      expect(game_text['withdraw_total_only']).to eq([357_850_148, 'withdraw'])
+    it 'records nothing for a withdrawal that comes before any BANK ACCOUNT' do
+      expect(game_text['withdraw_rows']).to eq(0)
     end
 
-    it 'records a BANK ACCOUNT listing, then updates that bank on a deposit' do
+    it 'records a BANK ACCOUNT listing, then moves only the total on a deposit' do
       expect(game_text['one_bank']).to eq(
-        [['Vornavis Bank of Solhaven', 422_471_304, nil, 'bank_account'], ['__total__', 422_471_304, 64_621_156, 'bank_account'],
-         ['Vornavis Bank of Solhaven', 422_476_116, 4812, 'deposit'], ['__total__', 422_476_116, 4812, 'deposit']]
+        [['Vornavis Bank of Solhaven', 422_471_304, nil, 'bank_account'], ['__total__', 422_471_304, nil, 'bank_account'],
+         ['__total__', 422_476_116, 4812, 'deposit']]
       )
     end
 
-    it 'records nothing for a deposit that cannot be placed among several banks' do
-      expect(game_text['ambiguous_rows']).to eq(0)
+    it 'moves the total by the amount deposited when there are several banks' do
+      expect(game_text['two_bank_deposit']).to eq([['__total__', 350, 50]])
     end
 
     it 'does not record the output of its own BANK ACCOUNT command twice' do
@@ -328,6 +328,26 @@ RSpec.describe 'analytics.lic' do
 
     it 'can be turned off, and then record_vendor_silver works again' do
       expect(game_text.values_at('disabled', 'hook_when_off')).to eq([true, 1])
+    end
+  end
+
+  describe 'bank deposits and withdrawals' do
+    subject(:moves) { result('bank_moves') }
+
+    it 'does not count silver in another town as earned when the first bank line is a withdrawal' do
+      expect(moves['first_listing_earned']).to eq(0)
+    end
+
+    it 'moves the total by the amount deposited at a bank it did not know' do
+      expect(moves['after_deposit']).to eq([5_098_500, 1000])
+    end
+
+    it 'leaves the known banks alone on a deposit, since it names no bank' do
+      expect(moves['banks_after_deposit']).to eq('Bank of Icemule' => 97_500, 'Bank of Solhaven' => 5_000_000)
+    end
+
+    it 'adds up to the silver actually moved' do
+      expect(moves.values_at('earned', 'last_total')).to eq([500, 5_098_000])
     end
   end
 

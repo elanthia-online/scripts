@@ -460,7 +460,7 @@ when 'game_text'
   settle.call
   sales = A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY amount")
   items = A::Database.all('SELECT item_name, item_noun, total_price, vendor_type, vendor_name FROM item_sales ORDER BY total_price')
-  withdraw = A::Database.one("SELECT balance, snapshot_type FROM bank_snapshots WHERE bank_name = '__total__'")
+  withdraw_rows = count.call('bank_snapshots')
   hook_ignored = (A::SilverManager.record_vendor_silver(999, 'gemshop', 'Bob'); count.call('silver_events'))
 
   # A BANK ACCOUNT block names the bank, so later deposits update it
@@ -471,16 +471,18 @@ when 'game_text'
   feed.call('You deposit 4,812 silvers into your account.  The teller carefully records the transaction and says, ' \
             '"Thank you, <a exist="-1" noun="Tysong">Tysong</a>.  This brings your total to 422,476,116 silvers.  Have a nice day!"')
   settle.call
-  one_bank = A::Database.all("SELECT bank_name, balance, delta_silver, snapshot_type FROM bank_snapshots WHERE snapshot_type != 'withdraw' ORDER BY timestamp, rowid, bank_name").map(&:values)
+  one_bank = A::Database.all('SELECT bank_name, balance, delta_silver, snapshot_type FROM bank_snapshots ORDER BY rowid').map(&:values)
 
-  # With two banks a deposit can't be placed, so nothing is recorded
+  # With two banks the deposit's bank is unknown; the total still moves by the amount
   feed.call('You currently have the following amounts on deposit:', '      Bank A: 100', '      Bank B: 200', '      Total: 300')
   settle.call
   rows_before = count.call('bank_snapshots')
   feed.call('You deposit 50 silvers into your account.  The teller carefully records the transaction and says, ' \
-            '"Thank you, Tysong.  This brings your total to 350 silvers.  Have a nice day!"')
+            '"Thank you, Tysong.  This brings your total to 250 silvers.  Have a nice day!"')
   settle.call
-  ambiguous_rows = count.call('bank_snapshots') - rows_before
+  two_bank_deposit = A::Database.all('SELECT bank_name, balance, delta_silver FROM bank_snapshots WHERE rowid > ' \
+                                     '(SELECT MAX(rowid) FROM bank_snapshots) - ? ORDER BY rowid',
+                                     count.call('bank_snapshots') - rows_before).map(&:values)
 
   # take_snapshot reads the same output the hook sees, and must not record it twice
   $bank_lines = ['You currently have the following amounts on deposit:', '      Bank A: 100', '      Bank B: 250', '      Total: 350']
@@ -505,9 +507,48 @@ when 'game_text'
 
   result = {
     'sales' => sales.map(&:values), 'items' => items.map(&:values),
-    'withdraw_total_only' => withdraw.values, 'hook_ignored' => hook_ignored,
-    'one_bank' => one_bank, 'ambiguous_rows' => ambiguous_rows, 'command_rows' => command_rows,
+    'withdraw_rows' => withdraw_rows, 'hook_ignored' => hook_ignored,
+    'one_bank' => one_bank, 'two_bank_deposit' => two_bank_deposit, 'command_rows' => command_rows,
     'disabled' => disabled, 'hook_when_off' => hook_when_off
+  }
+  A::SilverManager.stop
+
+when 'bank_moves'
+  # Deposits and withdrawals move the total by the amount moved, never by the
+  # balance they quote, which belongs to one bank
+  A::Database.connect!
+  A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  feed = ->(*lines) { lines.each { |line| DownstreamHook.run(line) } }
+  settle = -> { sleep 0.4 }
+  earned = lambda do
+    A::Database.one("SELECT COALESCE(SUM(delta_silver), 0) AS s FROM bank_snapshots WHERE bank_name = '__total__'")['s']
+  end
+  deposit = ->(amount, total) { "You deposit #{amount} silvers into your account.  The teller carefully records the transaction and says, \"Thank you, Tysong.  This brings your total to #{total} silvers.  Have a nice day!\"" }
+  withdraw = ->(amount, total) { "The teller carefully records the transaction, hands you #{amount} silvers, and says, \"This brings your total to #{total} silvers.\"" }
+
+  # First bank line is a withdrawal; the listing then shows silver in a second town
+  feed.call(withdraw.call('2,500', '97,500'))
+  settle.call
+  feed.call('You currently have the following amounts on deposit:', '      Bank of Icemule: 97,500',
+            '      Bank of Solhaven: 5,000,000', '      Total: 5,097,500')
+  settle.call
+  first_listing = earned.call
+
+  # A deposit at a third town, where the balance it quotes is that bank's only
+  feed.call(deposit.call('1,000', '1,000'))
+  settle.call
+  after_deposit = A::Database.one("SELECT balance, delta_silver FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid DESC LIMIT 1").values
+  banks_after_deposit = A::Database.latest_balances(WHO).except('__total__')
+  feed.call('You currently have the following amounts on deposit:', '      Bank of Icemule: 97,500',
+            '      Bank of Solhaven: 5,000,000', '      Bank of Teras: 1,000', '      Total: 5,098,500')
+  settle.call
+  feed.call(withdraw.call('500', '96,000'))
+  settle.call
+  result = {
+    'first_listing_earned' => first_listing, 'after_deposit' => after_deposit,
+    'banks_after_deposit' => banks_after_deposit, 'earned' => earned.call,
+    'last_total' => A::Database.latest_balances(WHO)['__total__']
   }
   A::SilverManager.stop
 

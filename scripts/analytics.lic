@@ -292,8 +292,9 @@ module GS4Analytics
       # parse_sales            true: vendor sales ("X takes your item ... hands you N
       #                        silver") are recorded from the game text, so your
       #                        selling script needs no changes. Default: true
-      # parse_bank             true: BANK ACCOUNT output and deposit / withdraw
-      #                        messages are recorded as bank balances. Default: true
+      # parse_bank             true: BANK ACCOUNT output is recorded as bank balances,
+      #                        and deposits / withdrawals move the recorded total
+      #                        by the amount moved. Default: true
       # death_script           Your own death-recovery script. While it runs, the
       #                        cycle is "dead". Death is also read from the game's
       #                        dead indicator, so this can stay null.
@@ -454,6 +455,9 @@ module GS4Analytics
     BUSY_BACKOFF_START_S = 2.0
     BUSY_BACKOFF_MAX_S   = 30.0
     MAX_PENDING_WRITES   = 5000
+    # Bank snapshot types that only move the total: a deposit or withdrawal
+    # names no bank. Every other type is a BANK ACCOUNT listing.
+    TOTAL_ONLY = %w[deposit withdraw].freeze
     # Rows from our own reads are keyed by column name as a String, which is
     # how every report and manager indexes them
     STRING_KEYS = ->(row) { row.transform_keys(&:to_s) }
@@ -694,28 +698,27 @@ module GS4Analytics
 
       # ----- bank ------------------------------------------------------------
 
-      # +results+ maps bank name to balance and carries a '__total__' entry.
-      # Individual banks are written only when their balance changed; the
-      # total always is, since it carries the silver-per-hour deltas.
-      # { bank name => balance } as of each bank's newest snapshot, '__total__' included
+      # { bank name => balance } as of each bank's newest snapshot, '__total__'
+      # included (the newest row wins when two share a second)
       def latest_balances(who)
-        all('SELECT s.bank_name, s.balance FROM bank_snapshots s ' \
-            'JOIN (SELECT bank_name, MAX(timestamp) AS ts FROM bank_snapshots ' \
-            '      WHERE game = ? AND character = ? GROUP BY bank_name) m ' \
-            'ON s.bank_name = m.bank_name AND s.timestamp = m.ts ' \
-            'WHERE s.game = ? AND s.character = ?', *who, *who)
+        all('SELECT bank_name, balance FROM bank_snapshots WHERE rowid IN ' \
+            '(SELECT MAX(rowid) FROM bank_snapshots WHERE game = ? AND character = ? GROUP BY bank_name)', *who)
           .to_h { |row| [row['bank_name'], row['balance'].to_i] }
       end
 
+      # +results+ maps bank name to balance and carries a '__total__' entry.
+      # Individual banks are written only when their balance changed; the
+      # total always is, since it carries the silver-per-hour deltas.
       def store_bank_snapshot(who, session_id, cycle_id, snapshot_type, results)
         now = Time.now.to_i
         previous = latest_balances(who)
 
         # A bank emptied to zero drops out of BANK ACCOUNT. Record the zero so a
-        # stale 2B balance doesn't keep warning, but only when the banks that
-        # were parsed add up to the total (a partial capture proves nothing).
+        # stale 2B balance doesn't keep warning, but only for a listing whose
+        # banks add up to its total (a partial capture proves nothing, and a
+        # deposit or withdrawal names no bank at all).
         banks = results.except('__total__')
-        if results['__total__'] && banks.values.sum == results['__total__']
+        if !TOTAL_ONLY.include?(snapshot_type) && results['__total__'] && banks.values.sum == results['__total__']
           previous.each { |bank, balance| results[bank] = 0 if balance.positive? && !results.key?(bank) }
         end
 
@@ -1207,8 +1210,10 @@ module GS4Analytics
         elsif @bank_lines
           @bank_lines << text
           finish_bank_capture if text.strip.start_with?('Total:') || @bank_lines.size > BANK_CAPTURE_MAX
-        elsif (found = text.match(DEPOSIT_RE) || text.match(WITHDRAW_RE))
-          record_total(digits(found[2]), text.match?(DEPOSIT_RE) ? 'deposit' : 'withdraw')
+        elsif (found = text.match(DEPOSIT_RE))
+          record_total(digits(found[1]), 'deposit')
+        elsif (found = text.match(WITHDRAW_RE))
+          record_total(-digits(found[1]), 'withdraw')
         end
       end
 
@@ -1222,18 +1227,19 @@ module GS4Analytics
         Database.async { record_banks(who, cycle_id, 'bank_account', banks) }
       end
 
-      # A deposit or withdrawal names no bank, only the new balance. With one
-      # known bank it is that bank's balance; with none, only the total is
-      # kept; with several it can't be placed, and BANK ACCOUNT will fix it.
-      def record_total(total, type)
+      # A deposit or withdrawal names no bank, and its "total" is the balance
+      # of the bank it was made at, not the account. Only the amount moved is
+      # certain, so the total moves by that much; with no total recorded yet
+      # there is nothing to move, and the next BANK ACCOUNT sets it.
+      def record_total(change, type)
         who = @who
         cycle_id = @cycle_id
         Database.async do
-          known = Database.latest_balances(who).except('__total__').select { |_, balance| balance.positive? }.keys
-          next Log.debug("#{type}: several banks, waiting for BANK ACCOUNT") if known.size > 1
+          previous = Database.latest_balances(who)['__total__']
+          total = previous && previous + change
+          next Log.debug("#{type}: no usable bank total, waiting for BANK ACCOUNT") if total.nil? || total.negative?
 
-          banks = known.to_h { |name| [name, total] }.merge('__total__' => total)
-          record_banks(who, cycle_id, type, banks)
+          record_banks(who, cycle_id, type, { '__total__' => total })
         end
       end
 
