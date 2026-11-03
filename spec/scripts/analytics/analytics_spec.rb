@@ -168,6 +168,26 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'Database when busy' do
+    subject(:busy) { result('busy_database') }
+
+    it 'retries a write that finds the database locked, once, without repeating its earlier statements' do
+      expect(busy.values_at('attempts', 'rows')).to eq([3, %w[retry.a retry.b]])
+    end
+
+    it 'keeps queued writes in order and skips one that fails for another reason' do
+      expect(busy['order']).to eq(%w[a broken b])
+    end
+
+    it 'reports a busy database and other failures once each' do
+      expect(busy.values_at('busy_reported', 'failure_reported')).to eq([true, true])
+    end
+
+    it 'tells a busy database from other errors' do
+      expect(busy['busy_tells_apart']).to eq([false, false])
+    end
+  end
+
   describe 'Database' do
     subject(:database) { result('database') }
 

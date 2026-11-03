@@ -449,9 +449,14 @@ module GS4Analytics
     MIN_CYCLE_SECONDS = 10
     SCHEMA_VERSION    = '3'
     BUSY_TIMEOUT_MS   = 15_000
+    # Queued writes that find the database locked by another Lich session are
+    # kept and retried, backing off from 2 s up to 30 s, up to this many
+    BUSY_BACKOFF_START_S = 2.0
+    BUSY_BACKOFF_MAX_S   = 30.0
+    MAX_PENDING_WRITES   = 5000
     # Rows from our own reads are keyed by column name as a String, which is
     # how every report and manager indexes them
-    STRING_KEYS       = ->(row) { row.transform_keys(&:to_s) }
+    STRING_KEYS = ->(row) { row.transform_keys(&:to_s) }
 
     # Raw-SQL reads for the report aggregates, mixed into the Sequel database.
     # Values are UTF-8 normalized, since a BLOB never equals a TEXT value.
@@ -774,16 +779,79 @@ module GS4Analytics
 
       def start_writer
         @queue = Queue.new
+        @pending = []
+        @busy_backoff = BUSY_BACKOFF_START_S
+        @busy_until = nil
         @writer = Thread.new do
-          while (job = @queue.pop) != :stop
-            begin
-              job.call
-            rescue StandardError => e
-              Log.error('queued write', e)
-            end
+          loop do
+            job = next_job
+            break if job == :stop
+
+            @pending << job if job
+            drain_writes
           end
+          drain_writes
+          Log.info("#{@pending.size} analytics write(s) were lost, the database stayed busy") unless @pending.empty?
         end
       end
+
+      # Next queued job. While writes are pending it waits only until the
+      # backoff ends, so they are retried even if nothing new arrives.
+      def next_job
+        return @queue.pop if @pending.empty?
+
+        @queue.pop(timeout: [(@busy_until || 0) - monotonic_now, 0].max)
+      end
+
+      # Runs pending writes in order until one finds the database busy. A busy
+      # write stays at the front and everything behind it waits, so a stuck
+      # lock costs one wait per backoff window, not one per queued write.
+      def drain_writes
+        until @pending.empty?
+          return if @busy_until && monotonic_now < @busy_until
+
+          run_write(@pending.first)
+          @pending.shift
+          @busy_until = nil
+          @busy_backoff = BUSY_BACKOFF_START_S
+        end
+      rescue StandardError => e
+        raise unless busy_error?(e)
+
+        back_off(e)
+      end
+
+      # One transaction per job, so a write that fails halfway leaves nothing
+      # behind to be repeated when it is retried
+      def run_write(job)
+        db.transaction { job.call }
+      rescue StandardError => e
+        raise if busy_error?(e)
+
+        Log.error('queued write', e)
+      end
+
+      def back_off(error)
+        Log.error('database busy', error) unless @busy_until
+        @busy_until = monotonic_now + @busy_backoff
+        @busy_backoff = [@busy_backoff * 2, BUSY_BACKOFF_MAX_S].min
+        return unless @pending.size > MAX_PENDING_WRITES
+
+        dropped = @pending.size - MAX_PENDING_WRITES
+        @pending.shift(dropped)
+        Log.info("#{dropped} analytics write(s) dropped while the database stayed busy")
+      end
+
+      # SQLite's "database is locked" (Sequel wraps it) or a connection pool
+      # that timed out waiting for the lock
+      def busy_error?(error)
+        return true if error.is_a?(Sequel::PoolTimeout)
+
+        defined?(::SQLite3::BusyException) &&
+          (error.is_a?(::SQLite3::BusyException) || error.cause.is_a?(::SQLite3::BusyException))
+      end
+
+      def monotonic_now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
       def stop_writer
         return unless @writer&.alive?

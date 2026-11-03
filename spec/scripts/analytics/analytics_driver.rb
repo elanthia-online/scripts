@@ -226,6 +226,44 @@ when 'database'
   A::Database.connect!
   result['reconnect_rows'] = A::Database.one('SELECT COUNT(*) AS n FROM cycles')['n']
 
+when 'busy_database'
+  A::Database.connect!
+  { BUSY_BACKOFF_START_S: 0.05, BUSY_BACKOFF_MAX_S: 0.1 }.each do |name, value|
+    A::Database.send(:remove_const, name)
+    A::Database.const_set(name, value)
+  end
+  A::Database.close
+  A::Database.connect!
+  order = []
+  attempts = 0
+  locked = lambda do
+    raise SQLite3::BusyException, 'database is locked'
+  rescue SQLite3::Exception
+    raise Sequel::DatabaseError, 'wrapped'
+  end
+  A::Database.async do
+    attempts += 1
+    A::Database.db[:metadata].insert(key: 'retry.a', value: 'x', updated_at: 1)
+    locked.call if attempts < 3
+    order << :a
+  end
+  A::Database.async { order << :broken; raise('not a busy error') }
+  A::Database.async do
+    A::Database.db[:metadata].insert(key: 'retry.b', value: 'y', updated_at: 1)
+    order << :b
+  end
+  deadline = Time.now + 10
+  sleep 0.02 until order.include?(:b) || Time.now > deadline
+  result = {
+    'attempts' => attempts, 'order' => order,
+    'rows' => A::Database.all("SELECT key FROM metadata WHERE key LIKE 'retry.%' ORDER BY key").map { |row| row['key'] },
+    'busy_reported' => OUT.any? { |line| line.include?('ERROR (database busy)') },
+    'failure_reported' => OUT.any? { |line| line.include?('ERROR (queued write): RuntimeError: not a busy error') },
+    'busy_tells_apart' => [A::Database.send(:busy_error?, Sequel::DatabaseError.new('constraint')),
+                           A::Database.send(:busy_error?, RuntimeError.new('other'))]
+  }
+  A::Database.close
+
 when 'bounties'
   A::Database.connect!
   session = A::Database.session_for(WHO)
