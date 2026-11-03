@@ -128,7 +128,7 @@ def lines(result) = result.join("\n")
 # One completed hunt cycle (and, with +rest+, the rest after it) starting at +start+
 def seed_cycles(who, session, start, rest: true, hunt_secs: 2700)
   hunt = A::Database.start_cycle(who, session, :hunt, 'bigshot', 'torvek_crags',
-                                 exp_total: 1_000_000, exp_field: 100, exp_max: 800, fame: 10, encumbrance: 20.0)
+                                 { exp_total: 1_000_000, exp_field: 100, exp_max: 800, fame: 10, encumbrance: 20.0 })
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', start, hunt)
   A::Database.end_cycle(hunt, { exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0 },
                         'Too many items')
@@ -136,7 +136,7 @@ def seed_cycles(who, session, start, rest: true, hunt_secs: 2700)
   return unless rest
 
   rest_id = A::Database.start_cycle(who, session, :rest, 'my_rest', 'torvek_crags',
-                                    exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0)
+                                    { exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0 })
   run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 400, ' \
           'exp_total_end = 1100000, rest_reason = ? WHERE cycle_id = ?', start + hunt_secs, start + hunt_secs + 400, 'Too many items', rest_id)
   A::Database.record_rest_steps(who, rest_id, start + hunt_secs, { 'travel' => 120.0, 'selling' => 80.5 })
@@ -158,6 +158,21 @@ def seed_history
               *who, (Date.today - ago).to_s, 'torvek_crags', 'kobold', 100, 5000, NOW - 100)
     end
   end
+end
+
+# Short lock waits, so a held lock costs milliseconds rather than seconds
+def quick_busy_timeouts
+  { BUSY_TIMEOUT_MS: 200, BUSY_BACKOFF_START_S: 0.05, BUSY_BACKOFF_MAX_S: 0.1 }.each do |name, value|
+    A::Database.send(:remove_const, name)
+    A::Database.const_set(name, value)
+  end
+end
+
+# Another Lich session holding the write lock (as ;analytics maintenance vacuum would)
+def hold_write_lock
+  lock = SQLite3::Database.new(A::Database.file)
+  lock.execute('BEGIN IMMEDIATE')
+  lock
 end
 
 result = {}
@@ -197,11 +212,11 @@ when 'settings'
 when 'database'
   A::Database.connect!
   session = A::Database.session_for(WHO)
-  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', exp_total: 100, exp_field: 10)
+  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', { exp_total: 100, exp_field: 10 })
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, hunt)
   ended = A::Database.end_cycle(hunt, { exp_total: 5100, exp_field: 700, exp_max: 800, fame: 11, encumbrance: 35.0 }, 'Too many items')
   saved = A::Database.one('SELECT * FROM cycles WHERE cycle_id = ?', hunt)
-  rest = A::Database.start_cycle(WHO, session, :rest, 'my_rest', 'torvek_crags', exp_total: 5100)
+  rest = A::Database.start_cycle(WHO, session, :rest, 'my_rest', 'torvek_crags', { exp_total: 5100 })
   run_sql('UPDATE cycles SET start_time = ?, rest_reason = ? WHERE cycle_id = ?', NOW - 300, 'Too many items', rest)
   A::Database.end_cycle(rest, {}, 'something else')
   A::Database.record_rest_steps(WHO, rest, NOW - 300, { 'travel' => 120.0, 'selling' => 80.5, 'waiting' => 0 })
@@ -285,10 +300,12 @@ when 'banks'
   A::Database.connect!
   A::SilverManager.start(WHO)
   A::SilverManager.take_snapshot
+  A::Database.flush
   rows = A::Database.all('SELECT bank_name, balance FROM bank_snapshots ORDER BY bank_name')
   warned = OUT.any? { |line| line.include?('2.0B') }
   $bank_lines = ['The Bank amounts on deposit:', 'Icemule Trace: 2,500,000', 'Total: 2,500,000']
   A::SilverManager.take_snapshot
+  A::Database.flush
   emptied = A::Database.one("SELECT balance FROM bank_snapshots WHERE bank_name = \"Wehnimer's Landing\" ORDER BY timestamp DESC, rowid DESC LIMIT 1")
   total = A::Database.one("SELECT balance, delta_silver FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY timestamp DESC, rowid DESC LIMIT 1")
   result = {
@@ -461,7 +478,7 @@ when 'game_text'
   sales = A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY amount")
   items = A::Database.all('SELECT item_name, item_noun, total_price, vendor_type, vendor_name FROM item_sales ORDER BY total_price')
   withdraw_rows = count.call('bank_snapshots')
-  hook_ignored = (A::SilverManager.record_vendor_silver(999, 'gemshop', 'Bob'); count.call('silver_events'))
+  hook_ignored = (A::SilverManager.record_vendor_silver(999, 'gemshop', 'Bob'); A::Database.flush; count.call('silver_events'))
 
   # A BANK ACCOUNT block names the bank, so later deposits update it
   feed.call('You currently have the following amounts on deposit:', '', '<output class="mono"/>',
@@ -503,6 +520,7 @@ when 'game_text'
   settle.call
   disabled = [count.call('silver_events'), count.call('item_sales'), count.call('bank_snapshots')] == before
   A::SilverManager.record_vendor_silver(999, 'gemshop', 'Bob')
+  A::Database.flush
   hook_when_off = count.call('silver_events') - before.first
 
   result = {
@@ -551,6 +569,79 @@ when 'bank_moves'
     'last_total' => A::Database.latest_balances(WHO)['__total__']
   }
   A::SilverManager.stop
+
+when 'locked_cycle'
+  # A hunt -> rest change while another session holds the write lock
+  quick_busy_timeouts
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::CycleManager
+  session = A::Database.session_for(WHO)
+  A::Database.flush
+  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', { exp_total: 100 })
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 1800, hunt)
+  { :@who => WHO, :@cfg => cfg, :@session_id => session, :@current_state => :hunt, :@current_cycle_id => hunt,
+    :@rest_steps => Hash.new(0.0), :@last_bigshot_status => :resting }.each { |name, value| manager.instance_variable_set(name, value) }
+  bounty = A::BountyManager
+  bounty.instance_variable_set(:@who, WHO)
+  $task = nil
+  $running = ['bigshot']
+  $rest_reason = 'encumbered.'
+
+  lock = hold_write_lock
+  changed_at = Time.now.to_i
+  manager.send(:transition_to, :rest)
+  bounty.send(:handle_reward, 100, 200, 300)
+  sleep 0.5
+  during = { 'state' => manager.current_state.to_s, 'cycle' => !manager.current_cycle_id.nil?,
+             'hunt_open' => A::Database.one('SELECT end_time FROM cycles WHERE cycle_id = ?', hunt)['end_time'].nil? }
+  lock.execute('COMMIT')
+  lock.close
+  flushed = A::Database.flush(10)
+  ended = A::Database.one('SELECT end_time, duration_seconds, rest_reason FROM cycles WHERE cycle_id = ?', hunt)
+  rest = A::Database.one('SELECT cycle_type, start_time, rest_reason FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)
+  result = {
+    'during' => during, 'flushed' => flushed,
+    'hunt' => [ended['duration_seconds'].to_i.between?(1799, 1802), ended['rest_reason'], ended['end_time'].to_i <= changed_at + 1],
+    'rest' => [rest['cycle_type'], rest['rest_reason'], rest['start_time'].to_i <= changed_at + 1],
+    'bounty' => A::Database.one('SELECT status, silver_reward FROM bounties').values,
+    'busy_reported' => OUT.any? { |line| line.include?('ERROR (database busy)') }
+  }
+  A::Database.close
+
+when 'killed_writer'
+  # ;kill stops the writer before before_dying runs. What it left, and what the
+  # managers queue while stopping, is written by close, in order.
+  quick_busy_timeouts
+  A::Database.connect!
+  session = A::Database.session_for(WHO)
+  A::Database.flush
+  lock = hold_write_lock
+  id = A::Database.new_id
+  A::Database.async { A::Database.start_cycle(WHO, session, :hunt, 'bigshot', nil, {}, id: id, at: NOW - 600) }
+  sleep 0.4 # the writer finds the lock and backs off
+  A::Database.instance_variable_get(:@writer).kill
+  sleep 0.1
+  A::Database.async { A::Database.end_cycle(id, {}, 'killed', at: NOW) } # what CycleManager.stop queues
+  lock.execute('COMMIT')
+  lock.close
+  A::Database.close
+  A::Database.connect!
+  row = A::Database.one('SELECT duration_seconds, rest_reason FROM cycles WHERE cycle_id = ?', id)
+  result['written'] = [row['duration_seconds'], row['rest_reason']]
+  result['lost_reported'] = OUT.any? { |line| line.include?('were lost') }
+
+  # Still locked when it stops: one wait, then the count of what was lost
+  lock = hold_write_lock
+  3.times { |i| A::Database.async { A::Database.set_metadata("lost.#{i}", 'x') } }
+  sleep 0.3
+  A::Database.instance_variable_get(:@writer).kill
+  started = Time.now
+  A::Database.close
+  result['stop_seconds'] = (Time.now - started).round(1)
+  result['lost_line'] = OUT.grep(/were lost/).last.to_s.sub('[analytics] ', '')
+  lock.execute('ROLLBACK')
+  lock.close
 
 when 'bigshot_status'
   # Bigshot's own status marks a rest, but only while the script is running
@@ -613,6 +704,7 @@ when 'interrupted_hunt'
   $running = ['ebounty']
   $rest_reason = nil
   manager.send(:transition_to, :rest)
+  A::Database.flush
   rest = A::Database.one('SELECT cycle_type, rest_reason FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)
   result['reasons'] = [A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', hunt_id)['rest_reason'],
                        rest['cycle_type'], rest['rest_reason']]
@@ -623,6 +715,7 @@ when 'interrupted_hunt'
   hunt_id = manager.current_cycle_id
   $rest_reason = 'encumbered.'
   manager.send(:transition_to, :rest)
+  A::Database.flush
   result['own_rest_reason'] = A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', hunt_id)['rest_reason']
 
   # An idle character running a script by hand does not start a rest
@@ -649,11 +742,13 @@ when 'town_bounty'
   # for a long time (the log's 05:32 gem task: finished in seconds, rewarded 17 minutes later)
   task.call(:gem, '', 'Solhaven', 9, 'piece of leopard skin jasper')
   manager.send(:check_task)
+  A::Database.flush
   recorded_while_not_hunting = A::Database.all('SELECT 1 FROM bounties').size
   task.call(:taskmaster)
   manager.send(:check_task)
   age_seen.call(1000)
   manager.send(:handle_reward, 1250, 1000, 4812)
+  A::Database.flush
   gem = row.call(4812)
 
   # Seen, then removed (no task): the reward cannot be for it
@@ -673,6 +768,7 @@ when 'town_bounty'
   # Never seen
   $task = nil
   manager.send(:handle_reward, 7, 8, 9)
+  A::Database.flush
 
   result = {
     'recorded_while_not_hunting' => recorded_while_not_hunting,

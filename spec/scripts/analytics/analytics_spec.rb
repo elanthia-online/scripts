@@ -331,6 +331,39 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'cycle and bounty writes while another session holds the database' do
+    subject(:locked) { result('locked_cycle') }
+
+    it 'moves to the rest at once, while the writes wait' do
+      expect(locked['during']).to eq('state' => 'rest', 'cycle' => true, 'hunt_open' => true)
+    end
+
+    it 'closes the hunt with its real end time and reason once the lock is released' do
+      expect([locked['flushed'], locked['hunt']]).to eq([true, [true, 'encumbered.', true]])
+    end
+
+    it 'records the rest from the time it started' do
+      expect(locked['rest']).to eq(['rest', 'encumbered.', true])
+    end
+
+    it 'records a bounty reward that arrived during the lock' do
+      expect(locked['bounty']).to eq(['completed', 300])
+    end
+  end
+
+  describe 'stopping after ;kill has stopped the writer' do
+    subject(:killed) { result('killed_writer') }
+
+    it 'writes what the writer left, then what was queued while stopping, in order' do
+      expect(killed.values_at('written', 'lost_reported')).to eq([[600, 'killed'], false])
+    end
+
+    it 'waits for the lock once and reports what could not be written' do
+      expect([killed['stop_seconds'] < 2, killed['lost_line']])
+        .to eq([true, '3 analytics write(s) were lost, the database stayed busy'])
+    end
+  end
+
   describe 'bank deposits and withdrawals' do
     subject(:moves) { result('bank_moves') }
 

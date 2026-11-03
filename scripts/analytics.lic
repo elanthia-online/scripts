@@ -455,6 +455,8 @@ module GS4Analytics
     BUSY_BACKOFF_START_S = 2.0
     BUSY_BACKOFF_MAX_S   = 30.0
     MAX_PENDING_WRITES   = 5000
+    # How long stopping waits for a write in progress (one lock wait and more)
+    STOP_WAIT_S          = 30
     # Bank snapshot types that only move the total: a deposit or withdrawal
     # names no bank. Every other type is a BANK ACCOUNT listing.
     TOTAL_ONLY = %w[deposit withdraw].freeze
@@ -524,6 +526,7 @@ module GS4Analytics
         stop_writer
         [@db, @reader].compact.each(&:disconnect)
         @db = @reader = nil
+        @queue = @pending = nil
         @sessions = {}
       end
 
@@ -532,16 +535,33 @@ module GS4Analytics
 
       # ----- async writes ----------------------------------------------------
       # DownstreamHook procs run on the game-text thread and must never wait
-      # on the database, so they queue their writes here.
+      # on the database, so they queue their writes here. The managers queue
+      # theirs too, so a database held by another session delays them instead
+      # of losing them.
 
       def async(&job)
-        if @writer&.alive?
+        # A job that queues another (a session row, say) runs it in place, in
+        # its own transaction, so a busy retry repeats both
+        return job.call if Thread.current == @writer
+
+        if @writer&.alive? || backlog?
+          # With the writer gone (;kill stops it before cleanup runs), jobs
+          # still queue behind the ones it left, and #close writes them in order
           @queue << job
         else
-          job.call
+          db.transaction { job.call }
         end
       rescue StandardError => e
         Log.error('async write', e)
+      end
+
+      # Waits until everything queued so far is written. True when it was.
+      def flush(timeout = 5)
+        return !backlog? unless @writer&.alive?
+
+        done = Queue.new
+        @queue << -> { done << true }
+        !done.pop(timeout: timeout).nil?
       end
 
       # ----- metadata --------------------------------------------------------
@@ -557,26 +577,34 @@ module GS4Analytics
       # ----- sessions and cycles ---------------------------------------------
 
       # One session per character per day, cached so the 2 s bounty poll and
-      # every kill don't query for it
+      # every kill don't query for it. A new one is queued, not written, so a
+      # busy database can't stop the cycle thread at midnight.
       def session_for(who)
         date = Date.today.to_s
         cached = @sessions[who]
         return cached[:id] if cached && cached[:date] == date
 
         @session_lock.synchronize do
-          sessions = db[:sessions]
-          sessions.insert_ignore.insert(session_id: new_id, game: who.game, character: who.name, start_date: date,
-                                        midnight_timestamp: Util.midnight(date), start_time: Time.now.to_i)
-          id = sessions.where(game: who.game, character: who.name, start_date: date).get(:session_id)
+          cached = @sessions[who]
+          return cached[:id] if cached && cached[:date] == date
+
+          key = { game: who.game, character: who.name, start_date: date }
+          id = db[:sessions].where(key).get(:session_id)
+          unless id
+            id = new_id
+            row = key.merge(session_id: id, midnight_timestamp: Util.midnight(date), start_time: Time.now.to_i)
+            async { db[:sessions].insert_ignore.insert(row) }
+          end
           @sessions[who] = { date: date, id: id }
           id
         end
       end
 
-      def start_cycle(who, session_id, type, trigger, profile, vitals)
-        id = new_id
+      # +id+ and +at+ are taken when the cycle starts, so a write that waits
+      # for a busy database still records the real start
+      def start_cycle(who, session_id, type, trigger, profile, vitals, id: new_id, at: Time.now.to_i)
         db[:cycles].insert(clean(cycle_id: id, session_id: session_id, game: who.game, character: who.name,
-                                 cycle_type: type.to_s, start_time: Time.now.to_i, profile: profile,
+                                 cycle_type: type.to_s, start_time: at, profile: profile,
                                  trigger_script: trigger, exp_total_start: vitals[:exp_total],
                                  exp_field_start: vitals[:exp_field], exp_field_max: vitals[:exp_max],
                                  fame_start: vitals[:fame], encumbrance_start: vitals[:encumbrance]))
@@ -586,8 +614,8 @@ module GS4Analytics
       # Closes a cycle and returns its row, or nil when it was too short to
       # keep. A rest keeps the reason it started with; other cycles only take
       # a non-empty reason, so 'unhandled exit' is never overwritten.
-      def end_cycle(cycle_id, vitals, rest_reason)
-        now = Time.now.to_i
+      def end_cycle(cycle_id, vitals, rest_reason, at: Time.now.to_i)
+        now = at
         reason = rest_reason.to_s.empty? ? nil : Util.norm(rest_reason)
         cycles = db[:cycles].where(cycle_id: cycle_id)
         cycles.update(end_time: now, duration_seconds: Sequel.expr(now) - :start_time,
@@ -642,11 +670,11 @@ module GS4Analytics
 
       # category: 'box', 'sale' or 'bounty'
       def record_silver(who, session_id, cycle_id, category, amount, vendor_type: nil, vendor_name: nil,
-                        bounty_type: nil)
+                        bounty_type: nil, at: Time.now.to_i)
         return unless amount.to_i.positive?
 
         db[:silver_events].insert(clean(event_id: new_id, session_id: session_id, cycle_id: cycle_id, game: who.game,
-                                        character: who.name, timestamp: Time.now.to_i, source_category: category,
+                                        character: who.name, timestamp: at, source_category: category,
                                         amount: amount.to_i, vendor_type: vendor_type, vendor_name: vendor_name,
                                         bounty_type: bounty_type))
       end
@@ -663,16 +691,16 @@ module GS4Analytics
 
       # ----- bounties --------------------------------------------------------
 
-      def start_bounty(who, session_id, cycle_id, type, creature, area, count_required = nil, received_at: nil)
-        id = new_id
+      def start_bounty(who, session_id, cycle_id, type, creature, area, count_required = nil, received_at: nil,
+                       id: new_id)
         db[:bounties].insert(clean(bounty_id: id, session_id: session_id, cycle_id: cycle_id, game: who.game,
                                    character: who.name, received_time: received_at || Time.now.to_i, bounty_type: type,
                                    creature: creature, area: area, count_required: count_required, status: 'active'))
         id
       end
 
-      def complete_bounty(bounty_id, silver, exp, bp)
-        db[:bounties].where(bounty_id: bounty_id).update(status: 'completed', completed_time: Time.now.to_i,
+      def complete_bounty(bounty_id, silver, exp, bp, at: Time.now.to_i)
+        db[:bounties].where(bounty_id: bounty_id).update(status: 'completed', completed_time: at,
                                                          silver_reward: silver, exp_reward: exp, bp_reward: bp)
       end
 
@@ -793,8 +821,6 @@ module GS4Analytics
             @pending << job if job
             drain_writes
           end
-          drain_writes
-          Log.info("#{@pending.size} analytics write(s) were lost, the database stayed busy") unless @pending.empty?
         end
       end
 
@@ -856,12 +882,41 @@ module GS4Analytics
 
       def monotonic_now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
+      # Stops the writer and writes what it left. Under ;kill Lich has already
+      # killed it, so whatever it had pending or queued is written here.
       def stop_writer
-        return unless @writer&.alive?
-
-        @queue << :stop
-        @writer.join(10)
+        if @writer&.alive?
+          @queue << :stop
+          @writer.join(STOP_WAIT_S)
+          @writer.kill if @writer.alive?
+        end
         @writer = nil
+        write_remaining
+      end
+
+      # One last attempt at each leftover write, in order, ignoring the
+      # backoff. The first that finds the database still busy ends it, so
+      # stopping waits for the lock once, not once per write.
+      def write_remaining
+        jobs = @pending.to_a
+        until @queue.nil? || @queue.empty?
+          job = @queue.pop
+          jobs << job unless job == :stop
+        end
+        @pending = []
+        return if jobs.empty? || @db.nil?
+
+        jobs.each_with_index do |job, index|
+          run_write(job)
+        rescue StandardError => e
+          raise unless busy_error?(e)
+
+          return Log.info("#{jobs.size - index} analytics write(s) were lost, the database stayed busy")
+        end
+      end
+
+      def backlog?
+        (@queue && !@queue.empty?) || (@pending && !@pending.empty?) ? true : false
       end
 
       # ----- schema ----------------------------------------------------------
@@ -1097,7 +1152,9 @@ module GS4Analytics
         banks = parse_bank(Lich::Util.quiet_command_xml('bank account', /amounts on deposit/, /Total:\s+[\d,]+/))
         return Log.info('Bank snapshot: no data captured') if banks.empty?
 
-        record_banks(@who, @cycle_id, snapshot_type, banks)
+        who = @who
+        cycle_id = @cycle_id
+        Database.async { record_banks(who, cycle_id, snapshot_type, banks) }
         Log.info("Bank snapshot recorded (#{banks.size - 1} banks, total #{Util.fmt(banks['__total__'])})")
       rescue StandardError => e
         Log.error('bank snapshot', e)
@@ -1110,8 +1167,13 @@ module GS4Analytics
         # Sales are read from the game text already; recording them here too would count them twice
         return unless @who && amount.to_i.positive? && !Settings.current[:parse_sales]
 
-        Database.record_silver(@who, Database.session_for(@who), @cycle_id, 'sale', amount,
-                               vendor_type: vendor_type, vendor_name: vendor_name)
+        who = @who
+        cycle_id = @cycle_id
+        at = Time.now.to_i
+        Database.async do
+          Database.record_silver(who, Database.session_for(who), cycle_id, 'sale', amount,
+                                 vendor_type: vendor_type, vendor_name: vendor_name, at: at)
+        end
         Log.debug("Recorded #{vendor_type} sale: #{Util.fmt(amount)} silver")
       end
 
@@ -1119,7 +1181,9 @@ module GS4Analytics
       def record_vendor_visit(vendor, start_time, end_time, silver)
         return unless @who
 
-        Database.record_vendor_visit(@who, @cycle_id, vendor, start_time, end_time, silver)
+        who = @who
+        cycle_id = @cycle_id
+        Database.async { Database.record_vendor_visit(who, cycle_id, vendor, start_time, end_time, silver) }
       end
 
       private
@@ -1326,8 +1390,8 @@ module GS4Analytics
 
         task = task_info
         keep = task ? actives.find { |row| matches_row?(row, task) } : actives.first
-        stale = actives.reject { |row| row['bounty_id'] == keep&.[]('bounty_id') }
-        stale.each { |row| Database.expire_bounty(row['bounty_id']) }
+        stale = actives.reject { |row| row['bounty_id'] == keep&.[]('bounty_id') }.map { |row| row['bounty_id'] }
+        Database.async { stale.each { |id| Database.expire_bounty(id) } } if stale.any?
         Log.debug("Expired #{stale.size} stale active bounty row(s)") if stale.any?
         adopt(keep) if keep
       rescue StandardError => e
@@ -1377,9 +1441,14 @@ module GS4Analytics
         nil
       end
 
+      # Everything is decided here and written as one queued job, so a busy
+      # database delays the reward instead of losing it
       def handle_reward(bp, exp, silver)
-        session = Database.session_for(@who)
+        who = @who
+        session = Database.session_for(who)
         cycle = cycle_id
+        at = Time.now.to_i
+        start = received_at = nil
         # A reward for a bounty we never saw start (analytics began mid-bounty)
         # still counts, so reward totals stay complete
         unless @bounty_id
@@ -1387,11 +1456,16 @@ module GS4Analytics
           # so describe it from the task the poll last saw
           task, received_at = untracked_task
           @type = task ? task[:type] : 'untracked'
-          @bounty_id = Database.start_bounty(@who, session, cycle, @type, task ? task[:creature] : '',
-                                             task ? task[:area] : '', task&.[](:count), received_at: received_at)
+          start = [task ? task[:creature] : '', task ? task[:area] : '', task&.[](:count)]
+          received_at ||= at
         end
-        Database.complete_bounty(@bounty_id, silver, exp, bp)
-        Database.record_silver(@who, session, cycle, 'bounty', silver, bounty_type: @type)
+        id = @bounty_id || Database.new_id
+        type = @type
+        Database.async do
+          Database.start_bounty(who, session, cycle, type, *start, received_at: received_at, id: id) if start
+          Database.complete_bounty(id, silver, exp, bp, at: at)
+          Database.record_silver(who, session, cycle, 'bounty', silver, bounty_type: type, at: at)
+        end
         Log.debug("Bounty completed: #{@type} (#{silver} silver, #{exp} exp, #{bp} BP)")
         clear_tracking
       end
@@ -1408,7 +1482,8 @@ module GS4Analytics
       def handle_abandon
         return unless @bounty_id
 
-        Database.abandon_bounty(@bounty_id)
+        id = @bounty_id
+        Database.async { Database.abandon_bounty(id) }
         Log.debug("Bounty abandoned: #{@type}")
         clear_tracking
       end
@@ -1424,14 +1499,16 @@ module GS4Analytics
           return if task_matches_tracked?(task)
 
           if CONTINUATIONS[@type] == task[:type] && task[:area] == @area
-            Database.retype_bounty(@bounty_id, task[:type], task[:creature])
+            id = @bounty_id
+            Database.async { Database.retype_bounty(id, task[:type], task[:creature]) }
             @type = task[:type]
             @creature = task[:creature]
             return
           end
 
           # Replaced without a reward line: waived, removed or reassigned
-          Database.abandon_bounty(@bounty_id)
+          id = @bounty_id
+          Database.async { Database.abandon_bounty(id) }
           clear_tracking
         end
 
@@ -1448,8 +1525,11 @@ module GS4Analytics
       end
 
       def record_new(task)
-        @bounty_id = Database.start_bounty(@who, Database.session_for(@who), cycle_id, task[:type],
-                                           task[:creature], task[:area], task[:count])
+        who = @who
+        row = [who, Database.session_for(who), cycle_id, task[:type], task[:creature], task[:area], task[:count]]
+        received_at = Time.now.to_i
+        @bounty_id = id = Database.new_id
+        Database.async { Database.start_bounty(*row, received_at: received_at, id: id) }
         @type = task[:type]
         @creature = task[:creature]
         @area = task[:area]
@@ -1561,6 +1641,8 @@ module GS4Analytics
         @last_step_at = nil
         @rest_steps = Hash.new(0.0)
         @rest_cycle = nil
+        @cycle_reason = nil
+        @last_hunt = nil
         @idle = { since: nil, warned: false, recovering: false }
         @weapon = { polls: 0, retries: 0 }
         @session_id = Database.session_for(who)
@@ -1658,7 +1740,7 @@ module GS4Analytics
         # that can only be told when something reports resting at all
         if @current_state == :hunt && target == :idle && @current_cycle_id && rest_detectable? &&
            !BIGSHOT_REST_STATUSES.include?(@last_bigshot_status)
-          Database.set_rest_reason(@current_cycle_id, 'unhandled exit')
+          note_reason(@current_cycle_id, 'unhandled exit')
         end
         @last_bigshot_status = nil
         name_interrupting_scripts if @current_state == :hunt && target == :rest
@@ -1677,7 +1759,7 @@ module GS4Analytics
         scripts = running_steps
         return if scripts.empty?
 
-        Database.set_rest_reason(@current_cycle_id, "stopped by #{scripts.join('/')}")
+        note_reason(@current_cycle_id, "stopped by #{scripts.join('/')}")
       end
 
       def roll_over_midnight
@@ -1692,10 +1774,17 @@ module GS4Analytics
         start_new_cycle(@current_state)
       end
 
+      # The id and every value are taken now and the write is queued, so a
+      # database held by another session delays the row instead of losing it
       def start_new_cycle(type)
         trigger = Array(@cfg[SCRIPT_KEYS[type]]).find { |name| running?(name) } || type.to_s
-        @current_cycle_id = Database.start_cycle(@who, @session_id, type, trigger, profile, Vitals.read)
-        start_rest(@current_cycle_id) if type == :rest
+        row = [@who, @session_id, type, trigger, profile, Vitals.read]
+        id = Database.new_id
+        at = Time.now.to_i
+        Database.async { Database.start_cycle(*row, id: id, at: at) }
+        @current_cycle_id = id
+        @cycle_reason = nil
+        start_rest(id) if type == :rest
         link_silver
         Log.debug("Started #{type} cycle")
       rescue StandardError => e
@@ -1712,22 +1801,38 @@ module GS4Analytics
         reason = recent_hunt_reason if reason.empty?
         return if reason.empty?
 
-        Database.set_rest_reason(cycle_id, reason)
+        note_reason(cycle_id, reason)
         Log.debug("Rest reason: #{reason}")
         Notifier.alert('ITEM LIMIT', "check inventory (#{reason})") if reason.match?(ITEM_LIMIT_REASON)
       end
 
+      # Queued like the start; the rest steps go in the same job, since they
+      # are stored against the cycle's start time
       def end_current_cycle
         id = @current_cycle_id or return
 
         @current_cycle_id = nil
         link_silver
-        row = Database.end_cycle(id, Vitals.read, rest_reason)
-        save_rest_steps(id, row['start_time']) if row && @rest_cycle == id
+        vitals = Vitals.read
+        reason = rest_reason
+        at = Time.now.to_i
+        steps = @rest_cycle == id && !@rest_steps.empty? ? @rest_steps.dup : nil
         @rest_cycle = nil if @rest_cycle == id
-        Log.debug(row ? "Ended cycle (#{Util.hm(row['duration_seconds'])})" : 'Dropped a cycle too short to keep')
+        @last_hunt = { reason: reason.empty? ? @cycle_reason.to_s : reason, at: at } if @current_state == :hunt
+        who = @who
+        Database.async do
+          row = Database.end_cycle(id, vitals, reason, at: at)
+          save_rest_steps(who, id, row['start_time'], steps) if row && steps
+          Log.debug(row ? "Ended cycle (#{Util.hm(row['duration_seconds'])})" : 'Dropped a cycle too short to keep')
+        end
       rescue StandardError => e
         Log.error('end cycle', e)
+      end
+
+      # Records a cycle's reason, and remembers it for the rest that follows
+      def note_reason(cycle_id, reason)
+        @cycle_reason = reason if cycle_id == @current_cycle_id
+        Database.async { Database.set_rest_reason(cycle_id, reason) }
       end
 
       # Closes cycles left open by a crash. The real end is unknown, so use the
@@ -1739,7 +1844,7 @@ module GS4Analytics
           following = Database.one('SELECT MIN(start_time) AS t FROM cycles WHERE game = ? AND character = ? ' \
                                    'AND start_time > ?', *@who, cycle['start_time'])['t']
           finish = (following || cycle['start_time']).to_i
-          Database.close_cycle(cycle['cycle_id'], cycle['start_time'], finish)
+          Database.async { Database.close_cycle(cycle['cycle_id'], cycle['start_time'], finish) }
         end
         Log.info("Closed #{stale.size} stale open cycle(s)") if stale.any?
       end
@@ -1771,18 +1876,18 @@ module GS4Analytics
         @rest_steps[label] += elapsed
       end
 
-      def save_rest_steps(cycle_id, start_time)
-        return if @rest_steps.empty?
-
-        Database.record_rest_steps(@who, cycle_id, start_time, @rest_steps)
-        summary = @rest_steps.sort_by { |_, secs| -secs }.map { |step, secs| "#{step} #{(secs / 60).round(1)}m" }
+      def save_rest_steps(who, cycle_id, start_time, steps)
+        Database.record_rest_steps(who, cycle_id, start_time, steps)
+        summary = steps.sort_by { |_, secs| -secs }.map { |step, secs| "#{step} #{(secs / 60).round(1)}m" }
         Log.debug("Rest breakdown: #{summary.join(', ')}")
       end
 
+      # The reason the hunt that ended in the last minute was given. Kept in
+      # memory, since its row may still be waiting in the write queue.
       def recent_hunt_reason
-        Database.one("SELECT rest_reason FROM cycles WHERE game = ? AND character = ? AND cycle_type = 'hunt' " \
-                     "AND end_time >= ? AND rest_reason IS NOT NULL AND rest_reason != '' " \
-                     'ORDER BY end_time DESC LIMIT 1', *@who, Time.now.to_i - 60)['rest_reason'].to_s
+        return '' unless @last_hunt && Time.now.to_i - @last_hunt[:at] <= 60
+
+        @last_hunt[:reason]
       end
 
       # ----- idle warning and recovery ---------------------------------------
@@ -1938,7 +2043,12 @@ module GS4Analytics
         @alerted_hunt = nil
         @silver_alerted_on = nil
         @last_silver_check = 0
-        set_digest_marker((Date.today - 1).to_s) if @cfg[:daily_digest] && digest_marker.nil?
+        @digest_posted = nil
+        # The first run starts counting from today rather than posting yesterday
+        if @cfg[:daily_digest] && digest_marker.nil?
+          @digest_posted = (Date.today - 1).to_s
+          set_digest_marker(@digest_posted)
+        end
         @thread = Thread.new { watch }
       end
 
@@ -2009,13 +2119,18 @@ module GS4Analytics
 
       # ----- daily digest ----------------------------------------------------
 
+      # Remembered in memory as well, so a marker still waiting in the write
+      # queue can't post the digest again on the next check
       def check_digest
-        yesterday = Date.today - 1
-        last = digest_marker
-        return if last && last >= yesterday.to_s
+        yesterday = (Date.today - 1).to_s
+        return if @digest_posted == yesterday
 
-        post_digest(yesterday)
-        set_digest_marker(yesterday.to_s)
+        last = digest_marker
+        if last.nil? || last < yesterday
+          post_digest(Date.parse(yesterday))
+          set_digest_marker(yesterday)
+        end
+        @digest_posted = yesterday
       end
 
       def post_digest(date)
@@ -2069,7 +2184,8 @@ module GS4Analytics
       end
 
       def set_digest_marker(date)
-        Database.set_metadata("digest_last_#{@who}", date)
+        key = "digest_last_#{@who}"
+        Database.async { Database.set_metadata(key, date) }
       end
     end
   end
