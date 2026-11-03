@@ -629,6 +629,25 @@ when 'locked_cycle'
   }
   A::Database.close
 
+when 'locked_session'
+  # A queued write that creates the day's session while the database is held:
+  # the retry must write the session row too
+  quick_busy_timeouts
+  A::Database.connect!
+  fresh = A::Who.new('GS3', 'Fresh')
+  lock = hold_write_lock
+  A::Database.async { A::Database.record_silver(fresh, A::Database.session_for(fresh), nil, 'box', 5) }
+  sleep 0.4
+  lock.execute('COMMIT')
+  lock.close
+  A::Database.flush(10)
+  result = {
+    'sessions' => A::Database.one("SELECT COUNT(*) AS n FROM sessions WHERE character = 'Fresh'")['n'],
+    'linked'   => A::Database.one('SELECT COUNT(*) AS n FROM silver_events e JOIN sessions s ON s.session_id = e.session_id ' \
+                                "WHERE s.character = 'Fresh'")['n']
+  }
+  A::Database.close
+
 when 'killed_writer'
   # ;kill stops the writer before before_dying runs. What it left, and what the
   # managers queue while stopping, is written by close, in order.

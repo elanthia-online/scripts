@@ -355,6 +355,12 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'a new session created inside a queued write while the database is held' do
+    it 'is written by the retry, with the write that needed it' do
+      expect(result('locked_session')).to eq('sessions' => 1, 'linked' => 1)
+    end
+  end
+
   describe 'stopping after ;kill has stopped the writer' do
     subject(:killed) { result('killed_writer') }
 
