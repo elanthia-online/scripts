@@ -412,6 +412,26 @@ when 'dashboard'
   end
   hosts = ['attacker.example', 'attacker.example:8080', "localhost:#{port}", '127.0.0.1', '[::1]:8080', 'LOCALHOST', nil]
   result['local_hosts'] = hosts.map { |host| status_for.call(host) }
+  # Headers sent as given, after the request line
+  raw_status = lambda do |headers, path = '/api/overview'|
+    socket = TCPSocket.new('127.0.0.1', port)
+    socket.write("GET #{path} HTTP/1.1\r\n#{headers.map { |h| "#{h}\r\n" }.join}Connection: close\r\n\r\n")
+    socket.read.split[1]
+  ensure
+    socket&.close
+  end
+  pad = ->(size, tail) { "X-Pad: #{'a' * (size - tail.size - 7)}#{tail}" }
+  result['split_headers'] = {
+    # a long custom header whose cut-off tail reads as a Host header
+    'padded_tail'       => raw_status.call(['Host: attacker.example', pad.call(4096 + 'host:localhost'.size, 'host:localhost')]),
+    'padded_long'       => raw_status.call(['Host: attacker.example', pad.call(16_384 + 'host:localhost'.size, 'host:localhost')]),
+    'two_hosts'         => raw_status.call(['Host: attacker.example', 'Host: localhost']),
+    'two_local_hosts'   => raw_status.call(['Host: localhost', 'Host: localhost']),
+    'long_cookie'       => raw_status.call(['Host: localhost', "Cookie: #{'c' * 12_000}"]),
+    'too_long_line'     => raw_status.call(['Host: localhost', "Cookie: #{'c' * 20_000}"]),
+    'too_many'          => raw_status.call(['Host: localhost'] + Array.new(150) { |i| "X-#{i}: 1" }),
+    'long_request_line' => raw_status.call(['Host: localhost'], "/api/overview?x=#{'a' * 5000}")
+  }
   A::Dashboard.stop
   A::Dashboard.start(port, '0.0.0.0')
   sleep 0.3

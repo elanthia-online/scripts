@@ -471,6 +471,19 @@ RSpec.describe 'analytics.lic' do
       expect(dashboard['local_hosts']).to eq(%w[403 403 200 200 200 200 403])
     end
 
+    it 'refuses a header line cut off at the length limit, so its tail cannot pose as a Host header' do
+      expect(dashboard['split_headers'].values_at('padded_tail', 'padded_long', 'too_long_line', 'long_request_line'))
+        .to eq(%w[403 400 400 400])
+    end
+
+    it 'refuses a second Host header, and more headers than any browser sends' do
+      expect(dashboard['split_headers'].values_at('two_hosts', 'two_local_hosts', 'too_many')).to eq(%w[400 400 400])
+    end
+
+    it 'still answers a request with a large cookie header' do
+      expect(dashboard['split_headers']['long_cookie']).to eq('200')
+    end
+
     it 'answers any Host header in LAN mode' do
       expect(dashboard['lan_hosts']).to eq(%w[200 200])
     end
