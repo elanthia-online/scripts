@@ -402,6 +402,20 @@ when 'dashboard'
     'http_missing' => http.get('/nope').code,
     'http_post' => http.post('/', 'x').code
   }
+  # The status code of a GET for / with this Host header (nil sends none)
+  status_for = lambda do |host|
+    socket = TCPSocket.new('127.0.0.1', port)
+    socket.write("GET /api/overview HTTP/1.1\r\n#{"Host: #{host}\r\n" if host}Connection: close\r\n\r\n")
+    socket.read.split[1]
+  ensure
+    socket&.close
+  end
+  hosts = ['attacker.example', 'attacker.example:8080', "localhost:#{port}", '127.0.0.1', '[::1]:8080', 'LOCALHOST', nil]
+  result['local_hosts'] = hosts.map { |host| status_for.call(host) }
+  A::Dashboard.stop
+  A::Dashboard.start(port, '0.0.0.0')
+  sleep 0.3
+  result['lan_hosts'] = ['attacker.example', '192.168.1.20:8080'].map { |host| status_for.call(host) }
   A::Dashboard.stop
   result['stopped'] = !A::Dashboard.running?
 

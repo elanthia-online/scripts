@@ -461,6 +461,14 @@ RSpec.describe 'analytics.lic' do
       expect(dashboard.values_at('http_missing', 'http_post')).to eq(%w[404 405])
     end
 
+    it "answers only this computer's names when it is not open to the network" do
+      expect(dashboard['local_hosts']).to eq(%w[403 403 200 200 200 200 403])
+    end
+
+    it 'answers any Host header in LAN mode' do
+      expect(dashboard['lan_hosts']).to eq(%w[200 200])
+    end
+
     it 'stops serving' do
       expect(dashboard['stopped']).to be(true)
     end
