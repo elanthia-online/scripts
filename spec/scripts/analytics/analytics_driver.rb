@@ -365,7 +365,13 @@ when 'reports'
       'widest'             => texts.values.flatten.map(&:length).max,
       'names_in_character' => texts['character'].join.scan(/Torvek|Ashur/).uniq.sort,
       'range_lines'        => ranges,
-      'bad_range'          => A::Report::Text.exp_summary(conn, 'bogus').first
+      'bad_range'          => A::Report::Text.exp_summary(conn, 'bogus').first,
+      # One 30-minute hunt and the 10-minute rest after it, both carrying the reason
+      'reason_rows'        => A::Report::Text.reason_section(
+        [{ 'cycle_type' => 'hunt', 'rest_reason' => 'encumbered.', 'duration_seconds' => 1800 },
+         { 'cycle_type' => 'rest', 'rest_reason' => 'encumbered.', 'duration_seconds' => 600 },
+         { 'cycle_type' => 'hunt', 'rest_reason' => 'unhandled exit', 'duration_seconds' => 300 }]
+      ).grep(/encumbered|unhandled/).map { |line| line.split('|').map(&:strip).reject(&:empty?) }
     }
   end
 
@@ -721,6 +727,13 @@ when 'interrupted_hunt'
   # An idle character running a script by hand does not start a rest
   start_state.call(:idle, :idle)
   result['idle_manual_script'] = signals.call(['go2'])
+
+  # The idle time after a rest does not take bigshot's leftover rest reason
+  idle_id = manager.current_cycle_id
+  $rest_reason = 'encumbered.'
+  manager.send(:end_current_cycle)
+  A::Database.flush
+  result['idle_reason'] = A::Database.one('SELECT cycle_type, rest_reason FROM cycles WHERE cycle_id = ?', idle_id).values
 
 when 'town_bounty'
   # A bounty finished in town, with no hunt running, still gets its type and area

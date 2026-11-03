@@ -133,6 +133,10 @@ RSpec.describe 'analytics.lic' do
       expect(trip['idle_manual_script']).to eq([false, false])
     end
 
+    it 'does not give the idle time after a rest the rest reason bigshot left behind' do
+      expect(trip['idle_reason']).to eq(['idle', nil])
+    end
+
     it 'names the script that stopped the hunt, on the hunt and on the rest' do
       expect(trip['reasons']).to eq(['stopped by ebounty', 'rest', 'stopped by ebounty'])
     end
@@ -411,6 +415,10 @@ RSpec.describe 'analytics.lic' do
 
     it 'still answers for today shortly after midnight, when there may be nothing yet' do
       expect(reports['range_lines']['daily']).to be >= 1
+    end
+
+    it 'counts each rest reason once, from the hunt it ended' do
+      expect(reports['reason_rows']).to eq([['encumbered.', '1', '50.0%', '30.0 min'], ['unhandled exit', '1', '50.0%', '5.0 min']])
     end
 
     it 'gives usage for an unknown range' do
