@@ -160,6 +160,19 @@ RSpec.describe 'lnet.lic LNet.get_data' do
       expect(ann.join(2).value.first).to eq('who' => 'Ann')
     end
 
+    [['Bob', 'a bare name'], ['GSIV:Bob', 'its game']].each do |gs_from, label|
+      it "routes replies for the same name in two games to the right requests (GS reply carrying #{label})" do
+        bare = ask('Bob', 'info')
+        wait_for_requests(1)
+        dr = ask('DR:Bob', 'info')
+        wait_for_requests(2)
+        answer({ 'game' => 'DR' }, from: 'DR:Bob')
+        answer({ 'game' => 'GS' }, from: gs_from)
+        expect(dr.join(2).value.first).to eq('game' => 'DR')
+        expect(bare.join(2).value.first).to eq('game' => 'GS')
+      end
+    end
+
     it 'answers two identical requests with one reply each' do
       first = ask('Bob', 'info')
       second = ask('Bob', 'info')
