@@ -53,6 +53,24 @@ RSpec.describe 'lnet.lic LNet::StreamParser' do
       end
     end
 
+    {
+      'CDATA' => %(<message type="server">a<![CDATA[x > y </message> z]]>b</message><ping/>),
+      'comment' => %(<message type="server">a<!-- q > <ping/> -->b</message><ping/>),
+      'top-level comment' => %(<!-- a > <ping/> --><message type="server">hi</message>)
+    }.each do |label, xml|
+      it "gives the same events at every split of a #{label} section that holds '>'" do
+        whole_log = LnetSpec::EventLog.new.tap { |l| lnet::StreamParser.new(l).feed(xml) }
+        (1...xml.bytesize).each do |cut|
+          split_log = LnetSpec::EventLog.new
+          split_parser = lnet::StreamParser.new(split_log)
+          split_parser.feed(xml.byteslice(0, cut))
+          split_parser.feed(xml.byteslice(cut..))
+          expect(split_log.events).to eq(whole_log.events), "split at byte #{cut}: #{xml.byteslice(0, cut).inspect}"
+        end
+        expect(whole_log.roots.count('ping')).to eq(label == 'top-level comment' ? 0 : 1)
+      end
+    end
+
     it 'gives the same events when fed one byte at a time' do
       stream.each_char { |byte| parser.feed(byte) }
       expect(log.events).to eq(whole)
