@@ -30,6 +30,7 @@ RSpec.describe 'lnet.lic commands' do
   describe 'chat' do
     {
       'chat to Bob hi there'      => ['message', { 'type' => 'private', 'to' => 'Bob' }, 'hi there'],
+      'chat to gsiv:bob hi'       => ['message', { 'type' => 'private', 'to' => 'GSIV:Bob' }, 'hi'],
       'chat ::GSIV:Bob hi'        => ['message', { 'type' => 'private', 'to' => 'GSIV:Bob' }, 'hi'],
       'chat on General hi all'    => ['message', { 'type' => 'channel', 'channel' => 'General' }, 'hi all'],
       'chat :General hi'          => ['message', { 'type' => 'channel', 'channel' => 'General' }, 'hi'],
@@ -87,6 +88,8 @@ RSpec.describe 'lnet.lic commands' do
       'channels full'     => ['query', { 'type' => 'channels' }, nil],
       'tune Help'         => ['tune', { 'channel' => 'Help' }, nil],
       'untune Help'       => ['untune', { 'channel' => 'Help' }, nil],
+      'tune Real_Talk'    => ['tune', { 'channel' => 'Real_Talk' }, nil],
+      'who Real_Talk'     => ['query', { 'type' => 'connected', 'name' => 'Real_Talk' }, nil],
       'locate bob'        => ['request', { 'type' => 'locate', 'to' => 'Bob' }, nil],
       'SPELLS dr:bob'     => ['request', { 'type' => 'spells', 'to' => 'DR:Bob' }, nil],
       'bounty gsplat:ann' => ['request', { 'type' => 'bounty', 'to' => 'GSPlat:Ann' }, nil]
@@ -97,7 +100,7 @@ RSpec.describe 'lnet.lic commands' do
       end
     end
 
-    ['who [Bob]', 'tune Gen_eral', 'locate Bob^', 'channelsfoo'].each do |line|
+    ['who [Bob]', 'tune Gen^eral', 'locate Bob^', 'channelsfoo'].each do |line|
       it "refuses #{line.inspect}" do
         expect(echoes(run(line)).last).to start_with("You're doing it wrong.")
         expect(server.lines).to be_empty
@@ -194,11 +197,11 @@ RSpec.describe 'lnet.lic commands' do
       end
     end
 
-    it 'sets every type, registered ones included, for allow all' do
-      lnet.add_callback('roundtime') { 1 }
-      run('allow all friends')
-      expect(lnet.options['permission'].keys).to contain_exactly('spells', 'skills', 'info', 'locate', 'health', 'bounty', 'roundtime')
-      expect(lnet.options['permission'].values.uniq).to eq(['friends'])
+    it "sets the six built-in types for allow all, and leaves a script's type for the user to name" do
+      lnet.add_callback('inventory') { 1 }
+      run('allow all all')
+      expect(lnet.options['permission'].keys).to contain_exactly('spells', 'skills', 'info', 'locate', 'health', 'bounty')
+      expect(lnet.allow?('inventory', 'GSIV:Stranger')).to be(false)
     end
 
     it 'sets a permission for a type a script registered' do
@@ -280,36 +283,36 @@ RSpec.describe 'lnet.lic commands' do
     end
   end
 
-# Checked at LNet.admin: REXML 3.4 reads an attribute name with a space
-# ("option 1") as "option", so on the wire only the last option survives,
-# as it always has with this REXML; what the server expects is unknown.
-describe 'create poll' do
-  def poll_attributes(line)
-    captured = nil
-    allow(lnet).to receive(:admin) { |attributes| captured = attributes }
-    run(line)
-    captured
-  end
+  # Checked at LNet.admin: REXML 3.4 reads an attribute name with a space
+  # ("option 1") as "option", so on the wire only the last option survives,
+  # as it always has with this REXML; what the server expects is unknown.
+  describe 'create poll' do
+    def poll_attributes(line)
+      captured = nil
+      allow(lnet).to receive(:admin) { |attributes| captured = attributes }
+      run(line)
+      captured
+    end
 
-  it 'reads its flags in any order, the vote time included' do
-    expect(poll_attributes('create poll --question Best town? --vote-time 5m --option-1 Landing --option-2 Icemule'))
-      .to eq('action' => 'create poll', 'question' => 'Best town?', 'option 1' => 'Landing', 'option 2' => 'Icemule', 'length' => '300')
-  end
+    it 'reads its flags in any order, the vote time included' do
+      expect(poll_attributes('create poll --question Best town? --vote-time 5m --option-1 Landing --option-2 Icemule'))
+        .to eq('action' => 'create poll', 'question' => 'Best town?', 'option 1' => 'Landing', 'option 2' => 'Icemule', 'length' => '300')
+    end
 
-  it 'stops at the first missing option number and trims long text' do
-    attributes = poll_attributes("create poll --option-1 a --option-2 #{'b' * 100} --option-4 d --question #{'q' * 600}")
-    expect(attributes.keys).to contain_exactly('action', 'question', 'option 1', 'option 2')
-    expect(attributes['option 2'].length).to eq(64)
-    expect(attributes['question'].length).to eq(512)
-  end
+    it 'stops at the first missing option number and trims long text' do
+      attributes = poll_attributes("create poll --option-1 a --option-2 #{'b' * 100} --option-4 d --question #{'q' * 600}")
+      expect(attributes.keys).to contain_exactly('action', 'question', 'option 1', 'option 2')
+      expect(attributes['option 2'].length).to eq(64)
+      expect(attributes['question'].length).to eq(512)
+    end
 
-  ['create poll --question Lonely? --option-1 only', 'create poll --option-1 a --option-2 b'].each do |line|
-    it "refuses #{line.inspect}" do
-      expect(echoes(run(line)).last).to start_with("You're doing it wrong.")
-      expect(server.lines).to be_empty
+    ['create poll --question Lonely? --option-1 only', 'create poll --option-1 a --option-2 b'].each do |line|
+      it "refuses #{line.inspect}" do
+        expect(echoes(run(line)).last).to start_with("You're doing it wrong.")
+        expect(server.lines).to be_empty
+      end
     end
   end
-end
 
   describe 'help' do
     it 'shows help for help and for nothing at all' do
