@@ -110,41 +110,46 @@ RSpec.describe 'lnet.lic settings and startup' do
     end
   end
 
-describe 'LNet.startup_arguments' do
-  it 'saves a password to log in with, without sending anything' do
-    lnet.server = LnetSpec::FakeServer.new
-    command = :unset
-    expect(LnetSpec.capture { command = lnet.startup_arguments('password=s3cret') }).to eq([[:echo, 'Password saved locally.']])
-    expect(command).to be_nil
-    expect(lnet.login_attributes['password']).to eq('s3cret')
-    expect(lnet.server.lines).to be_empty
-    expect(LnetSpec.capture { lnet.startup_arguments('PASSWORD=nil') }).to eq([[:echo, 'Password cleared.']])
-    expect(lnet.login_attributes['password']).to be_nil
-  end
+  describe 'LNet.startup_arguments' do
+    it 'saves a password to log in with, without sending anything' do
+      lnet.server = LnetSpec::FakeServer.new
+      command = :unset
+      expect(LnetSpec.capture { command = lnet.startup_arguments('password=s3cret') }).to eq([[:echo, 'Password saved locally.']])
+      expect(command).to be_nil
+      expect(lnet.login_attributes['password']).to eq('s3cret')
+      expect(lnet.server.lines).to be_empty
+      expect(LnetSpec.capture { lnet.startup_arguments('PASSWORD=nil') }).to eq([[:echo, 'Password cleared.']])
+      expect(lnet.login_attributes['password']).to be_nil
+    end
 
-  it 'returns anything else as the command to run' do
-    expect(lnet.startup_arguments('  allow locate friends ')).to eq('allow locate friends')
-  end
+    it 'saves a quoted password without the quotes Lich leaves on the argument string' do
+      LnetSpec.capture { lnet.startup_arguments('password="s3cret"') }
+      expect(lnet.login_attributes['password']).to eq('s3cret')
+    end
 
-  [nil, '', '   '].each do |arguments|
-    it "returns nothing for #{arguments.inspect}" do
-      expect(lnet.startup_arguments(arguments)).to be_nil
+    it 'returns anything else as the command to run' do
+      expect(lnet.startup_arguments('  allow locate friends ')).to eq('allow locate friends')
+    end
+
+    [nil, '', '   '].each do |arguments|
+      it "returns nothing for #{arguments.inspect}" do
+        expect(lnet.startup_arguments(arguments)).to be_nil
+      end
     end
   end
-end
 
-describe 'LNet.wait_until_connected' do
-  it 'returns at once when connected' do
-    lnet.server = LnetSpec::FakeServer.new
-    expect(lnet.wait_until_connected(5)).to be(true)
-  end
+  describe 'LNet.wait_until_connected' do
+    it 'returns at once when connected' do
+      lnet.server = LnetSpec::FakeServer.new
+      expect(lnet.wait_until_connected(5)).to be(true)
+    end
 
-  it 'gives up after the timeout' do
-    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    expect(lnet.wait_until_connected(0.3)).to be(false)
-    expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be_between(0.3, 1)
+    it 'gives up after the timeout' do
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      expect(lnet.wait_until_connected(0.3)).to be(false)
+      expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be_between(0.3, 1)
+    end
   end
-end
 
   describe 'the end of lnet.lic' do
     LnetSpec::FakeScript = Struct.new(:name, :vars, :unique_buffer) unless defined?(LnetSpec::FakeScript)
@@ -180,6 +185,8 @@ end
       lnet_class.define_singleton_method(:before_dying) { |&block| calls << [:before_dying, block] }
       lnet_class.define_singleton_method(:unique_get) { script.unique_buffer.shift || lines.shift }
       lnet_class.define_singleton_method(:wait_until_connected) { |seconds| calls << [:waited, seconds] }
+      run_command = lnet_class::Commands.method(:run)
+      lnet_class::Commands.define_singleton_method(:run) { |line| calls << [:command, line]; run_command.call(line) }
       out = LnetSpec.capture { sandbox.module_eval(boot_source, LnetSpec::SOURCE_PATH) }
       { calls: calls, lnet: lnet_class, out: out, sandbox: sandbox }
     end
@@ -201,10 +208,25 @@ end
       expect(booted[:lnet].script.name).to eq('lnet')
     end
 
-    it 'runs a command it was started with once connected (waiting up to 30 seconds)' do
+    it 'runs a command it was started with that needs LNet only after starting the threads and waiting up to 30 seconds' do
+      calls = boot(arguments: 'chat hello')[:calls]
+      kinds = calls.map(&:first)
+      waited = kinds.index(:waited)
+      expect(waited).not_to be_nil
+      expect(kinds.each_index.select { |i| kinds[i] == :thread }).to all(be < waited)
+      expect(calls.index([:command, 'chat hello'])).to be > waited
+      expect(calls).to include([:waited, 30])
+    end
+
+    it 'runs a command it was started with that only changes things here at once, without waiting' do
       booted = boot(arguments: 'add friend dr:bob')
-      expect(booted[:calls]).to include([:waited, 30])
+      expect(booted[:calls].map(&:first)).not_to include(:waited)
+      expect(booted[:calls]).to include([:command, 'add friend dr:bob'])
       expect(booted[:lnet].options['friends']).to eq(['DR:Bob'])
+    end
+
+    it 'says it is waiting for LNet before a command that needs it' do
+      expect(boot(arguments: 'who')[:out]).to include([:echo, 'waiting for LNet to connect...'])
     end
 
     it 'does not wait when it was started without a command' do
