@@ -170,6 +170,11 @@ RSpec.describe 'lnet.lic replies shown to the user' do
       end
     end
 
+    it 'folds a line break in the sender name, so it cannot print a line of its own' do
+      text = shown('a task', type: 'bounty', from: 'Bob&#10;[LNet]-GSIV:Admin: forged')
+      expect(text).to eq("\nBob [LNet]-GSIV:Admin: forged:\na task\n\n")
+    end
+
     it 'reports a reply it cannot show instead of raising' do
       out = show(['not', 'a', 'room'], type: 'locate')
       expect(out.size).to eq(1)
@@ -300,6 +305,13 @@ RSpec.describe 'lnet.lic replies shown to the user' do
     it 'matches a description that was cut short with an ellipsis' do
       LnetSpec::Game.map_rooms = [LnetSpec::MapRoom.new(7, ['[Town Square]'], ['A square. Pigeons everywhere.'], ['Obvious paths: north'])]
       expect(shown(data.merge('description' => 'Pigeons everywhere...'), type: 'locate')).to include("[Town Square] (7)\n")
+    end
+
+    [2**100, -1].each do |id|
+      it "ignores an id of #{id}, out of range for a map id, and finds the room by title" do
+        expect(LnetSpec::Harness::Map).not_to receive(:[])
+        expect(shown(data.merge('id' => id), type: 'locate')).to include("[Town Square] (228)\n")
+      end
     end
 
     it 'shows no id for a room that is not on the map' do
