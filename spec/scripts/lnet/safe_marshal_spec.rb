@@ -204,6 +204,24 @@ RSpec.describe 'lnet.lic' do
       expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 1
     end
 
+    {
+      'links to one large string' => -> { big = 'z' * 16_384; Array.new(2048) { big } },
+      'links to one large symbol' => -> { sym = ('z' * 16_384).to_sym; Array.new(2048) { sym } },
+      'links to an array holding a large string' => -> { inner = ['z' * 16_384]; Array.new(2048) { inner } }
+    }.each do |label, build|
+      it "refuses #{label} that would expand a small payload into megabytes of text" do
+        blob = Marshal.dump(build.call)
+        expect(blob.bytesize).to be < 25_000
+        expect { lnet.safe_unmarshal(blob) }.to raise_error(ArgumentError, /expands too far/)
+      end
+    end
+
+    it 'still loads the shared hash keys real replies have' do
+      key = 'name'
+      reply = { 'pcs' => [{ key => 'Ann', 'status' => nil }, { key => 'Bob', 'status' => 'sitting' }] }
+      expect(lnet.safe_unmarshal(Marshal.dump(reply))).to eq(reply)
+    end
+
     it 'still loads a little sharing' do
       expect(lnet.safe_unmarshal(Marshal.dump(doubled(5)))).to eq(doubled(5))
     end

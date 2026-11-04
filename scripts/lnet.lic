@@ -12,8 +12,7 @@
 
   changelog:
     1.19 (2026-11-05):
-      Move the <data> payload checks into LNet::SafeMarshal, and refuse payloads whose
-        shared parts would expand past 2,000,000 values or that hold numbers over 256 bits
+      Refuse LNet replies that would take too much memory or time to show
     1.18 (2026-11-05):
       A server certificate with the wrong name no longer closes Lich
       Writes from different threads no longer interleave on the connection
@@ -701,7 +700,8 @@ class LNet
   # run code to load. Strings and symbols may only carry their encoding, and
   # links back to an array/hash that is still being read are refused, so the
   # result is a finite tree of plain values; links can't expand it past
-  # MAX_VALUES values, and numbers are at most MAX_BIGNUM_WORDS long.
+  # MAX_VALUES values or MAX_BYTES bytes of text, and numbers are at most
+  # MAX_BIGNUM_WORDS long.
   module SafeMarshal
     module_function
 
@@ -726,7 +726,10 @@ class LNet
       raise ArgumentError, 'unsupported marshal format' unless bin.byteslice(0, 2) == "\x04\x08".b
 
       limit = [(bin.bytesize * 64) + 1024, MAX_VALUES].min
-      pos = check_value(bin, 2, 0, { 'objects' => [], 'symbols' => [], 'sizes' => [], 'values' => 0, 'limit' => limit })
+      byte_limit = [(bin.bytesize * 64) + 65_536, MAX_BYTES].min
+      seen = { 'objects' => [], 'symbols' => [], 'sizes' => [], 'values' => 0, 'limit' => limit,
+               'byte_sizes' => [], 'bytes' => 0, 'byte_limit' => byte_limit }
+      pos = check_value(bin, 2, 0, seen)
       raise ArgumentError, 'trailing marshal data' unless pos == bin.bytesize
 
       Marshal.load(bin)
@@ -741,12 +744,16 @@ class LNet
     # Longest bignum accepted, in 16-bit words (256 bits; LNet's numbers fit
     # in 64).
     MAX_BIGNUM_WORDS = 16
+    # Most bytes of strings and symbols a payload may hold once its links are
+    # followed (and at most 64 per byte of payload, plus 64 KB).
+    MAX_BYTES = 8_000_000
 
     # seen mirrors Marshal.load's link tables: 'objects' has one entry per
     # linkable object (false while an array/hash is still being read, the text
     # of a string, true otherwise), 'symbols' the name of each symbol read,
-    # 'sizes' how many values each array/hash holds (for links) and 'values'
-    # how many values the payload has expanded to so far
+    # 'sizes' how many values each array/hash holds (for links), 'values' how
+    # many values the payload has expanded to so far, and 'byte_sizes' and
+    # 'bytes' the same in bytes of text
     def check_value(bin, pos, depth, seen)
       raise ArgumentError, 'marshal data nested too deep' if depth > MAX_DEPTH
 
@@ -761,7 +768,9 @@ class LNet
       when 'i'
         read_long(bin, pos)[1]
       when ':', ';'
-        read_symbol(bin, pos - 1, seen)[1]
+        name, pos = read_symbol(bin, pos - 1, seen)
+        add_bytes(seen, name.bytesize)
+        pos
       when '@' # link to an earlier object
         index, pos = read_long(bin, pos)
         raise ArgumentError, 'bad or circular marshal link' unless index >= 0 and seen['objects'][index]
@@ -769,10 +778,13 @@ class LNet
         seen['values'] += seen['sizes'][index].to_i
         raise ArgumentError, 'marshal data expands too far' if seen['values'] > seen['limit']
 
+        add_bytes(seen, seen['byte_sizes'][index].to_i)
         pos
       when '"' # string
         text, pos = read_string(bin, pos)
+        seen['byte_sizes'][seen['objects'].length] = text.bytesize
         seen['objects'].push(text)
+        add_bytes(seen, text.bytesize)
         pos
       when 'f' # float
         seen['objects'].push(true)
@@ -789,20 +801,25 @@ class LNet
         index = seen['objects'].length
         seen['objects'].push(false)
         before = seen['values']
+        before_bytes = seen['bytes']
         len, pos = read_count(bin, pos)
         len *= 2 unless type.chr == '['
         len += 1 if type.chr == '}'
         len.times { pos = check_value(bin, pos, depth + 1, seen) }
         seen['objects'][index] = true
         seen['sizes'][index] = seen['values'] - before
+        seen['byte_sizes'][index] = seen['bytes'] - before_bytes
         pos
       when 'I' # a string or symbol followed by its encoding
         case bin.byteslice(pos, 1)
         when '"'
           text, pos = read_string(bin, pos + 1)
+          seen['byte_sizes'][seen['objects'].length] = text.bytesize
           seen['objects'].push(text)
+          add_bytes(seen, text.bytesize)
         when ':'
-          pos = read_symbol(bin, pos, seen)[1]
+          name, pos = read_symbol(bin, pos, seen)
+          add_bytes(seen, name.bytesize)
         else
           raise ArgumentError, 'instance variables on unsupported type'
         end
@@ -832,6 +849,18 @@ class LNet
       else
         raise ArgumentError, "refusing to load marshal type #{type.chr.inspect}"
       end
+    end
+
+    # Counts text a payload holds, links included, and refuses it past its
+    # byte limit.
+    #
+    # @param seen [Hash] see #check_value
+    # @param count [Integer] bytes to add
+    # @return [void]
+    # @raise [ArgumentError] past the limit
+    def add_bytes(seen, count)
+      seen['bytes'] += count
+      raise ArgumentError, 'marshal data expands too far' if seen['bytes'] > seen['byte_limit']
     end
 
     def read_long(bin, pos)
