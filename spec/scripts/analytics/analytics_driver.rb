@@ -702,6 +702,29 @@ when 'killed_writer'
   lock.execute('ROLLBACK')
   lock.close
 
+when 'baseline'
+  # With no bank total yet, starting takes one listing; after that it doesn't
+  A::Database.connect!
+  A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  manager = A::SilverManager
+  count = -> { A::Database.flush; A::Database.one('SELECT COUNT(*) AS n FROM bank_snapshots')['n'] }
+  A::Settings.current[:parse_bank] = false
+  off = [manager.take_baseline_now, count.call]
+  A::Settings.current[:parse_bank] = true
+  first = [manager.take_baseline_now, count.call]
+  again = [manager.take_baseline_now, count.call]
+  DownstreamHook.run('You deposit 1,000 silvers into your account.  The teller carefully records the transaction and says, ' \
+                     '"Thank you, Torvek.  This brings your total to 1,501,000 silvers.  Have a nice day!"')
+  sleep 0.4
+  A::Database.flush
+  result = {
+    'off' => off, 'first' => first, 'again' => again,
+    'types' => A::Database.all("SELECT DISTINCT snapshot_type FROM bank_snapshots WHERE snapshot_type = 'baseline'").map(&:values),
+    'deposit' => A::Database.one("SELECT balance, delta_silver FROM bank_snapshots WHERE snapshot_type = 'deposit'").values
+  }
+  manager.stop
+
 when 'bigshot_status'
   # Bigshot's own status marks a rest, but only while the script is running
   A::Database.connect!

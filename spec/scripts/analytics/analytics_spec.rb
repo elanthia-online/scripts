@@ -374,6 +374,22 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'the first bank listing for a character' do
+    subject(:baseline) { result('baseline') }
+
+    it 'is taken when there is no bank total yet' do
+      expect(baseline['first']).to eq([true, 3])
+    end
+
+    it 'is not taken again once there is one, or with parse_bank off' do
+      expect(baseline.values_at('again', 'off')).to eq([[false, 3], [false, 0]])
+    end
+
+    it 'lets the next deposit move the total' do
+      expect([baseline['types'], baseline['deposit']]).to eq([[['baseline']], [2_101_501_000, 1000]])
+    end
+  end
+
   describe 'bank deposits and withdrawals' do
     subject(:moves) { result('bank_moves') }
 
