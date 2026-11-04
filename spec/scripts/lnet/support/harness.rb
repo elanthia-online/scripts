@@ -307,7 +307,7 @@ module LnetSpec
     # way the script's socket loop does, and returns what it produced.
     def feed(*chunks)
       LnetSpec.capture do
-        parser = lnet::StreamParser.new(lnet.new)
+        parser = lnet::StreamParser.new(lnet::Listener.new)
         chunks.each { |chunk| parser.feed(chunk) }
       end
     end
