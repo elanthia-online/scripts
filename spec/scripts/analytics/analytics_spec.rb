@@ -407,6 +407,10 @@ RSpec.describe 'analytics.lic' do
     it 'agrees with the next BANK ACCOUNT listing' do
       expect(notes['listing']).to eq([1_563_160, 0])
     end
+
+    it 'does not count again what a listing between two lines at the same teller already took in' do
+      expect(result('teller_listing')).to eq('after_note' => 1_425_750, 'next_listing' => 0, 'after_snapshot' => 1_336_750)
+    end
   end
 
   describe 'cycle edges' do

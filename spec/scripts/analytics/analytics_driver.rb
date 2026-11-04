@@ -783,6 +783,48 @@ when 'notes'
   result = { 'sales' => sales, 'totals' => steps, 'listing' => listing }
   A::SilverManager.stop
 
+when 'teller_listing'
+  # A listing between two lines at the same teller already includes what
+  # happened in between, so the second line must not count it again
+  A::Database.connect!
+  A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  feed = ->(*lines) { lines.each { |line| DownstreamHook.run(line) } }
+  settle = -> { sleep 0.3; A::Database.flush }
+  total = -> { A::Database.latest_balances(WHO)['__total__'] }
+  listing = lambda do |bank_a, total_silver|
+    feed.call('You currently have the following amounts on deposit:', "      Bank A: #{bank_a}", '      Bank B: 500,000',
+              "      Total: #{total_silver}")
+    settle.call
+  end
+  listing.call('1,000,000', '1,500,000')
+  $room_id = 100
+  feed.call('You deposit 15,750 silvers into your account.  The teller carefully records the transaction and says, ' \
+            '"Thank you, Torvek.  This brings your total to 1,015,750 silvers.  Have a nice day!"')
+  settle.call
+  # a 99,000 note withdrawn (its line names no amount), then a listing
+  listing.call('916,750', '1,416,750')
+  feed.call('You deposit your <a exist="1" noun="note">note</a> worth 9,000 into your account.  The teller carefully records ' \
+            'the transaction and says, "Thank you, Torvek.  This brings your total to 925,750 silvers.  Have a nice day!"')
+  settle.call
+  after_note = total.call
+  listing.call('925,750', '1,425,750')
+  last_delta = -> { A::Database.one("SELECT delta_silver FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid DESC LIMIT 1")['delta_silver'] }
+  result = { 'after_note' => after_note, 'next_listing' => last_delta.call }
+
+  # The same through take_snapshot (the first-run listing and the public hook)
+  feed.call('You deposit 1,000 silvers into your account.  The teller carefully records the transaction and says, ' \
+            '"Thank you, Torvek.  This brings your total to 926,750 silvers.  Have a nice day!"')
+  settle.call
+  $bank_lines = ['You currently have the following amounts on deposit:', '      Bank A: 827,750', '      Bank B: 500,000',
+                 '      Total: 1,327,750']
+  A::SilverManager.take_snapshot
+  feed.call('You deposit your <a exist="1" noun="note">note</a> worth 9,000 into your account.  The teller carefully records ' \
+            'the transaction and says, "Thank you, Torvek.  This brings your total to 836,750 silvers.  Have a nice day!"')
+  settle.call
+  result['after_snapshot'] = total.call
+  A::SilverManager.stop
+
 when 'cycle_edges'
   # The collector's first moments, and a hunt that ends in a death
   A::Database.connect!
