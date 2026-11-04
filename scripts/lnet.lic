@@ -8,9 +8,20 @@
       game: any
       tags: core
   required: Lich > 5.0.1
-   version: 1.23
+   version: 1.24
 
   changelog:
+    1.24 (2026-11-05):
+      ;lnet allow lists what each permission covers (it printed "to ." on every line)
+        and accepts request types scripts registered
+      ;lnet add alias Bob reply me no longer sends a private message (reply is anchored)
+      create poll reads --vote-time wherever it appears
+      Friend, enemy and ignore names with any game code are written as LNet writes them
+        (dr:bob is DR:Bob); an old entry saved in another case can be removed
+      ;lnet-callbacks, ;whois and other commands that start like an lnet one reach Lich;
+        ;GSIV:Bob hi sends to GSIV:Bob
+      Say so when a command could not be sent because LNet is not connected
+      ;lnet debug=on|off; ;lnet alone shows help
     1.23 (2026-11-05):
       Aliases change only what you see; scripts get the real name
       Always echo your own private messages (no 512 character limit)
@@ -101,7 +112,7 @@ class LNet
   # this one. Drop the constants an earlier copy of this file defined, so each
   # comes from this file; constants other scripts add to LNet (inbox.lic's
   # LNet::Inbox) are left alone.
-  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT REQUEST_TIMEOUT SAFE_SEND_INTERVAL USER_CALLBACKS_SCRIPT CA_CERTIFICATE GAME_SPELLINGS StreamParser SafeMarshal Thoughts Listener Display Responders Waiter MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
+  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT REQUEST_TIMEOUT SAFE_SEND_INTERVAL USER_CALLBACKS_SCRIPT CA_CERTIFICATE GAME_CODES GAME_SPELLINGS StreamParser SafeMarshal Thoughts Listener Display Hook Commands Responders Waiter MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
 
   @@server    ||= nil
   @@script    ||= nil
@@ -1700,6 +1711,522 @@ class LNet
     end
   end
 
+  # Game codes LNet puts before character names (XMLData.game).
+  GAME_CODES = %w[GSIV GSPlat GSF GST DR DRF DRT DRX].freeze
+
+  # Turns what the user types in the game client into lnet commands: the
+  # shortcuts (';chat', ';,', ';who', ';locate Bob', ';Bob:hi' ...) and
+  # anything after ';lnet'.
+  module Hook
+    module_function
+
+    # Shortcut words that work without ';lnet', each followed by a space.
+    SHORTCUTS = %w[chat reply tune untune locate spells info skills health bounty].freeze
+    # Shortcut words that work alone or followed by a space.
+    BARE_SHORTCUTS = %w[who channels channel].freeze
+
+    # @param line [String] a line the user typed
+    # @param lich_char [String] Lich's command prefix, usually ';'
+    # @param script_name [String] lnet's script name
+    # @return [Array(Symbol, String), nil] [:shortcut, command] or
+    #   [:script, command] for a line meant for lnet, nil for anything else
+    def command_for(line, lich_char:, script_name:)
+      body = line.to_s.chomp.delete_prefix('<c>')
+      return nil if lich_char.to_s.empty? || !body.start_with?(lich_char)
+
+      rest = body[lich_char.length..]
+      if rest.start_with?(',')
+        [:shortcut, "chat #{rest[1..]}"]
+      elsif (match = rest.match(/\A(#{SHORTCUTS.join('|')}) (.*)\z/))
+        [:shortcut, "#{match[1]} #{match[2]}"]
+      elsif (match = rest.match(/\A(#{BARE_SHORTCUTS.join('|')})(?: (.*))?\z/))
+        [:shortcut, [match[1], match[2]].compact.join(' ')]
+      elsif (match = rest.match(/\A#{Regexp.escape(script_name)}(?:\s+(.*))?\z/))
+        [:script, match[1].to_s]
+      elsif (match = rest.match(/\A([A-Za-z]+):(.*)\z/))
+        [:shortcut, private_shortcut(match[1], match[2])]
+      end
+    end
+
+    # ';Bob:hi' sends 'hi' to Bob. When the part before the colon is a game
+    # code, the name follows it: ';GSIV:Bob hi' and ';GSIV:Bob:hi' both send
+    # 'hi' to GSIV:Bob.
+    #
+    # @return [String] the chat command
+    def private_shortcut(name, rest)
+      if GAME_CODES.any? { |code| code.casecmp?(name) } && (match = rest.match(/\A([A-Za-z]+)[: ](.*)\z/))
+        "chat ::#{name}:#{match[1]} #{match[2]}"
+      else
+        "chat ::#{name} #{rest}"
+      end
+    end
+
+    # @param script_name [String]
+    # @return [Proc] the UpstreamHook that hands lnet's commands to the
+    #   running lnet script
+    def build(script_name)
+      proc do |client_string|
+        kind, command = command_for(client_string, lich_char: $lich_char, script_name: script_name)
+        next client_string unless kind
+
+        if (script = (Script.running + Script.hidden).find { |running| running.name == script_name })
+          script.unique_buffer.push(command)
+          next nil
+        end
+        UpstreamHook.remove(script_name)
+        next client_string if kind == :script # Lich starts lnet with these arguments
+
+        respond '--- Lich: lnet is not running'
+        nil
+      rescue StandardError
+        UpstreamHook.remove(script_name)
+        client_string
+      end
+    end
+  end
+
+  # The commands the user gives lnet. Each route is a pattern and the method
+  # that handles a match; the first matching route wins.
+  module Commands
+    module_function
+
+    # Words ;lnet allow accepts for who may see something.
+    GROUPS = { 'all' => 'all', 'friend' => 'friends', 'friends' => 'friends', 'non-enemies' => 'enemies',
+               'nonenemies' => 'enemies', 'enemies' => 'enemies', 'enemy' => 'enemies', 'none' => 'none' }.freeze
+
+    # How ;lnet allow describes each permission.
+    WHO = { 'all' => 'everyone', 'friends' => 'only your friends', 'enemies' => 'everyone except your enemies',
+            'none' => 'no one' }.freeze
+
+    # Seconds in each unit a ban, gag or poll length may be given in.
+    UNITS = { 's' => 1, 'm' => 60, 'h' => 3600, 'd' => 86_400, 'y' => 31_536_000 }.freeze
+
+    # The lists the friend, enemy and ignore commands edit, and their words.
+    LISTS = {
+      'friends' => { present: '%s is already on your friend list.', added: '%s was added to your friend list.',
+                     removed: '%s was removed from your friend list.', absent: '%s was not found on your friend list.',
+                     empty: 'You have no friends.', listing: 'friends: %s' },
+      'enemies' => { present: '%s is already on your enemy list.', added: '%s was added to your enemy list.',
+                     removed: '%s was removed from your enemy list.', absent: '%s was not found on your enemy list.',
+                     empty: 'You have no enemies.', listing: 'enemies: %s' },
+      'ignore'  => { present: 'You were already ignoring %s.', added: 'You are now ignoring %s.',
+                     removed: 'You are no longer ignoring %s.', absent: "%s wasn't being ignored.",
+                     empty: 'You are not ignoring anyone.', listing: 'You are ignoring the following people: %s' },
+    }.freeze
+
+    NAME = '((?:[A-Za-z]+:)?[A-Za-z]+)'
+    TIME = '(\d+)\s*(seconds?|minutes?|hours?|days?|years?|s|m|h|d|y)'
+
+    ROUTES = [
+      [/\Achat\s+(?:::|to\s+)(\S+)\s+(.+)\z/im, :private_message],
+      [/\Achat\s+(?::(?!:)|on\s+)(\S+)\s+(.+)\z/im, :channel_message],
+      # 'chat ot ...' is refused, so a typo for 'chat to' can't broadcast a private message
+      [/\Achat\s+(?!::|to\s|on\s|ot\s)(.+)\z/im, :default_message],
+      [/\Areply\s+(.+)\z/im, :reply],
+      [/\Awho\z/i, :who],
+      [/\Awho\s+([A-Za-z:]+)\z/i, :who],
+      [/\Astats\z/i, :stats],
+      [/\Achannels?(?:\s+(full|all))?\z/i, :channels],
+      [/\Atune\s+([A-Za-z]+)\z/i, :tune],
+      [/\Auntune\s+([A-Za-z]+)\z/i, :untune],
+      [/\A(spells|skills|info|locate|health|bounty)\s+#{NAME}\z/i, :request],
+      [/\Aadd\s?alias\s+(\S+)\s+(.+)\z/i, :add_alias],
+      [/\A(?:del|rem|delete|remove)\s?alias\s+(.+)\z/i, :remove_alias],
+      [/\Aaliases\z/i, :aliases],
+      [/\Aadd\s?friends?\s+#{NAME}\z/i, :add_friend],
+      [/\A(?:del|rem|delete|remove)\s?friends?\s+#{NAME}\z/i, :remove_friend],
+      [/\Afriends?\z/i, :friends],
+      [/\Aadd\s?en[ie]m(?:y|ies)\s+#{NAME}\z/i, :add_enemy],
+      [/\A(?:del|rem|delete|remove)\s?en[ie]m(?:y|ies)\s+#{NAME}\z/i, :remove_enemy],
+      [/\Aenem(?:y|ies)\z/i, :enemies],
+      [/\Aignore\z/i, :ignores],
+      [/\Aignore\s+#{NAME}\z/i, :ignore],
+      [/\Aunignore\s+#{NAME}\z/i, :unignore],
+      [/\Aallow\z/i, :permissions],
+      [/\Aallow\s+(\S+)\s+(\S+)\z/i, :allow],
+      [/\Atimestamps?=(on|off)\z/i, :timestamps],
+      [/\Afamwindow=(on|off)\z/i, :famwindow],
+      [/\Agreeting=(on|off)\z/i, :greeting],
+      [/\Adebug=(on|off)\z/i, :debug],
+      [/\Apassword=(\S+)\z/i, :password],
+      [/\Apreset=(\S+)\z/i, :preset],
+      [/\Aemail=(\S+)\z/i, :email],
+      [/\A(ban|gag|mod|banip)\s+([A-Za-z0-9:]+)\s+on\s+([A-Za-z]+)\z/i, :moderate],
+      [/\A(ban|gag|banip)\s+([A-Za-z0-9:]+)\s+on\s+([A-Za-z]+)\s+for\s+#{TIME}\z/i, :moderate],
+      [/\A(unban|ungag|unmod)\s+([A-Za-z0-9:]+)\s+on\s+([A-Za-z]+)\z/i, :moderate],
+      [/\Acreate\s+(hidden\s+)?(private\s+)?channel\s+([A-Za-z]+)\s+(.+)\z/i, :create_channel],
+      [/\Acreate\s+poll\s+(.+)\z/i, :create_poll],
+      [/\Adelete\s+channel\s+([A-Za-z]+)\z/i, :delete_channel],
+      [/\Aeval (.+)\z/m, :server_eval],
+      [/\A(?:help)?\z/i, :help],
+    ].freeze
+
+    # Runs one command.
+    #
+    # @param line [String] e.g. 'chat hello' or 'allow locate friends'
+    # @return [void]
+    def run(line)
+      line = line.to_s.strip
+      ROUTES.each do |pattern, handler|
+        match = pattern.match(line)
+        return public_send(handler, *match.captures) if match
+      end
+      echo "You're doing it wrong.  Type #{$clean_lich_char}#{script_name} help"
+    end
+
+    # @return [String] the running script's name, for messages
+    def script_name
+      LNet.script&.name || 'lnet'
+    end
+
+    # Reports a send that failed because lnet is not connected.
+    #
+    # @param sent [Boolean] what the send returned
+    # @return [Boolean] sent
+    def delivered(sent)
+      echo 'LNet is not connected right now; that was not sent.' unless sent
+      sent
+    end
+
+    def private_message(name, message)
+      delivered(LNet.send_message({ 'type' => 'private', 'to' => name }, message))
+    end
+
+    def channel_message(channel, message)
+      delivered(LNet.send_message({ 'type' => 'channel', 'channel' => channel }, message))
+    end
+
+    # 'chat .to x' and 'chat .on x' send 'to x' and 'on x' to the default channel.
+    def default_message(message)
+      delivered(LNet.send_message({ 'type' => 'channel' }, message.sub(/\A\.(to|on) /i, '\1 ')))
+    end
+
+    def reply(message)
+      return echo('No private message to reply to.') unless LNet.last_priv
+
+      private_message(LNet.last_priv, message)
+    end
+
+    def who(name = nil)
+      delivered(LNet.send_query(name ? { 'type' => 'connected', 'name' => name } : { 'type' => 'connected' }))
+    end
+
+    def stats
+      delivered(LNet.send_query({ 'type' => 'server stats' }))
+    end
+
+    def channels(full = nil)
+      delivered(LNet.send_query(full ? { 'type' => 'channels' } : { 'type' => 'channels', 'num' => '15' }))
+    end
+
+    def tune(channel)
+      delivered(LNet.tune_channel(channel))
+    end
+
+    def untune(channel)
+      delivered(LNet.untune_channel(channel))
+    end
+
+    def request(type, name)
+      name = LNet.normalize_name(name)
+      return echo("There's no point in sending a request to someone you're ignoring.") if LNet.ignored?(name)
+
+      delivered(LNet.send_request({ 'type' => type.downcase, 'to' => name }))
+    end
+
+    def add_alias(real_name, shown_name)
+      LNet.alias[real_name] = shown_name
+      echo "chats from #{real_name} will now appear as #{shown_name}"
+      return if real_name.match?(/\A[A-Z][A-Za-z]+:[A-Z][a-z]+\z/)
+
+      echo "The name should be entered exactly as it appears in the thought window, for example:   #{$clean_lich_char}#{script_name} add alias GSIV:Jeril StrangerDanger"
+      echo "If #{real_name} is incorrect, you can remove it using:   #{$clean_lich_char}#{script_name} remove alias #{shown_name}"
+    end
+
+    def remove_alias(shown_name)
+      if LNet.alias.value?(shown_name)
+        LNet.alias.delete_if { |_real, shown| shown == shown_name }
+        echo 'alias deleted'
+      else
+        echo "couldn't find an alias by that name"
+      end
+    end
+
+    def aliases
+      return echo('You have no aliases.') if LNet.alias.empty?
+
+      width = LNet.alias.keys.map(&:length).max
+      respond "\n#{LNet.alias.map { |real, shown| "   #{real.ljust(width)} => #{shown}\n" }.join}\n"
+    end
+
+    def add_friend(name)
+      add_to('friends', name)
+    end
+
+    def remove_friend(name)
+      remove_from('friends', name)
+    end
+
+    def friends
+      show_list('friends')
+    end
+
+    def add_enemy(name)
+      add_to('enemies', name)
+    end
+
+    def remove_enemy(name)
+      remove_from('enemies', name)
+    end
+
+    def enemies
+      show_list('enemies')
+    end
+
+    def ignore(name)
+      add_to('ignore', name)
+    end
+
+    def unignore(name)
+      remove_from('ignore', name)
+    end
+
+    def ignores
+      show_list('ignore')
+    end
+
+    def add_to(list, name)
+      name = LNet.normalize_name(name)
+      names = LNet.options[list]
+      if names.any? { |entry| entry.to_s.casecmp?(name) }
+        echo format(LISTS[list][:present], name)
+      else
+        names.push(name)
+        echo format(LISTS[list][:added], name)
+      end
+    end
+
+    def remove_from(list, name)
+      name = LNet.normalize_name(name)
+      names = LNet.options[list]
+      matches = names.select { |entry| entry.to_s.casecmp?(name) }
+      matches.each { |entry| names.delete(entry) }
+      echo format(matches.empty? ? LISTS[list][:absent] : LISTS[list][:removed], name)
+    end
+
+    def show_list(list)
+      names = LNet.options[list]
+      echo(names.empty? ? LISTS[list][:empty] : format(LISTS[list][:listing], names.join(', ')))
+    end
+
+    # @return [Array<String>] request types a permission can be set for:
+    #   the stock ones, then those scripts registered
+    def permission_types
+      %w[locate spells skills info health bounty] | LNet.callbacks.keys
+    end
+
+    # @return [String] what allowing a request type lets someone do
+    def what_it_allows(type)
+      {
+        'locate' => 'locate you', 'spells' => 'view your active spells',
+        'skills' => "view your #{'mad ' if rand(100).zero?}skills", 'info' => 'view your stats',
+        'health' => 'view your health', 'bounty' => 'view your bounties'
+      }.fetch(type, "request your #{type}")
+    end
+
+    def permissions
+      permission_types.each do |type|
+        respond "You are allowing #{WHO.fetch(LNet.options['permission'][type], 'no one')} to #{what_it_allows(type)}."
+      end
+    end
+
+    def allow(type, group)
+      permission = GROUPS[group.downcase]
+      types = type.casecmp?('all') ? permission_types : permission_types.select { |known| known.casecmp?(type) }
+      return echo("Who may see it must be one of: all, friends, non-enemies, none (not #{group}).") unless permission
+      return echo("#{type} is not something you can allow. Choose from: #{permission_types.join(', ')}, all.") if types.empty?
+
+      types.each do |allowed|
+        LNet.options['permission'][allowed] = permission
+        echo "You are now allowing #{WHO[permission]} to #{what_it_allows(allowed)}."
+      end
+    end
+
+    def toggle(option, value, on_message, off_message)
+      LNet.options[option] = value.casecmp?('on')
+      echo(LNet.options[option] ? on_message : off_message)
+    end
+
+    def timestamps(value)
+      toggle('timestamps', value, 'timestamps will be shown', 'timestamps will not be shown')
+    end
+
+    def famwindow(value)
+      toggle('fam_window', value, 'chats will be sent to the familiar window', 'chats will be sent to the thought window')
+    end
+
+    def greeting(value)
+      toggle('greeting', value, 'greeting will be shown at login', 'greeting will not be shown')
+    end
+
+    def debug(value)
+      toggle('debug', value, 'debug output is on', 'debug output is off')
+    end
+
+    # Changes the password on the server ('nil' removes it) and saves it
+    # here for the next login.
+    def password(value)
+      sent = LNet.send_data({ 'type' => 'newpassword' }, value)
+      LNet.secret = value == 'nil' ? nil : value
+      echo(value == 'nil' ? 'Password cleared.' : 'Password saved locally.')
+      echo 'LNet is not connected right now, so the server still has the old password.' unless sent
+    end
+
+    def preset(value)
+      case value
+      when /\Anil\z/i
+        LNet.options['preset'] = nil
+        echo 'Removed highlight preset for lnet messages.'
+      when /\Alnet\z/i
+        LNet.options['preset'] = 'lnet'
+        echo "Set highlight preset for lnet messages to 'lnet', be sure your FrontEnd supports this."
+      when /\Athoughts?\z/i
+        LNet.options['preset'] = 'thought'
+        echo "Set highlight preset for lnet message to 'thought', be careful to distinguish lnet from ESP thoughts."
+      else
+        echo "Unknown option specified for preset - {#{value}} - only 'lnet', 'thought' and 'nil' are supported."
+      end
+    end
+
+    def email(address)
+      delivered(LNet.send_data({ 'type' => 'newemail' }, address))
+    end
+
+    # @return [Integer] seconds in count units ('5m' is 300)
+    def seconds(count, unit)
+      count.to_i * UNITS.fetch(unit.to_s[0].to_s.downcase, 1)
+    end
+
+    def moderate(action, name, channel, count = nil, unit = nil)
+      attributes = { 'action' => action.downcase, 'name' => name, 'channel' => channel }
+      attributes['length'] = seconds(count, unit).to_s if count
+      delivered(LNet.moderate(attributes))
+    end
+
+    def create_channel(hidden, private_channel, name, description)
+      delivered(LNet.admin({ 'action' => 'create channel', 'name' => name, 'description' => description.strip,
+                             'hidden' => hidden ? 'yes' : 'no', 'private' => private_channel ? 'yes' : 'no' }))
+    end
+
+    # 'create poll --question <text> --option-1 <text> --option-2 <text> ...
+    # [--vote-time <time>]', flags in any order.
+    def create_poll(arguments)
+      flags = poll_flags(arguments)
+      question = flags['question']&.slice(0, 512)
+      options = (1..).lazy.map { |n| flags["option-#{n}"] }.take_while { |option| option }.map { |option| option[0, 64] }.to_a
+      return echo("You're doing it wrong.  Type #{$clean_lich_char}#{script_name} help") unless question && options.size > 1
+
+      attributes = { 'action' => 'create poll', 'question' => question }
+      options.each_with_index { |option, i| attributes["option #{i + 1}"] = option }
+      if (time = flags['vote-time']&.match(/\A#{TIME}\z/i))
+        attributes['length'] = seconds(time[1], time[2]).to_s
+      end
+      delivered(LNet.admin(attributes))
+    end
+
+    # @return [Hash{String => String}] each '--name value' in the arguments
+    def poll_flags(arguments)
+      " #{arguments}".split(/\s--(?=[a-z])/i).drop(1).to_h do |part|
+        name, value = part.split(/\s+/, 2)
+        [name.downcase, value.to_s.strip]
+      end
+    end
+
+    def delete_channel(name)
+      delivered(LNet.admin({ 'action' => 'delete channel', 'name' => name }))
+    end
+
+    def server_eval(code)
+      delivered(LNet.send_data({ 'type' => 'eval' }, code))
+    end
+
+    def help
+      c = $clean_lich_char
+      s = "#{c}#{script_name}"
+      respond <<~HELP
+
+        #{c}chat <message>                     send a message to your default channel
+        #{c},<message>                         ''
+        #{c}chat on <channel name> <message>   send a message to the given channel
+        #{c}chat :<channel name> <message>     ''
+        #{c}chat to <name> <message>           send a private message
+        #{c}chat ::<name> <message>            ''
+        #{c}<name>:<message>                   ''
+        #{c}reply <message>                    reply to the last private message
+        #{c}who                                list who's connected
+        #{c}who <channel>                      list who's tuned into the given channel
+        #{c}who <name>                         tells if a user is connected
+        #{c}channels                           list the 15 most populated channels
+        #{c}channels full                      list all available channels
+        #{c}tune <channel name>                listen to the given channel, or set as default if already tuned
+        #{c}untune <channel name>              stop listening to the given channel
+
+        #{c}locate <name>                      show someone's current room
+        #{c}spells <name>                      show someone's active spells and time remaining
+        #{c}skills <name>                      show someone's skills
+        #{c}info <name>                        show someone's stats
+        #{c}health <name>                      show someone's health, spirit, stamina and injuries
+        #{c}bounty <name>                      show someone's current adventurer's guild task
+
+        #{s} stats                         unhelpful information
+        #{s} timestamps=<on/off>           turn on/off all chats having a timestamp
+        #{s} famwindow=<on/off>            turn on/off sending chats to your familiar window
+        #{s} greeting=<on/off>             turn on/off showing a server greeting at logon
+        #{s} preset=<lnet/thought/nil>     set preset highlights for your front end to use
+        #{s} debug=<on/off>                turn on/off connection and parsing details
+
+        #{s} friends                       list friends
+        #{s} add friend <name>             add a name to your friend list
+        #{s} del friend <name>             delete a name from your friend list
+
+        #{s} enemies                       list enemies
+        #{s} add enemy <name>              add a name to your enemy list
+        #{s} del enemy <name>              delete a name from your enemy list
+
+        #{s} allow                         list your current permissions
+        #{s} allow <action> <group>        set permissions
+              <action> can be one of: #{permission_types.join(', ')}, all
+              <group> can be one of: all, friends, non-enemies, none
+
+        #{s} aliases                       list aliases
+        #{s} add alias <name> <new_name>   causes chats from name to appear as new_name
+        #{s} del alias <new_name>          delete an alias
+
+        #{s} ignore                        list names currently being ignored
+        #{s} ignore <name>                 ignore chats/private chats/data requests from a person
+        #{s} unignore <name>               unignore a person
+
+        #{s} password=<password>           protect your character name on the server with a password
+        #{s} password=nil                  remove password protection
+
+        #{s} create [hidden] [private] channel <name> <description>
+              hidden channels don't show up in the channel list
+              private channels ban everyone by default, and the owner (or moderator) must unban anyone they want to allow in
+        #{s} delete channel <name>
+        #{s} create poll --question <text> --option-1 <text> --option-2 <text> [--vote-time <time>]
+
+        #{s} ban <character> on <channel> for <time>
+        #{s} unban <character> on <channel>
+        #{s} gag <character> on <channel> for <time>
+        #{s} ungag <character> on <channel>
+        #{s} mod <character> on <channel>
+        #{s} unmod <character> on <channel>
+              <time> should be a number followed by one of: seconds, minutes, hours, days, or years (may be abbreviated to one letter)
+
+      HELP
+    end
+  end
+
   # Answers other players' requests for this character's information, and
   # the request types scripts register with LNet.add_callback.
   module Responders
@@ -2125,437 +2652,14 @@ end
 before_dying { LNet.disconnect; LNet.script = nil }
 LNet.script = Script.self
 
-#
-# capture input from the client
-#
 script_name = script.name.dup
-action = proc { |client_string|
-  begin
-    if client_string =~ /^(?:<c>)?#{$lich_char}(,|chat |reply |who|locate |spells |info |skills |health |bounty |tune |untune |channels?)(.*)/
-      cmd, extra = $1, $2
-      cmd = 'chat ' if cmd == ','
-      if (s = (Script.running + Script.hidden).find { |val| val.name == script_name })
-        s.unique_buffer.push("#{cmd}#{extra}")
-        nil
-      else
-        respond '--- Lich: lnet is not running'
-        UpstreamHook.remove(script_name)
-        nil
-      end
-    elsif client_string =~ /^(?:<c>)?#{$lich_char}([A-z]+):(.*)/
-      name, message = $1, $2
-      if (s = (Script.running + Script.hidden).find { |val| val.name == script_name })
-        s.unique_buffer.push("chat ::#{name} #{message}")
-        nil
-      else
-        respond '--- Lich: lnet is not running'
-        UpstreamHook.remove(script_name)
-        nil
-      end
-    elsif client_string =~ /^(?:<c>)?#{$lich_char}#{script_name}(.*)/
-      cmd = $1
-      if (s = (Script.running + Script.hidden).find { |val| val.name == script_name })
-        s.unique_buffer.push(cmd)
-        nil
-      else
-        UpstreamHook.remove(script_name)
-        client_string
-      end
-    else
-      client_string
-    end
-  rescue
-    UpstreamHook.remove(script_name)
-    client_string
-  end
-}
 before_dying { UpstreamHook.remove(script_name) }
-UpstreamHook.add(script_name, action)
+UpstreamHook.add(script_name, LNet::Hook.build(script_name))
 LNet.start_user_callbacks
 
 Thread.new { LNet.keepalive_loop }
 Thread.new { LNet.connection_loop }
 
-#
-# listen to the user
-#
-while (msg = unique_get.strip)
-  if msg =~ /^chat\s+\:\:(.+?) (.*)/i or msg =~ /^chat\s+to\s+(.+?) (.*)/i
-    LNet.send_message(attr = { 'type' => 'private', 'to' => $1 }, $2)
-  elsif msg =~ /^chat\s+\:([^\:].*?) (.*)/i or msg =~ /^chat\s+on\s+(.+?) (.*)/i
-    LNet.send_message(attr = { 'type' => 'channel', 'channel' => $1 }, $2)
-  elsif msg =~ /^chat\s+(?!:\:|to |on |ot )(.*)/i
-    message = $1.sub(/^\.(to|on) /i, '\\1 ')
-    LNet.send_message(attr = { 'type'=>'channel' }, message)
-  elsif msg =~ /reply\s(.+)/i
-    if LNet.last_priv
-      LNet.send_message(attr = { 'type' => 'private', 'to' => LNet.last_priv }, $1)
-    else
-      echo "No private message to reply to."
-    end
-  elsif msg =~ /^who$/i
-    LNet.send_query(attr = { 'type'=>'connected' })
-  elsif msg =~ /^stats$/i
-    LNet.send_query(attr = { 'type'=>'server stats' })
-  elsif msg =~ /^who\s+([A-z\:]+)$/i
-    LNet.send_query(attr = { 'type' => 'connected', 'name' => $1 })
-  elsif msg =~ /^channels?\s*(full|all)?/i
-    if $1
-      LNet.send_query(attr = { 'type'=>'channels' })
-    else
-      LNet.send_query(attr = { 'type' => 'channels', 'num' => '15' })
-    end
-  elsif msg =~ /^tune\s+([A-z]+)$/i
-    LNet.tune_channel($1)
-  elsif msg =~ /^untune\s+([A-z]+)$/i
-    LNet.untune_channel($1)
-  elsif msg =~ /^(spells|skills|info|locate|health|bounty)\s+([A-z\:]+)$/i
-    type = $1.downcase
-    name = $2
-    if LNet.ignored?(name)
-      echo "There's no point in sending a request to someone you're ignoring."
-    else
-      LNet.send_request(attr = { 'type' => type, 'to' => name })
-    end
-  elsif msg =~ /^add\s?alias\s+([^\s]+)\s+(.+)$/i
-    real_name = $1
-    aliased_name = $2
-    LNet.alias[real_name] = aliased_name
-    echo "chats from #{real_name} will now appear as #{aliased_name}"
-    if real_name !~ /^[A-Z][A-z]+:[A-Z][a-z]+$/
-      echo "The name should be entered exactly as it appears in the thought window, for example:   ;lnet add alias GSIV:Jeril StrangerDanger"
-      echo "If #{real_name} is incorrect, you can remove it using:   ;lnet remove alias #{aliased_name}"
-    end
-  elsif msg =~ /^(?:del|rem|delete|remove)\s?alias\s+(.+)$/i
-    aliased_name = $1
-    if LNet.alias.values.any? { |v| v == aliased_name }
-      LNet.alias.delete_if { |_k, v| v == aliased_name }
-      echo "alias deleted"
-    else
-      echo "couldn't find an alias by that name"
-    end
-  elsif msg =~ /^aliases$/i
-    if LNet.alias.empty?
-      echo 'You have no aliases.'
-    else
-      output = "\n"
-      max_k = 0; max_v = 0; LNet.alias.each_pair { |k, v| max_k = [max_k, k.length].max; max_v = [max_v, v.length].max }
-      LNet.alias.each_pair { |k, v|
-        output.concat "   #{k.ljust(max_k)} => #{v.ljust(max_v)}\n"
-      }
-      output.concat "\n"
-      respond output
-    end
-  elsif msg =~ /^add\s?friends?\s+([A-z]+\:)?([A-z]+)$/i
-    fix_game = { 'gsf' => 'GSF', 'gsiv' => 'GSIV', 'gsplat' => 'GSPlat' }
-    name = $2.capitalize
-    if (game = $1.sub(/\:$/, ''))
-      game = fix_game[game.downcase] if fix_game[game.downcase]
-      name = "#{game}:#{name}"
-    end
-    if LNet.options['friends'].include?(name)
-      echo "#{name} is already on your friend list."
-    else
-      LNet.options['friends'].push(name)
-      echo "#{name} was added to your friend list."
-    end
-  elsif msg =~ /^(?:del|rem|delete|remove)\s?friends?\s+([A-z]+\:)?([A-z]+)$/i
-    fix_game = { 'gsf' => 'GSF', 'gsiv' => 'GSIV', 'gsplat' => 'GSPlat' }
-    name = $2.capitalize
-    if (game = $1.sub(/\:$/, ''))
-      game = fix_game[game.downcase] if fix_game[game.downcase]
-      name = "#{game}:#{name}"
-    end
-    if LNet.options['friends'].delete(name)
-      echo "#{name} was removed from your friend list."
-    else
-      echo "#{name} was not found on your friend list."
-    end
-  elsif msg =~ /^add\s?en[ie]m(?:y|ies)\s+([A-z]+\:)?([A-z]+)$/i
-    fix_game = { 'gsf' => 'GSF', 'gsiv' => 'GSIV', 'gsplat' => 'GSPlat' }
-    name = $2.capitalize
-    if (game = $1.sub(/\:$/, ''))
-      game = fix_game[game.downcase] if fix_game[game.downcase]
-      name = "#{game}:#{name}"
-    end
-    if LNet.options['enemies'].include?(name)
-      echo "#{name} is already on your enemy list."
-    else
-      LNet.options['enemies'].push(name)
-      echo "#{name} was added to your enemy list."
-    end
-  elsif msg =~ /^(?:del|rem|delete|remove)\s?en[ie]m(?:y|ies)\s+([A-z]+\:)?([A-z]+)$/i
-    fix_game = { 'gsf' => 'GSF', 'gsiv' => 'GSIV', 'gsplat' => 'GSPlat' }
-    name = $2.capitalize
-    if (game = $1.sub(/\:$/, ''))
-      game = fix_game[game.downcase] if fix_game[game.downcase]
-      name = "#{game}:#{name}"
-    end
-    if LNet.options['enemies'].delete(name)
-      echo "#{name} was removed from your enemy list."
-    else
-      echo "#{name} was not found on your enemy list."
-    end
-  elsif msg =~ /^friends?$/i
-    if LNet.options['friends'].empty?
-      echo 'You have no friends.'
-    else
-      echo "friends: #{LNet.options['friends'].join(', ')}"
-    end
-  elsif msg =~ /^enem(?:y|ies)$/i
-    if LNet.options['enemies'].empty?
-      echo 'You have no enemies.'
-    else
-      echo "enemies: #{LNet.options['enemies'].join(', ')}"
-    end
-  elsif msg =~ /^allow$/i
-    fix_type = { 'all' => 'everyone', 'friends' => 'only your friends', 'enemies' => 'everyone except your enemies', 'none' => 'no one', nil => 'no one' }
-    fix_action = { 'locate' => 'locate you', 'spells' => 'view your active spells', 'skills' => "view your #{if rand(100) == 0; 'mad '; end}skills", 'info' => 'view your stats', 'health' => 'view your health', 'bounty' => 'view your bounties' }
-    ['locate', 'spells', 'skills', 'info', 'health', 'bounty'].each { |lnet_action|
-      respond "You are allowing #{fix_type[LNet.options['permission'][lnet_action]]} to #{fix_action[action]}."
-    }
-  elsif msg =~ /^allow\s+(locate|spells|skills|info|health|bounty|all)\s+(all|friend|friends|non\-enemies|nonenemies|enemies|enemy|none)$/i
-    action, group = $1, $2
-    fix_action = { 'locate' => 'locate you', 'spells' => 'view your active spells', 'skills' => "view your #{if rand(100) == 0; 'mad '; end}skills", 'info' => 'view your stats', 'health' => 'view your health', 'bounty' => 'view your bounties' }
-    if action =~ /^all$/i
-      for action in ['locate', 'spells', 'skills', 'info', 'health', 'bounty']
-        if group =~ /^all$/i
-          LNet.options['permission'][action] = 'all'
-          echo "You are now allowing everyone to #{fix_action[action]}."
-        elsif group =~ /^friends?$/i
-          LNet.options['permission'][action] = 'friends'
-          echo "You are now allowing only your friends to #{fix_action[action]}."
-        elsif group =~ /enem/i
-          LNet.options['permission'][action] = 'enemies'
-          echo "You are now allowing everyone except your enemies to #{fix_action[action]}."
-        elsif group =~ /^none$/i
-          LNet.options['permission'][action] = 'none'
-          echo "You are now allowing no one to #{fix_action[action]}."
-        end
-      end
-    elsif group =~ /^all$/i
-      LNet.options['permission'][action] = 'all'
-      echo "You are now allowing everyone to #{fix_action[action]}."
-    elsif group =~ /^friends?$/i
-      LNet.options['permission'][action] = 'friends'
-      echo "You are now allowing only your friends to #{fix_action[action]}."
-    elsif group =~ /enem/i
-      LNet.options['permission'][action] = 'enemies'
-      echo "You are now allowing everyone except your enemies to #{fix_action[action]}."
-    elsif group =~ /^none$/i
-      LNet.options['permission'][action] = 'none'
-      echo "You are now allowing no one to #{fix_action[action]}."
-    end
-  elsif msg =~ /^allow\s+(\S+)\s+(all|friend|friends|non\-enemies|nonenemies|enemies|enemy|none)$/i and LNet.callbacks.key?($1)
-    type = $1
-    permission = { 'all' => 'all', 'friend' => 'friends', 'friends' => 'friends', 'non-enemies' => 'enemies', 'nonenemies' => 'enemies',
-                   'enemies' => 'enemies', 'enemy' => 'enemies', 'none' => 'none' }[$2.downcase]
-    LNet.options['permission'][type] = permission
-    who = { 'all' => 'everyone', 'friends' => 'only your friends', 'enemies' => 'everyone except your enemies', 'none' => 'no one' }[permission]
-    echo "You are now allowing #{who} to request your #{type}."
-  elsif msg =~ /^ignore$/i
-    if LNet.options['ignore'].empty?
-      echo 'You are not ignoring anyone.'
-    else
-      echo "You are ignoring the following people: #{LNet.options['ignore'].join(', ')}"
-    end
-  elsif msg =~ /^ignore\s+([A-z]+\:)?([A-z]+)$/i
-    fix_game = { 'gsf' => 'GSF', 'gsiv' => 'GSIV', 'gsplat' => 'GSPlat' }
-    name = $2.capitalize
-    if (game = $1.sub(/\:$/, ''))
-      game = fix_game[game.downcase] if fix_game[game.downcase]
-      name = "#{game}:#{name}"
-    end
-    if LNet.options['ignore'].include?(name)
-      echo "You were already ignoring #{name}."
-    else
-      LNet.options['ignore'].push(name)
-      echo "You are now ignoring #{name}."
-    end
-  elsif msg =~ /^unignore\s+([A-z]+\:)?([A-z]+)$/i
-    fix_game = { 'gsf' => 'GSF', 'gsiv' => 'GSIV', 'gsplat' => 'GSPlat' }
-    name = $2.capitalize
-    if (game = $1.sub(/\:$/, ''))
-      game = fix_game[game.downcase] if fix_game[game.downcase]
-      name = "#{game}:#{name}"
-    end
-    if LNet.options['ignore'].delete(name)
-      echo "You are no longer ignoring #{name}."
-    else
-      echo "#{name} wasn't being ignored."
-    end
-  elsif msg =~ /^timestamps?=(on|off)$/i
-    if $1 == 'on'
-      LNet.options['timestamps'] = true
-      echo 'timestamps will be shown'
-    else
-      LNet.options['timestamps'] = false
-      echo 'timestamps will not be shown'
-    end
-  elsif msg =~ /^famwindow=(on|off)$/i
-    if $1 == 'on'
-      LNet.options['fam_window'] = true
-      echo 'chats will be sent to the familiar window'
-    else
-      LNet.options['fam_window'] = false
-      echo 'chats will be sent to the thought window'
-    end
-  elsif msg =~ /^greeting=(on|off)$/i
-    if $1 == 'on'
-      LNet.options['greeting'] = true
-      echo 'greeting will be shown at login'
-    else
-      LNet.options['greeting'] = false
-      echo 'getting will not be shown'
-    end
-  elsif msg =~ /^password=([^\s]+)$/i
-    LNet.send_data(attr = { 'type'=>'newpassword' }, $1)
-    if $1 == 'nil'
-      LNet.secret = nil
-      echo 'Password cleared.'
-    else
-      LNet.secret = $1
-      echo 'Password saved locally.'
-    end
-  elsif msg =~ /^preset=([^\s]+)$/i
-    case $1
-    when /^nil$/i
-      LNet.options['preset'] = nil
-      echo 'Removed highlight preset for lnet messages.'
-    when /^lnet$/i
-      LNet.options['preset'] = 'lnet'
-      echo "Set highlight preset for lnet messages to '#{LNet.options['preset']}', be sure your FrontEnd supports this."
-    when /^thoughts?$/i
-      LNet.options['preset'] = 'thought'
-      echo "Set highlight preset for lnet message to '#{LNet.options['preset']}', be careful to distinguish lnet from ESP thoughts."
-    else
-      echo "Unknown option specified for preset - {#{$1}} - only 'lnet', 'thought' and 'nil' are supported."
-    end
-  elsif msg =~ /^email=([^\s]+)$/i
-    LNet.send_data(attr = { 'type'=>'newemail' }, $1)
-  elsif msg =~ /^(ban|gag|mod|banip)\s+([\:A-z0-9]+)\s+on\s+([A-z]+)$/i
-    LNet.moderate(attr = { 'action' => $1.downcase, 'name' => $2, 'channel' => $3 })
-  elsif msg =~ /^(ban|gag|banip)\s+([\:A-z0-9]+)\s+on\s+([A-z]+)\s+for\s+([0-9]+)\s*(seconds?|minutes?|hours?|days?|years?|s|m|h|d|y)$/i
-    multiplier = { nil => 1, 's' => 1, 'second' => 1, 'seconds' => 1, 'm' => 60, 'minute' => 60, 'minutes' => 60, 'h' => 3600, 'hour' => 3600, 'hours' => 3600, 'd' => 86400, 'day' => 86400, 'days' => 86400, 'y' => 31536000, 'year' => 31536000, 'years' => 31536000 }
-    LNet.moderate(attr = { 'action' => $1.downcase, 'name' => $2, 'channel' => $3, 'length' => ($4.to_i * multiplier[$5]).to_s })
-  elsif msg =~ /^(unban|ungag|unmod)\s+([\:A-z0-9]+)\s+on\s+([A-z]+)$/i
-    LNet.moderate(attr = { 'action' => $1.downcase, 'name' => $2, 'channel' => $3 })
-  elsif msg =~ /^create\s+(hidden)?\s*(private)?\s*channel\s+([A-z]+)\s+(.+?)$/i
-    attr = attr = { 'action' => 'create channel', 'name' => $3, 'description' => $4.strip }
-    if $1
-      attr['hidden'] = 'yes'
-    else
-      attr['hidden'] = 'no'
-    end
-    if $2
-      attr['private'] = 'yes'
-    else
-      attr['private'] = 'no'
-    end
-    LNet.admin(attr)
-  elsif msg =~ /^create\s+poll\s+/i
-    if msg =~ /\-\-question\s+(.+?)\s*(?:\-\-|$)/
-      question = $1[0, 512].strip
-    else
-      question = nil
-    end
-    if msg =~ /\-\-vote\-time\s+([0-9]+)\s*(seconds?|minutes?|hours?|days?|years?|s|m|h|d|y)(?:\-\-|$)/
-      multiplier = { nil => 1, 's' => 1, 'second' => 1, 'seconds' => 1, 'm' => 60, 'minute' => 60, 'minutes' => 60, 'h' => 3600, 'hour' => 3600, 'hours' => 3600, 'd' => 86400, 'day' => 86400, 'days' => 86400, 'y' => 31536000, 'year' => 31536000, 'years' => 31536000 }
-      vote_time = $1.to_i * multiplier[$2]
-    else
-      vote_time = nil
-    end
-    num = 1
-    option = Hash.new
-    while msg =~ /\-\-option\-#{num}\s+(.+?)\s*(?:\-\-|$)/
-      option[num] = $1[0, 64].strip
-      num += 1
-    end
-    if question and (option.length > 1)
-      attr = { 'action' => 'create poll', 'question' => question }
-      option.each_pair { |num_pair, opt_pair| attr["option #{num_pair}"] = opt_pair }
-      if vote_time
-        attr['length'] = vote_time
-      end
-      # fixme: confirm
-      LNet.admin(attr)
-    else
-      echo "You're doing it wrong.  Type #{$clean_lich_char}#{script.name} help"
-    end
-  elsif msg =~ /^delete\s+channel\s+([A-z]+)$/i
-    LNet.admin(attr = { 'action' => 'delete channel', 'name' => $1 })
-  elsif msg =~ /^eval (.+)$/
-    LNet.send_data(attr = { 'type'=>'eval' }, $1)
-  elsif msg =~ /^help$/i
-    output = String.new
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}chat <message>                     send a message to your default channel\n"
-    output.concat "#{$clean_lich_char},<message>                         ''\n"
-    output.concat "#{$clean_lich_char}chat on <channel name> <message>   send a message to the given channel\n"
-    output.concat "#{$clean_lich_char}chat :<channel name> <message>     ''\n"
-    output.concat "#{$clean_lich_char}chat to <name> <message>           send a private message\n"
-    output.concat "#{$clean_lich_char}chat ::<name> <message>            ''\n"
-    output.concat "#{$clean_lich_char}<name>:<message>                   ''\n"
-    output.concat "#{$clean_lich_char}who                                list who's connected\n"
-    output.concat "#{$clean_lich_char}who <channel>                      list who's tuned into the given channel\n"
-    output.concat "#{$clean_lich_char}who <name>                         tells if a user is connected\n"
-    output.concat "#{$clean_lich_char}channels                           list the 15 most populated channels\n"
-    output.concat "#{$clean_lich_char}channels full                      list all available channels\n"
-    output.concat "#{$clean_lich_char}tune <channel name>                listen to the given channel, or set as default if already tuned\n"
-    output.concat "#{$clean_lich_char}untune <channel name>              stop listening to the given channel\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}locate <name>                      show someone's current room\n"
-    output.concat "#{$clean_lich_char}spells <name>                      show someone's active spells and time remaining\n"
-    output.concat "#{$clean_lich_char}skills <name>                      show someone's skills\n"
-    output.concat "#{$clean_lich_char}info <name>                        show someone's stats\n"
-    output.concat "#{$clean_lich_char}health <name>                      show someone's health, spirit, stamina and injuries\n"
-    output.concat "#{$clean_lich_char}bounty <name>                      show someone's current adventurer's guild task\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} stats                         unhelpful information\n"
-    output.concat "#{$clean_lich_char}#{script.name} timestamps=<on/off>           turn on/off all chats having a timestamp\n"
-    output.concat "#{$clean_lich_char}#{script.name} famwindow=<on/off>            turn on/off sending chats to your familiar window\n"
-    output.concat "#{$clean_lich_char}#{script.name} greeting=<on/off>             turn on/off showing a server greeting at logon\n"
-    output.concat "#{$clean_lich_char}#{script.name} preset=<lnet/thought/nil>     set preset highlights for your front end to use\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} friends                       list friends\n"
-    output.concat "#{$clean_lich_char}#{script.name} add friend <name>             add a name to your friend list\n"
-    output.concat "#{$clean_lich_char}#{script.name} del friend <name>             delete a name from your friend list\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} enemies                       list enemies\n"
-    output.concat "#{$clean_lich_char}#{script.name} add enemy <name>              add a name to your enemy list\n"
-    output.concat "#{$clean_lich_char}#{script.name} del enemy <name>              delete a name from your enemy list\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} allow                         list your current permissions\n"
-    output.concat "#{$clean_lich_char}#{script.name} allow <action> <group>        set permissions\n"
-    output.concat "      <action> can be one of: locate, spells, skills, info, health, bounty, all\n"
-    output.concat "      <group> can be one of: all, friends, non-enemies, none\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} aliases                       list aliases\n"
-    output.concat "#{$clean_lich_char}#{script.name} add alias <name> <new_name>   causes chats from name to appear as new_name\n"
-    output.concat "#{$clean_lich_char}#{script.name} del alias <new_name>          delete an alias\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} ignore                        list names currently being ignored\n"
-    output.concat "#{$clean_lich_char}#{script.name} ignore <name>                 ignore chats/private chats/data requests from a person\n"
-    output.concat "#{$clean_lich_char}#{script.name} unignore <name>               unignore a person\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} password=<password>           protect your character name on the server with a password\n"
-    output.concat "#{$clean_lich_char}#{script.name} password=nil                  remove password protection\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} create [hidden] [private] channel <name> <description>\n"
-    output.concat "      hidden channels don't show up in the channel list\n"
-    output.concat "      private channels ban everyone by default, and the owner (or moderator) must unban anyone he wants to allow in\n"
-    output.concat "#{$clean_lich_char}#{script.name} delete channel <name>\n"
-    output.concat "\n"
-    output.concat "#{$clean_lich_char}#{script.name} ban <character> on <channel> for <time>\n"
-    output.concat "#{$clean_lich_char}#{script.name} unban <character> on <channel>\n"
-    output.concat "#{$clean_lich_char}#{script.name} gag <character> on <channel> for <time>\n"
-    output.concat "#{$clean_lich_char}#{script.name} ungag <character> on <channel>\n"
-    output.concat "#{$clean_lich_char}#{script.name} mod <character> on <channel>\n"
-    output.concat "#{$clean_lich_char}#{script.name} unmod <character> on <channel>\n"
-    output.concat "      <time> should be a number followed by one of: seconds, minutes, hours, days, or years (may be abbreviated to one letter)\n"
-    output.concat "\n"
-    respond output
-  else
-    echo "You're doing it wrong.  Type #{$clean_lich_char}#{script.name} help"
-  end
+while (line = unique_get)
+  LNet::Commands.run(line)
 end

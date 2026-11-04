@@ -37,7 +37,7 @@ module LnetSpec
   module Game
     class << self
       attr_accessor :infomon, :status, :bounty, :active_spells, :pcs, :npcs, :loot, :room, :scripts, :running, :started,
-                    :spell_book, :map_rooms
+                    :spell_book, :map_rooms, :running_scripts, :removed_hooks
 
       def reset!
         @infomon = {}
@@ -53,6 +53,8 @@ module LnetSpec
         @started = []
         @spell_book = {}
         @map_rooms = []
+        @running_scripts = []
+        @removed_hooks = []
       end
     end
   end
@@ -60,6 +62,7 @@ module LnetSpec
   Obj = Struct.new(:name, :status)
   ActiveSpell = Struct.new(:num, :timeleft)
   MapRoom = Struct.new(:id, :title, :desc, :paths)
+  RunningScript = Struct.new(:name, :unique_buffer)
   SpellInfo = Struct.new(:circlename, :name)
 
   # lich-5's real Numeric#as_time (and nothing else from that file), which
@@ -111,6 +114,12 @@ module LnetSpec
       def self.exists?(name) = Game.scripts.include?(name)
       def self.running?(name) = Game.running.include?(name)
       def self.start(name, *args) = Game.started << [name, *args]
+      def self.running = Game.running_scripts
+      def self.hidden = []
+    end
+
+    module UpstreamHook
+      def self.remove(name) = Game.removed_hooks << name
     end
 
     # Game state the script reads; set what an example needs.
@@ -331,6 +340,7 @@ module LnetSpec
     Harness::XMLData.name = 'Tester'
     Harness::XMLData.game = 'GSIV'
     $clean_lich_char = ';'
+    $lich_char = ';'
     OUTPUT.clear
   end
 end
