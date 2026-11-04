@@ -7,18 +7,20 @@ require_relative 'support/harness'
 # requests and notices, pings, messages, base64 <data>) in every combination
 # and at every chunk boundary, and check that each element arrives exactly
 # once, whole, in order.
-RSpec.describe 'lnet.lic LNet::StreamParser' do
-  let(:log) { LnetSpec::EventLog.new }
-  let(:parser) { lnet::StreamParser.new(log) }
-
+module LnetSpec
   # what the server writes, one kind of element each
-  ELEMENTS = {
+  STREAM_ELEMENTS = {
     'request' => %(<request type="info" from="GSIV:Bob"/>),
     'notify'  => %(<notify type="server-restart"/>),
     'ping'    => %(<ping/>),
     'message' => %(<message type="channel" from="GSIV:Ann" channel="General">hi &amp; bye</message>),
     'data'    => %(<data type="info" from="Bob">BAh7BkkiCVJh\nY2UGOgZFVEki\nCEVsZgY7AFQ=\n</data>)
   }.freeze
+end
+
+RSpec.describe 'lnet.lic LNet::StreamParser' do
+  let(:log) { LnetSpec::EventLog.new }
+  let(:parser) { lnet::StreamParser.new(log) }
 
   def deliver_all(*chunks)
     chunks.each { |chunk| parser.feed(chunk) }
@@ -26,7 +28,7 @@ RSpec.describe 'lnet.lic LNet::StreamParser' do
   end
 
   describe 'two elements in one read' do
-    ELEMENTS.to_a.product(ELEMENTS.to_a).each do |(first, first_xml), (second, second_xml)|
+    LnetSpec::STREAM_ELEMENTS.to_a.product(LnetSpec::STREAM_ELEMENTS.to_a).each do |(first, first_xml), (second, second_xml)|
       it "delivers both a #{first} and the #{second} after it" do
         deliver_all("#{first_xml}\n#{second_xml}\n")
         expect(log.roots).to eq([first_xml[/<(\w+)/, 1], second_xml[/<(\w+)/, 1]])
@@ -34,13 +36,13 @@ RSpec.describe 'lnet.lic LNet::StreamParser' do
     end
 
     it 'delivers the message after a request without the request swallowing it' do
-      deliver_all("#{ELEMENTS['request']}\n#{ELEMENTS['message']}\n")
+      deliver_all("#{LnetSpec::STREAM_ELEMENTS['request']}\n#{LnetSpec::STREAM_ELEMENTS['message']}\n")
       expect(log.events).to include([:text, 'hi & bye'])
     end
   end
 
   describe 'chunk boundaries' do
-    let(:stream) { ELEMENTS.values.join("\n") + "\n" }
+    let(:stream) { LnetSpec::STREAM_ELEMENTS.values.join("\n") + "\n" }
     let(:whole) { LnetSpec::EventLog.new.tap { |l| lnet::StreamParser.new(l).feed(stream) }.events }
 
     it 'gives the same events whichever byte the stream is split at' do
@@ -78,7 +80,7 @@ RSpec.describe 'lnet.lic LNet::StreamParser' do
 
     it 'gives the same events for random chunkings of a long stream' do
       rng = Random.new(1_105)
-      long = Array.new(60) { ELEMENTS.values.sample(random: rng) }.join("\n")
+      long = Array.new(60) { LnetSpec::STREAM_ELEMENTS.values.sample(random: rng) }.join("\n")
       expected = LnetSpec::EventLog.new.tap { |l| lnet::StreamParser.new(l).feed(long) }.events
       expect(expected.count { |kind, _| kind == :start }).to be >= 60
       50.times do
@@ -156,7 +158,7 @@ RSpec.describe 'lnet.lic LNet::StreamParser' do
     end
 
     it 'drops an element with mismatched tags and still delivers the next one' do
-      deliver_all(%(<a><b></a></b>\n#{ELEMENTS['message']}))
+      deliver_all(%(<a><b></a></b>\n#{LnetSpec::STREAM_ELEMENTS['message']}))
       expect(log.roots).to eq(['message'])
     end
 
@@ -170,7 +172,7 @@ RSpec.describe 'lnet.lic LNet::StreamParser' do
       parser.feed(%(<data type="x" from="Bob">))
       parser.feed('A' * 300)
       expect(log.events).to be_empty
-      deliver_all(ELEMENTS['ping'])
+      deliver_all(LnetSpec::STREAM_ELEMENTS['ping'])
       expect(log.roots).to eq(['ping'])
     end
   end
