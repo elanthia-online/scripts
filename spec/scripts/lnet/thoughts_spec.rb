@@ -8,12 +8,12 @@ RSpec.describe 'lnet.lic' do
       saved = [$frontend, $_CLIENT_, $_SERVERBUFFER_]
       $_CLIENT_ = LnetSpec::FakeClient.new
       $_SERVERBUFFER_ = []
-      lnet.options = { 'ignore' => [], 'permission' => {}, 'timestamps' => false }
-      lnet.alias = {}
       example.run
     ensure
       $frontend, $_CLIENT_, $_SERVERBUFFER_ = saved
     end
+
+    before { lnet.options['timestamps'] = false }
 
     def xml_outputs(out)
       out.select { |kind, _| %i[_respond downstream_xml].include?(kind) }.map(&:last) + $_SERVERBUFFER_

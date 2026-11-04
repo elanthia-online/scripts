@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
+require 'openssl'
 require 'rexml/document'
+require 'socket'
+require 'timeout'
 require 'ostruct'
 require 'set'
 require_relative '../../../spec_helper'
@@ -51,6 +54,13 @@ module LnetSpec
     module Script
       def self.new_downstream(line) = OUTPUT << [:downstream, line]
       def self.new_downstream_xml(line) = OUTPUT << [:downstream_xml, line]
+    end
+
+    # Game state the script reads; set what an example needs.
+    module XMLData
+      class << self
+        attr_accessor :name, :game
+      end
     end
 
     body = extract_from_source(LnetSpec::SOURCE, /^class LNet\n.*?^end\n/m, label: 'class LNet', source_path: LnetSpec::SOURCE_PATH)
@@ -170,6 +180,21 @@ module LnetSpec
   end
 end
 
+module LnetSpec
+  # Puts the script's class-level state back to how a fresh run starts, so no
+  # example sees a connection, password or option another one left behind.
+  def self.reset!
+    lnet = Harness::LNet
+    { server: nil, server_restart: false, last_send: Time.now, last_recv: Time.now, last_priv: nil,
+      secret: [], waiting: [], alias: {}, options: { 'ignore' => [], 'friends' => [], 'enemies' => [], 'permission' => {} } }
+      .each { |name, value| lnet.class_variable_set(:"@@#{name}", value) }
+    Harness::XMLData.name = 'Tester'
+    Harness::XMLData.game = 'GSIV'
+    OUTPUT.clear
+  end
+end
+
 RSpec.configure do |config|
   config.include LnetSpec::Helpers, file_path: %r{spec/scripts/lnet/}
+  config.before(file_path: %r{spec/scripts/lnet/}) { LnetSpec.reset! }
 end
