@@ -186,9 +186,9 @@ RSpec.describe 'lnet.lic request handling' do
                                        'npcs' => [{ 'name' => 'a rat', 'status' => nil }])
       end
 
-      it 'sends a nil id for a room that is not mapped' do
+      it 'sends no id at all for a room that is not mapped, so to.lic falls back to its title search' do
         request('locate')
-        expect(reply['payload']).to include('id' => nil)
+        expect(reply['payload']).not_to have_key('id')
       end
 
       it "describes this character's own state" do
@@ -286,6 +286,23 @@ RSpec.describe 'lnet.lic request handling' do
       expect { out = request('gem') }.not_to raise_error
       expect(out.last[1]).to eq('could not answer the gem request: LoadError: cannot load such file -- missing')
       expect(reply['payload']).to be_nil
+    end
+
+    it 'declines, without stopping the connection, when the callback overflows the stack' do
+      lnet.add_callback('deep') { recurse = ->(n) { recurse.call(n + 1) }; recurse.call(0) }
+      allow_request('deep', 'all')
+      out = nil
+      expect { out = request('deep') }.not_to raise_error
+      expect(out.last[1]).to start_with('could not answer the deep request: SystemStackError')
+      expect(reply['payload']).to be_nil
+    end
+
+    it "accepts 0net's add_callback(name, type) form" do
+      lnet.add_callback(:my_roundtime, 'roundtime') { |_request| { 'hard' => 3 } }
+      expect(lnet.callbacks.keys).to eq(['roundtime'])
+      allow_request('roundtime', 'all')
+      request('roundtime')
+      expect(reply['payload']).to eq('hard' => 3)
     end
 
     it 'refuses a registration without a block or a type' do
