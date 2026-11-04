@@ -41,6 +41,7 @@ def pause(*) = nil
 module XMLData
   def self.game = 'GS3'
   def self.name = 'Torvek'
+  def self.room_id = $room_id || 0
 end
 
 class Script
@@ -724,6 +725,106 @@ when 'baseline'
     'deposit' => A::Database.one("SELECT balance, delta_silver FROM bank_snapshots WHERE snapshot_type = 'deposit'").values
   }
   manager.stop
+
+when 'notes'
+  # Sales paid with promissory notes or with a gem pouch, note deposits, and
+  # an eherbs note round trip that only the teller's balances reveal
+  A::Database.connect!
+  A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  feed = ->(*lines) { lines.each { |line| DownstreamHook.run(line) } }
+  settle = -> { sleep 0.3; A::Database.flush }
+  kahlyr = 'The <pushBold/><a exist="66987" noun="Kahlyr">jeweler Kahlyr</a><popBold/>'
+  feed.call(
+    "#{kahlyr} takes the <a exist=\"1968237\" noun=\"ring\">diamond ring</a>, gives it a careful examination and and says, " \
+    '"I don\'t have that much spare silver, so I will have to give you a bank note for it."  She then hands you a ' \
+    '<a exist="1979973" noun="note">Vornavis promissory note</a> for 22,555 silvers.',
+    "#{kahlyr} takes the <a exist=\"1108966\" noun=\"pouch\">ruby red pouch</a>, inspects the contents carefully, and removes " \
+    'the gems she is interested in.  She hands it back to you, along with 8,120 silver.',
+    "#{kahlyr} takes the <a exist=\"1108967\" noun=\"pouch\">leather gem pouch</a>, inspects the contents carefully, and removes " \
+    'the gems she is interested in.  She hands it back to you and says, "I don\'t have that much spare silver, so I will have ' \
+    'to give you a <a exist="1200062" noun="note">Vornavis promissory note</a> for it."',
+    "#{kahlyr} removes the gems and hands you a <a exist=\"1698202\" noun=\"note\">Vornavis promissory note</a> for 23,136 silvers."
+  )
+  settle.call
+  sales = A::Database.all('SELECT item_name, item_noun, total_price, vendor_name FROM item_sales ORDER BY rowid').map(&:values)
+
+  total = -> { A::Database.latest_balances(WHO)['__total__'] }
+  deposit = ->(amount, balance) { "You deposit #{amount} silvers into your account.  The teller carefully records the transaction and says, \"Thank you, Torvek.  This brings your total to #{balance} silvers.  Have a nice day!\"" }
+  feed.call('You currently have the following amounts on deposit:', '      Bank A: 1,000,000', '      Bank B: 500,000',
+            '      Total: 1,500,000')
+  settle.call
+  steps = []
+  $room_id = 100 # Bank A's teller
+  feed.call(deposit.call('15,750', '1,015,750'))
+  settle.call
+  steps << total.call
+  feed.call('The teller purses her lips and says, "Hmm, we will have to give you a <a exist="1" noun="note">Vornavis promissory note</a> ' \
+            'for that amount."  The teller makes some marks on a blank <a exist="1" noun="note">note</a> and hands it to you, ' \
+            'saying "That is a 0 silver surcharge.  Have a nice day."')
+  $room_id = 200 # the herbalist spends 90 of the 99
+  $room_id = 100
+  feed.call('You deposit your <a exist="1" noun="note">note</a> worth 9 into your account.  The teller carefully records the ' \
+            'transaction and says, "Thank you, <a exist="-1" noun="Torvek">Torvek</a>.  This brings your total to 1,015,660 silvers.  Have a nice day!"')
+  settle.call
+  steps << total.call
+  feed.call('<inv id="stow"> a <a exist="2" noun="wand">wand</a></inv>You hand over your notes to the teller, who nods, carefully ' \
+            'recording each amount.  She says, "That\'s a total of 50,000 silvers, bringing your balance to 1,065,660 silvers."')
+  settle.call
+  steps << total.call
+  $room_id = 300 # Bank B, in another town
+  feed.call('The teller carefully records the transaction, hands you 2,500 silvers, and says, "This brings your total to 497,500 silvers."')
+  settle.call
+  steps << total.call
+  feed.call('You currently have the following amounts on deposit:', '      Bank A: 1,065,660', '      Bank B: 497,500',
+            '      Total: 1,563,160')
+  settle.call
+  listing = A::Database.one("SELECT balance, delta_silver FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid DESC LIMIT 1").values
+  result = { 'sales' => sales, 'totals' => steps, 'listing' => listing }
+  A::SilverManager.stop
+
+when 'cycle_edges'
+  # The collector's first moments, and a hunt that ends in a death
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::CycleManager
+  $running = []
+  manager.start(WHO, cfg)
+  A::Database.flush
+  first = A::Database.one('SELECT cycle_type, start_time FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)
+  result['startup'] = [manager.current_state.to_s, first['cycle_type'], (first['start_time'].to_i - Time.now.to_i).abs <= 2]
+  manager.instance_variable_set(:@running, false)
+  manager.instance_variable_get(:@thread).join(2)
+
+  session = A::Database.session_for(WHO)
+  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', {})
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, hunt)
+  { :@current_state => :hunt, :@current_cycle_id => hunt, :@cycle_started_at => NOW - 600, :@last_bigshot_status => :resting,
+    :@rest_steps => Hash.new(0.0) }.each { |name, value| manager.instance_variable_set(name, value) }
+  $running = ['bigshot']
+  $rest_reason = 'wounded.'
+  manager.send(:transition_to, :rest) # bigshot heads out to rest...
+  rest = manager.current_cycle_id
+  manager.send(:transition_to, :dead) # ...and dies a few seconds later
+  dead = manager.current_cycle_id
+  A::Database.flush
+  ended = A::Database.one('SELECT end_time, rest_reason FROM cycles WHERE cycle_id = ?', hunt)
+  died = A::Database.one('SELECT cycle_type, start_time FROM cycles WHERE cycle_id = ?', dead)
+  result['death'] = {
+    'hunt_reason' => ended['rest_reason'], 'short_rest_dropped' => A::Database.all('SELECT 1 FROM cycles WHERE cycle_id = ?', rest).empty?,
+    'no_gap' => died['start_time'] == ended['end_time'], 'dead' => died['cycle_type']
+  }
+
+when 'mind'
+  # Bounty experience can take the mind past its capacity
+  A::Database.connect!
+  session = A::Database.session_for(WHO)
+  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', { exp_field: 1267, exp_max: 1125, exp_total: 1 })
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', [A::Util.midnight, NOW - 60].max, hunt)
+  A::Database.end_cycle(hunt, { exp_field: 1524, exp_max: 1125, exp_total: 2 }, nil)
+  torvek = A::Dashboard.overview['characters'].find { |c| c['id'] == 'GS3:Torvek' }
+  trend = A::Dashboard.character('GS3:Torvek', 'daily')['trends']['mind']['values'].compact
+  result = { 'mind' => torvek['mind'].values_at('start_avg', 'end_avg'), 'trend_capped' => trend.all? { |v| v <= 100 } }
 
 when 'bigshot_status'
   # Bigshot's own status marks a rest, but only while the script is running

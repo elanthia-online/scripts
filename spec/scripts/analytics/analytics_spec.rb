@@ -390,6 +390,47 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'promissory notes and gem pouches' do
+    subject(:notes) { result('notes') }
+
+    it 'records sales paid with a note, and gem pouch sales paid either way' do
+      expect(notes['sales']).to eq(
+        [['diamond ring', 'ring', 22_555, 'Kahlyr'], ['gems from ruby red pouch', 'pouch', 8120, 'Kahlyr'],
+         ['gems from leather gem pouch', 'pouch', 23_136, 'Kahlyr']]
+      )
+    end
+
+    it 'moves the total for note deposits, and by what the same teller\'s balances show for a note round trip' do
+      expect(notes['totals']).to eq([1_515_750, 1_515_660, 1_565_660, 1_563_160])
+    end
+
+    it 'agrees with the next BANK ACCOUNT listing' do
+      expect(notes['listing']).to eq([1_563_160, 0])
+    end
+  end
+
+  describe 'cycle edges' do
+    subject(:edges) { result('cycle_edges') }
+
+    it 'records the idle time from the moment the collector starts' do
+      expect(edges['startup']).to eq(['idle', 'idle', true])
+    end
+
+    it 'marks the hunt that ended in a death, keeping why it stopped' do
+      expect(edges['death']['hunt_reason']).to eq('died (wounded.)')
+    end
+
+    it 'leaves no gap where a cycle too short to keep was dropped' do
+      expect(edges['death'].values_at('short_rest_dropped', 'no_gap', 'dead')).to eq([true, true, 'dead'])
+    end
+  end
+
+  describe 'mind over capacity' do
+    it 'shows as full on the dashboard' do
+      expect(result('mind')).to eq('mind' => [100.0, 100.0], 'trend_capped' => true)
+    end
+  end
+
   describe 'bank deposits and withdrawals' do
     subject(:moves) { result('bank_moves') }
 

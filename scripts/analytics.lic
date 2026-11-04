@@ -1119,11 +1119,19 @@ module GS4Analytics
     DIRECT_RE  = /You gather the remaining ([\d,]+) coins? from inside your/
     BANK_SKIP  = /amounts on deposit|inter-town|urchin/i
     BANK_START = /amounts on deposit/
-    # "<vendor> takes your <item>, ... hands you N silver ..." (also "takes the <item>")
-    SALE_RE    = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), .*?\bhands you (?<amount>[\d,]+) silvers?/
+    # "<vendor> takes your <item>, ... hands you N silver ..." (also "takes the <item>"),
+    # or "... hands you a Vornavis promissory note for N silvers" when the vendor is short
+    SALE_RE    = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), .*?\bhands you (?:an? [^,]*?promissory note for )?(?<amount>[\d,]+) silvers?/
+    # A gem pouch: paid with the pouch ("along with N silver"), or with a note
+    # given on the next line
+    POUCH_RE   = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), inspects the contents carefully, and removes the gems (?:she|he) is interested in\.\s+(?:She|He) hands it back to \S+?(?:, along with (?<amount>[\d,]+) silvers?| and says, .*promissory note)/
+    POUCH_NOTE_RE = /\A(?:The )?(?<vendor>[^,]+?) removes the gems and hands you an? [^,]*?promissory note for (?<amount>[\d,]+) silvers?/
     NOUN_RE    = /takes (?:your|the) <a [^>]*noun="([^"]+)"/
+    # Teller lines: [amount moved, the balance of this bank afterwards]
     DEPOSIT_RE = /You deposit ([\d,]+) silvers? into your account\..*?brings your total to ([\d,]+) silvers?/
     WITHDRAW_RE = /hands you ([\d,]+) silvers?, and says, "This brings your total to ([\d,]+) silvers?/
+    NOTES_RE = /You hand over your notes to the teller.*?That's a total of ([\d,]+) silvers?, bringing your balance to ([\d,]+) silvers?/
+    NOTE_WORTH_RE = /You deposit your note worth ([\d,]+) into your account\..*?brings your total to ([\d,]+) silvers?/
     BANK_CAPTURE_MAX = 14 # lines to wait for the Total line
     # Seconds after the collector starts before the first bank listing, so
     # login and the other autostart scripts settle first
@@ -1140,6 +1148,8 @@ module GS4Analytics
         @last_kill_at = nil
         @bank_lines = nil
         @snapshotting = false
+        @teller = nil
+        @pouch = nil
         DownstreamHook.remove(HOOK)
         DownstreamHook.add(HOOK, proc { |line| on_line(line) })
       end
@@ -1275,15 +1285,29 @@ module GS4Analytics
         line
       end
 
-      # A vendor buying an item: one silver event and one item sale
+      # A vendor buying an item: one silver event and one item sale. A gem
+      # pouch paid with a note is told over two lines: the pouch, then the note.
       def read_sale(line, text)
-        found = text.match(SALE_RE)
-        return unless found
+        if (found = text.match(SALE_RE))
+          record_sale(found[:vendor], found[:item], line[NOUN_RE, 1], digits(found[:amount]))
+        elsif (found = text.match(POUCH_RE))
+          noun = line[NOUN_RE, 1]
+          if found[:amount]
+            record_sale(found[:vendor], "gems from #{found[:item].strip}", noun, digits(found[:amount]))
+          else
+            @pouch = { item: found[:item].strip, noun: noun, at: Time.now.to_i }
+          end
+        elsif (found = text.match(POUCH_NOTE_RE))
+          pouch = @pouch if @pouch && Time.now.to_i - @pouch[:at] <= 5
+          @pouch = nil
+          record_sale(found[:vendor], pouch ? "gems from #{pouch[:item]}" : 'gems', pouch&.[](:noun), digits(found[:amount]))
+        end
+      end
 
-        vendor_type, vendor_name = split_vendor(found[:vendor].strip)
-        item = found[:item].strip
-        noun = line[NOUN_RE, 1] || item.split.last
-        amount = digits(found[:amount])
+      def record_sale(vendor, item, noun, amount)
+        vendor_type, vendor_name = split_vendor(vendor.strip)
+        item = item.strip
+        noun ||= item.split.last
         who = @who
         cycle_id = @cycle_id
         Database.async do
@@ -1304,7 +1328,7 @@ module GS4Analytics
         [first, (rest.join(' ') unless rest.empty?)]
       end
 
-      # BANK ACCOUNT output, then deposit and withdraw messages
+      # BANK ACCOUNT output, then the teller's deposit, withdraw and note messages
       def read_bank(text)
         return if @snapshotting
 
@@ -1313,11 +1337,25 @@ module GS4Analytics
         elsif @bank_lines
           @bank_lines << text
           finish_bank_capture if text.strip.start_with?('Total:') || @bank_lines.size > BANK_CAPTURE_MAX
-        elsif (found = text.match(DEPOSIT_RE))
-          record_total(digits(found[1]), 'deposit')
+        elsif (found = text.match(DEPOSIT_RE) || text.match(NOTES_RE) || text.match(NOTE_WORTH_RE))
+          record_total(teller_change(digits(found[1]), digits(found[2])), 'deposit')
         elsif (found = text.match(WITHDRAW_RE))
-          record_total(-digits(found[1]), 'withdraw')
+          record_total(teller_change(-digits(found[1]), digits(found[2])), 'withdraw')
         end
+      end
+
+      # How much this teller line moved the total. Each line quotes the balance
+      # of the bank it was made at, so two lines at the same teller differ by
+      # exactly what happened in between, including what no line states (a
+      # note withdrawn for eherbs, then the change deposited back as "note
+      # worth 9"). Elsewhere, the amount the line names.
+      def teller_change(stated, balance)
+        room = Util.safely { XMLData.room_id }
+        last = @teller
+        @teller = { room: room, balance: balance }
+        return stated unless last && room && room != 0 && last[:room] == room
+
+        balance - last[:balance]
       end
 
       def finish_bank_capture
@@ -1688,6 +1726,10 @@ module GS4Analytics
         @session_date = Date.today.to_s
         link_silver
         close_stale_cycles
+        @carry_from = nil
+        # Time before the first change is recorded too: an idle cycle from now,
+        # which the first tick replaces at once when something is already running
+        start_new_cycle(:idle)
         @running = true
         @thread = Thread.new { watch }
         Log.info("Cycle manager watching #{describe_scripts}")
@@ -1788,7 +1830,19 @@ module GS4Analytics
         @current_state = target
         @hunt_start_time = target == :hunt ? Time.now.to_i : nil
         @weapon = { polls: 0, retries: 0 }
+        mark_death if target == :dead
         start_new_cycle(target)
+      end
+
+      # The hunt that ended in a death says so, keeping why it had stopped:
+      # "died (wounded.)". A death a minute or more after the hunt ended isn't
+      # put on it.
+      def mark_death
+        hunt = @last_hunt
+        return unless hunt && Time.now.to_i - hunt[:at] <= 60
+
+        @last_hunt = nil
+        note_reason(hunt[:id], hunt[:reason].to_s.empty? ? 'died' : "died (#{hunt[:reason]})")
       end
 
       # A hunt that ended with no rest reason of its own was stopped from outside
@@ -1807,6 +1861,7 @@ module GS4Analytics
 
         Log.info("Midnight rollover: #{@session_date} -> #{today}")
         end_current_cycle
+        @carry_from = nil # the new day starts at midnight
         @session_id = Database.session_for(@who)
         @session_date = today
         link_silver
@@ -1819,9 +1874,12 @@ module GS4Analytics
         trigger = Array(@cfg[SCRIPT_KEYS[type]]).find { |name| running?(name) } || type.to_s
         row = [@who, @session_id, type, trigger, profile, Vitals.read]
         id = Database.new_id
-        at = Time.now.to_i
+        # A cycle dropped as too short leaves no gap: this one starts where it did
+        at = @carry_from || Time.now.to_i
+        @carry_from = nil
         Database.async { Database.start_cycle(*row, id: id, at: at) }
         @current_cycle_id = id
+        @cycle_started_at = at
         @cycle_reason = nil
         start_rest(id) if type == :rest
         link_silver
@@ -1857,9 +1915,13 @@ module GS4Analytics
         # until its next hunt, so the idle time after a rest would take it too.
         reason = @current_state == :hunt ? rest_reason : ''
         at = Time.now.to_i
+        # Database.end_cycle drops a cycle this short; the next one takes its time
+        @carry_from = @cycle_started_at if @cycle_started_at && at - @cycle_started_at < Database::MIN_CYCLE_SECONDS
         steps = @rest_cycle == id && !@rest_steps.empty? ? @rest_steps.dup : nil
         @rest_cycle = nil if @rest_cycle == id
-        @last_hunt = { reason: reason.empty? ? @cycle_reason.to_s : reason, at: at } if @current_state == :hunt
+        if @current_state == :hunt && !@carry_from
+          @last_hunt = { id: id, reason: reason.empty? ? @cycle_reason.to_s : reason, at: at }
+        end
         who = @who
         Database.async do
           row = Database.end_cycle(id, vitals, reason, at: at)
@@ -3005,7 +3067,8 @@ module GS4Analytics
         item_rests = rests.count { |row| row['rest_reason'].to_s.match?(/\bitems?\b/i) }
 
         # mind (field exp) as a percent of capacity, where capacity is known
-        percent = ->(value, max) { value && max && max.to_i.positive? ? (value.to_f * 100 / max.to_i).round(1) : nil }
+        # Bounty experience can take the mind past its capacity; it shows as full
+        percent = ->(value, max) { value && max && max.to_i.positive? ? [value.to_f * 100 / max.to_i, 100.0].min.round(1) : nil }
         hunt_rows = started.select { |row| row['cycle_type'] == 'hunt' }
         mind_start = hunt_rows.filter_map { |row| percent.call(row['exp_field_start'], row['exp_field_max']) }
         mind_end = hunt_rows.filter_map { |row| row['end_time'] && percent.call(row['exp_field_end'], row['exp_field_max']) }
@@ -3265,7 +3328,7 @@ module GS4Analytics
                              'AND date >= ? AND date <= ? GROUP BY 1', *who, Report.date_of(base_from), Report.date_of(now))
         end
         { 'enc'  => ['encumbrance_start', 'encumbrance_start IS NOT NULL'],
-          'mind' => ['(exp_field_end * 100.0 / exp_field_max)', 'exp_field_end IS NOT NULL AND exp_field_max > 0'] }.each do |metric, (expr, cond)|
+          'mind' => ['MIN(100.0, exp_field_end * 100.0 / exp_field_max)', 'exp_field_end IS NOT NULL AND exp_field_max > 0'] }.each do |metric, (expr, cond)|
           grab.call("#{metric}_sum", "SELECT #{bucket.call('start_time')} AS b, SUM(#{expr}) AS t FROM cycles WHERE #{hunt_where} AND #{cond} GROUP BY 1",
                     *who, base_from, now)
           grab.call("#{metric}_n", "SELECT #{bucket.call('start_time')} AS b, COUNT(*) AS t FROM cycles WHERE #{hunt_where} AND #{cond} GROUP BY 1",
