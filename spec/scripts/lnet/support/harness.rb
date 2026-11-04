@@ -74,7 +74,7 @@ module LnetSpec
   def self.reload!
     body = extract_from_source(SOURCE, /^class LNet\n.*?^end\n/m, label: 'class LNet', source_path: SOURCE_PATH)
     Harness.module_eval(body, SOURCE_PATH, SOURCE[0...SOURCE.index(body)].count("\n") + 1)
-    install_globals!(Harness::LNet)
+    respond_to?(:install_globals!) ? install_globals!(Harness::LNet) : record_output!(Harness::LNet)
   end
 
   # Records what the script writes straight to the game client.

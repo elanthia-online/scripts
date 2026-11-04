@@ -147,6 +147,18 @@ RSpec.describe 'lnet.lic connection' do
       expect(lnet.connected?).to be(false)
     end
 
+    it 'publishes the connection only after the login is written' do
+      socket = FakeServer.new
+      allow(socket).to receive(:peer_cert).and_return(LnetSpec::TLS.issue(authority, 'LichNet')[1])
+      seen = []
+      allow(socket).to receive(:puts).and_wrap_original { |original, text| seen << lnet.connected?; original.call(text) }
+      allow(lnet).to receive(:open_tls).and_return(socket)
+      expect(lnet.connect).to be(true)
+      expect(seen).to eq([false])
+      expect(socket.lines.first).to start_with('<login ')
+      expect(lnet.connected?).to be(true)
+    end
+
     it 'closes the previous connection first' do
       old = FakeServer.new
       lnet.server = old
