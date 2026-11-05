@@ -8,9 +8,14 @@
       game: any
       tags: core
   required: Lich > 5.0.1
-   version: 1.22
+   version: 1.23
 
   changelog:
+    1.23 (2026-11-05):
+      Aliases change only what you see; scripts get the real name
+      Always echo your own private messages (no 512 character limit)
+      Show a message split into several text parts as one
+      The debug setting is remembered between starts
     1.22 (2026-11-05):
       Replies shown from LNet can no longer carry control codes, extra lines or markup
       ;who lists channel owners, then moderators, then everyone, each alphabetically
@@ -81,10 +86,7 @@
 
 =end
 
-$lnet_debug = false
-
 # fixme: option to separate private messages to familiar window
-# fixme: scrub
 
 require 'openssl'
 require 'rexml/document'
@@ -99,7 +101,7 @@ class LNet
   # this one. Drop the constants an earlier copy of this file defined, so each
   # comes from this file; constants other scripts add to LNet (inbox.lic's
   # LNet::Inbox) are left alone.
-  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT REQUEST_TIMEOUT SAFE_SEND_INTERVAL USER_CALLBACKS_SCRIPT CA_CERTIFICATE GAME_SPELLINGS StreamParser SafeMarshal Display Responders Waiter MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
+  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT REQUEST_TIMEOUT SAFE_SEND_INTERVAL USER_CALLBACKS_SCRIPT CA_CERTIFICATE GAME_SPELLINGS StreamParser SafeMarshal Thoughts Listener Display Responders Waiter MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
 
   @@server    ||= nil
   @@script    ||= nil
@@ -149,7 +151,7 @@ class LNet
   # @param message [String]
   # @return [void]
   def LNet.debug(message)
-    echo(message) if $lnet_debug
+    echo(message) if @@options['debug']
   end
 
   # Cuts the server's byte stream into complete top-level XML elements and
@@ -426,6 +428,11 @@ class LNet
     @@last_priv
   end
 
+  # @param val [String, nil]
+  def LNet.last_priv=(val)
+    @@last_priv = val
+  end
+
   # @return [Boolean] whether there is an open connection to the server
   def LNet.connected?
     server = @@server
@@ -677,7 +684,7 @@ class LNet
   # @param server [IO]
   # @return [void]
   def LNet.read_session(server)
-    parser = StreamParser.new(LNet.new)
+    parser = StreamParser.new(Listener.new)
     loop { parser.feed(server.readpartial(4096)) }
   rescue IOError, SystemCallError, OpenSSL::SSL::SSLError => e # EOFError is an IOError
     LNet.debug("connection ended: #{e.class}: #{e.message}")
@@ -983,47 +990,184 @@ class LNet
     text.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
   end
 
-  def LNet.echo_thought(from, message, channel)
-    aliased_from = LNet.clean_text(LNet.alias[from] || from)
-    message = LNet.clean_text(message, from == '[server]')
-    channel = LNet.clean_text(channel)
-    channel = "[#{channel}]-" unless from == '[server]'
-    xml_from = LNet.xml_escape("#{channel}#{aliased_from}")
-    xml_message = LNet.xml_escape(message)
-    if @@options['timestamps']
-      timestamp = "  (#{Time.now.strftime('%X')})"
-    else
-      timestamp = String.new
+  # Shows LNet chat to the user and passes it to scripts.
+  #
+  # The user sees senders under their aliases (';lnet add alias'); scripts
+  # and Lich's server buffer always get the real name, so a script matching
+  # '[Private]-GSIV:Name' keeps working whatever the user calls Name.
+  module Thoughts
+    module_function
+
+    # @param from [String] the sender as LNet names them, or '[server]'
+    # @param message [String]
+    # @param channel [String] 'Private', 'PrivateTo', a channel name, or ''
+    #   for server messages
+    # @return [void]
+    def show(from, message, channel)
+      server = from == '[server]'
+      message = LNet.clean_text(message, server)
+      prefix = server ? '' : "[#{LNet.clean_text(channel)}]-"
+      real = prefix + LNet.clean_text(from)
+      stamp = LNet.options['timestamps'] ? "  (#{Time.now.strftime('%X')})" : ''
+      to_client(prefix + LNet.clean_text(LNet.alias[from] || from), message, stamp) unless LNet.ignored?(from)
+      xml = xml_line(real, message, stamp)
+      $_SERVERBUFFER_.push(xml)
+      Script.new_downstream_xml(xml)
+      Script.new_downstream("#{real}: \"#{message}\"#{stamp}")
     end
-    if @@options['preset']
-      preset_open = "<preset id='#{@@options['preset']}'>"
-      preset_close = "</preset>"
-    else
-      preset_open = preset_close = ""
-    end
-    if @@options['fam_window']
-      xml_thought = "<pushStream id=\"familiar\" ifClosedStyle=\"watching\"/>#{xml_from}: \"#{xml_message}\"#{timestamp}\n<popStream/>\n"
-    else
-      xml_thought = "<pushStream id=\"thoughts\"/>#{preset_open}#{xml_from}:#{preset_close} \"#{xml_message}\"#{timestamp}\n<popStream/>\n"
-    end
-    unless LNet.ignored?(from)
+
+    def to_client(sender, message, stamp)
       if $frontend =~ /wizard|avalon/
-        if @@options['fam_window']
-          $_CLIENT_.puts("\034GSe\r\n#{channel}#{aliased_from}: \"#{message}\"#{timestamp}\r\n\034GSf\r\n")
+        if LNet.options['fam_window']
+          $_CLIENT_.puts("\034GSe\r\n#{sender}: \"#{message}\"#{stamp}\r\n\034GSf\r\n")
         else
-          $_CLIENT_.puts("You hear the faint thoughts of #{channel}#{aliased_from} echo in your mind:\r\n\"#{message}\"#{timestamp}\r\n")
+          $_CLIENT_.puts("You hear the faint thoughts of #{sender} echo in your mind:\r\n\"#{message}\"#{stamp}\r\n")
         end
+      elsif defined?(_respond)
+        _respond(xml_line(sender, message, stamp))
       else
-        if defined?(_respond)
-          _respond(xml_thought)
-        else
-          $_CLIENT_.puts(xml_thought)
-        end
+        $_CLIENT_.puts(xml_line(sender, message, stamp))
       end
     end
-    $_SERVERBUFFER_.push(xml_thought)
-    Script.new_downstream_xml(xml_thought)
-    Script.new_downstream("#{channel}#{aliased_from}: \"#{message}\"#{timestamp}")
+
+    # @return [String] the line for XML front ends: the thoughts window (with
+    #   the user's highlight preset) or the familiar window
+    def xml_line(sender, message, stamp)
+      sender = LNet.xml_escape(sender)
+      message = LNet.xml_escape(message)
+      if LNet.options['fam_window']
+        "<pushStream id=\"familiar\" ifClosedStyle=\"watching\"/>#{sender}: \"#{message}\"#{stamp}\n<popStream/>\n"
+      elsif (preset = LNet.options['preset'])
+        "<pushStream id=\"thoughts\"/><preset id='#{preset}'>#{sender}:</preset> \"#{message}\"#{stamp}\n<popStream/>\n"
+      else
+        "<pushStream id=\"thoughts\"/>#{sender}: \"#{message}\"#{stamp}\n<popStream/>\n"
+      end
+    end
+  end
+
+  # @param from [String]
+  # @param message [String]
+  # @param channel [String]
+  # @return [void]
+  # @see Thoughts.show
+  def LNet.echo_thought(from, message, channel)
+    Thoughts.show(from, message, channel)
+  end
+
+  # Notes that something arrived from the server.
+  # @return [void]
+  def LNet.received!
+    @@last_recv = Time.now
+  end
+
+  # Receives the server's elements from the StreamParser and acts on each:
+  # pings, requests and notices when they start, messages and data once
+  # their text is complete.
+  class Listener
+    def initialize
+      @open = []
+    end
+
+    # @param name [String]
+    # @param attributes [Hash{String => String}]
+    # @return [void]
+    def tag_start(name, attributes)
+      LNet.received!
+      @open.push([name, attributes, +''])
+      case name
+      when 'ping' then LNet.send_element('pong')
+      when 'request' then Responders.handle(attributes)
+      when 'notify' then notify(attributes)
+      end
+    rescue StandardError => e
+      report(e)
+    end
+
+    # @param text [String] text directly inside the innermost open element
+    # @return [void]
+    def text(text)
+      @open.last&.at(2)&.concat(text)
+    end
+
+    # @param _name [String]
+    # @return [void]
+    def tag_end(_name)
+      name, attributes, text = @open.pop
+      case name
+      when 'message' then message(attributes, text)
+      when 'data' then data(attributes, text)
+      end
+    rescue StandardError => e
+      report(e)
+    end
+
+    private
+
+    def notify(attributes)
+      case attributes['type']
+      when 'new-spell-ranks'
+        LNet.send_request({ 'type' => 'spell-ranks', 'to' => 'server', 'timestamp' => SpellRanks.timestamp.to_s }) if defined?(SpellRanks)
+      when 'server-restart'
+        LNet.server_restart = true
+        LNet.disconnect
+      end
+    end
+
+    def message(attributes, text)
+      return if text.empty? # lnet never showed an empty message
+
+      case attributes['type']
+      when 'greeting'
+        respond LNet.for_client(text, true) if LNet.options['greeting']
+      when 'server'
+        password_refused if text =~ /incorrect password|password required/
+        Thoughts.show('[server]', text, '')
+      when 'private'
+        return unless (from = attributes['from'])
+
+        LNet.last_priv = from
+        Thoughts.show(from, text, 'Private')
+      when 'privateto'
+        Thoughts.show(attributes['to'], text, 'PrivateTo') if attributes['to']
+      when 'channel'
+        Thoughts.show(attributes['from'], text, attributes['channel']) if attributes['from'] && attributes['channel']
+      end
+    end
+
+    # The server refused the saved password: say how to fix it and stop, so
+    # lnet doesn't keep reconnecting with it.
+    def password_refused
+      name = LNet.script&.name || 'lnet'
+      respond "\nIf you have forgotten your password, visit https://lnet.lichproject.org to reset it.\n" \
+              "To attempt to log in with a different password, type: #{$clean_lich_char}#{name} password=<password>\n\n"
+      LNet.script&.kill
+    end
+
+    # A reply: handed to the request waiting for it, otherwise shown. An
+    # empty element carries no data (nil); one holding anything but plain
+    # values is refused, which fails the waiting request at once.
+    def data(attributes, text)
+      type = attributes['type']
+      from = attributes['from']
+      waiter = LNet.waiter_for(from, type)
+      begin
+        payload = text.strip.empty? ? nil : SafeMarshal.decode(text)
+      rescue ArgumentError => e
+        echo LNet.for_client("ignored #{type} data from #{from} that contained something other than plain values (#{e.message})")
+        waiter&.deliver(false)
+        return
+      end
+      if waiter
+        waiter.deliver(payload)
+      else
+        Display.show(type, from, attributes, payload)
+      end
+    end
+
+    def report(error)
+      echo "error: #{error.message}"
+      LNet.debug(error.backtrace.first(2).join("\n"))
+    end
   end
 
   # Whether name may receive what action reveals, by the permission the user
@@ -1919,88 +2063,6 @@ class LNet
     rescue
       return false
     end
-  end
-
-  def initialize
-    @active_tags = Array.new
-    @active_attributes = Array.new
-  end
-
-  def tag_start(tag_name, attributes)
-    begin
-      @@last_recv = Time.now
-      @active_tags.push(tag_name)
-      @active_attributes.push(attributes)
-      if tag_name == 'ping'
-        LNet.send_element('pong')
-      elsif tag_name == 'request'
-        Responders.handle(attributes)
-      elsif (tag_name == 'notify')
-        if (attributes['type'] == 'new-spell-ranks') and defined?(SpellRanks)
-          LNet.send_request({ 'type' => 'spell-ranks', 'to' => 'server', 'timestamp' => SpellRanks.timestamp.to_s })
-        elsif attributes['type'] == 'server-restart'
-          @@server_restart = true
-          LNet.disconnect
-        end
-      end
-    rescue
-      echo $!
-      respond $!.backtrace[0..1]
-    end
-  end
-
-  def text(text)
-    begin
-      if @active_tags.last == 'message'
-        if @active_attributes.last['type'] == 'greeting'
-          respond text if @@options['greeting']
-        elsif @active_attributes.last['type'] == 'server'
-          if text =~ /(?!kill).*(?:incorrect password|password required)/
-            output = "\n"
-            output.concat "If you have forgotten your password, visit https://lnet.lichproject.org to reset it."
-            output.concat "\n"
-            output.concat "To attempt to log in with a different password, type: #{$clean_lich_char}#{@@script.name} password=<password>\n"
-            output.concat "\n"
-            respond output
-            Script.self.kill
-          end
-          LNet.echo_thought('[server]', text, '')
-        elsif (@active_attributes.last['type'] == 'private') and (from = @active_attributes.last['from'])
-          @@last_priv = from
-          LNet.echo_thought(from, text, 'Private')
-        elsif (@active_attributes.last['type'] == 'privateto') and (to = @active_attributes.last['to'])
-          if text.length < 512 # fixme
-            LNet.echo_thought(to, text, 'PrivateTo')
-          end
-        elsif (@active_attributes.last['type'] == 'channel') and (from = @active_attributes.last['from']) and (channel = @active_attributes.last['channel'])
-          LNet.echo_thought(from, text, channel)
-        end
-      elsif (@active_tags.last == 'data')
-        waiter = LNet.waiter_for(@active_attributes.last['from'], @active_attributes.last['type'])
-        begin
-          data = SafeMarshal.decode(text)
-        rescue ArgumentError => e
-          echo "ignored #{@active_attributes.last['type']} data from #{@active_attributes.last['from']} that contained something other than plain values (#{e.message})"
-          # fail the waiting request now rather than letting it time out
-          waiter&.deliver(false)
-          return
-        end
-        if waiter
-          waiter.deliver(data)
-        else
-          Display.show(@active_attributes.last['type'], @active_attributes.last['from'], @active_attributes.last, data)
-        end
-
-      end
-    rescue
-      echo $!
-      respond $!.backtrace[0..1]
-    end
-  end
-
-  def tag_end(_tag_name)
-    @active_tags.pop
-    @active_attributes.pop
   end
 end
 

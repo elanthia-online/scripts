@@ -49,8 +49,10 @@ RSpec.describe 'lnet.lic' do
       it 'escapes markup in the channel name and in a local alias' do
         lnet.alias['GSIV:Bob'] = 'Bob & <b>'
         out = feed(%(<message type="channel" from="GSIV:Bob" channel="Gen&lt;pushBold/&gt;">hi</message>))
-        xml_outputs(out).each do |xml|
-          expect(expect_one_thought_element(xml).root.text).to include('[Gen<pushBold/>]-Bob & <b>: "hi"')
+        shown = out.find { |kind, _| kind == :_respond }[1]
+        expect(expect_one_thought_element(shown).root.text).to include(%([Gen<pushBold/>]-Bob & <b>: "hi"))
+        (out.select { |kind, _| kind == :downstream_xml }.map(&:last) + $_SERVERBUFFER_).each do |xml|
+          expect(expect_one_thought_element(xml).root.text).to include(%([Gen<pushBold/>]-GSIV:Bob: "hi"))
         end
       end
 
