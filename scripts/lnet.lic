@@ -8,9 +8,12 @@
       game: any
       tags: core
   required: Lich > 5.0.1
-   version: 1.16
+   version: 1.17
 
   changelog:
+    1.17 (2026-11-05):
+      Stop losing messages that arrive together with another LNet message
+      A comment, CDATA or DOCTYPE from the server no longer drops the connection
     1.16 (2026-10-25):
       Ignore LNet replies that contain anything other than plain data, and say so
       Escape LNet names/channels in XML output, strip control codes and line breaks
@@ -63,158 +66,12 @@ $lnet_debug = false
 # fixme: scrub
 
 require 'openssl'
+require 'rexml/document'
 require 'timeout'
 
 toggle_unique
 clear
 hide_me
-
-# Add this new SafeXMLParser class before the main LNet class
-
-class SafeXMLParser
-  def initialize(handler)
-    @handler = handler
-    @buffer = ''
-    @in_root = false
-  end
-
-  def parse_chunk(chunk)
-    @buffer += chunk
-
-    # Process complete XML documents from the buffer
-    while @buffer.length > 0
-      # Look for complete XML elements
-      if (match = @buffer.match(/^(<[^>]*>.*?<\/[^>]*>)/m))
-        xml_fragment = match[1]
-        @buffer = @buffer[match.end(0)..-1] || ''
-
-        process_xml_fragment(xml_fragment)
-      elsif (match = @buffer.match(/^(<[^>]*\/>)/m))
-        # Self-closing tags
-        xml_fragment = match[1]
-        @buffer = @buffer[match.end(0)..-1] || ''
-
-        process_xml_fragment(xml_fragment)
-      else
-        # Wait for more data if we don't have a complete element
-        break
-      end
-    end
-  end
-
-  private
-
-  def process_xml_fragment(fragment)
-    begin
-      # Try to parse the fragment as-is first
-      REXML::Document.new(fragment)
-      REXML::Document.parse_stream(fragment, @handler)
-    rescue REXML::ParseException, ArgumentError => e
-      echo "XML parse error: #{e.message}" if $lnet_debug
-
-      # Attempt to fix common XML issues
-      fixed_fragment = sanitize_xml(fragment)
-
-      begin
-        # Wrap in root element if it's not well-formed
-        if !fixed_fragment.match(/^<\?xml/) && !is_complete_document(fixed_fragment)
-          wrapped_fragment = "<root>#{fixed_fragment}</root>"
-          REXML::Document.parse_stream(wrapped_fragment, WrapperHandler.new(@handler))
-        else
-          REXML::Document.parse_stream(fixed_fragment, @handler)
-        end
-      rescue REXML::ParseException, ArgumentError => e2
-        echo "Failed to parse XML even after sanitization: #{e2.message}" if $lnet_debug
-        # Log the problematic XML for debugging
-        echo "Problematic XML: #{fragment[0..200]}" if $lnet_debug
-      end
-    end
-  end
-
-  def sanitize_xml(xml)
-    # Remove control characters except tab, newline, carriage return
-    xml = xml.gsub(/[\x00-\x08\x0B\x0C\x0E-\x1F]/, '')
-
-    # Fix common encoding issues
-    xml = xml.encode('UTF-8', invalid: :replace, undef: :replace, replace: '?')
-
-    # Escape unescaped ampersands (but not already escaped ones)
-    xml = xml.gsub(/&(?!(?:amp|lt|gt|quot|apos);)/, '&amp;')
-
-    # Fix unclosed tags by attempting basic repairs
-    xml = fix_unclosed_tags(xml)
-
-    xml
-  end
-
-  def fix_unclosed_tags(xml)
-    # This is a basic implementation - you might need to enhance based on actual issues
-    # Stack to track open tags
-    tag_stack = []
-    result = ''
-
-    # Simple regex to find tags - this is basic and may need refinement
-    xml.scan(/<\/?[^>]*>|[^<]+/) do |token|
-      if token.start_with?('<')
-        if token.start_with?('</')
-          # Closing tag
-          tag_name = token.match(/<\/([^>\s]+)/)[1] rescue nil
-          if tag_name && tag_stack.last == tag_name
-            tag_stack.pop
-          end
-        elsif !token.end_with?('/>')
-          # Opening tag (not self-closing)
-          tag_name = token.match(/<([^>\s]+)/)[1] rescue nil
-          tag_stack.push(tag_name) if tag_name
-        end
-      end
-      result += token
-    end
-
-    # Close any remaining open tags
-    while !tag_stack.empty?
-      result += "</#{tag_stack.pop}>"
-    end
-
-    result
-  end
-
-  def is_complete_document(xml)
-    xml.strip.start_with?('<') && xml.strip.end_with?('>')
-  end
-end
-
-# Wrapper handler to skip the artificial root element
-class WrapperHandler
-  def initialize(real_handler)
-    @real_handler = real_handler
-    @in_root = false
-  end
-
-  def tag_start(name, attrs)
-    if name == 'root' && !@in_root
-      @in_root = true
-      return
-    end
-    @real_handler.tag_start(name, attrs)
-  end
-
-  def tag_end(name)
-    if name == 'root' && @in_root
-      @in_root = false
-      return
-    end
-    @real_handler.tag_end(name)
-  end
-
-  def text(text)
-    @real_handler.text(text) if @in_root
-  end
-
-  def method_missing(method, *args)
-    @real_handler.send(method, *args) if @real_handler.respond_to?(method)
-  end
-end
 
 class LNet
   @@server    ||= nil
@@ -228,6 +85,212 @@ class LNet
   @@version     = '1.6'
 
   @@server_restart = false
+
+  # Prints a diagnostic line when LNet debugging is switched on.
+  #
+  # @param message [String]
+  # @return [void]
+  def LNet.debug(message)
+    echo(message) if $lnet_debug
+  end
+
+  # Cuts the server's byte stream into complete top-level XML elements and
+  # hands each one, as tag/text events, to a listener.
+  #
+  # The server writes one element after another on a single TLS stream with
+  # no other framing, and REXML 3.3.2+ can no longer parse straight from a
+  # socket. This class buffers what arrives, finds where each top-level
+  # element ends by counting nested tags (so two elements that arrive in one
+  # read are never mistaken for one), and parses every element on its own:
+  # a broken element costs only itself, never the connection or the
+  # elements around it.
+  #
+  # Each element is parsed into a tree before any event is sent, so an
+  # element is either delivered whole or not at all; the listener never sees
+  # the start of an element whose end failed to parse.
+  class StreamParser
+    # One markup token: a comment, a CDATA section, the opening of a comment
+    # or CDATA section whose end hasn't arrived yet, a declaration or
+    # processing instruction, or a tag. Tags capture the closing slash (1),
+    # the name (2) and the self-closing slash (3); quoted attribute values may
+    # contain '>'. A tag can't contain '<' (the server escapes it), so a stray
+    # '<' in the stream never swallows the tag after it.
+    TOKEN = %r{<!--.*?-->|<!\[CDATA\[.*?\]\]>|(?:<!--|<!\[CDATA\[)|<!(?!--|\[CDATA\[)[^>]*>|<\?[^>]*>|<(/?)([A-Za-z_:][-.\w:]*)(?:[^<>"']|"[^"]*"|'[^']*')*?(/?)>}m
+
+    # Elements the server sends at the top level. None contains another, so
+    # one starting inside an element means that element was never closed.
+    TOP_LEVEL = %w[message data request notify ping].freeze
+
+    # Largest unfinished element kept before the buffer is thrown away. The
+    # server's biggest known reply (spell ranks) is under 2 MB.
+    MAX_BUFFER = 16 * 1024 * 1024
+
+    # @param listener [#tag_start, #text, #tag_end] receives the events of
+    #   each complete element, in document order
+    def initialize(listener)
+      @listener = listener
+      @buffer = String.new(encoding: Encoding::BINARY)
+      reset_scan
+    end
+
+    # Adds bytes read from the server and delivers every element they
+    # complete.
+    #
+    # @param chunk [String] raw bytes, in any encoding
+    # @return [Integer] the number of elements delivered
+    def feed(chunk)
+      @buffer << chunk.b
+      delivered = 0
+      while (element = next_element)
+        deliver(element)
+        delivered += 1
+      end
+      overflow! if @buffer.bytesize > MAX_BUFFER
+      delivered
+    end
+
+    private
+
+    def reset_scan
+      @scan_pos = 0
+      @gt_seen = 0
+      @start = nil
+      @depth = 0
+    end
+
+    # Continues scanning where the last call stopped, so an element that
+    # arrives in many chunks is scanned once, not once per chunk.
+    #
+    # @return [String, nil] the next complete element, or nil if the buffer
+    #   holds only part of one
+    def next_element
+      while token_can_end? && (match = TOKEN.match(@buffer, @scan_pos))
+        if match[0] == '<!--' || match[0] == '<![CDATA['
+          # a comment or CDATA section still arriving: wait for its end rather
+          # than read the markup inside it as tags
+          @scan_pos = match.begin(0)
+          @gt_seen = @buffer.bytesize
+          return nil
+        end
+        @scan_pos = match.end(0)
+        name = match[2]
+        if @start.nil?
+          next unless name # comments, declarations and stray text between elements
+
+          @start = match.begin(0)
+        elsif name && match[1] != '/' && TOP_LEVEL.include?(name)
+          LNet.debug('dropping an element the server never closed')
+          @start = match.begin(0)
+          @depth = 0
+        end
+        if name
+          if match[1] == '/'
+            @depth -= 1
+          elsif match[3] != '/'
+            @depth += 1
+          end
+        end
+        next if @depth.positive?
+
+        element = @buffer.byteslice(@start, @scan_pos - @start)
+        @buffer = @buffer.byteslice(@scan_pos, @buffer.bytesize - @scan_pos)
+        reset_scan
+        return element
+      end
+      # No complete token is left. One still arriving can only start at a
+      # '<', so the next scan resumes at the first one instead of rescanning
+      # a long element from where its last token ended.
+      @scan_pos = @buffer.index('<', @scan_pos) || @buffer.bytesize
+      @gt_seen = @buffer.bytesize
+      drop_leading_text if @start.nil?
+      nil
+    end
+
+    # A token can only end at a '>'. Looks only past where the last fruitless
+    # scan reached, so a long tag that hasn't ended is not rescanned on every
+    # read.
+    #
+    # @return [Boolean] whether a '>' arrived since then
+    def token_can_end?
+      !@buffer.index('>', [@scan_pos, @gt_seen].max).nil?
+    end
+
+    # Between elements, everything before the next '<' is stray text that can
+    # never become part of an element.
+    def drop_leading_text
+      @gt_seen = [@gt_seen - @scan_pos, 0].max
+      @buffer = @buffer.byteslice(@scan_pos, @buffer.bytesize - @scan_pos)
+      @scan_pos = 0
+    end
+
+    def overflow!
+      LNet.debug("discarding #{@buffer.bytesize} bytes of an element that never ended")
+      @buffer = String.new(encoding: Encoding::BINARY)
+      reset_scan
+    end
+
+    # Parses one element and sends its events. An element that is not
+    # well-formed gets one repair attempt (see #repair); if that fails too it
+    # is dropped.
+    #
+    # @param element [String] one complete top-level element, as bytes
+    # @return [void]
+    def deliver(element)
+      text = element.dup.force_encoding(Encoding::UTF_8)
+      text = text.scrub('?') unless text.valid_encoding?
+      root = parse(text) || parse(repair(text))
+      if root
+        walk(root)
+      else
+        LNet.debug("dropped an element that is not valid XML: #{text[0, 200]}")
+      end
+    rescue StandardError, ScriptError, SystemStackError => e
+      LNet.debug("error handling an element: #{e.class}: #{e.message}")
+    end
+
+    # @return [REXML::Element, nil]
+    def parse(text)
+      REXML::Document.new(text).root
+    rescue StandardError => e
+      LNet.debug("XML parse error: #{e.message.lines.first.to_s.strip}")
+      nil
+    end
+
+    # Removes control characters XML forbids and escapes a '&' or '<' that
+    # cannot start an entity or a tag.
+    #
+    # @param text [String]
+    # @return [String]
+    def repair(text)
+      text.gsub(/[\x00-\x08\x0B\x0C\x0E-\x1F]/, '')
+          .gsub(/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x\h+);)/, '&amp;')
+          .gsub(%r{<(?![/!?A-Za-z_:])}, '&lt;')
+    end
+
+    # Sends an element's events to the listener in document order. CDATA is
+    # delivered as text; comments and processing instructions are skipped.
+    # Walks with its own stack, so no nesting depth can overflow Ruby's.
+    #
+    # @param root [REXML::Element]
+    # @return [void]
+    def walk(root)
+      pending = [[:open, root]]
+      until pending.empty?
+        step, node = pending.pop
+        if step == :close
+          @listener.tag_end(node.name)
+        elsif node.is_a?(REXML::Element)
+          attributes = {}
+          node.attributes.each_attribute { |attribute| attributes[attribute.expanded_name] = attribute.value }
+          @listener.tag_start(node.name, attributes)
+          pending.push([:close, node])
+          node.children.reverse_each { |child| pending.push([:open, child]) }
+        elsif node.is_a?(REXML::Text)
+          @listener.text(node.value)
+        end
+      end
+    end
+  end
 
   def LNet.server;
     @@server;
@@ -1499,14 +1562,13 @@ Thread.new {
     begin
       LNet.connect
 
-      # Create the safe XML parser
-      safe_parser = SafeXMLParser.new(LNet.new)
+      parser = LNet::StreamParser.new(LNet.new)
 
       # Read from server in chunks and parse safely
       while !LNet.server.closed?
         begin
           chunk = LNet.server.readpartial(4096)
-          safe_parser.parse_chunk(chunk)
+          parser.feed(chunk)
         rescue EOFError
           echo "Server closed connection" if $lnet_debug
           break
