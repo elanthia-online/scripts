@@ -522,7 +522,7 @@ module GS4Analytics
       end
 
       # A database for reading. The collector's own connection is reused;
-      # otherwise a read-only one is opened, which needs the file to exist.
+      # otherwise one is opened for reading, which needs the file to exist.
       def reader(path = file)
         conn = @db || (@reader ||= open_reader(path))
         block_given? ? yield(conn) : conn
@@ -803,15 +803,20 @@ module GS4Analytics
         open_database(path, readonly: true)
       end
 
-      # Lich's helper gives the writer its busy handling (a lock wait that lets
-      # the rest of the process run); readers use plain Sequel.
+      # Lich's helper gives every connection its busy handling: a lock wait
+      # that lets the rest of the process run and holds back a ;kill until
+      # SQLite returns. Readers need it too. With no collector running, the
+      # dashboard reads from its request threads, and on Windows a kill that
+      # lands in a plain connection's lock wait can leave that connection
+      # stuck, so closing it at shutdown would hang Lich (lich-5#2254). The
+      # helper has no read-only option; a reader only runs the report SELECTs,
+      # and the dashboard answers only GET and runs no SQL from a request.
+      # Without the helper (older Lich), plain Sequel, read-only for readers.
       def open_database(path, readonly:)
-        conn = if readonly
-                 Sequel.sqlite(path, readonly: true, timeout: BUSY_TIMEOUT_MS)
-               elsif Lich.respond_to?(:open_sequel_sqlite)
+        conn = if Lich.respond_to?(:open_sequel_sqlite)
                  Lich.open_sequel_sqlite(path)
                else
-                 Sequel.sqlite(path, timeout: BUSY_TIMEOUT_MS)
+                 Sequel.sqlite(path, readonly: readonly, timeout: BUSY_TIMEOUT_MS)
                end
         conn.extend(Queries)
         conn
@@ -1350,13 +1355,6 @@ module GS4Analytics
       # exactly what happened in between, including what no line states (a
       # note withdrawn for eherbs, then the change deposited back as "note
       # worth 9"). Elsewhere, the amount the line names.
-      # A listing sets the total to the truth, which already includes whatever
-      # happened at the last teller since its line. Comparing the next line
-      # with that one would count it again, so the next line names its amount.
-      def forget_teller
-        @teller = nil
-      end
-
       def teller_change(stated, balance)
         room = Util.safely { XMLData.room_id }
         last = @teller
@@ -1364,6 +1362,13 @@ module GS4Analytics
         return stated unless last && room && room != 0 && last[:room] == room
 
         balance - last[:balance]
+      end
+
+      # A listing sets the total to the truth, which already includes whatever
+      # happened at the last teller since its line. Comparing the next line
+      # with that one would count it again, so the next line names its amount.
+      def forget_teller
+        @teller = nil
       end
 
       def finish_bank_capture

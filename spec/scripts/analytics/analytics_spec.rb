@@ -577,7 +577,7 @@ RSpec.describe 'analytics.lic' do
   describe 'without a running collector' do
     subject(:standalone) { result('standalone') }
 
-    it 'reads the database read-only' do
+    it 'reads the database read-only without the Lich helper' do
       expect(standalone.values_at('connected', 'overview', 'write_refused')).to eq([false, 3, true])
     end
 
@@ -587,6 +587,19 @@ RSpec.describe 'analytics.lic' do
 
     it 'says so when there is no database yet' do
       expect(standalone['missing']).to be(true)
+    end
+  end
+
+  describe 'reading through Lich.open_sequel_sqlite' do
+    subject(:lich_reader) { result('lich_reader') }
+
+    it 'opens the reader through the helper, so it gets its lock waits' do
+      expect(lich_reader.values_at('opened', 'hooked')).to eq([true, true])
+    end
+
+    it 'builds reports from it' do
+      expect(lich_reader['overview']).to eq(3)
+      expect(lich_reader['report_lines']).to be > 10
     end
   end
 end
