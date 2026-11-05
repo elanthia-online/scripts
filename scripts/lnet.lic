@@ -8,9 +8,12 @@
       game: any
       tags: core
   required: Lich > 5.0.1
-   version: 1.20
+   version: 1.21
 
   changelog:
+    1.21 (2026-11-05):
+      Scripts looking up another player get the answer as soon as it arrives
+      Lookups work with names like gsiv:bob, and a bare name accepts that character in any game
     1.20 (2026-11-05):
       Scripts can answer their own LNet request types, for players you allow
       Start your lnet-callbacks script, if you have one, with lnet
@@ -91,7 +94,7 @@ class LNet
   # this one. Drop the constants an earlier copy of this file defined, so each
   # comes from this file; constants other scripts add to LNet (inbox.lic's
   # LNet::Inbox) are left alone.
-  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT SAFE_SEND_INTERVAL USER_CALLBACKS_SCRIPT CA_CERTIFICATE StreamParser SafeMarshal Responders MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
+  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT REQUEST_TIMEOUT SAFE_SEND_INTERVAL USER_CALLBACKS_SCRIPT CA_CERTIFICATE GAME_SPELLINGS StreamParser SafeMarshal Responders Waiter MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
 
   @@server    ||= nil
   @@script    ||= nil
@@ -127,6 +130,8 @@ class LNet
   RECONNECT_INTERVAL = 300
   # Seconds to wait after the server announces a restart.
   RESTART_WAIT = 30
+  # Seconds LNet.get_data waits for an answer.
+  REQUEST_TIMEOUT = 8
   # Least seconds between two LNet.safe_send messages.
   SAFE_SEND_INTERVAL = 3
   # A script of the user's own that lnet starts so it can add callbacks.
@@ -1328,22 +1333,153 @@ class LNet
     end
   end
 
-  def LNet.get_data(name, type)
-    return false if (!name.is_a?(String)) or name.empty? or (!type.is_a?(String)) or type.empty? or !LNet.connected?
-    name.capitalize!
-    waiter = { 'type' => type, 'name' => name, 'data' => :waiting }
+  # Game codes whose LNet spelling is not simply upper case.
+  GAME_SPELLINGS = { 'gsiv' => 'GSIV', 'gsplat' => 'GSPlat' }.freeze
+
+  # Writes a character name the way LNet does: 'bob' becomes 'Bob' and
+  # 'gsiv:bob' becomes 'GSIV:Bob'. Never modifies its argument.
+  #
+  # @param text [String] a name, optionally prefixed with a game code
+  # @return [String]
+  def LNet.normalize_name(text)
+    game, name = LNet.split_name(text)
+    name = name.capitalize
+    return name unless game
+
+    "#{GAME_SPELLINGS.fetch(game.downcase, game.upcase)}:#{name}"
+  end
+
+  # @param text [String] 'Bob' or 'GSIV:Bob'
+  # @return [Array(String, String), Array(nil, String)] the game code (nil
+  #   when there is none) and the character name
+  def LNet.split_name(text)
+    text = text.to_s.strip
+    return [nil, text] unless text.include?(':')
+
+    game, name = text.split(':', 2)
+    [game, name]
+  end
+
+  # Whether a reply from `from` answers a request sent to `requested`. The
+  # name asked for may be the start of the character's name, and its game,
+  # when both name one, must match.
+  #
+  # @param requested [String] the name the request was sent to
+  # @param from [String] the name the reply came from
+  # @return [Boolean]
+  def LNet.same_character?(requested, from)
+    want_game, want_name = LNet.split_name(requested)
+    from_game, from_name = LNet.split_name(from)
+    return false if want_name.empty? || !from_name.downcase.start_with?(want_name.downcase)
+
+    want_game.nil? || from_game.nil? || want_game.casecmp?(from_game)
+  end
+
+  # A request that is waiting for its reply.
+  class Waiter
+    # @return [String] the request type
+    attr_reader :type
+    # @return [String] the name the request was sent to
+    attr_reader :name
+
+    def initialize(type, name)
+      @type = type
+      @name = name
+      @lock = Mutex.new
+      @arrived = ConditionVariable.new
+      @answered = false
+      @reply = nil
+    end
+
+    # @return [Boolean] whether the reply is still to come
+    def pending?
+      !@answered
+    end
+
+    # @param from [String] who a reply came from
+    # @param type [String] its type
+    # @return [Boolean] whether that reply answers this request
+    def answered_by?(from, type)
+      pending? && type == @type && LNet.same_character?(@name, from)
+    end
+
+    # Hands over the reply; only the first one counts.
+    #
+    # @param data [Object] the decoded data, or false for a refused payload
+    # @return [Boolean] whether this was the first reply
+    def deliver(data)
+      @lock.synchronize do
+        return false if @answered
+
+        @answered = true
+        @reply = [data]
+        @arrived.signal
+        true
+      end
+    end
+
+    # @param timeout [Numeric] seconds
+    # @return [Array(Object), nil] the reply wrapped in an array, or nil if
+    #   none came in time
+    def wait(timeout)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      @lock.synchronize do
+        until @reply
+          left = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          break unless left.positive?
+
+          @arrived.wait(@lock, left)
+        end
+        @reply
+      end
+    end
+  end
+
+  # The waiting request a reply answers. When several could take it, a
+  # request naming the reply's game comes first, then one naming no game,
+  # then any other, each in the order they were made.
+  #
+  # @param from [String]
+  # @param type [String]
+  # @return [Waiter, nil]
+  def LNet.waiter_for(from, type)
+    return nil if from.to_s.empty? || type.to_s.empty?
+
+    candidates = @@waiting.select { |waiter| waiter.answered_by?(from, type) }
+    from_game = LNet.split_name(from).first
+    candidates.find { |waiter| (game = LNet.split_name(waiter.name).first) && from_game && game.casecmp?(from_game) } ||
+      candidates.find { |waiter| LNet.split_name(waiter.name).first.nil? } ||
+      candidates.first
+  end
+
+  # Asks another player for information and waits for the answer.
+  #
+  # @example
+  #   LNet.get_data('Bob', 'bounty') # => "You have been tasked to ..."
+  #
+  # @param name [String] a character name, optionally with a game code
+  #   ('GSIV:Bob'); not modified
+  # @param type [String] the request type, e.g. 'locate', 'bounty' or one a
+  #   script registered with LNet.add_callback
+  # @param timeout [Numeric] seconds to wait for the answer
+  # @return [Object] the data sent back; nil if they declined; false if no
+  #   answer came (not connected, no such user, a refused payload or the
+  #   timeout ran out)
+  def LNet.get_data(name, type, timeout: REQUEST_TIMEOUT)
+    return false unless name.is_a?(String) && type.is_a?(String) && !name.strip.empty? && !type.empty?
+    return false unless LNet.connected?
+
+    target = LNet.normalize_name(name)
+    waiter = Waiter.new(type, target)
     @@waiting.push(waiter)
     begin
-      LNet.send_request({ 'type' => type, 'to' => name })
-      80.times { sleep 0.1; break unless waiter['data'] == :waiting }
+      return false unless LNet.send_request({ 'type' => type, 'to' => target })
+
+      reply = waiter.wait(timeout)
     ensure
       @@waiting.delete(waiter)
     end
-    if waiter['data'] == :waiting
-      false
-    else
-      waiter['data']
-    end
+    reply ? reply.first : false
   end
 
   def LNet.upload_spell_ranks
@@ -1432,19 +1568,17 @@ class LNet
           LNet.echo_thought(from, text, channel)
         end
       elsif (@active_tags.last == 'data')
-        if @active_attributes.last['from'] and @active_attributes.last['type']
-          waiter = @@waiting.find { |w| (@active_attributes.last['from'] =~ /^#{Regexp.escape(w['name'])}/i) and (w['type'] == @active_attributes.last['type']) and w['data'] == :waiting }
-        end
+        waiter = LNet.waiter_for(@active_attributes.last['from'], @active_attributes.last['type'])
         begin
           data = SafeMarshal.decode(text)
-        rescue
-          echo "ignored #{@active_attributes.last['type']} data from #{@active_attributes.last['from']} that contained something other than plain values (#{$!.message})"
+        rescue ArgumentError => e
+          echo "ignored #{@active_attributes.last['type']} data from #{@active_attributes.last['from']} that contained something other than plain values (#{e.message})"
           # fail the waiting request now rather than letting it time out
-          waiter['data'] = false if waiter
+          waiter&.deliver(false)
           return
         end
         if waiter
-          waiter['data'] = data
+          waiter.deliver(data)
         elsif (@active_attributes.last['type'] == 'connected') and (@active_attributes.last['from'] == 'server')
           output = String.new
           sort_by_game = Hash.new
