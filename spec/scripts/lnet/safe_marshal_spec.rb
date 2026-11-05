@@ -188,4 +188,79 @@ RSpec.describe 'lnet.lic' do
       expect(accepted).to be > 100 # the mutations didn't just break every blob
     end
   end
+
+  describe 'payloads that would expand' do
+    def doubled(levels)
+      value = ['x']
+      levels.times { value = [value, value] } # each level links to the one before
+      value
+    end
+
+    it 'refuses shared links that would expand a tiny payload into a huge tree, quickly' do
+      blob = Marshal.dump([doubled(30), 1]) # 2**30 leaves through shared links
+      expect(blob.bytesize).to be < 200
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      expect { lnet.safe_unmarshal(blob) }.to raise_error(ArgumentError, /expands too far/)
+      expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 1
+    end
+
+    {
+      'links to one large string' => -> { big = 'z' * 16_384; Array.new(2048) { big } },
+      'links to one large symbol' => -> { sym = ('z' * 16_384).to_sym; Array.new(2048) { sym } },
+      'links to an array holding a large string' => -> { inner = ['z' * 16_384]; Array.new(2048) { inner } }
+    }.each do |label, build|
+      it "refuses #{label} that would expand a small payload into megabytes of text" do
+        blob = Marshal.dump(build.call)
+        expect(blob.bytesize).to be < 25_000
+        expect { lnet.safe_unmarshal(blob) }.to raise_error(ArgumentError, /expands too far/)
+      end
+    end
+
+    it 'still loads the shared hash keys real replies have' do
+      key = 'name'
+      reply = { 'pcs' => [{ key => 'Ann', 'status' => nil }, { key => 'Bob', 'status' => 'sitting' }] }
+      expect(lnet.safe_unmarshal(Marshal.dump(reply))).to eq(reply)
+    end
+
+    it 'still loads a little sharing' do
+      expect(lnet.safe_unmarshal(Marshal.dump(doubled(5)))).to eq(doubled(5))
+    end
+
+    it 'refuses a number longer than 256 bits' do
+      expect(lnet.safe_unmarshal(Marshal.dump(2**255))).to eq(2**255)
+      expect { lnet.safe_unmarshal(Marshal.dump(2**300)) }.to raise_error(ArgumentError, /bignum too long/)
+    end
+
+    it 'raises ArgumentError for a symbol in a bad encoding' do
+      expect { lnet.safe_unmarshal("\x04\bI:\x06\xFF\x06:\x06ET".b) }.to raise_error(ArgumentError)
+    end
+  end
+
+  describe 'LNet::SafeMarshal.encode and .decode' do
+    LnetSpec::REAL_PAYLOADS.each do |type, payload|
+      it "round-trips the #{type} payload through the text of a <data> element" do
+        text = lnet::SafeMarshal.encode(payload)
+        expect(text).not_to end_with("\n")
+        expect(lnet::SafeMarshal.decode(text)).to eq(payload)
+      end
+    end
+
+    it 'decodes text wrapped across lines, as base64 arrives in a <data> element' do
+      text = [Marshal.dump(LnetSpec::REAL_PAYLOADS['locate'])].pack('m')
+      expect(text.count("\n")).to be > 1
+      expect(lnet::SafeMarshal.decode(text)).to eq(LnetSpec::REAL_PAYLOADS['locate'])
+    end
+
+    [['empty text', ''], ['nil', nil], ['text that is not base64', '!!!***'], ['base64 of junk', ['junk'].pack('m')]].each do |label, text|
+      it "raises ArgumentError, not anything else, for #{label}" do
+        expect { lnet::SafeMarshal.decode(text) }.to raise_error(ArgumentError)
+      end
+    end
+
+    it 'refuses a hook object without running its load hook' do
+      LnetSpec::Gadget.loaded = 0
+      expect { lnet::SafeMarshal.decode(lnet::SafeMarshal.encode(LnetSpec::Gadget.new)) }.to raise_error(ArgumentError)
+      expect(LnetSpec::Gadget.loaded).to eq(0)
+    end
+  end
 end

@@ -8,9 +8,11 @@
       game: any
       tags: core
   required: Lich > 5.0.1
-   version: 1.18
+   version: 1.19
 
   changelog:
+    1.19 (2026-11-05):
+      Refuse LNet replies that would take too much memory or time to show
     1.18 (2026-11-05):
       A server certificate with the wrong name no longer closes Lich
       Writes from different threads no longer interleave on the connection
@@ -83,7 +85,7 @@ class LNet
   # this one. Drop the constants an earlier copy of this file defined, so each
   # comes from this file; constants other scripts add to LNet (inbox.lic's
   # LNet::Inbox) are left alone.
-  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT CA_CERTIFICATE MARSHAL_MAX_DEPTH StreamParser].each { |name| remove_const(name) if const_defined?(name, false) }
+  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT CA_CERTIFICATE StreamParser SafeMarshal MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
 
   @@server    ||= nil
   @@script    ||= nil
@@ -605,7 +607,7 @@ class LNet
   #   symbols, arrays and hashes of them)
   # @return [Boolean]
   def LNet.send_data(attributes, data)
-    LNet.send_element('data', attributes, [Marshal.dump(data)].pack('m').strip)
+    LNet.send_element('data', attributes, SafeMarshal.encode(data))
   end
 
   # Keeps the connection alive; call it in a loop.
@@ -688,154 +690,235 @@ class LNet
     end
   end
 
-  # <data> payloads come from the server and from other players' clients, and
+  # Encodes and decodes the Marshal payloads of <data> elements.
+  #
+  # Payloads come from the server and from other players' clients, and
   # Marshal.load will instantiate any class and run its marshal_load/_load
-  # hooks. Walk the stream first and only hand it to Marshal.load when every
-  # object in it is nil, true, false, an Integer, Float, String, Symbol, Array
-  # or Hash -- the only things LNet ever sends, none of which run code to load.
-  # Strings and symbols may only carry their encoding, and links back to an
-  # array/hash that is still being read are refused, so the result is always
-  # a finite tree of plain values.
-  MARSHAL_MAX_DEPTH = 32
+  # hooks. #load walks the stream first and only hands it to Marshal.load
+  # when every object in it is nil, true, false, an Integer, Float, String,
+  # Symbol, Array or Hash -- the only things LNet ever sends, none of which
+  # run code to load. Strings and symbols may only carry their encoding, and
+  # links back to an array/hash that is still being read are refused, so the
+  # result is a finite tree of plain values; links can't expand it past
+  # MAX_VALUES values or MAX_BYTES bytes of text, and numbers are at most
+  # MAX_BIGNUM_WORDS long.
+  module SafeMarshal
+    module_function
 
-  def LNet.safe_unmarshal(bin)
-    bin = bin.b
-    raise ArgumentError, 'unsupported marshal format' unless bin.byteslice(0, 2) == "\x04\x08".b
+    # @param data [Object] plain data
+    # @return [String] the base64 text of a <data> element
+    def encode(data)
+      [Marshal.dump(data)].pack('m').strip
+    end
 
-    pos = LNet.marshal_check(bin, 2, 0, { 'objects' => [], 'symbols' => [] })
-    raise ArgumentError, 'trailing marshal data' unless pos == bin.bytesize
+    # @param text [String] the base64 text of a <data> element
+    # @return [Object] the plain data it holds
+    # @raise [ArgumentError] if it holds anything else or is malformed
+    def decode(text)
+      load(text.to_s.unpack1('m'))
+    end
 
-    Marshal.load(bin)
-  end
+    # @param bin [String] a Marshal stream
+    # @return [Object] the plain data it holds
+    # @raise [ArgumentError] if it holds anything else or is malformed
+    def load(bin)
+      bin = bin.b
+      raise ArgumentError, 'unsupported marshal format' unless bin.byteslice(0, 2) == "\x04\x08".b
 
-  # seen mirrors Marshal.load's link tables: 'objects' has one entry per
-  # linkable object (false while an array/hash is still being read, the text
-  # of a string, true otherwise) and 'symbols' the name of each symbol read
-  def LNet.marshal_check(bin, pos, depth, seen)
-    raise ArgumentError, 'marshal data nested too deep' if depth > MARSHAL_MAX_DEPTH
+      limit = [(bin.bytesize * 64) + 1024, MAX_VALUES].min
+      byte_limit = [(bin.bytesize * 64) + 65_536, MAX_BYTES].min
+      seen = { 'objects' => [], 'symbols' => [], 'sizes' => [], 'values' => 0, 'limit' => limit,
+               'byte_sizes' => [], 'bytes' => 0, 'byte_limit' => byte_limit }
+      pos = check_value(bin, 2, 0, seen)
+      raise ArgumentError, 'trailing marshal data' unless pos == bin.bytesize
 
-    type = bin.getbyte(pos) or raise ArgumentError, 'truncated marshal data'
-    pos += 1
-    case type.chr
-    when '0', 'T', 'F'
-      pos
-    when 'i'
-      LNet.marshal_long(bin, pos)[1]
-    when ':', ';'
-      LNet.marshal_symbol(bin, pos - 1, seen)[1]
-    when '@' # link to an earlier object
-      index, pos = LNet.marshal_long(bin, pos)
-      raise ArgumentError, 'bad or circular marshal link' unless index >= 0 and seen['objects'][index]
+      Marshal.load(bin)
+    rescue EncodingError => e # older Rubies, for a symbol in a bad encoding
+      raise ArgumentError, "bad marshal encoding: #{e.message}"
+    end
 
-      pos
-    when '"' # string
-      text, pos = LNet.marshal_string(bin, pos)
-      seen['objects'].push(text)
-      pos
-    when 'f' # float
-      seen['objects'].push(true)
-      LNet.marshal_string(bin, pos)[1]
-    when 'l' # bignum: sign, length in 16-bit words, digits
-      raise ArgumentError, 'bad bignum sign' unless ['+', '-'].include?(bin.byteslice(pos, 1))
+    MAX_DEPTH = 32
+    # Most values a payload may hold once its links are followed (and at most
+    # 64 per byte of payload), so shared parts can't blow up into a huge tree.
+    MAX_VALUES = 2_000_000
+    # Longest bignum accepted, in 16-bit words (256 bits; LNet's numbers fit
+    # in 64).
+    MAX_BIGNUM_WORDS = 16
+    # Most bytes of strings and symbols a payload may hold once its links are
+    # followed (and at most 64 per byte of payload, plus 64 KB).
+    MAX_BYTES = 8_000_000
 
-      seen['objects'].push(true)
-      len, pos = LNet.marshal_long(bin, pos + 1)
-      LNet.marshal_skip(bin, pos, len * 2)
-    when '[', '{', '}' # array, hash, hash with default value
-      index = seen['objects'].length
-      seen['objects'].push(false)
-      len, pos = LNet.marshal_count(bin, pos)
-      len *= 2 unless type.chr == '['
-      len += 1 if type.chr == '}'
-      len.times { pos = LNet.marshal_check(bin, pos, depth + 1, seen) }
-      seen['objects'][index] = true
-      pos
-    when 'I' # a string or symbol followed by its encoding
-      case bin.byteslice(pos, 1)
-      when '"'
-        text, pos = LNet.marshal_string(bin, pos + 1)
+    # seen mirrors Marshal.load's link tables: 'objects' has one entry per
+    # linkable object (false while an array/hash is still being read, the text
+    # of a string, true otherwise), 'symbols' the name of each symbol read,
+    # 'sizes' how many values each array/hash holds (for links), 'values' how
+    # many values the payload has expanded to so far, and 'byte_sizes' and
+    # 'bytes' the same in bytes of text
+    def check_value(bin, pos, depth, seen)
+      raise ArgumentError, 'marshal data nested too deep' if depth > MAX_DEPTH
+
+      seen['values'] += 1
+      raise ArgumentError, 'marshal data expands too far' if seen['values'] > seen['limit']
+
+      type = bin.getbyte(pos) or raise ArgumentError, 'truncated marshal data'
+      pos += 1
+      case type.chr
+      when '0', 'T', 'F'
+        pos
+      when 'i'
+        read_long(bin, pos)[1]
+      when ':', ';'
+        name, pos = read_symbol(bin, pos - 1, seen)
+        add_bytes(seen, name.bytesize)
+        pos
+      when '@' # link to an earlier object
+        index, pos = read_long(bin, pos)
+        raise ArgumentError, 'bad or circular marshal link' unless index >= 0 and seen['objects'][index]
+
+        seen['values'] += seen['sizes'][index].to_i
+        raise ArgumentError, 'marshal data expands too far' if seen['values'] > seen['limit']
+
+        add_bytes(seen, seen['byte_sizes'][index].to_i)
+        pos
+      when '"' # string
+        text, pos = read_string(bin, pos)
+        seen['byte_sizes'][seen['objects'].length] = text.bytesize
         seen['objects'].push(text)
-      when ':'
-        pos = LNet.marshal_symbol(bin, pos, seen)[1]
-      else
-        raise ArgumentError, 'instance variables on unsupported type'
-      end
-      len, pos = LNet.marshal_count(bin, pos)
-      len.times {
-        raise ArgumentError, 'bad instance variable name' unless [':', ';'].include?(bin.byteslice(pos, 1))
+        add_bytes(seen, text.bytesize)
+        pos
+      when 'f' # float
+        seen['objects'].push(true)
+        read_string(bin, pos)[1]
+      when 'l' # bignum: sign, length in 16-bit words, digits
+        raise ArgumentError, 'bad bignum sign' unless ['+', '-'].include?(bin.byteslice(pos, 1))
 
-        name, pos = LNet.marshal_symbol(bin, pos, seen)
-        value = bin.byteslice(pos, 1)
-        if name == 'E' and ['T', 'F'].include?(value)
-          pos += 1
-        elsif name == 'encoding' and value == '"'
-          encoding, pos = LNet.marshal_string(bin, pos + 1)
-          seen['objects'].push(encoding)
-          Encoding.find(encoding)
-        elsif name == 'encoding' and value == '@' # the same encoding name as an earlier string
-          index, pos = LNet.marshal_long(bin, pos + 1)
-          encoding = seen['objects'][index] if index >= 0
-          raise ArgumentError, 'bad marshal encoding link' unless encoding.is_a?(String)
+        seen['objects'].push(true)
+        len, pos = read_long(bin, pos + 1)
+        raise ArgumentError, 'marshal bignum too long' if len > MAX_BIGNUM_WORDS
 
-          Encoding.find(encoding)
+        skip_bytes(bin, pos, len * 2)
+      when '[', '{', '}' # array, hash, hash with default value
+        index = seen['objects'].length
+        seen['objects'].push(false)
+        before = seen['values']
+        before_bytes = seen['bytes']
+        len, pos = read_count(bin, pos)
+        len *= 2 unless type.chr == '['
+        len += 1 if type.chr == '}'
+        len.times { pos = check_value(bin, pos, depth + 1, seen) }
+        seen['objects'][index] = true
+        seen['sizes'][index] = seen['values'] - before
+        seen['byte_sizes'][index] = seen['bytes'] - before_bytes
+        pos
+      when 'I' # a string or symbol followed by its encoding
+        case bin.byteslice(pos, 1)
+        when '"'
+          text, pos = read_string(bin, pos + 1)
+          seen['byte_sizes'][seen['objects'].length] = text.bytesize
+          seen['objects'].push(text)
+          add_bytes(seen, text.bytesize)
+        when ':'
+          name, pos = read_symbol(bin, pos, seen)
+          add_bytes(seen, name.bytesize)
         else
-          raise ArgumentError, "refusing instance variable #{name.inspect}"
+          raise ArgumentError, 'instance variables on unsupported type'
         end
-      }
-      pos
-    else
-      raise ArgumentError, "refusing to load marshal type #{type.chr.inspect}"
+        len, pos = read_count(bin, pos)
+        len.times {
+          raise ArgumentError, 'bad instance variable name' unless [':', ';'].include?(bin.byteslice(pos, 1))
+
+          name, pos = read_symbol(bin, pos, seen)
+          value = bin.byteslice(pos, 1)
+          if name == 'E' and ['T', 'F'].include?(value)
+            pos += 1
+          elsif name == 'encoding' and value == '"'
+            encoding, pos = read_string(bin, pos + 1)
+            seen['objects'].push(encoding)
+            Encoding.find(encoding)
+          elsif name == 'encoding' and value == '@' # the same encoding name as an earlier string
+            index, pos = read_long(bin, pos + 1)
+            encoding = seen['objects'][index] if index >= 0
+            raise ArgumentError, 'bad marshal encoding link' unless encoding.is_a?(String)
+
+            Encoding.find(encoding)
+          else
+            raise ArgumentError, "refusing instance variable #{name.inspect}"
+          end
+        }
+        pos
+      else
+        raise ArgumentError, "refusing to load marshal type #{type.chr.inspect}"
+      end
+    end
+
+    # Counts text a payload holds, links included, and refuses it past its
+    # byte limit.
+    #
+    # @param seen [Hash] see #check_value
+    # @param count [Integer] bytes to add
+    # @return [void]
+    # @raise [ArgumentError] past the limit
+    def add_bytes(seen, count)
+      seen['bytes'] += count
+      raise ArgumentError, 'marshal data expands too far' if seen['bytes'] > seen['byte_limit']
+    end
+
+    def read_long(bin, pos)
+      c = bin.getbyte(pos) or raise ArgumentError, 'truncated marshal data'
+      c -= 256 if c > 127
+      pos += 1
+      return [0, pos] if c == 0
+      return [c - 5, pos] if c > 4
+      return [c + 5, pos] if c < -4
+
+      n = c.abs
+      raise ArgumentError, 'truncated marshal data' if pos + n > bin.bytesize
+
+      x = 0
+      n.times { |i| x |= bin.getbyte(pos + i) << (8 * i) }
+      x -= 256**n if c < 0
+      [x, pos + n]
+    end
+
+    # a length-prefixed element count that the remaining bytes could hold
+    def read_count(bin, pos)
+      len, pos = read_long(bin, pos)
+      raise ArgumentError, 'bad marshal length' if len < 0 or len > bin.bytesize - pos
+
+      [len, pos]
+    end
+
+    def read_string(bin, pos)
+      len, pos = read_long(bin, pos)
+      [bin.byteslice(pos, len), skip_bytes(bin, pos, len)]
+    end
+
+    # a ':' symbol or ';' symbol link starting at pos; returns its name
+    def read_symbol(bin, pos, seen)
+      if bin.byteslice(pos, 1) == ';'
+        index, pos = read_long(bin, pos + 1)
+        raise ArgumentError, 'bad marshal symbol link' unless index >= 0 and index < seen['symbols'].length
+
+        [seen['symbols'][index], pos]
+      else
+        name, pos = read_string(bin, pos + 1)
+        seen['symbols'].push(name)
+        [name, pos]
+      end
+    end
+
+    def skip_bytes(bin, pos, len)
+      raise ArgumentError, 'bad marshal length' if len < 0 or pos + len > bin.bytesize
+
+      pos + len
     end
   end
 
-  def LNet.marshal_long(bin, pos)
-    c = bin.getbyte(pos) or raise ArgumentError, 'truncated marshal data'
-    c -= 256 if c > 127
-    pos += 1
-    return [0, pos] if c == 0
-    return [c - 5, pos] if c > 4
-    return [c + 5, pos] if c < -4
-
-    n = c.abs
-    raise ArgumentError, 'truncated marshal data' if pos + n > bin.bytesize
-
-    x = 0
-    n.times { |i| x |= bin.getbyte(pos + i) << (8 * i) }
-    x -= 256**n if c < 0
-    [x, pos + n]
-  end
-
-  # a length-prefixed element count that the remaining bytes could hold
-  def LNet.marshal_count(bin, pos)
-    len, pos = LNet.marshal_long(bin, pos)
-    raise ArgumentError, 'bad marshal length' if len < 0 or len > bin.bytesize - pos
-
-    [len, pos]
-  end
-
-  def LNet.marshal_string(bin, pos)
-    len, pos = LNet.marshal_long(bin, pos)
-    [bin.byteslice(pos, len), LNet.marshal_skip(bin, pos, len)]
-  end
-
-  # a ':' symbol or ';' symbol link starting at pos; returns its name
-  def LNet.marshal_symbol(bin, pos, seen)
-    if bin.byteslice(pos, 1) == ';'
-      index, pos = LNet.marshal_long(bin, pos + 1)
-      raise ArgumentError, 'bad marshal symbol link' unless index >= 0 and index < seen['symbols'].length
-
-      [seen['symbols'][index], pos]
-    else
-      name, pos = LNet.marshal_string(bin, pos + 1)
-      seen['symbols'].push(name)
-      [name, pos]
-    end
-  end
-
-  def LNet.marshal_skip(bin, pos, len)
-    raise ArgumentError, 'bad marshal length' if len < 0 or pos + len > bin.bytesize
-
-    pos + len
+  # @param bin [String] a Marshal stream
+  # @return [Object] the plain data it holds
+  # @raise [ArgumentError] see SafeMarshal.load
+  def LNet.safe_unmarshal(bin)
+    SafeMarshal.load(bin)
   end
 
   # @param channel [String]
@@ -1234,7 +1317,7 @@ class LNet
           waiter = @@waiting.find { |w| (@active_attributes.last['from'] =~ /^#{Regexp.escape(w['name'])}/i) and (w['type'] == @active_attributes.last['type']) and w['data'] == :waiting }
         end
         begin
-          data = LNet.safe_unmarshal(text.unpack('m').first)
+          data = SafeMarshal.decode(text)
         rescue
           echo "ignored #{@active_attributes.last['type']} data from #{@active_attributes.last['from']} that contained something other than plain values (#{$!.message})"
           # fail the waiting request now rather than letting it time out
