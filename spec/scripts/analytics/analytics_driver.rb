@@ -1066,10 +1066,32 @@ when 'bounty_progress'
   task.call(:cull, 'kobold', 'Icemule', 2)
   manager.send(:check_task)
   steps << last.call
+  # Done: on the way back to the guard and the taskmaster, nothing is left
+  task.call(:guard, '', '', nil)
+  manager.send(:check_task)
+  steps << last.call
   task.call(:taskmaster, '', '', nil)
   manager.send(:check_task)
+  steps << last.call
   manager.send(:handle_reward, 907, 1000, 9070)
   steps << last.call
+
+  # Five killed before the hunt script started still count as done
+  manager.send(:clear_tracking)
+  $running = []
+  task.call(:cull, 'troll', 'Wehnimer', 20)
+  manager.send(:check_task)
+  task.call(:cull, 'troll', 'Wehnimer', 15)
+  manager.send(:check_task)
+  $running = ['bigshot']
+  manager.send(:check_task)
+  before_hunt = [last.call]
+  task.call(:cull, 'troll', 'Wehnimer', 14)
+  manager.send(:check_task)
+  before_hunt << last.call
+  task.call(:none, '', '', nil)
+  manager.send(:check_task)
+  manager.send(:clear_tracking)
 
   # A gem task worked in town and turned in without a hunt: the count asked
   # for is the first one seen, not the last
@@ -1081,7 +1103,7 @@ when 'bounty_progress'
   task.call(:taskmaster, '', '', nil)
   manager.send(:check_task)
   manager.send(:handle_reward, 1050, 1000, 5130)
-  result = { 'cull' => steps, 'town_gem' => last.call }
+  result = { 'cull' => steps, 'before_hunt' => before_hunt, 'town_gem' => last.call }
 
 when 'sessions'
   # A day's session is open while the collector runs and closed when it stops

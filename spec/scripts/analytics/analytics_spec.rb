@@ -175,8 +175,14 @@ RSpec.describe 'analytics.lic' do
   describe 'bounty progress' do
     subject(:progress) { result('bounty_progress') }
 
-    it 'counts what is done from the task\'s remaining count, across a restart, and all of it on the reward' do
-      expect(progress['cull']).to eq([[11, 0, 'active'], [11, 4, 'active'], [11, 9, 'active'], [11, 11, 'completed']])
+    it 'counts what is done from the task\'s remaining count, across a restart, all of it once done, and on the reward' do
+      expect(progress['cull']).to eq(
+        [[11, 0, 'active'], [11, 4, 'active'], [11, 9, 'active'], [11, 11, 'active'], [11, 11, 'active'], [11, 11, 'completed']]
+      )
+    end
+
+    it 'counts kills made before the hunt script started' do
+      expect(progress['before_hunt']).to eq([[20, 5, 'active'], [20, 6, 'active']])
     end
 
     it 'keeps the first count seen for a task finished in town' do
