@@ -36,7 +36,8 @@ module LnetSpec
   # what an example needs.
   module Game
     class << self
-      attr_accessor :infomon, :status, :bounty, :active_spells, :pcs, :npcs, :loot, :room, :scripts, :running, :started
+      attr_accessor :infomon, :status, :bounty, :active_spells, :pcs, :npcs, :loot, :room, :scripts, :running, :started,
+                    :spell_book, :map_rooms
 
       def reset!
         @infomon = {}
@@ -50,13 +51,21 @@ module LnetSpec
         @scripts = []
         @running = []
         @started = []
+        @spell_book = {}
+        @map_rooms = []
       end
     end
   end
 
   Obj = Struct.new(:name, :status)
   ActiveSpell = Struct.new(:num, :timeleft)
-  MapRoom = Struct.new(:id)
+  MapRoom = Struct.new(:id, :title, :desc, :paths)
+  SpellInfo = Struct.new(:circlename, :name)
+
+  # lich-5's real Numeric#as_time (and nothing else from that file), which
+  # the spells display calls.
+  AS_TIME = read_lich5_source('lib/common/class_exts/numeric.rb').to_s[/^  def as_time\n.*?^  end\n/m]
+  Numeric.class_eval(AS_TIME) if AS_TIME && !0.respond_to?(:as_time)
 
   # Lich's bare status checks, and what in LnetSpec::Game.status makes each true.
   STATUS_CHECKS = {
@@ -118,6 +127,12 @@ module LnetSpec
 
     module Spell
       def self.active = Game.active_spells
+      def self.[](num) = Game.spell_book[num.to_s]
+    end
+
+    module Map
+      def self.list = Game.map_rooms
+      def self.[](id) = Game.map_rooms.find { |room| room.id == id }
     end
 
     module GameObj
@@ -315,6 +330,7 @@ module LnetSpec
     Game.reset!
     Harness::XMLData.name = 'Tester'
     Harness::XMLData.game = 'GSIV'
+    $clean_lich_char = ';'
     OUTPUT.clear
   end
 end
@@ -322,4 +338,12 @@ end
 RSpec.configure do |config|
   config.include LnetSpec::Helpers, file_path: %r{spec/scripts/lnet/}
   config.before(file_path: %r{spec/scripts/lnet/}) { LnetSpec.reset! }
+  # reset! sets these Lich globals; put them back for every other spec
+  config.around(file_path: %r{spec/scripts/lnet/}) do |example|
+    saved = [$clean_lich_char, $lich_char, $frontend]
+    $frontend = nil
+    example.run
+  ensure
+    $clean_lich_char, $lich_char, $frontend = saved
+  end
 end
