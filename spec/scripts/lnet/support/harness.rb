@@ -32,9 +32,42 @@ module LnetSpec
     OUTPUT.dup
   end
 
-  # Defines the Lich output calls on mod and every class or module nested in
-  # it, so whichever one the script calls is recorded.
-  def self.record_output!(mod, seen = Set.new)
+  # Game state the stubs below read. Reset before every example; set only
+  # what an example needs.
+  module Game
+    class << self
+      attr_accessor :infomon, :status, :bounty, :active_spells, :pcs, :npcs, :loot, :room, :scripts, :running, :started
+
+      def reset!
+        @infomon = {}
+        @status = []
+        @bounty = nil
+        @active_spells = []
+        @pcs = []
+        @npcs = []
+        @loot = []
+        @room = nil
+        @scripts = []
+        @running = []
+        @started = []
+      end
+    end
+  end
+
+  Obj = Struct.new(:name, :status)
+  ActiveSpell = Struct.new(:num, :timeleft)
+  MapRoom = Struct.new(:id)
+
+  # Lich's bare status checks, and what in LnetSpec::Game.status makes each true.
+  STATUS_CHECKS = {
+    hidden?: :hidden, invisible?: :invisible, dead?: :dead, webbed?: :webbed, stunned?: :stunned,
+    kneeling?: :kneeling, sitting?: :sitting
+  }.freeze
+
+  # Defines the Lich calls the script makes without a receiver (output,
+  # status checks, checkbounty) on mod and every class or module nested in
+  # it, so whichever one the script calls is recorded or answered from Game.
+  def self.install_globals!(mod, seen = Set.new)
     return unless seen.add?(mod)
 
     [mod, mod.singleton_class].each do |target|
@@ -42,32 +75,83 @@ module LnetSpec
         define_method(:echo) { |*args| OUTPUT << [:echo, *args] }
         define_method(:respond) { |*args| OUTPUT << [:respond, *args] }
         define_method(:_respond) { |*args| OUTPUT << [:_respond, *args] }
+        STATUS_CHECKS.each { |check, flag| define_method(check) { Game.status.include?(flag) } }
+        define_method(:standing?) { !Game.status.intersect?(%i[kneeling sitting lying]) }
+        define_method(:checkbounty) { Game.bounty }
       end
     end
     mod.constants(false).each do |name|
       value = mod.const_get(name, false)
-      record_output!(value, seen) if value.is_a?(Module) && value.name&.start_with?(mod.name)
+      install_globals!(value, seen) if value.is_a?(Module) && value.name&.start_with?(mod.name)
     end
   end
+
+  # lich-5's real GemStone Skills, Spells and Stats, backed by a fake
+  # Infomon, so the responders are checked against the method names Lich
+  # actually has. Empty when no lich-5 checkout is available.
+  GEMSTONE = Module.new
+  ATTRIBUTE_SOURCES = %w[skills spells stats].to_h { |name| [name, read_lich5_source("lib/attributes/#{name}.rb")] }
+
+  # @return [Boolean] whether lich-5's attribute modules could be loaded
+  def self.lich5_attributes? = ATTRIBUTE_SOURCES.values.all?
 
   module Harness
     module Script
       def self.new_downstream(line) = OUTPUT << [:downstream, line]
       def self.new_downstream_xml(line) = OUTPUT << [:downstream_xml, line]
+      def self.exists?(name) = Game.scripts.include?(name)
+      def self.running?(name) = Game.running.include?(name)
+      def self.start(name, *args) = Game.started << [name, *args]
     end
 
     # Game state the script reads; set what an example needs.
     module XMLData
       class << self
-        attr_accessor :name, :game
+        attr_accessor :name, :game, :level, :exp, :mana, :room_title, :room_description, :room_exits_string,
+                      :injuries, :health, :max_health, :spirit, :max_spirit, :stamina, :max_stamina
       end
+    end
+
+    module Char
+      def self.name = XMLData.name
+    end
+
+    module Spell
+      def self.active = Game.active_spells
+    end
+
+    module GameObj
+      def self.pcs = Game.pcs
+      def self.npcs = Game.npcs
+      def self.loot = Game.loot
+    end
+
+    module Room
+      def self.current = Game.room
+    end
+
+    if LnetSpec.lich5_attributes?
+      GEMSTONE.const_set(:XMLData, XMLData)
+      GEMSTONE.module_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+        module Lich
+          module Gemstone
+            module Infomon
+              def self.get(key) = LnetSpec::Game.infomon[key]
+            end
+          end
+        end
+      RUBY
+      ATTRIBUTE_SOURCES.each { |name, source| GEMSTONE.module_eval(source, "lich-5/lib/attributes/#{name}.rb") }
+      Skills = GEMSTONE::Lich::Gemstone::Skills
+      Spells = GEMSTONE::Lich::Gemstone::Spells
+      Stats = GEMSTONE::Lich::Gemstone::Stats
     end
 
     body = extract_from_source(LnetSpec::SOURCE, /^class LNet\n.*?^end\n/m, label: 'class LNet', source_path: LnetSpec::SOURCE_PATH)
     assert_parses!(body, label: 'class LNet', source_path: LnetSpec::SOURCE_PATH)
     module_eval(body, LnetSpec::SOURCE_PATH, LnetSpec::SOURCE[0...LnetSpec::SOURCE.index(body)].count("\n") + 1)
   end
-  record_output!(Harness::LNet)
+  install_globals!(Harness::LNet)
 
   # Evaluates the LNet class again, as running lnet a second time in one
   # Lich session does: class variables survive, constants are defined anew.
@@ -81,6 +165,46 @@ module LnetSpec
   class FakeClient
     def puts(line) = OUTPUT << [:client, line]
   end
+
+  # Records what the script writes; can be told to fail, or to write slowly
+  # one character at a time so unsynchronised writers would interleave.
+  class FakeServer
+    attr_reader :lines, :written
+
+    def initialize(fail_with: nil, slow: false, incoming: [])
+      @fail_with = fail_with
+      @slow = slow
+      @incoming = incoming.dup
+      @lines = []
+      @written = +''
+      @closed = false
+    end
+
+    def puts(text)
+      raise @fail_with if @fail_with
+
+      if @slow
+        "#{text}\n".each_char do |char|
+          @written << char
+          Thread.pass
+        end
+      else
+        @lines << text
+      end
+    end
+
+    def readpartial(_max)
+      raise IOError, 'closed stream' if @closed
+      raise EOFError if @incoming.empty?
+
+      item = @incoming.shift
+      item.is_a?(Exception) ? raise(item) : item
+    end
+
+    def closed? = @closed
+    def close = @closed = true
+  end
+
 
   # A stream listener that records the events it is given.
   class EventLog
@@ -186,8 +310,9 @@ module LnetSpec
   def self.reset!
     lnet = Harness::LNet
     { server: nil, server_restart: false, last_send: Time.now, last_recv: Time.now, last_priv: nil,
-      secret: [], waiting: [], alias: {}, options: { 'ignore' => [], 'friends' => [], 'enemies' => [], 'permission' => {} } }
+      secret: [], waiting: [], alias: {}, callbacks: {}, last_safe_send: nil, options: { 'ignore' => [], 'friends' => [], 'enemies' => [], 'permission' => {} } }
       .each { |name, value| lnet.class_variable_set(:"@@#{name}", value) }
+    Game.reset!
     Harness::XMLData.name = 'Tester'
     Harness::XMLData.game = 'GSIV'
     OUTPUT.clear

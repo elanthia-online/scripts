@@ -7,45 +7,6 @@ require_relative 'support/tls'
 # local TLS server and a throwaway CA pinned in place of LNet's), writing to
 # the server from several threads, keepalives and the reconnect loop.
 RSpec.describe 'lnet.lic connection' do
-  # Records what the script writes; can be told to fail, or to write slowly
-  # one character at a time so unsynchronised writers would interleave.
-  class FakeServer
-    attr_reader :lines, :written
-
-    def initialize(fail_with: nil, slow: false, incoming: [])
-      @fail_with = fail_with
-      @slow = slow
-      @incoming = incoming.dup
-      @lines = []
-      @written = +''
-      @closed = false
-    end
-
-    def puts(text)
-      raise @fail_with if @fail_with
-
-      if @slow
-        "#{text}\n".each_char do |char|
-          @written << char
-          Thread.pass
-        end
-      else
-        @lines << text
-      end
-    end
-
-    def readpartial(_max)
-      raise IOError, 'closed stream' if @closed
-      raise EOFError if @incoming.empty?
-
-      item = @incoming.shift
-      item.is_a?(Exception) ? raise(item) : item
-    end
-
-    def closed? = @closed
-    def close = @closed = true
-  end
-
   let(:authority) { LnetSpec::TLS.authority }
 
   def serve(common_name, replies: [], handshake: true, authority: self.authority)
@@ -139,7 +100,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'closes the socket when the login cannot be written' do
-      socket = FakeServer.new(fail_with: Errno::EPIPE)
+      socket = LnetSpec::FakeServer.new(fail_with: Errno::EPIPE)
       allow(socket).to receive(:peer_cert).and_return(LnetSpec::TLS.issue(authority, 'LichNet')[1])
       allow(lnet).to receive(:open_tls).and_return(socket)
       expect(lnet.connect).to be(false)
@@ -148,7 +109,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'publishes the connection only after the login is written' do
-      socket = FakeServer.new
+      socket = LnetSpec::FakeServer.new
       allow(socket).to receive(:peer_cert).and_return(LnetSpec::TLS.issue(authority, 'LichNet')[1])
       seen = []
       allow(socket).to receive(:puts).and_wrap_original { |original, text| seen << lnet.connected?; original.call(text) }
@@ -160,7 +121,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'closes the previous connection first' do
-      old = FakeServer.new
+      old = LnetSpec::FakeServer.new
       lnet.server = old
       allow(lnet).to receive(:open_tls).and_raise(Errno::ECONNREFUSED)
       lnet.connect
@@ -196,7 +157,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'returns false on a closed connection and does not count it as sent' do
-      lnet.server = FakeServer.new.tap(&:close)
+      lnet.server = LnetSpec::FakeServer.new.tap(&:close)
       before = lnet.last_send
       expect(lnet.send_query({ 'type' => 'connected' })).to be(false)
       expect(lnet.last_send).to eq(before)
@@ -204,7 +165,7 @@ RSpec.describe 'lnet.lic connection' do
 
     [Errno::EPIPE, Errno::ECONNRESET, IOError.new('closed stream'), OpenSSL::SSL::SSLError.new('bad record')].each do |error|
       it "drops the connection instead of raising when a write fails with #{error.inspect}" do
-        socket = FakeServer.new(fail_with: error)
+        socket = LnetSpec::FakeServer.new(fail_with: error)
         lnet.server = socket
         expect(lnet.send_request({ 'type' => 'info', 'to' => 'Bob' })).to be(false)
         expect(socket.closed?).to be(true)
@@ -213,8 +174,8 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'does not close a newer connection when a write on an older one fails' do
-      old = FakeServer.new(fail_with: Errno::EPIPE)
-      newer = FakeServer.new
+      old = LnetSpec::FakeServer.new(fail_with: Errno::EPIPE)
+      newer = LnetSpec::FakeServer.new
       allow(old).to receive(:puts) do
         lnet.server = newer # the connection thread reconnected mid-write
         raise Errno::EPIPE
@@ -226,7 +187,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'keeps the closed socket, so LNet.server.closed? shows the disconnect to other scripts' do
-      socket = FakeServer.new(fail_with: Errno::EPIPE)
+      socket = LnetSpec::FakeServer.new(fail_with: Errno::EPIPE)
       lnet.server = socket
       lnet.send_ping
       expect(lnet.server).to be(socket)
@@ -234,7 +195,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'never interleaves writes from different threads' do
-      socket = FakeServer.new(slow: true)
+      socket = LnetSpec::FakeServer.new(slow: true)
       lnet.server = socket
       threads = Array.new(6) do |t|
         Thread.new { 25.times { |i| lnet.send_message({ 'type' => 'channel' }, "thread #{t} message #{i}") } }
@@ -246,7 +207,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'leaves out nil attributes and writes other values as text' do
-      socket = FakeServer.new
+      socket = LnetSpec::FakeServer.new
       lnet.server = socket
       lnet.send_element('admin', { 'action' => 'create poll', 'length' => 3600, 'skip' => nil }, 'a < b')
       expect(socket.lines).to eq([%(<admin action='create poll' length='3600'>a &lt; b</admin>)])
@@ -257,7 +218,7 @@ RSpec.describe 'lnet.lic connection' do
     let(:now) { Time.now }
 
     it 'pings after 50 quiet seconds and checks again in 50' do
-      socket = FakeServer.new
+      socket = LnetSpec::FakeServer.new
       lnet.server = socket
       lnet.class_variable_set(:@@last_send, now - 50)
       expect(lnet.keepalive_tick(now)).to eq(50)
@@ -265,7 +226,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'waits out the rest of the interval when something was sent recently' do
-      lnet.server = FakeServer.new
+      lnet.server = LnetSpec::FakeServer.new
       lnet.class_variable_set(:@@last_send, now - 10)
       expect(lnet.keepalive_tick(now)).to eq(40)
     end
@@ -315,7 +276,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'hands everything the server sends to the listener until it hangs up, then disconnects' do
-      socket = FakeServer.new(incoming: ['<pi', "ng/>\n<ping/>"])
+      socket = LnetSpec::FakeServer.new(incoming: ['<pi', "ng/>\n<ping/>"])
       allow(lnet).to receive(:connect) do
         lnet.server = socket
         true
@@ -327,7 +288,7 @@ RSpec.describe 'lnet.lic connection' do
     end
 
     it 'ends the session quietly when the connection is reset' do
-      socket = FakeServer.new(incoming: ['<ping/>', Errno::ECONNRESET.new])
+      socket = LnetSpec::FakeServer.new(incoming: ['<ping/>', Errno::ECONNRESET.new])
       allow(lnet).to receive(:connect) do
         lnet.server = socket
         true
