@@ -11,7 +11,7 @@
             author: Tysong (horibu on PC)
               game: Gemstone
               tags: analytics, dashboard, hunting, silver, bounty, discord
-          required: Lich >= 5.22.0
+          required: Lich >= 5.23.0
            version: 1.0.0
 
   Usage (run the collector once on every character you want tracked):
@@ -34,6 +34,11 @@
   Silver in the reports comes from bank balances. Box, sale and bounty silver
   (silver_events), item sales (item_sales) and vendor visits (vendor_visits)
   are also stored, for your own SQL queries; no report shows them yet.
+  Creature silver counts only what a corpse had when you searched it; coins
+  picked up off the floor show up only in the bank balance.
+
+  Fame is only as fresh as the last EXPERIENCE output Lich saw. Have your
+  rest script run EXPERIENCE (or ;xp) if you want fame per hunt and rest.
 
   Hooks for your own rest and selling scripts (all optional):
     GS4Analytics::SilverManager.take_snapshot
@@ -608,6 +613,23 @@ module GS4Analytics
         end
       end
 
+      # A day's session is open while the collector runs. Starting again the
+      # same day reopens it; one from an earlier day still open was left by a
+      # crash and closes at the end of its last cycle.
+      def open_session(who, session_id)
+        db[:sessions].where(session_id: session_id).update(end_time: nil, status: 'active')
+        db[:sessions].where(game: who.game, character: who.name, status: 'active').exclude(session_id: session_id)
+                     .select_map(%i[session_id start_time]).each do |id, start|
+          last = db[:cycles].where(session_id: id).max(:end_time)
+          end_session(id, last || start)
+        end
+      end
+
+      # Closed when the collector stops, or at midnight when the day ends
+      def end_session(session_id, at)
+        db[:sessions].where(session_id: session_id).update(end_time: at, status: 'ended')
+      end
+
       # +id+ and +at+ are taken when the cycle starts, so a write that waits
       # for a busy database still records the real start
       def start_cycle(who, session_id, type, trigger, profile, vitals, id: new_id, at: Time.now.to_i)
@@ -666,14 +688,16 @@ module GS4Analytics
 
       # ----- kills and silver ------------------------------------------------
 
-      def record_kill(who, creature, profile, silver)
+      # +at+ is when the corpse was searched, so a kill whose write waits
+      # still lands on the right day
+      def record_kill(who, creature, profile, silver, at: Time.now.to_i)
         kills = Sequel[:kill_stats]
         db[:kill_stats].insert_conflict(
           target: %i[game character date profile creature],
           update: { kill_count: kills[:kill_count] + 1, total_silver: kills[:total_silver] + Sequel[:excluded][:total_silver],
                     last_kill_at: Sequel[:excluded][:last_kill_at] }
-        ).insert(clean(game: who.game, character: who.name, date: Date.today.to_s, profile: profile.to_s,
-                       creature: creature, kill_count: 1, total_silver: silver.to_i, last_kill_at: Time.now.to_i))
+        ).insert(clean(game: who.game, character: who.name, date: Time.at(at).to_date.to_s, profile: profile.to_s,
+                       creature: creature, kill_count: 1, total_silver: silver.to_i, last_kill_at: at))
       end
 
       # category: 'box', 'sale' or 'bounty'
@@ -707,9 +731,17 @@ module GS4Analytics
         id
       end
 
+      # A completed bounty has done everything it needed
       def complete_bounty(bounty_id, silver, exp, bp, at: Time.now.to_i)
         db[:bounties].where(bounty_id: bounty_id).update(status: 'completed', completed_time: at,
-                                                         silver_reward: silver, exp_reward: exp, bp_reward: bp)
+                                                         silver_reward: silver, exp_reward: exp, bp_reward: bp,
+                                                         count_completed: Sequel.function(:coalesce, :count_required,
+                                                                                          :count_completed))
+      end
+
+      # How many of the kills or items a bounty asks for are done so far
+      def bounty_progress(bounty_id, done)
+        db[:bounties].where(bounty_id: bounty_id, status: 'active').update(count_completed: done)
       end
 
       def abandon_bounty(bounty_id)
@@ -803,8 +835,9 @@ module GS4Analytics
       end
 
       # The writer and readers both open through Lich's helper, which gives
-      # every connection its busy handling: a lock wait that lets the rest of
-      # the process run and holds back a ;kill until SQLite returns. Readers
+      # every connection its busy handling: since Lich 5.23.0 (the version
+      # this script requires), a lock wait that lets the rest of the process
+      # run and holds back a ;kill until SQLite returns. Readers
       # need it too. With no collector running, the dashboard reads from its
       # request threads, and on Windows a kill that lands in a plain
       # connection's lock wait can leave that connection stuck, so closing it
@@ -1120,11 +1153,19 @@ module GS4Analytics
     # "<vendor> takes your <item>, ... hands you N silver ..." (also "takes the <item>"),
     # or "... hands you a Vornavis promissory note for N silvers" when the vendor is short
     SALE_RE    = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), .*?\bhands you (?:an? [^,]*?promissory note for )?(?<amount>[\d,]+) silvers?/
-    # A gem pouch: paid with the pouch ("along with N silver"), or with a note
-    # given on the next line
-    POUCH_RE   = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), inspects the contents carefully, and removes the gems (?:she|he) is interested in\.\s+(?:She|He) hands it back to \S+?(?:, along with (?<amount>[\d,]+) silvers?| and says, .*promissory note)/
+    # A gem pouch or other container bought from: paid with the container
+    # ("along with N silver"), or with a note given on the next line.
+    # "Ragnoz takes the silk cloak, inspects the contents carefully and removes
+    # the item he is interested in.  Ragnoz hands it back to you, along with 819 silver."
+    POUCH_RE   = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), inspects the contents carefully,? and removes the (?<what>gems|items?) (?:she|he) (?:is|are) interested in\.\s+.+? hands it back to you(?:, along with (?<amount>[\d,]+) silvers?| and says, .*promissory note)/
     POUCH_NOTE_RE = /\A(?:The )?(?<vendor>[^,]+?) removes the gems and hands you an? [^,]*?promissory note for (?<amount>[\d,]+) silvers?/
     NOUN_RE    = /takes (?:your|the) <a [^>]*noun="([^"]+)"/
+    # A vendor short of coin pays with a note it writes out, two lines after
+    # the offer: "You offer to sell your veil iron shield to Walsor Gryhm." ...
+    # "He scribbles out a Vornavis promissory note for 23,760 silvers and hands it to you."
+    OFFER_RE   = /You offer to sell your (?<item>.+?) to (?:the )?(?<vendor>[^.]+)\.\s*\z/
+    OFFER_NOUN_RE = /sell your <a [^>]*noun="([^"]+)"/
+    SCRIBBLE_RE = /\A(?:He|She) scribbles out an? [^,]*?promissory note for (?<amount>[\d,]+) silvers? and hands it to you/
     # Teller lines: [amount moved, the balance of this bank afterwards]
     DEPOSIT_RE = /You deposit ([\d,]+) silvers? into your account\..*?brings your total to ([\d,]+) silvers?/
     WITHDRAW_RE = /hands you ([\d,]+) silvers?, and says, "This brings your total to ([\d,]+) silvers?/
@@ -1148,6 +1189,7 @@ module GS4Analytics
         @snapshotting = false
         @teller = nil
         @pouch = nil
+        @offer = nil
         DownstreamHook.remove(HOOK)
         DownstreamHook.add(HOOK, proc { |line| on_line(line) })
       end
@@ -1261,8 +1303,8 @@ module GS4Analytics
         text = line.gsub(TAGS, '')
         if (found = text.match(SEARCH_RE))
           flush_kill
-          @kill = { creature: found[1].strip, silver: 0 }
           @last_kill_at = Time.now.to_i
+          @kill = { creature: found[1].strip, silver: 0, at: @last_kill_at }
         elsif @kill && (found = text.match(SILVER_RE))
           @kill[:silver] = digits(found[1])
         elsif @kill && line.match?(PROMPT_RE)
@@ -1291,15 +1333,23 @@ module GS4Analytics
           record_sale(found[:vendor], found[:item], line[NOUN_RE, 1], digits(found[:amount]))
         elsif (found = text.match(POUCH_RE))
           noun = line[NOUN_RE, 1]
+          item = "#{found[:what]} from #{found[:item].strip}"
           if found[:amount]
-            record_sale(found[:vendor], "gems from #{found[:item].strip}", noun, digits(found[:amount]))
+            record_sale(found[:vendor], item, noun, digits(found[:amount]))
           else
-            @pouch = { item: found[:item].strip, noun: noun, at: Time.now.to_i }
+            @pouch = { item: item, noun: noun, at: Time.now.to_i }
           end
         elsif (found = text.match(POUCH_NOTE_RE))
           pouch = @pouch if @pouch && Time.now.to_i - @pouch[:at] <= 5
           @pouch = nil
-          record_sale(found[:vendor], pouch ? "gems from #{pouch[:item]}" : 'gems', pouch&.[](:noun), digits(found[:amount]))
+          record_sale(found[:vendor], pouch ? pouch[:item] : 'gems', pouch&.[](:noun), digits(found[:amount]))
+        elsif (found = text.match(OFFER_RE))
+          @offer = { item: found[:item].strip, vendor: found[:vendor].strip, noun: line[OFFER_NOUN_RE, 1], at: Time.now.to_i }
+        elsif (found = text.match(SCRIBBLE_RE))
+          offer = @offer if @offer && Time.now.to_i - @offer[:at] <= 5
+          @offer = nil
+          record_sale(offer ? offer[:vendor] : 'vendor', offer ? offer[:item] : 'item', offer&.[](:noun),
+                      digits(found[:amount]))
         end
       end
 
@@ -1407,7 +1457,7 @@ module GS4Analytics
         @kill = nil
         who = @who
         profile = Util.safely('') { UserVars.op['profile_current'].to_s }
-        Database.async { Database.record_kill(who, kill[:creature], profile, kill[:silver]) }
+        Database.async { Database.record_kill(who, kill[:creature], profile, kill[:silver], at: kill[:at]) }
       end
 
       def record_box(amount, method)
@@ -1580,7 +1630,7 @@ module GS4Analytics
           # Taskmaster, guard, assignment and "none" states are steps of the
           # turn-in; hold and wait for the reward line
           return unless task
-          return if task_matches_tracked?(task)
+          return track_progress(task[:count]) if task_matches_tracked?(task)
 
           if CONTINUATIONS[@type] == task[:type] && task[:area] == @area
             id = @bounty_id
@@ -1617,6 +1667,8 @@ module GS4Analytics
         @type = task[:type]
         @creature = task[:creature]
         @area = task[:area]
+        @required = task[:count]
+        @done = 0
         Log.debug("New bounty: #{task[:type]} #{task[:creature]} #{task[:area]} #{task[:count]}")
       end
 
@@ -1625,11 +1677,26 @@ module GS4Analytics
         @type = row['bounty_type'].to_s
         @creature = row['creature'].to_s
         @area = row['area'].to_s
+        @required = row['count_required']&.to_i
+        @done = row['count_completed'].to_i
         Log.debug("Tracking bounty: #{@type} #{@creature}")
       end
 
       def clear_tracking
-        @bounty_id = @type = @creature = @area = @seen = nil
+        @bounty_id = @type = @creature = @area = @seen = @required = @done = nil
+      end
+
+      # The task names how many are still to do ("kill 4 more"); the row keeps
+      # how many are done, so the dashboard can show 7/11
+      def track_progress(remaining)
+        return unless @bounty_id && @required && remaining
+
+        done = (@required - remaining.to_i).clamp(0, @required)
+        return if done == @done
+
+        @done = done
+        id = @bounty_id
+        Database.async { Database.bounty_progress(id, done) }
       end
 
       # A task that is gone, failed or replaced by a new assignment can no longer
@@ -1644,6 +1711,8 @@ module GS4Analytics
         return unless task
 
         same = @seen && @seen[:task].values_at(:type, :creature, :area) == task.values_at(:type, :creature, :area)
+        # The count left only goes down, so the first one seen is closest to what was asked for
+        task = task.merge(count: [@seen[:task][:count], task[:count]].compact.max) if same
         @seen = { task: task, at: same ? @seen[:at] : Time.now.to_i }
       end
 
@@ -1731,6 +1800,8 @@ module GS4Analytics
         @weapon = { polls: 0, retries: 0 }
         @session_id = Database.session_for(who)
         @session_date = Date.today.to_s
+        session = @session_id
+        Database.async { Database.open_session(who, session) }
         link_silver
         close_stale_cycles
         @carry_from = nil
@@ -1746,6 +1817,10 @@ module GS4Analytics
         @running = false
         @thread&.join(2)
         end_current_cycle
+        session = @session_id or return
+
+        at = Time.now.to_i
+        Database.async { Database.end_session(session, at) }
       end
 
       def status
@@ -1869,6 +1944,9 @@ module GS4Analytics
         Log.info("Midnight rollover: #{@session_date} -> #{today}")
         end_current_cycle
         @carry_from = nil # the new day starts at midnight
+        ended = @session_id
+        midnight = Util.midnight(today)
+        Database.async { Database.end_session(ended, midnight) } if ended
         @session_id = Database.session_for(@who)
         @session_date = today
         link_silver

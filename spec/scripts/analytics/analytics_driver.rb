@@ -755,10 +755,28 @@ when 'notes'
     "#{kahlyr} takes the <a exist=\"1108967\" noun=\"pouch\">leather gem pouch</a>, inspects the contents carefully, and removes " \
     'the gems she is interested in.  She hands it back to you and says, "I don\'t have that much spare silver, so I will have ' \
     'to give you a <a exist="1200062" noun="note">Vornavis promissory note</a> for it."',
-    "#{kahlyr} removes the gems and hands you a <a exist=\"1698202\" noun=\"note\">Vornavis promissory note</a> for 23,136 silvers."
+    "#{kahlyr} removes the gems and hands you a <a exist=\"1698202\" noun=\"note\">Vornavis promissory note</a> for 23,136 silvers.",
+    # Someone else's pouch sale, then the 2026-11-05 lines the earlier patterns missed
+    "#{kahlyr} takes the <a exist=\"1108968\" noun=\"pouch\">leather gem pouch</a>, inspects the contents carefully, and removes " \
+    'the gems she is interested in.  She hands it back to Ashur and says, "I don\'t have that much spare silver, so I will have ' \
+    'to give you a <a exist="1200063" noun="note">Vornavis promissory note</a> for it."',
+    "#{kahlyr} removes the gems and hands Ashur a <a exist=\"1698203\" noun=\"note\">Vornavis promissory note</a>.",
+    'You ask Ragnoz if he would like to buy the contents of an embroidered sage green silk cloak.',
+    'Ragnoz takes the <a exist="20716945" noun="cloak">sage green silk cloak</a>, inspects the contents carefully and removes ' \
+    'the item he is interested in.  Ragnoz hands it back to you, along with 819 silver.',
+    "<inv id='stow'> a <a exist=\"2\" noun=\"wand\">wand</a></inv>You offer to sell your " \
+    '<a exist="20748012" noun="shield">veil iron shield</a> to Walsor Gryhm.',
+    '<pushBold/><a exist="10421" noun="Walsor Gryhm">Walsor Gryhm</a><popBold/> says, "I\'m afraid I don\'t have that much silver ' \
+    'on hand, <a exist="-1" noun="Torvek">Torvek</a>, so I\'ll have to give you a <a exist="3" noun="note">Vornavis promissory note</a> for it."',
+    'He scribbles out a <a exist="3" noun="note">Vornavis promissory note</a> for 23,760 silvers and hands it to you.',
+    'You offer to sell your <a exist="1039576912" noun="grimoire">black leather grimoire</a> to the pawnbroker.',
+    'The pawnbroker says, "I\'m afraid I don\'t have that much silver on hand, Torvek, so I\'ll have to give you a ' \
+    '<a exist="4" noun="note">Vornavis promissory note</a> for it."',
+    'He scribbles out a <a exist="4" noun="note">Vornavis promissory note</a> for 21,905 silvers and hands it to you.'
   )
   settle.call
   sales = A::Database.all('SELECT item_name, item_noun, total_price, vendor_name FROM item_sales ORDER BY rowid').map(&:values)
+  vendors = A::Database.all('SELECT vendor_type, vendor_name, amount FROM silver_events ORDER BY rowid').map(&:values)
 
   total = -> { A::Database.latest_balances(WHO)['__total__'] }
   deposit = ->(amount, balance) { "You deposit #{amount} silvers into your account.  The teller carefully records the transaction and says, \"Thank you, Torvek.  This brings your total to #{balance} silvers.  Have a nice day!\"" }
@@ -791,7 +809,7 @@ when 'notes'
             '      Total: 1,563,160')
   settle.call
   listing = A::Database.one("SELECT balance, delta_silver FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid DESC LIMIT 1").values
-  result = { 'sales' => sales, 'totals' => steps, 'listing' => listing }
+  result = { 'sales' => sales, 'vendors' => vendors, 'totals' => steps, 'listing' => listing }
   A::SilverManager.stop
 
 when 'teller_listing'
@@ -1022,6 +1040,93 @@ when 'town_bounty'
                                      A::Util.bounty_target('gem', 'opal', ''), A::Util.bounty_target('escort', '', "Ta'Vaalor")],
     'untracked'                  => A::Database.all("SELECT silver_reward FROM bounties WHERE bounty_type = 'untracked' ORDER BY silver_reward").map { |r| r['silver_reward'] }
   }
+
+when 'bounty_progress'
+  # The task's "N more" count becomes the row's done count, across a restart
+  A::Database.connect!
+  A::Settings.load(WHO)
+  manager = A::BountyManager
+  manager.instance_variable_set(:@who, WHO)
+  manager.instance_variable_set(:@hunt_script, 'bigshot')
+  $running = ['bigshot']
+  task = ->(type, *rest) { $task = TaskStub.new(type, *rest) }
+  last = lambda do
+    A::Database.flush
+    A::Database.one('SELECT count_required, count_completed, status FROM bounties ORDER BY rowid DESC LIMIT 1').values
+  end
+  steps = []
+  task.call(:cull, 'kobold', 'Icemule', 11)
+  manager.send(:check_task)
+  steps << last.call
+  task.call(:cull, 'kobold', 'Icemule', 7)
+  manager.send(:check_task)
+  steps << last.call
+  manager.send(:clear_tracking) # the collector restarts and adopts the open row
+  manager.send(:reconcile_active_bounties)
+  task.call(:cull, 'kobold', 'Icemule', 2)
+  manager.send(:check_task)
+  steps << last.call
+  task.call(:taskmaster, '', '', nil)
+  manager.send(:check_task)
+  manager.send(:handle_reward, 907, 1000, 9070)
+  steps << last.call
+
+  # A gem task worked in town and turned in without a hunt: the count asked
+  # for is the first one seen, not the last
+  $running = []
+  task.call(:gem, '', 'Solhaven', 9, 'blue sapphire')
+  manager.send(:check_task)
+  task.call(:gem, '', 'Solhaven', 3, 'blue sapphire')
+  manager.send(:check_task)
+  task.call(:taskmaster, '', '', nil)
+  manager.send(:check_task)
+  manager.send(:handle_reward, 1050, 1000, 5130)
+  result = { 'cull' => steps, 'town_gem' => last.call }
+
+when 'sessions'
+  # A day's session is open while the collector runs and closed when it stops
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  $running = []
+  yesterday = Date.today - 1
+  old_start = A::Util.midnight(yesterday) + 100
+  run_sql("INSERT INTO sessions (session_id, game, character, start_date, midnight_timestamp, start_time, status) " \
+          "VALUES ('crashed', 'GS3', 'Torvek', ?, ?, ?, 'active')", yesterday.to_s, A::Util.midnight(yesterday), old_start)
+  run_sql("INSERT INTO cycles (cycle_id, session_id, game, character, cycle_type, start_time, end_time, duration_seconds) " \
+          "VALUES ('c1', 'crashed', 'GS3', 'Torvek', 'hunt', ?, ?, 800)", old_start + 100, old_start + 900)
+  row = ->(id) { A::Database.one('SELECT status, end_time FROM sessions WHERE session_id = ?', id).values }
+  manager = A::CycleManager
+  manager.start(WHO, cfg)
+  A::Database.flush
+  today = A::Database.session_for(WHO)
+  result = { 'crashed' => row.call('crashed') == ['ended', old_start + 900], 'running' => row.call(today) }
+  manager.stop
+  A::Database.flush
+  status, ended = row.call(today)
+  result['stopped'] = [status, (NOW..Time.now.to_i + 1).cover?(ended)]
+  manager.start(WHO, cfg) # started again the same day
+  A::Database.flush
+  result['restarted'] = row.call(today)
+  manager.stop
+  A::Database.flush
+  # Midnight: the day that just ended closes at midnight
+  manager.instance_variable_set(:@who, WHO)
+  manager.instance_variable_set(:@cfg, cfg)
+  manager.instance_variable_set(:@current_state, :idle)
+  manager.instance_variable_set(:@session_id, 'crashed')
+  manager.instance_variable_set(:@session_date, yesterday.to_s)
+  manager.send(:roll_over_midnight)
+  manager.send(:end_current_cycle)
+  A::Database.flush
+  result['midnight'] = row.call('crashed') == ['ended', A::Util.midnight]
+
+when 'kill_time'
+  # A kill's day is the day of the search, even if its write runs later
+  A::Database.connect!
+  A::Database.record_kill(WHO, 'kobold', 'crags', 25, at: NOW - 86_400)
+  A::Database.record_kill(WHO, 'kobold', 'crags', 30, at: NOW)
+  result = { 'days' => A::Database.all('SELECT date, kill_count, total_silver, last_kill_at FROM kill_stats ORDER BY date').map(&:values),
+             'yesterday' => (Date.today - 1).to_s, 'today' => Date.today.to_s, 'now' => NOW }
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

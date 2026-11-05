@@ -172,6 +172,42 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'bounty progress' do
+    subject(:progress) { result('bounty_progress') }
+
+    it 'counts what is done from the task\'s remaining count, across a restart, and all of it on the reward' do
+      expect(progress['cull']).to eq([[11, 0, 'active'], [11, 4, 'active'], [11, 9, 'active'], [11, 11, 'completed']])
+    end
+
+    it 'keeps the first count seen for a task finished in town' do
+      expect(progress['town_gem']).to eq([9, 9, 'completed'])
+    end
+  end
+
+  describe 'sessions' do
+    subject(:sessions) { result('sessions') }
+
+    it 'closes an earlier day left open by a crash at the end of its last cycle' do
+      expect(sessions['crashed']).to be(true)
+    end
+
+    it 'is open while the collector runs, closed when it stops, and reopened on a restart that day' do
+      expect(sessions.values_at('running', 'stopped', 'restarted')).to eq([['active', nil], ['ended', true], ['active', nil]])
+    end
+
+    it 'closes the day that ended at midnight' do
+      expect(sessions['midnight']).to be(true)
+    end
+  end
+
+  describe 'kill times' do
+    subject(:kills) { result('kill_time') }
+
+    it 'files a kill under the day and time of the search' do
+      expect(kills['days']).to eq([[kills['yesterday'], 1, 25, kills['now'] - 86_400], [kills['today'], 1, 30, kills['now']]])
+    end
+  end
+
   describe 'Database when busy' do
     subject(:busy) { result('busy_database') }
 
@@ -394,10 +430,21 @@ RSpec.describe 'analytics.lic' do
     subject(:notes) { result('notes') }
 
     it 'records sales paid with a note, and gem pouch sales paid either way' do
-      expect(notes['sales']).to eq(
+      expect(notes['sales'].first(3)).to eq(
         [['diamond ring', 'ring', 22_555, 'Kahlyr'], ['gems from ruby red pouch', 'pouch', 8120, 'Kahlyr'],
          ['gems from leather gem pouch', 'pouch', 23_136, 'Kahlyr']]
       )
+    end
+
+    it 'records an item bought out of a container, and notes a vendor writes out after an offer' do
+      expect(notes['sales'].drop(3)).to eq(
+        [['item from sage green silk cloak', 'cloak', 819, 'Ragnoz'], ['veil iron shield', 'shield', 23_760, 'Walsor Gryhm'],
+         ['black leather grimoire', 'grimoire', 21_905, nil]]
+      )
+    end
+
+    it 'splits those vendors into type and name, and ignores another player\'s pouch sale' do
+      expect(notes['vendors'].drop(3)).to eq([['vendor', 'Ragnoz', 819], ['vendor', 'Walsor Gryhm', 23_760], ['pawnbroker', nil, 21_905]])
     end
 
     it 'moves the total for note deposits, and by what the same teller\'s balances show for a note round trip' do
