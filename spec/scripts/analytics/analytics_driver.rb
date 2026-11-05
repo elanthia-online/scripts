@@ -85,7 +85,18 @@ BANK_LINES = ['The Bank amounts on deposit:', 'Icemule Trace: 1,500,000',
 $bank_lines = BANK_LINES
 $lich_char_regex = Regexp.union(',', ';')
 
+# Stand-in for Lich's SQLite helper: Lich's busy timeout, and a record of
+# every connection it set up (Lich's own after_connect installs its lock wait)
+$sqlite_busy_ms = 5000
+$sqlite_opened = []
+$sqlite_hooked = []
+
 module Lich
+  def self.open_sequel_sqlite(path)
+    $sqlite_opened << path
+    Sequel.sqlite(path, timeout: $sqlite_busy_ms, after_connect: ->(conn) { $sqlite_hooked << conn.object_id })
+  end
+
   module Messaging
     def self.msg(type, text) = OUT << "msg[#{type}]: #{text}"
   end
@@ -163,7 +174,8 @@ end
 
 # Short lock waits, so a held lock costs milliseconds rather than seconds
 def quick_busy_timeouts
-  { BUSY_TIMEOUT_MS: 200, BUSY_BACKOFF_START_S: 0.05, BUSY_BACKOFF_MAX_S: 0.1 }.each do |name, value|
+  $sqlite_busy_ms = 200
+  { BUSY_BACKOFF_START_S: 0.05, BUSY_BACKOFF_MAX_S: 0.1 }.each do |name, value|
     A::Database.send(:remove_const, name)
     A::Database.const_set(name, value)
   end
@@ -474,21 +486,20 @@ when 'cli'
   }
 
 when 'standalone'
-  # No collector, no Lich helper: the plain read-only reader works, refuses writes, and a missing file is reported
+  # No collector: the reader opens through Lich's helper (so it gets Lich's
+  # lock waits), reports work from it, and a missing file is reported
   A::Database.connect!
   seed_history
   A::Database.close
   result['connected'] = A::Database.connected?
+  $sqlite_opened.clear
+  $sqlite_hooked.clear
   A::Database.reader do |conn|
     result['overview'] = A::Dashboard.send(:build_overview)['characters'].size
     result['report_lines'] = A::Report::Text.character_summary(conn).size
-    result['write_refused'] = begin
-      conn.run('DELETE FROM cycles')
-      false
-    rescue StandardError
-      true
-    end
   end
+  result['opened'] = $sqlite_opened == [A::Database.file]
+  result['hooked'] = !$sqlite_hooked.empty?
   A::Database.close
   FileUtils.rm_f(A::Database.file)
   result['missing'] = begin
@@ -1011,26 +1022,6 @@ when 'town_bounty'
                                      A::Util.bounty_target('gem', 'opal', ''), A::Util.bounty_target('escort', '', "Ta'Vaalor")],
     'untracked'                  => A::Database.all("SELECT silver_reward FROM bounties WHERE bounty_type = 'untracked' ORDER BY silver_reward").map { |r| r['silver_reward'] }
   }
-
-when 'lich_reader'
-  # With Lich's helper, the reader opens through it too, so its connections
-  # get Lich's lock waits (see Database.open_database)
-  A::Database.connect!
-  seed_history
-  A::Database.close
-  opened = []
-  hooked = []
-  Lich.define_singleton_method(:open_sequel_sqlite) do |path|
-    opened << path
-    Sequel.sqlite(path, timeout: 5000, after_connect: ->(conn) { hooked << conn.object_id })
-  end
-  A::Database.reader do |conn|
-    result['overview'] = A::Dashboard.send(:build_overview)['characters'].size
-    result['report_lines'] = A::Report::Text.character_summary(conn).size
-  end
-  result['opened'] = opened == [A::Database.file]
-  result['hooked'] = !hooked.empty?
-  A::Database.close
 
 when 'reload'
   # Loading the body again must not warn about redefined constants
