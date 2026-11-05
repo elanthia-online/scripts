@@ -55,6 +55,11 @@ RSpec.describe 'effect-list.xml Resist Nature (620) cast-proc' do
     expect(caster.sent).to eq(['incant 620 cold'])
   end
 
+  it 'strips whitespace around the element' do
+    caster.cast(' lightning ')
+    expect(caster.sent).to eq(['incant 620 lightning'])
+  end
+
   it 'uses UserVars.resist_element with no target' do
     caster.cast
     expect(caster.sent).to eq(['incant 620 heat'])
@@ -62,6 +67,31 @@ RSpec.describe 'effect-list.xml Resist Nature (620) cast-proc' do
 
   it 'treats a multicast count as no element' do
     caster.cast('2')
+    expect(caster.sent).to eq(['incant 620 heat'])
+  end
+
+  # Pins ^\d+$ over Mage Armor's ^\d$: a two-digit count isn't an element.
+  it 'treats a multi-digit count as no element' do
+    caster.cast('12')
+    expect(caster.sent).to eq(['incant 620 heat'])
+  end
+
+  ['', '  ', ' 2 ', 'self', 'SELF'].each do |target|
+    it "falls back to UserVars.resist_element for #{target.inspect}" do
+      caster.cast(target)
+      expect(caster.sent).to eq(['incant 620 heat'])
+    end
+  end
+
+  it 'sends what it sent before for an Integer target' do
+    caster.cast(2)
+    expect(caster.sent).to eq(['incant 620 heat'])
+  end
+
+  it 'sends what it sent before for a GameObj target' do
+    game_obj = Object.new
+    def game_obj.to_s = 'Horibu'
+    caster.cast(game_obj)
     expect(caster.sent).to eq(['incant 620 heat'])
   end
 end
