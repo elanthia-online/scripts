@@ -8,9 +8,14 @@
       game: any
       tags: core
   required: Lich > 5.0.1
-   version: 1.17
+   version: 1.18
 
   changelog:
+    1.18 (2026-11-05):
+      A server certificate with the wrong name no longer closes Lich
+      Writes from different threads no longer interleave on the connection
+      Sending while disconnected returns false instead of silently doing nothing
+      Skip reading after a failed connection; a failed write reconnects
     1.17 (2026-11-05):
       Stop losing messages that arrive together with another LNet message
       A comment, CDATA or DOCTYPE from the server no longer drops the connection
@@ -74,6 +79,12 @@ clear
 hide_me
 
 class LNet
+  # Lich keeps classes for the whole session, so running a newer lnet reopens
+  # this one. Drop the constants an earlier copy of this file defined, so each
+  # comes from this file; constants other scripts add to LNet (inbox.lic's
+  # LNet::Inbox) are left alone.
+  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT CA_CERTIFICATE MARSHAL_MAX_DEPTH StreamParser].each { |name| remove_const(name) if const_defined?(name, false) }
+
   @@server    ||= nil
   @@script    ||= nil
   @@options   ||= Hash.new
@@ -82,9 +93,28 @@ class LNet
   @@last_send ||= Time.now
   @@last_priv ||= nil
   @@secret    ||= Array.new
-  @@version     = '1.6'
+  @@alias     ||= Hash.new
+  @@write_lock ||= Mutex.new
 
   @@server_restart = false
+
+  # LNet server address.
+  HOSTNAME = 'lnet.lichproject.org'
+  PORT = 7155
+  # Seconds allowed for each of the TCP connect and the TLS handshake.
+  CONNECT_TIMEOUT = 10
+  # Common names a server certificate signed by CA_CERTIFICATE may carry.
+  TRUSTED_COMMON_NAMES = %w[lichproject.org LichNet].freeze
+  # Client protocol version sent at login; the server decides what it means.
+  PROTOCOL_VERSION = '1.6'
+  # Seconds without sending anything before a keepalive is sent.
+  KEEPALIVE_INTERVAL = 50
+  # Least seconds between two connection attempts.
+  RECONNECT_INTERVAL = 300
+  # Seconds to wait after the server announces a restart.
+  RESTART_WAIT = 30
+  # The only certificate authority LNet trusts.
+  CA_CERTIFICATE = "-----BEGIN CERTIFICATE-----\nMIIDoDCCAoigAwIBAgIUYwhIyTlqWaEd5mYGXoQQoC+ndKcwDQYJKoZIhvcNAQEL\nBQAwYTELMAkGA1UEBhMCVVMxETAPBgNVBAgMCElsbGlub2lzMRIwEAYDVQQKDAlN\nYXR0IExvd2UxDzANBgNVBAMMBlJvb3RDQTEaMBgGCSqGSIb3DQEJARYLbWF0dEBp\nbzQudXMwHhcNMjQwNjA1MTM1NzUxWhcNNDQwNTMxMTM1NzUxWjBhMQswCQYDVQQG\nEwJVUzERMA8GA1UECAwISWxsaW5vaXMxEjAQBgNVBAoMCU1hdHQgTG93ZTEPMA0G\nA1UEAwwGUm9vdENBMRowGAYJKoZIhvcNAQkBFgttYXR0QGlvNC51czCCASIwDQYJ\nKoZIhvcNAQEBBQADggEPADCCAQoCggEBAJwhGfQgwI1h4vlqAqaR152AlewjJMlL\nyoqtjoS9Cyri23SY7c6v0rwhoOXuoV1D2d9InmmE2CgLL3Bn2sNa/kWFjkyedUca\nvd8JrtGQzEkVH83CIPiKFCWLE5SXLvqCVx7Jz/pBBL1s173p69kOy0REYAV/OAdj\nioCXK6tHqYG70xvLIJGiTrExGeOttMw2S+86y4bSxj2i35IscaBTepPv7BWH8JtZ\nyN4Xv9DBr/99sWSarlzUW6+FTcNqdJLP5W5a508VLJnevmlisswlazKiYNriCQvZ\nsnmPJrYFYMxe9JIKl1CA8MiUKUx8AUt39KzxkgZrq40VxIrpdxrnUKUCAwEAAaNQ\nME4wHQYDVR0OBBYEFJxuCVGIbPP3LO6GAHAViOCKZ4HIMB8GA1UdIwQYMBaAFJxu\nCVGIbPP3LO6GAHAViOCKZ4HIMAwGA1UdEwQFMAMBAf8wDQYJKoZIhvcNAQELBQAD\nggEBAGKn0vYx9Ta5+/X1WRUuADuie6JuNMHUxzYtxwEba/m5lA4nE5f2yoO6Y/Y3\nLZDX2Y9kWt+7pGQ2SKOT79gNcnOSc3SGYWkX48J6C1hihhjD3AfD0hb1mgvlJuij\nzNnZ7vczOF8AcvBeu8ww5eIrkN6TTshjICg71/deVo9HvjhiCGK0XvL+WL6EQwLe\n6/nVVFrPfd0sRZZ5OTJR5nM1kA71oChUw9mHCyrAc3zYyW37k+p8ADRFfON8th8M\n1Blel1SpgqlQ22WpYoHbUCSjGt6JKC/HrSHdKBezTuRahOSfqwncAE77Dz4FJaQ5\nWD2mk3SZbB2ytAHUDEy3xr697EI=\n-----END CERTIFICATE-----".freeze
 
   # Prints a diagnostic line when LNet debugging is switched on.
   #
@@ -292,173 +322,370 @@ class LNet
     end
   end
 
-  def LNet.server;
-    @@server;
+  # @return [OpenSSL::SSL::SSLSocket, nil] the socket to the server (closed
+  #   while disconnected), nil before the first connection
+  def LNet.server
+    @@server
   end
 
-  def LNet.server=(val);
-    @@server = val;
+  # @param val [OpenSSL::SSL::SSLSocket, nil]
+  def LNet.server=(val)
+    @@server = val
   end
 
-  def LNet.script;
-    @@script;
+  # @return [Script, nil] the running lnet script
+  def LNet.script
+    @@script
   end
 
-  def LNet.script=(val);
-    @@script = val;
+  # @param val [Script, nil]
+  def LNet.script=(val)
+    @@script = val
   end
 
-  def LNet.options;
-    @@options;
+  # @return [Hash] the character's LNet options (saved by Lich)
+  def LNet.options
+    @@options
   end
 
-  def LNet.options=(val);
-    @@options = val;
+  # @param val [Hash]
+  def LNet.options=(val)
+    @@options = val
   end
 
-  def LNet.alias;
-    @@alias;
+  # @return [Hash{String => String}] display names for LNet senders
+  def LNet.alias
+    @@alias
   end
 
-  def LNet.alias=(val);
-    @@alias = val;
+  # @param val [Hash{String => String}]
+  def LNet.alias=(val)
+    @@alias = val
   end
 
-  def LNet.server_restart;
-    @@server_restart;
+  # @return [Boolean] whether the server announced a restart
+  def LNet.server_restart
+    @@server_restart
   end
 
-  def LNet.server_restart=(val);
-    @@server_restart = val;
+  # @param val [Boolean]
+  def LNet.server_restart=(val)
+    @@server_restart = val
   end
 
-  def LNet.store_secret=(val);
-    @@secret = val;
+  # @param val [Array] the saved one-element array holding the password
+  def LNet.store_secret=(val)
+    @@secret = val
   end
 
-  def LNet.secret=(val);
-    @@secret[0] = val;
+  # @param val [String, nil] the LNet password, nil for none
+  def LNet.secret=(val)
+    @@secret[0] = val
   end
 
+  # @return [Time] when anything was last written to the server
   def LNet.last_send
     @@last_send
   end
 
+  # @return [Time] when anything was last read from the server
   def LNet.last_recv
     @@last_recv
   end
 
+  # @return [String, nil] who sent the last private message
   def LNet.last_priv
     @@last_priv
   end
 
-  def LNet.connect
-    begin
-      socket = nil
-      ssl_socket = nil
-      connected = false
-      hostname = 'lnet.lichproject.org'
-      port     = 7155
-      ca_cert  = OpenSSL::X509::Certificate.new("-----BEGIN CERTIFICATE-----\nMIIDoDCCAoigAwIBAgIUYwhIyTlqWaEd5mYGXoQQoC+ndKcwDQYJKoZIhvcNAQEL\nBQAwYTELMAkGA1UEBhMCVVMxETAPBgNVBAgMCElsbGlub2lzMRIwEAYDVQQKDAlN\nYXR0IExvd2UxDzANBgNVBAMMBlJvb3RDQTEaMBgGCSqGSIb3DQEJARYLbWF0dEBp\nbzQudXMwHhcNMjQwNjA1MTM1NzUxWhcNNDQwNTMxMTM1NzUxWjBhMQswCQYDVQQG\nEwJVUzERMA8GA1UECAwISWxsaW5vaXMxEjAQBgNVBAoMCU1hdHQgTG93ZTEPMA0G\nA1UEAwwGUm9vdENBMRowGAYJKoZIhvcNAQkBFgttYXR0QGlvNC51czCCASIwDQYJ\nKoZIhvcNAQEBBQADggEPADCCAQoCggEBAJwhGfQgwI1h4vlqAqaR152AlewjJMlL\nyoqtjoS9Cyri23SY7c6v0rwhoOXuoV1D2d9InmmE2CgLL3Bn2sNa/kWFjkyedUca\nvd8JrtGQzEkVH83CIPiKFCWLE5SXLvqCVx7Jz/pBBL1s173p69kOy0REYAV/OAdj\nioCXK6tHqYG70xvLIJGiTrExGeOttMw2S+86y4bSxj2i35IscaBTepPv7BWH8JtZ\nyN4Xv9DBr/99sWSarlzUW6+FTcNqdJLP5W5a508VLJnevmlisswlazKiYNriCQvZ\nsnmPJrYFYMxe9JIKl1CA8MiUKUx8AUt39KzxkgZrq40VxIrpdxrnUKUCAwEAAaNQ\nME4wHQYDVR0OBBYEFJxuCVGIbPP3LO6GAHAViOCKZ4HIMB8GA1UdIwQYMBaAFJxu\nCVGIbPP3LO6GAHAViOCKZ4HIMAwGA1UdEwQFMAMBAf8wDQYJKoZIhvcNAQELBQAD\nggEBAGKn0vYx9Ta5+/X1WRUuADuie6JuNMHUxzYtxwEba/m5lA4nE5f2yoO6Y/Y3\nLZDX2Y9kWt+7pGQ2SKOT79gNcnOSc3SGYWkX48J6C1hihhjD3AfD0hb1mgvlJuij\nzNnZ7vczOF8AcvBeu8ww5eIrkN6TTshjICg71/deVo9HvjhiCGK0XvL+WL6EQwLe\n6/nVVFrPfd0sRZZ5OTJR5nM1kA71oChUw9mHCyrAc3zYyW37k+p8ADRFfON8th8M\n1Blel1SpgqlQ22WpYoHbUCSjGt6JKC/HrSHdKBezTuRahOSfqwncAE77Dz4FJaQ5\nWD2mk3SZbB2ytAHUDEy3xr697EI=\n-----END CERTIFICATE-----")
-      if ca_cert.not_before > Time.now
-        respond "\n---\n--- warning: The current date is set incorrectly on your computer. This will\n---          cause the SSL certificate verification to fail and prevent LNet\n---          from connecting to the server.  Fix it.\n---\n\n"
-        sleep 3
-      end
-      if ca_cert.not_after < Time.now
-        respond "\n---\n--- warning: Your computer thinks the date is #{Time.now.strftime("%m-%d-%Y")}.  If this is the\n---          correct date, you need an updated version of this script.  If \n---          this is not the correct date, you need to change it.  In either\n---          case, this date makes the SSL certificate in this script\n---          invalid and will prevent LNet from connecting to the server.\n---\n\n"
-        sleep 3
-      end
-      cert_store              = OpenSSL::X509::Store.new
-      ssl_context             = OpenSSL::SSL::SSLContext.new
-      ssl_context.cert_store  = cert_store
-      ssl_context.options     = (OpenSSL::SSL::OP_NO_SSLv2 + OpenSSL::SSL::OP_NO_SSLv3)
-      cert_store.add_cert(ca_cert)
-      ssl_context.verify_mode = OpenSSL::SSL::VERIFY_PEER
-      echo "opening TCP socket to #{hostname}:#{port}" if $lnet_debug
-      socket = Timeout.timeout(10) { TCPSocket.open(hostname, port) }
-      echo 'TCP socket connected' if $lnet_debug
-      ssl_socket = OpenSSL::SSL::SSLSocket.new(socket, ssl_context)
-      ssl_socket.sync_close = true
-      ssl_socket.hostname = hostname if ssl_socket.respond_to?(:hostname=)
-      echo 'starting SSL handshake' if $lnet_debug
-      Timeout.timeout(10) { ssl_socket.connect }
-      echo 'SSL handshake complete' if $lnet_debug
-      echo ssl_socket.peer_cert.inspect if $lnet_debug
-      if (ssl_socket.peer_cert.subject.to_a.find { |n| n[0] == 'CN' }[1] != 'lichproject.org') and (ssl_socket.peer_cert.subject.to_a.find { |n| n[0] == 'CN' }[1] != 'LichNet')
-        echo "error: server certificate hostname mismatch"
-        ssl_socket.close
-        exit
-      end
-      LNet.server = ssl_socket
-      connected = true
+  # @return [Boolean] whether there is an open connection to the server
+  def LNet.connected?
+    server = @@server
+    !server.nil? && !server.closed?
+  end
 
-      xml = REXML::Document.new
-      element = xml.add_element('login')
-      element.add_attribute('name', XMLData.name)
-      element.add_attribute('game', XMLData.game)
-      element.add_attribute('client', @@version)
-      element.add_attribute('lich', $version)
-      if @@secret[0]
-        element.add_attribute('password', @@secret[0])
-      end
-      @@server.puts(xml)
-      @@last_send = Time.now
-    rescue Timeout::Error
-      echo 'error: LNet connection timed out during TCP connect or SSL handshake'
-    rescue
-      echo $!
-      respond $!.backtrace[0..1]
-    ensure
-      unless connected
-        ssl_socket.close if ssl_socket && !ssl_socket.closed? rescue nil
-        socket.close if socket && !socket.closed? rescue nil
+  # Connects to the server and logs in. Never raises and never ends the
+  # process: a refused certificate, a timeout or a network error is reported
+  # and returns false.
+  #
+  # @return [Boolean] true once the login has been sent
+  def LNet.connect
+    LNet.disconnect
+    warning = LNet.certificate_date_warning(LNet.ca_certificate, Time.now)
+    if warning
+      respond warning
+      sleep 3
+    end
+    ssl_socket = LNet.open_tls
+    LNet.debug(ssl_socket.peer_cert.inspect)
+    unless LNet.trusted_peer?(ssl_socket.peer_cert)
+      echo 'error: server certificate hostname mismatch'
+      ssl_socket.close
+      return false
+    end
+    # the login goes out before anything else can use the connection
+    @@write_lock.synchronize { ssl_socket.puts(LNet.document('login', LNet.login_attributes).to_s) }
+    @@last_send = Time.now
+    @@server = ssl_socket
+    true
+  rescue Timeout::Error
+    echo 'error: LNet connection timed out during TCP connect or SSL handshake'
+    false
+  rescue StandardError => e
+    echo "error: LNet connection failed: #{e.message}"
+    LNet.debug(e.backtrace.first(2).join("\n"))
+    false
+  ensure
+    # a socket that never became the connection (refused, or the thread killed)
+    unless ssl_socket.nil? || @@server.equal?(ssl_socket) || ssl_socket.closed?
+      begin
+        ssl_socket.close
+      rescue StandardError
+        nil
       end
     end
   end
 
+  # Opens the TLS connection, closing whatever it opened if a step fails or
+  # the thread is killed.
+  #
+  # @return [OpenSSL::SSL::SSLSocket] a connected socket whose peer
+  #   certificate chains to CA_CERTIFICATE
+  # @raise [Timeout::Error, SystemCallError, OpenSSL::SSL::SSLError]
+  def LNet.open_tls
+    opened = false
+    LNet.debug("opening TCP socket to #{HOSTNAME}:#{PORT}")
+    socket = Timeout.timeout(CONNECT_TIMEOUT) { TCPSocket.open(HOSTNAME, PORT) }
+    ssl_socket = OpenSSL::SSL::SSLSocket.new(socket, LNet.ssl_context)
+    ssl_socket.sync_close = true
+    ssl_socket.hostname = HOSTNAME
+    LNet.debug('starting SSL handshake')
+    Timeout.timeout(CONNECT_TIMEOUT) { ssl_socket.connect }
+    LNet.debug('SSL handshake complete')
+    opened = true
+    ssl_socket
+  ensure
+    [ssl_socket, socket].each { |io| io&.close rescue nil } unless opened
+  end
+
+  # @return [OpenSSL::X509::Certificate]
+  def LNet.ca_certificate
+    OpenSSL::X509::Certificate.new(CA_CERTIFICATE)
+  end
+
+  # @return [OpenSSL::SSL::SSLContext] verifies the peer against
+  #   CA_CERTIFICATE alone, never the system store
+  def LNet.ssl_context
+    store = OpenSSL::X509::Store.new
+    store.add_cert(LNet.ca_certificate)
+    context = OpenSSL::SSL::SSLContext.new
+    context.cert_store = store
+    context.options = OpenSSL::SSL::OP_NO_SSLv2 | OpenSSL::SSL::OP_NO_SSLv3
+    context.verify_mode = OpenSSL::SSL::VERIFY_PEER
+    context
+  end
+
+  # @param cert [OpenSSL::X509::Certificate, nil]
+  # @return [Boolean] whether the certificate names a trusted LNet server
+  def LNet.trusted_peer?(cert)
+    common_name = cert&.subject&.to_a&.find { |entry| entry[0] == 'CN' }&.at(1)
+    TRUSTED_COMMON_NAMES.include?(common_name)
+  end
+
+  # @param cert [OpenSSL::X509::Certificate]
+  # @param now [Time]
+  # @return [String, nil] why the certificate will fail to verify on this
+  #   computer, or nil if its dates are fine
+  def LNet.certificate_date_warning(cert, now)
+    if cert.not_before > now
+      "\n---\n--- warning: The current date is set incorrectly on your computer. This will\n---          cause the SSL certificate verification to fail and prevent LNet\n---          from connecting to the server.  Fix it.\n---\n\n"
+    elsif cert.not_after < now
+      "\n---\n--- warning: Your computer thinks the date is #{now.strftime('%m-%d-%Y')}.  If this is the\n---          correct date, you need an updated version of this script.  If \n---          this is not the correct date, you need to change it.  In either\n---          case, this date makes the SSL certificate in this script\n---          invalid and will prevent LNet from connecting to the server.\n---\n\n"
+    end
+  end
+
+  # @return [Hash{String => String, nil}] the login element's attributes;
+  #   the password is left out when none is saved
+  def LNet.login_attributes
+    {
+      'name'     => XMLData.name,
+      'game'     => XMLData.game,
+      'client'   => PROTOCOL_VERSION,
+      'lich'     => $version,
+      'password' => @@secret[0],
+    }
+  end
+
+  # Closes the connection. LNet.server keeps the closed socket, as it always
+  # has, so a script checking LNet.server.closed? sees the disconnect.
+  # Passing the socket a failure happened on leaves a newer connection alone.
+  #
+  # @param socket [IO, nil] the connection to close; the current one by
+  #   default
+  # @return [void]
+  def LNet.disconnect(socket = @@server)
+    socket.close unless socket.nil? || socket.closed?
+  rescue StandardError => e
+    LNet.debug("error closing the connection: #{e.message}")
+  end
+
+  # Writes one XML document to the server. Writes from different threads
+  # never interleave. A failed write closes the connection so the connection
+  # thread reconnects.
+  #
+  # @param document [REXML::Document, String]
+  # @return [Boolean] true if it was written, false if not connected or the
+  #   write failed
+  def LNet.transmit(document)
+    server = nil
+    @@write_lock.synchronize do
+      server = @@server
+      return false if server.nil? || server.closed?
+
+      server.puts(document.to_s)
+    end
+    @@last_send = Time.now
+    true
+  rescue IOError, SystemCallError, OpenSSL::SSL::SSLError => e
+    LNet.debug("error writing to the server: #{e.class}: #{e.message}")
+    LNet.disconnect(server)
+    false
+  end
+
+  # Sends one element. Attributes whose value is nil are left out.
+  #
+  # @param tag [String]
+  # @param attributes [Hash{String => #to_s, nil}]
+  # @param text [String, nil] the element's text
+  # @return [Boolean] see #transmit
+  def LNet.send_element(tag, attributes = {}, text = nil)
+    LNet.transmit(LNet.document(tag, attributes, text))
+  end
+
+  # @param tag [String]
+  # @param attributes [Hash{String => #to_s, nil}] nil values are left out
+  # @param text [String, nil]
+  # @return [REXML::Document] a document holding one element
+  def LNet.document(tag, attributes = {}, text = nil)
+    document = REXML::Document.new
+    element = document.add_element(tag)
+    attributes.each_pair { |name, value| element.add_attribute(name.to_s, value.to_s) unless value.nil? }
+    element.text = text unless text.nil?
+    document
+  end
+
+  # Sends an empty document, which keeps the connection from idling out.
+  # @return [Boolean]
   def LNet.send_ping
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.transmit(REXML::Document.new)
   end
 
+  # @param attributes [Hash] 'type' ('private' or 'channel') plus 'to' or
+  #   'channel'
+  # @param message [String]
+  # @return [Boolean]
   def LNet.send_message(attributes, message)
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    element = xml.add_element('message')
-    attributes.each_pair { |name, val| element.add_attribute(name, val) }
-    element.text = message
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.send_element('message', attributes, message)
   end
 
+  # @param attributes [Hash] 'type' plus any filter, e.g. 'name' or 'num'
+  # @return [Boolean]
   def LNet.send_query(attributes)
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    element = xml.add_element('query')
-    attributes.each_pair { |name, val| element.add_attribute(name, val) }
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.send_element('query', attributes)
   end
 
+  # @param attributes [Hash] 'type' and 'to'
+  # @return [Boolean]
   def LNet.send_request(attributes)
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    element = xml.add_element('request')
-    attributes.each_pair { |name, val| element.add_attribute(name, val) }
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.send_element('request', attributes)
   end
 
+  # @param attributes [Hash] 'type' and usually 'to'
+  # @param data [Object] plain data (nil, booleans, numbers, strings,
+  #   symbols, arrays and hashes of them)
+  # @return [Boolean]
   def LNet.send_data(attributes, data)
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    element = xml.add_element('data')
-    attributes.each_pair { |name, val| element.add_attribute(name, val) }
-    element.text = [Marshal.dump(data)].pack('m').strip
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.send_element('data', attributes, [Marshal.dump(data)].pack('m').strip)
+  end
+
+  # Keeps the connection alive; call it in a loop.
+  #
+  # @param now [Time]
+  # @return [Numeric] seconds to wait before calling it again
+  def LNet.keepalive_tick(now = Time.now)
+    idle = now - @@last_send
+    if idle > KEEPALIVE_INTERVAL - 1 && LNet.send_ping
+      idle = 0
+    end
+    [KEEPALIVE_INTERVAL - idle, 5].max
+  end
+
+  # Sends a keepalive whenever the connection has been quiet. Never returns.
+  def LNet.keepalive_loop
+    loop do
+      sleep LNet.keepalive_tick
+    rescue StandardError => e
+      echo "error: #{e.message}"
+      sleep 1
+    end
+  end
+
+  # One connection attempt and, if it logs in, everything the server sends
+  # until the connection ends.
+  #
+  # @param started_at [Time] when the attempt began
+  # @return [Numeric] seconds to wait before the next attempt
+  def LNet.connection_cycle(started_at = Time.now)
+    server = LNet.connect ? @@server : nil
+    LNet.read_session(server) if server
+    LNet.reconnect_delay(started_at, Time.now)
+  ensure
+    LNet.disconnect(server) if server
+  end
+
+  # Reads from the server until the connection ends, feeding every element
+  # to a fresh listener.
+  #
+  # @param server [IO]
+  # @return [void]
+  def LNet.read_session(server)
+    parser = StreamParser.new(LNet.new)
+    loop { parser.feed(server.readpartial(4096)) }
+  rescue IOError, SystemCallError, OpenSSL::SSL::SSLError => e # EOFError is an IOError
+    LNet.debug("connection ended: #{e.class}: #{e.message}")
+  end
+
+  # How long to wait before reconnecting: RESTART_WAIT after a restart
+  # notice, otherwise whatever is left of RECONNECT_INTERVAL since the last
+  # attempt began (at least 1 second). Says why it is waiting.
+  #
+  # @param started_at [Time] when the last attempt began
+  # @param now [Time]
+  # @return [Numeric] seconds
+  def LNet.reconnect_delay(started_at, now)
+    if @@server_restart
+      @@server_restart = false
+      echo "server is restarting; waiting #{RESTART_WAIT} seconds to reconnect..."
+      return RESTART_WAIT
+    end
+    echo 'connection lost'
+    delay = [RECONNECT_INTERVAL - (now - started_at), 1].max
+    echo "waiting #{delay.to_i} seconds before trying to reconnect..." if delay > 1
+    delay
+  end
+
+  # Connects, reads and reconnects for as long as the script runs.
+  def LNet.connection_loop
+    loop do
+      started_at = Time.now
+      delay = begin
+        LNet.connection_cycle(started_at)
+      rescue StandardError, ScriptError, SystemStackError => e
+        echo "error: #{e.message}"
+        LNet.reconnect_delay(started_at, Time.now)
+      end
+      sleep delay
+    end
   end
 
   # <data> payloads come from the server and from other players' clients, and
@@ -611,40 +838,28 @@ class LNet
     pos + len
   end
 
+  # @param channel [String]
+  # @return [Boolean]
   def LNet.tune_channel(channel)
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    element = xml.add_element('tune')
-    element.add_attribute('channel', channel)
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.send_element('tune', { 'channel' => channel })
   end
 
+  # @param channel [String]
+  # @return [Boolean]
   def LNet.untune_channel(channel)
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    element = xml.add_element('untune')
-    element.add_attribute('channel', channel)
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.send_element('untune', { 'channel' => channel })
   end
 
+  # @param attributes [Hash] 'action', 'name', 'channel' and optionally 'length'
+  # @return [Boolean]
   def LNet.moderate(attributes)
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    element = xml.add_element('moderate')
-    attributes.each_pair { |name, val| element.add_attribute(name, val) }
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.send_element('moderate', attributes)
   end
 
+  # @param attributes [Hash] 'action' plus what that action needs
+  # @return [Boolean]
   def LNet.admin(attributes)
-    return false if @@server.closed?
-    xml = REXML::Document.new
-    element = xml.add_element('admin')
-    attributes.each_pair { |name, val| element.add_attribute(name, val) }
-    @@server.puts(xml)
-    @@last_send = Time.now
+    LNet.send_element('admin', attributes)
   end
 
   # Drops control characters (Wizard/Avalon \034GS codes among them) and,
@@ -735,7 +950,7 @@ class LNet
   end
 
   def LNet.get_data(name, type)
-    return false if (!name.is_a?(String)) or name.empty? or (!type.is_a?(String)) or type.empty? or @@server.closed?
+    return false if (!name.is_a?(String)) or name.empty? or (!type.is_a?(String)) or type.empty? or !LNet.connected?
     name.capitalize!
     waiter = { 'type' => type, 'name' => name, 'data' => :waiting }
     @@waiting.push(waiter)
@@ -754,7 +969,8 @@ class LNet
 
   def LNet.upload_spell_ranks
     begin
-      return false if @@server.closed?
+      return false unless LNet.connected?
+
       data = {
         'minorspiritual' => Spells.minorspiritual,
         'majorspiritual' => Spells.majorspiritual,
@@ -793,10 +1009,7 @@ class LNet
       @active_tags.push(tag_name)
       @active_attributes.push(attributes)
       if tag_name == 'ping'
-        xml = REXML::Document.new
-        xml.add_element('pong')
-        @@server.puts(xml)
-        @@last_send = Time.now
+        LNet.send_element('pong')
       elsif (tag_name == 'request') and (type = attributes['type']) and (name = attributes['from'])
         if LNet.ignored?(name)
           LNet.send_data({ 'type' => type, 'to' => name }, nil)
@@ -981,7 +1194,7 @@ class LNet
           LNet.send_request({ 'type' => 'spell-ranks', 'to' => 'server', 'timestamp' => SpellRanks.timestamp.to_s })
         elsif attributes['type'] == 'server-restart'
           @@server_restart = true
-          @@server.close rescue('Server Restart - Server Close Error!')
+          LNet.disconnect
         end
       end
     rescue
@@ -1489,7 +1702,7 @@ elsif script.vars[1].downcase == 'help'
   script.unique_buffer.push('help')
 end
 
-before_dying { LNet.server.close rescue('Close Server when script dying error!'); LNet.script = nil }
+before_dying { LNet.disconnect; LNet.script = nil }
 LNet.script = Script.self
 
 #
@@ -1539,66 +1752,8 @@ action = proc { |client_string|
 before_dying { UpstreamHook.remove(script_name) }
 UpstreamHook.add(script_name, action)
 
-#
-# keepalive
-#
-Thread.new {
-  loop {
-    begin
-      sleep [50 - (Time.now - LNet.last_send), 5].max
-      LNet.send_ping if (Time.now - LNet.last_send) > 49
-    rescue
-      echo $!
-      puts $!.backtrace[0..1]
-      sleep 1
-    end
-  }
-}
-
-# Modified connection thread - replace the existing connection thread with this:
-Thread.new {
-  loop {
-    last_connect_attempt = Time.now
-    begin
-      LNet.connect
-
-      parser = LNet::StreamParser.new(LNet.new)
-
-      # Read from server in chunks and parse safely
-      while !LNet.server.closed?
-        begin
-          chunk = LNet.server.readpartial(4096)
-          parser.feed(chunk)
-        rescue EOFError
-          echo "Server closed connection" if $lnet_debug
-          break
-        rescue Errno::ECONNRESET
-          echo "Connection reset by server" if $lnet_debug
-          break
-        rescue => e
-          echo "Error reading from server: #{e.message}" if $lnet_debug
-          break
-        end
-      end
-    rescue
-      echo $!
-      respond $!.backtrace[0..1]
-    end
-    LNet.server.close rescue('Server close after connecting error!')
-    if LNet.server_restart
-      LNet.server_restart = false
-      echo 'server is restarting; waiting 30 seconds to reconnect...'
-      sleep 30
-    else
-      echo 'connection lost'
-      wait_time = [300 - (Time.now - last_connect_attempt), 1].max
-      if wait_time > 1
-        echo "waiting #{wait_time.to_i} seconds before trying to reconnect..."
-      end
-      sleep wait_time
-    end
-  }
-}
+Thread.new { LNet.keepalive_loop }
+Thread.new { LNet.connection_loop }
 
 #
 # listen to the user
