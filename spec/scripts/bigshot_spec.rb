@@ -1731,7 +1731,7 @@ module BigshotCastSignsSpec
 
     module UserVars
       class << self
-        attr_accessor :element
+        attr_accessor :element, :resist_element
       end
     end
 
@@ -1940,6 +1940,30 @@ RSpec.describe 'bigshot cast_signs' do
     it 'still uses UserVars.element for a plain 520' do
       cast_signs('520')
       expect(h::Spell[520].sent).to eq(['incant 520 water '])
+    end
+  end
+
+  # Resist Nature's proc reads the element from the target, falling back to
+  # UserVars.resist_element.
+  describe 'Resist Nature (620), through its real cast-proc' do
+    before do
+      h::Spell[620].cast_proc = BigshotCastSignsSpec.cast_proc(620)
+      h::UserVars.resist_element = 'heat'
+    end
+
+    it 'sends the element from the entry, not UserVars.resist_element' do
+      cast_signs('620 cold')
+      expect(h::Spell[620].sent).to eq(['incant 620 cold'])
+    end
+
+    it 'still uses UserVars.resist_element for a plain 620' do
+      cast_signs('620')
+      expect(h::Spell[620].sent).to eq(['incant 620 heat'])
+    end
+
+    it 'treats a multicast count as no element, as before' do
+      h::Spell[620].cast('2')
+      expect(h::Spell[620].sent).to eq(['incant 620 heat'])
     end
   end
 
