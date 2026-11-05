@@ -222,6 +222,27 @@ RSpec.describe 'lnet.lic request handling' do
     end
   end
 
+  describe 'LNet.upload_spell_ranks' do
+    before { skip 'needs a lich-5 checkout for the real Skills and Spells' unless LnetSpec.lich5_attributes? }
+
+    it 'sends the spell list ranks for the server\'s spell rank list' do
+      LnetSpec::Game.infomon.merge!('spell.minor_elemental' => 30, 'spell.wizard' => 50, 'spell.minor_mental' => 4,
+                                    'skill.arcane_symbols' => 40, 'skill.magic_item_use' => 20)
+      expect(lnet.upload_spell_ranks).to be(true)
+      tag, attributes, payload = server.lines.map { |line| REXML::Document.new(line).root }
+                                     .map { |e| [e.name, e.attributes['type'], lnet::SafeMarshal.decode(e.text)] }.first
+      expect([tag, attributes]).to eq(%w[data spell-ranks])
+      expect(payload.keys).to contain_exactly('minorspiritual', 'majorspiritual', 'cleric', 'minorelemental', 'majorelemental', 'ranger',
+                                              'sorcerer', 'wizard', 'bard', 'empath', 'paladin', 'arcanesymbols', 'magicitemuse', 'minormental')
+      expect(payload).to include('minorelemental' => 30, 'wizard' => 50, 'minormental' => 4, 'arcanesymbols' => 40, 'magicitemuse' => 20, 'cleric' => 0)
+    end
+
+    it 'returns false when not connected' do
+      lnet.server = nil
+      expect(lnet.upload_spell_ranks).to be(false)
+    end
+  end
+
   describe 'LNet.add_callback' do
     it 'answers a new request type only for players the user allows' do
       lnet.add_callback('roundtime') { |_request| { 'hard' => 3 } }

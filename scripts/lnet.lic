@@ -8,9 +8,12 @@
       game: any
       tags: core
   required: Lich > 5.0.1
-   version: 1.24
+   version: 1.25
 
   changelog:
+    1.25 (2026-11-05):
+      Commands given when starting lnet run at once, or once it connects if they need LNet
+      Remove the old UNTRUSTED_LNET_* and lichnet_get_spells names (use LNet.get_data)
     1.24 (2026-11-05):
       ;lnet allow lists each permission correctly and accepts script request types by name
       Fix ;lnet add alias ... reply, create poll --vote-time, and dr:bob in friend lists
@@ -98,16 +101,15 @@ require 'openssl'
 require 'rexml/document'
 require 'timeout'
 
-toggle_unique
-clear
-hide_me
-
+# LNet: chat, and requests for other players' information, between Lich
+# users over lnet.lichproject.org. Everything the script does lives in this
+# class; LNet.run starts it.
 class LNet
   # Lich keeps classes for the whole session, so running a newer lnet reopens
   # this one. Drop the constants an earlier copy of this file defined, so each
   # comes from this file; constants other scripts add to LNet (inbox.lic's
   # LNet::Inbox) are left alone.
-  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT REQUEST_TIMEOUT SAFE_SEND_INTERVAL USER_CALLBACKS_SCRIPT CA_CERTIFICATE GAME_CODES GAME_SPELLINGS StreamParser SafeMarshal Thoughts Listener Display Hook Commands Responders Waiter MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
+  %i[HOSTNAME PORT CONNECT_TIMEOUT TRUSTED_COMMON_NAMES PROTOCOL_VERSION KEEPALIVE_INTERVAL RECONNECT_INTERVAL RESTART_WAIT STARTUP_WAIT REQUEST_TIMEOUT SAFE_SEND_INTERVAL USER_CALLBACKS_SCRIPT CA_CERTIFICATE GAME_CODES GAME_SPELLINGS StreamParser SafeMarshal Thoughts Listener Display Hook Commands Responders Waiter MARSHAL_MAX_DEPTH].each { |name| remove_const(name) if const_defined?(name, false) }
 
   @@server    ||= nil
   @@script    ||= nil
@@ -128,8 +130,9 @@ class LNet
 
   @@server_restart = false
 
-  # LNet server address.
+  # LNet server host.
   HOSTNAME = 'lnet.lichproject.org'
+  # LNet server port.
   PORT = 7155
   # Seconds allowed for each of the TCP connect and the TLS handshake.
   CONNECT_TIMEOUT = 10
@@ -143,6 +146,8 @@ class LNet
   RECONNECT_INTERVAL = 300
   # Seconds to wait after the server announces a restart.
   RESTART_WAIT = 30
+  # Most seconds a command lnet was started with waits for the connection.
+  STARTUP_WAIT = 30
   # Seconds LNet.get_data waits for an answer.
   REQUEST_TIMEOUT = 8
   # Least seconds between two LNet.safe_send messages.
@@ -217,6 +222,8 @@ class LNet
 
     private
 
+    # Forgets where the last scan stopped; the buffer starts a new element.
+    # @return [void]
     def reset_scan
       @scan_pos = 0
       @gt_seen = 0
@@ -289,6 +296,8 @@ class LNet
       @scan_pos = 0
     end
 
+    # Throws away an element that grew past MAX_BUFFER without ending.
+    # @return [void]
     def overflow!
       LNet.debug("discarding #{@buffer.bytesize} bytes of an element that never ended")
       @buffer = String.new(encoding: Encoding::BINARY)
@@ -776,6 +785,7 @@ class LNet
       raise ArgumentError, "bad marshal encoding: #{e.message}"
     end
 
+    # Deepest nesting of arrays and hashes accepted.
     MAX_DEPTH = 32
     # Most values a payload may hold once its links are followed (and at most
     # 64 per byte of payload), so shared parts can't blow up into a huge tree.
@@ -890,6 +900,11 @@ class LNet
       end
     end
 
+    # Reads a Marshal packed integer.
+    # @param bin [String] the Marshal stream
+    # @param pos [Integer] where it starts
+    # @return [Array(Integer, Integer)] the value and the position after it
+    # @raise [ArgumentError] if the stream ends first
     # Counts text a payload holds, links included, and refuses it past its
     # byte limit.
     #
@@ -927,6 +942,11 @@ class LNet
       [len, pos]
     end
 
+    # Reads a length-prefixed byte string.
+    # @param bin [String]
+    # @param pos [Integer]
+    # @return [Array(String, Integer)] the bytes and the position after them
+    # @raise [ArgumentError] if the stream ends first
     def read_string(bin, pos)
       len, pos = read_long(bin, pos)
       [bin.byteslice(pos, len), skip_bytes(bin, pos, len)]
@@ -946,6 +966,11 @@ class LNet
       end
     end
 
+    # @param bin [String]
+    # @param pos [Integer]
+    # @param len [Integer]
+    # @return [Integer] the position len bytes on
+    # @raise [ArgumentError] if that is past the end
     def skip_bytes(bin, pos, len)
       raise ArgumentError, 'bad marshal length' if len < 0 or pos + len > bin.bytesize
 
@@ -987,11 +1012,18 @@ class LNet
   # Drops control characters (Wizard/Avalon \034GS codes among them) and,
   # unless told otherwise, folds line breaks so one LNet message can't print
   # what looks like a separate game line.
+  #
+  # @param text [String]
+  # @param keep_newlines [Boolean] keep line breaks (server messages)
+  # @return [String]
   def LNet.clean_text(text, keep_newlines = false)
     text = text.gsub(/\r\n?|\n/, ' ') unless keep_newlines
     text.gsub(/[\x00-\x08\x0B-\x1F\x7F]/, '')
   end
 
+  # Escapes text for an XML front end.
+  # @param text [String]
+  # @return [String]
   def LNet.xml_escape(text)
     text.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
   end
@@ -1022,6 +1054,11 @@ class LNet
       Script.new_downstream("#{real}: \"#{message}\"#{stamp}")
     end
 
+    # Shows a chat line in the game client, in the form its front end understands.
+    # @param sender [String] channel prefix and the name to show
+    # @param message [String]
+    # @param stamp [String] the timestamp, or empty
+    # @return [void]
     def to_client(sender, message, stamp)
       if $frontend =~ /wizard|avalon/
         if LNet.options['fam_window']
@@ -1109,6 +1146,8 @@ class LNet
 
     private
 
+    # @param attributes [Hash{String => String}] a <notify> element's attributes
+    # @return [void]
     def notify(attributes)
       case attributes['type']
       when 'new-spell-ranks'
@@ -1119,6 +1158,9 @@ class LNet
       end
     end
 
+    # @param attributes [Hash{String => String}] a <message> element's attributes
+    # @param text [String] its text
+    # @return [void]
     def message(attributes, text)
       return if text.empty? # lnet never showed an empty message
 
@@ -1170,6 +1212,8 @@ class LNet
       end
     end
 
+    # @param error [StandardError] what went wrong handling an element
+    # @return [void]
     def report(error)
       echo "error: #{error.message}"
       LNet.debug(error.backtrace.first(2).join("\n"))
@@ -1442,6 +1486,11 @@ class LNet
       respond LNet.for_client(text, true)
     end
 
+    # Shows a reply from another player, or why there is nothing to show.
+    # @param type [String]
+    # @param from [String]
+    # @param data [Object]
+    # @return [void]
     def player_reply(type, from, data)
       return if LNet.ignored?(from)
 
@@ -1813,9 +1862,12 @@ class LNet
                      empty: 'You are not ignoring anyone.', listing: 'You are ignoring the following people: %s' },
     }.freeze
 
+    # Pattern source for a character name, optionally with a game code.
     NAME = '((?:[A-Za-z]+:)?[A-Za-z]+)'
+    # Pattern source for a length of time: a number and a unit (s, m, h, d, y).
     TIME = '(\d+)\s*(seconds?|minutes?|hours?|days?|years?|s|m|h|d|y)'
 
+    # Each command: the pattern it must match and the method that runs it.
     ROUTES = [
       [/\Achat\s+(?:::|to\s+)(\S+)\s+(.+)\z/im, :private_message],
       [/\Achat\s+(?::(?!:)|on\s+)(\S+)\s+(.+)\z/im, :channel_message],
@@ -1860,6 +1912,19 @@ class LNet
       [/\A(?:help)?\z/i, :help],
     ].freeze
 
+    # Handlers that only change things here and send nothing to the server.
+    LOCAL_HANDLERS = %i[help aliases add_alias remove_alias friends add_friend remove_friend enemies add_enemy remove_enemy
+                        ignores ignore unignore permissions allow timestamps famwindow greeting debug preset].freeze
+
+    # @param line [String]
+    # @return [Boolean] whether the command can run without a connection (it
+    #   only changes things here, or isn't a command at all)
+    def local?(line)
+      line = line.to_s.strip
+      route = ROUTES.find { |pattern, _handler| pattern.match?(line) }
+      route.nil? || LOCAL_HANDLERS.include?(route[1])
+    end
+
     # Runs one command.
     #
     # @param line [String] e.g. 'chat hello' or 'allow locate friends'
@@ -1887,10 +1952,14 @@ class LNet
       sent
     end
 
+    # Sends a private message.
+    # @return [Boolean] whether it was sent
     def private_message(name, message)
       delivered(LNet.send_message({ 'type' => 'private', 'to' => LNet.normalize_name(name) }, message))
     end
 
+    # Sends a message to a channel.
+    # @return [Boolean] whether it was sent
     def channel_message(channel, message)
       delivered(LNet.send_message({ 'type' => 'channel', 'channel' => channel }, message))
     end
@@ -1900,32 +1969,49 @@ class LNet
       delivered(LNet.send_message({ 'type' => 'channel' }, message.sub(/\A\.(to|on) /i, '\1 ')))
     end
 
+    # Sends a private message to whoever sent the last one.
+    # @param message [String]
+    # @return [Boolean, void]
     def reply(message)
       return echo('No private message to reply to.') unless LNet.last_priv
 
       private_message(LNet.last_priv, message)
     end
 
+    # Asks who is connected, or tuned to a channel, or whether someone is connected.
+    # @return [Boolean] whether it was sent
     def who(name = nil)
       delivered(LNet.send_query(name ? { 'type' => 'connected', 'name' => name } : { 'type' => 'connected' }))
     end
 
+    # Asks for the server statistics.
+    # @return [Boolean] whether it was sent
     def stats
       delivered(LNet.send_query({ 'type' => 'server stats' }))
     end
 
+    # Asks for the busiest 15 channels, or all of them.
+    # @return [Boolean] whether it was sent
     def channels(full = nil)
       delivered(LNet.send_query(full ? { 'type' => 'channels' } : { 'type' => 'channels', 'num' => '15' }))
     end
 
+    # Listens to a channel, or makes it the default if already listening.
+    # @return [Boolean] whether it was sent
     def tune(channel)
       delivered(LNet.tune_channel(channel))
     end
 
+    # Stops listening to a channel.
+    # @return [Boolean] whether it was sent
     def untune(channel)
       delivered(LNet.untune_channel(channel))
     end
 
+    # Asks another player for information; the reply is shown when it arrives.
+    # @param type [String] a stock request type
+    # @param name [String]
+    # @return [Boolean, void]
     def request(type, name)
       name = LNet.normalize_name(name)
       return echo("There's no point in sending a request to someone you're ignoring.") if LNet.ignored?(name)
@@ -1933,6 +2019,9 @@ class LNet
       delivered(LNet.send_request({ 'type' => type.downcase, 'to' => name }))
     end
 
+    # @param real_name [String] the sender as LNet names them, e.g. GSIV:Jeril
+    # @param shown_name [String] what to show instead
+    # @return [void]
     def add_alias(real_name, shown_name)
       LNet.alias[real_name] = shown_name
       echo "chats from #{real_name} will now appear as #{shown_name}"
@@ -1942,6 +2031,8 @@ class LNet
       echo "If #{real_name} is incorrect, you can remove it using:   #{$clean_lich_char}#{script_name} remove alias #{shown_name}"
     end
 
+    # @param shown_name [String] the alias to remove
+    # @return [void]
     def remove_alias(shown_name)
       if LNet.alias.value?(shown_name)
         LNet.alias.delete_if { |_real, shown| shown == shown_name }
@@ -1951,6 +2042,8 @@ class LNet
       end
     end
 
+    # Lists the aliases.
+    # @return [void]
     def aliases
       return echo('You have no aliases.') if LNet.alias.empty?
 
@@ -1958,42 +2051,69 @@ class LNet
       respond "\n#{LNet.alias.map { |real, shown| "   #{real.ljust(width)} => #{shown}\n" }.join}\n"
     end
 
+    # Adds a name to the friend list.
+    # @param name [String]
+    # @return [void]
     def add_friend(name)
       add_to('friends', name)
     end
 
+    # Removes a name from the friend list.
+    # @param name [String]
+    # @return [void]
     def remove_friend(name)
       remove_from('friends', name)
     end
 
+    # Lists friends.
+    # @return [void]
     def friends
       show_list('friends')
     end
 
+    # Adds a name to the enemy list.
+    # @param name [String]
+    # @return [void]
     def add_enemy(name)
       add_to('enemies', name)
     end
 
+    # Removes a name from the enemy list.
+    # @param name [String]
+    # @return [void]
     def remove_enemy(name)
       remove_from('enemies', name)
     end
 
+    # Lists enemies.
+    # @return [void]
     def enemies
       show_list('enemies')
     end
 
+    # Ignores a name.
+    # @param name [String]
+    # @return [void]
     def ignore(name)
       add_to('ignore', name)
     end
 
+    # Stops ignoring a name.
+    # @param name [String]
+    # @return [void]
     def unignore(name)
       remove_from('ignore', name)
     end
 
+    # Lists ignored names.
+    # @return [void]
     def ignores
       show_list('ignore')
     end
 
+    # @param list [String] 'friends', 'enemies' or 'ignore'
+    # @param name [String]
+    # @return [void]
     def add_to(list, name)
       name = LNet.normalize_name(name)
       names = LNet.options[list]
@@ -2005,6 +2125,9 @@ class LNet
       end
     end
 
+    # @param list [String] 'friends', 'enemies' or 'ignore'
+    # @param name [String]
+    # @return [void]
     def remove_from(list, name)
       name = LNet.normalize_name(name)
       names = LNet.options[list]
@@ -2013,6 +2136,8 @@ class LNet
       echo format(matches.empty? ? LISTS[list][:absent] : LISTS[list][:removed], name)
     end
 
+    # @param list [String] 'friends', 'enemies' or 'ignore'
+    # @return [void]
     def show_list(list)
       names = LNet.options[list]
       echo(names.empty? ? LISTS[list][:empty] : format(LISTS[list][:listing], names.join(', ')))
@@ -2033,12 +2158,18 @@ class LNet
       }.fetch(type, "request your #{type}")
     end
 
+    # Lists who may see what each request type reveals.
+    # @return [void]
     def permissions
       permission_types.each do |type|
         respond "You are allowing #{WHO.fetch(LNet.options['permission'][type], 'no one')} to #{what_it_allows(type)}."
       end
     end
 
+    # Sets who may see what a request type reveals.
+    # @param type [String] a request type, or 'all'
+    # @param group [String] a word from GROUPS
+    # @return [void]
     def allow(type, group)
       permission = GROUPS[group.downcase]
       types = type.casecmp?('all') ? STOCK_TYPES : permission_types.select { |known| known.casecmp?(type) }
@@ -2051,23 +2182,40 @@ class LNet
       end
     end
 
+    # @param option [String] the option to set
+    # @param value [String] 'on' or 'off'
+    # @param on_message [String]
+    # @param off_message [String]
+    # @return [void]
     def toggle(option, value, on_message, off_message)
       LNet.options[option] = value.casecmp?('on')
       echo(LNet.options[option] ? on_message : off_message)
     end
 
+    # Shows or hides chat timestamps.
+    # @param value [String] 'on' or 'off'
+    # @return [void]
     def timestamps(value)
       toggle('timestamps', value, 'timestamps will be shown', 'timestamps will not be shown')
     end
 
+    # Sends chat to the familiar window or the thoughts window.
+    # @param value [String] 'on' or 'off'
+    # @return [void]
     def famwindow(value)
       toggle('fam_window', value, 'chats will be sent to the familiar window', 'chats will be sent to the thought window')
     end
 
+    # Shows or hides the server greeting.
+    # @param value [String] 'on' or 'off'
+    # @return [void]
     def greeting(value)
       toggle('greeting', value, 'greeting will be shown at login', 'greeting will not be shown')
     end
 
+    # Shows or hides connection and parsing details.
+    # @param value [String] 'on' or 'off'
+    # @return [void]
     def debug(value)
       toggle('debug', value, 'debug output is on', 'debug output is off')
     end
@@ -2081,6 +2229,8 @@ class LNet
       echo 'LNet is not connected right now, so the server still has the old password.' unless sent
     end
 
+    # @param value [String] 'lnet', 'thought' or 'nil'
+    # @return [void]
     def preset(value)
       case value
       when /\Anil\z/i
@@ -2097,6 +2247,8 @@ class LNet
       end
     end
 
+    # Saves an email address on the server.
+    # @return [Boolean] whether it was sent
     def email(address)
       delivered(LNet.send_data({ 'type' => 'newemail' }, address))
     end
@@ -2106,12 +2258,19 @@ class LNet
       count.to_i * UNITS.fetch(unit.to_s[0].to_s.downcase, 1)
     end
 
+    # Bans, gags or makes a moderator, for a time when given, or undoes it.
+    # @return [Boolean] whether it was sent
     def moderate(action, name, channel, count = nil, unit = nil)
       attributes = { 'action' => action.downcase, 'name' => name, 'channel' => channel }
       attributes['length'] = seconds(count, unit).to_s if count
       delivered(LNet.moderate(attributes))
     end
 
+    # @param hidden [String, nil] set to hide it from the channel list
+    # @param private_channel [String, nil] set to ban everyone by default
+    # @param name [String]
+    # @param description [String]
+    # @return [Boolean]
     def create_channel(hidden, private_channel, name, description)
       delivered(LNet.admin({ 'action' => 'create channel', 'name' => name, 'description' => description.strip,
                              'hidden' => hidden ? 'yes' : 'no', 'private' => private_channel ? 'yes' : 'no' }))
@@ -2141,14 +2300,20 @@ class LNet
       end
     end
 
+    # Deletes a channel the user owns.
+    # @return [Boolean] whether it was sent
     def delete_channel(name)
       delivered(LNet.admin({ 'action' => 'delete channel', 'name' => name }))
     end
 
+    # Sends code for the server to run (server administrators only).
+    # @return [Boolean] whether it was sent
     def server_eval(code)
       delivered(LNet.send_data({ 'type' => 'eval' }, code))
     end
 
+    # Shows every command.
+    # @return [void]
     def help
       c = $clean_lich_char
       s = "#{c}#{script_name}"
@@ -2324,6 +2489,10 @@ class LNet
       nil
     end
 
+    # @param type [String]
+    # @param to [String]
+    # @param data [Object] plain data, or nil to decline
+    # @return [Boolean]
     def reply(type, to, data)
       LNet.send_data({ 'type' => type, 'to' => to }, data)
     end
@@ -2460,6 +2629,8 @@ class LNet
     # @return [String] the name the request was sent to
     attr_reader :name
 
+    # @param type [String] the request type
+    # @param name [String] who it was sent to
     def initialize(type, name)
       @type = type
       @name = name
@@ -2560,105 +2731,155 @@ class LNet
     reply ? reply.first : false
   end
 
+  # Sends this character's spell list ranks for the server's spell rank list
+  # (GemStone only; infomon calls it).
+  #
+  # @return [Boolean] whether they were sent
   def LNet.upload_spell_ranks
-    begin
-      return false unless LNet.connected?
+    return false unless LNet.connected?
 
-      data = {
-        'minorspiritual' => Spells.minorspiritual,
-        'majorspiritual' => Spells.majorspiritual,
-        'cleric'         => Spells.cleric,
-        'minorelemental' => Spells.minorelemental,
-        'majorelemental' => Spells.majorelemental,
-        'ranger'         => Spells.ranger,
-        'sorcerer'       => Spells.sorcerer,
-        'wizard'         => Spells.wizard,
-        'bard'           => Spells.bard,
-        'empath'         => Spells.empath,
-        'paladin'        => Spells.paladin,
-        'arcanesymbols'  => Skills.arcanesymbols,
-        'magicitemuse'   => Skills.magicitemuse,
-      }
-      begin
-        data['minormental'] = Spells.minormental
-      rescue
-        nil
+    data = %w[minorspiritual majorspiritual cleric minorelemental majorelemental ranger sorcerer wizard bard empath paladin]
+           .to_h { |list| [list, Spells.public_send(list)] }
+    data['arcanesymbols'] = Skills.arcanesymbols
+    data['magicitemuse'] = Skills.magicitemuse
+    data['minormental'] = Spells.minormental if Spells.respond_to?(:minormental)
+    LNet.send_data({ 'type' => 'spell-ranks' }, data)
+  rescue StandardError
+    false
+  end
+
+  # Loads the saved settings: the character's options and password
+  # (CharSettings) and the aliases shared by all characters (Settings).
+  # Values are kept as Lich returns them, so changes are saved by Lich.
+  #
+  # @param char_settings [#[], #[]=] Lich's CharSettings
+  # @param settings [#[], #[]=] Lich's Settings
+  # @return [void]
+  def LNet.load_settings(char_settings, settings)
+    char_settings['options'] = {} unless char_settings['options'].is_a?(Hash)
+    char_settings['secret'] = [] unless char_settings['secret'].is_a?(Array)
+    LNet.options = char_settings['options']
+    LNet.store_secret = char_settings['secret']
+    LNet.import_legacy_settings(settings) if LNet.options.empty?
+    LNet.normalize_options(LNet.options)
+    settings['alias'] = {} unless settings['alias'].is_a?(Hash)
+    LNet.alias = settings['alias']
+  end
+
+  # A copy of saved data made of plain hashes, arrays and strings, sharing
+  # nothing with the original (which may be one of Lich's SettingsProxy
+  # objects, whose dup shares the saved value).
+  #
+  # @param value [Object]
+  # @return [Object]
+  def LNet.plain_copy(value)
+    if value.is_a?(Hash)
+      value.to_h.each_with_object({}) { |(key, item), copy| copy[LNet.plain_copy(key)] = LNet.plain_copy(item) }
+    elsif value.is_a?(Array)
+      value.to_a.map { |item| LNet.plain_copy(item) }
+    elsif value.is_a?(String)
+      value.to_s.dup
+    else
+      value
+    end
+  end
+
+  # Copies a character's options from the settings old versions of lnet
+  # kept for every character, and moves their password across.
+  #
+  # @param settings [#[]] Lich's Settings
+  # @return [void]
+  def LNet.import_legacy_settings(settings)
+    legacy = settings['options']
+    return unless legacy.is_a?(Hash)
+
+    %w[timestamps fam_window greeting].each { |key| LNet.options[key] = legacy[key] unless legacy[key].nil? }
+    %w[friends enemies permission ignore].each { |key| LNet.options[key] = LNet.plain_copy(legacy[key]) unless legacy[key].nil? }
+    own = legacy[XMLData.name]
+    return unless own.is_a?(Hash) && own['password']
+
+    LNet.secret = own['password'].to_s.dup
+    own['password'] = nil
+  end
+
+  # Fills in missing options and replaces any of the wrong kind.
+  #
+  # @param options [#[], #[]=]
+  # @return [void]
+  def LNet.normalize_options(options)
+    options['timestamps'] = false if options['timestamps'].nil?
+    options['fam_window'] = false if options['fam_window'].nil?
+    options['greeting'] = true if options['greeting'].nil?
+    %w[friends enemies ignore].each { |key| options[key] = [] unless options[key].is_a?(Array) }
+    options['permission'] = {} unless options['permission'].is_a?(Hash)
+  end
+
+  # Handles what lnet was started with: 'password=<password>' (or nil) saves
+  # the password to log in with (without the quotes Lich leaves around it);
+  # anything else is a command to run once lnet is listening.
+  #
+  # @param arguments [String, nil] e.g. 'password=secret' or 'allow locate friends'
+  # @return [String, nil] the command to run, if any
+  def LNet.startup_arguments(arguments)
+    arguments = arguments.to_s.strip
+    if (match = arguments.match(/\Apassword=(\S+)\z/i))
+      value = match[1][/\A"(.*)"\z/, 1] || match[1] # Lich leaves quotes on the whole argument string
+      LNet.secret = value == 'nil' ? nil : value
+      echo(value == 'nil' ? 'Password cleared.' : 'Password saved locally.')
+      nil
+    elsif !arguments.empty?
+      arguments
+    end
+  end
+
+  # Waits for the connection thread to log in.
+  #
+  # @param timeout [Numeric] seconds to wait at most
+  # @return [Boolean] whether lnet is connected
+  def LNet.wait_until_connected(timeout)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    sleep 0.1 until LNet.connected? || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+    LNet.connected?
+  end
+
+  # Starts the keepalive and connection threads.
+  # @return [Array<Thread>]
+  def LNet.start_threads
+    [Thread.new { LNet.keepalive_loop }, Thread.new { LNet.connection_loop }]
+  end
+
+  # Runs lnet until the script is killed: loads the settings, takes over the
+  # chat commands typed in the client, connects, and runs each command.
+  #
+  # @param script [Script] the running lnet script
+  # @return [void]
+  def LNet.run(script)
+    LNet.load_settings(CharSettings, Settings)
+    LNet.script = script
+    script_name = script.name.dup
+    before_dying do
+      UpstreamHook.remove(script_name)
+      LNet.disconnect
+      LNet.script = nil
+    end
+    UpstreamHook.add(script_name, Hook.build(script_name))
+    command = LNet.startup_arguments(script.vars[0])
+    LNet.start_user_callbacks
+    LNet.start_threads
+    if command
+      unless Commands.local?(command) || LNet.connected?
+        echo 'waiting for LNet to connect...'
+        LNet.wait_until_connected(STARTUP_WAIT)
       end
-      LNet.send_data({ 'type'=>'spell-ranks' }, data)
-      return true
-    rescue
-      return false
+      Commands.run(command)
+    end
+    while (line = unique_get)
+      Commands.run(line)
     end
   end
 end
 
-unless defined?(UNTRUSTED_LNET_GET_DATA)
-  UNTRUSTED_LNET_GET_DATA = proc { |name, type| LNet.get_data(name, type) }
-end
-
-unless defined?(UNTRUSTED_LNET_UPLOAD_SPELL_RANKS)
-  UNTRUSTED_LNET_UPLOAD_SPELL_RANKS = proc { LNet.upload_spell_ranks }
-end
-
-def lichnet_get_spells(name)
-  LNet.get_data(name, 'spells')
-end
-
-CharSettings['options'] ||= Hash.new
-LNet.options = CharSettings['options']
-
-CharSettings['secret'] ||= Array.new
-LNet.store_secret = CharSettings['secret']
-
-if LNet.options.empty?
-  LNet.options['timestamps'] = Settings['options']['timestamps']
-  LNet.options['fam_window'] = Settings['options']['fam_window']
-  LNet.options['greeting']   = Settings['options']['greeting']
-  LNet.options['friends']    = Settings['options']['friends'].dup
-  LNet.options['enemies']    = Settings['options']['enemies'].dup
-  LNet.options['permission'] = Settings['options']['permission'].dup
-  LNet.options['ignore']     = Settings['options']['ignore'].dup
-  LNet.secret                = Settings['options'][XMLData.name]['password'].dup
-  Settings['options'][XMLData.name]['password'] = nil
-end
-
-if LNet.options['timestamps'].nil?
-  LNet.options['timestamps'] = false
-  LNet.options['fam_window'] = false
-end
-
-LNet.options['greeting']   = true if LNet.options['greeting'].nil?
-LNet.options['friends']    = Array.new unless LNet.options['friends'].is_a?(Array)
-LNet.options['enemies']    = Array.new unless LNet.options['enemies'].is_a?(Array)
-LNet.options['permission'] = Hash.new  unless LNet.options['permission'].is_a?(Hash)
-LNet.options['ignore']     = Array.new unless LNet.options['ignore'].is_a?(Array)
-
-Settings['alias']          = Hash.new  unless Settings['alias'].is_a?(Hash)
-LNet.alias = Settings['alias']
-
-if script.vars[1] =~ /^password=([^\s]+)$/i
-  if $1 == 'nil'
-    LNet.secret = nil
-    echo 'Password cleared.'
-  else
-    LNet.secret = $1
-    echo 'Password saved locally.'
-  end
-elsif script.vars[1].downcase == 'help'
-  script.unique_buffer.push('help')
-end
-
-before_dying { LNet.disconnect; LNet.script = nil }
-LNet.script = Script.self
-
-script_name = script.name.dup
-before_dying { UpstreamHook.remove(script_name) }
-UpstreamHook.add(script_name, LNet::Hook.build(script_name))
-LNet.start_user_callbacks
-
-Thread.new { LNet.keepalive_loop }
-Thread.new { LNet.connection_loop }
-
-while (line = unique_get)
-  LNet::Commands.run(line)
-end
+toggle_unique
+clear
+hide_me
+LNet.run(Script.current)
