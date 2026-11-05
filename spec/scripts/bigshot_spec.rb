@@ -1700,6 +1700,14 @@ module BigshotCastSignsSpec
   CAST_SIGNS_SRC = extract(/^  def cast_signs\(single_cast = false\).*?^  end$/m, 'cast_signs')
   CAST_SPELL_SRC = extract(/^  def cast_spell\(.*?^  end$/m, 'cast_spell')
 
+  # The real cast-proc text Lich runs for a spell, from effect-list.xml.
+  def self.cast_proc(num)
+    require 'rexml/document'
+    @effect_list ||= REXML::Document.new(File.read(find_lic_source('effect-list.xml', from: __dir__)))
+    REXML::XPath.first(@effect_list, "//spell[@number='#{num}']/cast-proc")&.text or
+      raise "no cast-proc for #{num} in effect-list.xml"
+  end
+
   HINDRANCE = '[Spell Hindrance for Robe is 5% with current Lore ranks.]'
 
   class Harness
@@ -1718,6 +1726,12 @@ module BigshotCastSignsSpec
     module Skills
       class << self
         attr_accessor :slblessings, :elair
+      end
+    end
+
+    module UserVars
+      class << self
+        attr_accessor :element
       end
     end
 
@@ -1755,7 +1769,9 @@ module BigshotCastSignsSpec
     end
 
     # Spell double: records each cast call and spends the mana, so the
-    # hindrance retry loop sees mana drop the way it does in game.
+    # hindrance retry loop sees mana drop the way it does in game. With a
+    # cast_proc set, cast evals it the way Lich's Spell#cast does (target as
+    # a local, options never passed in) and records the commands it sends.
     class Spell
       class << self
         def book
@@ -1767,8 +1783,9 @@ module BigshotCastSignsSpec
         end
       end
 
-      attr_accessor :num, :name, :known, :active, :mana_cost, :affordable, :group_cooldown, :last_cast, :results
-      attr_reader :calls
+      attr_accessor :num, :name, :known, :active, :mana_cost, :affordable, :group_cooldown, :last_cast, :results,
+                    :cast_proc
+      attr_reader :calls, :sent
 
       def initialize(num)
         @num = num
@@ -1779,6 +1796,7 @@ module BigshotCastSignsSpec
         @affordable = true
         @last_cast = Time.at(0)
         @calls = []
+        @sent = []
         @results = []
       end
 
@@ -1787,14 +1805,30 @@ module BigshotCastSignsSpec
       def affordable? = affordable
 
       def cast(*args)
-        record(:cast, *args)
+        return record(:cast, *args) unless cast_proc
+
+        target = args.first # rubocop:disable Lint/UselessAssignment -- read by the eval'd cast-proc
+        record(:cast_proc, *args)
+        eval(cast_proc) # mirrors Lich's Spell#cast
       end
 
+      # Lich's force_incant is cast(nil, ...), so a cast-proc runs with no target
       def force_incant(extra = nil)
+        return cast(nil) if cast_proc
+
         record(:force_incant, extra)
       end
 
       private
+
+      def checkprep
+        'None'
+      end
+
+      def dothistimeout(cmd, *)
+        @sent << cmd
+        'A layer of raw elemental energy forms around you.'
+      end
 
       def record(*call)
         @calls << call
@@ -1876,8 +1910,8 @@ RSpec.describe 'bigshot cast_signs' do
 
   context 'with extra spell options' do
     it 'incants the spell with them' do
-      cast_signs('520 fire')
-      expect(calls(520)).to eq([[:force_incant, 'fire']])
+      cast_signs('503 open')
+      expect(calls(503)).to eq([[:force_incant, 'open']])
     end
 
     it 'applies the 515 mana check to the parsed spell number' do
@@ -1886,6 +1920,26 @@ RSpec.describe 'bigshot cast_signs' do
       h::Char.mana = 12
       cast_signs('520 fire')
       expect(calls(520)).to be_empty
+    end
+  end
+
+  # Spell#cast runs a cast-proc in place of its own incant, and the proc never
+  # sees the options, only the target. Mage Armor's proc reads the element
+  # from the target, falling back to UserVars.element.
+  describe 'Mage Armor (520), through its real cast-proc' do
+    before do
+      h::Spell[520].cast_proc = BigshotCastSignsSpec.cast_proc(520)
+      h::UserVars.element = 'water'
+    end
+
+    it 'sends the element from the entry, not UserVars.element' do
+      cast_signs('520 fire')
+      expect(h::Spell[520].sent).to eq(['incant 520 fire'])
+    end
+
+    it 'still uses UserVars.element for a plain 520' do
+      cast_signs('520')
+      expect(h::Spell[520].sent).to eq(['incant 520 water '])
     end
   end
 
@@ -1924,6 +1978,17 @@ RSpec.describe 'bigshot cast_signs' do
       cast_signs('605 evoke')
       # 20 -> 15 (still covers 15), retry -> 10, short for an evoke: stop
       expect(calls(605).size).to eq(2)
+    end
+
+    it 'prices the 515 cooldown penalty on the 15-mana evoke, not the 5-mana cast' do
+      group!('Grhim')
+      h::Spell[597].active = true
+      { 17 => 0, 19 => 0, 20 => 1 }.each do |mana, casts|
+        h::Spell[605].calls.clear
+        h::Char.mana = mana
+        cast_signs('605 evoke')
+        expect(calls(605).size).to eq(casts), "at #{mana} mana"
+      end
     end
 
     it 'skips while Barkskin is on cooldown' do
