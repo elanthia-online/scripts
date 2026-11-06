@@ -2094,6 +2094,8 @@ module BigshotWandSpec
   DISPATCH_RE = Regexp.new(DISPATCH_SRC[/\/(\^wand.*?)\/i/, 1], Regexp::IGNORECASE)
   # Fails loudly if the out-of-mana fallback stops calling cmd_wand with no args.
   extract(/^      if \(@WAND_IF_OOM\)\n        cmd_wand\(target\); return;$/, 'wand_if_oom fallback')
+  # Fails loudly if rest stops starting the next hunt back on the first wand type.
+  extract(/^  def rest\(\)(?:(?!^  end$).)*^    \$bigshot_wand = 0$/m, 'rest resets wand index')
 
   Item = Struct.new(:id, :name)
   Target = Struct.new(:id)
@@ -2137,7 +2139,8 @@ module BigshotWandSpec
       held = GameObj.right_hand
       return unless held.id == Regexp.last_match(1)
 
-      GameObj.reserve << held
+      @reserved = held
+      GameObj.reserve << held unless reserve_list_stale
       GameObj.right_hand = Item.new(nil, 'Empty')
     end
 
@@ -2153,11 +2156,11 @@ module BigshotWandSpec
       get_reply || "You remove #{wand.name}."
     end
 
-    attr_accessor :hands_full
+    attr_accessor :hands_full, :reserve_list_stale
 
     # RESERVE CLEAR moves the item back into a hand, if one is free
     def clear_reserve(id)
-      item = GameObj.reserve.find { |o| o.id == id }
+      item = GameObj.reserve.find { |o| o.id == id } || (@reserved if @reserved&.id == id)
       return nil if item.nil? || hands_full
 
       GameObj.reserve.delete(item)
@@ -2271,7 +2274,15 @@ RSpec.describe 'bigshot cmd_wand' do
       expect(bs.sent.last(2)).to eq(['reserve clear #100', 'put #100 in my sack'])
     end
 
-    it 'warns and leaves the wand alone when it cannot come out of RESERVE' do
+    it 'takes a dead wand out of RESERVE even if the reserve list has not refreshed yet' do
+      bs.wave_result = nil
+      bs.reserve_list_stale = true
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last(3)).to eq(['wave #100 at #555', 'reserve clear #100', 'drop #100'])
+    end
+
+    it 'warns and rests when a dead wand cannot come out of RESERVE' do
       bs.wave_result = nil
       bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
       bs.hands_full = true
@@ -2279,6 +2290,8 @@ RSpec.describe 'bigshot cmd_wand' do
 
       expect(bs.sent.last).to eq('reserve clear #200')
       expect(bs.messages.last).to match(/Couldn't take the dead wand out of RESERVE/)
+      expect($bigshot_should_rest).to be true
+      expect($rest_reason).to eq('Dead wand stuck in RESERVE!')
     end
 
     it 'refreshes the reserve list when the reserved wand is gone' do
@@ -2332,6 +2345,30 @@ RSpec.describe 'bigshot cmd_wand' do
       bs.WAND = ['wand (glowing)']
       bs.cmd_wand(target)
       expect(bs.sent).to eq(['get wand (glowing) from my cloak', 'wave #400 at #555'])
+    end
+  end
+
+  describe 'with no wand name to use' do
+    let(:sword) { BigshotWandSpec::Item.new('900', 'broadsword') }
+
+    before { bs.class::GameObj.right_hand = sword }
+
+    [nil, ' reserve'].each do |args|
+      it "leaves the held weapon alone when every wand type is used up (args: #{args.inspect})" do
+        $bigshot_wand = 1
+        bs.cmd_wand(target, args)
+        expect(bs.sent).to be_empty
+        expect(bs.messages.last).to match(/no wand type left/)
+      end
+    end
+
+    [nil, [], ['']].each do |setting|
+      it "leaves the held weapon alone when the wand setting is #{setting.inspect}" do
+        bs.WAND = setting
+        bs.cmd_wand(target)
+        expect(bs.sent).to be_empty
+        expect(bs.messages.last).to match(/no wand type left/)
+      end
     end
   end
 
