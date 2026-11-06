@@ -233,12 +233,8 @@ RSpec.describe 'analytics.lic' do
   describe 'boxes and spending' do
     subject(:spending) { result('spending') }
 
-    it 'adds the boxes column to a database from before it existed' do
-      expect(spending['migrated']).to be(true)
-    end
-
     it 'counts the boxes found on searched corpses by creature' do
-      expect(spending['kills']).to eq([['flesh monstrosity', 1, 57, 0], ['kobold', 3, 30, 0], ['scaled shaper', 1, 0, 1]])
+      expect(spending['kills']).to eq([['flesh monstrosity', 1, 57, 0], ['scaled shaper', 1, 0, 1]])
     end
 
     it 'records silver spent at the locksmith (once per quote), the locksmith pool and the priestess' do
@@ -270,6 +266,29 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'a database from another build' do
+    subject(:guard) { result('schema_guard') }
+
+    it 'is refused before anything is written into it, saying what to do' do
+      expect(guard['writer'].first).to be(true)
+      expect(guard['writer'].last).to include('schema 6', 'this one uses 7', 'Rename or move it')
+      expect(guard['untouched']).to eq(%w[cycles metadata])
+    end
+
+    it 'is refused when it has tables but no schema version' do
+      expect(guard['no_version'].first).to be(true)
+      expect(guard['no_version'].last).to include('schema unknown')
+    end
+
+    it 'is refused for reading too: reports say why, and the dashboard API answers 503 with the reason' do
+      expect(guard.values_at('reader', 'cli', 'api')).to eq([true, true, ['503', true]])
+    end
+
+    it 'starts a fresh database in an empty file' do
+      expect(guard['empty_file']).to eq('7')
+    end
+  end
+
   describe 'this login (session) report' do
     subject(:login) { result('session_report') }
 
@@ -296,22 +315,6 @@ RSpec.describe 'analytics.lic' do
 
     it 'finds the latest login, still live, for the report' do
       expect(login['login_ok']).to be(true)
-    end
-  end
-
-  describe 'sessions' do
-    subject(:sessions) { result('sessions') }
-
-    it 'closes an earlier day left open by a crash at the end of its last cycle' do
-      expect(sessions['crashed']).to be(true)
-    end
-
-    it 'is open while the collector runs, closed when it stops, and reopened on a restart that day' do
-      expect(sessions.values_at('running', 'stopped', 'restarted')).to eq([['active', nil], ['ended', true], ['active', nil]])
-    end
-
-    it 'closes the day that ended at midnight' do
-      expect(sessions['midnight']).to be(true)
     end
   end
 
@@ -352,10 +355,6 @@ RSpec.describe 'analytics.lic' do
 
     it 'records the game and the character on every row' do
       expect(database.values_at('game_column', 'character_column')).to eq(%w[GS3 Torvek])
-    end
-
-    it 'keeps one session per game and character' do
-      expect(database.values_at('session_cached', 'session_per_game')).to eq([true, true])
     end
 
     it 'closes a cycle with its duration and ending figures' do
@@ -503,12 +502,6 @@ RSpec.describe 'analytics.lic' do
 
     it 'records a bounty reward that arrived during the lock' do
       expect(locked['bounty']).to eq(['completed', 300])
-    end
-  end
-
-  describe 'a new session created inside a queued write while the database is held' do
-    it 'is written by the retry, with the write that needed it' do
-      expect(result('locked_session')).to eq('sessions' => 1, 'linked' => 1)
     end
   end
 

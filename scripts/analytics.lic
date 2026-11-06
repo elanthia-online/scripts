@@ -9,7 +9,7 @@
   alerts and a daily digest, and a web dashboard that reads this computer's
   data in your browser: https://analytics.elanthia.online/
 
-            author: Tysong (horibu on PC)
+            author: elanthia-online
               game: Gemstone
               tags: analytics, dashboard, hunting, silver, bounty, discord
           required: Lich >= 5.23.0
@@ -381,13 +381,16 @@ module GS4Analytics
     constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
 
     class Missing < StandardError; end
+    # A database made by a build with a different schema. There are no
+    # migrations before the first release: testers start with a fresh file.
+    class Outdated < StandardError; end
 
     # Cycles shorter than this are state flapping, not real hunts or rests
     MIN_CYCLE_SECONDS = 10
-    SCHEMA_VERSION    = '6'
-    # Columns added after a table was first made. create_table? leaves an
-    # existing table alone, so a database from an earlier version gets them here.
-    ADDED_COLUMNS = { kill_stats: { boxes: [Integer, { default: 0 }] } }.freeze
+    # The schema in create_schema. Any change to it bumps this, and a file made
+    # with another value is refused (see check_schema), not migrated. Kept in
+    # step with KNOWN_SCHEMAS in elanthia-online/analytics.
+    SCHEMA_VERSION    = '7'
     BACKUPS_KEPT = 7 # maintenance backup keeps this many
     # Queued writes that find the database locked by another Lich session are
     # kept and retried, backing off from 2 s up to 30 s, up to this many
@@ -431,18 +434,12 @@ module GS4Analytics
       def connect!(path = file)
         close
         FileUtils.mkdir_p(File.dirname(path))
-        @db = open_database(path)
+        conn = open_database(path)
+        check_schema(conn, path) # a refused file must not become the writer
+        @db = conn
         @db.run('PRAGMA journal_mode=WAL')
-        columns = @db.table_exists?(:cycles) ? @db.all('PRAGMA table_info(cycles)').map { |col| col['name'] } : nil
-        if columns && !columns.include?('game')
-          raise "#{path} is an older analytics database without a game column; move it aside and restart"
-        end
-
         create_schema
-        add_missing_columns
         set_metadata('schema_version', SCHEMA_VERSION)
-        @sessions = {}
-        @session_lock = Mutex.new
         start_writer
         Log.info("Database ready: #{path}")
       end
@@ -474,7 +471,6 @@ module GS4Analytics
         [@db, @reader].compact.each(&:disconnect)
         @db = @reader = nil
         @queue = @pending = nil
-        @sessions = {}
       end
 
       def all(sql, *params) = db.all(sql, *params)
@@ -524,53 +520,12 @@ module GS4Analytics
         db[:metadata].insert_conflict(:replace).insert(key: key, value: value.to_s, updated_at: Time.now.to_i)
       end
 
-      # ----- sessions and cycles ---------------------------------------------
-
-      # One session per character per day, cached so the 2 s bounty poll and
-      # every kill don't query for it. A new one is queued, not written, so a
-      # busy database can't stop the cycle thread at midnight.
-      def session_for(who)
-        date = Date.today.to_s
-        cached = @sessions[who]
-        return cached[:id] if cached && cached[:date] == date
-
-        @session_lock.synchronize do
-          cached = @sessions[who]
-          return cached[:id] if cached && cached[:date] == date
-
-          key = { game: who.game, character: who.name, start_date: date }
-          id = db[:sessions].where(key).get(:session_id)
-          unless id
-            id = new_id
-            row = key.merge(session_id: id, midnight_timestamp: Util.midnight(date), start_time: Time.now.to_i)
-            async { db[:sessions].insert_ignore.insert(row) }
-          end
-          @sessions[who] = { date: date, id: id }
-          id
-        end
-      end
-
-      # A day's session is open while the collector runs. Starting again the
-      # same day reopens it; one from an earlier day still open was left by a
-      # crash and closes at the end of its last cycle.
-      def open_session(who, session_id)
-        db[:sessions].where(session_id: session_id).update(end_time: nil, status: 'active')
-        db[:sessions].where(game: who.game, character: who.name, status: 'active').exclude(session_id: session_id)
-                     .select_map(%i[session_id start_time]).each do |id, start|
-          last = db[:cycles].where(session_id: id).max(:end_time)
-          end_session(id, last || start)
-        end
-      end
-
-      # Closed when the collector stops, or at midnight when the day ends
-      def end_session(session_id, at)
-        db[:sessions].where(session_id: session_id).update(end_time: at, status: 'ended')
-      end
+      # ----- cycles ----------------------------------------------------------
 
       # +id+ and +at+ are taken when the cycle starts, so a write that waits
       # for a busy database still records the real start
-      def start_cycle(who, session_id, type, trigger, profile, vitals, id: new_id, at: Time.now.to_i)
-        db[:cycles].insert(clean(cycle_id: id, session_id: session_id, game: who.game, character: who.name,
+      def start_cycle(who, type, trigger, profile, vitals, id: new_id, at: Time.now.to_i)
+        db[:cycles].insert(clean(cycle_id: id, game: who.game, character: who.name,
                                  cycle_type: type.to_s, start_time: at, profile: profile,
                                  trigger_script: trigger, exp_total_start: vitals[:exp_total],
                                  exp_field_start: vitals[:exp_field], exp_field_max: vitals[:exp_max],
@@ -639,21 +594,21 @@ module GS4Analytics
       end
 
       # category: 'box', 'sale', 'bounty', or 'expense' (silver spent, stored positive)
-      def record_silver(who, session_id, cycle_id, category, amount, vendor_type: nil, vendor_name: nil,
+      def record_silver(who, cycle_id, category, amount, vendor_type: nil, vendor_name: nil,
                         bounty_type: nil, at: Time.now.to_i)
         return unless amount.to_i.positive?
 
-        db[:silver_events].insert(clean(event_id: new_id, session_id: session_id, cycle_id: cycle_id, game: who.game,
+        db[:silver_events].insert(clean(event_id: new_id, cycle_id: cycle_id, game: who.game,
                                         character: who.name, timestamp: at, source_category: category,
                                         amount: amount.to_i, vendor_type: vendor_type, vendor_name: vendor_name,
                                         bounty_type: bounty_type))
       end
 
       # Available to custom selling scripts
-      def record_item_sale(who, session_id, item_name, item_noun, total_price, vendor_type, vendor_name = nil,
+      def record_item_sale(who, item_name, item_noun, total_price, vendor_type, vendor_name = nil,
                            quantity = 1)
         unit = quantity.to_i.positive? ? total_price / quantity : total_price
-        db[:item_sales].insert(clean(sale_id: new_id, session_id: session_id, game: who.game, character: who.name,
+        db[:item_sales].insert(clean(sale_id: new_id, game: who.game, character: who.name,
                                      timestamp: Time.now.to_i, item_name: item_name, item_noun: item_noun,
                                      quantity: quantity, unit_price: unit, total_price: total_price,
                                      vendor_type: vendor_type, vendor_name: vendor_name))
@@ -661,9 +616,9 @@ module GS4Analytics
 
       # ----- bounties --------------------------------------------------------
 
-      def start_bounty(who, session_id, cycle_id, type, creature, area, count_required = nil, received_at: nil,
+      def start_bounty(who, cycle_id, type, creature, area, count_required = nil, received_at: nil,
                        id: new_id)
-        db[:bounties].insert(clean(bounty_id: id, session_id: session_id, cycle_id: cycle_id, game: who.game,
+        db[:bounties].insert(clean(bounty_id: id, cycle_id: cycle_id, game: who.game,
                                    character: who.name, received_time: received_at || Time.now.to_i, bounty_type: type,
                                    creature: creature, area: area, count_required: count_required, status: 'active'))
         id
@@ -715,8 +670,8 @@ module GS4Analytics
 
       # ----- bounty offers ---------------------------------------------------
 
-      def record_offer(who, session_id, cycle_id, offer, id:, at:)
-        db[:bounty_offers].insert(clean(offer_id: id, session_id: session_id, cycle_id: cycle_id, game: who.game,
+      def record_offer(who, cycle_id, offer, id:, at:)
+        db[:bounty_offers].insert(clean(offer_id: id, cycle_id: cycle_id, game: who.game,
                                         character: who.name, offered_at: at, assignment: offer[:assignment],
                                         town: offer[:town], area: offer[:area], description: offer[:description],
                                         expedited: offer[:expedited] ? true : false,
@@ -756,7 +711,7 @@ module GS4Analytics
       # +results+ maps bank name to balance and carries a '__total__' entry.
       # Individual banks are written only when their balance changed; the
       # total always is, since it carries the silver-per-hour deltas.
-      def store_bank_snapshot(who, session_id, cycle_id, snapshot_type, results)
+      def store_bank_snapshot(who, cycle_id, snapshot_type, results)
         now = Time.now.to_i
         previous = latest_balances(who)
 
@@ -774,7 +729,7 @@ module GS4Analytics
             prior = previous[bank]
             next if bank != '__total__' && prior == balance
 
-            db[:bank_snapshots].insert(clean(snapshot_id: new_id, session_id: session_id, cycle_id: cycle_id,
+            db[:bank_snapshots].insert(clean(snapshot_id: new_id, cycle_id: cycle_id,
                                              game: who.game, character: who.name, timestamp: now, bank_name: bank,
                                              balance: balance, delta_silver: prior && balance - prior,
                                              snapshot_type: snapshot_type))
@@ -809,7 +764,7 @@ module GS4Analytics
       end
 
       def statistics
-        counts = %i[sessions logins cycles kill_stats bounties bounty_offers silver_events item_sales bank_snapshots
+        counts = %i[logins cycles kill_stats bounties bounty_offers silver_events item_sales bank_snapshots
                     rest_steps vendor_visits].map { |table| "#{table}: #{Util.fmt(db[table].count)}" }
         counts << "size: #{(File.size(file) / 1_048_576.0).round(2)} MB"
       end
@@ -824,7 +779,21 @@ module GS4Analytics
       def open_reader(path)
         raise Missing, "No analytics data yet at #{path}" unless File.exist?(path)
 
-        open_database(path)
+        open_database(path).tap { |conn| check_schema(conn, path) }
+      end
+
+      # Before anything is created: a file with tables but no schema_version, or
+      # another one, was made by a different build. Writing into it would half
+      # build this schema inside the old one, so it's refused.
+      def check_schema(conn, path)
+        return if conn.tables.empty?
+
+        found = conn[:metadata].where(key: 'schema_version').get(:value) if conn.table_exists?(:metadata)
+        return if found == SCHEMA_VERSION
+
+        conn.disconnect
+        raise Outdated, "#{path} was made by another build of analytics.lic (schema #{found || 'unknown'}, " \
+                        "this one uses #{SCHEMA_VERSION}). Rename or move it, then start ;analytics again for a fresh one."
       end
 
       # The writer and readers both open through Lich's helper, which gives
@@ -954,31 +923,9 @@ module GS4Analytics
 
       # ----- schema ----------------------------------------------------------
 
-      def add_missing_columns
-        ADDED_COLUMNS.each do |table, columns|
-          have = db.schema(table, reload: true).map(&:first)
-          columns.each do |name, (type, opts)|
-            db.alter_table(table) { add_column name, type, **opts } unless have.include?(name)
-          end
-        end
-      end
-
       def create_schema
-        db.create_table?(:sessions) do
-          String :session_id, primary_key: true
-          String :game, null: false
-          String :character, null: false
-          String :start_date, null: false
-          Integer :midnight_timestamp, null: false
-          Integer :start_time, null: false
-          Integer :end_time
-          String :status, default: 'active'
-          unique %i[game character start_date]
-        end
-
         db.create_table?(:cycles) do
           String :cycle_id, primary_key: true
-          String :session_id, null: false
           String :game, null: false
           String :character, null: false
           String :cycle_type, null: false # hunt, rest, dead, idle
@@ -1016,7 +963,6 @@ module GS4Analytics
 
         db.create_table?(:bounties) do
           String :bounty_id, primary_key: true
-          String :session_id, null: false
           String :cycle_id
           String :game, null: false
           String :character, null: false
@@ -1040,7 +986,6 @@ module GS4Analytics
         # removed, replaced or expired)
         db.create_table?(:bounty_offers) do
           String :offer_id, primary_key: true
-          String :session_id, null: false
           String :cycle_id
           String :game, null: false
           String :character, null: false
@@ -1065,7 +1010,6 @@ module GS4Analytics
         # player's own queries; no report reads them yet
         db.create_table?(:silver_events) do
           String :event_id, primary_key: true
-          String :session_id, null: false
           String :cycle_id
           String :game, null: false
           String :character, null: false
@@ -1080,7 +1024,6 @@ module GS4Analytics
 
         db.create_table?(:item_sales) do
           String :sale_id, primary_key: true
-          String :session_id, null: false
           String :game, null: false
           String :character, null: false
           Integer :timestamp, null: false
@@ -1096,7 +1039,6 @@ module GS4Analytics
 
         db.create_table?(:bank_snapshots) do
           String :snapshot_id, primary_key: true
-          String :session_id, null: false
           String :cycle_id
           String :game, null: false
           String :character, null: false
@@ -1229,7 +1171,6 @@ module GS4Analytics
 
       def start(who)
         @who = who
-        @session_id = nil
         @cycle_id = nil
         @kill = nil
         @last_kill_at = nil
@@ -1274,10 +1215,9 @@ module GS4Analytics
         true
       end
 
-      # Keeps silver events linked to the live cycle and session
-      def link(cycle_id, session_id)
+      # Keeps silver events linked to the live cycle
+      def link(cycle_id)
         @cycle_id = cycle_id
-        @session_id = session_id
       end
 
       # Reads the bank balances now. The game text is also read as it passes
@@ -1310,8 +1250,7 @@ module GS4Analytics
         cycle_id = @cycle_id
         at = Time.now.to_i
         Database.async do
-          Database.record_silver(who, Database.session_for(who), cycle_id, 'sale', amount,
-                                 vendor_type: vendor_type, vendor_name: vendor_name, at: at)
+          Database.record_silver(who, cycle_id, 'sale', amount, vendor_type: vendor_type, vendor_name: vendor_name, at: at)
         end
         Log.debug("Recorded #{vendor_type} sale: #{Util.fmt(amount)} silver")
       end
@@ -1427,7 +1366,7 @@ module GS4Analytics
         cycle_id = @cycle_id
         at = Time.now.to_i
         Database.async do
-          Database.record_silver(who, Database.session_for(who), cycle_id, 'expense', amount, vendor_type: kind,
+          Database.record_silver(who, cycle_id, 'expense', amount, vendor_type: kind,
                                                                                                vendor_name: name, at: at)
         end
         Log.debug("Spent #{Util.fmt(amount)} (#{kind})")
@@ -1440,10 +1379,8 @@ module GS4Analytics
         who = @who
         cycle_id = @cycle_id
         Database.async do
-          session = Database.session_for(who)
-          Database.record_silver(who, session, cycle_id, 'sale', amount, vendor_type: vendor_type,
-                                                                         vendor_name: vendor_name)
-          Database.record_item_sale(who, session, item, noun, amount, vendor_type, vendor_name)
+          Database.record_silver(who, cycle_id, 'sale', amount, vendor_type: vendor_type, vendor_name: vendor_name)
+          Database.record_item_sale(who, item, noun, amount, vendor_type, vendor_name)
         end
         Log.debug("Sale: #{item} for #{Util.fmt(amount)} (#{vendor_type})")
       end
@@ -1527,7 +1464,7 @@ module GS4Analytics
 
           Log.info("WARNING: #{bank} is #{Util.fmt(balance)}, at or over 2.0B")
         end
-        Database.store_bank_snapshot(who, Database.session_for(who), cycle_id, type, banks)
+        Database.store_bank_snapshot(who, cycle_id, type, banks)
       end
 
       def flush_kill
@@ -1546,7 +1483,7 @@ module GS4Analytics
         who = @who
         cycle_id = @cycle_id
         Database.async do
-          Database.record_silver(who, Database.session_for(who), cycle_id, 'box', amount, vendor_name: method)
+          Database.record_silver(who, cycle_id, 'box', amount, vendor_name: method)
         end
         Log.debug("Box silver (#{method}): #{Util.fmt(amount)}")
       end
@@ -1707,7 +1644,6 @@ module GS4Analytics
       # database delays the reward instead of losing it
       def handle_reward(bp, exp, silver)
         who = @who
-        session = Database.session_for(who)
         cycle = cycle_id
         at = Time.now.to_i
         start = received_at = nil
@@ -1724,9 +1660,9 @@ module GS4Analytics
         id = @bounty_id || Database.new_id
         type = @type
         Database.async do
-          Database.start_bounty(who, session, cycle, type, *start, received_at: received_at, id: id) if start
+          Database.start_bounty(who, cycle, type, *start, received_at: received_at, id: id) if start
           Database.complete_bounty(id, silver, exp, bp, at: at)
-          Database.record_silver(who, session, cycle, 'bounty', silver, bounty_type: type, at: at)
+          Database.record_silver(who, cycle, 'bounty', silver, bounty_type: type, at: at)
         end
         Log.debug("Bounty completed: #{@type} (#{silver} silver, #{exp} exp, #{bp} BP)")
         finish_offer('completed', at, id)
@@ -1747,10 +1683,9 @@ module GS4Analytics
         offer = parse_offer(text).merge(description: words,
                                         expedited: !expedite.nil?, vouchers_left: expedite&.[](:left))
         who = @who
-        session = Database.session_for(who)
         cycle = cycle_id
         id = Database.new_id
-        Database.async { Database.record_offer(who, session, cycle, offer, id: id, at: at) }
+        Database.async { Database.record_offer(who, cycle, offer, id: id, at: at) }
         @offer = { id: id, detail: nil, words: words }
         Log.debug("Bounty offered: #{offer[:assignment]} #{offer[:town]}#{' (expedited)' if expedite}")
       end
@@ -1873,7 +1808,7 @@ module GS4Analytics
         seen = @seen&.[](:task)
         same = seen && seen.values_at(:type, :creature, :area) == task.values_at(:type, :creature, :area)
         required = [same ? seen[:count] : nil, task[:count]].compact.max
-        row = [who, Database.session_for(who), cycle_id, task[:type], task[:creature], task[:area], required]
+        row = [who, cycle_id, task[:type], task[:creature], task[:area], required]
         received_at = Time.now.to_i
         @bounty_id = id = Database.new_id
         Database.async { Database.start_bounty(*row, received_at: received_at, id: id) }
@@ -2014,10 +1949,7 @@ module GS4Analytics
         @last_hunt = nil
         @idle = { since: nil, warned: false, recovering: false }
         @weapon = { polls: 0, retries: 0 }
-        @session_id = Database.session_for(who)
-        @session_date = Date.today.to_s
-        session = @session_id
-        Database.async { Database.open_session(who, session) }
+        @day = Date.today.to_s
         link_silver
         close_stale_cycles
         @carry_from = nil
@@ -2033,15 +1965,11 @@ module GS4Analytics
         @running = false
         @thread&.join(2)
         end_current_cycle
-        session = @session_id or return
-
-        at = Time.now.to_i
-        Database.async { Database.end_session(session, at) }
       end
 
       def status
         names = SCRIPT_KEYS.map { |state, key| "#{state}: #{Array(@cfg[key]).join(', ').then { |s| s.empty? ? '(not set)' : s }}" }
-        ["State: #{@current_state}", "Cycle: #{@current_cycle_id || 'none'}", "Session: #{@session_id}",
+        ["State: #{@current_state}", "Cycle: #{@current_cycle_id || 'none'}", "Login since: #{Collector.login_at ? Time.at(Collector.login_at).strftime('%Y-%m-%d %H:%M') : 'unknown'}",
          "Scripts: #{names.join('; ')}", "Bigshot status: #{bigshot_status.inspect}"]
       end
 
@@ -2170,18 +2098,16 @@ module GS4Analytics
         note_reason(@current_cycle_id, "stopped by #{scripts.join('/')}")
       end
 
+      # A cycle never spans midnight: the day's figures (on the site and in the
+      # reports) are counted by when a cycle starts
       def roll_over_midnight
         today = Date.today.to_s
-        return if today == @session_date
+        return if today == @day
 
-        Log.info("Midnight rollover: #{@session_date} -> #{today}")
+        Log.info("Midnight rollover: #{@day} -> #{today}")
         end_current_cycle
         @carry_from = nil # the new day starts at midnight
-        ended = @session_id
-        midnight = Util.midnight(today)
-        Database.async { Database.end_session(ended, midnight) } if ended
-        @session_id = Database.session_for(@who)
-        @session_date = today
+        @day = today
         link_silver
         start_new_cycle(@current_state)
       end
@@ -2190,7 +2116,7 @@ module GS4Analytics
       # database held by another session delays the row instead of losing it
       def start_new_cycle(type)
         trigger = Array(@cfg[SCRIPT_KEYS[type]]).find { |name| running?(name) } || type.to_s
-        row = [@who, @session_id, type, trigger, profile, Vitals.read]
+        row = [@who, type, trigger, profile, Vitals.read]
         id = Database.new_id
         # A cycle dropped as too short leaves no gap: this one starts where it did
         at = @carry_from || Time.now.to_i
@@ -2438,7 +2364,7 @@ module GS4Analytics
       end
 
       def link_silver
-        SilverManager.link(@current_cycle_id, @session_id)
+        SilverManager.link(@current_cycle_id)
       end
 
       def monotonic
@@ -3364,7 +3290,7 @@ module GS4Analytics
     ALLOWED_ORIGINS = [%r{\Ahttps://analytics\.elanthia\.online\z},
                        %r{\Ahttp://(?:localhost|127\.0\.0\.1|\[::1\]):\d+\z}].freeze
     STATUS = { 200 => 'OK', 204 => 'No Content', 302 => 'Found', 400 => 'Bad Request', 403 => 'Forbidden',
-               404 => 'Not Found', 405 => 'Method Not Allowed', 500 => 'Internal Server Error' }.freeze
+               404 => 'Not Found', 405 => 'Method Not Allowed', 500 => 'Internal Server Error', 503 => 'Service Unavailable' }.freeze
 
     # Every API read happens under this lock, so the API connection's pool only
     # ever makes one connection: PRAGMA data_version is only comparable on the
@@ -3470,6 +3396,8 @@ module GS4Analytics
         end
       rescue Timeout::Error
         reply(client, 400, 'text/plain', 'Bad request')
+      rescue Database::Missing, Database::Outdated => e
+        reply(client, 503, 'text/plain', e.message, origin)
       rescue StandardError => e
         Log.error('dashboard', e)
         reply(client, 500, 'text/plain', 'Internal error')
@@ -3582,6 +3510,8 @@ module GS4Analytics
           execute(args)
           sleep 3600 while Dashboard.running? # serve keeps the script alive until it is killed
         end
+      rescue Database::Outdated => e
+        Log.info(e.message)
       rescue StandardError => e
         Log.error('main', e)
       end
@@ -3653,6 +3583,8 @@ module GS4Analytics
         end
       rescue Database::Missing => e
         Log.info("#{e.message}. Run ;#{Script.current.name} on a character first.")
+      rescue Database::Outdated => e
+        Log.info(e.message)
       rescue StandardError => e
         Log.error('command', e)
       end

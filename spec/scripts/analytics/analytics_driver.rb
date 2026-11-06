@@ -164,8 +164,8 @@ def run_sql(statement, *params) = A::Database.db.run(Sequel.lit(statement, *para
 def lines(result) = result.join("\n")
 
 # One completed hunt cycle (and, with +rest+, the rest after it) starting at +start+
-def seed_cycles(who, session, start, rest: true, hunt_secs: 2700)
-  hunt = A::Database.start_cycle(who, session, :hunt, 'bigshot', 'torvek_crags',
+def seed_cycles(who, start, rest: true, hunt_secs: 2700)
+  hunt = A::Database.start_cycle(who, :hunt, 'bigshot', 'torvek_crags',
                                  { exp_total: 1_000_000, exp_field: 100, exp_max: 800, fame: 10, encumbrance: 20.0 })
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', start, hunt)
   A::Database.end_cycle(hunt, { exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0 },
@@ -173,7 +173,7 @@ def seed_cycles(who, session, start, rest: true, hunt_secs: 2700)
   run_sql('UPDATE cycles SET end_time = ?, duration_seconds = ? WHERE cycle_id = ?', start + hunt_secs, hunt_secs, hunt)
   return unless rest
 
-  rest_id = A::Database.start_cycle(who, session, :rest, 'my_rest', 'torvek_crags',
+  rest_id = A::Database.start_cycle(who, :rest, 'my_rest', 'torvek_crags',
                                     { exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0 })
   run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 400, ' \
           'exp_total_end = 1100000, rest_reason = ? WHERE cycle_id = ?', start + hunt_secs, start + hunt_secs + 400, 'Too many items', rest_id)
@@ -183,14 +183,13 @@ end
 # Three characters over the last few days: two games, one shared name
 def seed_history
   [WHO, A::Who.new('GS3', 'Ashur'), A::Who.new('GSF', 'Torvek')].each do |who|
-    session = A::Database.session_for(who)
     midnight = A::Util.midnight(Date.today)
     # A hunt (and rest, when there is room) earlier today, whatever the time of day, so it shows on the dashboard
     recent = [A::Util.midnight(Date.today), NOW - 5000].max
     hunt_secs = [2700, NOW - recent - 30].min
-    seed_cycles(who, session, recent, rest: NOW - recent > 3200, hunt_secs: hunt_secs) if hunt_secs > 60
+    seed_cycles(who, recent, rest: NOW - recent > 3200, hunt_secs: hunt_secs) if hunt_secs > 60
     3.downto(1) do |ago|
-      seed_cycles(who, session, midnight - (ago * 86_400) + (8 * 3600))
+      seed_cycles(who, midnight - (ago * 86_400) + (8 * 3600))
       run_sql('INSERT INTO kill_stats (game, character, date, profile, creature, kill_count, total_silver, last_kill_at) ' \
               'VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING',
               *who, (Date.today - ago).to_s, 'torvek_crags', 'kobold', 100, 5000, NOW - 100)
@@ -251,22 +250,19 @@ when 'settings'
 
 when 'database'
   A::Database.connect!
-  session = A::Database.session_for(WHO)
-  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', { exp_total: 100, exp_field: 10 })
+  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'torvek_crags', { exp_total: 100, exp_field: 10 })
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, hunt)
   ended = A::Database.end_cycle(hunt, { exp_total: 5100, exp_field: 700, exp_max: 800, fame: 11, encumbrance: 35.0 }, 'Too many items')
   saved = A::Database.one('SELECT * FROM cycles WHERE cycle_id = ?', hunt)
-  rest = A::Database.start_cycle(WHO, session, :rest, 'my_rest', 'torvek_crags', { exp_total: 5100 })
+  rest = A::Database.start_cycle(WHO, :rest, 'my_rest', 'torvek_crags', { exp_total: 5100 })
   run_sql('UPDATE cycles SET start_time = ?, rest_reason = ? WHERE cycle_id = ?', NOW - 300, 'Too many items', rest)
   A::Database.end_cycle(rest, {}, 'something else')
   A::Database.record_rest_steps(WHO, rest, NOW - 300, { 'travel' => 120.0, 'selling' => 80.5, 'waiting' => 0 })
-  short = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', nil, {})
+  short = A::Database.start_cycle(WHO, :hunt, 'bigshot', nil, {})
   A::Database.record_kill(WHO, 'kobold', 'torvek_crags', 100)
   A::Database.record_kill(WHO, 'kobold', 'torvek_crags', 50)
   result = {
     'game_column' => saved['game'], 'character_column' => saved['character'],
-    'session_cached' => session == A::Database.session_for(WHO),
-    'session_per_game' => A::Database.session_for(A::Who.new('GSF', 'Torvek')) != session,
     'duration_ok' => ended['duration_seconds'].between?(599, 602),
     'exp_end' => saved['exp_total_end'], 'rest_reason' => saved['rest_reason'],
     'rest_reason_kept' => A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', rest)['rest_reason'],
@@ -321,10 +317,9 @@ when 'busy_database'
 
 when 'bounties'
   A::Database.connect!
-  session = A::Database.session_for(WHO)
-  first = A::Database.start_bounty(WHO, session, nil, 'cull', 'kobold', 'Icemule Trace', 20)
-  second = A::Database.start_bounty(WHO, session, nil, 'dangerous', 'troll', 'Wehnimer', nil)
-  third = A::Database.start_bounty(WHO, session, nil, 'gem', nil, "Ta'Vaalor", 5)
+  first = A::Database.start_bounty(WHO, nil, 'cull', 'kobold', 'Icemule Trace', 20)
+  second = A::Database.start_bounty(WHO, nil, 'dangerous', 'troll', 'Wehnimer', nil)
+  third = A::Database.start_bounty(WHO, nil, 'gem', nil, "Ta'Vaalor", 5)
   A::Database.complete_bounty(first, 11_066, 1100, 1106)
   A::Database.abandon_bounty(second)
   A::Database.expire_bounty(third)
@@ -370,7 +365,7 @@ when 'collector'
   DownstreamHook.run('They locate a pile of 500 coins, reclaiming them')
   DownstreamHook.run('You gather the remaining 250 coins from inside your box')
   A::SilverManager.record_vendor_visit('gemshop', NOW - 100, NOW - 50, 12_345)
-  A::Database.record_item_sale(WHO, A::Database.session_for(WHO), 'a black opal', 'opal', 5000, 'gemshop', 'Bob', 2)
+  A::Database.record_item_sale(WHO, 'a black opal', 'opal', 5000, 'gemshop', 'Bob', 2)
   A::SilverManager.stop # records the kill still being read
   sleep 0.5
   kills = A::Database.all('SELECT creature, total_silver, game, character FROM kill_stats ORDER BY creature')
@@ -458,7 +453,7 @@ when 'dashboard'
   first = A::Dashboard.snapshot
   again = A::Dashboard.snapshot
   before = rows.call(again.last)
-  A::Database.start_cycle(WHO, A::Database.session_for(WHO), :idle, 'idle', 'crags', {})
+  A::Database.start_cycle(WHO, :idle, 'idle', 'crags', {})
   wal_bytes = File.size?("#{A::Database.file}-wal").to_i
   after = A::Dashboard.snapshot
   result['token'] = [first.first == again.first, first.last.equal?(again.last), after.first != first.first,
@@ -701,11 +696,10 @@ when 'locked_cycle'
   A::Database.connect!
   cfg = A::Settings.load(WHO)
   manager = A::CycleManager
-  session = A::Database.session_for(WHO)
   A::Database.flush
-  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', { exp_total: 100 })
+  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'torvek_crags', { exp_total: 100 })
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 1800, hunt)
-  { :@who => WHO, :@cfg => cfg, :@session_id => session, :@current_state => :hunt, :@current_cycle_id => hunt,
+  { :@who => WHO, :@cfg => cfg, :@current_state => :hunt, :@current_cycle_id => hunt,
     :@rest_steps => Hash.new(0.0), :@last_bigshot_status => :resting }.each { |name, value| manager.instance_variable_set(name, value) }
   bounty = A::BountyManager
   bounty.instance_variable_set(:@who, WHO)
@@ -734,35 +728,15 @@ when 'locked_cycle'
   }
   A::Database.close
 
-when 'locked_session'
-  # A queued write that creates the day's session while the database is held:
-  # the retry must write the session row too
-  quick_busy_timeouts
-  A::Database.connect!
-  fresh = A::Who.new('GS3', 'Fresh')
-  lock = hold_write_lock
-  A::Database.async { A::Database.record_silver(fresh, A::Database.session_for(fresh), nil, 'box', 5) }
-  sleep 0.4
-  lock.execute('COMMIT')
-  lock.close
-  A::Database.flush(10)
-  result = {
-    'sessions' => A::Database.one("SELECT COUNT(*) AS n FROM sessions WHERE character = 'Fresh'")['n'],
-    'linked'   => A::Database.one('SELECT COUNT(*) AS n FROM silver_events e JOIN sessions s ON s.session_id = e.session_id ' \
-                                "WHERE s.character = 'Fresh'")['n']
-  }
-  A::Database.close
-
 when 'killed_writer'
   # ;kill stops the writer before before_dying runs. What it left, and what the
   # managers queue while stopping, is written by close, in order.
   quick_busy_timeouts
   A::Database.connect!
-  session = A::Database.session_for(WHO)
   A::Database.flush
   lock = hold_write_lock
   id = A::Database.new_id
-  A::Database.async { A::Database.start_cycle(WHO, session, :hunt, 'bigshot', nil, {}, id: id, at: NOW - 600) }
+  A::Database.async { A::Database.start_cycle(WHO, :hunt, 'bigshot', nil, {}, id: id, at: NOW - 600) }
   sleep 0.4 # the writer finds the lock and backs off
   A::Database.instance_variable_get(:@writer).kill
   sleep 0.1
@@ -940,8 +914,7 @@ when 'cycle_edges'
   manager.instance_variable_set(:@running, false)
   manager.instance_variable_get(:@thread).join(2)
 
-  session = A::Database.session_for(WHO)
-  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', {})
+  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'torvek_crags', {})
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, hunt)
   { :@current_state => :hunt, :@current_cycle_id => hunt, :@cycle_started_at => NOW - 600, :@last_bigshot_status => :resting,
     :@rest_steps => Hash.new(0.0) }.each { |name, value| manager.instance_variable_set(name, value) }
@@ -991,17 +964,15 @@ when 'interrupted_hunt'
   A::Database.connect!
   cfg = A::Settings.load(WHO)
   manager = A::CycleManager
-  session = A::Database.session_for(WHO)
   set = ->(name, value) { manager.instance_variable_set(name, value) }
   start_state = lambda do |state, cycle_type|
     set.call(:@who, WHO)
     set.call(:@cfg, cfg)
-    set.call(:@session_id, session)
     set.call(:@current_state, state)
     set.call(:@rest_steps, Hash.new(0.0))
     set.call(:@last_step_at, nil)
     set.call(:@last_bigshot_status, nil)
-    set.call(:@current_cycle_id, A::Database.start_cycle(WHO, session, cycle_type, 'bigshot', 'torvek_crags', {}))
+    set.call(:@current_cycle_id, A::Database.start_cycle(WHO, cycle_type, 'bigshot', 'torvek_crags', {}))
     run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, manager.current_cycle_id)
   end
   signals = lambda do |running|
@@ -1167,43 +1138,6 @@ when 'bounty_progress'
   manager.send(:handle_reward, 1050, 1000, 5130)
   result = { 'cull' => steps, 'before_hunt' => before_hunt, 'town_gem' => last.call }
 
-when 'sessions'
-  # A day's session is open while the collector runs and closed when it stops
-  A::Database.connect!
-  cfg = A::Settings.load(WHO)
-  $running = []
-  yesterday = Date.today - 1
-  old_start = A::Util.midnight(yesterday) + 100
-  run_sql("INSERT INTO sessions (session_id, game, character, start_date, midnight_timestamp, start_time, status) " \
-          "VALUES ('crashed', 'GS3', 'Torvek', ?, ?, ?, 'active')", yesterday.to_s, A::Util.midnight(yesterday), old_start)
-  run_sql("INSERT INTO cycles (cycle_id, session_id, game, character, cycle_type, start_time, end_time, duration_seconds) " \
-          "VALUES ('c1', 'crashed', 'GS3', 'Torvek', 'hunt', ?, ?, 800)", old_start + 100, old_start + 900)
-  row = ->(id) { A::Database.one('SELECT status, end_time FROM sessions WHERE session_id = ?', id).values }
-  manager = A::CycleManager
-  manager.start(WHO, cfg)
-  A::Database.flush
-  today = A::Database.session_for(WHO)
-  result = { 'crashed' => row.call('crashed') == ['ended', old_start + 900], 'running' => row.call(today) }
-  manager.stop
-  A::Database.flush
-  status, ended = row.call(today)
-  result['stopped'] = [status, (NOW..Time.now.to_i + 1).cover?(ended)]
-  manager.start(WHO, cfg) # started again the same day
-  A::Database.flush
-  result['restarted'] = row.call(today)
-  manager.stop
-  A::Database.flush
-  # Midnight: the day that just ended closes at midnight
-  manager.instance_variable_set(:@who, WHO)
-  manager.instance_variable_set(:@cfg, cfg)
-  manager.instance_variable_set(:@current_state, :idle)
-  manager.instance_variable_set(:@session_id, 'crashed')
-  manager.instance_variable_set(:@session_date, yesterday.to_s)
-  manager.send(:roll_over_midnight)
-  manager.send(:end_current_cycle)
-  A::Database.flush
-  result['midnight'] = row.call('crashed') == ['ended', A::Util.midnight]
-
 when 'kill_time'
   # A kill's day is the day of the search, even if its write runs later
   A::Database.connect!
@@ -1294,24 +1228,7 @@ when 'offers'
 when 'spending'
   # Boxes found on corpses, and silver spent at the locksmith, the locksmith
   # pool and the priestess, from the 2026-11-05 logs
-  # A database from before kill_stats had a boxes column gets it on connect
-  old = Sequel.sqlite(A::Database.file)
-  old.create_table(:kill_stats) do
-    String :game, null: false
-    String :character, null: false
-    String :date, null: false
-    String :profile, null: false
-    String :creature, null: false
-    Integer :kill_count, default: 0
-    Integer :total_silver, default: 0
-    Integer :last_kill_at
-    primary_key %i[game character date profile creature]
-  end
-  old[:kill_stats].insert(game: 'GS3', character: 'Torvek', date: Date.today.to_s, profile: 'p', creature: 'kobold',
-                          kill_count: 3, total_silver: 30, last_kill_at: NOW)
-  old.disconnect
   A::Database.connect!
-  migrated = A::Database.db.schema(:kill_stats, reload: true).map(&:first).include?(:boxes)
   A::Settings.load(WHO)
   A::SilverManager.start(WHO)
   feed = ->(*lines) { lines.each { |line| DownstreamHook.run(line) } }
@@ -1332,9 +1249,8 @@ when 'spending'
   sleep 0.3
   A::Database.flush
   result = {
-    'migrated' => migrated,
-    'kills'    => A::Database.all('SELECT creature, kill_count, total_silver, boxes FROM kill_stats ORDER BY creature').map(&:values),
-    'spent'    => A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'expense' " \
+    'kills' => A::Database.all('SELECT creature, kill_count, total_silver, boxes FROM kill_stats ORDER BY creature').map(&:values),
+    'spent' => A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'expense' " \
                                'ORDER BY rowid').map(&:values)
   }
   A::SilverManager.stop
@@ -1343,7 +1259,6 @@ when 'money_reports'
   # The silver, kills and cycle reports, the death alert and backups
   A::Database.connect!
   cfg = A::Settings.load(WHO)
-  session = A::Database.session_for(WHO)
   # Everything in the last ~70 minutes and read through the weekly window,
   # so the numbers hold at any time of day, midnight included
   day = NOW - 4200
@@ -1351,15 +1266,15 @@ when 'money_reports'
   A::Database.record_kill(WHO, 'kobold', 'crags', 60, at: day + 20)
   A::Database.record_kill(WHO, 'troll', 'crags', 500, at: day + 30, boxes: 1)
   { 'box' => [300, nil], 'sale' => [1000, 'pawnbroker'], 'bounty' => [9000, nil] }.each do |cat, (amount, kind)|
-    A::Database.record_silver(WHO, session, nil, cat, amount, vendor_type: kind, at: day + 40)
+    A::Database.record_silver(WHO, nil, cat, amount, vendor_type: kind, at: day + 40)
   end
-  A::Database.record_silver(WHO, session, nil, 'expense', 4033, vendor_type: 'locksmith', vendor_name: 'Jyhm', at: day + 50)
-  A::Database.record_silver(WHO, session, nil, 'expense', 1200, vendor_type: 'priestess', at: day + 60)
+  A::Database.record_silver(WHO, nil, 'expense', 4033, vendor_type: 'locksmith', vendor_name: 'Jyhm', at: day + 50)
+  A::Database.record_silver(WHO, nil, 'expense', 1200, vendor_type: 'priestess', at: day + 60)
   [[day + 100, 600], [day + 3700, 300]].each do |start, secs|
-    dead = A::Database.start_cycle(WHO, session, :dead, 'dead', 'crags', {})
+    dead = A::Database.start_cycle(WHO, :dead, 'dead', 'crags', {})
     run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = ? WHERE cycle_id = ?', start, start + secs, secs, dead)
   end
-  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'crags', {})
+  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'crags', {})
   run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 3000 WHERE cycle_id = ?', day + 700, day + 3700, hunt)
   texts = A::Database.reader do |conn|
     %w[silver kill cycle].to_h do |name|
@@ -1401,18 +1316,17 @@ when 'session_report'
   # "This login" (Lich's $login_time, days long) next to today, week, month,
   # YTD and lifetime: silver, exp, rates and deaths
   A::Database.connect!
-  session = A::Database.session_for(WHO)
   login = NOW - (2 * 86_400) - 3600 # logged in two days and an hour ago
   A::Database.record_login(WHO, login, login + 5)
   A::Database.record_login(WHO, login, NOW - 30) # a restart in the same login keeps it
   cycle = lambda do |type, start, secs, exp_a, exp_b|
-    id = A::Database.start_cycle(WHO, session, type, type.to_s, 'crags', { exp_total: exp_a })
+    id = A::Database.start_cycle(WHO, type, type.to_s, 'crags', { exp_total: exp_a })
     run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = ?, exp_total_end = ? WHERE cycle_id = ?',
             start, secs && start + secs, secs, exp_b, id)
   end
   bank = lambda do |at, delta|
-    run_sql("INSERT INTO bank_snapshots (snapshot_id, session_id, game, character, timestamp, bank_name, balance, delta_silver, snapshot_type) " \
-            "VALUES (?, ?, 'GS3', 'Torvek', ?, '__total__', 0, ?, 'deposit')", A::Database.new_id, session, at, delta)
+    run_sql("INSERT INTO bank_snapshots (snapshot_id, game, character, timestamp, bank_name, balance, delta_silver, snapshot_type) " \
+            "VALUES (?, 'GS3', 'Torvek', ?, '__total__', 0, ?, 'deposit')", A::Database.new_id, at, delta)
   end
   # Before this login: a year-old death and silver that only lifetime counts
   cycle.call(:dead, NOW - (400 * 86_400), 600, 900, 900)
@@ -1437,6 +1351,51 @@ when 'session_report'
     'login' => A::Database.reader { |conn| A::Report.login_for(conn, WHO) }&.values_at('started_at', 'live')
   }
   result['login_ok'] = result.delete('login') == [login, true]
+
+when 'schema_guard'
+  # A file from another build is refused, not migrated: testers start fresh
+  file = A::Database.file
+  old = lambda do |version|
+    FileUtils.rm_f(Dir["#{file}*"])
+    db = Sequel.sqlite(file)
+    db.create_table(:cycles) { String :cycle_id, primary_key: true }
+    if version
+      db.create_table(:metadata) { String :key, primary_key: true; String :value; Integer :updated_at }
+      db[:metadata].insert(key: 'schema_version', value: version, updated_at: NOW)
+    end
+    db.disconnect
+  end
+  refused = lambda do |&action|
+    [false, action.call]
+  rescue A::Database::Outdated => e
+    [true, e.message]
+  end
+  tables = -> { Sequel.sqlite(file).then { |db| db.tables.sort.tap { db.disconnect } } }
+  result = {}
+  old.call('6')
+  result['writer'] = refused.call { A::Database.connect! }
+  result['untouched'] = tables.call
+  result['reader'] = refused.call { A::Database.reader }.first
+  old.call(nil)
+  result['no_version'] = refused.call { A::Database.connect! }
+  old.call('6')
+  OUT.clear
+  A::CLI.send(:execute, %w[report cycle])
+  result['cli'] = OUT.any? { |line| line.include?('was made by another build') }
+  port = 39_000 + (Process.pid % 1000)
+  A::Dashboard.start(port)
+  sleep 0.2
+  socket = TCPSocket.new('127.0.0.1', port)
+  socket.write("GET /api/meta HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+  reply = socket.read
+  socket.close
+  A::Dashboard.stop
+  result['api'] = [reply.split[1], reply.include?('was made by another build')]
+  FileUtils.rm_f(Dir["#{file}*"])
+  File.write(file, '')
+  A::Database.connect!
+  result['empty_file'] = A::Database.one("SELECT value FROM metadata WHERE key = 'schema_version'")['value']
+  A::Database.close
 
 when 'reload'
   # Loading the body again must not warn about redefined constants
