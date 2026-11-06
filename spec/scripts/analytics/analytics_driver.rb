@@ -481,6 +481,8 @@ when 'cli'
   result = {
     'report' => report.include?('Summary'), 'status' => status.include?('Database:'),
     'stats' => stats.include?('cycles:'), 'help' => help.include?('Usage'),
+    'help_paths' => [help.include?("Settings: #{File.join(DATA_DIR, 'GS3', 'Torvek', 'analytics.yaml')}"),
+                     help.include?("Database: #{File.join(DATA_DIR, 'analytics.db')}"), help.include?('<Lich data>')],
     'caught' => caught, 'dashboard' => dashboard, 'passed' => passed,
     'queued' => cli.instance_variable_get(:@commands).size
   }

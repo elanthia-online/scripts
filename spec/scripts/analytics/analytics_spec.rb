@@ -614,6 +614,10 @@ RSpec.describe 'analytics.lic' do
       expect(cli.values_at('report', 'status', 'stats', 'help')).to eq([true, true, true, true])
     end
 
+    it 'shows where this character\'s settings and the database really are in help' do
+      expect(cli['help_paths']).to eq([true, true, false])
+    end
+
     it 'catches ;analytics commands typed while the collector runs, and queues them' do
       expect(cli.values_at('caught', 'queued')).to eq([[nil, nil], 2])
     end
