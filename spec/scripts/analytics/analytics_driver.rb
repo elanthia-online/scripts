@@ -1238,6 +1238,39 @@ when 'offers'
   }
   DownstreamHook.remove('GS4Analytics::BountyManager')
 
+when 'failed_offer'
+  # A failed task closes nothing, so the next task from the same town arrives
+  # with the same words while the old offer is still open
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::BountyManager
+  manager.instance_variable_set(:@who, WHO)
+  manager.instance_variable_set(:@hunt_script, cfg[:hunt_script])
+  manager.instance_variable_set(:@events, Queue.new)
+  manager.send(:clear_tracking)
+  manager.send(:install_hook)
+  $running = ['bigshot']
+  feed = lambda do |*lines|
+    lines.each { |line| DownstreamHook.run(line) }
+    manager.send(:drain_events)
+  end
+  words = "Hmm, I've got a task here from the town of Vornavis.  It appears they have a creature problem they'd like you to solve.  " \
+          'Go report to one of the Vornavis gate guards to find out more.  Be sure to ASK about BOUNTIES.'
+  told = "<clearStream id='bounty'/><pushStream id='bounty'/>The taskmaster told you:  \"#{words}\""
+  feed.call(told)
+  $task = TaskStub.new(:cull, 'lithe veiled sentinel', 'shadow of the Sanctum', 20)
+  manager.send(:check_task)
+  $task = TaskStub.new(:failed, '', '', nil)
+  manager.send(:check_task)
+  feed.call(told)
+  $task = TaskStub.new(:cull, 'grotesque nightmare', 'shadow of the Sanctum', 15)
+  manager.send(:check_task)
+  feed.call('[You have earned 889 bounty points, 1000 experience points, and 8890 silver.]')
+  A::Database.flush
+  rows = A::Database.all('SELECT creature, count, outcome FROM bounty_offers ORDER BY offered_at, rowid')
+  result = { 'rows' => rows.map(&:values) }
+  DownstreamHook.remove('GS4Analytics::BountyManager')
+
 when 'spending'
   # Boxes found on corpses, and silver spent at the locksmith, the locksmith
   # pool and the priestess, from the 2026-11-05 logs

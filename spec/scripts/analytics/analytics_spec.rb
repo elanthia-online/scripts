@@ -38,6 +38,15 @@ end
 RSpec.describe 'analytics.lic' do
   def result(scenario) = AnalyticsSpec.result(scenario)
 
+  describe 'a failed task' do
+    it 'keeps the next offer with the same words as its own row' do
+      rows = result('failed_offer')['rows']
+      expect(rows.size).to eq(2)
+      expect(rows.first.values_at(0, 2)).to eq(['lithe veiled sentinel', 'replaced'])
+      expect(rows.last).to eq(['grotesque nightmare', 15, 'completed'])
+    end
+  end
+
   describe 'shop visits' do
     subject(:shops) { result('shops') }
 
