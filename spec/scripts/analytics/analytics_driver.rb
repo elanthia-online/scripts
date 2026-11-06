@@ -1315,7 +1315,9 @@ when 'money_reports'
   A::Database.connect!
   cfg = A::Settings.load(WHO)
   session = A::Database.session_for(WHO)
-  day = [A::Util.midnight, NOW - 7200].max
+  # Everything in the last ~70 minutes and read through the weekly window,
+  # so the numbers hold at any time of day, midnight included
+  day = NOW - 4200
   A::Database.record_kill(WHO, 'kobold', 'crags', 40, at: day + 10, boxes: 1)
   A::Database.record_kill(WHO, 'kobold', 'crags', 60, at: day + 20)
   A::Database.record_kill(WHO, 'troll', 'crags', 500, at: day + 30, boxes: 1)
@@ -1333,7 +1335,7 @@ when 'money_reports'
   texts = A::Database.reader do |conn|
     %w[silver kill cycle].to_h do |name|
       [name, A::Report::Text.public_send({ 'silver' => :silver_summary, 'kill' => :kill_summary, 'cycle' => :cycle_summary }[name],
-                                         conn, WHO, 'daily').join("\n")]
+                                         conn, WHO, 'weekly').join("\n")]
     end
   end
   cell = ->(text, label) { text[/\| #{Regexp.escape(label)}\s*\|\s*([^|]+?)\s*\|/, 1] }
@@ -1365,6 +1367,47 @@ when 'money_reports'
     'alert'  => [alerted, quiet],
     'backup' => [message.start_with?('Backed up to'), copies.size, copied_kills, File.basename(copies.first).start_with?('analytics-2020')]
   }
+
+when 'session_report'
+  # "This login" (Lich's $login_time, days long) next to today, week, month,
+  # YTD and lifetime: silver, exp, rates and deaths
+  A::Database.connect!
+  session = A::Database.session_for(WHO)
+  login = NOW - (2 * 86_400) - 3600 # logged in two days and an hour ago
+  A::Database.record_login(WHO, login, login + 5)
+  A::Database.record_login(WHO, login, NOW - 30) # a restart in the same login keeps it
+  cycle = lambda do |type, start, secs, exp_a, exp_b|
+    id = A::Database.start_cycle(WHO, session, type, type.to_s, 'crags', { exp_total: exp_a })
+    run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = ?, exp_total_end = ? WHERE cycle_id = ?',
+            start, secs && start + secs, secs, exp_b, id)
+  end
+  bank = lambda do |at, delta|
+    run_sql("INSERT INTO bank_snapshots (snapshot_id, session_id, game, character, timestamp, bank_name, balance, delta_silver, snapshot_type) " \
+            "VALUES (?, ?, 'GS3', 'Torvek', ?, '__total__', 0, ?, 'deposit')", A::Database.new_id, session, at, delta)
+  end
+  # Before this login: a year-old death and silver that only lifetime counts
+  cycle.call(:dead, NOW - (400 * 86_400), 600, 900, 900)
+  bank.call(NOW - (400 * 86_400), 50_000)
+  # In this login: two hours hunting (one of them two days ago), a death, and
+  # an hour of hunt still running now
+  cycle.call(:hunt, login + 600, 3600, 1000, 3000)
+  bank.call(login + 4000, 100_000)
+  cycle.call(:dead, login + 4300, 300, 3000, 3000)
+  cycle.call(:hunt, NOW - 3600, nil, 3000, nil)
+  bank.call(NOW - 60, 20_000)
+  text = A::Database.reader { |conn| A::Report::Text.session_summary(conn, WHO) }.join("\n")
+  cells = ->(label) { text.lines.find { |l| l.start_with?("| #{label} ") }.to_s.split('|').map(&:strip).drop(2) }
+  login_info = A::Database.one('SELECT first_seen, last_seen FROM logins')
+  result = {
+    'header' => text.lines.map(&:strip).find { |l| l.start_with?('This login: since') }.to_s.sub(/\(.*\)/, '(...)'),
+    'columns' => text.lines.find { |l| l.include?('This login') && l.start_with?('|') }.to_s.split('|').map(&:strip).drop(2),
+    'silver' => cells.call('Silver'), 'deaths' => cells.call('Deaths'), 'exp' => cells.call('Exp'),
+    'silver_hr' => cells.call('Silver / hour').first, 'hunting' => cells.call('Hunting').first,
+    'kept_first_seen' => [login_info['first_seen'] == login + 5, login_info['last_seen'] == NOW - 30],
+    'expected_since' => Time.at(login).strftime('%Y-%m-%d %H:%M'),
+    'dashboard' => A::Database.reader { |conn| A::Dashboard.send(:login_figures, conn, WHO, NOW) }&.slice('silver', 'exp', 'deaths', 'since', 'live')
+  }
+  result['dashboard_since_ok'] = result['dashboard'] && result['dashboard'].delete('since') == login
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

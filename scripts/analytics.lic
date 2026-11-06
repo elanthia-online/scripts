@@ -19,7 +19,7 @@
     ;analytics --dashboard[=PORT]     collect and also serve the dashboard
     ;analytics serve [PORT] [lan]     serve the dashboard only (no collecting)
     ;analytics report <name> [range]  text report: character, exp, bounty, cycle,
-                                      silver, kills
+                                      silver, kills, session
     ;analytics status                 what the collector is doing right now
     ;analytics maintenance <task>     compact | vacuum | stats | backup
     ;analytics help
@@ -131,6 +131,17 @@ module GS4Analytics
     def hms(seconds)
       secs = seconds.to_i
       format('%d:%02d:%02d', secs / 3600, secs % 3600 / 60, secs % 60)
+    end
+
+    # 273_600 -> "3d 4h", 8040 -> "2h 14m", 300 -> "5m"
+    def span(seconds)
+      secs = seconds.to_i
+      days, rest = secs.divmod(86_400)
+      hours, rest = rest.divmod(3600)
+      return "#{days}d #{hours}h" if days.positive?
+      return "#{hours}h #{rest / 60}m" if hours.positive?
+
+      "#{rest / 60}m"
     end
 
     def hm(seconds)
@@ -507,7 +518,7 @@ module GS4Analytics
 
     # Cycles shorter than this are state flapping, not real hunts or rests
     MIN_CYCLE_SECONDS = 10
-    SCHEMA_VERSION    = '5'
+    SCHEMA_VERSION    = '6'
     # Columns added after a table was first made. create_table? leaves an
     # existing table alone, so a database from an earlier version gets them here.
     ADDED_COLUMNS = { kill_stats: { boxes: [Integer, { default: 0 }] } }.freeze
@@ -818,6 +829,17 @@ module GS4Analytics
                      .order(Sequel.desc(:received_time), Sequel.desc(:rowid)).with_row_proc(STRING_KEYS).all
       end
 
+      # ----- logins ----------------------------------------------------------
+
+      def record_login(who, started_at, at)
+        db[:logins].insert_conflict(target: %i[game character started_at], update: { last_seen: Sequel[:excluded][:last_seen] })
+                   .insert(clean(game: who.game, character: who.name, started_at: started_at, first_seen: at, last_seen: at))
+      end
+
+      def touch_login(who, started_at, at)
+        db[:logins].where(game: who.game, character: who.name, started_at: started_at).update(last_seen: at)
+      end
+
       # ----- bounty offers ---------------------------------------------------
 
       def record_offer(who, session_id, cycle_id, offer, id:, at:)
@@ -914,7 +936,7 @@ module GS4Analytics
       end
 
       def statistics
-        counts = %i[sessions cycles kill_stats bounties bounty_offers silver_events item_sales bank_snapshots
+        counts = %i[sessions logins cycles kill_stats bounties bounty_offers silver_events item_sales bank_snapshots
                     rest_steps vendor_visits].map { |table| "#{table}: #{Util.fmt(db[table].count)}" }
         counts << "size: #{(File.size(file) / 1_048_576.0).round(2)} MB"
       end
@@ -1236,6 +1258,17 @@ module GS4Analytics
           Integer :duration_seconds, null: false
           Integer :silver
           index %i[game character start_time]
+        end
+
+        # One row per game login: Lich's $login_time, kept across restarts of
+        # this script within that login, and when the collector last ran in it
+        db.create_table?(:logins) do
+          String :game, null: false
+          String :character, null: false
+          Integer :started_at, null: false
+          Integer :first_seen
+          Integer :last_seen
+          primary_key %i[game character started_at]
         end
 
         db.create_table?(:metadata) do
@@ -2142,6 +2175,7 @@ module GS4Analytics
       end
 
       def tick
+        touch_login
         roll_over_midnight
         signals = read_signals
         track_rest_step if @current_state == :rest
@@ -2149,6 +2183,13 @@ module GS4Analytics
         check_weapons if @current_state == :hunt && @cfg[:weapon_loadout]
         check_idle(signals.values.any?)
         update_state(signals)
+      end
+
+      def touch_login
+        return if @touched_at && monotonic - @touched_at < 60
+
+        @touched_at = monotonic
+        Collector.touch_login
       end
 
       def read_signals
@@ -2685,8 +2726,18 @@ module GS4Analytics
   # ==========================================================================
   module Collector
     class << self
+      attr_reader :login_at
+
       def start(who, cfg)
         Database.connect!
+        # When Lich connected to the game; a restart of this script inside the
+        # same login keeps it, so "this login" spans days of play
+        @login_at = Util.safely { $login_time&.to_i }
+        @login_at = Time.now.to_i unless @login_at.to_i.positive?
+        login = @login_at
+        now = Time.now.to_i
+        Database.async { Database.record_login(who, login, now) }
+        @who = who
         SilverManager.start(who)
         SilverManager.take_baseline
         CycleManager.start(who, cfg)
@@ -2708,7 +2759,16 @@ module GS4Analytics
         BountyManager.stop
         CycleManager.stop
         SilverManager.stop
+        touch_login
         Database.close
+      end
+
+      # Marks the login as still running; the cycle watcher calls it each minute
+      def touch_login
+        who = @who
+        login = @login_at
+        now = Time.now.to_i
+        Database.async { Database.touch_login(who, login, now) } if who && login
       end
     end
   end
@@ -2736,6 +2796,44 @@ module GS4Analytics
         ['This Month', day - (29 * 86_400)],
         ['YTD', Util.midnight(Date.new(now.year, 1, 1))]
       ]
+    end
+
+    # Silver, exp, deaths and hours for one character from +from+ to now.
+    # Hours are time logged in with the collector running (an open cycle
+    # counts up to now), so a week with days offline isn't diluted.
+    def figures(conn, who, from, now = Time.now.to_i)
+      silver = conn.one("SELECT COALESCE(SUM(delta_silver), 0) AS s FROM bank_snapshots WHERE game = ? AND character = ? " \
+                        "AND bank_name = '__total__' AND delta_silver IS NOT NULL AND timestamp >= ? AND timestamp <= ?",
+                        *who, from, now)['s'].to_i
+      open_secs = 'CASE WHEN end_time IS NOT NULL THEN duration_seconds WHEN start_time >= ? THEN ? - start_time ELSE 0 END'
+      row = conn.one("SELECT MIN(exp_total_start) AS exp_a, MAX(COALESCE(exp_total_end, exp_total_start)) AS exp_b, " \
+                     "SUM(CASE WHEN cycle_type = 'dead' THEN 1 ELSE 0 END) AS deaths, " \
+                     "COALESCE(SUM(#{open_secs}), 0) AS secs, " \
+                     "COALESCE(SUM(CASE WHEN cycle_type = 'hunt' THEN #{open_secs} ELSE 0 END), 0) AS hunt_secs " \
+                     'FROM cycles WHERE game = ? AND character = ? AND start_time >= ? AND start_time <= ?',
+                     now - 86_400, now, now - 86_400, now, *who, from, now)
+      exp = row['exp_a'] && row['exp_b'] ? [row['exp_b'].to_i - row['exp_a'].to_i, 0].max : 0
+      hours = row['secs'].to_i / 3600.0
+      hunt_hours = row['hunt_secs'].to_i / 3600.0
+      per = ->(total, hrs) { hrs >= 0.05 ? (total / hrs).round : nil }
+      { 'silver' => silver, 'exp' => exp, 'deaths' => row['deaths'].to_i, 'secs' => row['secs'].to_i,
+        'hunt_secs' => row['hunt_secs'].to_i, 'silver_hr' => per.call(silver, hours), 'silver_hunt_hr' => per.call(silver, hunt_hours),
+        'exp_hr' => per.call(exp, hours), 'exp_hunt_hr' => per.call(exp, hunt_hours) }
+    end
+
+    # This character's current game login (or its last one), as
+    # { 'started_at', 'last_seen', 'live' }, or nil before the first
+    def login_for(conn, who)
+      if Collector.running? && Collector.login_at && Who.current.to_a == who.to_a
+        return { 'started_at' => Collector.login_at, 'last_seen' => Time.now.to_i, 'live' => true }
+      end
+
+      row = Util.safely do
+        conn.one('SELECT started_at, last_seen FROM logins WHERE game = ? AND character = ? ORDER BY started_at DESC LIMIT 1', *who)
+      end
+      return unless row && row['started_at']
+
+      row.merge('live' => Time.now.to_i - row['last_seen'].to_i <= 180)
     end
 
     # [label, start_ts] for a report argument, or nil when it's unknown
@@ -3173,6 +3271,32 @@ module GS4Analytics
         out + heading('Time and silver') +
           table(['Metric', 'Value'], [[label == 'Today' ? 'Since midnight' : 'Total tracked time', Util.hm(elapsed)],
                                       ['Silver / hour', Util.fmt(silver_hr)]], aligns: %i[left right])
+      end
+
+      # This login next to the calendar windows and lifetime: silver, exp,
+      # their rates per hour logged in and per hunting hour, and deaths
+      def session_summary(conn, who)
+        now = Time.now.to_i
+        login = Report.login_for(conn, who)
+        columns = [*(login ? [['This login', login['started_at'].to_i]] : []), *Report.windows, ['Lifetime', 0]]
+        figs = columns.map { |_, from| Report.figures(conn, who, from, now) }
+        return ["No data for #{who.name} yet."] if figs.last['secs'].zero? && figs.last['silver'].zero?
+
+        money = ->(v) { v.nil? ? '--' : Util.fmt(v) }
+        row = ->(label, key, fmt = money) { [label, *figs.map { |fig| fmt.call(fig[key]) }] }
+        hours = ->(v) { Util.span(v) }
+        out = banner('GS4 Analytics - Session', who.name)
+        if login
+          since = Time.at(login['started_at']).strftime('%Y-%m-%d %H:%M')
+          state = login['live'] ? "logged in #{Util.span(now - login['started_at'])}" : "ended #{Time.at(login['last_seen']).strftime('%Y-%m-%d %H:%M')}"
+          out << "This login: since #{since} (#{state})"
+        end
+        out + table(['', *columns.map(&:first)],
+                    [row.call('Silver', 'silver'), row.call('Silver / hour', 'silver_hr'), row.call('Silver / hunt hour', 'silver_hunt_hr'),
+                     row.call('Exp', 'exp'), row.call('Exp / hour', 'exp_hr'), row.call('Exp / hunt hour', 'exp_hunt_hr'),
+                     row.call('Deaths', 'deaths', ->(v) { v.to_s }), row.call('Logged in', 'secs', hours),
+                     row.call('Hunting', 'hunt_secs', hours)]) +
+          ['Per hour = per hour logged in with ;analytics running. Silver is from bank balances.']
       end
 
       # How often this character dies: hunting time per death, and the clock
@@ -3735,7 +3859,8 @@ module GS4Analytics
             'steps_covered' => covered,
             'trends' => trends, 'trend' => trend_meta,
             'grounds' => hunting_grounds(conn, who), 'recent_bounties' => recent_bounties(conn, who),
-            'offers' => offers_for(conn, who, from, now)
+            'offers' => offers_for(conn, who, from, now),
+            'login' => login_figures(conn, who, now)
           }
         end
       end
@@ -3777,6 +3902,13 @@ module GS4Analytics
             'took' => row['completed_time'] ? row['completed_time'].to_i - row['received_time'].to_i : nil,
             'silver' => row['silver_reward'], 'exp' => row['exp_reward'] }
         end
+      end
+
+      # This game login's silver, exp and deaths, for the "This login" chip
+      def login_figures(conn, who, now)
+        login = Report.login_for(conn, who) or return nil
+
+        Report.figures(conn, who, login['started_at'].to_i, now).merge('since' => login['started_at'].to_i, 'live' => login['live'])
       end
 
       # The tasks offered in the range, newest first, with the ones sent back
@@ -4330,6 +4462,10 @@ module GS4Analytics
           chip('Last bounty', '<span data-ago="' + (c.last_bounty || '') + '">' + ago(c.last_bounty) + '</span>', c.last_bounty ? clock(c.last_bounty) : '') +
           chip('Active bounty', b ? (b.need ? b.done + '/' + b.need : esc(b.type)) : '--', bountyLine) +
           chip('Crashes today', c.crashes.length, c.crashes.map(function (x) { return clock(x.at) + ' ' + esc(x.reason); }).join(', ') || 'none') +
+          (c.login ? chip(c.login.live ? 'This login' : 'Last login', short(c.login.silver) + ' silver',
+            (c.login.silver_hr == null ? '--' : short(c.login.silver_hr)) + ' / hr, ' + short(c.login.exp) + ' exp (' +
+            (c.login.exp_hr == null ? '--' : short(c.login.exp_hr)) + ' / hr), ' + c.login.deaths + ' death' + (c.login.deaths === 1 ? '' : 's') +
+            ', ' + dur(c.login.secs) + ' since ' + new Date(c.login.since * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })) : '') +
           '</div><div style="margin-top:12px">' + timeline([c], c.day_start) + '</div></section>';
 
         var summary = '<section class="card"><div class="head" style="margin-bottom:10px"><h2 style="margin:0">' + esc(c.label) + '</h2><span class="spacer"></span><div class="tabs" id="tabs">' + tabs + '</div></div>' +
@@ -4548,6 +4684,7 @@ module GS4Analytics
         ;analytics report bounty [range]   this character's bounties
         ;analytics report cycle [range]    this character's hunt/rest cycles and deaths
         ;analytics report silver [range]   this character's silver in and out
+        ;analytics report session          this login vs today, week, month, ytd, lifetime
         ;analytics report kills [range]    this character's kills, boxes and silver by creature
         ;analytics status                  what the collector is doing
         ;analytics maintenance compact|vacuum|stats|backup
@@ -4651,6 +4788,7 @@ module GS4Analytics
                   when 'bounty', 'bounties' then Report::Text.bounty_summary(conn, Who.current, range)
                   when 'cycle', 'cycles' then Report::Text.cycle_summary(conn, Who.current, range)
                   when 'silver' then Report::Text.silver_summary(conn, Who.current, range)
+                  when 'session', 'login' then Report::Text.session_summary(conn, Who.current)
                   when 'kill', 'kills' then Report::Text.kill_summary(conn, Who.current, range)
                   else [usage]
                   end

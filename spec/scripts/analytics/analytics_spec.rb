@@ -264,6 +264,36 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'this login (session) report' do
+    subject(:login) { result('session_report') }
+
+    # Only the login, week and lifetime columns: today and YTD move with the clock
+    let(:pick) { ->(cells) { cells.values_at(0, 2, 5) } }
+
+    it 'starts the login at Lich\'s login time, kept over restarts within it' do
+      expect(login['header']).to eq("This login: since #{login['expected_since']} (...)")
+      expect(login['kept_first_seen']).to eq([true, true])
+    end
+
+    it 'shows this login next to the calendar windows and lifetime' do
+      expect(login['columns'].first(6)).to eq(['This login', 'Today', 'This Week', 'This Month', 'YTD', 'Lifetime'])
+    end
+
+    it 'totals silver, exp and deaths for the login, the week and lifetime' do
+      expect([pick.call(login['silver']), pick.call(login['exp']), pick.call(login['deaths'])])
+        .to eq([%w[120,000 120,000 170,000], %w[2,000 2,000 2,100], %w[1 1 2]])
+    end
+
+    it 'rates silver per hour logged in, counting a hunt still running' do
+      expect(login.values_at('silver_hr', 'hunting')).to eq(['57,600', '2h 0m'])
+    end
+
+    it 'gives the dashboard the same login figures' do
+      expect([login['dashboard'], login['dashboard_since_ok']])
+        .to eq([{ 'silver' => 120_000, 'exp' => 2000, 'deaths' => 1, 'live' => true }, true])
+    end
+  end
+
   describe 'sessions' do
     subject(:sessions) { result('sessions') }
 
