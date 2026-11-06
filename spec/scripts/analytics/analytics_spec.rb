@@ -61,6 +61,10 @@ RSpec.describe 'analytics.lic' do
       expect(util['binary_string']).to eq('UTF-8')
     end
 
+    it "keeps VERSION the same as the header's version line" do
+      expect(util['version'].uniq.size).to eq(1)
+    end
+
     it 'identifies a character by game and name' do
       expect(util['who']).to eq(['GS3:Torvek', %w[GS3 Torvek], true, 1, false])
     end
@@ -217,10 +221,8 @@ RSpec.describe 'analytics.lic' do
                                       'escort to Zul Logoth', 'Something new the taskmaster says.', 'gem task from Solhaven'])
     end
 
-    it 'shows offers, removals and expedites in the bounty report and on the dashboard' do
+    it 'shows offers, removals and expedites in the bounty report' do
       expect(offers['report']).to eq([true, '6', '3', '1', true])
-      expect(offers['dashboard'].slice('offered', 'removed', 'expedited', 'vouchers'))
-        .to eq({ 'offered' => 6, 'removed' => 3, 'expedited' => 1, 'vouchers' => 8132 })
     end
   end
 
@@ -288,9 +290,8 @@ RSpec.describe 'analytics.lic' do
       expect(login.values_at('silver_hr', 'hunting')).to eq(['57,600', '2h 0m'])
     end
 
-    it 'gives the dashboard the same login figures' do
-      expect([login['dashboard'], login['dashboard_since_ok']])
-        .to eq([{ 'silver' => 120_000, 'exp' => 2000, 'deaths' => 1, 'live' => true }, true])
+    it 'finds the latest login, still live, for the report' do
+      expect(login['login_ok']).to be(true)
     end
   end
 
@@ -586,12 +587,6 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
-  describe 'mind over capacity' do
-    it 'shows as full on the dashboard' do
-      expect(result('mind')).to eq('mind' => [100.0, 100.0], 'trend_capped' => true)
-    end
-  end
-
   describe 'bank deposits and withdrawals' do
     subject(:moves) { result('bank_moves') }
 
@@ -650,72 +645,77 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
-  describe 'Dashboard' do
-    subject(:dashboard) { result('dashboard') }
+  describe 'Dashboard API (for the hosted dashboard)' do
+    subject(:api) { result('dashboard') }
 
-    it 'lists characters by game and name' do
-      expect(dashboard['ids']).to eq(%w[GS3:Ashur GS3:Torvek GSF:Torvek])
+    it 'says who is answering in /api/meta: app, API version, schema and script version, size' do
+      expect(api['meta']).to eq(['analytics', 1, true, true, true])
     end
 
-    it 'builds every section of a character overview' do
-      expect(dashboard['fields']).to be(true)
+    it 'sends the database as one SQLite image with its token' do
+      expect(api['db']).to eq(['200', 'application/vnd.sqlite3', true, true])
     end
 
-    it 'charts 24 hours, 7 days or 30 days' do
-      expect(dashboard['trend_labels']).to eq([24, 7, 30])
+    it 'keeps the token and the image while nothing changes, and moves both on a write still in the WAL' do
+      expect(api['token']).to eq([true, true, true, true, true])
     end
 
-    it 'returns a character detail with rest steps, and nothing for an unknown character' do
-      expect(dashboard.values_at('detail_id', 'steps', 'unknown')).to eq(['GS3:Torvek', %w[selling travel], true])
+    it 'gives the same rows through VACUUM INTO when the sqlite3 gem has no serialize' do
+      expect(api['fallback']).to be(true)
     end
 
-    it 'serves the page with a restrictive Content-Security-Policy' do
-      expect(dashboard['http_index']).to eq(['200', true, true])
+    it 'lets the hosted site and pages on this computer read it' do
+      expect(api['cors']['site']).to eq(['200', 'https://analytics.elanthia.online', 'Origin', 'X-Analytics-Token'])
+      expect(api['cors']['local_copy']).to eq('http://localhost:8000')
     end
 
-    it 'serves pin buttons that keep favourite characters first, saved in the browser' do
-      expect(dashboard['pins']).to eq([true, true, true])
+    it 'refuses any other page, including the shared org Pages origin, and a second Origin header' do
+      expect(api['cors'].values_at('evil', 'shared_pages', 'two_origins')).to eq([['403', nil], '403', '400'])
     end
 
-    it 'serves a theme button that is applied before the first paint, with a dark theme that works on a light system' do
-      expect(dashboard['theme_toggle']).to eq([true, true, true, 1])
+    it 'answers a request with no Origin without CORS headers, and allows origins added in settings' do
+      expect(api['cors'].values_at('no_origin', 'added')).to eq([['200', nil], 'https://someone.github.io'])
     end
 
-    it 'serves the page with the save-image button, and allows the data image it draws from' do
-      expect(dashboard['export_button']).to eq([true, true, true])
+    it 'answers the Private Network Access preflight with no data' do
+      expect(api['preflight']).to eq(['204', 'https://analytics.elanthia.online', 'true', 'GET', ''])
     end
 
-    it 'serves the JSON API' do
-      expect(dashboard.values_at('http_api', 'http_character', 'http_unknown')).to eq([3, '200', '404'])
+    it 'redirects / to the hosted page, connected to this port, or to site_url' do
+      expect(api['redirect']).to eq(['302', api['expected_location'], api['custom_location']])
+    end
+
+    it 'sends no-store, nosniff, a CSP with no page allowances, and cross-origin resource policy' do
+      expect(api['headers']).to eq(['nosniff', 'no-store', "default-src 'none'; frame-ancestors 'none'", 'cross-origin'])
     end
 
     it 'answers only GET for known paths' do
-      expect(dashboard.values_at('http_missing', 'http_post')).to eq(%w[404 405])
+      expect(api.values_at('http_missing', 'http_post')).to eq(%w[404 405])
     end
 
-    it "answers only this computer's names when it is not open to the network" do
-      expect(dashboard['local_hosts']).to eq(%w[403 403 200 200 200 200 403])
+    it "answers only this computer's names" do
+      expect(api['local_hosts']).to eq(%w[403 403 200 200 200 200 403])
     end
 
     it 'refuses a header line cut off at the length limit, so its tail cannot pose as a Host header' do
-      expect(dashboard['split_headers'].values_at('padded_tail', 'padded_long', 'too_long_line', 'long_request_line'))
+      expect(api['split_headers'].values_at('padded_tail', 'padded_long', 'too_long_line', 'long_request_line'))
         .to eq(%w[403 400 400 400])
     end
 
     it 'refuses a second Host header, and more headers than any browser sends' do
-      expect(dashboard['split_headers'].values_at('two_hosts', 'two_local_hosts', 'too_many')).to eq(%w[400 400 400])
+      expect(api['split_headers'].values_at('two_hosts', 'two_local_hosts', 'too_many')).to eq(%w[400 400 400])
     end
 
     it 'still answers a request with a large cookie header' do
-      expect(dashboard['split_headers']['long_cookie']).to eq('200')
+      expect(api['split_headers']['long_cookie']).to eq('200')
     end
 
-    it 'answers any Host header in LAN mode' do
-      expect(dashboard['lan_hosts']).to eq(%w[200 200])
+    it 'refuses lan with an explanation and serves this computer only, printing the hosted URL' do
+      expect(api['lan']).to eq([true, '127.0.0.1', true])
     end
 
-    it 'stops serving' do
-      expect(dashboard['stopped']).to be(true)
+    it 'stops serving and closes its connection' do
+      expect(api['stopped']).to eq([true, true])
     end
   end
 
@@ -747,7 +747,7 @@ RSpec.describe 'analytics.lic' do
     subject(:standalone) { result('standalone') }
 
     it "reads the database through Lich's helper, so it gets its lock waits" do
-      expect(standalone.values_at('connected', 'opened', 'hooked', 'overview')).to eq([false, true, true, 3])
+      expect(standalone.values_at('connected', 'opened', 'hooked')).to eq([false, true, true])
     end
 
     it 'builds reports from it' do

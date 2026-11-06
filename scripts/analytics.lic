@@ -3,10 +3,11 @@
 =begin
   analytics.lic: hunting analytics for GemStone IV
 
-  Records what each of your characters does while hunting (hunt / rest / dead
-  / idle cycles, kills, silver, bounties, experience, bank balances) into one
-  shared SQLite database, then reports on it three ways: a live web dashboard,
-  text reports in the game window, and Discord alerts plus a daily digest.
+  Records each character's hunt / rest / dead / idle cycles, kills, silver,
+  bounties and task offers, experience and bank balances into one shared
+  SQLite database. Shows them as text reports in the game window, Discord
+  alerts and a daily digest, and a web dashboard that reads this computer's
+  data in your browser: https://analytics.elanthia.online/
 
             author: Tysong (horibu on PC)
               game: Gemstone
@@ -14,74 +15,21 @@
           required: Lich >= 5.23.0
            version: 1.0.0
 
-  Usage (run the collector once on every character you want tracked):
-    ;analytics                        collect data for this character
-    ;analytics --dashboard[=PORT]     collect and also serve the dashboard
-    ;analytics serve [PORT] [lan]     serve the dashboard only (no collecting)
-    ;analytics report <name> [range]  text report: character, exp, bounty, cycle,
-                                      silver, kills, session
-    ;analytics status                 what the collector is doing right now
-    ;analytics maintenance <task>     compact | vacuum | stats | backup
-    ;analytics help
+  Guide (setup, commands, reports, every setting, the dashboard, FAQ):
+    https://analytics.elanthia.online/guide/
+  Dashboard source, ideas and issues:
+    https://github.com/elanthia-online/analytics
 
-  While the collector is running, the other commands above also work by
-  typing them as usual (for example ;analytics report exp weekly). Lich will
-  not start a second copy of a running script, so the collector catches them.
-
-  Settings live in <Lich data>/<game>/<character>/analytics.yaml and are
-  created with their defaults the first time the collector runs. The database
-  is <Lich data>/analytics.db and every row records its game and character.
-
-  Silver per hour in the reports comes from bank balances. Box, sale and
-  bounty silver and silver spent at the locksmith, locksmith pool and
-  priestess (silver_events) are shown by ;analytics report silver. Item
-  sales (item_sales) and vendor visits (vendor_visits) are stored for your
-  own SQL queries.
-  Every task the taskmaster offers is kept too (bounty_offers), including
-  ones you remove before starting and whether an expedite voucher got it;
-  ;analytics report bounty and the dashboard show them.
-
-  Creature silver counts only what a corpse had when you searched it; coins
-  picked up off the floor show up only in the bank balance.
-
-  Fame is only as fresh as the last EXPERIENCE output Lich saw. Have your
-  rest script run EXPERIENCE (or ;xp) if you want fame per hunt and rest.
-
-  Hooks for your own rest and selling scripts (all optional):
-    GS4Analytics::SilverManager.take_snapshot
-    GS4Analytics::SilverManager.record_vendor_silver(amount, vendor_type, vendor_name = nil)
-    GS4Analytics::SilverManager.record_vendor_visit(vendor, start_time, end_time, silver)
-
-  Discord alerts need ;discordhook set up and loaded first.
+  Quick start:
+    ;analytics              collect data for this character (run it on each one)
+    ;analytics --dashboard  collect, and feed the web dashboard
+    ;analytics help         every command, and where your settings file is
 
   Improvements:
   Major_change.feature_addition.bugfix
   v1.0.0 (2026-10-27)
     - initial release as a single script
 =end
-
-# TODO: ideas not built yet, from a player's design notes (2026-11-05)
-#   - Show the current rest step (selling, travelling, healing, banking) as
-#     the live state on the dashboard, not only "rest".
-#   - A ;analytics report rest with the rest-step times and reasons per range.
-#   - Death's Sting: record its level from EXPERIENCE and time to recover.
-#   - Other spending: shop purchases, plus deed and resurrection costs
-#     (locksmith, locksmith pool and priestess are tracked).
-#   - Locker notes and a net worth figure beyond bank balances.
-#   - Bank reconciliation: show when a BANK ACCOUNT listing differs from the
-#     tracked total, and by how much, as unexplained change.
-#   - Compare selling locations (sales by town and vendor) on the dashboard.
-#   - Cross-character comparisons of creatures and bounty types on the dashboard.
-#   - Searchable history: filter cycles, kills, bounties, deaths and silver
-#     by character, profile, date and type.
-#   - Custom date ranges and a year view on the dashboard; sortable rankings.
-#   - Customizable dashboard layouts.
-#   - Per-character Discord destinations (discordhook has one webhook).
-#   - Alerts for unexpected disconnects, and a disarmed-weapon alert without
-#     weapon_loadout set up.
-#   - Settings layered global -> game -> character, not only per character.
-#   - A data retention policy (pruning old rows) alongside compact and backup.
-#   - Error counts and recent errors in ;analytics status.
 
 require 'date'
 require 'fileutils'
@@ -91,10 +39,15 @@ require 'securerandom'
 require 'sequel'
 require 'socket'
 require 'timeout'
+require 'tmpdir'
 require 'uri'
 require 'yaml'
 
 module GS4Analytics
+  # The header's version: line; a spec keeps the two the same
+  %i[VERSION].each { |name| remove_const(name) if const_defined?(name, false) }
+  VERSION = '1.0.0'
+
   # ==========================================================================
   # Util: small pure helpers shared by everything
   # ==========================================================================
@@ -320,122 +273,35 @@ module GS4Analytics
         daily_digest: true,
         death: true
       },
-      dashboard: { port: 8080, lan: false }
+      dashboard: { port: 8080, site_url: 'https://analytics.elanthia.online/', allowed_origins: [] }
     }.freeze
 
     HEADER = <<~TEXT
-      # ===========================================================================
-      # analytics.lic settings for this character
-      # ===========================================================================
-      # This file was created with every setting at its default. You only need to
-      # keep the lines you change: anything left out uses the default shown here.
-      # Restart ;analytics after editing (stop it with ;kill analytics, then start it).
-      # Indent with spaces, never tabs. A mistake in this file is reported once in
-      # the game window and the defaults are used instead.
+      # analytics.lic settings for this character. Every setting is explained at
+      #   https://analytics.elanthia.online/guide/#settings
       #
-      # Each character has its own copy of this file:
-      #   <Lich data>/<game>/<character>/analytics.yaml
-      # The database is shared: <Lich data>/analytics.db
+      # Keep only the lines you change; anything left out uses its default. Restart
+      # ;analytics after editing (;kill analytics, then ;analytics). Indent with
+      # spaces, never tabs. null (or an empty value) means off / not set.
       #
-      # "null" (or an empty value) means off / not set.
-      #
-      # ---------------------------------------------------------------------------
-      # Scripts that define the hunt / rest / dead cycle
-      # ---------------------------------------------------------------------------
-      # hunt_script            Script name, or a list, whose running state means
-      #                        "hunting". Default: bigshot
-      #                        A list looks like:  hunt_script: [bigshot, my_hunter]
-      # rest_script            Your own script that rests (sells, loots, banks,
-      #                        returns). While it runs, the cycle is "rest". Bigshot
-      #                        resting is detected on its own (see bigshot_status);
-      #                        this adds your script's time. Also used by
-      #                        idle_recover_minutes.
-      # bigshot_status         true: while bigshot is running, its own status
-      #                        ($bigshot_status) says when it is resting, so a rest
-      #                        is detected even without a rest_script. Only read
-      #                        while bigshot is running, because the value can be
-      #                        stale otherwise. Set false if you hunt with
-      #                        something other than bigshot. Default: true
-      # parse_sales            true: vendor sales ("X takes your item ... hands you N
-      #                        silver") are recorded from the game text, so your
-      #                        selling script needs no changes. Default: true
-      # parse_bank             true: BANK ACCOUNT output is recorded as bank balances,
-      #                        and deposits / withdrawals move the recorded total
-      #                        by the amount moved. With no total recorded yet for
-      #                        this character, one BANK ACCOUNT is sent quietly a
-      #                        few seconds after starting. Default: true
-      # death_script           Your own death-recovery script. While it runs, the
-      #                        cycle is "dead". Death is also read from the game's
-      #                        dead indicator, so this can stay null.
-      #
-      # ---------------------------------------------------------------------------
-      # Hunt limits and recovery (all off while null)
-      # ---------------------------------------------------------------------------
-      # max_hunt_minutes       After this many minutes of one hunt, ask bigshot to
-      #                        rest (sets $bigshot_should_rest). Example: 15
-      # idle_warn_minutes      Alert after this long with none of your scripts
-      #                        running. Default: 8
-      # idle_recover_minutes   After this long idle, walk to the room in
-      #                        profile_room_map and start rest_script. Needs a
-      #                        rest_script. Example: 20
-      # profile_room_map       Where idle recovery walks to, by bigshot profile.
-      #                        The key is the profile name, with or without the
-      #                        leading "<character>_". Value is a room number:
-      #                          profile_room_map:
-      #                            crags: 1234
-      #                            torvek_cliffs: 5678
-      # weapon_loadout         Re-arm check while hunting. If your hands do not
-      #                        match, hunting is paused and this is tried; after
-      #                        several failures you get an alert and a rest.
-      #                          weapon_loadout:
-      #                            right: scepter       # noun that must be in the right hand
-      #                            left: shield         # optional
-      #                            gird: true           # try GIRD first
-      #                            get_right: get my scepter   # command if still empty
-      #                            get_left: get my shield
-      #
-      # ---------------------------------------------------------------------------
-      # Timing the steps of a rest
-      # ---------------------------------------------------------------------------
-      # rest_steps             "script: label" pairs. While resting, time is
-      #                        credited to the first script listed that is running,
-      #                        and the dashboard shows time per label. Time with
-      #                        none of them running is labeled "waiting". Add your
-      #                        own scripts here, for example  my_sell: selling
-      #                        These scripts also mark a trip as resting when the hunt
-      #                        was stopped by another script (for example ebounty
-      #                        turning in a bounty): while one of them runs, right
-      #                        after a hunt or rest, the time is a rest, not idle.
-      #
-      # ---------------------------------------------------------------------------
-      # Alerts (in the game window, and Discord when discord is true)
-      # ---------------------------------------------------------------------------
-      # alerts:
-      #   no_kill_minutes          Alert after this long hunting with no kills. Default: 10
-      #   silver_drop_pct          Alert when today's silver per hour is this percent
-      #                            below the week's average. Default: 50
-      #   silver_check_after_hours Hours hunted today before that check runs. Default: 2
-      #   daily_digest             Send a summary of yesterday once a day. Default: true
-      #   death                    Alert when this character dies. Default: true
-      # discord                  true sends alerts through discordhook. Start
-      #                          ;discordhook first and set its webhook as that script
-      #                          describes; with it not running, only the game window
-      #                          shows alerts. Default: true
-      #
-      # ---------------------------------------------------------------------------
-      # Dashboard
-      # ---------------------------------------------------------------------------
-      # dashboard:
-      #   port                     Port for --dashboard and serve. Default: 8080
-      #   lan                      false: this computer only (http://localhost:PORT)
-      #                            true: anyone on your network can open it. The
-      #                            dashboard has NO password, so use true only on a
-      #                            network you trust. Default: false
-      #   Command line options win: ;analytics --dashboard=9000 --lan
-      #
-      # verbose                  true prints extra log lines to help find problems.
-      #                          Default: false
-      # ===========================================================================
+      # hunt_script            script (or [list]) whose running means hunting. bigshot
+      # rest_script            your rest script; while it runs the cycle is a rest
+      # death_script           your death-recovery script (death is also detected on its own)
+      # bigshot_status         read bigshot's own resting status. true
+      # parse_sales            record vendor sales and spending from the game text. true
+      # parse_bank             record BANK ACCOUNT and teller lines as bank balances. true
+      # max_hunt_minutes       ask bigshot to rest after this long. off
+      # idle_warn_minutes      alert after this long with nothing running. 8
+      # idle_recover_minutes   walk to profile_room_map and start rest_script. off
+      # profile_room_map       { profile: room } for idle recovery
+      # weapon_loadout         { right:, left:, gird:, get_right:, get_left: } re-arm check
+      # rest_steps             { script: label } that time the steps of a rest
+      # alerts                 no_kill_minutes 10, silver_drop_pct 50,
+      #                        silver_check_after_hours 2, daily_digest true, death true
+      # discord                send alerts through ;discordhook. true
+      # dashboard              port 8080, site_url (the hosted page),
+      #                        allowed_origins [] (a fork's https://... origin)
+      # verbose                extra log lines. false
 
     TEXT
 
@@ -594,6 +460,13 @@ module GS4Analytics
       def reader(path = file)
         conn = @db || (@reader ||= open_reader(path))
         block_given? ? yield(conn) : conn
+      end
+
+      # A connection of its own for the dashboard API. The collector's writer
+      # won't do: PRAGMA data_version doesn't change for a connection's own
+      # commits, so the API would never see the collector's writes.
+      def api_reader(path = file)
+        open_reader(path)
       end
 
       def close
@@ -3448,41 +3321,44 @@ end
 
 module GS4Analytics
   # ==========================================================================
-  # Dashboard: a read-only web page served from this computer. Run it as
+  # Dashboard: hands this computer's database to the hosted dashboard at
+  # SITE_URL, which computes every figure in the browser. Two read-only
+  # routes, /api/meta and /api/db; the contract is docs/api.md in
+  # https://github.com/elanthia-online/analytics. Run it as
   # ;analytics --dashboard (with the collector) or ;analytics serve.
   # ==========================================================================
   module Dashboard
     constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
 
-    RANGES        = { 'daily' => 'Today', 'weekly' => 'This Week', 'monthly' => 'This Month' }.freeze
-    CACHE_SECS    = 3
-    IDLE_WARN     = 480    # seconds idle before amber/red, matches the cycle manager
-    STALE_OPEN    = 7200   # an open cycle older than this means the character isn't running
-    NO_KILL_WARN  = 900    # seconds hunting without a kill before red
-    DAY_HUNT      = 7200   # hunting seconds for a day to count toward "typical"
-    HOUR_HUNT     = 1200   # hunting seconds for an hour to count toward "typical"
-    BASE_DAYS     = 30
-    MIN_SAMPLES   = 5
-    # The cycle each crash reason is recorded on
-    CRASH_REASONS = { 'unhandled exit' => 'hunt', 'idle recovery' => 'rest' }.freeze
+    API_VERSION   = 1
+    SITE_URL      = 'https://analytics.elanthia.online/'
     MAX_LINE      = 4096 # longest request line
     # Longest header line, and most headers. Cookies for localhost are shared
     # by every local port, so a header line can be long for honest reasons.
     MAX_HEADER_LINE = 16_384
     MAX_HEADERS     = 100
-    # Host headers a this-computer-only dashboard answers. Anything else is a
-    # web page reaching it through DNS rebinding, so it gets a 403.
-    LOCAL_HOSTS   = %w[localhost 127.0.0.1 [::1]].freeze
-    WHO           = Report::WHO_SQL
+    # Host headers the server answers. Anything else is a web page reaching it
+    # through DNS rebinding, so it gets a 403.
+    LOCAL_HOSTS = %w[localhost 127.0.0.1 [::1]].freeze
+    # Pages that may read the API: the project's site, and any page served from
+    # this computer (development, or a copy of the site). Players add a fork's
+    # origin with dashboard.allowed_origins. The shared elanthia-online.github.io
+    # origin is deliberately not here: every Pages site in the org lives there.
+    ALLOWED_ORIGINS = [%r{\Ahttps://analytics\.elanthia\.online\z},
+                       %r{\Ahttp://(?:localhost|127\.0\.0\.1|\[::1\]):\d+\z}].freeze
+    STATUS = { 200 => 'OK', 204 => 'No Content', 302 => 'Found', 400 => 'Bad Request', 403 => 'Forbidden',
+               404 => 'Not Found', 405 => 'Method Not Allowed', 500 => 'Internal Server Error' }.freeze
 
-    @cache = {}
-    @lock = Monitor.new # re-entrant: the character view reuses the overview
+    # Every API read happens under this lock, so the API connection's pool only
+    # ever makes one connection: PRAGMA data_version is only comparable on the
+    # same connection. Re-entrant, since meta takes a snapshot.
+    @lock = Monitor.new
 
     class << self
-      def start(port, host)
+      def start(port)
         stop
-        @server = TCPServer.new(host, port)
-        @local_only = host == '127.0.0.1'
+        @server = TCPServer.new('127.0.0.1', port)
+        @boot_id = SecureRandom.hex(4)
         @thread = Thread.new do
           loop do
             client = @server.accept
@@ -3500,516 +3376,54 @@ module GS4Analytics
         @server = @thread = nil
       rescue IOError
         nil
+      ensure
+        @lock.synchronize do
+          @api_conn&.disconnect
+          @api_conn = @snapshot = nil
+        end
       end
 
       def running? = !@server.nil?
       attr_reader :port
 
-      # Cached so several open tabs don't multiply the database work
-      def memo(key)
+      # Where / redirects and what the CLI prints: the hosted page, connected
+      # to this port
+      def url(port = @port)
+        base = Settings.current.dig(:dashboard, :site_url).to_s.strip
+        base = SITE_URL if base.empty?
+        "#{base}#{base.include?('?') ? '&' : '?'}live=#{port}"
+      end
+
+      def meta
+        token, image = snapshot
+        { 'app' => 'analytics', 'api' => API_VERSION, 'script_version' => VERSION,
+          'schema_version' => Database::SCHEMA_VERSION, 'token' => token,
+          'now' => Time.now.to_i, 'db_bytes' => image.bytesize }
+      end
+
+      # [token, image]: the database as one committed snapshot, rebuilt only
+      # when another connection has committed since the last one
+      def snapshot
         @lock.synchronize do
-          hit = @cache[key]
-          return hit[:val] if hit && Time.now.to_f - hit[:at] < CACHE_SECS
-
-          val = yield
-          @cache[key] = { at: Time.now.to_f, val: val }
-          val
+          conn = (@api_conn ||= Database.api_reader)
+          version = conn.fetch('PRAGMA data_version').single_value
+          @snapshot = [version, "#{@boot_id}.#{version}", image_of(conn)] if @snapshot.nil? || @snapshot[0] != version
+          @snapshot.drop(1)
         end
       end
 
-      def overview
-        memo(:overview) { build_overview }
-      end
+      # The main file plus every committed WAL frame, as one SQLite file image.
+      # sqlite3 gem 2.x has Database#serialize; an older gem gets the same
+      # through VACUUM INTO a temporary file.
+      def image_of(conn)
+        image = conn.synchronize { |raw| raw.serialize('main') if raw.respond_to?(:serialize) }
+        return image.b if image
 
-      # One character: the overview entry plus range figures and tables
-      def character(id, range)
-        range = 'daily' unless RANGES.key?(range)
-        memo([:char, id, range]) do
-          ov = overview
-          base = ov['characters'].find { |entry| entry['id'].casecmp?(id) }
-          next nil unless base
-
-          base.merge(range_figures(base['id'], range)).merge(
-            'generated_at' => ov['generated_at'], 'day_start' => ov['day_start'], 'range' => range, 'ranges' => RANGES
-          )
+        Dir.mktmpdir('analytics-api') do |dir|
+          target = File.join(dir, 'snapshot.db')
+          conn.run(Sequel.lit('VACUUM INTO ?', target))
+          File.binread(target)
         end
-      end
-
-      private
-
-      # ----- SQL fragments ---------------------------------------------------
-
-      def local(col) = "#{col}, 'unixepoch', 'localtime'"
-      def day(col) = "strftime('%Y-%m-%d', #{local(col)})"
-
-      # Seconds since local midnight for a timestamp column
-      def tod(col)
-        "(CAST(strftime('%H', #{local(col)}) AS INTEGER) * 3600 + CAST(strftime('%M', #{local(col)}) AS INTEGER) * 60 " \
-          "+ CAST(strftime('%S', #{local(col)}) AS INTEGER))"
-      end
-
-      # ======================================================================
-      # OVERVIEW: today, every character
-      # ======================================================================
-
-      def build_overview
-        now = Time.now.to_i
-        today = Date.today
-        day_start = Util.midnight(today)
-        ctx = { now: now, day_start: day_start, today_s: today.to_s, tod_now: now - day_start,
-                base_from: Util.midnight(today - BASE_DAYS) }
-        data = Database.reader { |conn| overview_data(conn, ctx) }
-
-        names = (data[:rows].keys + data[:latest].select { |_, row| now - row['start_time'].to_i < 86_400 }.keys).uniq
-        chars = names.sort_by { |id| data[:labels][id].to_s.downcase }.map do |id|
-          build_status(id, data[:labels][id] || id, ctx, data)
-        end
-        alerts = chars.flat_map do |char|
-          char['light']['reasons'].map { |r| { 'id' => char['id'], 'character' => char['name'], 'level' => r['level'], 'text' => r['text'] } }
-        end.sort_by { |alert| [alert['level'] == 'red' ? 0 : 1, alert['character']] }
-
-        { 'generated_at' => now, 'day_start' => day_start, 'characters' => chars, 'alerts' => alerts,
-          'names' => chars.map { |char| char['id'] } }
-      end
-
-      def overview_data(conn, ctx)
-        now, day_start, base_from, tod_now = ctx.values_at(:now, :day_start, :base_from, :tod_now)
-        today = Date.today
-        data = { labels: Report.labels(conn) }
-
-        # cycles touching today (timeline and today's figures)
-        data[:rows] = conn.all("SELECT #{WHO} AS who, cycle_type, start_time, end_time, duration_seconds, rest_reason, " \
-                               'profile, exp_total_start, exp_total_end, exp_field_start, exp_field_end, exp_field_max, ' \
-                               'encumbrance_start FROM cycles WHERE start_time >= ? AND (end_time IS NULL OR end_time >= ?) ' \
-                               'ORDER BY start_time', day_start - 86_400, day_start).group_by { |row| row['who'] }
-
-        # latest cycle per character, for state (covers characters not seen today)
-        data[:latest] = conn.all("SELECT #{WHO} AS who, cycle_type, start_time, end_time, rest_reason, profile FROM cycles " \
-                                 'WHERE start_time >= ? AND start_time = (SELECT MAX(c2.start_time) FROM cycles c2 ' \
-                                 'WHERE c2.game = cycles.game AND c2.character = cycles.character)',
-                                 now - (7 * 86_400)).to_h { |row| [row['who'], row] }
-
-        # per-day totals for pace: the full day, and up to this time of day
-        daily = Hash.new { |h, id| h[id] = Hash.new { |h2, metric| h2[metric] = {} } }
-        per_day = lambda do |metric, value, table, ts, where|
-          conn.all("SELECT #{WHO} AS who, #{day(ts)} AS d, SUM(#{value}) AS f, " \
-                   "SUM(CASE WHEN #{tod(ts)} < ? THEN #{value} ELSE 0 END) AS u FROM #{table} " \
-                   "WHERE #{where} AND #{ts} >= ? AND #{ts} <= ? GROUP BY 1, 2", tod_now, base_from, now).each do |row|
-            daily[row['who']][metric][row['d'].to_s] = [row['f'].to_f, row['u'].to_f]
-          end
-        end
-        per_day.call('hunt', 'duration_seconds', 'cycles', 'start_time',
-                     "cycle_type = 'hunt' AND end_time IS NOT NULL AND duration_seconds >= 10")
-        per_day.call('silver', 'delta_silver', 'bank_snapshots', 'timestamp',
-                     "bank_name = '__total__' AND delta_silver IS NOT NULL")
-        per_day.call('exp', '(exp_total_end - exp_total_start)', 'cycles', 'start_time', 'exp_total_end > exp_total_start')
-        per_day.call('bounties', '1', 'bounties', 'completed_time', "status = 'completed'")
-        data[:daily] = daily
-
-        # rest reasons up to this time of day, per day
-        reasons = Hash.new { |h, id| h[id] = Hash.new { |h2, d| h2[d] = Hash.new(0) } }
-        conn.all("SELECT #{WHO} AS who, #{day('start_time')} AS d, LOWER(TRIM(rest_reason)) AS reason, COUNT(*) AS n " \
-                 "FROM cycles WHERE cycle_type = 'rest' AND start_time >= ? AND start_time <= ? " \
-                 "AND #{tod('start_time')} < ? GROUP BY 1, 2, 3", base_from, now, tod_now).each do |row|
-          reason = row['reason'].to_s.sub(/[.!]+\z/, '')
-          reasons[row['who']][row['d'].to_s][reason.empty? ? '(none)' : reason] += row['n'].to_i
-        end
-        data[:reasons] = reasons
-
-        data[:enc_base] = conn.all("SELECT #{WHO} AS who, AVG(encumbrance_start) AS a, COUNT(*) AS n FROM cycles " \
-                                   "WHERE cycle_type = 'hunt' AND encumbrance_start IS NOT NULL " \
-                                   'AND start_time >= ? AND start_time < ? GROUP BY 1', base_from, day_start)
-                              .to_h { |row| [row['who'], [row['a'].to_f, row['n'].to_i]] }
-        data[:last_kill] = conn.all("SELECT #{WHO} AS who, MAX(last_kill_at) AS t FROM kill_stats WHERE date >= ? GROUP BY 1",
-                                    (today - 1).to_s).to_h { |row| [row['who'], row['t']&.to_i] }
-        data[:last_bounty] = conn.all("SELECT #{WHO} AS who, MAX(completed_time) AS t FROM bounties " \
-                                      "WHERE status = 'completed' AND completed_time >= ? GROUP BY 1",
-                                      base_from).to_h { |row| [row['who'], row['t']&.to_i] }
-        data[:kills_today] = conn.all("SELECT #{WHO} AS who, SUM(kill_count) AS t FROM kill_stats WHERE date = ? GROUP BY 1",
-                                      ctx[:today_s]).to_h { |row| [row['who'], row['t'].to_i] }
-
-        # the active bounty, and how long each bounty type usually takes
-        data[:active] = conn.all("SELECT #{WHO} AS who, bounty_type, creature, area, count_required, count_completed, " \
-                                 "received_time FROM bounties WHERE status = 'active' AND received_time >= ? " \
-                                 'ORDER BY received_time', now - 86_400).to_h { |row| [row['who'], row] }
-        took = Hash.new { |h, key| h[key] = [] }
-        conn.all("SELECT #{WHO} AS who, bounty_type AS type, completed_time - received_time AS secs FROM bounties " \
-                 "WHERE status = 'completed' AND completed_time >= ? AND received_time IS NOT NULL", base_from).each do |row|
-          next unless row['secs'].to_i.positive?
-
-          took[[row['who'], row['type'].to_s]] << row['secs'].to_i
-          took[[nil, row['type'].to_s]] << row['secs'].to_i
-        end
-        data[:took] = took
-        data
-      end
-
-      def build_status(id, label, ctx, data)
-        now, day_start, today_s = ctx.values_at(:now, :day_start, :today_s)
-        name = Who.parse(id).name
-        last = data[:latest][id]
-        daily = data[:daily][id]
-        reasons = data[:reasons][id]
-        last_kill = data[:last_kill][id]
-
-        # ---- state ----
-        state = { 'type' => 'offline', 'since' => nil, 'reason' => nil, 'profile' => nil }
-        if last
-          if last['end_time'].nil? && now - last['start_time'].to_i < STALE_OPEN
-            state = { 'type' => last['cycle_type'].to_s, 'since' => last['start_time'].to_i,
-                      'reason' => last['rest_reason'].to_s, 'profile' => Report.short_profile(last['profile'], name) }
-          else
-            state['since'] = (last['end_time'] || last['start_time']).to_i
-          end
-        end
-
-        # ---- timeline segments, clipped to today ----
-        rows = data[:rows][id] || []
-        timeline = rows.filter_map do |row|
-          from = [row['start_time'].to_i, day_start].max
-          to = row['end_time']&.to_i || (now if now - row['start_time'].to_i < STALE_OPEN)
-          [row['cycle_type'].to_s, from, to, row['rest_reason'].to_s] if to && to > from
-        end
-
-        # ---- today's figures (cycles that started today) ----
-        started = rows.select { |row| row['start_time'].to_i >= day_start }
-        hunts = started.select { |row| row['cycle_type'] == 'hunt' && row['end_time'] && row['duration_seconds'].to_i >= 10 }
-        rests = started.select { |row| row['cycle_type'] == 'rest' && row['end_time'] && row['duration_seconds'].to_i.positive? }
-        hunt_s = hunts.sum { |row| row['duration_seconds'].to_i }
-        rest_s = rests.sum { |row| row['duration_seconds'].to_i }
-        idle_s = started.select { |row| row['cycle_type'] == 'idle' }.sum { |row| row['duration_seconds'].to_i }
-        deaths = started.count { |row| row['cycle_type'] == 'dead' }
-        crashes = started.select { |row| CRASH_REASONS[row['rest_reason'].to_s.strip.downcase] == row['cycle_type'] }
-                         .map { |row| { 'at' => row['start_time'].to_i, 'reason' => row['rest_reason'].to_s } }
-        item_rests = rests.count { |row| row['rest_reason'].to_s.match?(/\bitems?\b/i) }
-
-        # mind (field exp) as a percent of capacity, where capacity is known
-        # Bounty experience can take the mind past its capacity; it shows as full
-        percent = ->(value, max) { value && max && max.to_i.positive? ? [value.to_f * 100 / max.to_i, 100.0].min.round(1) : nil }
-        hunt_rows = started.select { |row| row['cycle_type'] == 'hunt' }
-        mind_start = hunt_rows.filter_map { |row| percent.call(row['exp_field_start'], row['exp_field_max']) }
-        mind_end = hunt_rows.filter_map { |row| row['end_time'] && percent.call(row['exp_field_end'], row['exp_field_max']) }
-        absorbed = rests.filter_map do |row|
-          before = row['exp_field_start']
-          after = row['exp_field_end']
-          [before.to_i - after.to_i, row['duration_seconds'].to_i] if before && after && before.to_i >= after.to_i
-        end
-        enc_today = hunt_rows.filter_map { |row| row['encumbrance_start']&.to_f }
-
-        pace = pace_for(daily, today_s)
-        reason_rows = reason_rows_for(reasons, today_s, pace[:active_days])
-        pace = pace[:metrics]
-        bounty = bounty_for(id, data, now)
-
-        reds, ambers = lights(state, now, last_kill, hunt_s, pace, deaths, item_rests, crashes, bounty, reason_rows,
-                              data[:enc_base][id], enc_today, mind_start)
-        level = if state['type'] == 'offline' then 'gray'
-                elsif reds.any? then 'red'
-                elsif ambers.any? then 'amber'
-                else 'green'
-                end
-        {
-          'id' => id, 'name' => label, 'state' => state, 'timeline' => timeline,
-          'light' => { 'level'   => level,
-                       'reasons' => reds.map { |t| { 'level' => 'red', 'text' => t } } +
-                         ambers.map { |t| { 'level' => 'amber', 'text' => t } } },
-          'pace' => pace, 'last_kill' => last_kill, 'last_bounty' => data[:last_bounty][id],
-          'today' => { 'hunt_s' => hunt_s, 'rest_s' => rest_s, 'idle_s' => idle_s, 'deaths' => deaths,
-                       'kills' => data[:kills_today][id].to_i, 'hunts' => hunts.size, 'rests' => rests.size,
-                       'item_rests' => item_rests, 'uptime_pct' => Util.percent(hunt_s, hunt_s + rest_s) },
-          'crashes' => crashes, 'bounty' => bounty, 'rest_reasons' => reason_rows.first(8),
-          'mind' => { 'start_avg' => Util.mean(mind_start)&.round(1), 'end_avg' => Util.mean(mind_end)&.round(1),
-                      'samples' => mind_end.size,
-                      'absorbed_per_min' => absorbed.sum { |a| a[1] }.zero? ? nil : (absorbed.sum { |a| a[0] } * 60.0 / absorbed.sum { |a| a[1] }).round(1),
-                      'absorbed_per_rest' => absorbed.empty? ? nil : Util.mean(absorbed.map(&:first)).round },
-          'encumbrance' => { 'today' => Util.mean(enc_today)&.round(1), 'typical' => data[:enc_base][id]&.first&.round(1) }
-        }
-      end
-
-      # Silver, exp and bounties so far today against what this character
-      # typically has by this time of day, and the projected end of day
-      def pace_for(daily, today_s)
-        active_days = (daily['hunt'] || {}).select { |d, (full, _)| d != today_s && full >= DAY_HUNT }.keys
-        metrics = %w[silver exp bounties].to_h do |metric|
-          series = daily[metric] || {}
-          so_far = (series[today_s] || [0, 0])[0]
-          typical_now = Util.mean(active_days.map { |d| (series[d] || [0, 0])[1] })
-          typical_day = Util.mean(active_days.map { |d| (series[d] || [0, 0])[0] })
-          ok = active_days.size >= MIN_SAMPLES && typical_now&.positive?
-          [metric, { 'so_far' => so_far.round(1), 'typical_now' => typical_now&.round(1),
-                     'typical_day' => typical_day&.round(1),
-                     'projected' => ok ? (so_far / typical_now * typical_day).round(1) : nil,
-                     'pct' => ok ? ((so_far / typical_now - 1) * 100).round(1) : nil, 'samples' => active_days.size }]
-        end
-        { metrics: metrics, active_days: active_days }
-      end
-
-      # Rest reasons today against the typical count by this time of day
-      def reason_rows_for(reasons, today_s, active_days)
-        (reasons.values.flat_map(&:keys) + reasons[today_s].keys).uniq.map do |reason|
-          typical = active_days.empty? ? nil : (active_days.sum { |d| reasons[d][reason] }.to_f / active_days.size).round(1)
-          { 'reason' => reason, 'today' => reasons[today_s][reason], 'typical' => typical }
-        end.select { |row| row['today'].positive? || row['typical'].to_f >= 0.5 }
-           .sort_by { |row| [-row['today'], -row['typical'].to_f] }
-      end
-
-      # The active bounty's age against how long that type usually takes
-      def bounty_for(id, data, now)
-        active = data[:active][id] or return nil
-
-        type = active['bounty_type'].to_s
-        durations = data[:took][[id, type]].size >= MIN_SAMPLES ? data[:took][[id, type]] : data[:took][[nil, type]]
-        typical = durations.size >= MIN_SAMPLES ? Util.median(durations).round : nil
-        age = now - active['received_time'].to_i
-        { 'type' => type, 'target' => Util.bounty_target(type, active['creature'], active['area']),
-          'done' => active['count_completed'].to_i, 'need' => active['count_required'].to_i,
-          'received' => active['received_time'].to_i, 'age' => age, 'typical' => typical,
-          'stuck' => typical ? age > [typical * 2, 600].max : false }
-      end
-
-      # The status light: what turns a character amber or red
-      def lights(state, now, last_kill, hunt_s, pace, deaths, item_rests, crashes, bounty, reason_rows, enc_base, enc_today, mind_start)
-        reds = []
-        ambers = []
-        since = state['since'] ? now - state['since'] : 0
-        reds << "Dead for #{since / 60} min" if state['type'] == 'dead'
-        (since > IDLE_WARN * 2 ? reds : ambers) << "Idle for #{since / 60} min" if state['type'] == 'idle' && since > IDLE_WARN
-        if state['type'] == 'hunt' && since > NO_KILL_WARN && last_kill && now - last_kill > NO_KILL_WARN
-          reds << "No kills for #{(now - last_kill) / 60} min while hunting"
-        end
-        if hunt_s >= 3600
-          { 'silver' => 'Silver', 'exp' => 'Exp' }.each do |metric, label|
-            pct = pace[metric]['pct'] or next
-            if pct <= -50 then reds << "#{label} #{pct.round}% vs typical by this time"
-            elsif pct <= -20 then ambers << "#{label} #{pct.round}% vs typical by this time"
-            end
-          end
-        end
-        ambers << "#{deaths} death#{'s' unless deaths == 1} today" if deaths.positive?
-        ambers << "#{item_rests} item limit rest#{'s' unless item_rests == 1} today" if item_rests.positive?
-        ambers << "#{crashes.size} crash / idle recovery today" if crashes.any?
-        ambers << "Bounty running #{bounty['age'] / 60} min (typical #{bounty['typical'] / 60} min)" if bounty && bounty['stuck']
-        reason_rows.each do |row|
-          next if row['reason'] == '(none)' || row['typical'].nil?
-
-          if row['today'] >= 3 && row['today'] >= (row['typical'] * 2) + 1
-            ambers << "#{row['reason']}: #{row['today']} rests today (typical #{row['typical']} by now)"
-          end
-        end
-        if enc_base && enc_base[1] >= 10 && enc_today.size >= 3 && Util.mean(enc_today) >= enc_base[0] + 10
-          ambers << "Starting hunts at #{Util.mean(enc_today).round}% encumbrance (typical #{enc_base[0].round}%)"
-        end
-        ambers << "Starting hunts with mind #{Util.mean(mind_start).round}% full" if mind_start.size >= 3 && Util.mean(mind_start) >= 90
-        [reds, ambers]
-      end
-
-      # ======================================================================
-      # ONE CHARACTER: range figures and the deep-dive tables
-      # ======================================================================
-
-      def range_figures(id, range)
-        label, from = Report.range_from_arg(range)
-        who = Who.parse(id)
-        now = Time.now.to_i
-        hours = [(now - from) / 3600.0, 0.01].max
-        Database.reader do |conn|
-          k = conn.one("SELECT SUM(CASE WHEN cycle_type = 'hunt' AND end_time IS NOT NULL AND duration_seconds >= 10 THEN duration_seconds ELSE 0 END) AS hunt_s, " \
-                       "SUM(CASE WHEN cycle_type = 'hunt' AND end_time IS NOT NULL AND duration_seconds >= 10 THEN 1 ELSE 0 END) AS hunt_n, " \
-                       "SUM(CASE WHEN cycle_type = 'rest' AND end_time IS NOT NULL AND duration_seconds > 0 THEN duration_seconds ELSE 0 END) AS rest_s, " \
-                       "SUM(CASE WHEN cycle_type = 'rest' AND end_time IS NOT NULL AND duration_seconds > 0 THEN 1 ELSE 0 END) AS rest_n, " \
-                       "SUM(CASE WHEN cycle_type = 'dead' THEN 1 ELSE 0 END) AS deaths, MIN(exp_total_start) AS exp_a, " \
-                       'MAX(exp_total_end) AS exp_b FROM cycles WHERE game = ? AND character = ? AND start_time >= ? AND start_time <= ?',
-                       *who, from, now)
-          silver = conn.one("SELECT SUM(delta_silver) AS t FROM bank_snapshots WHERE game = ? AND character = ? AND bank_name = '__total__' " \
-                            'AND delta_silver IS NOT NULL AND timestamp >= ? AND timestamp <= ?', *who, from, now)['t'].to_i
-          kills = conn.one('SELECT SUM(kill_count) AS t FROM kill_stats WHERE game = ? AND character = ? AND date >= ? AND date <= ?',
-                           *who, Report.date_of(from), Report.date_of(now))['t'].to_i
-          done = conn.one("SELECT COUNT(*) AS n, SUM(silver_reward) AS s, SUM(exp_reward) AS e FROM bounties WHERE game = ? AND character = ? " \
-                          "AND status = 'completed' AND completed_time >= ? AND completed_time <= ?", *who, from, now)
-          dropped = conn.one("SELECT SUM(CASE WHEN status = 'abandoned' THEN 1 ELSE 0 END) AS a, " \
-                             "SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) AS x FROM bounties " \
-                             'WHERE game = ? AND character = ? AND received_time >= ? AND received_time <= ?', *who, from, now)
-          step_secs = conn.all('SELECT step, SUM(seconds) AS s FROM rest_steps WHERE game = ? AND character = ? ' \
-                               'AND rest_start >= ? AND rest_start <= ? GROUP BY 1', *who, from, now)
-                          .to_h { |row| [row['step'].to_s, row['s'].to_f] }
-          covered = conn.one('SELECT COUNT(DISTINCT cycle_id) AS n FROM rest_steps WHERE game = ? AND character = ? ' \
-                             'AND rest_start >= ? AND rest_start <= ?', *who, from, now)['n'].to_i
-          trends, trend_meta = trends_for(conn, who, range, now)
-
-          hs = k['hunt_s'].to_i
-          hn = k['hunt_n'].to_i
-          rs = k['rest_s'].to_i
-          rn = k['rest_n'].to_i
-          hunt_h = hs / 3600.0
-          gain = k['exp_a'] && k['exp_b'] && k['exp_b'].to_i > k['exp_a'].to_i ? k['exp_b'].to_i - k['exp_a'].to_i : 0
-          {
-            'label' => label, 'hours' => hours.round(2),
-            'range_stats' => {
-              'silver' => silver, 'silver_hr' => (silver / hours).round,
-              'silver_hunt_hr' => hunt_h.positive? ? (silver / hunt_h).round : nil,
-              'exp' => gain, 'exp_hr' => (gain / hours).round, 'exp_hunt_hr' => hunt_h.positive? ? (gain / hunt_h).round : nil,
-              'bounties' => done['n'].to_i, 'bounties_hunt_hr' => hunt_h.positive? ? (done['n'].to_i / hunt_h).round(2) : nil,
-              'bounty_silver' => done['s'].to_i, 'bounty_exp' => done['e'].to_i,
-              'abandoned' => dropped['a'].to_i, 'expired' => dropped['x'].to_i,
-              'kills' => kills, 'deaths' => k['deaths'].to_i,
-              'hunt_avg' => hn.zero? ? nil : (hs.to_f / hn).round, 'rest_avg' => rn.zero? ? nil : (rs.to_f / rn).round,
-              'hunts' => hn, 'rests' => rn, 'uptime_pct' => Util.percent(hs, hs + rs)
-            },
-            'steps' => covered.zero? ? {} : step_secs.transform_values { |v| (v / covered).round(1) },
-            'steps_covered' => covered,
-            'trends' => trends, 'trend' => trend_meta,
-            'grounds' => hunting_grounds(conn, who), 'recent_bounties' => recent_bounties(conn, who),
-            'offers' => offers_for(conn, who, from, now),
-            'login' => login_figures(conn, who, now)
-          }
-        end
-      end
-
-      # Each profile ranked by exp per hunt hour over the last 30 days
-      def hunting_grounds(conn, who)
-        from = Util.midnight(Date.today - (BASE_DAYS - 1))
-        grounds = Hash.new { |h, profile| h[profile] = { 'hunt_s' => 0, 'hunts' => 0, 'exp' => 0, 'kills' => 0, 'silver' => 0, 'deaths' => 0 } }
-        conn.all("SELECT profile, SUM(CASE WHEN cycle_type = 'hunt' THEN duration_seconds ELSE 0 END) AS hs, " \
-                 "SUM(CASE WHEN cycle_type = 'hunt' THEN 1 ELSE 0 END) AS n, " \
-                 "SUM(CASE WHEN cycle_type = 'hunt' AND exp_total_end > exp_total_start THEN exp_total_end - exp_total_start ELSE 0 END) AS xp, " \
-                 "SUM(CASE WHEN cycle_type = 'dead' THEN 1 ELSE 0 END) AS d FROM cycles " \
-                 'WHERE game = ? AND character = ? AND end_time IS NOT NULL AND profile IS NOT NULL AND start_time >= ? GROUP BY 1',
-                 *who, from).each do |row|
-          ground = grounds[Report.short_profile(row['profile'], who.name)]
-          ground['hunt_s'] += row['hs'].to_i
-          ground['hunts'] += row['n'].to_i
-          ground['exp'] += row['xp'].to_i
-          ground['deaths'] += row['d'].to_i
-        end
-        conn.all('SELECT profile, SUM(kill_count) AS k, SUM(total_silver) AS s FROM kill_stats ' \
-                 'WHERE game = ? AND character = ? AND date >= ? GROUP BY 1', *who, Report.date_of(from)).each do |row|
-          ground = grounds[Report.short_profile(row['profile'], who.name)]
-          ground['kills'] += row['k'].to_i
-          ground['silver'] += row['s'].to_i
-        end
-        grounds.select { |_, g| g['hunt_s'] >= 3600 }.map do |profile, g|
-          hours = g['hunt_s'] / 3600.0
-          { 'profile' => profile, 'hours' => hours.round(1), 'hunts' => g['hunts'], 'exp_hr' => (g['exp'] / hours).round,
-            'kills_hr' => (g['kills'] / hours).round(1), 'silver_hr' => (g['silver'] / hours).round, 'deaths' => g['deaths'] }
-        end.sort_by { |ground| -ground['exp_hr'] }
-      end
-
-      def recent_bounties(conn, who)
-        conn.all('SELECT bounty_type AS type, creature, area, status, received_time, completed_time, silver_reward, exp_reward ' \
-                 'FROM bounties WHERE game = ? AND character = ? ORDER BY received_time DESC LIMIT 12', *who).map do |row|
-          { 'type' => row['type'].to_s, 'target' => Util.bounty_target(row['type'], row['creature'], row['area']),
-            'status' => row['status'].to_s, 'received' => row['received_time'].to_i,
-            'took' => row['completed_time'] ? row['completed_time'].to_i - row['received_time'].to_i : nil,
-            'silver' => row['silver_reward'], 'exp' => row['exp_reward'] }
-        end
-      end
-
-      # This game login's silver, exp and deaths, for the "This login" chip
-      def login_figures(conn, who, now)
-        login = Report.login_for(conn, who) or return nil
-
-        Report.figures(conn, who, login['started_at'].to_i, now).merge('since' => login['started_at'].to_i, 'live' => login['live'])
-      end
-
-      # The tasks offered in the range, newest first, with the ones sent back
-      def offers_for(conn, who, from, now)
-        rows = conn.all('SELECT * FROM bounty_offers WHERE game = ? AND character = ? AND offered_at >= ? AND offered_at <= ? ' \
-                        'ORDER BY offered_at DESC, rowid DESC', *who, from, now)
-        {
-          'offered' => rows.size, 'removed' => rows.count { |row| row['outcome'] == 'removed' },
-          'expedited' => rows.count { |row| Util.truthy(row['expedited']) },
-          'vouchers' => rows.find { |row| row['vouchers_left'] }&.[]('vouchers_left'),
-          'recent' => rows.first(15).map do |row|
-            { 'at' => row['offered_at'].to_i, 'task' => Util.offer_label(row), 'outcome' => row['outcome'].to_s,
-              'expedited' => Util.truthy(row['expedited']) }
-          end
-        }
-      end
-
-      # Per-bucket values against the character's own baseline. Today is shown
-      # by hour (baseline: last 14 days of hours with real hunting); week and
-      # month by day (baseline: last 30 days of days with real hunting). The
-      # current, unfinished hour or day is plotted but left out of the baseline.
-      def trends_for(conn, who, range, now)
-        hourly = range == 'daily'
-        pattern = hourly ? '%Y-%m-%d %H' : '%Y-%m-%d'
-        today = Date.today
-        base_days = hourly ? 14 : BASE_DAYS
-        base_from = Util.midnight(today - (base_days - 1))
-        min_hunt = hourly ? HOUR_HUNT : DAY_HUNT
-        hours = ->(date) { (0..23).map { |h| Time.new(date.year, date.month, date.day, h).strftime(pattern) } }
-        if hourly
-          labels = hours.call(today)
-          current = Time.now.strftime(pattern)
-          base_keys = (0...base_days).flat_map { |d| hours.call(today - (base_days - 1 - d)) }
-        else
-          days = range == 'weekly' ? 7 : 30
-          labels = (0...days).map { |i| (today - (days - 1 - i)).to_s }
-          current = today.to_s
-          base_keys = (0...base_days).map { |i| (today - (base_days - 1 - i)).to_s }
-        end
-
-        data = Hash.new { |h, metric| h[metric] = Hash.new(0.0) }
-        bucket = ->(col) { "strftime('#{pattern}', #{local(col)})" }
-        grab = lambda do |metric, sql, *params|
-          conn.all(sql, *params).each { |row| data[metric][row['b'].to_s] += row['t'].to_f }
-        end
-        hunt_where = "cycle_type = 'hunt' AND game = ? AND character = ? AND start_time >= ? AND start_time <= ?"
-        grab.call('hunt', "SELECT #{bucket.call('start_time')} AS b, SUM(duration_seconds) AS t FROM cycles WHERE #{hunt_where} " \
-                          'AND end_time IS NOT NULL AND duration_seconds >= 10 GROUP BY 1', *who, base_from, now)
-        grab.call('silver', "SELECT #{bucket.call('timestamp')} AS b, SUM(delta_silver) AS t FROM bank_snapshots WHERE game = ? AND character = ? " \
-                            "AND bank_name = '__total__' AND delta_silver IS NOT NULL AND timestamp >= ? AND timestamp <= ? GROUP BY 1",
-                  *who, base_from, now)
-        grab.call('exp', "SELECT #{bucket.call('start_time')} AS b, SUM(exp_total_end - exp_total_start) AS t FROM cycles WHERE game = ? AND character = ? " \
-                         'AND exp_total_end > exp_total_start AND start_time >= ? AND start_time <= ? GROUP BY 1', *who, base_from, now)
-        grab.call('bounties', "SELECT #{bucket.call('completed_time')} AS b, COUNT(*) AS t FROM bounties WHERE game = ? AND character = ? " \
-                              "AND status = 'completed' AND completed_time >= ? AND completed_time <= ? GROUP BY 1", *who, base_from, now)
-        unless hourly # kills are stored per day
-          grab.call('kills', 'SELECT date AS b, SUM(kill_count) AS t FROM kill_stats WHERE game = ? AND character = ? ' \
-                             'AND date >= ? AND date <= ? GROUP BY 1', *who, Report.date_of(base_from), Report.date_of(now))
-        end
-        { 'enc'  => ['encumbrance_start', 'encumbrance_start IS NOT NULL'],
-          'mind' => ['MIN(100.0, exp_field_end * 100.0 / exp_field_max)', 'exp_field_end IS NOT NULL AND exp_field_max > 0'] }.each do |metric, (expr, cond)|
-          grab.call("#{metric}_sum", "SELECT #{bucket.call('start_time')} AS b, SUM(#{expr}) AS t FROM cycles WHERE #{hunt_where} AND #{cond} GROUP BY 1",
-                    *who, base_from, now)
-          grab.call("#{metric}_n", "SELECT #{bucket.call('start_time')} AS b, COUNT(*) AS t FROM cycles WHERE #{hunt_where} AND #{cond} GROUP BY 1",
-                    *who, base_from, now)
-        end
-
-        per = hourly ? 'per hour' : 'per day'
-        specs = [['silver', "Silver #{per}", :sum], ['exp', "Experience #{per}", :sum], ['bounties', "Bounties #{per}", :sum]]
-        specs << ['kills', 'Kills per day', :sum] unless hourly
-        specs << ['enc', 'Encumbrance at hunt start (%)', :avg] << ['mind', 'Mind at hunt end (%)', :avg]
-
-        value = lambda do |metric, kind, key|
-          if kind == :sum
-            data[metric][key]
-          else
-            count = data["#{metric}_n"][key]
-            count.positive? ? data["#{metric}_sum"][key] / count : nil
-          end
-        end
-        active = ->(key) { data['hunt'][key] >= min_hunt }
-
-        trends = specs.to_h do |metric, title, kind|
-          baseline = base_keys.reject { |key| key == current }.select { |key| active.call(key) }.filter_map { |key| value.call(metric, kind, key) }
-          mean = Util.mean(baseline) || 0.0
-          sd = baseline.size < 2 ? 0.0 : Math.sqrt(baseline.sum { |v| (v - mean)**2 } / baseline.size)
-          shown = labels.map do |label|
-            v = value.call(metric, kind, label)
-            if label == current then data['hunt'][label].positive? && v ? v.round(1) : nil
-            elsif label > current then nil
-            else active.call(label) && v ? v.round(1) : nil
-            end
-          end
-          complete = labels.each_index.filter_map { |i| shown[i] if labels[i] != current }
-          avg = Util.mean(complete)
-          [metric, { 'title' => title, 'kind' => kind.to_s, 'values' => shown, 'mean' => mean.round(2), 'sd' => sd.round(2),
-                     'n' => baseline.size, 'shown_avg' => avg&.round(2),
-                     'vs_pct' => avg && mean.positive? ? ((avg - mean) * 100.0 / mean).round(1) : nil,
-                     'partial_index' => labels.index(current) }]
-        end
-        [trends, { 'labels' => labels, 'hourly' => hourly, 'baseline_days' => base_days, 'min_hunt_minutes' => min_hunt / 60 }]
       end
 
       # ======================================================================
@@ -4017,25 +3431,25 @@ module GS4Analytics
       # ======================================================================
 
       def serve(client)
-        request, host = Timeout.timeout(5) { read_head(client) }
+        request, host, origin = Timeout.timeout(5) { read_head(client) }
         return reply(client, 400, 'text/plain', 'Bad request') unless request
 
         verb, target = request.split
-        return reply(client, 405, 'text/plain', 'Method not allowed') unless verb == 'GET'
         return reply(client, 403, 'text/plain', 'Forbidden') unless allowed_host?(host)
+        return reply(client, 403, 'text/plain', 'Forbidden') if origin && !allowed_origin?(origin)
+        return preflight(client, origin) if verb == 'OPTIONS'
+        return reply(client, 405, 'text/plain', 'Method not allowed', origin) unless verb == 'GET'
 
-        route, query = target.to_s.split('?', 2)
-        params = decode_params(query)
-        case route
+        case target.to_s.split('?', 2).first
         when '/', '/index.html'
-          reply(client, 200, 'text/html; charset=utf-8', PAGE)
-        when '/api/overview'
-          reply(client, 200, 'application/json', JSON.generate(overview))
-        when '/api/character'
-          data = character(params['name'].to_s, params['range'].to_s)
-          data ? reply(client, 200, 'application/json', JSON.generate(data)) : reply(client, 404, 'application/json', '{"error":"unknown character"}')
+          reply(client, 302, 'text/plain', '', origin, 'Location' => url)
+        when '/api/meta'
+          reply(client, 200, 'application/json', JSON.generate(meta), origin)
+        when '/api/db'
+          token, image = snapshot
+          reply(client, 200, 'application/vnd.sqlite3', image, origin, 'X-Analytics-Token' => token)
         else
-          reply(client, 404, 'text/plain', 'Not found')
+          reply(client, 404, 'text/plain', 'Not found', origin)
         end
       rescue Timeout::Error
         reply(client, 400, 'text/plain', 'Bad request')
@@ -4046,854 +3460,64 @@ module GS4Analytics
         client.close unless client.closed?
       end
 
-      # [request line, Host value], or nil for a request that isn't well formed:
-      # a line cut off at its length limit (the rest would be read as a header
-      # of its own, which a page could pad to end in a Host header), more than
-      # one Host header, or more headers than a browser sends
+      # [request line, Host, Origin], or nil for a request that isn't well
+      # formed: a line cut off at its length limit (the rest would be read as a
+      # header of its own, which a page could pad to end in a Host header), a
+      # second Host or Origin header, or more headers than a browser sends
       def read_head(client)
         line = client.gets(MAX_LINE)
         return unless line&.end_with?("\n")
 
-        host = nil
+        seen = {}
         MAX_HEADERS.times do
           header = client.gets(MAX_HEADER_LINE)
           return unless header&.end_with?("\n")
-          return [line, host] if header.strip.empty?
+          return [line, seen['host'], seen['origin']] if header.strip.empty?
 
           name, value = header.split(':', 2)
-          next unless name.strip.casecmp?('host')
-          return if host
+          key = name.strip.downcase
+          next unless %w[host origin].include?(key)
+          return if seen.key?(key)
 
-          host = value.to_s.strip
+          seen[key] = value.to_s.strip
         end
         nil
       end
 
-      # In LAN mode any address may be used; otherwise only this computer's names
       def allowed_host?(host)
-        return true unless @local_only
-
         LOCAL_HOSTS.include?(host.to_s.downcase.sub(/:\d+\z/, ''))
       end
 
-      def decode_params(query)
-        URI.decode_www_form(query.to_s).to_h
-      rescue ArgumentError
-        {}
+      def allowed_origin?(origin)
+        extra = Array(Settings.current.dig(:dashboard, :allowed_origins)).map { |o| o.to_s.strip.chomp('/') }
+        ALLOWED_ORIGINS.any? { |re| re.match?(origin) } || extra.include?(origin)
       end
 
-      def reply(client, code, type, body)
-        status = { 200 => 'OK', 400 => 'Bad Request', 403 => 'Forbidden', 404 => 'Not Found', 405 => 'Method Not Allowed',
-                   500 => 'Internal Server Error' }[code]
-        body = body.dup.force_encoding(Encoding::UTF_8)
-        client.write("HTTP/1.1 #{code} #{status}\r\nContent-Type: #{type}\r\nContent-Length: #{body.bytesize}\r\n" \
-                     "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n" \
-                     "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " \
-                     "img-src data:; connect-src 'self'\r\nConnection: close\r\n\r\n#{body}")
+      def cors(origin)
+        return {} unless origin && allowed_origin?(origin)
+
+        { 'Access-Control-Allow-Origin' => origin, 'Vary' => 'Origin', 'Access-Control-Expose-Headers' => 'X-Analytics-Token' }
+      end
+
+      # Older Chromium asks first (Private Network Access); the answer has no data
+      def preflight(client, origin)
+        reply(client, 204, 'text/plain', '', origin, 'Access-Control-Allow-Methods'         => 'GET',
+                                                     'Access-Control-Allow-Private-Network' => 'true',
+                                                     'Access-Control-Max-Age'               => '600')
+      end
+
+      def reply(client, code, type, body, origin = nil, extra = {})
+        body = type == 'application/vnd.sqlite3' ? body.b : body.to_s.dup.force_encoding(Encoding::UTF_8)
+        headers = { 'Content-Type' => type, 'Content-Length' => body.bytesize, 'Cache-Control' => 'no-store',
+                    'X-Content-Type-Options' => 'nosniff', 'Cross-Origin-Resource-Policy' => 'cross-origin',
+                    'Content-Security-Policy' => "default-src 'none'; frame-ancestors 'none'" }
+        headers.merge!(cors(origin), extra)
+        client.write("HTTP/1.1 #{code} #{STATUS[code]}\r\n#{headers.map { |k, v| "#{k}: #{v}\r\n" }.join}Connection: close\r\n\r\n")
+        client.write(body) unless body.empty?
       rescue IOError, SystemCallError
         nil
       end
     end
-
-    PAGE = <<~'HTML'
-    <!doctype html>
-    <html lang="en">
-    <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>GS4 Analytics</title>
-    <script>
-      // The theme picked with the Theme button, applied before the first paint
-      try { var saved = localStorage.getItem('gs4a-theme');
-            if (saved === 'light' || saved === 'dark') document.documentElement.setAttribute('data-theme', saved); } catch (e) {}
-    </script>
-    <style>
-      :root { color-scheme: light dark; }
-      :root[data-theme="light"] { color-scheme: light; }
-      /* Light. Categorical slots (k1..k8), activity states and status colors are
-         the validated reference palette; states use slots 1-3 (all-pairs safe) */
-      :root {
-        --page: #f4f6f9; --surface: #ffffff; --surface-2: #f7f8fa; --sunken: #eef1f5;
-        --ink: #0f1623; --ink-2: #475164; --muted: #7a8394; --line: #e6e9ef; --line-2: #d3d8e1;
-        --accent: #2a78d6; --accent-ink: #1c5cab; --accent-soft: rgba(42, 120, 214, .10);
-        --k1: #2a78d6; --k2: #eb6834; --k3: #1baf7a; --k4: #eda100; --k5: #e87ba4; --k6: #008300; --k7: #6250d6; --k8: #e34948;
-        --st-hunt: #1baf7a; --st-rest: #2a78d6; --st-dead: #eb6834; --st-idle: #a0a7b4; --st-none: #eef1f5;
-        --good: #0ca30c; --good-ink: #006300; --warn: #fab219; --warn-ink: #8a5a00; --serious: #ec835a; --crit: #d03b3b; --crit-ink: #b42323;
-        --gray: #9aa1ad;
-        --shadow: 0 1px 2px rgba(15, 22, 35, .04), 0 2px 6px rgba(15, 22, 35, .05);
-        --shadow-hover: 0 2px 4px rgba(15, 22, 35, .06), 0 8px 24px rgba(15, 22, 35, .08);
-        --header: rgba(244, 246, 249, .82);
-      }
-      @media (prefers-color-scheme: dark) {
-        :root:not([data-theme="light"]) {
-          --page: #0b0e14; --surface: #141922; --surface-2: #181e29; --sunken: #1c2330;
-          --ink: #eef1f6; --ink-2: #b6bdca; --muted: #8b94a4; --line: #232a37; --line-2: #313a4a;
-          --accent: #3987e5; --accent-ink: #86b6ef; --accent-soft: rgba(57, 135, 229, .16);
-          --k1: #3987e5; --k2: #d95926; --k3: #199e70; --k4: #c98500; --k5: #d55181; --k6: #008300; --k7: #9085e9; --k8: #e66767;
-          --st-hunt: #199e70; --st-rest: #3987e5; --st-dead: #d95926; --st-idle: #6b7484; --st-none: #1c2330;
-          --good: #0ca30c; --good-ink: #2fc42f; --warn: #fab219; --warn-ink: #fab219; --serious: #ec835a; --crit: #d03b3b; --crit-ink: #ff7b7b;
-          --gray: #6b7484;
-          --shadow: 0 0 0 1px rgba(255, 255, 255, .02); --shadow-hover: 0 0 0 1px rgba(255, 255, 255, .05), 0 8px 24px rgba(0, 0, 0, .35);
-          --header: rgba(11, 14, 20, .78);
-        }
-      }
-      /* Dark chosen with the Theme button, whatever the system setting */
-      :root[data-theme="dark"] {
-        color-scheme: dark;
-        --page: #0b0e14; --surface: #141922; --surface-2: #181e29; --sunken: #1c2330;
-        --ink: #eef1f6; --ink-2: #b6bdca; --muted: #8b94a4; --line: #232a37; --line-2: #313a4a;
-        --accent: #3987e5; --accent-ink: #86b6ef; --accent-soft: rgba(57, 135, 229, .16);
-        --k1: #3987e5; --k2: #d95926; --k3: #199e70; --k4: #c98500; --k5: #d55181; --k6: #008300; --k7: #9085e9; --k8: #e66767;
-        --st-hunt: #199e70; --st-rest: #3987e5; --st-dead: #d95926; --st-idle: #6b7484; --st-none: #1c2330;
-        --good: #0ca30c; --good-ink: #2fc42f; --warn: #fab219; --warn-ink: #fab219; --serious: #ec835a; --crit: #d03b3b; --crit-ink: #ff7b7b;
-        --gray: #6b7484;
-        --shadow: 0 0 0 1px rgba(255, 255, 255, .02); --shadow-hover: 0 0 0 1px rgba(255, 255, 255, .05), 0 8px 24px rgba(0, 0, 0, .35);
-        --header: rgba(11, 14, 20, .78);
-      }
-
-      * { box-sizing: border-box; }
-      html { -webkit-text-size-adjust: 100%; }
-      body { margin: 0; background: var(--page); color: var(--ink);
-             font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
-      button, select { font: inherit; color: inherit; }
-      .wrap { max-width: 1320px; margin: 0 auto; padding: 0 24px 32px; }
-      @media (max-width: 640px) { .wrap { padding: 0 16px 24px; } }
-
-      /* ---------- top bar ---------- */
-      .top { position: sticky; top: 0; z-index: 20; margin: 0 -24px 20px; padding: 12px 24px;
-             background: var(--header); backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px);
-             border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px 16px; flex-wrap: wrap; }
-      @media (max-width: 640px) { .top { margin: 0 -16px 16px; padding: 10px 16px; } }
-      .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: inherit; cursor: pointer; background: none; border: 0; padding: 0; }
-      .logo { width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; flex: none;
-              background: linear-gradient(135deg, var(--k1), var(--k7)); box-shadow: 0 2px 6px rgba(42, 120, 214, .35); }
-      .brand h1 { font-size: 16px; font-weight: 700; letter-spacing: -.01em; margin: 0; line-height: 1.1; }
-      .brand small { display: block; font-size: 11.5px; color: var(--muted); font-weight: 500; letter-spacing: .01em; }
-      .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px 3px 8px; border-radius: 999px;
-              background: var(--surface); border: 1px solid var(--line); font-size: 12px; color: var(--ink-2); white-space: nowrap; }
-      .live { width: 7px; height: 7px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px rgba(12, 163, 12, .16); }
-      .live.stale { background: var(--crit); box-shadow: 0 0 0 3px rgba(208, 59, 59, .16); }
-      .spacer { flex: 1; }
-      .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-      .tool { font-size: 13px; font-weight: 550; padding: 7px 12px; border-radius: 9px; border: 1px solid var(--line-2);
-              background: var(--surface); color: var(--ink); cursor: pointer; display: inline-flex; align-items: center; gap: 6px; line-height: 1.2; }
-      .tool:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-ink); }
-      .tool:focus-visible, .tabs button:focus-visible, .pin:focus-visible, select:focus-visible, .card.click:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-      .tool:disabled { opacity: .6; cursor: default; }
-      select { padding: 7px 30px 7px 12px; border-radius: 9px; border: 1px solid var(--line-2); background: var(--surface); font-size: 13px; font-weight: 550;
-               min-width: 150px; appearance: none; -webkit-appearance: none; cursor: pointer;
-               background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
-               background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%; background-size: 5px 5px; background-repeat: no-repeat; }
-      .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-
-      /* ---------- type and layout ---------- */
-      .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; margin: 4px 0 16px; }
-      .page-head h2 { font-size: 26px; line-height: 1.15; letter-spacing: -.02em; margin: 0; font-weight: 750; }
-      .page-head p { margin: 4px 0 0; color: var(--muted); font-size: 13.5px; }
-      .eyebrow { font-size: 11.5px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
-      .grid { display: grid; gap: 16px; }
-      .g-cards { grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); }
-      .g-2 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); }
-      .g-split { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
-      @media (max-width: 980px) { .g-split { grid-template-columns: minmax(0, 1fr); } }
-      .g-charts { grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); }
-      section { margin-top: 16px; }
-      .card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; box-shadow: var(--shadow); min-width: 0; }
-      .card.click { cursor: pointer; transition: box-shadow .15s, border-color .15s, transform .15s; }
-      .card.click:hover { box-shadow: var(--shadow-hover); border-color: var(--line-2); transform: translateY(-1px); }
-      .card-head { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; margin-bottom: 14px; }
-      .card-head h3 { font-size: 15px; font-weight: 680; margin: 0; letter-spacing: -.005em; }
-      .card-head .note { color: var(--muted); font-size: 12.5px; }
-      .muted { color: var(--muted); } .ink2 { color: var(--ink-2); } .small { font-size: 12.5px; }
-      .empty { color: var(--muted); padding: 28px 0; text-align: center; }
-
-      /* ---------- status and state ---------- */
-      .status { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; flex: none;
-                font-size: 11px; font-weight: 800; color: #fff; line-height: 1; }
-      .s-green { background: var(--good); } .s-amber { background: var(--warn); color: #0b0b0b; } .s-red { background: var(--crit); } .s-gray { background: var(--gray); }
-      .state { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--ink-2);
-               padding: 2px 9px 2px 7px; border-radius: 999px; background: var(--sunken); white-space: nowrap; }
-      .state i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-      .timer { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-      .reasons { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 6px; }
-      .reasons li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: var(--ink-2); }
-      .reasons .status { width: 16px; height: 16px; font-size: 10px; margin-top: 1px; }
-
-      /* ---------- numbers ---------- */
-      .hero { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 3fr); gap: 0; padding: 0; overflow: hidden; }
-      @media (max-width: 900px) { .hero { grid-template-columns: minmax(0, 1fr); } }
-      .hero-main { padding: 22px 24px; border-right: 1px solid var(--line);
-                   background: linear-gradient(160deg, var(--accent-soft), transparent 70%); }
-      @media (max-width: 900px) { .hero-main { border-right: 0; border-bottom: 1px solid var(--line); } }
-      .hero-fig { font-size: 48px; font-weight: 750; letter-spacing: -.035em; line-height: 1.05; margin: 6px 0 4px; }
-      .hero-sub { color: var(--ink-2); font-size: 13.5px; }
-      .hero-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr)); }
-      .hero-stats > div { padding: 18px 20px; border-left: 1px solid var(--line); border-top: 1px solid var(--line); margin: -1px 0 0 -1px; }
-      .stat-lab { font-size: 12.5px; color: var(--muted); font-weight: 550; }
-      .stat-val { font-size: 24px; font-weight: 700; letter-spacing: -.02em; line-height: 1.2; margin-top: 2px; }
-      .stat-sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
-      .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 12px; }
-      @media (max-width: 640px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } .tile .stat-val { font-size: 19px; } }
-      .tile { background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; padding: 13px 14px; min-width: 0; }
-      .tile .stat-val { font-size: 22px; }
-      @media (min-width: 1100px) { .tiles.perf { grid-template-columns: repeat(7, minmax(0, 1fr)); } }
-      .tile.lead { grid-column: span 2; background: linear-gradient(160deg, var(--accent-soft), var(--surface-2) 75%); }
-      .tile.lead .stat-val { font-size: 40px; letter-spacing: -.03em; }
-      @media (max-width: 640px) { .tile.lead { grid-column: span 2; } .tile.lead .stat-val { font-size: 34px; } }
-      .delta { display: inline-flex; align-items: center; gap: 3px; font-size: 12px; font-weight: 650; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
-      .delta.good { color: var(--good-ink); background: rgba(12, 163, 12, .10); }
-      .delta.bad { color: var(--crit-ink); background: rgba(208, 59, 59, .10); }
-      .delta.flat { color: var(--muted); background: var(--sunken); }
-
-      /* ---------- character card ---------- */
-      .ch-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
-      .avatar { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; flex: none; font-weight: 750; font-size: 17px;
-                background: var(--sunken); color: var(--ink-2); border: 1px solid var(--line); }
-      .avatar.big { width: 56px; height: 56px; border-radius: 16px; font-size: 24px; }
-      .ch-name { font-size: 17px; font-weight: 720; letter-spacing: -.01em; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .ch-meta { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; margin-top: 3px; }
-      .pin { margin-left: auto; background: none; border: 0; cursor: pointer; color: var(--muted); font-size: 18px; line-height: 1; padding: 4px; border-radius: 8px; align-self: flex-start; }
-      .pin.on { color: var(--k4); } .pin:hover { color: var(--k4); background: var(--sunken); }
-      .kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
-      .kpis > div { background: var(--surface-2); border: 1px solid var(--line); border-radius: 11px; padding: 10px 12px; min-width: 0; }
-      .kpis .stat-val { font-size: 20px; }
-      .kpis .stat-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .facts { margin-top: 14px; display: grid; gap: 8px; }
-      .fact { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
-      .fact > span:first-child { color: var(--muted); }
-      .fact > span:last-child { text-align: right; font-variant-numeric: tabular-nums; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .meter { height: 6px; border-radius: 999px; background: var(--accent-soft); overflow: hidden; margin-top: 6px; }
-      .meter span { display: block; height: 100%; border-radius: 999px; background: var(--accent); }
-
-      /* ---------- tabs ---------- */
-      .tabs { display: inline-flex; padding: 3px; border-radius: 10px; background: var(--sunken); gap: 2px; }
-      .tabs button { border: 0; background: none; padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-2); }
-      .tabs button:hover { color: var(--ink); }
-      .tabs button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgba(15, 22, 35, .12); }
-
-      /* ---------- tables ---------- */
-      .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 -4px; padding: 0 4px; }
-      table { width: 100%; border-collapse: collapse; font-size: 13px; }
-      th, td { text-align: right; padding: 9px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; font-variant-numeric: tabular-nums; }
-      th:first-child, td:first-child { text-align: left; padding-left: 2px; }
-      th { color: var(--muted); font-weight: 600; font-size: 12px; border-bottom-color: var(--line-2); }
-      td.l, th.l { text-align: left; }
-      td.wrapcell { white-space: normal; min-width: 140px; }
-      tbody tr:last-child td { border-bottom: 0; }
-      tbody tr.click { cursor: pointer; } tbody tr.click:hover td { background: var(--surface-2); }
-      tr.mark td { font-weight: 650; }
-      .tag { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--sunken); color: var(--ink-2); }
-      .tag i { width: 6px; height: 6px; border-radius: 50%; background: var(--gray); }
-      .tag.t-ok i { background: var(--good); } .tag.t-live i { background: var(--accent); } .tag.t-off { color: var(--muted); }
-
-      /* ---------- charts ---------- */
-      .chart { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 14px 10px; min-width: 0; }
-      .chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 2px; }
-      .chart-head h4 { font-size: 13px; font-weight: 650; margin: 0; }
-      .chart-val { font-size: 20px; font-weight: 700; letter-spacing: -.02em; }
-      .chart-foot { font-size: 12px; color: var(--muted); margin-top: 2px; }
-      svg text { fill: var(--muted); font-size: 10.5px; font-family: inherit; font-variant-numeric: tabular-nums; }
-      svg .tl-name { fill: var(--ink-2); font-size: 12px; font-weight: 600; }
-      svg .lab { fill: var(--ink-2); font-size: 11px; font-weight: 650; }
-      .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: 12.5px; color: var(--ink-2); }
-      .legend span { display: inline-flex; align-items: center; gap: 6px; }
-      .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
-      .segbar { display: flex; gap: 2px; height: 28px; }
-      .segbar span { display: flex; align-items: center; height: 100%; border-radius: 4px; min-width: 2px; padding: 0 8px; overflow: visible;
-                     font-size: 12px; font-weight: 650; color: #fff; white-space: nowrap; }
-      .segbar span.dark { color: #0b0b0b; }
-      .steps { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--ink-2); }
-      .steps div { display: inline-flex; align-items: center; gap: 7px; }
-      .steps i { width: 10px; height: 10px; border-radius: 3px; flex: none; }
-      .steps b { font-weight: 650; color: var(--ink); font-variant-numeric: tabular-nums; }
-      .divider { height: 1px; background: var(--line); margin: 18px 0; }
-
-      /* ---------- alerts ---------- */
-      .alerts { display: grid; gap: 8px; }
-      .alert { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--line); cursor: pointer; font-size: 13px; }
-      .alert:hover { border-color: var(--line-2); }
-      .alert b { font-weight: 680; }
-      .alert .status { width: 18px; height: 18px; font-size: 10.5px; margin-top: 1px; }
-      .crumb { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); margin: 2px 0 12px; }
-      .crumb button { background: none; border: 0; padding: 0; color: var(--accent-ink); cursor: pointer; font-weight: 600; }
-      .crumb button:hover { text-decoration: underline; }
-
-      /* ---------- hover tooltip ---------- */
-      .tip { position: fixed; z-index: 50; pointer-events: none; background: var(--ink); color: var(--surface); font-size: 12px; font-weight: 550;
-             padding: 6px 9px; border-radius: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, .18); max-width: 280px; line-height: 1.35; display: none; }
-      footer.foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 28px; }
-    </style>
-    </head>
-    <body>
-    <div class="wrap">
-      <header class="top">
-        <button class="brand" id="home" type="button" title="Everyone">
-          <span class="logo" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18"><rect x="2" y="9" width="3" height="7" rx="1.2" fill="#fff" opacity=".75"/><rect x="7.5" y="5" width="3" height="11" rx="1.2" fill="#fff" opacity=".9"/><rect x="13" y="2" width="3" height="14" rx="1.2" fill="#fff"/></svg></span>
-          <span><h1>GS4 Analytics</h1><small>Hunting dashboard</small></span>
-        </button>
-        <span class="pill"><span class="live" id="liveDot"></span><span id="statusText">connecting</span></span>
-        <span class="spacer"></span>
-        <div class="controls">
-          <label class="sr" for="who">View</label>
-          <select id="who"><option value="">Everyone</option></select>
-          <button class="tool no-export" id="theme" type="button" title="Switch between the system theme, light and dark">Theme: Auto</button>
-          <button class="tool no-export" id="export" type="button" title="Save this view as a PNG image">Save image</button>
-        </div>
-      </header>
-      <div id="overview"></div>
-      <div id="detail" hidden></div>
-      <footer class="foot">Updates every 5 seconds &middot; Read only</footer>
-    </div>
-    <div class="tip" id="tip"></div>
-
-    <script>
-    // Symbols are built from code points so this file stays plain ASCII
-    function U(code) { return String.fromCharCode(code); }
-    (function () {
-      // Theme button: Auto (follow the system), Light, Dark, and round again
-      var themeBtn = document.getElementById('theme'), THEMES = ['auto', 'light', 'dark'];
-      var ICON = { auto: U(0x25D0), light: U(0x2600), dark: U(0x263E) };
-      function showTheme() {
-        var t = document.documentElement.getAttribute('data-theme') || 'auto';
-        themeBtn.textContent = ICON[t] + ' ' + t.charAt(0).toUpperCase() + t.slice(1);
-        themeBtn.setAttribute('aria-label', 'Theme: ' + t);
-      }
-      themeBtn.onclick = function () {
-        var cur = document.documentElement.getAttribute('data-theme') || 'auto';
-        var next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
-        if (next === 'auto') document.documentElement.removeAttribute('data-theme');
-        else document.documentElement.setAttribute('data-theme', next);
-        try { if (next === 'auto') localStorage.removeItem('gs4a-theme'); else localStorage.setItem('gs4a-theme', next); } catch (e) {}
-        showTheme();
-      };
-      showTheme();
-    })();
-    (function () {
-      var who = decodeURIComponent(location.hash.slice(1)), range = 'daily';
-      var ov = null, det = null, offset = 0, failed = 0;
-      // Rest steps in a fixed order, each on its own categorical slot
-      var STEP_ORDER = ['travel', 'selling', 'eloot', 'bounty', 'healing', 'spells', 'other scripts', 'waiting'];
-      var STEP_COL = { travel: '--k1', selling: '--k2', eloot: '--k3', bounty: '--k4', healing: '--k5', spells: '--k6', 'other scripts': '--k7', waiting: '--gray' };
-      var STEP_DARK_TEXT = { bounty: true };
-      var STATE_COL = { hunt: '--st-hunt', rest: '--st-rest', idle: '--st-idle', dead: '--st-dead', offline: '--gray' };
-      var STATE_NAME = { hunt: 'Hunting', rest: 'Resting', idle: 'Idle', dead: 'Dead', offline: 'Offline' };
-      var LIGHT = { green: [U(0x2713), 'All normal'], amber: ['!', 'Needs a look'], red: ['!', 'Problem'], gray: [U(0x2013), 'Not running'] };
-
-      function $(id) { return document.getElementById(id); }
-      function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
-      function css(v) { return 'var(' + v + ')'; }
-      function num(n) { return n == null ? '--' : Math.round(n).toLocaleString('en-US'); }
-      function short(n) {
-        if (n == null) return '--';
-        var a = Math.abs(n), s = n < 0 ? '-' : '';
-        if (a >= 1e9) return s + (a / 1e9).toFixed(2) + 'B';
-        if (a >= 1e6) return s + (a / 1e6).toFixed(1) + 'M';
-        if (a >= 1e4) return s + (a / 1e3).toFixed(1) + 'K';
-        if (a > 0 && a < 10 && a % 1) return s + a.toFixed(1);
-        return s + Math.round(a).toLocaleString('en-US');
-      }
-      function dur(sec) {
-        if (sec == null) return '--';
-        sec = Math.max(0, Math.round(sec));
-        var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
-        if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm';
-        return m + ':' + String(s).padStart(2, '0');
-      }
-      function nowSrv() { return Date.now() / 1000 + offset; }
-      function ago(ts) {
-        if (!ts) return '--';
-        var s = Math.max(0, nowSrv() - ts);
-        if (s < 60) return Math.round(s) + 's ago';
-        if (s < 3600) return Math.floor(s / 60) + ' min ago';
-        if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm ago';
-        return Math.floor(s / 86400) + 'd ago';
-      }
-      function clock(ts) { return new Date(ts * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
-      function stamp(ts) { return new Date(ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); }
-      function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
-      // A change vs typical: arrow and sign, green when it's the good direction
-      function delta(p, highBad, suffix) {
-        if (p == null) return '';
-        var r = Math.round(p);
-        if (r === 0) return '<span class="delta flat">0%' + (suffix || '') + '</span>';
-        var good = (r > 0) !== !!highBad;
-        return '<span class="delta ' + (good ? 'good' : 'bad') + '">' + (r > 0 ? U(0x25B2) + ' +' : U(0x25BC) + ' ') + r + '%' + (suffix || '') + '</span>';
-      }
-      function status(level, cls) {
-        var l = LIGHT[level] || LIGHT.gray;
-        return '<span class="status s-' + esc(level) + (cls ? ' ' + cls : '') + '" title="' + l[1] + '" aria-label="' + l[1] + '">' + l[0] + '</span>';
-      }
-      function stateHtml(st) {
-        return '<span class="state"><i style="background:' + css(STATE_COL[st.type] || '--gray') + '"></i>' + esc(STATE_NAME[st.type] || st.type) + '</span>' +
-               '<span class="timer" data-since="' + (st.since || '') + '" data-type="' + esc(st.type) + '"></span>';
-      }
-      function initial(name) { return esc(String(name || '?').charAt(0).toUpperCase()); }
-      function stat(lab, val, sub, cls) {
-        return '<div' + (cls ? ' class="' + cls + '"' : '') + '><div class="stat-lab">' + lab + '</div><div class="stat-val">' + val + '</div>' +
-               (sub ? '<div class="stat-sub">' + sub + '</div>' : '') + '</div>';
-      }
-      function reasonsHtml(light) {
-        if (!light.reasons.length) return '';
-        return '<ul class="reasons">' + light.reasons.map(function (r) { return '<li>' + status(r.level) + '<span>' + esc(r.text) + '</span></li>'; }).join('') + '</ul>';
-      }
-      // Clean axis steps (1, 2, 2.5, 5 x 10^n) so tick labels never repeat
-      function nice(hi) {
-        if (!(hi > 0)) return { max: 1, step: 0.25 };
-        var raw = hi / 4, mag = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / mag;
-        var step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * mag;
-        return { max: step * Math.ceil(hi / step - 1e-9), step: step };
-      }
-      function bountyText(b) {
-        if (!b) return 'None active';
-        return esc(b.target || b.type) + (b.need ? ' ' + U(0x00B7) + ' ' + b.done + '/' + b.need : '');
-      }
-      function meter(b) {
-        if (!b || !b.need) return '';
-        return '<div class="meter" role="img" aria-label="' + b.done + ' of ' + b.need + '"><span style="width:' + Math.min(100, b.done * 100 / b.need) + '%"></span></div>';
-      }
-
-      // ---------------- timeline (shared) ----------------
-      function timeline(chars, dayStart) {
-        var multi = chars.length > 1;
-        var longest = Math.max.apply(null, chars.map(function (c) { return String(c.name).length; }).concat([0]));
-        var rowH = 30, barH = 16, L = multi ? Math.min(220, Math.max(70, Math.round(longest * 7.5 + 16))) : 0, W = 1000, R = 4, top = 2, n = chars.length, H = top + n * rowH + 20;
-        var span = 86400, now = nowSrv();
-        function x(t) { return L + (W - L - R) * Math.min(Math.max((t - dayStart) / span, 0), 1); }
-        var svg = '';
-        for (var h = 0; h <= 24; h += 3) {
-          var hx = x(dayStart + h * 3600);
-          svg += '<line x1="' + hx + '" x2="' + hx + '" y1="' + top + '" y2="' + (top + n * rowH) + '" stroke="var(--line)"/>' +
-                 '<text x="' + hx + '" y="' + (H - 4) + '" text-anchor="' + (h === 24 ? 'end' : h === 0 ? 'start' : 'middle') + '">' + (h === 24 ? '24' : String(h).padStart(2, '0')) + ':00</text>';
-        }
-        chars.forEach(function (c, i) {
-          var y = top + i * rowH + (rowH - barH) / 2;
-          if (multi) svg += '<text class="tl-name" x="0" y="' + (y + 12) + '">' + esc(c.name) + '</text>';
-          svg += '<rect x="' + L + '" y="' + y + '" width="' + (W - L - R) + '" height="' + barH + '" rx="5" fill="var(--st-none)"/>';
-          c.timeline.forEach(function (s) {
-            var x1 = x(s[1]), x2 = x(s[2]);
-            var tip = (STATE_NAME[s[0]] || s[0]) + ' ' + clock(s[1]) + ' ' + U(0x2013) + ' ' + clock(s[2]) + ' (' + dur(s[2] - s[1]) + ')' + (s[3] ? ' ' + U(0x00B7) + ' ' + s[3] : '');
-            svg += '<rect x="' + x1.toFixed(1) + '" y="' + y + '" width="' + Math.max(1.2, x2 - x1).toFixed(1) + '" height="' + barH + '" fill="' + css(STATE_COL[s[0]] || '--gray') + '" data-tip="' + esc(tip) + '"/>';
-          });
-        });
-        var nx = x(now);
-        svg += '<line x1="' + nx + '" x2="' + nx + '" y1="' + top + '" y2="' + (top + n * rowH) + '" stroke="var(--ink)" stroke-width="1.5"/>' +
-               '<circle cx="' + nx + '" cy="' + top + '" r="3" fill="var(--ink)"/>';
-        var leg = ['hunt', 'rest', 'idle', 'dead'].map(function (k) {
-          return '<span><i style="background:' + css(STATE_COL[k]) + '"></i>' + STATE_NAME[k] + '</span>'; }).join('') +
-          '<span><i style="background:var(--st-none);box-shadow:inset 0 0 0 1px var(--line-2)"></i>No data</span>' +
-          '<span><i style="background:var(--ink);width:2px;border-radius:0"></i>Now</span>';
-        return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="Activity today">' + svg + '</svg><div class="legend">' + leg + '</div>';
-      }
-
-      // ---------------- everyone ----------------
-      // Pinned characters, saved in this browser, come first everywhere on the overview
-      var pins = [];
-      try { pins = JSON.parse(localStorage.getItem('gs4a-pins') || '[]') || []; } catch (e) { pins = []; }
-      function pinned(id) { return pins.indexOf(id) >= 0; }
-      function togglePin(id) {
-        pins = pinned(id) ? pins.filter(function (p) { return p !== id; }) : pins.concat([id]);
-        try { localStorage.setItem('gs4a-pins', JSON.stringify(pins)); } catch (e) {}
-        renderOverview();
-      }
-      function ordered(list) {
-        return list.filter(function (c) { return pinned(c.id); }).concat(list.filter(function (c) { return !pinned(c.id); }));
-      }
-      function paceKpi(lab, m) {
-        var sub = m.pct == null ? 'no baseline yet' : delta(m.pct, false, ' vs typical');
-        return stat(lab, short(m.so_far), sub);
-      }
-      function card(c) {
-        var on = pinned(c.id), b = c.bounty;
-        return '<div class="card click" tabindex="0" data-who="' + esc(c.id) + '">' +
-          '<div class="ch-head"><span class="avatar">' + initial(c.name) + '</span><div style="min-width:0">' +
-            '<div class="ch-name">' + esc(c.name) + '</div><div class="ch-meta">' + stateHtml(c.state) + '</div></div>' +
-            '<button class="pin no-export' + (on ? ' on' : '') + '" type="button" data-pin="' + esc(c.id) + '" title="' + (on ? 'Unpin' : 'Pin to the top') +
-            '" aria-pressed="' + on + '">' + (on ? '&#9733;' : '&#9734;') + '</button></div>' +
-          (c.light.reasons.length ? reasonsHtml(c.light)
-            : '<ul class="reasons"><li>' + status(c.light.level) + '<span>' + LIGHT[c.light.level][1] + '</span></li></ul>') +
-          '<div class="kpis">' + paceKpi('Silver today', c.pace.silver) + paceKpi('Exp today', c.pace.exp) + paceKpi('Bounties', c.pace.bounties) + '</div>' +
-          '<div class="facts">' +
-            '<div><div class="fact"><span>Active bounty</span><span>' + bountyText(b) + '</span></div>' + meter(b) + '</div>' +
-            '<div class="fact"><span>Last kill</span><span data-ago="' + (c.last_kill || '') + '">' + ago(c.last_kill) + '</span></div>' +
-            '<div class="fact"><span>Last bounty</span><span data-ago="' + (c.last_bounty || '') + '">' + ago(c.last_bounty) + '</span></div>' +
-          '</div></div>';
-      }
-      function renderOverview() {
-        if (!ov.characters.length) { $('overview').innerHTML = '<div class="card empty">No characters with data in the last day.</div>'; return; }
-        var chars = ordered(ov.characters);
-        var sum = function (f) { return chars.reduce(function (a, c) { return a + (f(c) || 0); }, 0); };
-        var silver = sum(function (c) { return c.pace.silver.so_far; }), exp = sum(function (c) { return c.pace.exp.so_far; });
-        var hours = Math.max((nowSrv() - ov.day_start) / 3600, 0.01);
-        var hunting = chars.filter(function (c) { return c.state.type === 'hunt'; }).length;
-        var online = chars.filter(function (c) { return c.state.type !== 'offline'; }).length;
-        var deaths = sum(function (c) { return c.today.deaths; });
-        var hero = '<div class="card hero">' +
-          '<div class="hero-main"><div class="eyebrow">Silver today &middot; all characters</div><div class="hero-fig">' + short(silver) + '</div>' +
-            '<div class="hero-sub">' + short(silver / hours) + ' per hour since midnight</div></div>' +
-          '<div class="hero-stats">' +
-            stat('Experience', short(exp), short(exp / hours) + ' / hr') +
-            stat('Bounties', num(sum(function (c) { return c.pace.bounties.so_far; })), 'completed') +
-            stat('Kills', num(sum(function (c) { return c.today.kills; })), 'creatures searched') +
-            stat('Hunting time', dur(sum(function (c) { return c.today.hunt_s; })), 'across ' + plural(chars.length, 'character')) +
-            stat('Deaths', num(deaths), deaths ? 'today' : 'none today') +
-          '</div></div>';
-        var rows = chars.map(function (c) {
-          var t = c.today;
-          return '<tr class="click" data-who="' + esc(c.id) + '"><td><b>' + esc(c.name) + '</b></td><td>' + short(c.pace.silver.so_far) + '</td><td>' + short(c.pace.exp.so_far) + '</td><td>' + num(c.pace.bounties.so_far) +
-            '</td><td>' + num(t.kills) + '</td><td>' + dur(t.hunt_s) + '</td><td>' + (t.uptime_pct == null ? '--' : t.uptime_pct + '%') +
-            '</td><td>' + t.deaths + '</td><td>' + c.crashes.length + '</td><td>' + t.item_rests + '</td></tr>';
-        }).join('');
-        var alerts = ov.alerts.length ? '<div class="alerts">' + ov.alerts.map(function (a) {
-          return '<div class="alert" data-who="' + esc(a.id) + '">' + status(a.level) + '<span><b>' + esc(a.character) + '</b> &middot; ' + esc(a.text) + '</span></div>'; }).join('') + '</div>'
-          : '<div class="empty">' + status('green') + ' Nothing to flag</div>';
-        var today = new Date(ov.day_start * 1000).toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' });
-        $('overview').innerHTML =
-          '<div class="page-head"><div><h2>Today</h2><p>' + esc(today) + ' &middot; ' + plural(chars.length, 'character') + ', ' + online + ' online, ' + hunting + ' hunting</p></div></div>' +
-          hero +
-          '<section><div class="card-head"><h3>Characters</h3><span class="note">Pin with the star to keep a character first</span></div>' +
-            '<div class="grid g-cards">' + chars.map(card).join('') + '</div></section>' +
-          '<section class="card"><div class="card-head"><h3>Activity today</h3><span class="note">Hover a stretch for its times</span></div>' + timeline(chars, ov.day_start) + '</section>' +
-          '<section class="grid g-split">' +
-            '<div class="card"><div class="card-head"><h3>Alerts</h3></div>' + alerts + '</div>' +
-            '<div class="card"><div class="card-head"><h3>Side by side</h3><span class="note">today</span></div><div class="scroll"><table><thead><tr><th>Character</th><th>Silver</th><th>Exp</th><th>Bounties</th>' +
-            '<th>Kills</th><th>Hunting</th><th>Uptime</th><th>Deaths</th><th>Crashes</th><th>Item limit</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>' +
-          '</section>';
-        bindWho($('overview'));
-        Array.prototype.forEach.call($('overview').querySelectorAll('[data-pin]'), function (el) {
-          el.onclick = function (e) { e.stopPropagation(); togglePin(el.getAttribute('data-pin')); };
-        });
-      }
-
-      // ---------------- one character ----------------
-      var FMT = { silver: short, exp: short, bounties: function (v) { return (Math.round(v * 10) / 10).toString(); }, kills: num,
-                  enc: function (v) { return Math.round(v) + '%'; }, mind: function (v) { return Math.round(v) + '%'; } };
-      var PCT = { enc: true, mind: true };
-
-      function trendChart(key, m, labels, hourly) {
-        var fmtv = FMT[key], W = 420, H = 168, L = 46, R = 44, T = 14, B = 22, n = labels.length;
-        var vals = m.values.filter(function (v) { return v != null; });
-        if (!vals.length && !m.n) return '<div class="empty small">No data yet</div>';
-        var scale = PCT[key] ? { max: 100, step: 25 } : nice(Math.max.apply(null, vals.concat([m.n ? m.mean + (m.n >= 5 ? m.sd : 0) : 0, 0])) * 1.05);
-        var hi = scale.max;
-        var tick = function (v) {
-          if (PCT[key]) return Math.round(v) + '%';
-          if (key === 'bounties') return scale.step < 1 ? v.toFixed(scale.step < 0.1 ? 2 : 1) : String(Math.round(v));
-          if (v >= 1e6) return (v / 1e6).toFixed(v % 1e6 ? 1 : 0) + 'M';
-          if (v >= 1e3) return (v / 1e3).toFixed(v % 1e3 ? 1 : 0) + 'K';
-          return String(Math.round(v));
-        };
-        function x(i) { return L + (W - L - R) * (n === 1 ? 0.5 : i / (n - 1)); }
-        function y(v) { return T + (H - T - B) * (1 - Math.min(Math.max(v, 0), hi) / hi); }
-        var svg = '';
-        for (var g = 0; g <= hi + 1e-9; g += scale.step) {
-          var gy = y(g);
-          svg += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + gy + '" y2="' + gy + '" stroke="' + (g === 0 ? 'var(--line-2)' : 'var(--line)') + '"/>' +
-                 '<text x="' + (L - 6) + '" y="' + (gy + 3.5) + '" text-anchor="end">' + tick(g) + '</text>';
-        }
-        var band = m.n >= 5;
-        if (band) {
-          var top = y(m.mean + m.sd), bot = y(Math.max(0, m.mean - m.sd));
-          svg += '<rect x="' + L + '" y="' + top + '" width="' + (W - L - R) + '" height="' + Math.max(0, bot - top) + '" fill="var(--k1)" opacity=".10"/>';
-        }
-        if (m.n >= 1) {
-          var my = y(m.mean);
-          svg += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + my + '" y2="' + my + '" stroke="var(--muted)" stroke-width="1"/>' +
-                 '<text x="' + (W - R + 4) + '" y="' + (my + 3.5) + '">typical</text>';
-        }
-        var path = '', area = '', pen = false, first = null, last = null;
-        m.values.forEach(function (v, i) {
-          if (v == null) { pen = false; return; }
-          path += (pen ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1) + ' '; pen = true;
-          if (first == null) first = i; last = i;
-        });
-        if (path) svg += '<path d="' + path + '" fill="none" stroke="var(--k1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
-        var highBad = m.kind === 'avg';
-        m.values.forEach(function (v, i) {
-          if (v == null) return;
-          var partial = i === m.partial_index;
-          var tip = (hourly ? labels[i].slice(11) : labels[i].slice(5)) + ': ' + fmtv(v) +
-            (band ? ' (' + (v >= m.mean ? '+' : '') + Math.round((v - m.mean) * 100 / (m.mean || 1)) + '% vs typical)' : '') + (partial ? ' ' + U(0x00B7) + ' still in progress' : '');
-          svg += '<circle cx="' + x(i) + '" cy="' + y(v) + '" r="4" fill="' + (partial ? 'var(--surface)' : 'var(--k1)') + '" stroke="' + (partial ? 'var(--k1)' : 'var(--surface)') + '" stroke-width="2"/>' +
-                 '<circle cx="' + x(i) + '" cy="' + y(v) + '" r="12" fill="transparent" data-tip="' + esc(tip) + '"/>';
-        });
-        if (last != null) {
-          var ly = y(m.values[last]), above = ly - 8 >= T + 2, lx = x(last), text = fmtv(m.values[last]);
-          // Near the right edge the label goes on the point's left so it isn't cut off
-          var left = lx + 8 + String(text).length * 6.5 > W;
-          svg += '<text class="lab" x="' + (left ? lx - 8 : lx + 8) + '" y="' + (above ? ly - 8 : ly + 16) + '"' + (left ? ' text-anchor="end"' : '') + '>' + esc(text) + '</text>';
-        }
-        var step = hourly ? 3 : (n > 10 ? 5 : 1);
-        labels.forEach(function (lb, i) {
-          if (i % step === 0) svg += '<text x="' + x(i) + '" y="' + (H - 6) + '" text-anchor="middle">' + esc(hourly ? lb.slice(11, 13) : lb.slice(5)) + '</text>';
-        });
-        var foot = band ? 'Line = typical ' + fmtv(m.mean) + ', shaded = usual range, ' + m.n + ' samples' : 'Baseline building: ' + m.n + ' of 5 samples';
-        var latest = last != null ? fmtv(m.values[last]) : '--';
-        return '<div class="chart-head"><h4>' + esc(m.title.replace(/ \(%\)$/, '')) + '</h4>' + (band ? delta(m.vs_pct, highBad, ' vs typical') : '') + '</div>' +
-          '<div class="chart-val">' + esc(latest) + '<span class="muted small" style="font-weight:500;letter-spacing:0"> ' + (hourly ? 'latest hour' : 'latest day') + '</span></div>' +
-          '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="' + esc(m.title) + '">' + svg + '</svg>' +
-          '<div class="chart-foot">' + foot + '</div>';
-      }
-
-      function stepBar(steps) {
-        var keys = Object.keys(steps).filter(function (k) { return steps[k] > 0; }).sort(function (a, b) {
-          var ia = STEP_ORDER.indexOf(a), ib = STEP_ORDER.indexOf(b); return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib); });
-        var total = keys.reduce(function (a, k) { return a + steps[k]; }, 0);
-        if (!total) return '<div class="empty small">No step timing in this window yet.</div>';
-        var bar = '<div class="segbar" role="img" aria-label="Average rest: ' + keys.map(function (k) { return k + ' ' + dur(steps[k]); }).join(', ') + '">' + keys.map(function (k) {
-          var share = steps[k] * 100 / total, label = Math.round(share) + '%';
-          return '<span class="' + (STEP_DARK_TEXT[k] ? 'dark' : '') + '" style="flex:' + steps[k] + ' 1 0;background:' + css(STEP_COL[k] || '--gray') + '" data-tip="' +
-            esc(k + ' ' + U(0x00B7) + ' ' + dur(steps[k]) + ' (' + label + ')') + '">' + (share >= 9 ? label : '') + '</span>'; }).join('') + '</div>';
-        var list = '<div class="steps">' + keys.map(function (k) {
-          return '<div><i style="background:' + css(STEP_COL[k] || '--gray') + '"></i><span>' + esc(k) + '</span><b>' + dur(steps[k]) + '</b><span class="muted">' +
-            Math.round(steps[k] * 100 / total) + '%</span></div>'; }).join('') + '</div>';
-        return bar + list;
-      }
-
-      function statusTag(s) {
-        var cls = s === 'completed' ? 't-ok' : (s === 'active' || s === 'open') ? 't-live' : 't-off';
-        return '<span class="tag ' + cls + '"><i></i>' + esc(s) + '</span>';
-      }
-
-      function renderDetail() {
-        var c = det, t = c.trend, rs = c.range_stats, b = c.bounty, mind = c.mind, enc = c.encumbrance;
-        var tabs = Object.keys(c.ranges).map(function (k) {
-          return '<button type="button" data-r="' + k + '" class="' + (k === range ? 'on' : '') + '">' + esc(c.ranges[k]) + '</button>'; }).join('');
-        var basis = t.hourly ? 'hours with ' + t.min_hunt_minutes + '+ min of hunting over the last ' + t.baseline_days + ' days'
-                             : 'days with ' + (t.min_hunt_minutes / 60) + '+ hours of hunting over the last ' + t.baseline_days + ' days';
-        var light = LIGHT[c.light.level] || LIGHT.gray;
-
-        var head = '<div class="crumb"><button type="button" id="back">Everyone</button><span>/</span><span>' + esc(c.name) + '</span></div>' +
-          '<div class="card">' +
-            '<div class="ch-head" style="align-items:flex-start;flex-wrap:wrap;gap:14px">' +
-              '<span class="avatar big">' + initial(c.name) + '</span>' +
-              '<div style="min-width:0;flex:1 1 260px"><div class="ch-name" style="font-size:26px;letter-spacing:-.02em">' + esc(c.name) + '</div>' +
-                '<div class="ch-meta" style="margin-top:6px">' + stateHtml(c.state) +
-                (c.state.profile ? '<span class="tag">' + esc(c.state.profile) + '</span>' : '') +
-                (c.state.type === 'rest' && c.state.reason ? '<span class="small muted">resting: ' + esc(c.state.reason) + '</span>' : '') + '</div></div>' +
-              '<div style="min-width:220px;flex:0 1 360px"><div class="small" style="display:flex;align-items:center;gap:8px;font-weight:650">' + status(c.light.level) + light[1] + '</div>' +
-                reasonsHtml(c.light) + '</div>' +
-            '</div>' +
-            '<div class="tiles" style="margin-top:18px">' +
-              stat('Last kill', '<span data-ago="' + (c.last_kill || '') + '">' + ago(c.last_kill) + '</span>', c.last_kill ? clock(c.last_kill) : 'none yet', 'tile') +
-              stat('Last bounty', '<span data-ago="' + (c.last_bounty || '') + '">' + ago(c.last_bounty) + '</span>', c.last_bounty ? clock(c.last_bounty) : 'none yet', 'tile') +
-              '<div class="tile"><div class="stat-lab">Active bounty</div><div class="stat-val">' + (b ? (b.need ? b.done + '<span class="muted" style="font-size:15px;font-weight:600">/' + b.need + '</span>' : esc(b.type)) : '--') + '</div>' +
-                '<div class="stat-sub">' + (b ? esc(b.target || b.type) + ' ' + U(0x00B7) + ' ' + dur(b.age) + (b.typical ? ' (typ ' + dur(b.typical) + ')' : '') : 'none active') + '</div>' + meter(b) + '</div>' +
-              (c.login ? stat(c.login.live ? 'This login' : 'Last login', short(c.login.silver) + '<span class="muted" style="font-size:13px;font-weight:600"> silver</span>',
-                short(c.login.silver_hr) + '/hr ' + U(0x00B7) + ' ' + short(c.login.exp) + ' exp ' + U(0x00B7) + ' ' + plural(c.login.deaths, 'death') + ' ' + U(0x00B7) + ' since ' + stamp(c.login.since), 'tile') : '') +
-              stat('Crashes today', num(c.crashes.length), c.crashes.map(function (x) { return clock(x.at) + ' ' + esc(x.reason); }).join(', ') || 'none', 'tile') +
-            '</div>' +
-            '<div class="divider"></div>' +
-            '<div class="card-head" style="margin-bottom:8px"><h3>Activity today</h3></div>' + timeline([c], c.day_start) +
-          '</div>';
-
-        var perf = '<section class="card"><div class="card-head"><h3>Performance</h3><span class="note">' + esc(c.label) + '</span><span class="spacer"></span><div class="tabs" id="tabs">' + tabs + '</div></div>' +
-          '<div class="tiles perf">' +
-            stat('Silver', short(rs.silver), short(rs.silver_hr) + ' / hr ' + U(0x00B7) + ' ' + short(rs.silver_hunt_hr) + ' / hunt hr', 'tile lead') +
-            stat('Experience', short(rs.exp), short(rs.exp_hr) + ' / hr ' + U(0x00B7) + ' ' + short(rs.exp_hunt_hr) + ' / hunt hr', 'tile') +
-            stat('Bounties', num(rs.bounties), (rs.bounties_hunt_hr == null ? '--' : rs.bounties_hunt_hr) + ' / hunt hr ' + U(0x00B7) + ' ' + rs.abandoned + ' abandoned', 'tile') +
-            stat('Kills', num(rs.kills), plural(rs.deaths, 'death'), 'tile') +
-            stat('Task offers', num(c.offers.offered), c.offers.removed + ' removed ' + U(0x00B7) + ' ' + c.offers.expedited + ' expedited', 'tile') +
-            stat('Avg hunt / rest', dur(rs.hunt_avg) + '<span class="muted" style="font-weight:600"> / </span>' + dur(rs.rest_avg),
-                 rs.hunts + ' hunts ' + U(0x00B7) + ' ' + (rs.uptime_pct == null ? '--' : rs.uptime_pct + '%') + ' hunting', 'tile') +
-          '</div>' +
-          '<div class="card-head" style="margin:22px 0 10px"><h3>Trends</h3><span class="note">Typical = average of ' + esc(basis) + '</span></div>' +
-          '<div class="grid g-charts">' + Object.keys(c.trends).map(function (k) {
-            return '<div class="chart">' + trendChart(k, c.trends[k], t.labels, t.hourly) + '</div>'; }).join('') + '</div></section>';
-
-        var reasonRows = c.rest_reasons.length ? c.rest_reasons.map(function (r) {
-          var hot = r.typical != null && r.today >= 3 && r.today >= r.typical * 2 + 1;
-          return '<tr' + (hot ? ' class="mark"' : '') + '><td class="wrapcell">' + esc(r.reason) + '</td><td>' + r.today + '</td><td>' + (r.typical == null ? '--' : r.typical) + '</td></tr>'; }).join('')
-          : '<tr><td colspan="3" class="muted">No rests yet today</td></tr>';
-        var rest = '<section class="grid g-2">' +
-          '<div class="card"><div class="card-head"><h3>Average rest</h3><span class="note">' + esc(c.label) + ' ' + U(0x00B7) + ' time per step</span></div>' + stepBar(c.steps) +
-            '<div class="divider"></div><div class="card-head" style="margin-bottom:6px"><h3>Rest reasons today</h3></div>' +
-            '<div class="scroll"><table><thead><tr><th>Reason</th><th>Today</th><th>Typical by now</th></tr></thead><tbody>' + reasonRows + '</tbody></table></div></div>' +
-          '<div class="card"><div class="card-head"><h3>Mind and load</h3><span class="note">today</span></div><div class="tiles">' +
-            stat('Mind at hunt start', mind.start_avg == null ? '--' : Math.round(mind.start_avg) + '%', 'average', 'tile') +
-            stat('Mind at hunt end', mind.end_avg == null ? '--' : Math.round(mind.end_avg) + '%', plural(mind.samples, 'hunt'), 'tile') +
-            stat('Absorbed per rest', mind.absorbed_per_rest == null ? '--' : num(mind.absorbed_per_rest), mind.absorbed_per_min == null ? 'field exp' : mind.absorbed_per_min + ' per minute of rest', 'tile') +
-            stat('Encumbrance at start', enc.today == null ? '--' : Math.round(enc.today) + '%', enc.typical == null ? 'no baseline yet' : 'typical ' + Math.round(enc.typical) + '%', 'tile') +
-          '</div><div class="small muted" style="margin-top:12px">Mind percentages need mind capacity, recorded from this update on.</div></div></section>';
-
-        var grounds = c.grounds.length ? '<div class="scroll"><table><thead><tr><th>Profile</th><th>Hours</th><th>Exp / hunt hr</th><th>Kills / hunt hr</th><th>Creature silver / hr</th><th>Deaths</th></tr></thead><tbody>' +
-          c.grounds.map(function (g) {
-            var cur = c.state.profile && g.profile === c.state.profile;
-            return '<tr' + (cur ? ' class="mark"' : '') + '><td>' + esc(g.profile) + (cur ? ' <span class="tag t-live"><i></i>now</span>' : '') + '</td><td>' + g.hours + '</td><td>' + num(g.exp_hr) + '</td><td>' + g.kills_hr +
-              '</td><td>' + short(g.silver_hr) + '</td><td>' + g.deaths + '</td></tr>'; }).join('') + '</tbody></table></div>'
-          : '<div class="empty small">Needs at least an hour of hunting in a profile.</div>';
-        var recent = c.recent_bounties.length ? '<div class="scroll"><table><thead><tr><th>Received</th><th class="l">Type</th><th class="l">Target</th><th class="l">Status</th><th>Took</th><th>Silver</th><th>Exp</th></tr></thead><tbody>' +
-          c.recent_bounties.map(function (r) {
-            return '<tr><td>' + clock(r.received) + '</td><td class="l">' + esc(r.type) + '</td><td class="l wrapcell">' + esc(r.target) + '</td><td class="l">' + statusTag(r.status) + '</td><td>' + dur(r.took) +
-              '</td><td>' + short(r.silver) + '</td><td>' + short(r.exp) + '</td></tr>'; }).join('') + '</tbody></table></div>'
-          : '<div class="empty small">No bounties yet.</div>';
-        var offers = c.offers.recent.length ? '<div class="scroll"><table><thead><tr><th>Offered</th><th class="l">Task</th><th class="l">Outcome</th><th class="l">Voucher</th></tr></thead><tbody>' +
-          c.offers.recent.map(function (o) {
-            return '<tr' + (o.outcome === 'removed' ? ' class="mark"' : '') + '><td>' + clock(o.at) + '</td><td class="l wrapcell">' + esc(o.task) + '</td><td class="l">' + statusTag(o.outcome) +
-              '</td><td class="l">' + (o.expedited ? 'expedited' : '') + '</td></tr>'; }).join('') + '</tbody></table></div>'
-          : '<div class="empty small">No tasks offered in this range.</div>';
-
-        $('detail').innerHTML = head + perf + rest +
-          '<section class="card"><div class="card-head"><h3>Hunting grounds</h3><span class="note">last 30 days, best exp first</span></div>' + grounds + '</section>' +
-          '<section class="grid g-2"><div class="card"><div class="card-head"><h3>Recent bounties</h3></div>' + recent + '</div>' +
-          '<div class="card"><div class="card-head"><h3>Task offers</h3><span class="note">' + esc(c.label) + ' ' + U(0x00B7) + ' removed in bold</span></div>' + offers + '</div></section>';
-        $('back').onclick = function () { setWho(''); };
-        Array.prototype.forEach.call($('tabs').querySelectorAll('button'), function (bt) {
-          bt.onclick = function () { range = bt.getAttribute('data-r'); loadDetail(); };
-        });
-      }
-
-      // ---------------- hover tooltip ----------------
-      var tipEl = $('tip');
-      document.addEventListener('mouseover', function (e) {
-        var el = e.target.closest ? e.target.closest('[data-tip]') : null;
-        if (!el) { tipEl.style.display = 'none'; return; }
-        tipEl.textContent = el.getAttribute('data-tip'); tipEl.style.display = 'block';
-      });
-      document.addEventListener('mousemove', function (e) {
-        if (tipEl.style.display !== 'block') return;
-        var w = tipEl.offsetWidth, x = e.clientX + 14, y = e.clientY + 16;
-        if (x + w > window.innerWidth - 8) x = e.clientX - w - 14;
-        tipEl.style.left = x + 'px'; tipEl.style.top = y + 'px';
-      });
-
-      // ---------------- plumbing ----------------
-      function bindWho(root) {
-        Array.prototype.forEach.call(root.querySelectorAll('[data-who]'), function (el) {
-          el.onclick = function () { setWho(el.getAttribute('data-who')); };
-          el.onkeydown = function (e) { if (e.key === 'Enter' && e.target === el) setWho(el.getAttribute('data-who')); };
-        });
-      }
-      function setWho(name) {
-        who = name; history.replaceState(null, '', name ? '#' + encodeURIComponent(name) : location.pathname);
-        $('who').value = name; det = null; show(); if (name) loadDetail(); else if (ov) renderOverview(); window.scrollTo(0, 0);
-      }
-      function fillSelect() {
-        var sel = $('who'), want = [''].concat(ov.names);
-        var have = Array.prototype.map.call(sel.options, function (o) { return o.value; });
-        if (have.join('|') !== want.join('|')) {
-          sel.innerHTML = '<option value="">Everyone</option>' + ov.characters.map(function (c) { return '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>'; }).join('');
-        }
-        sel.value = who;
-      }
-      function show() {
-        $('overview').hidden = !!who; $('detail').hidden = !who;
-        if (who && !det) $('detail').innerHTML = '<div class="card empty">Loading ' + esc(who) + '...</div>';
-      }
-      function tick() {
-        Array.prototype.forEach.call(document.querySelectorAll('.timer'), function (el) {
-          var s = el.getAttribute('data-since'), off = el.getAttribute('data-type') === 'offline';
-          var secs = s ? nowSrv() - Number(s) : 0;
-          el.textContent = !s ? '' : off ? 'last seen ' + ago(Number(s)) : 'for ' + dur(secs);
-        });
-        Array.prototype.forEach.call(document.querySelectorAll('[data-ago]'), function (el) {
-          var ts = Number(el.getAttribute('data-ago')); if (ts) el.textContent = ago(ts);
-        });
-        if (ov) {
-          $('statusText').textContent = failed ? 'Connection lost, retrying' : 'Live ' + U(0x00B7) + ' updated ' + Math.round(nowSrv() - ov.generated_at) + 's ago';
-          $('liveDot').className = 'live' + (failed ? ' stale' : '');
-        }
-      }
-      function get(url) {
-        return fetch(url, { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
-      }
-      function loadOverview() {
-        return get('/api/overview').then(function (d) {
-          ov = d; failed = 0; offset = d.generated_at - Date.now() / 1000; fillSelect(); if (!who) renderOverview(); tick();
-        }).catch(function () { failed++; tick(); });
-      }
-      function loadDetail() {
-        if (!who) return;
-        var asked = who;
-        get('/api/character?name=' + encodeURIComponent(who) + '&range=' + range).then(function (d) {
-          if (asked !== who) return;
-          det = d; renderDetail(); tick();
-        }).catch(function () {
-          if (asked === who && !det) $('detail').innerHTML = '<div class="card empty">No data for ' + esc(who) + '. <button class="tool" id="back" type="button">Back to everyone</button></div>';
-          var bk = $('back'); if (bk && !det) bk.onclick = function () { setWho(''); };
-        });
-      }
-      function refresh() { if (document.hidden) return; loadOverview(); loadDetail(); }
-
-      // ----- save the current view as a PNG -----------------------------------
-      // The page is copied with every computed style written inline (so the
-      // current theme's colors are kept), wrapped in an SVG foreignObject, drawn
-      // onto a canvas and saved. If the browser refuses to read the canvas back,
-      // the SVG itself is saved instead.
-      function inlineStyles(src, dst) {
-        var cs = getComputedStyle(src), text = '';
-        for (var i = 0; i < cs.length; i++) text += cs[i] + ':' + cs.getPropertyValue(cs[i]) + ';';
-        dst.setAttribute('style', text);
-        for (var k = 0; k < src.children.length; k++) inlineStyles(src.children[k], dst.children[k]);
-      }
-      function exportName(ext) {
-        var d = new Date(), pad = function (n) { return (n < 10 ? '0' : '') + n; };
-        var stamp = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes());
-        return 'gs4-analytics-' + (who ? who.replace(/[^\w-]+/g, '_') + '-' + range : 'everyone') + '-' + stamp + '.' + ext;
-      }
-      function saveBlob(blob, ext) {
-        var a = document.createElement('a');
-        a.href = URL.createObjectURL(blob); a.download = exportName(ext);
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-        setTimeout(function () { URL.revokeObjectURL(a.href); }, 10000);
-      }
-      function exportImage() {
-        var btn = $('export'), root = document.querySelector('.wrap');
-        var width = root.offsetWidth, height = root.scrollHeight + 34;
-        function finish(label) { btn.textContent = label || 'Save image'; btn.disabled = false; if (label) setTimeout(function () { btn.textContent = 'Save image'; }, 3000); }
-        btn.disabled = true; btn.textContent = 'Saving...';
-        try {
-          var clone = root.cloneNode(true);
-          inlineStyles(root, clone);
-          var sel = clone.querySelector('select');
-          if (sel) {
-            var label = document.createElement('span');
-            label.textContent = $('who').options[$('who').selectedIndex].text;
-            label.setAttribute('style', 'color:' + getComputedStyle($('who')).color + ';font-size:13px;font-weight:600');
-            sel.parentNode.replaceChild(label, sel);
-          }
-          Array.prototype.forEach.call(clone.querySelectorAll('.no-export'), function (n) { n.parentNode.removeChild(n); });
-          // The copy keeps the page's measured height; let the wrapper size it instead
-          clone.style.cssText += ';margin:0;max-width:none;height:auto;width:' + width + 'px';
-          var top = clone.querySelector('.top');
-          if (top) top.style.position = 'static';
-          var foot = document.createElement('div');
-          foot.setAttribute('style', 'text-align:right;font-size:12px;padding:0 16px;font-family:' + getComputedStyle(document.body).fontFamily + ';color:' + getComputedStyle(document.documentElement).getPropertyValue('--muted'));
-          foot.textContent = 'GS4 Analytics - saved ' + new Date().toLocaleString();
-          var page = document.createElement('div');
-          page.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
-          page.setAttribute('style', 'width:' + width + 'px;height:' + height + 'px;background:' + getComputedStyle(document.body).backgroundColor);
-          page.appendChild(clone);
-          page.appendChild(foot);
-          var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + width + '" height="' + height + '"><foreignObject x="0" y="0" width="100%" height="100%">' +
-            new XMLSerializer().serializeToString(page) + '</foreignObject></svg>';
-          var scale = Math.max(1, Math.min(2, 16000 / height)), img = new Image();
-          img.onload = function () {
-            try {
-              var canvas = document.createElement('canvas');
-              canvas.width = Math.round(width * scale); canvas.height = Math.round(height * scale);
-              var g = canvas.getContext('2d'); g.scale(scale, scale); g.drawImage(img, 0, 0);
-              canvas.toBlob(function (blob) { if (blob) { saveBlob(blob, 'png'); finish(); } else { saveBlob(new Blob([svg], {type: 'image/svg+xml'}), 'svg'); finish('Saved as SVG'); } }, 'image/png');
-            } catch (e) { saveBlob(new Blob([svg], {type: 'image/svg+xml'}), 'svg'); finish('Saved as SVG'); }
-          };
-          img.onerror = function () { finish('Could not save'); };
-          img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
-        } catch (e) { finish('Could not save'); }
-      }
-      $('export').onclick = exportImage;
-
-      $('who').onchange = function () { setWho(this.value); };
-      $('home').onclick = function () { setWho(''); };
-      show();
-      loadOverview().then(function () { if (!who) renderOverview(); });
-      loadDetail();
-      setInterval(refresh, 5000);
-      setInterval(tick, 1000);
-      document.addEventListener('visibilitychange', refresh);
-    })();
-    </script>
-    </body>
-    </html>
-    HTML
   end
 end
 
@@ -4905,14 +3529,15 @@ module GS4Analytics
     constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
 
     HOOK = 'GS4Analytics::CLI'
+    GUIDE = 'https://analytics.elanthia.online/guide/'
     # Commands that also work while the collector is running (they are caught
     # from the upstream, since Lich won't start a second copy of the script)
     COMMANDS = %w[report serve dashboard status maintenance help].freeze
     USAGE = <<~TEXT
       Usage:
         ;analytics                         collect data for this character
-        ;analytics --dashboard[=PORT] [--lan]   collect and serve the dashboard
-        ;analytics serve [PORT] [lan]      serve the dashboard only (or, while the
+        ;analytics --dashboard[=PORT]      collect, and feed the web dashboard
+        ;analytics serve [PORT]            feed the web dashboard only (or, while the
                                            collector runs, start it there; --dashboard works too)
         ;analytics report character        all characters, four time windows
         ;analytics report exp [range]      experience per character
@@ -4924,6 +3549,7 @@ module GS4Analytics
         ;analytics status                  what the collector is doing
         ;analytics maintenance compact|vacuum|stats|backup
       Ranges: daily (default), weekly, monthly, ytd, total
+      Guide: https://analytics.elanthia.online/guide/
     TEXT
 
     @commands = Queue.new
@@ -4980,8 +3606,9 @@ module GS4Analytics
         })
       end
 
-      # ;analytics --dashboard[=PORT] [--lan] typed while the collector runs
-      # starts the dashboard inside it, the same as ;analytics serve [PORT] [lan]
+      # ;analytics --dashboard[=PORT] typed while the collector runs starts the
+      # dashboard inside it, the same as ;analytics serve [PORT] (a leftover
+      # --lan is passed on, so it gets its explanation)
       def dashboard_words(words)
         flag = words.find { |word| word.match?(/\A--dashboard(=\d+)?\z/i) }
         return unless flag
@@ -5038,18 +3665,25 @@ module GS4Analytics
         start_dashboard(port, args.include?('lan') || defaults[:lan])
       end
 
+      # The dashboard is the hosted page; this serves it this computer's
+      # database. lan is refused: an https page can't reach a LAN address, and
+      # the API would hand the whole database to the network.
       def start_dashboard(port, lan)
-        return Log.info("Dashboard already running at http://localhost:#{Dashboard.port}") if Dashboard.running?
+        if lan
+          Log.info('The dashboard now runs in your browser and reads this computer only; lan is no longer ' \
+                   "supported. See #{GUIDE}#lan")
+        end
+        return Log.info("Dashboard already running: #{Dashboard.url}") if Dashboard.running?
 
-        Dashboard.start(port, lan ? '0.0.0.0' : '127.0.0.1')
-        Log.info("Dashboard at http://localhost:#{port}#{lan ? ' (also reachable from your network, no password)' : ' (this computer only)'}")
+        Dashboard.start(port)
+        Log.info("Dashboard: #{Dashboard.url} (reads this computer's analytics.lic on port #{port})")
       rescue Errno::EADDRINUSE
         Log.info("Port #{port} is already in use. Try ;#{Script.current.name} serve <other port>.")
       end
 
       def status
         lines = Collector.running? ? CycleManager.status : ['The collector is not running in this session.']
-        lines << "Dashboard: #{Dashboard.running? ? "http://localhost:#{Dashboard.port}" : 'not running'}"
+        lines << "Dashboard: #{Dashboard.running? ? Dashboard.url : 'not running'}"
         lines << "Database: #{Database.file}"
         respond(lines.map { |line| "[analytics] #{line}" }.join("\n"))
       end

@@ -228,7 +228,8 @@ when 'util'
     'percent'       => [A::Util.percent(1, 4), A::Util.percent(1, 0)],
     'binary_string' => A::Util.norm('abc'.b).encoding.to_s,
     'who'           => [WHO.to_s, WHO.to_a, A::Who.parse('GS3:Torvek') == WHO, { WHO => 1 }[A::Who.parse('GS3:Torvek')],
-                        A::Who.new('GSF', 'Torvek') == WHO]
+                        A::Who.new('GSF', 'Torvek') == WHO],
+    'version'       => [A::VERSION, source[/^\s+version: (\S+)$/, 1]]
   }
 
 when 'settings'
@@ -415,55 +416,93 @@ when 'reports'
   end
 
 when 'dashboard'
+  # The API the hosted dashboard reads: /api/meta, /api/db, CORS for the site,
+  # the redirect, and the request limits and Host check kept from before
   A::Database.connect!
   seed_history
-  overview = A::Dashboard.overview
-  torvek = overview['characters'].find { |c| c['id'] == 'GS3:Torvek' }
-  detail = A::Dashboard.character('GS3:Torvek', 'weekly')
+  A::Database.flush
   port = 38_000 + (Process.pid % 1000)
-  A::Dashboard.start(port, '127.0.0.1')
+  A::Dashboard.start(port)
   sleep 0.3
-  http = Net::HTTP.new('127.0.0.1', port)
-  index = http.get('/')
-  api = JSON.parse(http.get('/api/overview').body)
-  result = {
-    'ids' => overview['characters'].map { |c| c['id'] }.sort,
-    'fields' => %w[state timeline pace today bounty mind encumbrance rest_reasons].all? { |key| torvek.key?(key) },
-    'trend_labels' => %w[daily weekly monthly].map { |range| A::Dashboard.character('GS3:Torvek', range)['trend']['labels'].size },
-    'detail_id' => detail['id'], 'steps' => detail['steps'].keys.sort,
-    'unknown' => A::Dashboard.character('GS3:Nobody', 'daily').nil?,
-    'http_index' => [index.code, index.body.include?('GS4 Analytics'), index['content-security-policy'].to_s.include?("default-src 'none'")],
-    'pins' => [index.body.include?("localStorage.getItem('gs4a-pins')"), index.body.include?('data-pin="'),
-               index.body.include?('e.stopPropagation(); togglePin')],
-    'theme_toggle' => [index.body.include?('id="theme"'), index.body.include?(':root[data-theme="dark"] {'),
-                       index.body.index("localStorage.getItem('gs4a-theme')").to_i < index.body.index('<style>').to_i,
-                       index.body.scan(/<button class="tool no-export" id="theme"/).size],
-    'export_button' => [index.body.include?('id="export"'), index.body.include?('function exportImage'),
-                        index['content-security-policy'].to_s.include?('img-src data:')],
-    'http_api' => api['characters'].size,
-    'http_character' => http.get('/api/character?name=GS3%3ATorvek&range=weekly').code,
-    'http_unknown' => http.get('/api/character?name=nobody').code,
-    'http_missing' => http.get('/nope').code,
-    'http_post' => http.post('/', 'x').code
-  }
-  # The status code of a GET for / with this Host header (nil sends none)
-  status_for = lambda do |host|
+  site = 'https://analytics.elanthia.online'
+  # [status, { lowercased header => value }, body] for a request sent as given
+  raw = lambda do |verb, path, headers|
     socket = TCPSocket.new('127.0.0.1', port)
-    socket.write("GET /api/overview HTTP/1.1\r\n#{"Host: #{host}\r\n" if host}Connection: close\r\n\r\n")
-    socket.read.split[1]
+    socket.write("#{verb} #{path} HTTP/1.1\r\n#{headers.map { |h| "#{h}\r\n" }.join}Connection: close\r\n\r\n")
+    head, body = socket.read.b.split("\r\n\r\n", 2)
+    status, *fields = head.split("\r\n")
+    [status.split[1], fields.to_h { |f| k, v = f.split(': ', 2); [k.downcase, v] }, body.to_s]
   ensure
     socket&.close
   end
+  get = ->(path, *headers) { raw.call('GET', path, ['Host: 127.0.0.1'] + headers) }
+  rows = lambda do |image|
+    file = File.join(DATA_DIR, "image-#{rand(1_000_000)}.db")
+    File.binwrite(file, image)
+    db = Sequel.sqlite(file)
+    db[:cycles].count.tap { db.disconnect }
+  end
+
+  _, _, meta_body = get.call('/api/meta')
+  meta = JSON.parse(meta_body)
+  db_status, db_headers, image = get.call("/api/db?token=#{meta['token']}")
+  result = {
+    'meta' => [meta['app'], meta['api'], meta['schema_version'] == A::Database::SCHEMA_VERSION, meta['script_version'] == A::VERSION,
+               meta['db_bytes'] == image.bytesize],
+    'db'   => [db_status, db_headers['content-type'], db_headers['x-analytics-token'] == meta['token'],
+               rows.call(image) == A::Database.one('SELECT COUNT(*) AS n FROM cycles')['n']]
+  }
+  # No write: same token and the same image, not rebuilt. A write from the
+  # collector (another connection): a new token, and the new row is in the
+  # image even before a checkpoint moves it out of the WAL.
+  first = A::Dashboard.snapshot
+  again = A::Dashboard.snapshot
+  before = rows.call(again.last)
+  A::Database.start_cycle(WHO, A::Database.session_for(WHO), :idle, 'idle', 'crags', {})
+  wal_bytes = File.size?("#{A::Database.file}-wal").to_i
+  after = A::Dashboard.snapshot
+  result['token'] = [first.first == again.first, first.last.equal?(again.last), after.first != first.first,
+                     rows.call(after.last) == before + 1, wal_bytes.positive?]
+  # An older sqlite3 gem without Database#serialize: VACUUM INTO gives the same rows
+  real = A::Database.api_reader
+  no_serialize = SimpleDelegator.new(real)
+  def no_serialize.synchronize = yield(Object.new)
+  result['fallback'] = rows.call(A::Dashboard.send(:image_of, no_serialize)) == before + 1
+  real.disconnect
+
+  status_of = ->(response) { response[0] }
+  cors_of = ->(response) { response[1].values_at('access-control-allow-origin', 'vary', 'access-control-expose-headers') }
+  result['cors'] = {
+    'site'         => [status_of.call(r = get.call('/api/meta', "Origin: #{site}")), *cors_of.call(r)],
+    'local_copy'   => get.call('/api/meta', 'Origin: http://localhost:8000')[1]['access-control-allow-origin'],
+    'evil'         => [status_of.call(r = get.call('/api/meta', 'Origin: https://evil.example')), r[1]['access-control-allow-origin']],
+    'shared_pages' => status_of.call(get.call('/api/db', 'Origin: https://elanthia-online.github.io')),
+    'no_origin'    => [status_of.call(r = get.call('/api/meta')), r[1]['access-control-allow-origin']],
+    'two_origins'  => status_of.call(get.call('/api/meta', "Origin: #{site}", "Origin: #{site}"))
+  }
+  A::Settings.instance_variable_set(:@current, A::Settings::DEFAULTS.merge(
+                                                 dashboard: A::Settings::DEFAULTS[:dashboard].merge(allowed_origins: ['https://someone.github.io/'], site_url: 'http://127.0.0.1:8000/')
+                                               ))
+  result['cors']['added'] = get.call('/api/meta', 'Origin: https://someone.github.io')[1]['access-control-allow-origin']
+  redirect = get.call('/')
+  A::Settings.instance_variable_set(:@current, A::Settings::DEFAULTS)
+  default_redirect = get.call('/')
+  preflight = raw.call('OPTIONS', '/api/db', ['Host: 127.0.0.1', "Origin: #{site}", 'Access-Control-Request-Private-Network: true'])
+  result['preflight'] = [preflight[0], preflight[1]['access-control-allow-origin'], preflight[1]['access-control-allow-private-network'],
+                         preflight[1]['access-control-allow-methods'], preflight[2]]
+  result['redirect'] = [default_redirect[0], default_redirect[1]['location'], redirect[1]['location']]
+  result['expected_location'] = "https://analytics.elanthia.online/?live=#{port}"
+  result['custom_location'] = "http://127.0.0.1:8000/?live=#{port}"
+  headers = db_headers
+  result['headers'] = headers.values_at('x-content-type-options', 'cache-control', 'content-security-policy', 'cross-origin-resource-policy')
+  result['http_missing'] = get.call('/nope')[0]
+  result['http_post'] = raw.call('POST', '/api/meta', ['Host: 127.0.0.1', 'Content-Length: 1'])[0]
+
+  # The status code of a GET with this Host header (nil sends none)
+  status_for = ->(host) { raw.call('GET', '/api/meta', host ? ["Host: #{host}"] : [])[0] }
   hosts = ['attacker.example', 'attacker.example:8080', "localhost:#{port}", '127.0.0.1', '[::1]:8080', 'LOCALHOST', nil]
   result['local_hosts'] = hosts.map { |host| status_for.call(host) }
-  # Headers sent as given, after the request line
-  raw_status = lambda do |headers, path = '/api/overview'|
-    socket = TCPSocket.new('127.0.0.1', port)
-    socket.write("GET #{path} HTTP/1.1\r\n#{headers.map { |h| "#{h}\r\n" }.join}Connection: close\r\n\r\n")
-    socket.read.split[1]
-  ensure
-    socket&.close
-  end
+  raw_status = ->(headers, path = '/api/meta') { raw.call('GET', path, headers)[0] }
   pad = ->(size, tail) { "X-Pad: #{'a' * (size - tail.size - 7)}#{tail}" }
   result['split_headers'] = {
     # a long custom header whose cut-off tail reads as a Host header
@@ -474,14 +513,16 @@ when 'dashboard'
     'long_cookie'       => raw_status.call(['Host: localhost', "Cookie: #{'c' * 12_000}"]),
     'too_long_line'     => raw_status.call(['Host: localhost', "Cookie: #{'c' * 20_000}"]),
     'too_many'          => raw_status.call(['Host: localhost'] + Array.new(150) { |i| "X-#{i}: 1" }),
-    'long_request_line' => raw_status.call(['Host: localhost'], "/api/overview?x=#{'a' * 5000}")
+    'long_request_line' => raw_status.call(['Host: localhost'], "/api/meta?x=#{'a' * 5000}")
   }
   A::Dashboard.stop
-  A::Dashboard.start(port, '0.0.0.0')
-  sleep 0.3
-  result['lan_hosts'] = ['attacker.example', '192.168.1.20:8080'].map { |host| status_for.call(host) }
+  # lan is refused with an explanation, and the server still binds this computer only
+  OUT.clear
+  A::CLI.send(:start_dashboard, port, true)
+  result['lan'] = [OUT.any? { |line| line.include?('lan is no longer supported') }, A::Dashboard.instance_variable_get(:@server).addr[3],
+                   OUT.any? { |line| line.include?("https://analytics.elanthia.online/?live=#{port}") }]
   A::Dashboard.stop
-  result['stopped'] = !A::Dashboard.running?
+  result['stopped'] = [!A::Dashboard.running?, A::Dashboard.instance_variable_get(:@api_conn).nil?]
 
 when 'cli'
   A::Database.connect!
@@ -528,7 +569,6 @@ when 'standalone'
   $sqlite_opened.clear
   $sqlite_hooked.clear
   A::Database.reader do |conn|
-    result['overview'] = A::Dashboard.send(:build_overview)['characters'].size
     result['report_lines'] = A::Report::Text.character_summary(conn).size
   end
   result['opened'] = $sqlite_opened == [A::Database.file]
@@ -919,21 +959,6 @@ when 'cycle_edges'
     'no_gap' => died['start_time'] == ended['end_time'], 'dead' => died['cycle_type']
   }
 
-when 'mind'
-  # Bounty experience can take the mind past its capacity
-  A::Database.connect!
-  session = A::Database.session_for(WHO)
-  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', { exp_field: 1267, exp_max: 1125, exp_total: 1 })
-  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 60, hunt)
-  A::Database.end_cycle(hunt, { exp_field: 1524, exp_max: 1125, exp_total: 2 }, nil)
-  # A minute long and inside today even just after midnight, when a hunt
-  # from midnight to now would be too short to keep
-  start = [A::Util.midnight, NOW - 60].max
-  run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 60 WHERE cycle_id = ?', start, start + 60, hunt)
-  torvek = A::Dashboard.overview['characters'].find { |c| c['id'] == 'GS3:Torvek' }
-  trend = A::Dashboard.character('GS3:Torvek', 'daily')['trends']['mind']['values'].compact
-  result = { 'mind' => torvek['mind'].values_at('start_avg', 'end_avg'), 'trend_capped' => trend.all? { |v| v <= 100 } }
-
 when 'bigshot_status'
   # Bigshot's own status marks a rest, but only while the script is running
   A::Database.connect!
@@ -1244,9 +1269,6 @@ when 'offers'
   rows = A::Database.all('SELECT * FROM bounty_offers ORDER BY offered_at, rowid')
   bounty = A::Database.one('SELECT bounty_id, status FROM bounties')
   text = A::Database.reader { |conn| A::Report::Text.bounty_summary(conn, WHO, 'daily') }.join("\n")
-  hunt = A::Database.start_cycle(WHO, A::Database.session_for(WHO), :hunt, 'bigshot', 'crags', { exp_total: 1 })
-  run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 60 WHERE cycle_id = ?', NOW - 60, NOW, hunt)
-  detail = A::Dashboard.character('GS3:Torvek', 'daily')['offers']
   result = {
     'rows' => rows.map do |row|
       [row['assignment'], row['town'], row['area'], row['bounty_type'], row['creature'], row['count'],
@@ -1257,8 +1279,7 @@ when 'offers'
     'described' => rows.first['description'].start_with?("Hmm, I've got") && !rows.first['description'].end_with?('"'),
     'ended' => rows.all? { |row| row['ended_at'] }, 'kept_on_restart' => kept,
     'report' => [text.include?('Task offers'), text[/Offered\s*\|\s*(\d+)/, 1], text[/Removed\s*\|\s*(\d+)/, 1],
-                 text[/Expedited\s*\|\s*(\d+)/, 1], text.include?('escort to Zul Logoth')],
-    'dashboard' => detail.slice('offered', 'removed', 'expedited', 'vouchers').merge('first' => detail['recent'].first)
+                 text[/Expedited\s*\|\s*(\d+)/, 1], text.include?('escort to Zul Logoth')]
   }
   DownstreamHook.remove('GS4Analytics::BountyManager')
 
@@ -1405,9 +1426,9 @@ when 'session_report'
     'silver_hr' => cells.call('Silver / hour').first, 'hunting' => cells.call('Hunting').first,
     'kept_first_seen' => [login_info['first_seen'] == login + 5, login_info['last_seen'] == NOW - 30],
     'expected_since' => Time.at(login).strftime('%Y-%m-%d %H:%M'),
-    'dashboard' => A::Database.reader { |conn| A::Dashboard.send(:login_figures, conn, WHO, NOW) }&.slice('silver', 'exp', 'deaths', 'since', 'live')
+    'login' => A::Database.reader { |conn| A::Report.login_for(conn, WHO) }&.values_at('started_at', 'live')
   }
-  result['dashboard_since_ok'] = result['dashboard'] && result['dashboard'].delete('since') == login
+  result['login_ok'] = result.delete('login') == [login, true]
 
 when 'reload'
   # Loading the body again must not warn about redefined constants
