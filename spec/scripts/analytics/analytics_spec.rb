@@ -38,6 +38,55 @@ end
 RSpec.describe 'analytics.lic' do
   def result(scenario) = AnalyticsSpec.result(scenario)
 
+  describe 'shop visits' do
+    subject(:shops) { result('shops') }
+
+    it 'opens a visit on entering a room the map tags as a shop, and adds the sales read there' do
+      expect(shops['open']).to eq('vendor' => 'gemshop', 'silver' => 6200, 'town' => "Wehnimer's Landing")
+    end
+
+    it 'records each stop with its time, silver, spending, room and town; passing through is not a stop' do
+      expect(shops['visits']).to eq([['gemshop', 60, 6200, 0, 20, "Wehnimer's Landing"],
+                                     ['locksmith pool', 30, 0, 300, 30, 'Icemule Trace'],
+                                     ['api', 50, 777, nil, nil, nil]])
+    end
+
+    it 'leaves visits to the selling script when track_shops is off' do
+      expect(shops['off']).to be_nil
+    end
+  end
+
+  describe 'progress' do
+    subject(:progress) { result('progress') }
+
+    it 'watches EXPERIENCE output for training points, and stops watching when stopped' do
+      expect(progress.values_at('hook', 'hook_removed')).to eq([true, true])
+    end
+
+    it 'writes a milestone at once, experience alone at most every five minutes, and a heartbeat hourly' do
+      # too soon, after EXP_EVERY, Death's Sting, training points, unchanged, heartbeat
+      expect(progress['checks']).to eq([false, true, true, true, false, true])
+    end
+
+    it 'records what Lich knows without sending a command' do
+      expect(progress['first']).to eq('level' => 100, 'exp' => 900_000, 'ascension_exp' => 100_000, 'until_next' => 1500,
+                                      'fame' => 5000, 'deeds' => 12, 'long_term_exp' => 59, 'deaths_sting' => 'None',
+                                      'ptp' => nil, 'lumnis' => nil)
+      expect(progress['stings']).to eq(%w[None Light])
+      expect(progress['tps']).to eq('ptp' => 36, 'mtp' => 0, 'atp' => 6)
+    end
+
+    it 'writes a row per check that was due, plus the first and the last' do
+      expect(progress['rows']).to eq(6) # first, after EXP_EVERY, sting, training points, heartbeat, last
+    end
+
+    it 'keeps regular and ascension experience apart on cycles' do
+      expect(progress['cycle']).to eq('exp_regular_start' => 900_500, 'exp_regular_end' => 900_500,
+                                      'exp_asc_start' => 100_000, 'exp_asc_end' => 100_000, 'exp_total_start' => 1_000_000)
+      expect(progress['schema']).to eq('8')
+    end
+  end
+
   describe 'loading' do
     it 'can be loaded again without constant warnings' do
       expect(result('reload')['constant_warnings']).to eq([])
@@ -291,7 +340,7 @@ RSpec.describe 'analytics.lic' do
 
     it 'is refused before anything is written into it, saying what to do' do
       expect(guard['writer'].first).to be(true)
-      expect(guard['writer'].last).to include('schema 6', 'this one uses 7', 'Rename or move it')
+      expect(guard['writer'].last).to include('schema 6', 'this one uses 8', 'Rename or move it')
       expect(guard['untouched']).to eq(%w[cycles metadata])
     end
 
@@ -305,7 +354,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'starts a fresh database in an empty file' do
-      expect(guard['empty_file']).to eq('7')
+      expect(guard['empty_file']).to eq('8')
     end
   end
 

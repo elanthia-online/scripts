@@ -248,6 +248,10 @@ module GS4Analytics
       # Read vendor sales and bank balances from the game text
       parse_sales: true,
       parse_bank: true,
+      # Record each stop at a shop, bank or locksmith (from the map's room
+      # tags), with the silver made and spent there. Works with any selling
+      # script, eloot included.
+      track_shops: true,
       # nil turns a feature off
       max_hunt_minutes: nil,
       idle_warn_minutes: 8,
@@ -390,7 +394,9 @@ module GS4Analytics
     # The schema in create_schema. Any change to it bumps this, and a file made
     # with another value is refused (see check_schema), not migrated. Kept in
     # step with KNOWN_SCHEMAS in elanthia-online/analytics.
-    SCHEMA_VERSION    = '7'
+    SCHEMA_VERSION    = '8'
+    PROGRESS_COLUMNS = %i[level exp ascension_exp until_next fame deeds long_term_exp deaths_sting
+                          ptp mtp atp lumnis rpa fashlonae].freeze
     BACKUPS_KEPT = 7 # maintenance backup keeps this many
     # Queued writes that find the database locked by another Lich session are
     # kept and retried, backing off from 2 s up to 30 s, up to this many
@@ -537,6 +543,7 @@ module GS4Analytics
         db[:cycles].insert(clean(cycle_id: id, game: who.game, character: who.name,
                                  cycle_type: type.to_s, start_time: at, profile: profile,
                                  trigger_script: trigger, exp_total_start: vitals[:exp_total],
+                                 exp_regular_start: vitals[:exp_regular], exp_asc_start: vitals[:exp_asc],
                                  exp_field_start: vitals[:exp_field], exp_field_max: vitals[:exp_max],
                                  fame_start: vitals[:fame], encumbrance_start: vitals[:encumbrance]))
         id
@@ -551,6 +558,7 @@ module GS4Analytics
         cycles = db[:cycles].where(cycle_id: cycle_id)
         cycles.update(end_time: now, duration_seconds: Sequel.expr(now) - :start_time,
                       exp_total_end: vitals[:exp_total], exp_field_end: vitals[:exp_field], fame_end: vitals[:fame],
+                      exp_regular_end: vitals[:exp_regular], exp_asc_end: vitals[:exp_asc],
                       encumbrance_end: vitals[:encumbrance],
                       exp_field_max: Sequel.function(:coalesce, vitals[:exp_max], :exp_field_max),
                       rest_reason: Sequel.case({ { cycle_type: 'rest' } => :rest_reason },
@@ -560,6 +568,12 @@ module GS4Analytics
 
         cycles.delete
         nil
+      end
+
+      # One progress row. A second one in the same second replaces the first.
+      def record_progress(who, at, values)
+        row = clean(values.slice(*PROGRESS_COLUMNS).merge(game: who.game, character: who.name, timestamp: at))
+        db[:progress].insert_conflict(:replace).insert(row)
       end
 
       def set_rest_reason(cycle_id, reason)
@@ -581,10 +595,11 @@ module GS4Analytics
         end
       end
 
-      def record_vendor_visit(who, cycle_id, vendor, start_time, end_time, silver)
+      def record_vendor_visit(who, cycle_id, vendor, start_time, end_time, silver, spent: nil, room_id: nil, town: nil)
         db[:vendor_visits].insert(clean(visit_id: new_id, game: who.game, character: who.name, cycle_id: cycle_id,
                                         vendor: vendor.to_s, start_time: start_time.to_i, end_time: end_time.to_i,
-                                        duration_seconds: (end_time - start_time).to_i, silver: silver))
+                                        duration_seconds: (end_time - start_time).to_i, silver: silver,
+                                        spent: spent, room_id: room_id, town: town))
       end
 
       # ----- kills and silver ------------------------------------------------
@@ -950,6 +965,12 @@ module GS4Analytics
           String :rest_reason
           Integer :exp_total_start
           Integer :exp_total_end
+          # The total is regular plus ascension experience; post-cap training
+          # points come from regular experience alone, so both are kept
+          Integer :exp_regular_start
+          Integer :exp_regular_end
+          Integer :exp_asc_start
+          Integer :exp_asc_end
           Integer :exp_field_start
           Integer :exp_field_end
           Integer :exp_field_max
@@ -1086,6 +1107,9 @@ module GS4Analytics
           Integer :end_time, null: false
           Integer :duration_seconds, null: false
           Integer :silver
+          Integer :spent # silver paid out there (locksmith, priestess, ...)
+          Integer :room_id
+          String :town # the map's location for the room
           index %i[game character start_time]
         end
 
@@ -1098,6 +1122,30 @@ module GS4Analytics
           Integer :first_seen
           Integer :last_seen
           primary_key %i[game character started_at]
+        end
+
+        # Where a character stands: written when something changes (level,
+        # training points, Death's Sting, Lumnis...), experience at most every
+        # few minutes, and at least hourly. See ProgressManager.
+        db.create_table?(:progress) do
+          String :game, null: false
+          String :character, null: false
+          Integer :timestamp, null: false
+          Integer :level
+          Integer :exp # regular experience
+          Integer :ascension_exp
+          Integer :until_next # experience to the next level, or past the cap to the next training point
+          Integer :fame
+          Integer :deeds
+          Integer :long_term_exp
+          String :deaths_sting # 'None', 'Light', ... as EXPERIENCE says it
+          Integer :ptp # unspent training points, from EXPERIENCE
+          Integer :mtp
+          Integer :atp
+          Integer :lumnis # only while the Gift of Lumnis is active
+          Float :rpa
+          Integer :fashlonae
+          primary_key %i[game character timestamp]
         end
 
         db.create_table?(:metadata) do
@@ -1121,12 +1169,198 @@ module GS4Analytics
       exp = defined?(Experience) ? Experience : Util.safely { Lich::Gemstone::Experience }
       {
         exp_total: Util.safely(0) { exp.txp },
+        exp_regular: Util.safely { exp.exp },
+        exp_asc: Util.safely { exp.axp },
         exp_field: Util.safely(0) { exp.fxp_current },
         # nil when Lich can't say, so a stored capacity is never overwritten by 0
         exp_max: Util.safely { exp.fxp_max.to_i.then { |max| max.positive? ? max : nil } },
         fame: Util.safely(0) { exp.fame },
         encumbrance: Util.safely(0.0) { Char.percent_encumbrance }
       }
+    end
+  end
+
+  # ==========================================================================
+  # ProgressManager: where the character stands (level, experience,
+  # ascension, training points, Death's Sting, Lumnis), recorded when it
+  # changes. Everything comes from Lich's game state and from EXPERIENCE
+  # output that passes anyway: it never sends a command.
+  # ==========================================================================
+  module ProgressManager
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    HOOK = 'GS4Analytics::ProgressManager'
+    TAGS = /<[^>]+>/
+    # EXPERIENCE: "      PTPs/MTPs: 36/0                        ATPs: 6"
+    TP_RE = %r{PTPs/MTPs:\s*([\d,]+)\s*/\s*([\d,]+)(?:\s+ATPs:\s*([\d,]+))?}
+    CHECK_EVERY = 60 # seconds between reads of the game state
+    EXP_EVERY = 300  # experience moves every pulse: written at most this often
+    HEARTBEAT = 3600 # a row at least this often, changed or not
+    # A change to any of these is written at once
+    MILESTONES = %i[level deaths_sting ptp mtp atp lumnis rpa fashlonae deeds].freeze
+    GAINS = %i[exp ascension_exp fame long_term_exp].freeze
+
+    class << self
+      def start(who)
+        @who = who
+        @last = nil
+        @written_at = nil
+        @tp = {}
+        DownstreamHook.remove(HOOK)
+        DownstreamHook.add(HOOK, proc { |line| on_line(line) })
+        @thread = Thread.new do
+          loop do
+            begin
+              check
+            rescue StandardError => e
+              Log.error('progress', e)
+            end
+            sleep CHECK_EVERY
+          end
+        end
+      end
+
+      def stop(now: Time.now.to_i)
+        DownstreamHook.remove(HOOK)
+        @thread&.kill
+        @thread = nil
+        check(now: now, final: true) if @who
+        @who = nil
+      end
+
+      # Reads the game state and queues a row when it is due. Returns true when one was queued.
+      def check(now: Time.now.to_i, final: false)
+        return false unless @who
+
+        values = read
+        return false if values[:exp].nil? && values[:level].nil? # nothing from the game yet
+
+        return false unless final || due?(values, now)
+
+        @last = values
+        @written_at = now
+        who = @who
+        Database.async { Database.record_progress(who, now, values) }
+        true
+      end
+
+      def read
+        exp = defined?(Experience) ? Experience : Util.safely { Lich::Gemstone::Experience }
+        positive = ->(value) { value.to_i.positive? ? value.to_i : nil }
+        {
+          level: positive.call(Util.safely { XMLData.level }),
+          exp: positive.call(Util.safely { exp.exp }),
+          ascension_exp: Util.safely { exp.axp }&.to_i,
+          until_next: Util.safely { exp.until_next }&.to_i,
+          fame: Util.safely { exp.fame }&.to_i,
+          deeds: Util.safely { exp.deeds }&.to_i,
+          long_term_exp: Util.safely { exp.lte }&.to_i,
+          deaths_sting: Util.safely { exp.deaths_sting }&.to_s,
+          lumnis: Util.safely { XMLData.lumnis }&.to_i,
+          rpa: Util.safely { XMLData.rpa }&.to_f,
+          fashlonae: Util.safely { XMLData.fashlonae }&.to_i
+        }.merge(@tp)
+      end
+
+      private
+
+      def due?(values, now)
+        return true if @last.nil? || now - @written_at >= HEARTBEAT
+        return true if MILESTONES.any? { |key| values[key] != @last[key] }
+
+        GAINS.any? { |key| values[key] != @last[key] } && now - @written_at >= EXP_EVERY
+      end
+
+      # Runs on the game-text thread: only remembers what it read
+      def on_line(line)
+        if line.include?('PTPs/MTPs') && (found = line.gsub(TAGS, '').match(TP_RE))
+          @tp = { ptp: found[1].delete(',').to_i, mtp: found[2].delete(',').to_i, atp: found[3]&.delete(',')&.to_i }.compact
+        end
+        line
+      rescue StandardError => e
+        Log.error('progress hook', e)
+        line
+      end
+    end
+  end
+
+  # ==========================================================================
+  # ShopWatcher: each stop at a shop, bank or locksmith. A room is a shop when
+  # Lich's map tags it so (the tags go2 and eloot travel by); the visit runs
+  # from arriving to leaving, with the sales and spending read meanwhile.
+  # ==========================================================================
+  module ShopWatcher
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    # Most specific first: a locksmith pool room is often tagged locksmith too
+    SHOP_TAGS = ['gemshop', 'pawnshop', 'furrier', 'alchemist', 'consignment', 'herbalist', 'general store',
+                 'locksmith pool', 'locksmith', 'bank', 'chronomage', 'debt'].freeze
+    MIN_SECONDS = 5 # walking through without doing anything is not a visit
+
+    class << self
+      def start(who)
+        @lock = Mutex.new
+        @who = who
+        @room = nil
+        @visit = nil
+      end
+
+      def stop(now: Time.now.to_i)
+        return unless @who
+
+        finish(now)
+        @who = nil
+      end
+
+      # From the cycle watcher's poll: has the character moved?
+      def tick(now = Time.now.to_i)
+        return unless @who && Settings.current[:track_shops]
+
+        id = Util.safely { XMLData.room_id }
+        return if id == @room
+
+        @room = id
+        finish(now)
+        shop = shop_here if id
+        @lock.synchronize { @visit = shop.merge(start: now, silver: 0, spent: 0, cycle_id: CycleManager.current_cycle_id) } if shop
+      end
+
+      # From the game-text thread: silver taken in or paid out in the shop
+      def note(silver: 0, spent: 0)
+        @lock&.synchronize do
+          next unless @visit
+
+          @visit[:silver] += silver.to_i
+          @visit[:spent] += spent.to_i
+        end
+      end
+
+      def current = @lock&.synchronize { @visit&.dup }
+
+      private
+
+      def shop_here
+        room = Util.safely { Room.current }
+        return unless room
+
+        tags = Array(Util.safely { room.tags })
+        tag = SHOP_TAGS.find { |name| tags.include?(name) }
+        return unless tag
+
+        { vendor: tag, room_id: Util.safely { room.id }, town: Util.safely { room.location }&.to_s }
+      end
+
+      def finish(now)
+        visit = @lock.synchronize { @visit.tap { @visit = nil } }
+        return unless visit
+        return if now - visit[:start] < MIN_SECONDS && visit[:silver].zero? && visit[:spent].zero?
+
+        who = @who
+        Database.async do
+          Database.record_vendor_visit(who, visit[:cycle_id], visit[:vendor], visit[:start], now, visit[:silver],
+                                       spent: visit[:spent], room_id: visit[:room_id], town: visit[:town])
+        end
+      end
     end
   end
 
@@ -1269,9 +1503,10 @@ module GS4Analytics
         Log.debug("Recorded #{vendor_type} sale: #{Util.fmt(amount)} silver")
       end
 
-      # Call from your selling script after each vendor section
+      # Call from your selling script after each vendor section. With
+      # track_shops on (the default) visits are recorded already.
       def record_vendor_visit(vendor, start_time, end_time, silver)
-        return unless @who
+        return unless @who && !Settings.current[:track_shops]
 
         who = @who
         cycle_id = @cycle_id
@@ -1383,6 +1618,7 @@ module GS4Analytics
           Database.record_silver(who, cycle_id, 'expense', amount, vendor_type: kind,
                                                                                                vendor_name: name, at: at)
         end
+        ShopWatcher.note(spent: amount)
         Log.debug("Spent #{Util.fmt(amount)} (#{kind})")
       end
 
@@ -1396,6 +1632,7 @@ module GS4Analytics
           Database.record_silver(who, cycle_id, 'sale', amount, vendor_type: vendor_type, vendor_name: vendor_name)
           Database.record_item_sale(who, item, noun, amount, vendor_type, vendor_name)
         end
+        ShopWatcher.note(silver: amount)
         Log.debug("Sale: #{item} for #{Util.fmt(amount)} (#{vendor_type})")
       end
 
@@ -2009,6 +2246,7 @@ module GS4Analytics
       def tick
         touch_login
         roll_over_midnight
+        ShopWatcher.tick
         signals = read_signals
         track_rest_step if @current_state == :rest
         check_hunt_timeout
@@ -2570,6 +2808,8 @@ module GS4Analytics
         @who = who
         SilverManager.start(who)
         SilverManager.take_baseline
+        ProgressManager.start(who)
+        ShopWatcher.start(who)
         CycleManager.start(who, cfg)
         BountyManager.start(who, cfg)
         AlertManager.start(who, cfg)
@@ -2588,6 +2828,8 @@ module GS4Analytics
         AlertManager.stop
         BountyManager.stop
         CycleManager.stop
+        ProgressManager.stop
+        ShopWatcher.stop
         SilverManager.stop
         touch_login
         Database.close

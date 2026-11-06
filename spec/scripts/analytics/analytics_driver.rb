@@ -42,6 +42,11 @@ module XMLData
   def self.game = 'GS3'
   def self.name = 'Splinter'
   def self.room_id = $room_id || 0
+  # What the mindState progress bar carries (ProgressManager)
+  def self.level = $level || 100
+  def self.lumnis = $lumnis
+  def self.rpa = nil
+  def self.fashlonae = nil
 end
 
 class Script
@@ -75,6 +80,12 @@ end
 
 module Experience
   def self.txp = 1_000_000
+  def self.exp = $exp || 900_000
+  def self.axp = 100_000
+  def self.until_next = 1500
+  def self.deeds = 12
+  def self.lte = 59
+  def self.deaths_sting = $sting || 'None'
   def self.fxp_current = 400
   def self.fxp_max = 800
   def self.fame = 5000
@@ -364,6 +375,8 @@ when 'collector'
   DownstreamHook.run("It didn't carry any silver.")
   DownstreamHook.run('They locate a pile of 500 coins, reclaiming them')
   DownstreamHook.run('You gather the remaining 250 coins from inside your box')
+  # A selling script reporting its own visits (only heard with track_shops off)
+  A::Settings.instance_variable_set(:@current, cfg.merge(track_shops: false))
   A::SilverManager.record_vendor_visit('gemshop', NOW - 100, NOW - 50, 12_345)
   A::Database.record_item_sale(WHO, 'a black opal', 'opal', 5000, 'gemshop', 'Bob', 2)
   A::SilverManager.stop # records the kill still being read
@@ -1437,6 +1450,81 @@ when 'writer_safety'
   late = file[:metadata].where(key: 'late').get(:value)
   file.disconnect
   result['writer_gone'] = queued + [ran_on && ran_on != hook, late]
+
+when 'progress'
+  A::Database.connect!
+  P = A::ProgressManager
+  P.start(WHO)
+  sleep 0.3 # the first read, from the thread
+  hook = DownstreamHook.names.include?('GS4Analytics::ProgressManager')
+  t = Time.now.to_i
+  $exp = 900_500
+  soon = P.check(now: t + 30)          # experience alone, too soon
+  later = P.check(now: t + 400)        # experience alone, after EXP_EVERY
+  $sting = 'Light'
+  sting = P.check(now: t + 410)        # a milestone: at once
+  DownstreamHook.run('<output class="mono"/>       PTPs/MTPs: 36/0                        ATPs: 6')
+  tps = P.check(now: t + 420)
+  same = P.check(now: t + 500)         # nothing changed
+  beat = P.check(now: t + 4100)        # the hourly heartbeat
+  vitals = A::Vitals.read
+  id = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'crags', vitals, at: NOW - 600)
+  A::Database.end_cycle(id, vitals, nil, at: NOW - 60)
+  P.stop(now: t + 5000)                # and a last row
+  A::Database.flush
+  rows = A::Database.all('SELECT * FROM progress ORDER BY timestamp')
+  cycle = A::Database.one('SELECT exp_regular_start, exp_regular_end, exp_asc_start, exp_asc_end, exp_total_start FROM cycles')
+  result = {
+    'hook' => hook, 'hook_removed' => !DownstreamHook.names.include?('GS4Analytics::ProgressManager'),
+    'checks' => [soon, later, sting, tps, same, beat], 'rows' => rows.size,
+    'first' => rows.first&.slice('level', 'exp', 'ascension_exp', 'until_next', 'fame', 'deeds', 'long_term_exp', 'deaths_sting', 'ptp', 'lumnis'),
+    'stings' => rows.map { |r| r['deaths_sting'] }.uniq,
+    'tps' => rows.find { |r| r['ptp'] }&.slice('ptp', 'mtp', 'atp'),
+    'cycle' => cycle, 'schema' => A::Database.metadata('schema_version')
+  }
+
+when 'shops'
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  shop_room = Struct.new(:id, :tags, :location, :title)
+  ROOMS = {
+    10 => shop_room.new(10, ['town square'], "Wehnimer's Landing", '[Town Square]'),
+    20 => shop_room.new(20, ['gemshop', 'urchin guide gemshop'], "Wehnimer's Landing", '[Gems]'),
+    30 => shop_room.new(30, ['locksmith', 'locksmith pool'], 'Icemule Trace', '[Pool]')
+  }.freeze
+  Object.const_set(:Room, Class.new { def self.current = ROOMS[$room_id] }) unless defined?(Room)
+  W = A::ShopWatcher
+  A::SilverManager.start(WHO)
+  W.start(WHO)
+  t = NOW - 1000
+  $room_id = 10
+  W.tick(t)
+  $room_id = 20
+  W.tick(t + 10)                       # into the gem shop
+  DownstreamHook.run('The jeweler takes your black opal, glances at it, and hands you 5,000 silvers.')
+  W.note(silver: 1200)
+  open_visit = W.current&.slice(:vendor, :silver, :town)
+  $room_id = 10
+  W.tick(t + 70)                       # out: a 60 second visit
+  $room_id = 20
+  W.tick(t + 80)
+  $room_id = 10
+  W.tick(t + 82)                       # straight through: not a visit
+  $room_id = 30
+  W.tick(t + 100)                      # the locksmith pool, tagged locksmith too
+  W.note(spent: 300)
+  A::SilverManager.record_vendor_visit('api', t + 110, t + 120, 777) # ignored: tracked already
+  W.stop(now: t + 130)
+  A::Settings.instance_variable_set(:@current, cfg.merge(track_shops: false))
+  A::SilverManager.record_vendor_visit('api', t + 200, t + 250, 777)
+  $room_id = 20
+  W.start(WHO)
+  W.tick(t + 300) # with track_shops off, nothing is opened
+  off = W.current
+  A::SilverManager.stop
+  A::Database.flush
+  visits = A::Database.all('SELECT vendor, duration_seconds, silver, spent, room_id, town FROM vendor_visits ORDER BY start_time')
+  result = { 'open' => open_visit && open_visit.transform_keys(&:to_s), 'visits' => visits.map(&:values), 'off' => off }
 
 when 'reload'
   # Loading the body again must not warn about redefined constants
