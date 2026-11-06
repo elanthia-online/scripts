@@ -2,6 +2,7 @@
 
 require_relative '../spec_helper'
 require 'securerandom'
+require 'stringio'
 
 # Spec for ecleanse.lic's disarm tracking (UserVars.last_disarm) and the
 # RECOVER ITEM search loop. ecleanse.lic can't be required standalone, so the
@@ -19,7 +20,7 @@ module EcleanseSpec
 
   ACTION_SRC = ACTION_METHODS.map { |name| extract_lic_method(SOURCE, name, source_path: SOURCE_PATH) }.join("\n")
   SET_HOOKS_SRC = extract_lic_method(SOURCE, 'set_hooks', source_path: SOURCE_PATH)
-  DISARM_CONSTANTS_SRC = extract_from_source(SOURCE, /DISARM_MAX \|\|= \d+\n.*?DISARM_LOCK \|\|= Mutex\.new/m, label: 'DISARM constants', source_path: SOURCE_PATH)
+  DISARM_CONSTANTS_SRC = extract_from_source(SOURCE, /DISARM_MAX = \d+\n.*?DISARM_LOCK \|\|= Mutex\.new/m, label: 'DISARM constants', source_path: SOURCE_PATH)
 
   Hand = Struct.new(:id, :noun, :name)
   EMPTY_HAND = Hand.new(nil, nil, 'Empty')
@@ -142,6 +143,55 @@ module EcleanseSpec
         end
       end
     RUBY
+  end
+end
+
+RSpec.describe 'ecleanse run more than once in a session' do
+  # Each extracted piece is the real source, evaluated twice into one module the
+  # way a second ;ecleanse re-evaluates the file.
+  def run_twice(source, edited_source = source)
+    target = Module.new
+    warnings = StringIO.new
+    original = [$stderr, $VERBOSE]
+    $stderr = warnings
+    $VERBOSE = true
+    target.module_eval(source)
+    target.module_eval(edited_source)
+    [target, warnings.string]
+  ensure
+    $stderr, $VERBOSE = original
+  end
+
+  let(:source) { EcleanseSpec::SOURCE }
+  let(:action_guard) { source[/^    %i\[DISARM_MAX\]\.each.*$/] }
+  let(:action_constants) { "#{action_guard}\n#{EcleanseSpec::DISARM_CONSTANTS_SRC}" }
+  let(:capped_collection) { extract_lic_module(source, 'CappedCollection', kind: 'class') }
+
+  it 'does not warn about CappedCollection constants' do
+    _target, warnings = run_twice(capped_collection)
+
+    expect(warnings).not_to include('already initialized')
+  end
+
+  it 'does not warn about Action constants' do
+    _target, warnings = run_twice(action_constants)
+
+    expect(warnings).not_to include('already initialized')
+  end
+
+  it 'picks up a changed limit rather than keeping the first run\'s value' do
+    target, = run_twice(action_constants, action_constants.sub('DISARM_MAX = 30', 'DISARM_MAX = 50'))
+
+    expect(target.const_get(:DISARM_MAX)).to eq(50)
+  end
+
+  it 'keeps the same lock' do
+    target = Module.new
+    target.module_eval(action_constants)
+    lock = target.const_get(:DISARM_LOCK)
+    target.module_eval(action_constants)
+
+    expect(target.const_get(:DISARM_LOCK)).to equal(lock)
   end
 end
 
