@@ -436,6 +436,13 @@ module GS4Analytics
         FileUtils.mkdir_p(File.dirname(path))
         conn = open_database(path)
         check_schema(conn, path) # a refused file must not become the writer
+        # In WAL mode, NORMAL syncs at checkpoints instead of on every commit:
+        # one write per kill stops costing a disk flush each, and a commit
+        # still survives the script or Lich crashing (only a power loss can
+        # undo the last ones). Sequel applies it to every connection it opens
+        # from here on, so the one the check used is dropped first.
+        conn.opts[:synchronous] = :normal
+        conn.disconnect
         @db = conn
         @db.run('PRAGMA journal_mode=WAL')
         create_schema
@@ -487,9 +494,11 @@ module GS4Analytics
         # its own transaction, so a busy retry repeats both
         return job.call if Thread.current == @writer
 
-        if @writer&.alive? || backlog?
+        if @queue
+          # Always queued, never run here: the caller may be the game-text
+          # thread, and a write can wait seconds for another session's lock.
           # With the writer gone (;kill stops it before cleanup runs), jobs
-          # still queue behind the ones it left, and #close writes them in order
+          # wait behind the ones it left, and #close writes them in order.
           @queue << job
         else
           db.transaction { job.call }
@@ -822,6 +831,10 @@ module GS4Analytics
 
             @pending << job if job
             drain_writes
+          rescue StandardError => e
+            # The writer only stops when told to, so writes keep their order
+            Log.error('analytics writer', e)
+            sleep 1
           end
         end
       end
@@ -979,6 +992,7 @@ module GS4Analytics
           String :status, default: 'active'
           index %i[game character status]
           index %i[game character completed_time]
+          index %i[game character received_time] # report bounty and the site's recent bounties
         end
 
         # Every task the taskmaster hands out, kept or not: what it was, whether

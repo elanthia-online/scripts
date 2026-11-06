@@ -40,7 +40,7 @@ def pause(*) = nil
 
 module XMLData
   def self.game = 'GS3'
-  def self.name = 'Torvek'
+  def self.name = 'Splinter'
   def self.room_id = $room_id || 0
 end
 
@@ -165,7 +165,7 @@ def lines(result) = result.join("\n")
 
 # One completed hunt cycle (and, with +rest+, the rest after it) starting at +start+
 def seed_cycles(who, start, rest: true, hunt_secs: 2700)
-  hunt = A::Database.start_cycle(who, :hunt, 'bigshot', 'torvek_crags',
+  hunt = A::Database.start_cycle(who, :hunt, 'bigshot', 'splinter_crags',
                                  { exp_total: 1_000_000, exp_field: 100, exp_max: 800, fame: 10, encumbrance: 20.0 })
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', start, hunt)
   A::Database.end_cycle(hunt, { exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0 },
@@ -173,7 +173,7 @@ def seed_cycles(who, start, rest: true, hunt_secs: 2700)
   run_sql('UPDATE cycles SET end_time = ?, duration_seconds = ? WHERE cycle_id = ?', start + hunt_secs, hunt_secs, hunt)
   return unless rest
 
-  rest_id = A::Database.start_cycle(who, :rest, 'my_rest', 'torvek_crags',
+  rest_id = A::Database.start_cycle(who, :rest, 'my_rest', 'splinter_crags',
                                     { exp_total: 1_100_000, exp_field: 700, exp_max: 800, fame: 20, encumbrance: 40.0 })
   run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 400, ' \
           'exp_total_end = 1100000, rest_reason = ? WHERE cycle_id = ?', start + hunt_secs, start + hunt_secs + 400, 'Too many items', rest_id)
@@ -182,7 +182,7 @@ end
 
 # Three characters over the last few days: two games, one shared name
 def seed_history
-  [WHO, A::Who.new('GS3', 'Ashur'), A::Who.new('GSF', 'Torvek')].each do |who|
+  [WHO, A::Who.new('GS3', 'April'), A::Who.new('GSF', 'Splinter')].each do |who|
     midnight = A::Util.midnight(Date.today)
     # A hunt (and rest, when there is room) earlier today, whatever the time of day, so it shows on the dashboard
     recent = [A::Util.midnight(Date.today), NOW - 5000].max
@@ -192,7 +192,7 @@ def seed_history
       seed_cycles(who, midnight - (ago * 86_400) + (8 * 3600))
       run_sql('INSERT INTO kill_stats (game, character, date, profile, creature, kill_count, total_silver, last_kill_at) ' \
               'VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING',
-              *who, (Date.today - ago).to_s, 'torvek_crags', 'kobold', 100, 5000, NOW - 100)
+              *who, (Date.today - ago).to_s, 'splinter_crags', 'kobold', 100, 5000, NOW - 100)
     end
   end
 end
@@ -226,8 +226,8 @@ when 'util'
     'median'        => [A::Util.median([3, 1, 2]), A::Util.median([1, 2, 3, 4]), A::Util.median([])],
     'percent'       => [A::Util.percent(1, 4), A::Util.percent(1, 0)],
     'binary_string' => A::Util.norm('abc'.b).encoding.to_s,
-    'who'           => [WHO.to_s, WHO.to_a, A::Who.parse('GS3:Torvek') == WHO, { WHO => 1 }[A::Who.parse('GS3:Torvek')],
-                        A::Who.new('GSF', 'Torvek') == WHO],
+    'who'           => [WHO.to_s, WHO.to_a, A::Who.parse('GS3:Splinter') == WHO, { WHO => 1 }[A::Who.parse('GS3:Splinter')],
+                        A::Who.new('GSF', 'Splinter') == WHO],
     'version'       => [A::VERSION, source[/^\s+version: (\S+)$/, 1]]
   }
 
@@ -250,17 +250,17 @@ when 'settings'
 
 when 'database'
   A::Database.connect!
-  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'torvek_crags', { exp_total: 100, exp_field: 10 })
+  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', { exp_total: 100, exp_field: 10 })
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, hunt)
   ended = A::Database.end_cycle(hunt, { exp_total: 5100, exp_field: 700, exp_max: 800, fame: 11, encumbrance: 35.0 }, 'Too many items')
   saved = A::Database.one('SELECT * FROM cycles WHERE cycle_id = ?', hunt)
-  rest = A::Database.start_cycle(WHO, :rest, 'my_rest', 'torvek_crags', { exp_total: 5100 })
+  rest = A::Database.start_cycle(WHO, :rest, 'my_rest', 'splinter_crags', { exp_total: 5100 })
   run_sql('UPDATE cycles SET start_time = ?, rest_reason = ? WHERE cycle_id = ?', NOW - 300, 'Too many items', rest)
   A::Database.end_cycle(rest, {}, 'something else')
   A::Database.record_rest_steps(WHO, rest, NOW - 300, { 'travel' => 120.0, 'selling' => 80.5, 'waiting' => 0 })
   short = A::Database.start_cycle(WHO, :hunt, 'bigshot', nil, {})
-  A::Database.record_kill(WHO, 'kobold', 'torvek_crags', 100)
-  A::Database.record_kill(WHO, 'kobold', 'torvek_crags', 50)
+  A::Database.record_kill(WHO, 'kobold', 'splinter_crags', 100)
+  A::Database.record_kill(WHO, 'kobold', 'splinter_crags', 50)
   result = {
     'game_column' => saved['game'], 'character_column' => saved['character'],
     'duration_ok' => ended['duration_seconds'].between?(599, 602),
@@ -398,7 +398,7 @@ when 'reports'
       'lengths'            => texts.transform_values(&:size),
       'ascii'              => texts.values.all? { |text| text.join.ascii_only? },
       'widest'             => texts.values.flatten.map(&:length).max,
-      'names_in_character' => texts['character'].join.scan(/Torvek|Ashur/).uniq.sort,
+      'names_in_character' => texts['character'].join.scan(/Splinter|April/).uniq.sort,
       'range_lines'        => ranges,
       'bad_range'          => A::Report::Text.exp_summary(conn, 'bogus').first,
       # One 30-minute hunt and the 10-minute rest after it, both carrying the reason
@@ -548,7 +548,7 @@ when 'cli'
   result = {
     'report' => report.include?('Summary'), 'status' => status.include?('Database:'),
     'stats' => stats.include?('cycles:'), 'help' => help.include?('Usage'),
-    'help_paths' => [help.include?("Settings: #{File.join(DATA_DIR, 'GS3', 'Torvek', 'analytics.yaml')}"),
+    'help_paths' => [help.include?("Settings: #{File.join(DATA_DIR, 'GS3', 'Splinter', 'analytics.yaml')}"),
                      help.include?("Database: #{File.join(DATA_DIR, 'analytics.db')}"), help.include?('<Lich data>')],
     'caught' => caught, 'dashboard' => dashboard, 'passed' => passed,
     'queued' => cli.instance_variable_get(:@commands).size
@@ -697,7 +697,7 @@ when 'locked_cycle'
   cfg = A::Settings.load(WHO)
   manager = A::CycleManager
   A::Database.flush
-  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'torvek_crags', { exp_total: 100 })
+  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', { exp_total: 100 })
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 1800, hunt)
   { :@who => WHO, :@cfg => cfg, :@current_state => :hunt, :@current_cycle_id => hunt,
     :@rest_steps => Hash.new(0.0), :@last_bigshot_status => :resting }.each { |name, value| manager.instance_variable_set(name, value) }
@@ -774,7 +774,7 @@ when 'baseline'
   first = [manager.take_baseline_now, count.call]
   again = [manager.take_baseline_now, count.call]
   DownstreamHook.run('You deposit 1,000 silvers into your account.  The teller carefully records the transaction and says, ' \
-                     '"Thank you, Torvek.  This brings your total to 1,501,000 silvers.  Have a nice day!"')
+                     '"Thank you, Splinter.  This brings your total to 1,501,000 silvers.  Have a nice day!"')
   sleep 0.4
   A::Database.flush
   result = {
@@ -805,19 +805,19 @@ when 'notes'
     "#{kahlyr} removes the gems and hands you a <a exist=\"1698202\" noun=\"note\">Vornavis promissory note</a> for 23,136 silvers.",
     # Someone else's pouch sale, then the 2026-11-05 lines the earlier patterns missed
     "#{kahlyr} takes the <a exist=\"1108968\" noun=\"pouch\">leather gem pouch</a>, inspects the contents carefully, and removes " \
-    'the gems she is interested in.  She hands it back to Ashur and says, "I don\'t have that much spare silver, so I will have ' \
+    'the gems she is interested in.  She hands it back to April and says, "I don\'t have that much spare silver, so I will have ' \
     'to give you a <a exist="1200063" noun="note">Vornavis promissory note</a> for it."',
-    "#{kahlyr} removes the gems and hands Ashur a <a exist=\"1698203\" noun=\"note\">Vornavis promissory note</a>.",
+    "#{kahlyr} removes the gems and hands April a <a exist=\"1698203\" noun=\"note\">Vornavis promissory note</a>.",
     'You ask Ragnoz if he would like to buy the contents of an embroidered sage green silk cloak.',
     'Ragnoz takes the <a exist="20716945" noun="cloak">sage green silk cloak</a>, inspects the contents carefully and removes ' \
     'the item he is interested in.  Ragnoz hands it back to you, along with 819 silver.',
     "<inv id='stow'> a <a exist=\"2\" noun=\"wand\">wand</a></inv>You offer to sell your " \
     '<a exist="20748012" noun="shield">veil iron shield</a> to Walsor Gryhm.',
     '<pushBold/><a exist="10421" noun="Walsor Gryhm">Walsor Gryhm</a><popBold/> says, "I\'m afraid I don\'t have that much silver ' \
-    'on hand, <a exist="-1" noun="Torvek">Torvek</a>, so I\'ll have to give you a <a exist="3" noun="note">Vornavis promissory note</a> for it."',
+    'on hand, <a exist="-1" noun="Splinter">Splinter</a>, so I\'ll have to give you a <a exist="3" noun="note">Vornavis promissory note</a> for it."',
     'He scribbles out a <a exist="3" noun="note">Vornavis promissory note</a> for 23,760 silvers and hands it to you.',
     'You offer to sell your <a exist="1039576912" noun="grimoire">black leather grimoire</a> to the pawnbroker.',
-    'The pawnbroker says, "I\'m afraid I don\'t have that much silver on hand, Torvek, so I\'ll have to give you a ' \
+    'The pawnbroker says, "I\'m afraid I don\'t have that much silver on hand, Splinter, so I\'ll have to give you a ' \
     '<a exist="4" noun="note">Vornavis promissory note</a> for it."',
     'He scribbles out a <a exist="4" noun="note">Vornavis promissory note</a> for 21,905 silvers and hands it to you.'
   )
@@ -826,7 +826,7 @@ when 'notes'
   vendors = A::Database.all('SELECT vendor_type, vendor_name, amount FROM silver_events ORDER BY rowid').map(&:values)
 
   total = -> { A::Database.latest_balances(WHO)['__total__'] }
-  deposit = ->(amount, balance) { "You deposit #{amount} silvers into your account.  The teller carefully records the transaction and says, \"Thank you, Torvek.  This brings your total to #{balance} silvers.  Have a nice day!\"" }
+  deposit = ->(amount, balance) { "You deposit #{amount} silvers into your account.  The teller carefully records the transaction and says, \"Thank you, Splinter.  This brings your total to #{balance} silvers.  Have a nice day!\"" }
   feed.call('You currently have the following amounts on deposit:', '      Bank A: 1,000,000', '      Bank B: 500,000',
             '      Total: 1,500,000')
   settle.call
@@ -841,7 +841,7 @@ when 'notes'
   $room_id = 200 # the herbalist spends 90 of the 99
   $room_id = 100
   feed.call('You deposit your <a exist="1" noun="note">note</a> worth 9 into your account.  The teller carefully records the ' \
-            'transaction and says, "Thank you, <a exist="-1" noun="Torvek">Torvek</a>.  This brings your total to 1,015,660 silvers.  Have a nice day!"')
+            'transaction and says, "Thank you, <a exist="-1" noun="Splinter">Splinter</a>.  This brings your total to 1,015,660 silvers.  Have a nice day!"')
   settle.call
   steps << total.call
   feed.call('<inv id="stow"> a <a exist="2" noun="wand">wand</a></inv>You hand over your notes to the teller, who nods, carefully ' \
@@ -876,12 +876,12 @@ when 'teller_listing'
   listing.call('1,000,000', '1,500,000')
   $room_id = 100
   feed.call('You deposit 15,750 silvers into your account.  The teller carefully records the transaction and says, ' \
-            '"Thank you, Torvek.  This brings your total to 1,015,750 silvers.  Have a nice day!"')
+            '"Thank you, Splinter.  This brings your total to 1,015,750 silvers.  Have a nice day!"')
   settle.call
   # a 99,000 note withdrawn (its line names no amount), then a listing
   listing.call('916,750', '1,416,750')
   feed.call('You deposit your <a exist="1" noun="note">note</a> worth 9,000 into your account.  The teller carefully records ' \
-            'the transaction and says, "Thank you, Torvek.  This brings your total to 925,750 silvers.  Have a nice day!"')
+            'the transaction and says, "Thank you, Splinter.  This brings your total to 925,750 silvers.  Have a nice day!"')
   settle.call
   after_note = total.call
   listing.call('925,750', '1,425,750')
@@ -890,13 +890,13 @@ when 'teller_listing'
 
   # The same through take_snapshot (the first-run listing and the public hook)
   feed.call('You deposit 1,000 silvers into your account.  The teller carefully records the transaction and says, ' \
-            '"Thank you, Torvek.  This brings your total to 926,750 silvers.  Have a nice day!"')
+            '"Thank you, Splinter.  This brings your total to 926,750 silvers.  Have a nice day!"')
   settle.call
   $bank_lines = ['You currently have the following amounts on deposit:', '      Bank A: 827,750', '      Bank B: 500,000',
                  '      Total: 1,327,750']
   A::SilverManager.take_snapshot
   feed.call('You deposit your <a exist="1" noun="note">note</a> worth 9,000 into your account.  The teller carefully records ' \
-            'the transaction and says, "Thank you, Torvek.  This brings your total to 836,750 silvers.  Have a nice day!"')
+            'the transaction and says, "Thank you, Splinter.  This brings your total to 836,750 silvers.  Have a nice day!"')
   settle.call
   result['after_snapshot'] = total.call
   A::SilverManager.stop
@@ -914,7 +914,7 @@ when 'cycle_edges'
   manager.instance_variable_set(:@running, false)
   manager.instance_variable_get(:@thread).join(2)
 
-  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'torvek_crags', {})
+  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', {})
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, hunt)
   { :@current_state => :hunt, :@current_cycle_id => hunt, :@cycle_started_at => NOW - 600, :@last_bigshot_status => :resting,
     :@rest_steps => Hash.new(0.0) }.each { |name, value| manager.instance_variable_set(name, value) }
@@ -972,7 +972,7 @@ when 'interrupted_hunt'
     set.call(:@rest_steps, Hash.new(0.0))
     set.call(:@last_step_at, nil)
     set.call(:@last_bigshot_status, nil)
-    set.call(:@current_cycle_id, A::Database.start_cycle(WHO, cycle_type, 'bigshot', 'torvek_crags', {}))
+    set.call(:@current_cycle_id, A::Database.start_cycle(WHO, cycle_type, 'bigshot', 'splinter_crags', {}))
     run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 600, manager.current_cycle_id)
   end
   signals = lambda do |running|
@@ -1177,7 +1177,7 @@ when 'offers'
   # BOUNTY typed before the guard repeats the taskmaster's words (twice here),
   # and the bounty window can repeat them too: still one offer.
   feed.call(told.call(creature))
-  listing = ['<a exist="-1" noun="Torvek">Torvek</a>, your Adventurer\'s Guild information is as follows:',
+  listing = ['<a exist="-1" noun="Splinter">Splinter</a>, your Adventurer\'s Guild information is as follows:',
              'You currently have 1,633,594 unspent bounty points.', 'You have 8133 expedited task reassignment vouchers remaining.',
              "The taskmaster told you:  \"#{creature}\"", '<prompt time="1">&gt;</prompt>']
   feed.call(*listing, *listing, told.call(creature))
@@ -1188,12 +1188,12 @@ when 'offers'
   feed.call('[You have earned 889 bounty points, 1000 experience points, and 8890 silver.]')
   # Sent back before the guard was asked; another player's removal is not ours
   $task = nil
-  feed.call(told.call(bandit), removed.call('Ashur'), removed.call('Torvek'))
+  feed.call(told.call(bandit), removed.call('April'), removed.call('Splinter'))
   # BOUNTY's own voucher listing is not an expedite; the bracketed line is
   feed.call('You have 8133 expedited task reassignment vouchers remaining.')
   feed.call(told.call(creature))
-  feed.call(removed.call('Torvek'), "#{malcrith} says, \"Very well, Torvek.  I'll expedite your task reassignment.\"",
-            '[You have 8132 expedited task reassignment vouchers remaining.]', told.call(escort), removed.call('Torvek'))
+  feed.call(removed.call('Splinter'), "#{malcrith} says, \"Very well, Splinter.  I'll expedite your task reassignment.\"",
+            '[You have 8132 expedited task reassignment vouchers remaining.]', told.call(escort), removed.call('Splinter'))
   # Wording the parser doesn't know, replaced by a gem task with no turn-in between
   feed.call(told.call('Something new the taskmaster says.'))
   feed.call(told.call("Hmm, I've got a task here from the town of Solhaven.  The local gem dealer, Kahlyr, has an order to fill " \
@@ -1289,7 +1289,7 @@ when 'money_reports'
   manager.instance_variable_set(:@cfg, cfg)
   OUT.clear
   manager.send(:alert_death)
-  alerted = OUT.any? { |line| line.include?('DEATH: Torvek died') }
+  alerted = OUT.any? { |line| line.include?('DEATH: Splinter died') }
   cfg[:alerts][:death] = false
   OUT.clear
   manager.send(:alert_death)
@@ -1326,7 +1326,7 @@ when 'session_report'
   end
   bank = lambda do |at, delta|
     run_sql("INSERT INTO bank_snapshots (snapshot_id, game, character, timestamp, bank_name, balance, delta_silver, snapshot_type) " \
-            "VALUES (?, 'GS3', 'Torvek', ?, '__total__', 0, ?, 'deposit')", A::Database.new_id, at, delta)
+            "VALUES (?, 'GS3', 'Splinter', ?, '__total__', 0, ?, 'deposit')", A::Database.new_id, at, delta)
   end
   # Before this login: a year-old death and silver that only lifetime counts
   cycle.call(:dead, NOW - (400 * 86_400), 600, 900, 900)
@@ -1396,6 +1396,47 @@ when 'schema_guard'
   A::Database.connect!
   result['empty_file'] = A::Database.one("SELECT value FROM metadata WHERE key = 'schema_version'")['value']
   A::Database.close
+
+when 'writer_safety'
+  # Cheaper syncing on every writer connection, the received-time index, and
+  # a write that never runs on the caller's thread once the writer exists
+  A::Database.connect!
+  sync = ->(conn) { conn.fetch('PRAGMA synchronous').single_value }
+  result = {
+    'synchronous'    => [sync.call(A::Database.db), Thread.new { sync.call(A::Database.db) }.value],
+    'received_index' => A::Database.db.indexes(:bounties).values.any? { |i| i[:columns] == %i[game character received_time] }
+  }
+  # The writer survives an error of its own and keeps writing, in order
+  original = A::Database.method(:drain_writes)
+  A::Database.singleton_class.send(:define_method, :drain_writes) do
+    A::Database.singleton_class.send(:define_method, :drain_writes, original)
+    raise 'boom'
+  end
+  A::Database.async { A::Database.set_metadata('first', '1') }
+  A::Database.async { A::Database.set_metadata('second', '2') }
+  sleep 1.5 # the writer pauses a second after an error
+  A::Database.flush
+  result['survives'] = [A::Database.instance_variable_get(:@writer).alive?,
+                        A::Database.metadata('first'), A::Database.metadata('second')]
+  # Writer gone (as on ;kill): a write from another thread is queued, not run
+  # there, and #close writes it
+  writer = A::Database.instance_variable_get(:@writer)
+  writer.kill
+  writer.join
+  ran_on = nil
+  hook = Thread.new do
+    A::Database.async do
+      ran_on = Thread.current
+      A::Database.set_metadata('late', 'yes')
+    end
+    Thread.current
+  end.value
+  queued = [ran_on.nil?, A::Database.send(:backlog?)]
+  A::Database.close
+  file = Sequel.sqlite(A::Database.file)
+  late = file[:metadata].where(key: 'late').get(:value)
+  file.disconnect
+  result['writer_gone'] = queued + [ran_on && ran_on != hook, late]
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

@@ -66,7 +66,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'identifies a character by game and name' do
-      expect(util['who']).to eq(['GS3:Torvek', %w[GS3 Torvek], true, 1, false])
+      expect(util['who']).to eq(['GS3:Splinter', %w[GS3 Splinter], true, 1, false])
     end
   end
 
@@ -75,7 +75,7 @@ RSpec.describe 'analytics.lic' do
 
     it 'writes the defaults under the game and character on first load' do
       expect(settings.values_at('path', 'written', 'default_hunt', 'default_rest', 'rest_steps_first')).to eq(
-        ['GS3/Torvek/analytics.yaml', true, 'bigshot', nil, 'go2']
+        ['GS3/Splinter/analytics.yaml', true, 'bigshot', nil, 'go2']
       )
     end
 
@@ -266,6 +266,26 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'writing safely and cheaply' do
+    subject(:writes) { result('writer_safety') }
+
+    it 'syncs at checkpoints (synchronous = NORMAL) on every writer connection, in WAL mode' do
+      expect(writes['synchronous']).to eq([1, 1])
+    end
+
+    it 'indexes bounties by received time' do
+      expect(writes['received_index']).to be(true)
+    end
+
+    it 'keeps writing, in order, after an error in the writer itself' do
+      expect(writes['survives']).to eq([true, '1', '2'])
+    end
+
+    it 'never runs a write on the caller (the game-text thread) when the writer is gone; close writes it' do
+      expect(writes['writer_gone']).to eq([true, true, true, 'yes'])
+    end
+  end
+
   describe 'a database from another build' do
     subject(:guard) { result('schema_guard') }
 
@@ -354,7 +374,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'records the game and the character on every row' do
-      expect(database.values_at('game_column', 'character_column')).to eq(%w[GS3 Torvek])
+      expect(database.values_at('game_column', 'character_column')).to eq(%w[GS3 Splinter])
     end
 
     it 'closes a cycle with its duration and ending figures' do
@@ -423,8 +443,8 @@ RSpec.describe 'analytics.lic' do
 
     it 'records each kill, ended by the prompt, the next search or stopping, with its silver' do
       expect(collector['kills']).to eq(
-        [['halfling cannibal', 1234, 'GS3', 'Torvek'], ['shambling lurk', 0, 'GS3', 'Torvek'],
-         ['veiled sentinel', 345, 'GS3', 'Torvek']]
+        [['halfling cannibal', 1234, 'GS3', 'Splinter'], ['shambling lurk', 0, 'GS3', 'Splinter'],
+         ['veiled sentinel', 345, 'GS3', 'Splinter']]
       )
     end
 
@@ -609,7 +629,7 @@ RSpec.describe 'analytics.lic' do
 
     it 'adds the game to a name only because two games are present' do
       expect(reports['labels']).to eq(
-        'GS3:Ashur' => 'Ashur (GS3)', 'GS3:Torvek' => 'Torvek (GS3)', 'GSF:Torvek' => 'Torvek (GSF)'
+        'GS3:April' => 'April (GS3)', 'GS3:Splinter' => 'Splinter (GS3)', 'GSF:Splinter' => 'Splinter (GSF)'
       )
     end
 
@@ -618,7 +638,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'lists every character in the character summary' do
-      expect(reports['names_in_character']).to eq(%w[Ashur Torvek])
+      expect(reports['names_in_character']).to eq(%w[April Splinter])
     end
 
     it 'keeps the text ASCII and narrow enough for the game window' do
