@@ -15,7 +15,7 @@ module EcleanseSpec
 
   ACTION_METHODS = %w[
     record_disarm queue_recover disarm_list disarm_tracked? disarm_add disarm_remove
-    disarm_remove_room disarm_remove_found spied_item same_item? disarm_recover recovered? recover
+    disarm_remove_room disarm_remove_found spied_item same_item? disarm_report disarm_recover recovered? recover
   ].freeze
 
   ACTION_SRC = ACTION_METHODS.map { |name| extract_lic_method(SOURCE, name, source_path: SOURCE_PATH) }.join("\n")
@@ -34,7 +34,7 @@ module EcleanseSpec
     UserVars = LichStub::UserVars
 
     class << self
-      attr_accessor :downstream_priority, :recover_regex, :current_room, :right_hand, :left_hand, :rooms, :replies, :commands, :notes, :downstream, :upstream, :dying, :dead
+      attr_accessor :held, :downstream_priority, :recover_regex, :current_room, :right_hand, :left_hand, :rooms, :replies, :commands, :notes, :downstream, :upstream, :dying, :dead
     end
 
     def self.reset!
@@ -47,6 +47,16 @@ module EcleanseSpec
       self.notes = []
       self.dying = []
       self.dead = false
+      self.held = []
+      $fill_hands_actions = []
+    end
+
+    # Lich::Stash's stack: each empty_hands pushes one frame of gets, and each
+    # fill_hands pops the newest frame and runs it. A get with no free hand does nothing.
+    def self.stash_held
+      frame = held.map { |item| proc { held << item if held.size < 2 } }
+      held.clear
+      $fill_hands_actions.push(frame)
     end
 
     module Room
@@ -105,7 +115,9 @@ module EcleanseSpec
         def self.get_command(command, regex)
           Harness.commands << command
           Harness.recover_regex = regex
-          Harness.replies.shift || []
+          reply = Harness.replies.shift || []
+          reply.each { |line| Harness.held << line[/(\w+) and recover it!/, 1] if line.include?('and recover it!') }
+          reply
         end
 
         def self.able_to_cast = false
@@ -120,8 +132,17 @@ module EcleanseSpec
         def self.go2(_room) = Harness.commands << :go2
         def self.settle_room = nil
         def self.change_stance(_stance) = nil
-        def self.empty_hands = Harness.commands << :empty_hands
-        def self.fill_hands = Harness.commands << :fill_hands
+
+        def self.empty_hands
+          Harness.commands << :empty_hands
+          Harness.stash_held
+        end
+
+        def self.fill_hands
+          Harness.commands << :fill_hands
+          $fill_hands_actions.pop&.each(&:call)
+        end
+
         def self.kneeling? = true
         def self.standing? = true
         def self.dead? = Harness.dead
@@ -383,18 +404,35 @@ RSpec.describe 'ecleanse disarm tracking' do
       expect(items).to eq(['handaxe'])
     end
 
-    it 'runs one fill_hands for every empty_hands' do
-      key = action.record_disarm('handaxe')
-      harness.replies = [
-        spy('xazkruvrixis broadsword'),
-        ['In order to recover something, you need a free hand.'],
-        spy('xazkruvrixis handaxe')
-      ]
+    context 'when the search finds an earlier disarm and has to stash it to keep going' do
+      let(:replies) do
+        [
+          spy('xazkruvrixis broadsword'),
+          ['In order to recover something, you need a free hand.'],
+          spy('xazkruvrixis handaxe')
+        ]
+      end
 
-      action.recover(key)
+      it 'gives what was being held the free hand, leaving the found weapon stowed' do
+        harness.held = ['shield']
+        key = action.record_disarm('handaxe')
+        harness.replies = replies
 
-      expect(harness.commands.count(:empty_hands)).to eq(2)
-      expect(harness.commands.count(:fill_hands)).to eq(2)
+        action.recover(key)
+
+        expect(harness.held).to contain_exactly('handaxe', 'shield')
+        expect($fill_hands_actions).to eq([])
+      end
+
+      it 'ends up holding both weapons when nothing else was being held (21:38 incident)' do
+        key = action.record_disarm('handaxe')
+        harness.replies = replies
+
+        action.recover(key)
+
+        expect(harness.held).to contain_exactly('handaxe', 'broadsword')
+        expect($fill_hands_actions).to eq([])
+      end
     end
   end
 
@@ -404,6 +442,24 @@ RSpec.describe 'ecleanse disarm tracking' do
 
       expect(action.record_disarm('handaxe')).to be_nil
       expect(user_vars.last_disarm).to be_nil
+    end
+  end
+
+  describe '.disarm_report' do
+    it 'lists what is still lost, newest first' do
+      action.disarm_add('broadsword')
+      action.disarm_add('handaxe')
+
+      action.disarm_report
+
+      expect(harness.notes.map { |note| note[/\w+/] }).to eq(%w[handaxe broadsword])
+      expect(harness.notes.first).to include('Room 34183 [Kresh Warrens, Hewn Tunnel] - 0 min ago')
+    end
+
+    it 'says so when nothing is saved' do
+      action.disarm_report
+
+      expect(harness.notes).to eq([' No unrecovered disarms.'])
     end
   end
 
@@ -486,7 +542,14 @@ RSpec.describe 'ecleanse disarm tracking' do
       expect(data.event_stack).to eq([:disarm_recover])
     end
 
-    [';ecleanse last disarm', ';bigshot disarmrecover', 'recover item'].each do |typed|
+    [';ecleanse last disarm', ';force ecleanse last disarm'].each do |typed|
+      it "takes #{typed.inspect} for the running script" do
+        expect(harness.upstream.call(typed)).to be_nil
+        expect(data.event_stack).to eq([:disarm_report])
+      end
+    end
+
+    [';ecleanse list', ';bigshot disarmrecover', ';bigshot last disarm', 'recover item'].each do |typed|
       it "passes #{typed.inspect} through" do
         expect(harness.upstream.call(typed)).to eq(typed)
         expect(data.event_stack).to eq([])
