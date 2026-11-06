@@ -891,8 +891,12 @@ when 'mind'
   A::Database.connect!
   session = A::Database.session_for(WHO)
   hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'torvek_crags', { exp_field: 1267, exp_max: 1125, exp_total: 1 })
-  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', [A::Util.midnight, NOW - 60].max, hunt)
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 60, hunt)
   A::Database.end_cycle(hunt, { exp_field: 1524, exp_max: 1125, exp_total: 2 }, nil)
+  # A minute long and inside today even just after midnight, when a hunt
+  # from midnight to now would be too short to keep
+  start = [A::Util.midnight, NOW - 60].max
+  run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 60 WHERE cycle_id = ?', start, start + 60, hunt)
   torvek = A::Dashboard.overview['characters'].find { |c| c['id'] == 'GS3:Torvek' }
   trend = A::Dashboard.character('GS3:Torvek', 'daily')['trends']['mind']['values'].compact
   result = { 'mind' => torvek['mind'].values_at('start_avg', 'end_avg'), 'trend_capped' => trend.all? { |v| v <= 100 } }
