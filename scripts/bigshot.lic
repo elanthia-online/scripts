@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.17.3
+       version: 5.17.4
       required: Lich >= 5.22.0
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,6 +17,10 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
+  v5.17.4  (2026-11-06)
+    - fix: wand now takes a stance and "reserve", e.g. "wand guarded reserve"; plain "wand" still uses your hands
+    - fix: wand could wrongly report a timeout when getting a fresh wand
+    - fix: wand and wandolier could miss wands with symbols in their name
   v5.17.3  (2026-10-24)
     - signs can now take extra spell options, e.g. "520 fire", "620 cold" or "605 evoke" (Barkskin evoke only when grouped, otherwise a normal cast)
     - "211 evoke", "215 evoke" and "219 evoke" in signs now evoke Bravery/Heroism/Spell Shield for your group whenever a member is ready for it again
@@ -3754,8 +3758,8 @@ class Bigshot
       cmd_throw(npc)
     elsif (command =~ /^k?weed/i)
       cmd_weed(command, npc)
-    elsif (command =~ /^wand\b/i)
-      cmd_wand(npc)
+    elsif (command =~ /^wand\b((?:\s+\w+){0,2})/i)
+      cmd_wand(npc, $1)
     elsif (command =~ /^wandolier((?:\s+\w+){0,2})/i)
       cmd_wandolier(npc, $1)
     elsif (command =~ /^hide\s?(\d+)?/i)
@@ -5613,47 +5617,88 @@ class Bigshot
     @last = selected_spell
   end
 
+  # Builds a case-insensitive pattern that matches a wand setting's words in
+  # order, e.g. "oaken wand" matches "polished oaken wand". Each word is
+  # escaped so names with regex characters still match literally.
+  #
+  # @param name [String] wand name from the wand setting
+  # @return [Regexp]
+  def wand_name_pattern(name)
+    /#{name.to_s.split(' ').map { |word| Regexp.escape(word) }.join('.*?')}/i
+  end
+
   # Attacks with a wand from the configured container.
   #
+  # Waves from your hands by default. "reserve" moves the wand into the
+  # RESERVE slot first and waves it from there; a stance word (e.g.
+  # "wand guarded reserve") picks the stance to wave in, default offensive.
+  #
   # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param args [String, nil] optional stance and "reserve" tokens
   # @return [void]
-  def cmd_wand(target)
-    debug_msg(@DEBUG_COMMANDS, "cmd_wand | target: #{target}")
+  def cmd_wand(target, args = nil)
+    debug_msg(@DEBUG_COMMANDS, "cmd_wand | target: #{target} | args: #{args}")
+    tokens  = args.to_s.downcase.split(/\s+/).reject(&:empty?)
+    reserve = tokens.include?('reserve')
+    stance  = (tokens & %w[offensive advance forward neutral guarded defensive]).first || 'offensive'
 
-    if (@FRESH_WAND_CONTAINER)
-      until ((GameObj.right_hand.name.to_s + GameObj.left_hand.name.to_s) =~ /#{@WAND[$bigshot_wand].split(' ').join('.*?')}/i)
-        result = dothistimeout("get #{@WAND[$bigshot_wand]} from my #{@FRESH_WAND_CONTAINER}", 3, /You remove|You slip|Get what/)
-        if (result =~ /Get what/)
-          $bigshot_wand += 1
-          if @WAND[$bigshot_wand].nil?
-            message("yellow", "ERROR: Couldn't find fresh wand. Gonna rest.")
-            $bigshot_should_rest = true
-            $rest_reason = "No fresh wands!"
-            return
-          end
-        elsif (result.nil?)
-          message("yellow", "ERROR: Timed out looking for wand."); return;
-        end
-      end
-
-      change_stance('offensive')
-      result = get_res("wave my #{@WAND[$bigshot_wand]} at ##{target.id}", /d100|You hurl|is already dead|You do not see that here|You are in no condition|I could not find/)
-      change_stance(@HUNTING_STANCE)
-
-      if (result =~ /You are in no condition/)
-        message("yellow", "ERROR: Wounded. Gonna rest.")
-        $bigshot_should_rest = true
-        $rest_reason = "Too injured to wave wands!"
-        return
-      elsif (result.nil?)
-        if (@DEAD_WAND_CONTAINER)
-          bs_put "put my #{@WAND[$bigshot_wand]} in my #{@DEAD_WAND_CONTAINER}"
-        else
-          bs_put "drop my #{@WAND[$bigshot_wand]}"
-        end
-      end
-    else
+    unless @FRESH_WAND_CONTAINER
       message("yellow", "ERROR: Wand command called but fresh wand container not defined.")
+      return
+    end
+
+    fput("reserve list") if reserve && GameObj.reserve.nil?
+    wand_obj = nil
+
+    loop do
+      wand_pattern = wand_name_pattern(@WAND[$bigshot_wand])
+      places = [GameObj.right_hand, GameObj.left_hand]
+      places.concat(GameObj.reserve.to_a) if reserve
+      wand_obj = places.compact.find { |o| o.name.to_s =~ wand_pattern }
+      break if wand_obj
+
+      result = dothistimeout("get #{@WAND[$bigshot_wand]} from my #{@FRESH_WAND_CONTAINER}", 3, /You (?:remove|slip|slide)|Get what/)
+      if (result =~ /Get what/)
+        $bigshot_wand += 1
+        if @WAND[$bigshot_wand].nil?
+          message("yellow", "ERROR: Couldn't find fresh wand. Gonna rest.")
+          $bigshot_should_rest = true
+          $rest_reason = "No fresh wands!"
+          return
+        end
+      elsif (result.nil?)
+        message("yellow", "ERROR: Timed out looking for wand."); return;
+      end
+    end
+
+    if reserve && [GameObj.right_hand, GameObj.left_hand].compact.any? { |o| o.id == wand_obj.id }
+      fput("reserve ##{wand_obj.id}")
+    end
+
+    change_stance(stance)
+    result = get_res("wave ##{wand_obj.id} at ##{target.id}", /d100|You hurl|is already dead|You do not see that here|You are in no condition|I could not find|What were you referring to/)
+    change_stance(@HUNTING_STANCE)
+
+    if (result =~ /You are in no condition/)
+      message("yellow", "ERROR: Wounded. Gonna rest.")
+      $bigshot_should_rest = true
+      $rest_reason = "Too injured to wave wands!"
+      return
+    elsif result =~ /What were you referring to/
+      fput('reserve list') if reserve
+    elsif (result.nil?)
+      # PUT and DROP only work on held items; RESERVE CLEAR moves it to a hand
+      if GameObj.reserve.to_a.any? { |o| o.id == wand_obj.id }
+        unless dothistimeout("reserve clear ##{wand_obj.id}", 3, /from your reserves/)
+          message("yellow", "ERROR: Couldn't take the dead wand out of RESERVE. Free a hand and RESERVE CLEAR it.")
+          return
+        end
+      end
+      if (@DEAD_WAND_CONTAINER)
+        bs_put "put ##{wand_obj.id} in my #{@DEAD_WAND_CONTAINER}"
+      else
+        bs_put "drop ##{wand_obj.id}"
+      end
     end
   end
 
@@ -5673,7 +5718,7 @@ class Bigshot
       wand_obj = nil
 
       loop do
-        wand_obj = [GameObj.right_hand, GameObj.left_hand, *GameObj.reserve.to_a].compact.find { |o| o.name.to_s =~ /#{@WAND[$bigshot_wand].split(' ').join('.*?')}/i }
+        wand_obj = [GameObj.right_hand, GameObj.left_hand, *GameObj.reserve.to_a].compact.find { |o| o.name.to_s =~ wand_name_pattern(@WAND[$bigshot_wand]) }
         break if wand_obj
 
         result = dothistimeout("get #{@WAND[$bigshot_wand]} from my #{@FRESH_WAND_CONTAINER}", 3, /You (?:remove|slip|slide)|Get what/)
