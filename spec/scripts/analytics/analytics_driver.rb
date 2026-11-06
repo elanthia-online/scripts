@@ -1239,8 +1239,16 @@ when 'offers'
            'as soon as you can, being ready for any dangers that the two of you may face.  Good luck!'
   removed = ->(name) { "#{malcrith} says, \"Very well <a exist=\"-1\" noun=\"#{name}\">#{name}</a>, I have removed you from your current assignment.\"" }
 
-  # Kept: the guard names the creature, the hunt starts, it's turned in
+  # Kept: the guard names the creature, the hunt starts, it's turned in.
+  # BOUNTY typed before the guard repeats the taskmaster's words (twice here),
+  # and the bounty window can repeat them too: still one offer.
   feed.call(told.call(creature))
+  listing = ['<a exist="-1" noun="Torvek">Torvek</a>, your Adventurer\'s Guild information is as follows:',
+             'You currently have 1,633,594 unspent bounty points.', 'You have 8133 expedited task reassignment vouchers remaining.',
+             "The taskmaster told you:  \"#{creature}\"", '<prompt time="1">&gt;</prompt>']
+  feed.call(*listing, *listing, told.call(creature))
+  A::Database.flush
+  repeats = A::Database.one('SELECT COUNT(*) AS n FROM bounty_offers')['n']
   $task = TaskStub.new(:cull, 'lithe veiled sentinel', 'shadow of the Sanctum', 20)
   manager.send(:check_task)
   feed.call('[You have earned 889 bounty points, 1000 experience points, and 8890 silver.]')
@@ -1277,7 +1285,7 @@ when 'offers'
     'labels' => rows.map { |row| A::Util.offer_label(row) },
     'linked' => rows.first['bounty_id'] == bounty['bounty_id'] && bounty['status'] == 'completed',
     'described' => rows.first['description'].start_with?("Hmm, I've got") && !rows.first['description'].end_with?('"'),
-    'ended' => rows.all? { |row| row['ended_at'] }, 'kept_on_restart' => kept,
+    'ended' => rows.all? { |row| row['ended_at'] }, 'kept_on_restart' => kept, 'after_bounty_listings' => repeats,
     'report' => [text.include?('Task offers'), text[/Offered\s*\|\s*(\d+)/, 1], text[/Removed\s*\|\s*(\d+)/, 1],
                  text[/Expedited\s*\|\s*(\d+)/, 1], text.include?('escort to Zul Logoth')]
   }

@@ -208,6 +208,10 @@ RSpec.describe 'analytics.lic' do
       )
     end
 
+    it 'counts an offer once when BOUNTY or the bounty window repeats the taskmaster\'s words' do
+      expect(offers['after_bounty_listings']).to eq(1)
+    end
+
     it 'ignores another player\'s removal and the BOUNTY voucher listing, and keeps the task held over a restart' do
       expect(offers.values_at('kept_on_restart', 'ended')).to eq([true, true])
     end

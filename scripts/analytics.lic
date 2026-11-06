@@ -1568,8 +1568,10 @@ module GS4Analytics
     REWARD_RE = /You have earned ([\d,]+) bounty points?(?:(?:, | and )([\d,]+) experience points?)?(?:,? and ([\d,]+) silver)?/i
     ABANDON_RE = /You have abandoned your current task/i
     # A new assignment shows in the character's own bounty window as
-    # 'The taskmaster told you:  "..."'; nothing else prints that line
+    # 'The taskmaster told you:  "..."'. BOUNTY's own listing may repeat it, so
+    # lines from its header to the next prompt are not offers.
     OFFER_MARK = 'The taskmaster told you:'
+    LISTING_MARK = "your Adventurer's Guild information is as follows:"
     # Bracketed, it's the voucher just spent; BOUNTY's own listing has no brackets
     VOUCHER_RE = /\A\s*\[You have ([\d,]+) expedited task reassignment vouchers? remaining\.\]/
     REMOVED_MARK = 'I have removed you from your current assignment'
@@ -1635,7 +1637,7 @@ module GS4Analytics
         return unless keep
 
         detail = keep.values_at('bounty_type', 'creature', 'area')
-        @offer = { id: keep['offer_id'], detail: detail.compact.empty? ? nil : detail }
+        @offer = { id: keep['offer_id'], detail: detail.compact.empty? ? nil : detail, words: keep['description'] }
       rescue StandardError => e
         Log.error('offer reconcile', e)
       end
@@ -1643,6 +1645,7 @@ module GS4Analytics
       # Parse only; the monitor thread owns all state and all writes
       def install_hook
         DownstreamHook.remove(HOOK)
+        @listing = false
         DownstreamHook.add(HOOK, proc { |line|
           begin
             if line.include?('You have earned') || line.include?('abandoned your current task')
@@ -1652,8 +1655,12 @@ module GS4Analytics
               elsif text.match?(ABANDON_RE)
                 @events << [:abandon]
               end
+            elsif line.include?(LISTING_MARK)
+              @listing = true
+            elsif @listing && line.include?('<prompt')
+              @listing = false
             elsif line.include?(OFFER_MARK)
-              @events << [:offer, line.gsub(/<[^>]+>/, '').strip, Time.now.to_i]
+              @events << [:offer, line.gsub(/<[^>]+>/, '').strip, Time.now.to_i] unless @listing
             elsif line.include?('expedited task reassignment')
               found = line.gsub(/<[^>]+>/, '').match(VOUCHER_RE)
               @events << [:expedite, found[1].delete(',').to_i, Time.now.to_i] if found
@@ -1729,18 +1736,28 @@ module GS4Analytics
       # A new assignment. One still open was neither turned in nor removed
       # (a failed task, or a reward line we never saw): it was replaced.
       def handle_offer(text, at)
+        words = offer_words(text)
+        # The same words again while it's open are a repeat (a task can't be
+        # reassigned while held; a removal or a turn-in closes it first)
+        return if @offer && @offer[:words] == words
+
         finish_offer('replaced', at)
         expedite = @expedite if @expedite && at - @expedite[:at] <= EXPEDITE_WINDOW
         @expedite = nil
-        offer = parse_offer(text).merge(description: text.sub(/\A.*?#{Regexp.escape(OFFER_MARK)}\s*"?/, '').sub(/"\s*\z/, ''),
+        offer = parse_offer(text).merge(description: words,
                                         expedited: !expedite.nil?, vouchers_left: expedite&.[](:left))
         who = @who
         session = Database.session_for(who)
         cycle = cycle_id
         id = Database.new_id
         Database.async { Database.record_offer(who, session, cycle, offer, id: id, at: at) }
-        @offer = { id: id, detail: nil }
+        @offer = { id: id, detail: nil, words: words }
         Log.debug("Bounty offered: #{offer[:assignment]} #{offer[:town]}#{' (expedited)' if expedite}")
+      end
+
+      # The taskmaster's words, without the "The taskmaster told you:" wrapper
+      def offer_words(text)
+        text.sub(/\A.*?#{Regexp.escape(OFFER_MARK)}\s*"?/, '').sub(/"\s*\z/, '')
       end
 
       # Removed at the taskmaster, before or after the work started
