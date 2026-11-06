@@ -2282,7 +2282,7 @@ RSpec.describe 'bigshot cmd_wand' do
       expect(bs.sent.last(3)).to eq(['wave #100 at #555', 'reserve clear #100', 'drop #100'])
     end
 
-    it 'warns and rests when a dead wand cannot come out of RESERVE' do
+    it 'warns and keeps hunting when a dead wand cannot come out of RESERVE' do
       bs.wave_result = nil
       bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
       bs.hands_full = true
@@ -2290,8 +2290,7 @@ RSpec.describe 'bigshot cmd_wand' do
 
       expect(bs.sent.last).to eq('reserve clear #200')
       expect(bs.messages.last).to match(/Couldn't take the dead wand out of RESERVE/)
-      expect($bigshot_should_rest).to be true
-      expect($rest_reason).to eq('Dead wand stuck in RESERVE!')
+      expect($bigshot_should_rest).to be_falsey
     end
 
     it 'refreshes the reserve list when the reserved wand is gone' do
