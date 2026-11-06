@@ -433,6 +433,8 @@ when 'dashboard'
     'detail_id' => detail['id'], 'steps' => detail['steps'].keys.sort,
     'unknown' => A::Dashboard.character('GS3:Nobody', 'daily').nil?,
     'http_index' => [index.code, index.body.include?('GS4 Analytics'), index['content-security-policy'].to_s.include?("default-src 'none'")],
+    'pins' => [index.body.include?("localStorage.getItem('gs4a-pins')"), index.body.include?('data-pin="'),
+               index.body.include?('e.stopPropagation(); togglePin')],
     'theme_toggle' => [index.body.include?('id="theme"'), index.body.include?(':root[data-theme="dark"] {'),
                        index.body.index("localStorage.getItem('gs4a-theme')").to_i < index.body.index('<style>').to_i,
                        index.body.scan(/<button class="tool no-export" id="theme"/).size],
@@ -1259,6 +1261,110 @@ when 'offers'
     'dashboard' => detail.slice('offered', 'removed', 'expedited', 'vouchers').merge('first' => detail['recent'].first)
   }
   DownstreamHook.remove('GS4Analytics::BountyManager')
+
+when 'spending'
+  # Boxes found on corpses, and silver spent at the locksmith, the locksmith
+  # pool and the priestess, from the 2026-11-05 logs
+  # A database from before kill_stats had a boxes column gets it on connect
+  old = Sequel.sqlite(A::Database.file)
+  old.create_table(:kill_stats) do
+    String :game, null: false
+    String :character, null: false
+    String :date, null: false
+    String :profile, null: false
+    String :creature, null: false
+    Integer :kill_count, default: 0
+    Integer :total_silver, default: 0
+    Integer :last_kill_at
+    primary_key %i[game character date profile creature]
+  end
+  old[:kill_stats].insert(game: 'GS3', character: 'Torvek', date: Date.today.to_s, profile: 'p', creature: 'kobold',
+                          kill_count: 3, total_silver: 30, last_kill_at: NOW)
+  old.disconnect
+  A::Database.connect!
+  migrated = A::Database.db.schema(:kill_stats, reload: true).map(&:first).include?(:boxes)
+  A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  feed = ->(*lines) { lines.each { |line| DownstreamHook.run(line) } }
+  feed.call('You search the scaled shaper.', 'You discard the shaper\'s useless equipment.',
+            'He carried a corroded brass strongbox on him!', "He didn't carry any silver.", 'He had nothing else of value.',
+            '<prompt time="1">&gt;</prompt>',
+            'You search the flesh monstrosity.', 'It had 57 silvers on it.', 'It had nothing else of value.',
+            '<prompt time="2">&gt;</prompt>',
+            'You ring the bell, and ask Jyhm if he can open your silver strongbox.',
+            'He looks over the silver strongbox, frowns, and tells you, "Havin\' some trouble, eh?  Of course I could open this, ' \
+            'but it\'ll cost ya.  Gimme 4,033 silvers, and I\'ll have it open before you know it."',
+            'The locksmith Jyhm accepts your silvers.',
+            'The locksmith Jyhm accepts your silvers.', # no quote before it: not counted twice
+            'Jahck takes your chest and says, "Your tip of 500 silvers has been recorded, and the 250 silver fee has been collected.  ' \
+            'We\'ll get someone on that right away."',
+            'You hand the priestess 1,200 silvers.  "Thank you," she says.  She removes a glass decanter, and fills a simple ' \
+            'indigo flask with a clear fluid, and then hands it to you.')
+  sleep 0.3
+  A::Database.flush
+  result = {
+    'migrated' => migrated,
+    'kills'    => A::Database.all('SELECT creature, kill_count, total_silver, boxes FROM kill_stats ORDER BY creature').map(&:values),
+    'spent'    => A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'expense' " \
+                               'ORDER BY rowid').map(&:values)
+  }
+  A::SilverManager.stop
+
+when 'money_reports'
+  # The silver, kills and cycle reports, the death alert and backups
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  session = A::Database.session_for(WHO)
+  day = [A::Util.midnight, NOW - 7200].max
+  A::Database.record_kill(WHO, 'kobold', 'crags', 40, at: day + 10, boxes: 1)
+  A::Database.record_kill(WHO, 'kobold', 'crags', 60, at: day + 20)
+  A::Database.record_kill(WHO, 'troll', 'crags', 500, at: day + 30, boxes: 1)
+  { 'box' => [300, nil], 'sale' => [1000, 'pawnbroker'], 'bounty' => [9000, nil] }.each do |cat, (amount, kind)|
+    A::Database.record_silver(WHO, session, nil, cat, amount, vendor_type: kind, at: day + 40)
+  end
+  A::Database.record_silver(WHO, session, nil, 'expense', 4033, vendor_type: 'locksmith', vendor_name: 'Jyhm', at: day + 50)
+  A::Database.record_silver(WHO, session, nil, 'expense', 1200, vendor_type: 'priestess', at: day + 60)
+  [[day + 100, 600], [day + 3700, 300]].each do |start, secs|
+    dead = A::Database.start_cycle(WHO, session, :dead, 'dead', 'crags', {})
+    run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = ? WHERE cycle_id = ?', start, start + secs, secs, dead)
+  end
+  hunt = A::Database.start_cycle(WHO, session, :hunt, 'bigshot', 'crags', {})
+  run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 3000 WHERE cycle_id = ?', day + 700, day + 3700, hunt)
+  texts = A::Database.reader do |conn|
+    %w[silver kill cycle].to_h do |name|
+      [name, A::Report::Text.public_send({ 'silver' => :silver_summary, 'kill' => :kill_summary, 'cycle' => :cycle_summary }[name],
+                                         conn, WHO, 'daily').join("\n")]
+    end
+  end
+  cell = ->(text, label) { text[/\| #{Regexp.escape(label)}\s*\|\s*([^|]+?)\s*\|/, 1] }
+  # Death alert, on and off
+  manager = A::CycleManager
+  manager.instance_variable_set(:@who, WHO)
+  manager.instance_variable_set(:@cfg, cfg)
+  OUT.clear
+  manager.send(:alert_death)
+  alerted = OUT.any? { |line| line.include?('DEATH: Torvek died') }
+  cfg[:alerts][:death] = false
+  OUT.clear
+  manager.send(:alert_death)
+  quiet = OUT.none? { |line| line.include?('DEATH') }
+  # Backups: a readable copy, and only the newest few kept
+  dir = File.join(DATA_DIR, 'analytics-backups')
+  FileUtils.mkdir_p(dir)
+  9.times { |i| File.write(File.join(dir, "analytics-20200101-00000#{i}.db"), '') }
+  message = A::Database.backup
+  copies = Dir[File.join(dir, 'analytics-*.db')].sort
+  copy = Sequel.sqlite(copies.last)
+  copied_kills = copy[:kill_stats].sum(:kill_count)
+  copy.disconnect
+  result = {
+    'silver' => %w[Corpses Boxes Sales Bounties Total locksmith priestess].map { |label| cell.call(texts['silver'], label) } +
+                [cell.call(texts['silver'], 'Found less spent')],
+    'kills'  => [cell.call(texts['kill'], 'kobold'), texts['kill'].lines.grep(/\| Total/).first.to_s.split('|').map(&:strip).reject(&:empty?)],
+    'deaths' => %w[Deaths Hunting\ time\ per\ death Time\ between\ deaths].map { |label| cell.call(texts['cycle'], label) },
+    'alert'  => [alerted, quiet],
+    'backup' => [message.start_with?('Backed up to'), copies.size, copied_kills, File.basename(copies.first).start_with?('analytics-2020')]
+  }
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

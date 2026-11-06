@@ -18,9 +18,10 @@
     ;analytics                        collect data for this character
     ;analytics --dashboard[=PORT]     collect and also serve the dashboard
     ;analytics serve [PORT] [lan]     serve the dashboard only (no collecting)
-    ;analytics report <name> [range]  text report: character, exp, bounty, cycle
+    ;analytics report <name> [range]  text report: character, exp, bounty, cycle,
+                                      silver, kills
     ;analytics status                 what the collector is doing right now
-    ;analytics maintenance <task>     compact | vacuum | stats
+    ;analytics maintenance <task>     compact | vacuum | stats | backup
     ;analytics help
 
   While the collector is running, the other commands above also work by
@@ -31,9 +32,11 @@
   created with their defaults the first time the collector runs. The database
   is <Lich data>/analytics.db and every row records its game and character.
 
-  Silver in the reports comes from bank balances. Box, sale and bounty silver
-  (silver_events), item sales (item_sales) and vendor visits (vendor_visits)
-  are also stored, for your own SQL queries; no report shows them yet.
+  Silver per hour in the reports comes from bank balances. Box, sale and
+  bounty silver and silver spent at the locksmith, locksmith pool and
+  priestess (silver_events) are shown by ;analytics report silver. Item
+  sales (item_sales) and vendor visits (vendor_visits) are stored for your
+  own SQL queries.
   Every task the taskmaster offers is kept too (bounty_offers), including
   ones you remove before starting and whether an expedite voucher got it;
   ;analytics report bounty and the dashboard show them.
@@ -56,6 +59,29 @@
   v1.0.0 (2026-10-27)
     - initial release as a single script
 =end
+
+# TODO: ideas not built yet, from a player's design notes (2026-11-05)
+#   - Show the current rest step (selling, travelling, healing, banking) as
+#     the live state on the dashboard, not only "rest".
+#   - A ;analytics report rest with the rest-step times and reasons per range.
+#   - Death's Sting: record its level from EXPERIENCE and time to recover.
+#   - Other spending: shop purchases, plus deed and resurrection costs
+#     (locksmith, locksmith pool and priestess are tracked).
+#   - Locker notes and a net worth figure beyond bank balances.
+#   - Bank reconciliation: show when a BANK ACCOUNT listing differs from the
+#     tracked total, and by how much, as unexplained change.
+#   - Compare selling locations (sales by town and vendor) on the dashboard.
+#   - Cross-character comparisons of creatures and bounty types on the dashboard.
+#   - Searchable history: filter cycles, kills, bounties, deaths and silver
+#     by character, profile, date and type.
+#   - Custom date ranges and a year view on the dashboard; sortable rankings.
+#   - Customizable dashboard layouts.
+#   - Per-character Discord destinations (discordhook has one webhook).
+#   - Alerts for unexpected disconnects, and a disarmed-weapon alert without
+#     weapon_loadout set up.
+#   - Settings layered global -> game -> character, not only per character.
+#   - A data retention policy (pruning old rows) alongside compact and backup.
+#   - Error counts and recent errors in ;analytics status.
 
 require 'date'
 require 'fileutils'
@@ -280,7 +306,8 @@ module GS4Analytics
         no_kill_minutes: 10,
         silver_drop_pct: 50,
         silver_check_after_hours: 2,
-        daily_digest: true
+        daily_digest: true,
+        death: true
       },
       dashboard: { port: 8080, lan: false }
     }.freeze
@@ -378,6 +405,7 @@ module GS4Analytics
       #                            below the week's average. Default: 50
       #   silver_check_after_hours Hours hunted today before that check runs. Default: 2
       #   daily_digest             Send a summary of yesterday once a day. Default: true
+      #   death                    Alert when this character dies. Default: true
       # discord                  true sends alerts through discordhook. Start
       #                          ;discordhook first and set its webhook as that script
       #                          describes; with it not running, only the game window
@@ -479,7 +507,11 @@ module GS4Analytics
 
     # Cycles shorter than this are state flapping, not real hunts or rests
     MIN_CYCLE_SECONDS = 10
-    SCHEMA_VERSION    = '4'
+    SCHEMA_VERSION    = '5'
+    # Columns added after a table was first made. create_table? leaves an
+    # existing table alone, so a database from an earlier version gets them here.
+    ADDED_COLUMNS = { kill_stats: { boxes: [Integer, { default: 0 }] } }.freeze
+    BACKUPS_KEPT = 7 # maintenance backup keeps this many
     # Queued writes that find the database locked by another Lich session are
     # kept and retried, backing off from 2 s up to 30 s, up to this many
     BUSY_BACKOFF_START_S = 2.0
@@ -530,6 +562,7 @@ module GS4Analytics
         end
 
         create_schema
+        add_missing_columns
         set_metadata('schema_version', SCHEMA_VERSION)
         @sessions = {}
         @session_lock = Mutex.new
@@ -710,17 +743,18 @@ module GS4Analytics
 
       # +at+ is when the corpse was searched, so a kill whose write waits
       # still lands on the right day
-      def record_kill(who, creature, profile, silver, at: Time.now.to_i)
+      def record_kill(who, creature, profile, silver, at: Time.now.to_i, boxes: 0)
         kills = Sequel[:kill_stats]
         db[:kill_stats].insert_conflict(
           target: %i[game character date profile creature],
           update: { kill_count: kills[:kill_count] + 1, total_silver: kills[:total_silver] + Sequel[:excluded][:total_silver],
+                    boxes: Sequel.function(:coalesce, kills[:boxes], 0) + Sequel[:excluded][:boxes],
                     last_kill_at: Sequel[:excluded][:last_kill_at] }
         ).insert(clean(game: who.game, character: who.name, date: Time.at(at).to_date.to_s, profile: profile.to_s,
-                       creature: creature, kill_count: 1, total_silver: silver.to_i, last_kill_at: at))
+                       creature: creature, kill_count: 1, total_silver: silver.to_i, boxes: boxes.to_i, last_kill_at: at))
       end
 
-      # category: 'box', 'sale' or 'bounty'
+      # category: 'box', 'sale', 'bounty', or 'expense' (silver spent, stored positive)
       def record_silver(who, session_id, cycle_id, category, amount, vendor_type: nil, vendor_name: nil,
                         bounty_type: nil, at: Time.now.to_i)
         return unless amount.to_i.positive?
@@ -858,6 +892,20 @@ module GS4Analytics
       def compact_bank_snapshots
         removed = db[:bank_snapshots].exclude(bank_name: '__total__').where(delta_silver: 0).delete
         "Removed #{removed} unchanged bank rows"
+      end
+
+      # A consistent copy of the database, safe while other sessions write
+      # (SQLite's VACUUM INTO), in analytics-backups/ next to it. The newest
+      # BACKUPS_KEPT are kept.
+      def backup
+        dir = File.join(File.dirname(file), 'analytics-backups')
+        FileUtils.mkdir_p(dir)
+        target = File.join(dir, "analytics-#{Time.now.strftime('%Y%m%d-%H%M%S')}.db")
+        db.run(Sequel.lit('VACUUM INTO ?', target))
+        old = Dir[File.join(dir, 'analytics-*.db')].sort.reverse.drop(BACKUPS_KEPT)
+        old.each { |path| File.delete(path) }
+        "Backed up to #{target} (#{(File.size(target) / 1_048_576.0).round(1)} MB)" \
+          "#{", removed #{old.size} older" if old.any?}"
       end
 
       def vacuum
@@ -1011,6 +1059,15 @@ module GS4Analytics
 
       # ----- schema ----------------------------------------------------------
 
+      def add_missing_columns
+        ADDED_COLUMNS.each do |table, columns|
+          have = db.schema(table, reload: true).map(&:first)
+          columns.each do |name, (type, opts)|
+            db.alter_table(table) { add_column name, type, **opts } unless have.include?(name)
+          end
+        end
+      end
+
       def create_schema
         db.create_table?(:sessions) do
           String :session_id, primary_key: true
@@ -1057,6 +1114,7 @@ module GS4Analytics
           String :creature, null: false
           Integer :kill_count, default: 0
           Integer :total_silver, default: 0
+          Integer :boxes, default: 0
           Integer :last_kill_at
           primary_key %i[game character date profile creature]
         end
@@ -1221,6 +1279,14 @@ module GS4Analytics
     TAGS       = /<[^>]+>/
     SEARCH_RE  = /You search the (.+)\./
     SILVER_RE  = /had ([\d,]+) silvers? on/
+    # A searched corpse's box: "He carried a corroded brass strongbox on him!"
+    BOX_FOUND_RE = /\A(?:He|She|It) carried an? .+ on (?:him|her|it)!/
+    # Silver spent: the town locksmith's quote then payment, the locksmith
+    # pool's tip and fee, and the wandering priestess's flasks
+    LOCK_QUOTE_RE = /Gimme ([\d,]+) silvers?, and I'll have it open/
+    LOCK_PAID_RE = /\AThe locksmith (\S+) accepts your silvers\./
+    POOL_PAID_RE = /\A(\S+) takes your .+? and says, "Your tip of ([\d,]+) silvers? has been recorded, and the ([\d,]+) silvers? fee has been collected/
+    PRIESTESS_RE = /\AYou hand the priestess ([\d,]+) silvers?\./
     PROMPT_RE  = /<prompt/
     CHARM_RE   = /They locate a pile of ([\d,]+) coins?, reclaiming them/
     DIRECT_RE  = /You gather the remaining ([\d,]+) coins? from inside your/
@@ -1266,6 +1332,7 @@ module GS4Analytics
         @teller = nil
         @pouch = nil
         @offer = nil
+        @lock_quote = nil
         DownstreamHook.remove(HOOK)
         DownstreamHook.add(HOOK, proc { |line| on_line(line) })
       end
@@ -1380,9 +1447,11 @@ module GS4Analytics
         if (found = text.match(SEARCH_RE))
           flush_kill
           @last_kill_at = Time.now.to_i
-          @kill = { creature: found[1].strip, silver: 0, at: @last_kill_at }
+          @kill = { creature: found[1].strip, silver: 0, boxes: 0, at: @last_kill_at }
         elsif @kill && (found = text.match(SILVER_RE))
           @kill[:silver] = digits(found[1])
+        elsif @kill && text.match?(BOX_FOUND_RE)
+          @kill[:boxes] += 1
         elsif @kill && line.match?(PROMPT_RE)
           # The prompt ends the search output, so the kill is recorded now
           # rather than when the next one is searched
@@ -1394,7 +1463,10 @@ module GS4Analytics
         elsif (found = text.match(DIRECT_RE))
           record_box(digits(found[1]), 'direct')
         end
-        read_sale(line, text) if Settings.current[:parse_sales]
+        if Settings.current[:parse_sales]
+          read_sale(line, text)
+          read_expense(text)
+        end
         read_bank(text) if Settings.current[:parse_bank]
         line
       rescue StandardError => e
@@ -1427,6 +1499,32 @@ module GS4Analytics
           record_sale(offer ? offer[:vendor] : 'vendor', offer ? offer[:item] : 'item', offer&.[](:noun),
                       digits(found[:amount]))
         end
+      end
+
+      # Silver spent at the locksmith, the locksmith pool or the priestess
+      def read_expense(text)
+        if (found = text.match(LOCK_QUOTE_RE))
+          @lock_quote = { amount: digits(found[1]), at: Time.now.to_i }
+        elsif (found = text.match(LOCK_PAID_RE))
+          quote = @lock_quote if @lock_quote && Time.now.to_i - @lock_quote[:at] <= 30
+          @lock_quote = nil
+          record_expense(quote[:amount], 'locksmith', found[1]) if quote
+        elsif (found = text.match(POOL_PAID_RE))
+          record_expense(digits(found[2]) + digits(found[3]), 'locksmith pool', found[1])
+        elsif (found = text.match(PRIESTESS_RE))
+          record_expense(digits(found[1]), 'priestess', nil)
+        end
+      end
+
+      def record_expense(amount, kind, name)
+        who = @who
+        cycle_id = @cycle_id
+        at = Time.now.to_i
+        Database.async do
+          Database.record_silver(who, Database.session_for(who), cycle_id, 'expense', amount, vendor_type: kind,
+                                                                                               vendor_name: name, at: at)
+        end
+        Log.debug("Spent #{Util.fmt(amount)} (#{kind})")
       end
 
       def record_sale(vendor, item, noun, amount)
@@ -1533,7 +1631,7 @@ module GS4Analytics
         @kill = nil
         who = @who
         profile = Util.safely('') { UserVars.op['profile_current'].to_s }
-        Database.async { Database.record_kill(who, kill[:creature], profile, kill[:silver], at: kill[:at]) }
+        Database.async { Database.record_kill(who, kill[:creature], profile, kill[:silver], at: kill[:at], boxes: kill[:boxes]) }
       end
 
       def record_box(amount, method)
@@ -2107,7 +2205,10 @@ module GS4Analytics
         @current_state = target
         @hunt_start_time = target == :hunt ? Time.now.to_i : nil
         @weapon = { polls: 0, retries: 0 }
-        mark_death if target == :dead
+        if target == :dead
+          mark_death
+          alert_death
+        end
         start_new_cycle(target)
       end
 
@@ -2120,6 +2221,12 @@ module GS4Analytics
 
         @last_hunt = nil
         note_reason(hunt[:id], hunt[:reason].to_s.empty? ? 'died' : "died (#{hunt[:reason]})")
+      end
+
+      def alert_death
+        return unless @cfg.dig(:alerts, :death)
+
+        Notifier.alert('DEATH', "#{@who.name} died#{" in #{profile}" unless profile.to_s.empty?}")
       end
 
       # A hunt that ended with no rest reason of its own was stopped from outside
@@ -2708,7 +2815,7 @@ module GS4Analytics
       # rest right aligned unless +aligns+ says otherwise.
       def table(headers, rows, footer: nil, aligns: nil)
         aligns ||= [:left] + ([:right] * (headers.size - 1))
-        all = [headers, *rows, *footer]
+        all = [headers, *rows, *([footer] if footer)]
         widths = headers.each_index.map { |i| all.map { |row| row[i].to_s.length }.max }
         line = lambda do |row|
           cells = row.each_with_index.map do |cell, i|
@@ -3061,10 +3168,92 @@ module GS4Analytics
         out += exp_section(cycles, hunt_time, by_type['hunt'] || [])
         out += encumbrance_section(by_type['hunt'] || [])
         out += reason_section(cycles)
+        out += deaths_section(by_type['dead'] || [], hunt_time)
         out += efficiency_section(by_type['hunt'] || [])
         out + heading('Time and silver') +
           table(['Metric', 'Value'], [[label == 'Today' ? 'Since midnight' : 'Total tracked time', Util.hm(elapsed)],
                                       ['Silver / hour', Util.fmt(silver_hr)]], aligns: %i[left right])
+      end
+
+      # How often this character dies: hunting time per death, and the clock
+      # time between one death and the next
+      def deaths_section(deaths, hunt_time)
+        return [] if deaths.empty?
+
+        starts = deaths.map { |row| row['start_time'].to_i }.sort
+        gaps = starts.each_cons(2).map { |a, b| b - a }
+        rows = [['Deaths', deaths.size], ['Hunting time per death', Util.hm(hunt_time / deaths.size)],
+                ['Time between deaths', gaps.empty? ? '--' : Util.hm(Util.mean(gaps))],
+                ['Time dead (average)', Util.minutes(Util.mean(deaths.filter_map { |row| row['duration_seconds'] }))],
+                ['Last death', Time.at(starts.last).strftime('%Y-%m-%d %H:%M')]]
+        heading('Deaths') + table(%w[Metric Value], rows, aligns: %i[left right])
+      end
+
+      # Where this character's silver came from and went, in the range:
+      # corpses, boxes, sales and bounties, less the locksmith, the locksmith
+      # pool and the priestess, next to what the bank actually moved by
+      def silver_summary(conn, who, arg)
+        label, from = Report.range_from_arg(arg)
+        return ['Usage: ;analytics report silver [daily|weekly|monthly|ytd|total]'] unless label
+
+        now = Time.now.to_i
+        creature = conn.one('SELECT COALESCE(SUM(total_silver), 0) AS s FROM kill_stats WHERE game = ? AND character = ? ' \
+                            'AND date >= ? AND date <= ?', *who, Report.date_of(from), Report.date_of(now))['s'].to_i
+        events = conn.all('SELECT source_category AS cat, vendor_type AS kind, vendor_name AS name, COUNT(*) AS n, SUM(amount) AS s ' \
+                          'FROM silver_events WHERE game = ? AND character = ? AND timestamp >= ? AND timestamp <= ? GROUP BY 1, 2, 3',
+                          *who, from, now)
+        bank = conn.one("SELECT COALESCE(SUM(delta_silver), 0) AS s FROM bank_snapshots WHERE game = ? AND character = ? " \
+                        "AND bank_name = '__total__' AND delta_silver IS NOT NULL AND timestamp >= ? AND timestamp <= ?",
+                        *who, from, now)['s'].to_i
+        total = ->(cat) { events.select { |row| row['cat'] == cat }.sum { |row| row['s'].to_i } }
+        by_kind = lambda do |cat|
+          events.select { |row| row['cat'] == cat }.group_by { |row| row['kind'].to_s }
+                .map { |kind, rows| [kind, rows.sum { |row| row['n'].to_i }, rows.sum { |row| row['s'].to_i }] }
+                .sort_by { |_, _, sum| -sum }
+        end
+        income = creature + total.call('box') + total.call('sale') + total.call('bounty')
+        spent = total.call('expense')
+
+        out = banner('GS4 Analytics - Silver', label, who.name)
+        out += heading('Silver in')
+        out += table(%w[Source Silver], [['Corpses', Util.fmt(creature)], ['Boxes', Util.fmt(total.call('box'))],
+                                         ['Sales', Util.fmt(total.call('sale'))], ['Bounties', Util.fmt(total.call('bounty'))]],
+                     footer: ['Total', Util.fmt(income)])
+        unless spent.zero?
+          out += heading('Silver out')
+          out += table(%w[Where Times Silver], by_kind.call('expense').map { |kind, n, sum| [kind, n, Util.fmt(sum)] },
+                       footer: ['Total', '', Util.fmt(spent)])
+        end
+        out += heading('Net')
+        out += table(%w[Metric Silver], [['Found less spent', Util.fmt(income - spent)], ['Bank change', Util.fmt(bank)]],
+                     aligns: %i[left right])
+        sales = by_kind.call('sale')
+        return out if sales.empty?
+
+        out + heading('Sales by vendor') + table(%w[Vendor Sales Silver], sales.map { |kind, n, sum| [kind, n, Util.fmt(sum)] })
+      end
+
+      # Kills, boxes and silver by creature in the range
+      def kill_summary(conn, who, arg)
+        label, from = Report.range_from_arg(arg)
+        return ['Usage: ;analytics report kills [daily|weekly|monthly|ytd|total]'] unless label
+
+        now = Time.now.to_i
+        rows = conn.all('SELECT creature, SUM(kill_count) AS k, SUM(COALESCE(boxes, 0)) AS b, SUM(total_silver) AS s FROM kill_stats ' \
+                        'WHERE game = ? AND character = ? AND date >= ? AND date <= ? GROUP BY 1 ORDER BY 2 DESC',
+                        *who, Report.date_of(from), Report.date_of(now))
+        return ["No kills for #{who.name} in #{label}."] if rows.empty?
+
+        kills = rows.sum { |row| row['k'].to_i }
+        boxes = rows.sum { |row| row['b'].to_i }
+        silver = rows.sum { |row| row['s'].to_i }
+        line = lambda do |name, k, b, sum|
+          [name.to_s[0, 30], Util.fmt(k), Util.fmt(b), "#{Util.percent(b, k) || 0}%", Util.fmt(sum), k.positive? ? Util.fmt(sum / k) : '--']
+        end
+        banner('GS4 Analytics - Kills', label, who.name) + heading('By creature') +
+          table(['Creature', 'Kills', 'Boxes', 'Box rate', 'Silver', 'Silver / kill'],
+                rows.first(25).map { |row| line.call(row['creature'], row['k'].to_i, row['b'].to_i, row['s'].to_i) },
+                footer: line.call('Total', kills, boxes, silver))
       end
 
       def exp_section(cycles, hunt_time, hunts)
@@ -3880,6 +4069,8 @@ module GS4Analytics
               background: var(--card); color: var(--ink); cursor: pointer; }
       .tool:hover:not(:disabled) { border-color: var(--rest); } .tool:disabled { opacity: .6; cursor: default; }
       .back { background: none; border: 0; color: var(--rest); cursor: pointer; font: inherit; padding: 0; }
+      .pin { margin-left: auto; background: none; border: 0; cursor: pointer; color: var(--muted); font-size: 18px; line-height: 1; padding: 0 2px; }
+      .pin.on { color: var(--amber); } .pin:hover { color: var(--amber); }
       @media (max-width: 520px) { .pace { grid-template-columns: 1fr; } }
     </style>
     </head>
@@ -4012,17 +4203,33 @@ module GS4Analytics
       }
 
       // ---------------- everyone ----------------
+      // Pinned characters, saved in this browser, come first everywhere on the overview
+      var pins = [];
+      try { pins = JSON.parse(localStorage.getItem('gs4a-pins') || '[]') || []; } catch (e) { pins = []; }
+      function pinned(id) { return pins.indexOf(id) >= 0; }
+      function togglePin(id) {
+        pins = pinned(id) ? pins.filter(function (p) { return p !== id; }) : pins.concat([id]);
+        try { localStorage.setItem('gs4a-pins', JSON.stringify(pins)); } catch (e) {}
+        renderOverview();
+      }
+      function ordered(list) {
+        return list.filter(function (c) { return pinned(c.id); }).concat(list.filter(function (c) { return !pinned(c.id); }));
+      }
       function renderOverview() {
         if (!ov.characters.length) { $('overview').innerHTML = '<div class="card empty">No characters with data in the last day.</div>'; return; }
-        var cards = ov.characters.map(function (c) {
+        var chars = ordered(ov.characters);
+        var cards = chars.map(function (c) {
+          var on = pinned(c.id);
           return '<div class="card click" data-who="' + esc(c.id) + '"><div class="head"><span class="light l-' + c.light.level + '"></span>' +
-            '<span class="name">' + esc(c.name) + '</span>' + stateHtml(c.state) + '</div>' + reasonsHtml(c.light) + paceHtml(c.pace) +
+            '<span class="name">' + esc(c.name) + '</span>' + stateHtml(c.state) +
+            '<button class="pin no-export' + (on ? ' on' : '') + '" type="button" data-pin="' + esc(c.id) + '" title="' + (on ? 'Unpin' : 'Pin to the top') +
+            '" aria-pressed="' + on + '">' + (on ? '&#9733;' : '&#9734;') + '</button></div>' + reasonsHtml(c.light) + paceHtml(c.pace) +
             '<div class="row small" style="margin-top:8px"><span class="muted">Last kill</span><span data-ago="' + (c.last_kill || '') + '">' + ago(c.last_kill) + '</span></div>' +
             '<div class="row small"><span class="muted">Last bounty</span><span data-ago="' + (c.last_bounty || '') + '">' + ago(c.last_bounty) + '</span></div>' +
             (c.bounty ? '<div class="row small"><span class="muted">Active bounty</span><span>' + esc(c.bounty.target || c.bounty.type) +
               (c.bounty.need ? ' ' + c.bounty.done + '/' + c.bounty.need : '') + ', ' + dur(c.bounty.age) + '</span></div>' : '') + '</div>';
         }).join('');
-        var rows = ov.characters.map(function (c) {
+        var rows = chars.map(function (c) {
           var t = c.today;
           return '<tr><td>' + esc(c.name) + '</td><td>' + short(c.pace.silver.so_far) + '</td><td>' + short(c.pace.exp.so_far) + '</td><td>' + num(c.pace.bounties.so_far) +
             '</td><td>' + num(t.kills) + '</td><td>' + dur(t.hunt_s) + '</td><td>' + (t.uptime_pct == null ? '--' : t.uptime_pct + '%') +
@@ -4032,11 +4239,14 @@ module GS4Analytics
           return '<div class="alert ' + a.level + '" data-who="' + esc(a.id) + '"><b>' + esc(a.character) + '</b> - ' + esc(a.text) + '</div>'; }).join('')
           : '<div class="muted">Nothing to flag.</div>';
         $('overview').innerHTML = '<div class="grid g-status">' + cards + '</div>' +
-          '<section class="card"><h2>Today</h2>' + timeline(ov.characters, ov.day_start) + '</section>' +
+          '<section class="card"><h2>Today</h2>' + timeline(chars, ov.day_start) + '</section>' +
           '<section class="card"><h2>Alerts</h2>' + alerts + '</section>' +
           '<section class="card"><h2>Today side by side</h2><div class="scroll"><table><thead><tr><th>Character</th><th>Silver</th><th>Exp</th><th>Bounties</th>' +
           '<th>Kills</th><th>Hunt time</th><th>Uptime</th><th>Deaths</th><th>Crashes</th><th>Item limit</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>';
         bindWho($('overview'));
+        Array.prototype.forEach.call($('overview').querySelectorAll('[data-pin]'), function (el) {
+          el.onclick = function (e) { e.stopPropagation(); togglePin(el.getAttribute('data-pin')); };
+        });
       }
 
       // ---------------- one character ----------------
@@ -4336,9 +4546,11 @@ module GS4Analytics
         ;analytics report character        all characters, four time windows
         ;analytics report exp [range]      experience per character
         ;analytics report bounty [range]   this character's bounties
-        ;analytics report cycle [range]    this character's hunt/rest cycles
+        ;analytics report cycle [range]    this character's hunt/rest cycles and deaths
+        ;analytics report silver [range]   this character's silver in and out
+        ;analytics report kills [range]    this character's kills, boxes and silver by creature
         ;analytics status                  what the collector is doing
-        ;analytics maintenance compact|vacuum|stats
+        ;analytics maintenance compact|vacuum|stats|backup
       Ranges: daily (default), weekly, monthly, ytd, total
     TEXT
 
@@ -4438,6 +4650,8 @@ module GS4Analytics
                   when 'exp' then Report::Text.exp_summary(conn, range)
                   when 'bounty', 'bounties' then Report::Text.bounty_summary(conn, Who.current, range)
                   when 'cycle', 'cycles' then Report::Text.cycle_summary(conn, Who.current, range)
+                  when 'silver' then Report::Text.silver_summary(conn, Who.current, range)
+                  when 'kill', 'kills' then Report::Text.kill_summary(conn, Who.current, range)
                   else [usage]
                   end
           respond(lines.join("\n"))
@@ -4475,7 +4689,8 @@ module GS4Analytics
                 when 'compact' then [Database.compact_bank_snapshots]
                 when 'vacuum' then [Database.vacuum]
                 when 'stats' then Database.statistics
-                else ["Usage: ;#{Script.current.name} maintenance compact|vacuum|stats"]
+                when 'backup' then [Database.backup]
+                else ["Usage: ;#{Script.current.name} maintenance compact|vacuum|stats|backup"]
                 end
         lines.each { |line| Log.info(line) }
       ensure

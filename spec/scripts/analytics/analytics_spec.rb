@@ -224,6 +224,46 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'boxes and spending' do
+    subject(:spending) { result('spending') }
+
+    it 'adds the boxes column to a database from before it existed' do
+      expect(spending['migrated']).to be(true)
+    end
+
+    it 'counts the boxes found on searched corpses by creature' do
+      expect(spending['kills']).to eq([['flesh monstrosity', 1, 57, 0], ['kobold', 3, 30, 0], ['scaled shaper', 1, 0, 1]])
+    end
+
+    it 'records silver spent at the locksmith (once per quote), the locksmith pool and the priestess' do
+      expect(spending['spent']).to eq([['locksmith', 'Jyhm', 4033], ['locksmith pool', 'Jahck', 750], ['priestess', nil, 1200]])
+    end
+  end
+
+  describe 'silver, kills and deaths reports, death alert and backups' do
+    subject(:money) { result('money_reports') }
+
+    it 'reports silver in by source, silver out by where, and the net' do
+      expect(money['silver']).to eq(%w[600 300 1,000 9,000 10,900 1 1 5,667])
+    end
+
+    it 'reports kills, boxes, box rate and silver by creature, with totals' do
+      expect(money['kills']).to eq(['2', ['Total', '3', '2', '66.7%', '600', '200']])
+    end
+
+    it 'reports deaths, hunting time per death and the time between them' do
+      expect(money['deaths']).to eq(%w[2 0:25 1:00])
+    end
+
+    it 'alerts on a death unless that alert is turned off' do
+      expect(money['alert']).to eq([true, true])
+    end
+
+    it 'backs up to a readable copy and keeps only the newest seven' do
+      expect(money['backup']).to eq([true, 7, 3, true])
+    end
+  end
+
   describe 'sessions' do
     subject(:sessions) { result('sessions') }
 
@@ -601,6 +641,10 @@ RSpec.describe 'analytics.lic' do
 
     it 'serves the page with a restrictive Content-Security-Policy' do
       expect(dashboard['http_index']).to eq(['200', true, true])
+    end
+
+    it 'serves pin buttons that keep favourite characters first, saved in the browser' do
+      expect(dashboard['pins']).to eq([true, true, true])
     end
 
     it 'serves a theme button that is applied before the first paint, with a dark theme that works on a light system' do
