@@ -201,7 +201,7 @@ RSpec.describe 'ecleanse run more than once in a session' do
   end
 
   it 'picks up a changed limit rather than keeping the first run\'s value' do
-    target, = run_twice(action_constants, action_constants.sub('DISARM_MAX = 30', 'DISARM_MAX = 50'))
+    target, = run_twice(action_constants, action_constants.sub('DISARM_MAX = 20', 'DISARM_MAX = 50'))
 
     expect(target.const_get(:DISARM_MAX)).to eq(50)
   end
@@ -249,12 +249,12 @@ RSpec.describe 'ecleanse disarm tracking' do
       expect(items).to eq(['handaxe'])
     end
 
-    it 'cycles out the oldest once 30 are saved' do
-      32.times { |n| action.disarm_add("weapon#{n}") }
+    it 'cycles out the oldest once 20 are saved' do
+      22.times { |n| action.disarm_add("weapon#{n}") }
 
-      expect(items.size).to eq(30)
+      expect(items.size).to eq(20)
       expect(items.first).to eq('weapon2')
-      expect(items.last).to eq('weapon31')
+      expect(items.last).to eq('weapon21')
     end
 
     it 'gives two disarms in the same second their own entries' do
@@ -266,12 +266,12 @@ RSpec.describe 'ecleanse disarm tracking' do
     end
 
     it 'is not corrupted by a disarm landing while another is being removed' do
-      ids = Array.new(30) { |n| action.disarm_add("weapon#{n}") }
-      adder = Thread.new { 15.times { |n| action.disarm_add("new#{n}") } }
-      ids.first(15).each { |id| action.disarm_remove(id) }
+      ids = Array.new(20) { |n| action.disarm_add("weapon#{n}") }
+      adder = Thread.new { 10.times { |n| action.disarm_add("new#{n}") } }
+      ids.first(10).each { |id| action.disarm_remove(id) }
       adder.join
 
-      expect(items).to include(*Array.new(15) { |n| "new#{n}" })
+      expect(items).to include(*Array.new(10) { |n| "new#{n}" })
     end
   end
 
