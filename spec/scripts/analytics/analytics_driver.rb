@@ -124,6 +124,32 @@ end
 
 module Bounty
   def self.task = $task
+
+  # Stand-in for Lich's Bounty::Parser, giving the same shapes for the
+  # taskmaster lines the specs use. Like Lich's, it returns its table of
+  # matchers, not nil, when nothing matches.
+  class Parser
+    TOWN = /task here from the town of (?<town>[^.]+)\./
+    MATCHERS = {
+      escort: /protective escort on (?:his|her) upcoming journey\.  Go to (?<start>[^.]+) and WAIT .* safety to (?<destination>[^.]+) as soon/,
+      bandit_assignment: /It appears they have a bandit problem/,
+      creature_assignment: /It appears they have a creature problem/,
+      gem_assignment: /The local gem dealer, (?<npc_name>[^,]+), has an order/
+    }.freeze
+
+    def initialize(description) = @description = description
+
+    def parse
+      MATCHERS.each do |type, regex|
+        next unless (found = regex.match(@description))
+
+        needs = found.named_captures.transform_keys(&:to_sym)
+        town = @description[TOWN, :town]
+        needs[:town] = town if town
+        return { type: type, requirements: needs, town: town }.compact
+      end
+    end
+  end
 end
 
 source = File.read(lic_path).gsub("\r\n", "\n")
@@ -407,6 +433,9 @@ when 'dashboard'
     'detail_id' => detail['id'], 'steps' => detail['steps'].keys.sort,
     'unknown' => A::Dashboard.character('GS3:Nobody', 'daily').nil?,
     'http_index' => [index.code, index.body.include?('GS4 Analytics'), index['content-security-policy'].to_s.include?("default-src 'none'")],
+    'theme_toggle' => [index.body.include?('id="theme"'), index.body.include?(':root[data-theme="dark"] {'),
+                       index.body.index("localStorage.getItem('gs4a-theme')").to_i < index.body.index('<style>').to_i,
+                       index.body.scan(/<button class="tool no-export" id="theme"/).size],
     'export_button' => [index.body.include?('id="export"'), index.body.include?('function exportImage'),
                         index['content-security-policy'].to_s.include?('img-src data:')],
     'http_api' => api['characters'].size,
@@ -1155,6 +1184,81 @@ when 'kill_time'
   A::Database.record_kill(WHO, 'kobold', 'crags', 30, at: NOW)
   result = { 'days' => A::Database.all('SELECT date, kill_count, total_silver, last_kill_at FROM kill_stats ORDER BY date').map(&:values),
              'yesterday' => (Date.today - 1).to_s, 'today' => Date.today.to_s, 'now' => NOW }
+
+when 'offers'
+  # Every task the taskmaster offers, kept or sent back, from the 2026-11-05 logs
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::BountyManager
+  manager.instance_variable_set(:@who, WHO)
+  manager.instance_variable_set(:@hunt_script, cfg[:hunt_script])
+  manager.instance_variable_set(:@events, Queue.new)
+  manager.send(:clear_tracking)
+  manager.send(:install_hook)
+  $running = ['bigshot']
+  $task = nil
+  feed = lambda do |*lines|
+    lines.each { |line| DownstreamHook.run(line) }
+    manager.send(:drain_events)
+  end
+  told = ->(words) { "<clearStream id='bounty'/><pushStream id='bounty'/>The taskmaster told you:  \"#{words}\"" }
+  malcrith = '<pushBold/><a exist="23813302" noun="Malcrith">Malcrith</a><popBold/>'
+  creature = "Hmm, I've got a task here from the town of Vornavis.  It appears they have a creature problem they'd like you to solve.  " \
+             'Go report to one of the Vornavis gate guards to find out more.  Be sure to ASK about BOUNTIES.'
+  bandit = "Hmm, I've got a task here from the town of Vornavis.  It appears they have a bandit problem they'd like you to solve.  " \
+           'Go report to one of the Vornavis gate guards to find out more.  Be sure to ASK about BOUNTIES.'
+  escort = "I've got a special mission for you.  A certain client has hired us to provide a protective escort on his upcoming journey.  " \
+           'Go to the south end of North Market and WAIT for him to meet you there.  You must guarantee his safety to Zul Logoth ' \
+           'as soon as you can, being ready for any dangers that the two of you may face.  Good luck!'
+  removed = ->(name) { "#{malcrith} says, \"Very well <a exist=\"-1\" noun=\"#{name}\">#{name}</a>, I have removed you from your current assignment.\"" }
+
+  # Kept: the guard names the creature, the hunt starts, it's turned in
+  feed.call(told.call(creature))
+  $task = TaskStub.new(:cull, 'lithe veiled sentinel', 'shadow of the Sanctum', 20)
+  manager.send(:check_task)
+  feed.call('[You have earned 889 bounty points, 1000 experience points, and 8890 silver.]')
+  # Sent back before the guard was asked; another player's removal is not ours
+  $task = nil
+  feed.call(told.call(bandit), removed.call('Ashur'), removed.call('Torvek'))
+  # BOUNTY's own voucher listing is not an expedite; the bracketed line is
+  feed.call('You have 8133 expedited task reassignment vouchers remaining.')
+  feed.call(told.call(creature))
+  feed.call(removed.call('Torvek'), "#{malcrith} says, \"Very well, Torvek.  I'll expedite your task reassignment.\"",
+            '[You have 8132 expedited task reassignment vouchers remaining.]', told.call(escort), removed.call('Torvek'))
+  # Wording the parser doesn't know, replaced by a gem task with no turn-in between
+  feed.call(told.call('Something new the taskmaster says.'))
+  feed.call(told.call("Hmm, I've got a task here from the town of Solhaven.  The local gem dealer, Kahlyr, has an order to fill " \
+                      'and wants our help.  Head over there and see what you can do.  Be sure to ASK about BOUNTIES.'))
+  gem = manager.instance_variable_get(:@offer)[:id]
+  A::Database.flush # a restart follows the last run's final writes
+  # Restarted while still holding it: kept. Restarted with no task: expired.
+  $task = TaskStub.new(:gem, '', 'Solhaven', 9, 'blue sapphire')
+  manager.send(:reconcile_offers)
+  kept = manager.instance_variable_get(:@offer)&.[](:id) == gem
+  $task = TaskStub.new(:none, '', '', nil)
+  manager.send(:reconcile_offers)
+  A::Database.flush
+
+  rows = A::Database.all('SELECT * FROM bounty_offers ORDER BY offered_at, rowid')
+  bounty = A::Database.one('SELECT bounty_id, status FROM bounties')
+  text = A::Database.reader { |conn| A::Report::Text.bounty_summary(conn, WHO, 'daily') }.join("\n")
+  hunt = A::Database.start_cycle(WHO, A::Database.session_for(WHO), :hunt, 'bigshot', 'crags', { exp_total: 1 })
+  run_sql('UPDATE cycles SET start_time = ?, end_time = ?, duration_seconds = 60 WHERE cycle_id = ?', NOW - 60, NOW, hunt)
+  detail = A::Dashboard.character('GS3:Torvek', 'daily')['offers']
+  result = {
+    'rows' => rows.map do |row|
+      [row['assignment'], row['town'], row['area'], row['bounty_type'], row['creature'], row['count'],
+       A::Util.truthy(row['expedited']), row['vouchers_left'], row['outcome']]
+    end,
+    'labels' => rows.map { |row| A::Util.offer_label(row) },
+    'linked' => rows.first['bounty_id'] == bounty['bounty_id'] && bounty['status'] == 'completed',
+    'described' => rows.first['description'].start_with?("Hmm, I've got") && !rows.first['description'].end_with?('"'),
+    'ended' => rows.all? { |row| row['ended_at'] }, 'kept_on_restart' => kept,
+    'report' => [text.include?('Task offers'), text[/Offered\s*\|\s*(\d+)/, 1], text[/Removed\s*\|\s*(\d+)/, 1],
+                 text[/Expedited\s*\|\s*(\d+)/, 1], text.include?('escort to Zul Logoth')],
+    'dashboard' => detail.slice('offered', 'removed', 'expedited', 'vouchers').merge('first' => detail['recent'].first)
+  }
+  DownstreamHook.remove('GS4Analytics::BountyManager')
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

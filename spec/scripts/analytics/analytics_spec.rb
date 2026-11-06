@@ -190,6 +190,40 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'task offers' do
+    subject(:offers) { result('offers') }
+
+    it 'records every task offered, what it turned out to be, and how it ended' do
+      expect(offers['rows']).to eq(
+        [['creature_assignment', 'Vornavis', 'shadow of the Sanctum', 'cull', 'lithe veiled sentinel', 20, false, nil, 'completed'],
+         ['bandit_assignment', 'Vornavis', nil, nil, nil, nil, false, nil, 'removed'],
+         ['creature_assignment', 'Vornavis', nil, nil, nil, nil, false, nil, 'removed'],
+         ['escort', nil, 'Zul Logoth', nil, nil, nil, true, 8132, 'removed'],
+         ['unknown', nil, nil, nil, nil, nil, false, nil, 'replaced'],
+         ['gem_assignment', 'Solhaven', nil, nil, nil, nil, false, nil, 'expired']]
+      )
+    end
+
+    it 'ignores another player\'s removal and the BOUNTY voucher listing, and keeps the task held over a restart' do
+      expect(offers.values_at('kept_on_restart', 'ended')).to eq([true, true])
+    end
+
+    it 'links the kept task to its bounty and stores the taskmaster\'s words' do
+      expect(offers.values_at('linked', 'described')).to eq([true, true])
+    end
+
+    it 'names each task as far as it was known' do
+      expect(offers['labels']).to eq(['cull: lithe veiled sentinel', 'bandit task from Vornavis', 'creature task from Vornavis',
+                                      'escort to Zul Logoth', 'Something new the taskmaster says.', 'gem task from Solhaven'])
+    end
+
+    it 'shows offers, removals and expedites in the bounty report and on the dashboard' do
+      expect(offers['report']).to eq([true, '6', '3', '1', true])
+      expect(offers['dashboard'].slice('offered', 'removed', 'expedited', 'vouchers'))
+        .to eq({ 'offered' => 6, 'removed' => 3, 'expedited' => 1, 'vouchers' => 8132 })
+    end
+  end
+
   describe 'sessions' do
     subject(:sessions) { result('sessions') }
 
@@ -567,6 +601,10 @@ RSpec.describe 'analytics.lic' do
 
     it 'serves the page with a restrictive Content-Security-Policy' do
       expect(dashboard['http_index']).to eq(['200', true, true])
+    end
+
+    it 'serves a theme button that is applied before the first paint, with a dark theme that works on a light system' do
+      expect(dashboard['theme_toggle']).to eq([true, true, true, 1])
     end
 
     it 'serves the page with the save-image button, and allows the data image it draws from' do

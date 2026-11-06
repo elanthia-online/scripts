@@ -34,6 +34,10 @@
   Silver in the reports comes from bank balances. Box, sale and bounty silver
   (silver_events), item sales (item_sales) and vendor visits (vendor_visits)
   are also stored, for your own SQL queries; no report shows them yet.
+  Every task the taskmaster offers is kept too (bounty_offers), including
+  ones you remove before starting and whether an expedite voucher got it;
+  ;analytics report bounty and the dashboard show them.
+
   Creature silver counts only what a corpse had when you searched it; coins
   picked up off the floor show up only in the bank balance.
 
@@ -150,6 +154,22 @@ module GS4Analytics
 
       "#{name} (#{area})"
     end
+
+    # What a task the taskmaster offered was, as far as it was known when it
+    # ended: "cull: kobold", "escort to Zul Logoth", "bandit task from Vornavis"
+    def offer_label(row)
+      type = row['bounty_type'].to_s
+      return "#{type}: #{bounty_target(type, row['creature'], row['area'])}".sub(/: \z/, '') unless type.empty?
+
+      assignment = row['assignment'].to_s
+      return "escort to #{row['area']}".sub(/ to \z/, '') if assignment == 'escort'
+      return "#{assignment.delete_suffix('_assignment')} task from #{row['town']}".sub(/ from \z/, '') if assignment.end_with?('_assignment')
+
+      row['description'].to_s[0, 60].then { |text| text.empty? ? 'unknown' : text }
+    end
+
+    # SQLite hands booleans back as 0 or 1
+    def truthy(value) = [true, 1, 't', '1'].include?(value)
 
     def percent(part, whole, digits = 1)
       whole.to_f.positive? ? (part * 100.0 / whole).round(digits) : nil
@@ -459,7 +479,7 @@ module GS4Analytics
 
     # Cycles shorter than this are state flapping, not real hunts or rests
     MIN_CYCLE_SECONDS = 10
-    SCHEMA_VERSION    = '3'
+    SCHEMA_VERSION    = '4'
     # Queued writes that find the database locked by another Lich session are
     # kept and retried, backing off from 2 s up to 30 s, up to this many
     BUSY_BACKOFF_START_S = 2.0
@@ -764,6 +784,36 @@ module GS4Analytics
                      .order(Sequel.desc(:received_time), Sequel.desc(:rowid)).with_row_proc(STRING_KEYS).all
       end
 
+      # ----- bounty offers ---------------------------------------------------
+
+      def record_offer(who, session_id, cycle_id, offer, id:, at:)
+        db[:bounty_offers].insert(clean(offer_id: id, session_id: session_id, cycle_id: cycle_id, game: who.game,
+                                        character: who.name, offered_at: at, assignment: offer[:assignment],
+                                        town: offer[:town], area: offer[:area], description: offer[:description],
+                                        expedited: offer[:expedited] ? true : false,
+                                        vouchers_left: offer[:vouchers_left], outcome: 'open'))
+      end
+
+      # What the guard or dealer said the task is, once it's known
+      def refine_offer(offer_id, type, creature, area, count)
+        db[:bounty_offers].where(offer_id: offer_id)
+                          .update(clean(bounty_type: type, creature: creature, area: area, count: count))
+      end
+
+      def link_offer(offer_id, bounty_id)
+        db[:bounty_offers].where(offer_id: offer_id).update(bounty_id: bounty_id)
+      end
+
+      # Only an open offer is ended, so a late event can't rewrite an outcome
+      def end_offer(offer_id, outcome, at)
+        db[:bounty_offers].where(offer_id: offer_id, outcome: 'open').update(outcome: outcome, ended_at: at)
+      end
+
+      def open_offers(who)
+        db[:bounty_offers].where(game: who.game, character: who.name, outcome: 'open')
+                          .order(Sequel.desc(:offered_at), Sequel.desc(:rowid)).with_row_proc(STRING_KEYS).all
+      end
+
       # ----- bank ------------------------------------------------------------
 
       # { bank name => balance } as of each bank's newest snapshot, '__total__'
@@ -816,8 +866,8 @@ module GS4Analytics
       end
 
       def statistics
-        counts = %i[sessions cycles kill_stats bounties silver_events item_sales bank_snapshots rest_steps
-                    vendor_visits].map { |table| "#{table}: #{Util.fmt(db[table].count)}" }
+        counts = %i[sessions cycles kill_stats bounties bounty_offers silver_events item_sales bank_snapshots
+                    rest_steps vendor_visits].map { |table| "#{table}: #{Util.fmt(db[table].count)}" }
         counts << "size: #{(File.size(file) / 1_048_576.0).round(2)} MB"
       end
 
@@ -1030,6 +1080,32 @@ module GS4Analytics
           String :status, default: 'active'
           index %i[game character status]
           index %i[game character completed_time]
+        end
+
+        # Every task the taskmaster hands out, kept or not: what it was, whether
+        # an expedite voucher got it, and how it ended (open, completed,
+        # removed, replaced or expired)
+        db.create_table?(:bounty_offers) do
+          String :offer_id, primary_key: true
+          String :session_id, null: false
+          String :cycle_id
+          String :game, null: false
+          String :character, null: false
+          Integer :offered_at, null: false
+          Integer :ended_at
+          String :assignment
+          String :town
+          String :description
+          String :bounty_type
+          String :creature
+          String :area
+          Integer :count
+          TrueClass :expedited, default: false
+          Integer :vouchers_left
+          String :outcome, default: 'open'
+          String :bounty_id
+          index %i[game character offered_at]
+          index %i[game character outcome]
         end
 
         # silver_events, item_sales and vendor_visits are stored for the
@@ -1487,6 +1563,13 @@ module GS4Analytics
     # [You have earned 1106 bounty points, 1100 experience points, and 11066 silver.]
     REWARD_RE = /You have earned ([\d,]+) bounty points?(?:(?:, | and )([\d,]+) experience points?)?(?:,? and ([\d,]+) silver)?/i
     ABANDON_RE = /You have abandoned your current task/i
+    # A new assignment shows in the character's own bounty window as
+    # 'The taskmaster told you:  "..."'; nothing else prints that line
+    OFFER_MARK = 'The taskmaster told you:'
+    # Bracketed, it's the voucher just spent; BOUNTY's own listing has no brackets
+    VOUCHER_RE = /\A\s*\[You have ([\d,]+) expedited task reassignment vouchers? remaining\.\]/
+    REMOVED_MARK = 'I have removed you from your current assignment'
+    EXPEDITE_WINDOW = 10 # seconds from the voucher to the offer it bought
     LOOP_INTERVAL = 0.5
     TASK_EVERY = 4 # loops, so every 2 seconds
     # Task states after the work is done and only the reward is left: the task is
@@ -1500,6 +1583,7 @@ module GS4Analytics
         @events = Queue.new
         @active = true
         clear_tracking
+        reconcile_offers
         reconcile_active_bounties
         install_hook
         @thread = Thread.new { monitor }
@@ -1532,6 +1616,26 @@ module GS4Analytics
         Log.error('bounty reconcile', e)
       end
 
+      # The newest open offer is the task still held, unless there is none;
+      # older open ones were left by a crash or restart
+      def reconcile_offers
+        @offer = @expedite = nil
+        open = Database.open_offers(@who)
+        return if open.empty?
+
+        live = Util.safely { Bounty.task }
+        keep = open.first unless live.nil? || live.none?
+        stale = open.reject { |row| row.equal?(keep) }.map { |row| row['offer_id'] }
+        now = Time.now.to_i
+        Database.async { stale.each { |id| Database.end_offer(id, 'expired', now) } } if stale.any?
+        return unless keep
+
+        detail = keep.values_at('bounty_type', 'creature', 'area')
+        @offer = { id: keep['offer_id'], detail: detail.compact.empty? ? nil : detail }
+      rescue StandardError => e
+        Log.error('offer reconcile', e)
+      end
+
       # Parse only; the monitor thread owns all state and all writes
       def install_hook
         DownstreamHook.remove(HOOK)
@@ -1544,6 +1648,13 @@ module GS4Analytics
               elsif text.match?(ABANDON_RE)
                 @events << [:abandon]
               end
+            elsif line.include?(OFFER_MARK)
+              @events << [:offer, line.gsub(/<[^>]+>/, '').strip, Time.now.to_i]
+            elsif line.include?('expedited task reassignment')
+              found = line.gsub(/<[^>]+>/, '').match(VOUCHER_RE)
+              @events << [:expedite, found[1].delete(',').to_i, Time.now.to_i] if found
+            elsif line.include?(REMOVED_MARK) && line.gsub(/<[^>]+>/, '').include?("Very well #{@who.name},")
+              @events << [:removed, Time.now.to_i]
             end
           rescue StandardError => e
             Log.error('bounty hook', e)
@@ -1569,7 +1680,13 @@ module GS4Analytics
       def drain_events
         until @events.empty?
           event, *args = @events.pop(true)
-          event == :reward ? handle_reward(*args) : handle_abandon
+          case event
+          when :reward then handle_reward(*args)
+          when :offer then handle_offer(*args)
+          when :expedite then @expedite = { left: args[0], at: args[1] }
+          when :removed then handle_removed(*args)
+          else handle_abandon
+          end
         end
       rescue ThreadError
         nil
@@ -1601,7 +1718,74 @@ module GS4Analytics
           Database.record_silver(who, session, cycle, 'bounty', silver, bounty_type: type, at: at)
         end
         Log.debug("Bounty completed: #{@type} (#{silver} silver, #{exp} exp, #{bp} BP)")
+        finish_offer('completed', at, id)
         clear_tracking
+      end
+
+      # A new assignment. One still open was neither turned in nor removed
+      # (a failed task, or a reward line we never saw): it was replaced.
+      def handle_offer(text, at)
+        finish_offer('replaced', at)
+        expedite = @expedite if @expedite && at - @expedite[:at] <= EXPEDITE_WINDOW
+        @expedite = nil
+        offer = parse_offer(text).merge(description: text.sub(/\A.*?#{Regexp.escape(OFFER_MARK)}\s*"?/, '').sub(/"\s*\z/, ''),
+                                        expedited: !expedite.nil?, vouchers_left: expedite&.[](:left))
+        who = @who
+        session = Database.session_for(who)
+        cycle = cycle_id
+        id = Database.new_id
+        Database.async { Database.record_offer(who, session, cycle, offer, id: id, at: at) }
+        @offer = { id: id, detail: nil }
+        Log.debug("Bounty offered: #{offer[:assignment]} #{offer[:town]}#{' (expedited)' if expedite}")
+      end
+
+      # Removed at the taskmaster, before or after the work started
+      def handle_removed(at)
+        finish_offer('removed', at)
+        handle_abandon
+      end
+
+      def finish_offer(outcome, at, bounty_id = nil)
+        offer = @offer or return
+
+        @offer = nil
+        id = offer[:id]
+        Database.async do
+          Database.link_offer(id, bounty_id) if bounty_id
+          Database.end_offer(id, outcome, at)
+        end
+      end
+
+      # Lich's own reading of the taskmaster's words: the assignment type
+      # (creature_assignment, escort, ...), the town, and an escort's destination
+      def parse_offer(text)
+        parser = Util.safely { Bounty::Parser }
+        result = parser && Util.safely { parser.new(text).parse }
+        # With no match, Parser#parse returns its table of matchers, not nil
+        return { assignment: 'unknown' } unless result.is_a?(Hash) && result[:type].is_a?(Symbol)
+
+        needs = result[:requirements] || {}
+        { assignment: result[:type].to_s, town: (result[:town] || needs[:town])&.to_s,
+          area: (needs[:destination] || needs[:area])&.to_s }
+      end
+
+      # The guard or dealer says what the offered task is; the first count seen
+      # is the one asked for
+      def refine_offer(task)
+        detail = task.values_at(:type, :creature, :area)
+        return if @offer[:detail] == detail
+
+        @offer[:detail] = detail
+        id = @offer[:id]
+        count = task[:count]
+        Database.async { Database.refine_offer(id, *detail, count) }
+      end
+
+      def link_offer(bounty_id)
+        return unless @offer
+
+        id = @offer[:id]
+        Database.async { Database.link_offer(id, bounty_id) }
       end
 
       # [task, when it was first seen] for a reward that arrived with no tracked bounty
@@ -1624,6 +1808,7 @@ module GS4Analytics
 
       def check_task
         task = task_info
+        refine_offer(task) if @offer && task
         remember(task)
         forget_seen unless task
         if @bounty_id
@@ -1676,6 +1861,7 @@ module GS4Analytics
         @area = task[:area]
         @required = required
         @done = 0
+        link_offer(id)
         track_progress(task[:count])
         Log.debug("New bounty: #{task[:type]} #{task[:creature]} #{task[:area]} #{required}")
       end
@@ -1687,6 +1873,7 @@ module GS4Analytics
         @area = row['area'].to_s
         @required = row['count_required']&.to_i
         @done = row['count_completed'].to_i
+        link_offer(@bounty_id)
         Log.debug("Tracking bounty: #{@type} #{@creature}")
       end
 
@@ -2754,6 +2941,7 @@ module GS4Analytics
                      [['Silver', Util.fmt(average.call(done, 'silver_reward')), Util.fmt(sum.call(done, 'silver_reward'))],
                       ['Experience', Util.fmt(average.call(done, 'exp_reward')), Util.fmt(sum.call(done, 'exp_reward'))],
                       ['Bounty points', Util.fmt(average.call(done, 'bp_reward')), Util.fmt(sum.call(done, 'bp_reward'))]])
+        out += offers_section(conn, who, from, now)
         return out if done.empty?
 
         breakdown = lambda do |title, groups, limit, first_head|
@@ -2772,6 +2960,29 @@ module GS4Analytics
                                 with_creature.group_by { |row| [row['bounty_type'], row['creature']] }, 20, 'Type / creature')
         end
         out + value_per_hour(rows.reject { |row| row['status'] == 'active' })
+      end
+
+      # Every task the taskmaster handed out, and the ones sent back
+      def offers_section(conn, who, from, now)
+        offers = conn.all('SELECT * FROM bounty_offers WHERE game = ? AND character = ? AND offered_at >= ? AND offered_at <= ? ' \
+                          'ORDER BY offered_at', *who, from, now)
+        return [] if offers.empty?
+
+        count = ->(outcome) { offers.count { |row| row['outcome'] == outcome } }
+        removed = offers.select { |row| row['outcome'] == 'removed' }
+        vouchers = offers.reverse.find { |row| row['vouchers_left'] }&.[]('vouchers_left')
+        out = heading('Task offers')
+        out += table(%w[Offers Count], [['Offered', offers.size], ['Completed', count.call('completed')],
+                                        ['Still open', count.call('open')], ['Removed', removed.size],
+                                        ['Replaced or expired', count.call('replaced') + count.call('expired')],
+                                        ['Removal rate', "#{Util.percent(removed.size, offers.size) || 0}%"],
+                                        ['Expedited', offers.count { |row| Util.truthy(row['expedited']) }],
+                                        ['Vouchers left', vouchers ? Util.fmt(vouchers) : '--']])
+        return out if removed.empty?
+
+        list = removed.group_by { |row| Util.offer_label(row) }.sort_by { |label, group| [-group.size, label] }
+                      .first(15).map { |label, group| [label[0, 40], group.size] }
+        out + heading('Removed tasks') + table(%w[Task Count], list)
       end
 
       # Rewards per hour spent on the bounty (received to turn-in), so types
@@ -3334,7 +3545,8 @@ module GS4Analytics
             'steps' => covered.zero? ? {} : step_secs.transform_values { |v| (v / covered).round(1) },
             'steps_covered' => covered,
             'trends' => trends, 'trend' => trend_meta,
-            'grounds' => hunting_grounds(conn, who), 'recent_bounties' => recent_bounties(conn, who)
+            'grounds' => hunting_grounds(conn, who), 'recent_bounties' => recent_bounties(conn, who),
+            'offers' => offers_for(conn, who, from, now)
           }
         end
       end
@@ -3376,6 +3588,21 @@ module GS4Analytics
             'took' => row['completed_time'] ? row['completed_time'].to_i - row['received_time'].to_i : nil,
             'silver' => row['silver_reward'], 'exp' => row['exp_reward'] }
         end
+      end
+
+      # The tasks offered in the range, newest first, with the ones sent back
+      def offers_for(conn, who, from, now)
+        rows = conn.all('SELECT * FROM bounty_offers WHERE game = ? AND character = ? AND offered_at >= ? AND offered_at <= ? ' \
+                        'ORDER BY offered_at DESC, rowid DESC', *who, from, now)
+        {
+          'offered' => rows.size, 'removed' => rows.count { |row| row['outcome'] == 'removed' },
+          'expedited' => rows.count { |row| Util.truthy(row['expedited']) },
+          'vouchers' => rows.find { |row| row['vouchers_left'] }&.[]('vouchers_left'),
+          'recent' => rows.first(15).map do |row|
+            { 'at' => row['offered_at'].to_i, 'task' => Util.offer_label(row), 'outcome' => row['outcome'].to_s,
+              'expedited' => Util.truthy(row['expedited']) }
+          end
+        }
       end
 
       # Per-bucket values against the character's own baseline. Today is shown
@@ -3554,7 +3781,14 @@ module GS4Analytics
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>GS4 Analytics</title>
+    <script>
+      // The theme picked with the Theme button, applied before the first paint
+      try { var saved = localStorage.getItem('gs4a-theme');
+            if (saved === 'light' || saved === 'dark') document.documentElement.setAttribute('data-theme', saved); } catch (e) {}
+    </script>
     <style>
+      :root { color-scheme: light dark; }
+      :root[data-theme="light"] { color-scheme: light; }
       :root {
         --bg: #f4f5f7; --card: #ffffff; --ink: #1c2330; --muted: #667085; --line: #e3e6ec; --soft: #eef0f4;
         --hunt: #1f9d55; --rest: #2f6fdb; --idle: #d98a00; --dead: #d13b3b; --off: #8b93a1;
@@ -3570,6 +3804,15 @@ module GS4Analytics
           --c0: #5b97ff; --c1: #ff8a52; --c2: #3ccf7a; --c3: #b085ff; --c4: #ff6fb5; --c5: #3dd3e0;
           --s0: #5b97ff; --s1: #ff8a52; --s2: #3ccf7a; --s3: #b085ff; --s4: #ff6fb5; --s5: #3dd3e0; --s6: #6d7789;
         }
+      }
+      /* Dark chosen with the Theme button, whatever the system setting */
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        --bg: #0f131a; --card: #171d27; --ink: #e8ecf3; --muted: #93a0b5; --line: #263041; --soft: #1e2532;
+        --hunt: #3ccf7a; --rest: #5b97ff; --idle: #f0ad2e; --dead: #ff6b6b; --off: #6d7789;
+        --green: #3ccf7a; --amber: #f0ad2e; --red: #ff6b6b; --gray: #6d7789;
+        --c0: #5b97ff; --c1: #ff8a52; --c2: #3ccf7a; --c3: #b085ff; --c4: #ff6fb5; --c5: #3dd3e0;
+        --s0: #5b97ff; --s1: #ff8a52; --s2: #3ccf7a; --s3: #b085ff; --s4: #ff6fb5; --s5: #3dd3e0; --s6: #6d7789;
       }
       * { box-sizing: border-box; }
       body { margin: 0; background: var(--bg); color: var(--ink);
@@ -3646,6 +3889,7 @@ module GS4Analytics
         <h1>GS4 Analytics</h1>
         <span class="sub"><span class="live" id="liveDot"></span><span id="statusText">connecting</span></span>
         <span class="spacer"></span>
+        <button class="tool no-export" id="theme" type="button" title="Switch between the system theme, light and dark">Theme: Auto</button>
         <button class="tool no-export" id="export" type="button" title="Save this view as a PNG image">Save image</button>
         <label class="sub" for="who">View</label>
         <select id="who"><option value="">Everyone</option></select>
@@ -3656,6 +3900,23 @@ module GS4Analytics
     </div>
 
     <script>
+    (function () {
+      // Theme button: Auto (follow the system), Light, Dark, and round again
+      var themeBtn = document.getElementById('theme'), THEMES = ['auto', 'light', 'dark'];
+      function showTheme() {
+        var t = document.documentElement.getAttribute('data-theme') || 'auto';
+        themeBtn.textContent = 'Theme: ' + t.charAt(0).toUpperCase() + t.slice(1);
+      }
+      themeBtn.onclick = function () {
+        var cur = document.documentElement.getAttribute('data-theme') || 'auto';
+        var next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+        if (next === 'auto') document.documentElement.removeAttribute('data-theme');
+        else document.documentElement.setAttribute('data-theme', next);
+        try { if (next === 'auto') localStorage.removeItem('gs4a-theme'); else localStorage.setItem('gs4a-theme', next); } catch (e) {}
+        showTheme();
+      };
+      showTheme();
+    })();
     (function () {
       var who = decodeURIComponent(location.hash.slice(1)), range = 'daily';
       var ov = null, det = null, offset = 0, failed = 0;
@@ -3866,6 +4127,8 @@ module GS4Analytics
           chip('Silver', short(rs.silver), short(rs.silver_hr) + ' / hr, ' + short(rs.silver_hunt_hr) + ' / hunt hr') +
           chip('Experience', short(rs.exp), short(rs.exp_hr) + ' / hr, ' + short(rs.exp_hunt_hr) + ' / hunt hr') +
           chip('Bounties', num(rs.bounties), (rs.bounties_hunt_hr == null ? '--' : rs.bounties_hunt_hr) + ' / hunt hr, ' + rs.abandoned + ' abandoned') +
+          chip('Task offers', num(c.offers.offered), c.offers.removed + ' removed, ' + c.offers.expedited + ' expedited' +
+            (c.offers.vouchers == null ? '' : ', ' + num(c.offers.vouchers) + ' vouchers left')) +
           chip('Kills', num(rs.kills), rs.deaths + ' death' + (rs.deaths === 1 ? '' : 's')) +
           chip('Avg hunt / rest', dur(rs.hunt_avg) + ' / ' + dur(rs.rest_avg), rs.hunts + ' hunts, ' + (rs.uptime_pct == null ? '--' : rs.uptime_pct + '%') + ' hunting') +
           '</div><div class="small muted" style="margin:12px 0 8px">Typical = average of ' + esc(basis) + '</div>' +
@@ -3900,10 +4163,16 @@ module GS4Analytics
             return '<tr><td>' + clock(r.received) + '</td><td style="text-align:left">' + esc(r.type) + '</td><td style="text-align:left">' + esc(r.target) + '</td><td style="text-align:left">' + esc(r.status) + '</td><td>' + dur(r.took) +
               '</td><td>' + short(r.silver) + '</td><td>' + short(r.exp) + '</td></tr>'; }).join('') + '</tbody></table></div>'
           : '<div class="muted">No bounties yet.</div>';
+        var offers = c.offers.recent.length ? '<div class="scroll"><table><thead><tr><th>Offered</th><th style="text-align:left">Task</th><th style="text-align:left">Outcome</th><th style="text-align:left">Expedited</th></tr></thead><tbody>' +
+          c.offers.recent.map(function (o) {
+            return '<tr' + (o.outcome === 'removed' ? ' class="mark"' : '') + '><td>' + clock(o.at) + '</td><td style="text-align:left">' + esc(o.task) + '</td><td style="text-align:left">' + esc(o.outcome) +
+              '</td><td style="text-align:left">' + (o.expedited ? 'yes' : '') + '</td></tr>'; }).join('') + '</tbody></table></div>'
+          : '<div class="muted">No tasks offered in this range.</div>';
 
         $('detail').innerHTML = head + summary + health +
           '<section class="card"><h2>Hunting grounds - last 30 days, best exp first</h2>' + grounds + '</section>' +
-          '<section class="card"><h2>Recent bounties</h2>' + recent + '</section>';
+          '<section class="grid g-2"><div class="card"><h2>Recent bounties</h2>' + recent + '</div>' +
+          '<div class="card"><h2>Task offers (' + esc(c.label) + ', removed in bold)</h2>' + offers + '</div></section>';
         $('back').onclick = function () { setWho(''); };
         Array.prototype.forEach.call($('tabs').querySelectorAll('button'), function (bt) {
           bt.onclick = function () { range = bt.getAttribute('data-r'); loadDetail(); };
