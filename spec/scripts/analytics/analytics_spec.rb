@@ -109,8 +109,8 @@ RSpec.describe 'analytics.lic' do
     it 'never stamps an old EXPERIENCE reading as current' do
       # The reading from before the script started isn't in the first row
       expect(progress['first']).to eq('level' => 100, 'exp' => 900_000, 'ascension_exp' => 100_000, 'until_next' => 1500,
-                                       'fame' => nil, 'deeds' => nil, 'long_term_exp' => nil, 'deaths_sting' => nil,
-                                       'ptp' => nil, 'lumnis' => nil)
+                                      'fame' => nil, 'deeds' => nil, 'long_term_exp' => nil, 'deaths_sting' => nil,
+                                      'ptp' => nil, 'lumnis' => nil)
       expect(progress['reading']).to eq('deaths_sting' => 'Light', 'fame' => 5000, 'deeds' => 12, 'long_term_exp' => 59)
       expect(progress['heartbeat']).to eq('exp' => 900_500, 'deaths_sting' => nil, 'fame' => nil)
     end
@@ -377,7 +377,7 @@ RSpec.describe 'analytics.lic' do
     subject(:writes) { result('writer_safety') }
 
     it 'syncs at checkpoints (synchronous = NORMAL) on every writer connection, in WAL mode' do
-      expect(writes['synchronous']).to eq([1, 1])
+      expect(writes['synchronous']).to eq([1, 1, 'normal'])
     end
 
     it 'indexes bounties by received time' do

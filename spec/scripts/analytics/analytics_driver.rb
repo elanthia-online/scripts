@@ -824,7 +824,6 @@ when 'close_writes'
   db.connect!
   result['once'] = count.call('once')
 
-
 when 'baseline'
   # With no bank total yet, starting takes one listing; after that it doesn't
   A::Database.connect!
@@ -1515,7 +1514,9 @@ when 'writer_safety'
   A::Database.connect!
   sync = ->(conn) { conn.fetch('PRAGMA synchronous').single_value }
   result = {
-    'synchronous'    => [sync.call(A::Database.db), Thread.new { sync.call(A::Database.db) }.value],
+    # the pragma reads 1 either way with Lich's gem (NORMAL is its WAL default): the
+    # setting itself is what makes another build the same
+    'synchronous'    => [sync.call(A::Database.db), Thread.new { sync.call(A::Database.db) }.value, A::Database.db.opts[:synchronous]],
     'received_index' => A::Database.db.indexes(:bounties).values.any? { |i| i[:columns] == %i[game character received_time] }
   }
   # The writer survives an error of its own and keeps writing, in order
@@ -1585,7 +1586,7 @@ when 'progress'
   fresh = A::Vitals.read
   id = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'crags', fresh, at: NOW - 600)
   A::Database.end_cycle(id, fresh, nil, at: NOW - 60)
-  P.stop(now: t + 5000)                # and a last row
+  P.stop(now: t + 5000) # and a last row
   A::Database.flush
   rows = A::Database.all('SELECT * FROM progress ORDER BY timestamp')
   cycle = A::Database.one('SELECT exp_regular_start, exp_regular_end, exp_asc_start, exp_asc_end, exp_total_start FROM cycles')
@@ -1614,8 +1615,8 @@ when 'shops'
     20 => shop_room.new(20, ['gemshop', 'urchin guide gemshop'], "Wehnimer's Landing", '[Gems]', 1),
     30 => shop_room.new(30, ['locksmith', 'locksmith pool'], 'the lowlands of Marshtown', '[Pool]', 2),
     40 => shop_room.new(40, ['consignment'], 'Solhaven', '[Consignment]', 2),
-    1 => shop_room.new(1, ['town'], "the town of Wehnimer's Landing", '[Town Square Central]', 1),
-    2 => shop_room.new(2, ['town'], 'the free port of Solhaven', '[Solhaven, North Market]', 2)
+    1  => shop_room.new(1, ['town'], "the town of Wehnimer's Landing", '[Town Square Central]', 1),
+    2  => shop_room.new(2, ['town'], 'the free port of Solhaven', '[Solhaven, North Market]', 2)
   }.freeze
   Object.const_set(:Room, Class.new do
     def self.current = ROOMS[$room_id]
@@ -1643,7 +1644,7 @@ when 'shops'
   W.note(spent: 300)
   A::SilverManager.record_vendor_visit('api', t + 110, t + 120, 777) # ignored: tracked already
   $room_id = 40
-  W.tick(t + 130)                      # the consignment shop, whose clerk calls itself a pawnbroker
+  W.tick(t + 130) # the consignment shop, whose clerk calls itself a pawnbroker
   DownstreamHook.run('The pawnbroker takes your silver ring, glances at it, and hands you 400 silvers.')
   W.tick(t + 131)
   $room_id = 10
