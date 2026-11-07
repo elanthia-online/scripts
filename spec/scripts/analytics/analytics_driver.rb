@@ -399,6 +399,9 @@ when 'collector'
   DownstreamHook.run('Penny summons a swarm of painted lady moths from her silvery fossil charm, which takes off in search of silvers.  ' \
                      'They locate a pile of 5,000 coins on the floor, reclaiming them and returning to her.')
   DownstreamHook.run('You gather the remaining 250 coins from inside your box')
+  # Coins off the floor (GET COINS); another line that only mentions coins isn't
+  DownstreamHook.run('You gather the remaining 1,234 coins.')
+  DownstreamHook.run('Bob says, "You gather the remaining 99 coins."')
   # A selling script reporting its own visits (only heard with track_shops off)
   A::Settings.instance_variable_set(:@current, cfg.merge(track_shops: false))
   A::SilverManager.record_vendor_visit('gemshop', NOW - 100, NOW - 50, 12_345)
@@ -410,6 +413,7 @@ when 'collector'
     'hook_registered' => hook, 'cfg_hunt' => cfg[:hunt_script],
     'kills' => kills.map(&:values),
     'box' => A::Database.all("SELECT amount FROM silver_events WHERE source_category = 'box' ORDER BY amount").map { |r| r['amount'] },
+    'floor' => A::Database.all("SELECT amount FROM silver_events WHERE source_category = 'floor'").map { |r| r['amount'] },
     'visit_seconds' => A::Database.one('SELECT duration_seconds FROM vendor_visits')['duration_seconds'],
     'unit_price' => A::Database.one('SELECT unit_price FROM item_sales')['unit_price']
   }
@@ -1054,9 +1058,31 @@ when 'cycle_edges'
   A::Database.flush
   ended = A::Database.one('SELECT end_time, rest_reason FROM cycles WHERE cycle_id = ?', hunt)
   died = A::Database.one('SELECT cycle_type, start_time FROM cycles WHERE cycle_id = ?', dead)
+  # Revived: the rest that follows says it recovers from the death
+  $running = []
+  $rest_reason = ''
+  # (each one backdated, so it's long enough to keep)
+  backdate = lambda do |id, ago|
+    A::Database.flush
+    run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', Time.now.to_i - ago, id)
+    manager.instance_variable_set(:@cycle_started_at, Time.now.to_i - ago)
+  end
+  backdate.call(dead, 900)
+  manager.send(:transition_to, :rest)
+  recovery = manager.current_cycle_id
+  backdate.call(recovery, 600)
+  # A hunt still going at midnight is cut there, and says so
+  manager.send(:transition_to, :hunt)
+  cut = manager.current_cycle_id
+  backdate.call(cut, 300)
+  manager.instance_variable_set(:@day, (Date.today - 1).to_s)
+  manager.send(:roll_over_midnight)
+  A::Database.flush
+  reason_of = ->(id) { A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', id)&.[]('rest_reason') }
   result['death'] = {
     'hunt_reason' => ended['rest_reason'], 'short_rest_dropped' => A::Database.all('SELECT 1 FROM cycles WHERE cycle_id = ?', rest).empty?,
-    'no_gap' => died['start_time'] == ended['end_time'], 'dead' => died['cycle_type']
+    'no_gap' => died['start_time'] == ended['end_time'], 'dead' => died['cycle_type'],
+    'after_death' => reason_of.call(recovery), 'midnight' => reason_of.call(cut), 'after_midnight' => reason_of.call(manager.current_cycle_id)
   }
 
 when 'bigshot_status'
@@ -1630,7 +1656,14 @@ when 'writer_safety'
 when 'progress'
   A::Database.connect!
   P = A::ProgressManager
-  $read_at = Time.now - 86_400 # an EXPERIENCE reading from a day ago, kept by infomon
+  # EXPERIENCE output as the game sends it, tags and all
+  experience = lambda do |fame:, sting:, lte:, deeds:|
+    ['<output class="mono"/>', '', "          Level: 100                         Fame: #{fame}",
+     '     Experience: 900,500             Field Exp: 400/800', '  Ascension Exp: 100,000          Recent Deaths: 1',
+     "      Total Exp: 1,000,500         Death's Sting: #{sting}", "  Long-Term Exp: #{lte}                  Deeds: #{deeds}",
+     '     Exp to next TP: 1,500'].each { |line| DownstreamHook.run(line) }
+  end
+  $read_at = Time.now - 86_400 # infomon's reading from a day ago: not one this session saw
   P.start(WHO)
   sleep 0.3 # the first read, from the thread
   hook = DownstreamHook.names.include?('GS4Analytics::ProgressManager')
@@ -1639,27 +1672,38 @@ when 'progress'
   soon = P.check(now: t + 30)          # experience alone: waits for the heartbeat
   later = P.check(now: t + 400)
   $sting = 'Light'
-  sting_unread = P.check(now: t + 405) # Lich's value changed, but no new EXPERIENCE: not written
-  $read_at = Time.at(t + 409)          # EXPERIENCE typed
-  read = P.check(now: t + 410)         # a new reading: at once
-  # Another player's words, then the real EXPERIENCE line
+  sting_unread = P.check(now: t + 405) # Lich's value changed, but no EXPERIENCE seen: not written
+  sleep 1.1                            # a reading is stamped with the clock: a second from the first row
+  # EXPERIENCE typed right after a death: the total is the same, only the sting moved,
+  # so infomon's time for the total doesn't move. The reading is read from the text.
+  experience.call(fame: '7,777', sting: 'Sharp', lte: 61, deeds: 13)
+  read = P.check(now: t + 410) # a new reading: at once
+  # Another player's words, then the real training-point line
   DownstreamHook.run('Bob says, "PTPs/MTPs: 999/888 ATPs: 777"')
+  DownstreamHook.run(%(Bob says, "      Total Exp: 1 Death's Sting: Harsh"))
   ignored = P.check(now: t + 415)
   DownstreamHook.run('<output class="mono"/>       PTPs/MTPs: 36/0                        ATPs: 6')
   tps = P.check(now: t + 420)
+  sleep 1.1
+  # RESOURCE output, as the game sends it, ended by the prompt
+  ['<output class="mono"/>', 'Health: 280/<pushBold/>300<popBold/>     Mana: 40/80     Stamina: 120/120     Spirit: 10/10',
+   'Devotion: 12,345/50,000 (Weekly)           67,890/200,000 (Total)', 'Suffused Devotion: 4,321', 'Voln Favor: 98,765',
+   'Bob says, "Voln Favor: 1"', '<prompt time="1">&gt;</prompt>'].each { |line| DownstreamHook.run(line) }
+  resource = P.check(now: t + 450)
   same = P.check(now: t + 500)         # nothing changed
   beat = P.check(now: t + 4100)        # the hourly heartbeat
-  sleep 1.1 # the sting's end is stamped with the clock: a second apart from the first row
+  sleep 1.1
+  experience.call(fame: '7,800', sting: 'Light', lte: 61, deeds: 13) # a potion eases it
+  sleep 1.1
   DownstreamHook.run('You feel the sting of a recent death slowly fade away, yet a lingering weakness remains.')
   P.check(now: t + 4150)
   eased = A::Database.flush && A::Database.one("SELECT COUNT(*) AS n FROM progress WHERE deaths_sting = 'None'")['n']
+  sleep 1.1
   DownstreamHook.run('You feel the sting of a recent death slowly fade away.')
   P.check(now: t + 4200)
-  # Fame on a cycle only from a reading fresh at that moment
-  $read_at = Time.now - 3600
-  stale = A::Vitals.read
-  $read_at = Time.now
-  fresh = A::Vitals.read
+  # Fame on a cycle only from a reading fresh at that moment (the last one the hook saw)
+  stale = A::Vitals.read(since: Time.now.to_i + 60)
+  fresh = A::Vitals.read(since: Time.now.to_i - 60)
   id = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'crags', fresh, at: NOW - 600)
   A::Database.end_cycle(id, fresh, nil, at: NOW - 60)
   P.stop(now: t + 5000) # and a last row
@@ -1667,15 +1711,20 @@ when 'progress'
   rows = A::Database.all('SELECT * FROM progress ORDER BY timestamp')
   cycle = A::Database.one('SELECT exp_regular_start, exp_regular_end, exp_asc_start, exp_asc_end, exp_total_start FROM cycles')
   at = ->(dt) { rows.find { |r| r['timestamp'] == t + dt } }
+  sting = ->(level) { rows.find { |r| r['deaths_sting'] == level } }
   result = {
     'hook' => hook, 'hook_removed' => !DownstreamHook.names.include?('GS4Analytics::ProgressManager'),
-    'checks' => [soon, later, sting_unread, read, ignored, tps, same, beat], 'rows' => rows.size,
+    'checks' => [soon, later, sting_unread, read, ignored, tps, same, beat], 'rows' => rows.size, 'resource_check' => resource,
+    'resource' => rows.find { |r| r['resource_name'] }&.slice('resource_name', 'resource_weekly', 'resource_total', 'suffused', 'voln_favor',
+                                                              'covert_arts_charges', 'fame', 'deaths_sting'),
     'first' => rows.first&.slice('level', 'exp', 'ascension_exp', 'until_next', 'fame', 'deeds', 'long_term_exp', 'deaths_sting', 'ptp', 'lumnis'),
-    'reading' => at.call(410)&.slice('deaths_sting', 'fame', 'deeds', 'long_term_exp'),
+    'reading' => sting.call('Sharp')&.slice('deaths_sting', 'fame', 'deeds', 'long_term_exp'),
+    'reading_at_its_time' => sting.call('Sharp') && sting.call('Sharp')['timestamp'] < t + 30,
+    'eased' => sting.call('Light')&.slice('deaths_sting', 'fame'),
     'heartbeat' => at.call(4100)&.slice('exp', 'deaths_sting', 'fame'),
     'tps' => rows.select { |r| r['ptp'] }.map { |r| r.slice('ptp', 'mtp', 'atp') },
     'gone' => [eased, rows.count { |r| r['deaths_sting'] == 'None' }], 'cycle_fame' => [stale[:fame], fresh[:fame]],
-    'gone_row' => rows.find { |r| r['deaths_sting'] == 'None' }&.slice('fame', 'deeds', 'long_term_exp'),
+    'gone_row' => sting.call('None')&.slice('fame', 'deeds', 'long_term_exp'),
     'cycle' => cycle, 'schema' => A::Database.metadata('schema_version')
   }
 
@@ -1691,6 +1740,7 @@ when 'shops'
     20 => shop_room.new(20, ['gemshop', 'urchin guide gemshop'], "Wehnimer's Landing", '[Gems]', 1),
     30 => shop_room.new(30, ['locksmith', 'locksmith pool'], 'the lowlands of Marshtown', '[Pool]', 2),
     40 => shop_room.new(40, ['consignment'], 'Solhaven', '[Consignment]', 2),
+    50 => shop_room.new(50, ['locksmith pool'], 'Solhaven', '[Garret]', 2), # the priestess, in a room tagged for the pool
     1  => shop_room.new(1, ['town'], "the town of Wehnimer's Landing", '[Town Square Central]', 1),
     2  => shop_room.new(2, ['town'], 'the free port of Solhaven', '[Solhaven, North Market]', 2)
   }.freeze
@@ -1723,6 +1773,10 @@ when 'shops'
   W.tick(t + 130) # the consignment shop, whose clerk calls itself a pawnbroker
   DownstreamHook.run('The pawnbroker takes your silver ring, glances at it, and hands you 400 silvers.')
   W.tick(t + 131)
+  $room_id = 50
+  W.tick(t + 132) # only the priestess paid here: named for her, not the tag
+  DownstreamHook.run('You hand the priestess 1,200 silvers.  "Thank you," she says.  She removes a glass decanter, and fills a simple ' \
+                     'indigo flask with a clear fluid, and then hands it to you.')
   $room_id = 10
   W.tick(t + 140)
   W.stop(now: t + 141)

@@ -25,6 +25,10 @@
     ;analytics --dashboard  collect, and feed the web dashboard
     ;analytics help         every command, and where your settings files are
 
+  Have your rest script type EXPERIENCE and RESOURCE once a rest: fame, deeds,
+  Death's Sting, training points and your profession's resource are read
+  from that output (the script never sends a command itself).
+
   Improvements:
   Major_change.feature_addition.bugfix
   v1.0.0 (2026-10-27)
@@ -429,9 +433,10 @@ module GS4Analytics
     # The schema in create_schema. Any change to it bumps this, and a file made
     # with another value is refused (see check_schema), not migrated. Kept in
     # step with KNOWN_SCHEMAS in elanthia-online/analytics.
-    SCHEMA_VERSION    = '9'
+    SCHEMA_VERSION    = '10'
     PROGRESS_COLUMNS = %i[level exp ascension_exp until_next fame deeds long_term_exp deaths_sting
-                          ptp mtp atp lumnis rpa fashlonae].freeze
+                          ptp mtp atp lumnis rpa fashlonae resource_name resource_weekly resource_total
+                          suffused voln_favor covert_arts_charges shadow_essence].freeze
     BACKUPS_KEPT = 7 # maintenance backup keeps this many
     # Queued writes that find the database locked by another Lich session are
     # kept and retried, backing off from 2 s up to 30 s, up to this many
@@ -674,7 +679,7 @@ module GS4Analytics
                        creature: creature, kill_count: 1, total_silver: silver.to_i, boxes: boxes.to_i, last_kill_at: at))
       end
 
-      # category: 'box', 'sale', 'bounty', or 'expense' (silver spent, stored positive)
+      # category: 'box', 'floor' (coins picked up), 'sale', 'bounty', or 'expense' (silver spent, stored positive)
       def record_silver(who, cycle_id, category, amount, vendor_type: nil, vendor_name: nil,
                         bounty_type: nil, at: Time.now.to_i)
         return unless amount.to_i.positive?
@@ -1210,6 +1215,14 @@ module GS4Analytics
           Integer :lumnis # only while the Gift of Lumnis is active
           Float :rpa
           Integer :fashlonae
+          # From RESOURCE output, on the row of the reading that showed them
+          String :resource_name # the profession's resource: Essence, Devotion, Grit...
+          Integer :resource_weekly # of 50,000
+          Integer :resource_total # of 200,000
+          Integer :suffused
+          Integer :voln_favor
+          Integer :covert_arts_charges
+          Integer :shadow_essence
           primary_key %i[game character timestamp]
         end
 
@@ -1239,7 +1252,9 @@ module GS4Analytics
 
     def read(since: Time.now.to_i - FRESH_SECONDS)
       exp = defined?(Experience) ? Experience : Util.safely { Lich::Gemstone::Experience }
-      read_at = Util.safely { exp.updated_at }&.to_i
+      # The last EXPERIENCE reading the progress hook saw; infomon's time for the
+      # total too, in case the hook isn't running (it moves only when the total does)
+      read_at = [ProgressManager.read_at, Util.safely { exp.updated_at }&.to_i].compact.max
       {
         exp_total: Util.safely(0) { exp.txp },
         exp_regular: Util.safely { exp.exp },
@@ -1264,8 +1279,24 @@ module GS4Analytics
 
     HOOK = 'GS4Analytics::ProgressManager'
     TAGS = /<[^>]+>/
-    # EXPERIENCE: "      PTPs/MTPs: 36/0                        ATPs: 6", at the start of the
-    # line (tags stripped), so another player saying the same words can't set them
+    # EXPERIENCE output, read as it passes (tags stripped, anchored at the start
+    # of the line, as Lich's own parser does, so another player's words can't
+    # match). A reading is the block from the Fame line to the "Exp until lvl"
+    # (or "Exp to next TP") line. Lich's infomon only stamps a value that
+    # changed, so its time can't say whether EXPERIENCE was typed: right after
+    # a death the total is the same and only the sting moved.
+    FAME_RE  = /\A\s+Level: \d+\s+Fame: (-?[\d,]+)\s*\z/
+    STING_RE = /\A\s+Total Exp: [\d,]+\s+Death's Sting: (\w+)\s*\z/
+    LTE_RE   = /\A\s+Long-Term Exp: ([\d,]+)\s+Deeds: (\d+)\s*\z/
+    END_RE   = /\A\s+Exp (?:until lvl|to next TP): -?[\d,]+/
+    # RESOURCE output, the same way: from its Health/Mana line to the prompt
+    RES_START_RE = %r{\AHealth: \d+/\d+\s+Mana: \d+/\d+\s+Stamina: }
+    RESOURCE_RE  = %r{\A(Essence|Necrotic Energy|Lore Knowledge|Motes of Tranquility|Devotion|Nature's Grace|Grit|Luck Inspiration|Guile|Vitality): ([\d,]+)/50,000 \(Weekly\)\s+([\d,]+)/200,000 \(Total\)\s*\z}
+    SUFFUSED_RE  = /\ASuffused (?:Essence|Necrotic Energy|Lore Knowledge|Motes of Tranquility|Devotion|Nature's Grace|Grit|Luck Inspiration|Guile|Vitality): ([\d,]+)\s*\z/
+    VOLN_RE      = /\AVoln Favor: (-?[\d,]+)\s*\z/
+    COVERT_RE    = %r{\ACovert Arts Charges: (-?[\d,]+)/200\s*\z}
+    SHADOW_RE    = /\AAccumulated Shadow [Ee]ssence: (\d)/
+    # "      PTPs/MTPs: 36/0                        ATPs: 6"
     TP_RE = %r{\A\s*PTPs/MTPs:\s*([\d,]+)\s*/\s*([\d,]+)(?:\s+ATPs:\s*([\d,]+))?}
     # The Death's Sting has worn off (the variant ending "yet a lingering
     # weakness remains" means it has eased, not gone)
@@ -1274,21 +1305,25 @@ module GS4Analytics
     HEARTBEAT = 3600 # a row at least this often; experience moving alone waits for it
     # A change to any of these is written at once
     MILESTONES = %i[level lumnis rpa fashlonae].freeze
-    # These come only from EXPERIENCE output, so a row has them only when a
-    # reading arrived since the row before it (nil otherwise): an old reading
-    # is never stamped as current. A new reading is written at once.
-    READINGS = %i[fame deeds long_term_exp deaths_sting].freeze
+    # These come only from EXPERIENCE output. Each reading is written as a row
+    # of its own, at the moment it was shown; other rows have them nil, so an
+    # old reading is never stamped as current.
+    READINGS = %i[fame deeds long_term_exp deaths_sting resource_name resource_weekly resource_total
+                  suffused voln_favor covert_arts_charges shadow_essence].freeze
 
     class << self
+      # When the last EXPERIENCE reading passed (Vitals uses it for fame on cycles)
+      attr_reader :read_at
+
       def start(who)
         @who = who
         @last = nil
         @written_at = nil
-        # The EXPERIENCE reading there already (infomon keeps it across logins):
-        # only one that arrives after starting counts as new
-        @read_at = read_at_now
         @tp = nil
-        @sting_gone_at = nil
+        @block = nil
+        @resource = nil
+        @read_at = nil
+        @readings = Thread::Queue.new
         DownstreamHook.remove(HOOK)
         DownstreamHook.add(HOOK, proc { |line| on_line(line) })
         @thread = Thread.new do
@@ -1311,37 +1346,45 @@ module GS4Analytics
         @who = nil
       end
 
-      # Reads the game state and queues a row when it is due. Returns true when one was queued.
+      # Reads the game state and queues the rows that are due: one for each
+      # reading seen since the last check, at its own time, and one more when a
+      # milestone changed or the heartbeat is due. Returns true when any was queued.
       def check(now: Time.now.to_i, final: false)
         return false unless @who
 
         values = read
         return false if values[:exp].nil? && values[:level].nil? # nothing from the game yet
 
-        # The sting wore off: written at the moment it did, as a reading of None
-        # and no other reading (the rest are as old as the last EXPERIENCE)
         unread = READINGS.to_h { |key| [key, nil] }
-        if (gone = @sting_gone_at)
-          @sting_gone_at = nil
-          who = @who
-          Database.async { Database.record_progress(who, gone, values.merge(unread, deaths_sting: 'None')) }
-        end
-        fresh = fresh_reading?
-        return false unless final || fresh || due?(values, now)
-
-        row = fresh ? values : values.merge(unread)
-        # a row in the same second replaces the sting's: it keeps the None
-        row = row.merge(deaths_sting: 'None') if gone && gone >= now
-        if @tp # training points seen in EXPERIENCE since the last row
-          row = row.merge(@tp)
-          @tp = nil
-        end
-        @read_at = values[:read_at]
-        @last = values
-        @written_at = now
+        readings = []
+        readings << @readings.pop until @readings.empty?
         who = @who
-        Database.async { Database.record_progress(who, now, row) }
-        true
+        readings.each_with_index do |reading, i|
+          row = values.merge(unread, reading.slice(*READINGS))
+          if @tp && i == readings.size - 1 # the training points shown with the last of them
+            row = row.merge(@tp)
+            @tp = nil
+          end
+          Database.async { Database.record_progress(who, reading[:at], row) }
+        end
+        written = !readings.empty?
+        if final || due?(values, now)
+          row = values.merge(unread)
+          if @tp
+            row = row.merge(@tp)
+            @tp = nil
+          end
+          # a reading in this same second already is this row
+          unless readings.any? { |r| r[:at] == now }
+            Database.async { Database.record_progress(who, now, row) }
+            written = true
+          end
+        end
+        if written
+          @last = values
+          @written_at = now
+        end
+        written
       end
 
       def read
@@ -1352,14 +1395,9 @@ module GS4Analytics
           exp: positive.call(Util.safely { exp.exp }),
           ascension_exp: Util.safely { exp.axp }&.to_i,
           until_next: Util.safely { exp.until_next }&.to_i,
-          fame: Util.safely { exp.fame }&.to_i,
-          deeds: Util.safely { exp.deeds }&.to_i,
-          long_term_exp: Util.safely { exp.lte }&.to_i,
-          deaths_sting: Util.safely { exp.deaths_sting }&.to_s,
           lumnis: Util.safely { XMLData.lumnis }&.to_i,
           rpa: Util.safely { XMLData.rpa }&.to_f,
-          fashlonae: Util.safely { XMLData.fashlonae }&.to_i,
-          read_at: Util.safely { exp.updated_at }&.to_i # when EXPERIENCE was last read
+          fashlonae: Util.safely { XMLData.fashlonae }&.to_i
         }
       end
 
@@ -1371,23 +1409,54 @@ module GS4Analytics
         MILESTONES.any? { |key| values[key] != @last[key] } || !@tp.nil?
       end
 
-      # An EXPERIENCE reading no row has taken yet
-      def fresh_reading?
-        at = read_at_now
-        !at.nil? && at != @read_at
-      end
+      def digits(text) = text.delete(',').to_i
 
-      def read_at_now
-        exp = defined?(Experience) ? Experience : Util.safely { Lich::Gemstone::Experience }
-        Util.safely { exp.updated_at }&.to_i
+      # One RESOURCE block: its values, written as a reading when the prompt ends it
+      def read_resource(line, text)
+        if text.match?(RES_START_RE)
+          @resource = {}
+        elsif line.include?('<prompt')
+          @readings << @resource.merge(at: Time.now.to_i) unless @resource.empty?
+          @resource = nil
+        elsif (found = text.match(RESOURCE_RE))
+          @resource.merge!(resource_name: found[1], resource_weekly: digits(found[2]), resource_total: digits(found[3]))
+        elsif (found = text.match(SUFFUSED_RE))
+          @resource[:suffused] = digits(found[1])
+        elsif (found = text.match(VOLN_RE))
+          @resource[:voln_favor] = digits(found[1])
+        elsif (found = text.match(COVERT_RE))
+          @resource[:covert_arts_charges] = digits(found[1])
+        elsif (found = text.match(SHADOW_RE))
+          @resource[:shadow_essence] = found[1].to_i
+        end
+        line
       end
 
       # Runs on the game-text thread: only remembers what it read
       def on_line(line)
-        if line.include?('PTPs/MTPs') && (found = line.gsub(TAGS, '').match(TP_RE))
-          @tp = { ptp: found[1].delete(',').to_i, mtp: found[2].delete(',').to_i, atp: found[3]&.delete(',')&.to_i }.compact
-        elsif line.include?('sting of a recent death') && line.gsub(TAGS, '').strip.match?(STING_GONE_RE)
-          @sting_gone_at = Time.now.to_i
+        return line unless line.include?('PTPs/MTPs') || line.include?('Fame: ') || line.include?('Death') ||
+                           line.include?('Deeds: ') || line.include?('Exp ') || line.include?('sting of a recent death') ||
+                           line.include?('Health: ') || (@resource && (line.include?(': ') || line.include?('<prompt')))
+
+        text = line.gsub(TAGS, '')
+        return read_resource(line, text) if @resource || text.match?(RES_START_RE)
+
+        if (found = text.match(TP_RE))
+          @tp = { ptp: digits(found[1]), mtp: digits(found[2]), atp: found[3] && digits(found[3]) }.compact
+        elsif (found = text.match(FAME_RE))
+          @block = { fame: digits(found[1]) }
+        elsif @block && (found = text.match(STING_RE))
+          @block[:deaths_sting] = found[1]
+        elsif @block && (found = text.match(LTE_RE))
+          @block[:long_term_exp] = digits(found[1])
+          @block[:deeds] = found[2].to_i
+        elsif @block && text.match?(END_RE)
+          at = Time.now.to_i
+          @readings << @block.merge(at: at)
+          @read_at = at
+          @block = nil
+        elsif text.strip.match?(STING_GONE_RE)
+          @readings << { deaths_sting: 'None', at: Time.now.to_i }
         end
         line
       rescue StandardError => e
@@ -1440,16 +1509,18 @@ module GS4Analytics
         @room = id
         finish(now)
         shop = shop_here if id
-        @lock.synchronize { @visit = shop.merge(start: now, silver: 0, spent: 0, cycle_id: CycleManager.current_cycle_id) } if shop
+        @lock.synchronize { @visit = shop.merge(start: now, silver: 0, spent: 0, kinds: Hash.new(0), cycle_id: CycleManager.current_cycle_id) } if shop
       end
 
       # From the game-text thread: silver taken in or paid out in the shop
-      def note(silver: 0, spent: 0)
+      # +kind+ is what the silver was spent on (priestess, locksmith pool...)
+      def note(silver: 0, spent: 0, kind: nil)
         @lock&.synchronize do
           next unless @visit
 
           @visit[:silver] += silver.to_i
           @visit[:spent] += spent.to_i
+          @visit[:kinds][kind] += spent.to_i if kind && spent.to_i.positive?
         end
       end
 
@@ -1484,6 +1555,12 @@ module GS4Analytics
         return unless visit
         return if now - visit[:start] < MIN_SECONDS && visit[:silver].zero? && visit[:spent].zero?
 
+        # A room can carry the tag of a shop next door (a priestess in a room
+        # the map tags locksmith pool): a stop where silver was only paid out,
+        # all for something other than its tag, is named by what it was paid for
+        if visit[:silver].zero? && visit[:kinds].size == 1 && visit[:kinds].keys.first != visit[:vendor]
+          visit[:vendor] = visit[:kinds].keys.first
+        end
         who = @who
         Database.async do
           Database.record_vendor_visit(who, visit[:cycle_id], visit[:vendor], visit[:start], now, visit[:silver],
@@ -1520,6 +1597,9 @@ module GS4Analytics
     # A warehouse's storage fee, paid from hand
     WAREHOUSE_RE = /recorded a storage fee of ([\d,]+) silvers? for you and thanks you for paying it/
     DIRECT_RE  = /You gather the remaining ([\d,]+) coins? from inside your/
+    # Coins picked up off the floor (GET COINS, as eloot and bigshot loot them):
+    # the line alone, with nothing after "coins."
+    FLOOR_RE   = /\AYou gather the remaining ([\d,]+) coins?\.\s*\z/
     BANK_SKIP  = /amounts on deposit|inter-town|urchin/i
     BANK_START = /amounts on deposit/
     # "<vendor> takes your <item>, ... hands you N silver ..." (also "takes the <item>"),
@@ -1690,6 +1770,8 @@ module GS4Analytics
           record_box(digits(found[1]), 'charm')
         elsif (found = text.match(DIRECT_RE))
           record_box(digits(found[1]), 'direct')
+        elsif (found = text.strip.match(FLOOR_RE))
+          record_floor(digits(found[1]))
         end
         if Settings.current[:parse_sales]
           read_sale(line, text)
@@ -1754,7 +1836,7 @@ module GS4Analytics
           Database.record_silver(who, cycle_id, 'expense', amount, vendor_type: kind,
                                                                                                vendor_name: name, at: at)
         end
-        ShopWatcher.note(spent: amount)
+        ShopWatcher.note(spent: amount, kind: kind)
         Log.debug("Spent #{Util.fmt(amount)} (#{kind})")
       end
 
@@ -1867,6 +1949,15 @@ module GS4Analytics
         who = @who
         profile = Util.safely('') { UserVars.op['profile_current'].to_s }
         Database.async { Database.record_kill(who, kill[:creature], profile, kill[:silver], at: kill[:at], boxes: kill[:boxes]) }
+      end
+
+      def record_floor(amount)
+        return unless amount.positive?
+
+        who = @who
+        cycle_id = @cycle_id
+        Database.async { Database.record_silver(who, cycle_id, 'floor', amount) }
+        Log.debug("Coins off the floor: #{Util.fmt(amount)}")
       end
 
       def record_box(amount, method)
@@ -2459,6 +2550,7 @@ module GS4Analytics
         name_interrupting_scripts if @current_state == :hunt && target == :rest
         @last_step_at = nil
         end_current_cycle
+        @after_death = @current_state == :dead
         @current_state = target
         @hunt_start_time = target == :hunt ? Time.now.to_i : nil
         @weapon = { polls: 0, retries: 0 }
@@ -2503,6 +2595,9 @@ module GS4Analytics
         return if today == @day
 
         Log.info("Midnight rollover: #{@day} -> #{today}")
+        # A hunt still going is cut here, with no reason of its own yet: say why it ended
+        note_reason(@current_cycle_id, 'midnight') if @current_state == :hunt && @current_cycle_id && rest_reason.empty?
+        @after_death = false
         end_current_cycle
         @carry_from = nil # the new day starts at midnight
         @day = today
@@ -2538,6 +2633,7 @@ module GS4Analytics
         # by hand, or bigshot already cleared it) use the hunt that just ended
         reason = rest_reason
         reason = recent_hunt_reason if reason.empty?
+        reason = 'after death' if reason.empty? && @after_death # the hunt that died says why; this rest recovers from it
         return if reason.empty?
 
         note_reason(cycle_id, reason)
@@ -3553,12 +3649,13 @@ module GS4Analytics
                 .map { |kind, rows| [kind, rows.sum { |row| row['n'].to_i }, rows.sum { |row| row['s'].to_i }] }
                 .sort_by { |_, _, sum| -sum }
         end
-        income = creature + total.call('box') + total.call('sale') + total.call('bounty')
+        income = creature + total.call('floor') + total.call('box') + total.call('sale') + total.call('bounty')
         spent = total.call('expense')
 
         out = banner('GS4 Analytics - Silver', label, who.name)
         out += heading('Silver in')
-        out += table(%w[Source Silver], [['Corpses', Util.fmt(creature)], ['Boxes', Util.fmt(total.call('box'))],
+        out += table(%w[Source Silver], [['Corpses', Util.fmt(creature)], ['Off the floor', Util.fmt(total.call('floor'))],
+                                         ['Boxes', Util.fmt(total.call('box'))],
                                          ['Sales', Util.fmt(total.call('sale'))], ['Bounties', Util.fmt(total.call('bounty'))]],
                      footer: ['Total', Util.fmt(income)])
         unless spent.zero?

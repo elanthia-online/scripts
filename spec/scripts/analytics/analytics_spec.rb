@@ -57,8 +57,14 @@ RSpec.describe 'analytics.lic' do
     it 'records each stop with its time, silver, spending, room and town; passing through is not a stop' do
       expect(shops['visits']).to eq([['gemshop', 60, 6200, 0, 20, "Wehnimer's Landing"],
                                      ['locksmith pool', 30, 0, 300, 30, 'Solhaven'],
-                                     ['consignment', 10, 400, 0, 40, 'Solhaven'],
+                                     ['consignment', 2, 400, 0, 40, 'Solhaven'],
+                                     ['priestess', 8, 0, 1200, 50, 'Solhaven'],
                                      ['api', 50, 777, nil, nil, nil]])
+    end
+
+    it 'names a stop where silver was only paid out, all for something else, by what it was paid for' do
+      # the priestess in a room the map tags locksmith pool; the pool itself keeps its tag
+      expect(shops['visits'].map(&:first)).to include('priestess', 'locksmith pool')
     end
 
     it "names a stop's town after the nearest town room, so one town is one name" do
@@ -101,7 +107,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'writes a milestone or a new EXPERIENCE reading at once, experience alone at the hourly heartbeat' do
-      # gain soon, gain later, sting changed but not read, a new reading, another player's TP line,
+      # gain soon, gain later, sting changed but not seen, a new reading, another player's lines,
       # the real TP line, unchanged, heartbeat
       expect(progress['checks']).to eq([false, false, false, true, false, true, false, true])
     end
@@ -111,8 +117,21 @@ RSpec.describe 'analytics.lic' do
       expect(progress['first']).to eq('level' => 100, 'exp' => 900_000, 'ascension_exp' => 100_000, 'until_next' => 1500,
                                       'fame' => nil, 'deeds' => nil, 'long_term_exp' => nil, 'deaths_sting' => nil,
                                       'ptp' => nil, 'lumnis' => nil)
-      expect(progress['reading']).to eq('deaths_sting' => 'Light', 'fame' => 5000, 'deeds' => 12, 'long_term_exp' => 59)
       expect(progress['heartbeat']).to eq('exp' => 900_500, 'deaths_sting' => nil, 'fame' => nil)
+    end
+
+    it 'reads each EXPERIENCE reading from the text, even when the total is unchanged, as a row at its own time' do
+      # right after a death only the sting moves, and infomon doesn't stamp an unchanged total
+      expect(progress['reading']).to eq('deaths_sting' => 'Sharp', 'fame' => 7777, 'deeds' => 13, 'long_term_exp' => 61)
+      expect(progress['reading_at_its_time']).to be(true)
+      expect(progress['eased']).to eq('deaths_sting' => 'Light', 'fame' => 7800)
+    end
+
+    it 'reads RESOURCE output into a row of its own, only from the block itself' do
+      expect(progress['resource_check']).to be(true)
+      expect(progress['resource']).to eq('resource_name' => 'Devotion', 'resource_weekly' => 12_345, 'resource_total' => 67_890,
+                                         'suffused' => 4321, 'voln_favor' => 98_765, 'covert_arts_charges' => nil,
+                                         'fame' => nil, 'deaths_sting' => nil)
     end
 
     it 'takes unspent training points only from the EXPERIENCE line itself, once' do
@@ -124,15 +143,16 @@ RSpec.describe 'analytics.lic' do
       expect(progress['gone_row']).to eq('fame' => nil, 'deeds' => nil, 'long_term_exp' => nil)
     end
 
-    it 'writes the first row, each due check, the sting wearing off and the last row' do
-      expect(progress['rows']).to eq(6)
+    it 'writes the first row, each reading, each due check, the sting wearing off and the last row' do
+      # first, Sharp, training points, resource, heartbeat, Light, None, last
+      expect(progress['rows']).to eq(8)
     end
 
     it 'keeps regular and ascension experience apart on cycles, and gives them fame only from a fresh reading' do
       expect(progress['cycle']).to eq('exp_regular_start' => 900_500, 'exp_regular_end' => 900_500,
                                       'exp_asc_start' => 100_000, 'exp_asc_end' => 100_000, 'exp_total_start' => 1_000_000)
       expect(progress['cycle_fame']).to eq([nil, 5000])
-      expect(progress['schema']).to eq('9')
+      expect(progress['schema']).to eq('10')
     end
   end
 
@@ -433,7 +453,7 @@ RSpec.describe 'analytics.lic' do
 
     it 'is refused before anything is written into it, saying what to do' do
       expect(guard['writer'].first).to be(true)
-      expect(guard['writer'].last).to include('schema 6', 'this one uses 9', 'Rename or move it')
+      expect(guard['writer'].last).to include('schema 6', 'this one uses 10', 'Rename or move it')
       expect(guard['untouched']).to eq(%w[cycles metadata])
     end
 
@@ -447,7 +467,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'starts a fresh database in an empty file' do
-      expect(guard['empty_file']).to eq('9')
+      expect(guard['empty_file']).to eq('10')
     end
   end
 
@@ -592,6 +612,10 @@ RSpec.describe 'analytics.lic' do
 
     it 'records box silver' do
       expect(collector['box']).to eq([250, 500])
+    end
+
+    it 'records coins picked up off the floor, and only that line' do
+      expect(collector['floor']).to eq([1234])
     end
 
     it 'records a vendor visit and the price per item' do
@@ -743,6 +767,10 @@ RSpec.describe 'analytics.lic' do
 
     it 'leaves no gap where a cycle too short to keep was dropped' do
       expect(edges['death'].values_at('short_rest_dropped', 'no_gap', 'dead')).to eq([true, true, 'dead'])
+    end
+
+    it 'gives the rest after a death, and a hunt cut at midnight, a reason' do
+      expect(edges['death'].values_at('after_death', 'midnight', 'after_midnight')).to eq(['after death', 'midnight', nil])
     end
   end
 
