@@ -1508,6 +1508,18 @@ when 'schema_guard'
   result['empty_file'] = A::Database.one("SELECT value FROM metadata WHERE key = 'schema_version'")['value']
   A::Database.close
 
+when 'zone'
+  # The zone this Lich runs in, recorded with the moment it was read
+  zone = lambda do |tz|
+    ENV['TZ'] = tz
+    A::Database.connect!
+    rows = A::Database.all("SELECT key, value, updated_at FROM metadata WHERE key IN ('utc_offset', 'zone') ORDER BY key")
+    A::Database.close
+    rows.to_h { |r| [r['key'], [r['value'], r['updated_at'].is_a?(Integer)]] }
+  end
+  result = { 'tokyo' => zone.call('Asia/Tokyo'), 'utc' => zone.call('UTC') }
+  ENV.delete('TZ')
+
 when 'writer_safety'
   # Cheaper syncing on every writer connection, the received-time index, and
   # a write that never runs on the caller's thread once the writer exists

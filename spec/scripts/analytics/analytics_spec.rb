@@ -393,6 +393,15 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'the zone it runs in' do
+    subject(:zone) { result('zone') }
+
+    it "records Lich's UTC offset and zone name on every start, for readers in another zone" do
+      expect(zone['tokyo']).to eq('utc_offset' => ['32400', true], 'zone' => ['JST', true])
+      expect(zone['utc']).to eq('utc_offset' => ['0', true], 'zone' => ['UTC', true])
+    end
+  end
+
   describe 'a database from another build' do
     subject(:guard) { result('schema_guard') }
 
