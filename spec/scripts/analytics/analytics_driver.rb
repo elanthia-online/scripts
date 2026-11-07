@@ -1539,7 +1539,8 @@ when 'session_report'
   cycle.call(:dead, login + 4300, 300, 3000, 3000)
   cycle.call(:hunt, NOW - 3600, nil, 3000, nil)
   bank.call(NOW - 60, 20_000)
-  text = A::Database.reader { |conn| A::Report::Text.session_summary(conn, WHO) }.join("\n")
+  # At the moment the rows were laid out, so a slow run doesn't stretch the hunt still going
+  text = A::Database.reader { |conn| A::Report::Text.session_summary(conn, WHO, now: NOW) }.join("\n")
   cells = ->(label) { text.lines.find { |l| l.start_with?("| #{label} ") }.to_s.split('|').map(&:strip).drop(2) }
   login_info = A::Database.one('SELECT first_seen, last_seen FROM logins')
   result = {
