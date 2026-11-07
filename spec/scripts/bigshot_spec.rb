@@ -2312,6 +2312,41 @@ RSpec.describe 'bigshot cmd_wand' do
     expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'wave #300 at #555'])
   end
 
+  describe 'with blank entries in the wand setting' do
+    let(:sword) { BigshotWandSpec::Item.new('900', 'broadsword') }
+    let(:iron) { BigshotWandSpec::Item.new('300', 'iron wand') }
+    let(:bs) { BigshotWandSpec::Harness.new(wands_in_container: [iron]) }
+
+    before { bs.class::GameObj.right_hand = sword }
+
+    [['oaken wand', '', 'iron wand'], ['oaken wand', ' ', 'iron wand']].each do |setting|
+      it "skips the blank entry in #{setting.inspect} and leaves the held weapon alone" do
+        bs.WAND = setting
+        bs.cmd_wand(target)
+        expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'wave #300 at #555'])
+      end
+    end
+
+    it 'skips a blank entry in reserve mode too' do
+      bs.WAND = ['oaken wand', '', 'iron wand']
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'reserve #300', 'wave #300 at #555'])
+    end
+
+    it 'skips a leading blank entry' do
+      bs.WAND = ['', 'iron wand']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get iron wand from my cloak', 'wave #300 at #555'])
+    end
+
+    it 'rests when only a blank entry is left after the last wand type' do
+      bs.WAND = ['oaken wand', '']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get oaken wand from my cloak'])
+      expect($rest_reason).to eq('No fresh wands!')
+    end
+  end
+
   it 'rests when no wand type is left' do
     bs = BigshotWandSpec::Harness.new(wands_in_container: [])
     bs.cmd_wand(target)
