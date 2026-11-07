@@ -246,19 +246,37 @@ when 'util'
 
 when 'settings'
   file = A::Settings.path(WHO)
+  global = A::Settings.global_path
   defaults = A::Settings.load(WHO)
-  written = File.exist?(file)
-  File.write(file, "rest_script: my_rest\nalerts:\n  no_kill_minutes: 3\nprofile_room_map:\n  crags: 1234\n")
+  written = [File.exist?(global), File.exist?(file)]
+  read = ->(path) { YAML.safe_load_file(path, symbolize_names: true) }
+  # What was written reads back: the defaults in the global file, every key blank in the character's
+  global_back = read.call(global)
+  char_back = read.call(file)
+  blank = char_back.all? { |_, v| v.nil? || (v.is_a?(Hash) && v.values.all?(&:nil?)) }
+  # every setting has its comment on its line (a map's entries, under it, are values)
+  map_entry = ->(l) { l.start_with?('  ') && !l.include?(' # ') && A::Settings::DEFAULTS[:rest_steps].any? { |k, v| l.strip == "#{k}: #{v}" } }
+  layout = File.readlines(global).reject { |l| l.start_with?('#') || l.strip.empty? || map_entry.call(l) }.all? { |l| l.include?(' # ') }
+  # The global file sets two things; the character's overrides one alert, turns the rest script off, adds a room
+  File.write(global, File.read(global).sub(/^rest_script:/, 'rest_script: shared_rest').sub(/^  no_kill_minutes: 10/, '  no_kill_minutes: 7'))
+  File.write(file, File.read(file).sub(/^rest_script:/, 'rest_script: false').sub(/^  silver_drop_pct:/, '  silver_drop_pct: 30')
+                                  .sub(/^profile_room_map:/, 'profile_room_map: { crags: 1234 }'))
   custom = A::Settings.load(WHO)
+  File.write(file, File.read(file).sub(/^rest_script: false/, 'rest_script:'))
+  inherited = A::Settings.load(WHO)
   File.write(file, "rest_script: [unclosed\n")
   broken = A::Settings.load(WHO)
   result = {
-    'path' => file.delete_prefix("#{DATA_DIR}/"), 'written' => written,
+    'path' => file.delete_prefix("#{DATA_DIR}/"), 'global_path' => global.delete_prefix("#{DATA_DIR}/"), 'written' => written,
     'default_hunt' => defaults[:hunt_script], 'default_rest' => defaults[:rest_script],
     'rest_steps_first' => defaults[:rest_steps].keys.first,
-    'custom_rest' => custom[:rest_script], 'custom_no_kill' => custom[:alerts][:no_kill_minutes],
-    'kept_default_drop' => custom[:alerts][:silver_drop_pct], 'room_map' => custom[:profile_room_map],
-    'broken_falls_back' => broken[:hunt_script], 'broken_reported' => OUT.any? { |line| line.include?('ERROR (settings)') }
+    'round_trip' => global_back.merge(rest_steps: global_back[:rest_steps].transform_keys(&:to_s)) == A::Settings::DEFAULTS,
+    'char_keys' => char_back.keys == A::Settings::DEFAULTS.keys && char_back[:alerts].keys == A::Settings::DEFAULTS[:alerts].keys,
+    'char_blank' => blank, 'inline_comments' => layout,
+    'custom' => [custom[:rest_script], custom[:alerts][:no_kill_minutes], custom[:alerts][:silver_drop_pct],
+                 custom[:alerts][:death], custom[:profile_room_map], custom[:hunt_script]],
+    'inherited_rest' => inherited[:rest_script],
+    'broken' => [broken[:rest_script], broken[:alerts][:no_kill_minutes], OUT.any? { |line| line.include?('ERROR (settings') }]
   }
 
 when 'database'
@@ -618,7 +636,8 @@ when 'cli'
   result = {
     'report' => report.include?('Summary'), 'status' => status.include?('Database:'),
     'stats' => stats.include?('cycles:'), 'help' => help.include?('Usage'),
-    'help_paths' => [help.include?("Settings: #{File.join(DATA_DIR, 'GS3', 'Splinter', 'analytics.yaml')}"),
+    'help_paths' => [help.include?("Settings: #{File.join(DATA_DIR, 'analytics.yaml')} (every character)") &&
+      help.include?("#{File.join(DATA_DIR, 'GS3', 'Splinter', 'analytics.yaml')} (this character's overrides)"),
                      help.include?("Database: #{File.join(DATA_DIR, 'analytics.db')}"), help.include?('<Lich data>')],
     'caught' => caught, 'dashboard' => dashboard, 'passed' => passed,
     'queued' => cli.instance_variable_get(:@commands).size

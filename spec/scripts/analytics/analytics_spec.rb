@@ -171,20 +171,24 @@ RSpec.describe 'analytics.lic' do
   describe 'Settings' do
     subject(:settings) { result('settings') }
 
-    it 'writes the defaults under the game and character on first load' do
-      expect(settings.values_at('path', 'written', 'default_hunt', 'default_rest', 'rest_steps_first')).to eq(
-        ['GS3/Splinter/analytics.yaml', true, 'bigshot', nil, 'go2']
-      )
+    it 'writes a global file with the defaults and a character file with every setting blank, on first load' do
+      expect(settings.values_at('global_path', 'path', 'written')).to eq(['analytics.yaml', 'GS3/Splinter/analytics.yaml', [true, true]])
+      expect(settings.values_at('default_hunt', 'default_rest', 'rest_steps_first')).to eq(['bigshot', nil, 'go2'])
+      expect(settings.values_at('round_trip', 'char_keys', 'char_blank')).to eq([true, true, true])
     end
 
-    it 'overrides only the keys the file sets' do
-      expect(settings.values_at('custom_rest', 'custom_no_kill', 'kept_default_drop', 'room_map')).to eq(
-        ['my_rest', 3, 50, { 'crags' => 1234 }]
-      )
+    it 'comments every setting on its own line' do
+      expect(settings['inline_comments']).to be(true)
     end
 
-    it 'reports an unreadable file once and falls back to the defaults' do
-      expect(settings.values_at('broken_falls_back', 'broken_reported')).to eq(['bigshot', true])
+    it 'takes a filled-in character setting over the global one, key by key within a group, and false as off' do
+      # rest_script: global shared_rest, character false; alerts: global no_kill 7, character drop 30
+      expect(settings['custom']).to eq([nil, 7, 30, true, { 'crags' => 1234 }, 'bigshot'])
+      expect(settings['inherited_rest']).to eq('shared_rest')
+    end
+
+    it "reports an unreadable character file once and uses the global settings" do
+      expect(settings['broken']).to eq(['shared_rest', 7, true])
     end
   end
 
