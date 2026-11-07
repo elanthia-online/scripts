@@ -5,10 +5,18 @@
   contributors: Tysong
           game: Gemstone
           tags: dispel, unpoison, undisease, disarmed, effects
-      required: Lich >= 5.12.10
-       version: 2.3.6
+      required: Lich >= 5.22.0
+       version: 2.3.7
 
   Improvements:
+  v2.3.7  (2026-11-06)
+    - finding a different lost weapon no longer ends the search for the one just disarmed
+    - keeps a list of up to 20 unrecovered disarms that survives a death or restart; see it with ;ecleanse last disarm
+    - added ;ecleanse disarmrecover to go back for the most recent unrecovered disarm
+    - stops searching right away when too injured to search, then puts your other weapon back in hand
+    - forgets saved disarms for a room once the game says there is nothing to recover there
+    - disarm detection now runs ahead of other scripts' text handling, so disarms are less likely to be missed
+    - now requires Lich 5.22.0 or newer
   v2.3.6  (2026-09-07)
     - fix use proper Feat.available?('escapeartist', min_rank: 5) for it's usage instead of having to scrape FEAT output
   v2.3.5  (2026-09-01)
@@ -159,7 +167,7 @@
 =end
 
 # Check version of Lich for compatibility
-lich_gem_requires = '5.12.10'
+lich_gem_requires = '5.22.0'
 
 if Gem::Version.new(LICH_VERSION) < Gem::Version.new(lich_gem_requires)
   if $frontend == 'stormfront' || $frontend == 'profanity'
@@ -183,11 +191,16 @@ if Gem::Version.new(LICH_VERSION) < Gem::Version.new(lich_gem_requires)
 end
 
 require 'yaml'
+require 'securerandom'
 require 'terminal-table'
 
 module Ecleanse
   class CappedCollection
-    MAX_SIZE ||= 200
+    # Drop constants left by an earlier run this session so a restart loads the
+    # current definitions without already-initialized warnings.
+    %i[MAX_SIZE].each { |name| remove_const(name) if const_defined?(name, false) }
+
+    MAX_SIZE = 200
     attr_accessor :list, :max_size
 
     def initialize(max_size = MAX_SIZE)
@@ -683,6 +696,10 @@ end
 # Main Script Methods
 module Ecleanse
   module Action
+    # Drop constants left by an earlier run this session so a restart loads the
+    # current definitions without already-initialized warnings.
+    %i[DISARM_MAX].each { |name| remove_const(name) if const_defined?(name, false) }
+
     def self.avoid_webs
       return unless Ecleanse.data.settings[:avoid_webs]
 
@@ -1065,7 +1082,10 @@ module Ecleanse
     # Snapshots the ids currently held in both hands at the moment a disarm
     # is detected and files it under recover_stuff. Returns the new entry's
     # key, or nil if the recovery feature is disabled - in which case
-    # nothing is tracked and no :recover event should be queued.
+    # nothing is tracked and no :recover event should be queued. Pass
+    # track: false for disarms RECOVER ITEM can't get back later (webbing,
+    # telekinetic); everything else is saved to UserVars.last_disarm here, not
+    # when the recovery runs, so being stopped or dying first can't lose it.
     #
     # Note: this intentionally does NOT dedupe against other pending entries
     # by known_ids. In two-weapon combat, known_ids for a "one hand emptied"
@@ -1075,14 +1095,117 @@ module Ecleanse
     # by coincidence and silently drop a genuine new disarm. Each entry is
     # independently keyed and consumed by its own dispatch (see recover),
     # so cross-entry dedup isn't needed for correctness.
-    def self.record_disarm(noun)
+    def self.record_disarm(noun, track: true)
       return nil unless Ecleanse.data.settings[:recover_disarmed]
 
+      disarm_id = track ? Action.disarm_add(noun) : nil
+      Action.queue_recover(Room.current, noun, disarm_id)
+    end
+
+    def self.queue_recover(room, noun, disarm_id)
       known_ids = [GameObj.right_hand.id, GameObj.left_hand.id].reject { |id| id.nil? || id.to_s.empty? }
       key = Ecleanse.data.recover_stuff_seq
       Ecleanse.data.recover_stuff_seq += 1
-      Ecleanse.data.recover_stuff[key] = { room: Room.current, noun: noun, known_ids: known_ids }
+      Ecleanse.data.recover_stuff[key] = { room: room, noun: noun, known_ids: known_ids, disarm_id: disarm_id }
       key
+    end
+
+    # The game's own recovery list holds 20 and drops the oldest for good.
+    DISARM_MAX = 20
+    # Here rather than on Data, which outlives script restarts: a Data built by
+    # an older version would have no lock, and nil.synchronize quietly skips
+    # its block under Lich's NilClass patch. Kept across runs rather than
+    # replaced, since a copy of the script started with ;force may be holding it.
+    DISARM_LOCK ||= Mutex.new
+
+    # Disarms not yet recovered, oldest first. UserVars.last_disarm was a bare
+    # room number before v2.3.7, which doesn't say whether anything is still
+    # lost, so any older value reads as an empty list.
+    def self.disarm_list
+      list = UserVars.last_disarm
+      list.is_a?(Array) ? list : []
+    end
+
+    def self.disarm_tracked?(id)
+      disarm_list.any? { |entry| entry[:id] == id }
+    end
+
+    # Runs on the downstream hook thread, while removals run on the main loop,
+    # so both take DISARM_LOCK around their read-modify-write. Must not raise:
+    # Lich removes a hook that does.
+    def self.disarm_add(noun)
+      room = Room.current
+      entry = { id: SecureRandom.hex(4), item: noun, room: room.id, title: Array(room.title).first.to_s, at: Time.now.to_i }
+      DISARM_LOCK.synchronize do
+        UserVars.last_disarm = (disarm_list + [entry]).last(DISARM_MAX)
+      end
+      entry[:id]
+    end
+
+    def self.disarm_remove(id)
+      DISARM_LOCK.synchronize do
+        UserVars.last_disarm = disarm_list.reject { |entry| entry[:id] == id }
+      end
+    end
+
+    # The game says the room is empty, so nothing else saved there can be found
+    # either. Unmapped rooms all save a nil id, so that says nothing about the others.
+    def self.disarm_remove_room(room_id, disarm_id)
+      DISARM_LOCK.synchronize do
+        UserVars.last_disarm = disarm_list.reject { |entry| entry[:id] == disarm_id || (!room_id.nil? && entry[:room] == room_id) }
+      end
+    end
+
+    # A search turned up an earlier disarm rather than the one being looked
+    # for. Dropping its entry also makes any recover event queued for it a no-op.
+    def self.disarm_remove_found(found, room_id)
+      entry = disarm_list.reverse.find { |e| e[:room] == room_id && Action.same_item?(found, e[:item]) }
+      Action.disarm_remove(entry[:id]) unless entry.nil?
+    end
+
+    # What a RECOVER ITEM result says was picked up: the noun when the line
+    # carries XML, otherwise its plain text. nil if nothing was.
+    def self.spied_item(lines)
+      line = lines.find { |l| l =~ /You spy .+ and recover it!/ }
+      return nil if line.nil?
+
+      line[/You spy .*?noun="([^"]+)"/, 1] || line.gsub(/<[^>]+>/, '')[/You spy (.+?) and recover it!/, 1]
+    end
+
+    def self.same_item?(found, noun)
+      found.to_s.match?(/\b#{Regexp.escape(noun.to_s)}\b/i)
+    end
+
+    # ;ecleanse last disarm - lists what is still lost, newest first.
+    def self.disarm_report
+      disarms = Action.disarm_list
+      Util.msg("yellow", " No unrecovered disarms.") if disarms.empty?
+      disarms.reverse_each do |entry|
+        Util.msg("yellow", " #{entry[:item]} - Room #{entry[:room]} #{entry[:title]} - #{(Time.now.to_i - entry[:at]) / 60} min ago")
+      end
+    end
+
+    # ;ecleanse disarmrecover - goes back for the most recent unrecovered disarm.
+    def self.disarm_recover
+      entry = disarm_list.last
+      if entry.nil?
+        Util.msg("yellow", " No unrecovered disarms to go back for.")
+        return
+      end
+      if dead?
+        Util.msg("yellow", " Can't go back for #{entry[:item]} while dead. It is in room #{entry[:room]}.")
+        return
+      end
+
+      # Room[nil] is a fuzzy title search rather than a miss, and an unmapped
+      # disarm room is saved with no id.
+      room = entry[:room].nil? ? nil : Room[entry[:room]]
+      if room.nil?
+        Util.msg("yellow", " Can't find the room #{entry[:item]} was lost in (#{entry[:title]}) on the map.")
+        return
+      end
+
+      Action.recover(Action.queue_recover(room, entry[:item], entry[:id]))
     end
 
     def self.recover(key)
@@ -1091,10 +1214,13 @@ module Ecleanse
       return if details.nil? # already handled or never recorded (e.g. feature was off)
 
       Ecleanse.data.recover_stuff.delete(key)
+      return unless Action.disarm_tracked?(details[:disarm_id]) # already turned up while searching for another disarm
+
       System.scripts_pause
 
       known_ids = details[:known_ids]
       item = details[:noun]
+      disarm_id = details[:disarm_id]
       room_id = details[:room].id
       title = details[:room].title
 
@@ -1106,7 +1232,6 @@ module Ecleanse
       Util.msg("yellow", " ## Room Name: #{title.first}")
       Util.msg("yellow", " ## Looking for: #{item}")
       Util.msg("yellow", " ########## DISARMED!!! ##########")
-      UserVars.last_disarm = room_id
       Action.go2(room_id)
 
       Util.wait_rt
@@ -1145,6 +1270,7 @@ module Ecleanse
             fput "stop 213"
           end
 
+          Action.disarm_remove(disarm_id)
           return
         end
       end
@@ -1181,6 +1307,11 @@ module Ecleanse
         already_recovered = Action.recovered?(known_ids, item)
       end
 
+      Action.disarm_remove(disarm_id) if already_recovered
+
+      # Each empty_hands saves its own set of items for one fill_hands to restore.
+      hand_fills = 1
+
       unless already_recovered
         empty_hands
 
@@ -1196,30 +1327,45 @@ module Ecleanse
 
           Util.wait_rt
 
-          lines = Util.get_command("recover item", /<dialogData|You spy|You continue to intently search the area|In order to recover something|You find nothing recoverable/)
+          lines = Util.get_command("recover item", /<dialogData|You spy|You continue to intently search the area|In order to recover something|You find nothing recoverable|You're not in any condition to be searching around/)
 
           # Trust the game's own confirmation text first - it's tied directly
           # to this command and can't be fooled by an unrelated item landing
-          # in a hand. Only fall back to the hand-occupancy check when that
-          # text is absent, and log it since it's an inferred (not confirmed)
-          # recovery.
-          if lines.grep(/You spy (?:an|a) (?:.*) and recover it\!/).any?
+          # in a hand. It can name a different item though, since RECOVER ITEM
+          # picks up whatever is in the room: an earlier disarm isn't the one
+          # being looked for, so keep searching. Only fall back to the
+          # hand-occupancy check when that text is absent, and log it since
+          # it's an inferred (not confirmed) recovery.
+          found = Action.spied_item(lines)
+          if found && Action.same_item?(found, item)
+            Action.disarm_remove(disarm_id)
             break
+          elsif found
+            Util.msg("yellow", " Recovered #{found} while looking for #{item}. Still searching.")
+            Action.disarm_remove_found(found, room_id)
           elsif Action.recovered?(known_ids, item)
             Util.msg("yellow", " No recovery message seen, but hand state changed - treating #{item} as recovered.")
+            Action.disarm_remove(disarm_id)
             break
           end
 
+          # The disarm stays saved, and the rest of this method still has to
+          # put the hands back and let the paused scripts resume.
           if lines.grep(/You're not in any condition to be searching around/).any?
-            Util.msg("yellow", " Unable to search. Exiting ecleanse.")
-            Util.msg("yellow", " #{item} is in room #{room_id}")
-            fput "stand" until standing?
-            System.scripts_resume
-            exit
+            Util.msg("yellow", " Unable to search. #{item} is in room #{room_id}. Use #{$lich_char}#{Script.current.name} disarmrecover to try again.")
+            break
+          end
+
+          # Only believed in the disarm room, in case go2 couldn't get back there.
+          if lines.grep(/You find nothing recoverable/).any? && Room.current.id == room_id
+            Util.msg("yellow", " Nothing to recover in room #{room_id}. No longer tracking disarms there.")
+            Action.disarm_remove_room(room_id, disarm_id)
+            break
           end
 
           if lines.grep(/In order to recover something/).any?
             empty_hands
+            hand_fills += 1
           end
 
           search_count += 1
@@ -1230,7 +1376,11 @@ module Ecleanse
 
       fput "stand" until standing?
       Util.wait_rt
-      fill_hands
+      # fill_hands restores the newest stash first, which would give anything the
+      # search turned up the free hand ahead of what was being held. Go oldest
+      # first instead; an extra item that no longer fits just stays stowed.
+      $fill_hands_actions.push(*$fill_hands_actions.pop(hand_fills).reverse) if hand_fills > 1
+      hand_fills.times { fill_hands }
       ReadyList.check(silent: true, quiet: true) unless ReadyList.valid?
 
       fput "stop 213" if stop_213
@@ -1630,7 +1780,7 @@ module Ecleanse
           key = Action.record_disarm(Regexp.last_match(1))
           Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> tears free from your hands and floats/
-          key = Action.record_disarm(Regexp.last_match(1))
+          key = Action.record_disarm(Regexp.last_match(1), track: false)
           Ecleanse.data.event_stack << { event: :telekinetic_recover, key: key } unless key.nil?
         elsif server =~ /Striking with a serpent's unsettling quickness, (?:.*)\.  Vile (?:.*), kindling it into an unholy semblance of life.  The (?:.*) form twists and mutates, sprouting scales and cold eyes as it transforms into a <a exist="\d+" noun="([^"]+)">[^<]+<\/a>\!/
           Ecleanse.data.creature = Regexp.last_match(1)
@@ -1638,7 +1788,7 @@ module Ecleanse
         elsif server =~ /The flesh around the wound feels hot and cold at the same time, heavy with infection./
           Ecleanse.data.event_stack << :use_vat unless Ecleanse.data.event_stack.include?(:use_vat)
         elsif server =~ /The webbing entangles your <a exist=".*?" noun="(.*?)">.*?<\/a>, rendering it useless/
-          key = Action.record_disarm(Regexp.last_match(1))
+          key = Action.record_disarm(Regexp.last_match(1), track: false)
           Ecleanse.data.event_stack << { event: :recover_weapon_webbing, key: key } unless key.nil?
         elsif server =~ /You notice a flickering glint in the shadows|The apparatus flickers with deadly radiance/
           Ecleanse.data.hive_trap_room = Room.current
@@ -1653,10 +1803,26 @@ module Ecleanse
         end
         server
       }
-      DownstreamHook.add('ecleanse_status', ecleanse_status)
+      DownstreamHook.add('ecleanse_status', ecleanse_status, priority: 100)
+
+      # Lich won't start a second copy of a running script, so while this one
+      # is up it has to pick these commands off before Lich sees them. The work
+      # is queued rather than done here because this runs on the client's thread.
+      disarm_command = /^(?:<c>)?#{$lich_char_regex}(?:force\s+)?#{Regexp.escape(Script.current.name)}\s+(disarmrecover|last\s+disarm)\s*$/i
+      ecleanse_command = proc { |client|
+        if client =~ disarm_command
+          event = Regexp.last_match(1).casecmp?('disarmrecover') ? :disarm_recover : :disarm_report
+          Ecleanse.data.event_stack << event unless Ecleanse.data.event_stack.include?(event)
+          nil
+        else
+          client
+        end
+      }
+      UpstreamHook.add('ecleanse_command', ecleanse_command)
 
       before_dying {
         DownstreamHook.remove('ecleanse_status')
+        UpstreamHook.remove('ecleanse_command')
         Ecleanse.data.settings[:script_list].each { |script| Script.unpause(script) if Script.paused?(script) }
       }
     end
@@ -1798,7 +1964,8 @@ module Ecleanse
       rows << ["#{$lich_char}#{Script.current.name} setup", "UI configuration tool"]
       rows << ["#{$lich_char}#{Script.current.name} load", "Reloads all settings"]
       rows << ["#{$lich_char}#{Script.current.name} list", "Lists all settings"]
-      rows << ["#{$lich_char}#{Script.current.name} last disarm", "Lists last disarm room"]
+      rows << ["#{$lich_char}#{Script.current.name} last disarm", "Lists disarms not yet recovered (up to #{Action::DISARM_MAX})"]
+      rows << ["#{$lich_char}#{Script.current.name} disarmrecover", "Goes back for the most recent disarm not yet recovered"]
 
       table = Terminal::Table.new :title => "#{Script.current.name.capitalize} ver #{Util.get_script_version}", :rows => rows
       respond
@@ -1894,12 +2061,15 @@ module Ecleanse
   when /^setup$/i
     Ecleanse::Setup.new(Ecleanse.data.settings).start
     Ecleanse.load(Ecleanse.load_profile)
+  when /^disarmrecover$/i
+    before_dying { Ecleanse::System.scripts_resume }
+    Ecleanse::Action.disarm_recover
   when /load/
     Ecleanse.load(Ecleanse.load_profile)
   when /list/
     Ecleanse::Setup.new(Ecleanse.data.settings).list
   when /last disarm/
-    Util.msg("yellow", " Last recorded disarm:  Room #{UserVars.last_disarm}.")
+    Ecleanse::Action.disarm_report
   when nil
     Ecleanse.data.did_something = false
     Ecleanse.data.event_stack = []
