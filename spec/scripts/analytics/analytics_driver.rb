@@ -86,6 +86,8 @@ module Experience
   def self.deeds = 12
   def self.lte = 59
   def self.deaths_sting = $sting || 'None'
+  # When EXPERIENCE was last read (infomon); nil until set
+  def self.updated_at = $read_at
   def self.fxp_current = 400
   def self.fxp_max = 800
   def self.fame = 5000
@@ -373,7 +375,11 @@ when 'collector'
   DownstreamHook.run('<prompt time="1793074672">&gt;</prompt>')
   DownstreamHook.run('You search the <pushBold/><a exist="2" noun="lurk">shambling lurk</a><popBold/>.')
   DownstreamHook.run("It didn't carry any silver.")
-  DownstreamHook.run('They locate a pile of 500 coins, reclaiming them')
+  # Your own charm, then another character's in the same room (not yours)
+  DownstreamHook.run('You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers inside an ' \
+                     'ornate thanot box.  They locate a pile of 500 coins, reclaiming them and returning to you.  The winged armored bugs retreat.')
+  DownstreamHook.run('Penny summons a swarm of painted lady moths from her silvery fossil charm, which takes off in search of silvers.  ' \
+                     'They locate a pile of 5,000 coins on the floor, reclaiming them and returning to her.')
   DownstreamHook.run('You gather the remaining 250 coins from inside your box')
   # A selling script reporting its own visits (only heard with track_shops off)
   A::Settings.instance_variable_set(:@current, cfg.merge(track_shops: false))
@@ -523,6 +529,12 @@ when 'dashboard'
     'too_many'          => raw_status.call(['Host: localhost'] + Array.new(150) { |i| "X-#{i}: 1" }),
     'long_request_line' => raw_status.call(['Host: localhost'], "/api/meta?x=#{'a' * 5000}")
   }
+  # An unexpected error answers 500, still readable by the site (CORS), so it isn't taken for a script that's not running
+  A::Dashboard.singleton_class.send(:alias_method, :real_meta, :meta)
+  A::Dashboard.define_singleton_method(:meta) { raise 'boom' }
+  status500, headers500, = get.call('/api/meta', "Origin: #{site}")
+  result['error_500'] = [status500, headers500['access-control-allow-origin']]
+  A::Dashboard.singleton_class.send(:alias_method, :meta, :real_meta)
   A::Dashboard.stop
   # lan is refused with an explanation, and the server still binds this computer only
   OUT.clear
@@ -773,6 +785,45 @@ when 'killed_writer'
   result['lost_line'] = OUT.grep(/were lost/).last.to_s.sub('[analytics] ', '')
   lock.execute('ROLLBACK')
   lock.close
+
+when 'close_writes'
+  db = A::Database
+  db.connect!
+  db.flush
+  event = lambda do |tag|
+    db.db[:silver_events].insert(event_id: db.new_id, game: 'GS3', character: 'Splinter', timestamp: NOW, source_category: tag, amount: 1)
+  end
+  count = ->(tag) { db.db[:silver_events].where(source_category: tag).count }
+  # close drains the queue after closing it (#write_remaining); a hook still
+  # running then (removed, but mid-line) queues a write: it is written in place
+  db.instance_variable_get(:@queue).close
+  db.async { event.call('late') }
+  result['late'] = count.call('late')
+  db.close
+  db.connect!
+  # Lich holds a ;kill back until COMMIT returns, so it lands after the
+  # commit and before the queue is shifted: the job must not run again in close
+  # ;kill comes from another thread (a thread can't defer killing itself)
+  go = Queue.new
+  killer = Thread.new do
+    go.pop
+    db.instance_variable_get(:@writer).kill
+  end
+  db.async do
+    event.call('once')
+    db.db.after_commit do
+      go << :now unless go.closed? # the kill arrives the moment COMMIT returns...
+      go.close
+      sleep 0.3                    # ...while the job's bookkeeping is still to run
+    end
+  end
+  killer.join(2)
+  sleep 0.5
+  result['writer_alive'] = db.instance_variable_get(:@writer)&.alive?
+  db.close
+  db.connect!
+  result['once'] = count.call('once')
+
 
 when 'baseline'
   # With no bank total yet, starting takes one listing; after that it doesn't
@@ -1028,6 +1079,16 @@ when 'interrupted_hunt'
   manager.send(:end_current_cycle)
   A::Database.flush
   result['idle_reason'] = A::Database.one('SELECT cycle_type, rest_reason FROM cycles WHERE cycle_id = ?', idle_id).values
+
+  # The hunting script stopped by hand: a stop, not a crash
+  start_state.call(:hunt, :hunt)
+  set.call(:@last_bigshot_status, :hunting) # bigshot was hunting, so a rest would have shown
+  stopped_id = manager.current_cycle_id
+  $running = []
+  $rest_reason = nil
+  manager.send(:transition_to, :idle)
+  A::Database.flush
+  result['stopped_reason'] = A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', stopped_id)['rest_reason']
 
 when 'town_bounty'
   # A bounty finished in town, with no hunt running, still gets its type and area
@@ -1286,12 +1347,17 @@ when 'spending'
             'You ring the bell, and ask Jyhm if he can open your silver strongbox.',
             'He looks over the silver strongbox, frowns, and tells you, "Havin\' some trouble, eh?  Of course I could open this, ' \
             'but it\'ll cost ya.  Gimme 4,033 silvers, and I\'ll have it open before you know it."',
+            # Another player's quote, 134 ms before this character pays (seen in the logs): not ours
+            'He looks over the walnut box, frowns, and tells Penny, "Havin\' some trouble, eh?  Of course I could open this, ' \
+            'but it\'ll cost ya.  Gimme 5,729 silvers, and I\'ll have it open before you know it."',
             'The locksmith Jyhm accepts your silvers.',
             'The locksmith Jyhm accepts your silvers.', # no quote before it: not counted twice
             'Jahck takes your chest and says, "Your tip of 500 silvers has been recorded, and the 250 silver fee has been collected.  ' \
             'We\'ll get someone on that right away."',
             'You hand the priestess 1,200 silvers.  "Thank you," she says.  She removes a glass decanter, and fills a simple ' \
-            'indigo flask with a clear fluid, and then hands it to you.')
+            'indigo flask with a clear fluid, and then hands it to you.',
+            'You hear the voice of the clerk from behind one of the thin walls telling you he has recorded a storage fee of ' \
+            '1210 silvers for you and thanks you for paying it promptly.')
   sleep 0.3
   A::Database.flush
   result = {
@@ -1487,45 +1553,73 @@ when 'writer_safety'
 when 'progress'
   A::Database.connect!
   P = A::ProgressManager
+  $read_at = Time.now - 86_400 # an EXPERIENCE reading from a day ago, kept by infomon
   P.start(WHO)
   sleep 0.3 # the first read, from the thread
   hook = DownstreamHook.names.include?('GS4Analytics::ProgressManager')
   t = Time.now.to_i
   $exp = 900_500
-  soon = P.check(now: t + 30)          # experience alone, too soon
-  later = P.check(now: t + 400)        # experience alone, after EXP_EVERY
+  soon = P.check(now: t + 30)          # experience alone: waits for the heartbeat
+  later = P.check(now: t + 400)
   $sting = 'Light'
-  sting = P.check(now: t + 410)        # a milestone: at once
+  sting_unread = P.check(now: t + 405) # Lich's value changed, but no new EXPERIENCE: not written
+  $read_at = Time.at(t + 409)          # EXPERIENCE typed
+  read = P.check(now: t + 410)         # a new reading: at once
+  # Another player's words, then the real EXPERIENCE line
+  DownstreamHook.run('Bob says, "PTPs/MTPs: 999/888 ATPs: 777"')
+  ignored = P.check(now: t + 415)
   DownstreamHook.run('<output class="mono"/>       PTPs/MTPs: 36/0                        ATPs: 6')
   tps = P.check(now: t + 420)
   same = P.check(now: t + 500)         # nothing changed
   beat = P.check(now: t + 4100)        # the hourly heartbeat
-  vitals = A::Vitals.read
-  id = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'crags', vitals, at: NOW - 600)
-  A::Database.end_cycle(id, vitals, nil, at: NOW - 60)
+  sleep 1.1 # the sting's end is stamped with the clock: a second apart from the first row
+  DownstreamHook.run('You feel the sting of a recent death slowly fade away, yet a lingering weakness remains.')
+  P.check(now: t + 4150)
+  eased = A::Database.flush && A::Database.one("SELECT COUNT(*) AS n FROM progress WHERE deaths_sting = 'None'")['n']
+  DownstreamHook.run('You feel the sting of a recent death slowly fade away.')
+  P.check(now: t + 4200)
+  # Fame on a cycle only from a reading fresh at that moment
+  $read_at = Time.now - 3600
+  stale = A::Vitals.read
+  $read_at = Time.now
+  fresh = A::Vitals.read
+  id = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'crags', fresh, at: NOW - 600)
+  A::Database.end_cycle(id, fresh, nil, at: NOW - 60)
   P.stop(now: t + 5000)                # and a last row
   A::Database.flush
   rows = A::Database.all('SELECT * FROM progress ORDER BY timestamp')
   cycle = A::Database.one('SELECT exp_regular_start, exp_regular_end, exp_asc_start, exp_asc_end, exp_total_start FROM cycles')
+  at = ->(dt) { rows.find { |r| r['timestamp'] == t + dt } }
   result = {
     'hook' => hook, 'hook_removed' => !DownstreamHook.names.include?('GS4Analytics::ProgressManager'),
-    'checks' => [soon, later, sting, tps, same, beat], 'rows' => rows.size,
+    'checks' => [soon, later, sting_unread, read, ignored, tps, same, beat], 'rows' => rows.size,
     'first' => rows.first&.slice('level', 'exp', 'ascension_exp', 'until_next', 'fame', 'deeds', 'long_term_exp', 'deaths_sting', 'ptp', 'lumnis'),
-    'stings' => rows.map { |r| r['deaths_sting'] }.uniq,
-    'tps' => rows.find { |r| r['ptp'] }&.slice('ptp', 'mtp', 'atp'),
+    'reading' => at.call(410)&.slice('deaths_sting', 'fame', 'deeds', 'long_term_exp'),
+    'heartbeat' => at.call(4100)&.slice('exp', 'deaths_sting', 'fame'),
+    'tps' => rows.select { |r| r['ptp'] }.map { |r| r.slice('ptp', 'mtp', 'atp') },
+    'gone' => [eased, rows.count { |r| r['deaths_sting'] == 'None' }], 'cycle_fame' => [stale[:fame], fresh[:fame]],
     'cycle' => cycle, 'schema' => A::Database.metadata('schema_version')
   }
 
 when 'shops'
   A::Database.connect!
   cfg = A::Settings.load(WHO)
-  shop_room = Struct.new(:id, :tags, :location, :title)
+  # find_nearest_by_tag('town'): the town room each shop is nearest (Lich walks the map)
+  shop_room = Struct.new(:id, :tags, :location, :title, :town_room) do
+    def find_nearest_by_tag(tag) = tag == 'town' ? town_room : nil
+  end
   ROOMS = {
-    10 => shop_room.new(10, ['town square'], "Wehnimer's Landing", '[Town Square]'),
-    20 => shop_room.new(20, ['gemshop', 'urchin guide gemshop'], "Wehnimer's Landing", '[Gems]'),
-    30 => shop_room.new(30, ['locksmith', 'locksmith pool'], 'Icemule Trace', '[Pool]')
+    10 => shop_room.new(10, ['town square'], "Wehnimer's Landing", '[Town Square]', 1),
+    20 => shop_room.new(20, ['gemshop', 'urchin guide gemshop'], "Wehnimer's Landing", '[Gems]', 1),
+    30 => shop_room.new(30, ['locksmith', 'locksmith pool'], 'the lowlands of Marshtown', '[Pool]', 2),
+    40 => shop_room.new(40, ['consignment'], 'Solhaven', '[Consignment]', 2),
+    1 => shop_room.new(1, ['town'], "the town of Wehnimer's Landing", '[Town Square Central]', 1),
+    2 => shop_room.new(2, ['town'], 'the free port of Solhaven', '[Solhaven, North Market]', 2)
   }.freeze
-  Object.const_set(:Room, Class.new { def self.current = ROOMS[$room_id] }) unless defined?(Room)
+  Object.const_set(:Room, Class.new do
+    def self.current = ROOMS[$room_id]
+    def self.[](id) = ROOMS[id]
+  end) unless defined?(Room)
   W = A::ShopWatcher
   A::SilverManager.start(WHO)
   W.start(WHO)
@@ -1547,7 +1641,13 @@ when 'shops'
   W.tick(t + 100)                      # the locksmith pool, tagged locksmith too
   W.note(spent: 300)
   A::SilverManager.record_vendor_visit('api', t + 110, t + 120, 777) # ignored: tracked already
-  W.stop(now: t + 130)
+  $room_id = 40
+  W.tick(t + 130)                      # the consignment shop, whose clerk calls itself a pawnbroker
+  DownstreamHook.run('The pawnbroker takes your silver ring, glances at it, and hands you 400 silvers.')
+  W.tick(t + 131)
+  $room_id = 10
+  W.tick(t + 140)
+  W.stop(now: t + 141)
   A::Settings.instance_variable_set(:@current, cfg.merge(track_shops: false))
   A::SilverManager.record_vendor_visit('api', t + 200, t + 250, 777)
   $room_id = 20
@@ -1557,7 +1657,9 @@ when 'shops'
   A::SilverManager.stop
   A::Database.flush
   visits = A::Database.all('SELECT vendor, duration_seconds, silver, spent, room_id, town FROM vendor_visits ORDER BY start_time')
-  result = { 'open' => open_visit && open_visit.transform_keys(&:to_s), 'visits' => visits.map(&:values), 'off' => off }
+  sales = A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY timestamp, amount")
+  result = { 'open' => open_visit && open_visit.transform_keys(&:to_s), 'visits' => visits.map(&:values), 'off' => off,
+             'sales' => sales.map(&:values) }
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

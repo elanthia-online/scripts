@@ -294,6 +294,7 @@ module GS4Analytics
       # bigshot_status         read bigshot's own resting status. true
       # parse_sales            record vendor sales and spending from the game text. true
       # parse_bank             record BANK ACCOUNT and teller lines as bank balances. true
+      # track_shops            record each shop, bank and locksmith stop (the map's room tags). true
       # max_hunt_minutes       ask bigshot to rest after this long. off
       # idle_warn_minutes      alert after this long with nothing running. 8
       # idle_recover_minutes   walk to profile_room_map and start rest_script. off
@@ -394,7 +395,7 @@ module GS4Analytics
     # The schema in create_schema. Any change to it bumps this, and a file made
     # with another value is refused (see check_schema), not migrated. Kept in
     # step with KNOWN_SCHEMAS in elanthia-online/analytics.
-    SCHEMA_VERSION    = '8'
+    SCHEMA_VERSION    = '9'
     PROGRESS_COLUMNS = %i[level exp ascension_exp until_next fame deeds long_term_exp deaths_sting
                           ptp mtp atp lumnis rpa fashlonae].freeze
     BACKUPS_KEPT = 7 # maintenance backup keeps this many
@@ -444,15 +445,21 @@ module GS4Analytics
         check_schema(conn, path) # a refused file must not become the writer
         # In WAL mode, NORMAL syncs at checkpoints instead of on every commit:
         # one write per kill stops costing a disk flush each, and a commit
-        # still survives the script or Lich crashing (only a power loss can
-        # undo the last ones). Sequel applies it to every connection it opens
+        # still survives the script or Lich crashing (a power loss or an
+        # operating system crash can undo the last ones). It is SQLite's WAL
+        # default already in Lich's sqlite3 gem; set here so another build is the same. Sequel applies it to every connection it opens
         # from here on, so the one the check used is dropped first.
         conn.opts[:synchronous] = :normal
         conn.disconnect
         @db = conn
         @db.run('PRAGMA journal_mode=WAL')
-        create_schema
-        set_metadata('schema_version', SCHEMA_VERSION)
+        # Tables and the version in one transaction, taken for writing at once:
+        # a second character starting on a fresh file sees either nothing (and
+        # waits its turn) or the finished schema, never tables without a version
+        @db.transaction(mode: :immediate) do
+          create_schema
+          set_metadata('schema_version', SCHEMA_VERSION)
+        end
         start_writer
         Log.info("Database ready: #{path}")
       end
@@ -500,15 +507,20 @@ module GS4Analytics
         # its own transaction, so a busy retry repeats both
         return job.call if Thread.current == @writer
 
-        if @queue
+        if @queue && !@queue.closed?
           # Always queued, never run here: the caller may be the game-text
           # thread, and a write can wait seconds for another session's lock.
           # With the writer gone (;kill stops it before cleanup runs), jobs
           # wait behind the ones it left, and #close writes them in order.
-          @queue << job
-        else
-          db.transaction { job.call }
+          begin
+            return @queue << job
+          rescue ClosedQueueError
+            nil # closed between the check and the push: written below instead
+          end
         end
+        # No queue, or #close has closed it to drain what's left: a hook still
+        # running (removed but mid-line) writes in place rather than being lost
+        db.transaction { job.call }
       rescue StandardError => e
         # Inside a job, a busy database fails the whole job so it is retried
         raise if Thread.current == @writer && busy_error?(e)
@@ -551,7 +563,7 @@ module GS4Analytics
 
       # Closes a cycle and returns its row, or nil when it was too short to
       # keep. A rest keeps the reason it started with; other cycles only take
-      # a non-empty reason, so 'unhandled exit' is never overwritten.
+      # a non-empty reason, so 'hunt stopped' is never overwritten.
       def end_cycle(cycle_id, vitals, rest_reason, at: Time.now.to_i)
         now = at
         reason = rest_reason.to_s.empty? ? nil : Util.norm(rest_reason)
@@ -789,7 +801,7 @@ module GS4Analytics
 
       def statistics
         counts = %i[logins cycles kill_stats bounties bounty_offers silver_events item_sales bank_snapshots
-                    rest_steps vendor_visits].map { |table| "#{table}: #{Util.fmt(db[table].count)}" }
+                    rest_steps vendor_visits progress].map { |table| "#{table}: #{Util.fmt(db[table].count)}" }
         counts << "size: #{(File.size(file) / 1_048_576.0).round(2)} MB"
       end
 
@@ -869,8 +881,13 @@ module GS4Analytics
         until @pending.empty?
           return if @busy_until && monotonic_now < @busy_until
 
-          run_write(@pending.first)
-          @pending.shift
+          # Lich holds a ;kill back until COMMIT returns. Without this guard the
+          # kill would land between the commit and the shift, and #close would
+          # write the same job a second time.
+          Thread.handle_interrupt(Object => :never) do
+            run_write(@pending.first)
+            @pending.shift
+          end
           @busy_until = nil
           @busy_backoff = BUSY_BACKOFF_START_S
         end
@@ -916,8 +933,8 @@ module GS4Analytics
       # killed it, so whatever it had pending or queued is written here.
       def stop_writer
         if @writer&.alive?
-          @queue << :stop
-          @writer.join(STOP_WAIT_S)
+          @queue << :stop unless @queue.closed? # a closed queue has nothing more to send
+          @writer.join(@queue.closed? ? 1 : STOP_WAIT_S)
           @writer.kill if @writer.alive?
         end
         @writer = nil
@@ -928,6 +945,7 @@ module GS4Analytics
       # backoff. The first that finds the database still busy ends it, so
       # stopping waits for the lock once, not once per write.
       def write_remaining
+        @queue&.close # from here, a late async call writes in place (see #async)
         jobs = @pending.to_a
         until @queue.nil? || @queue.empty?
           job = @queue.pop
@@ -1041,8 +1059,8 @@ module GS4Analytics
           index %i[game character outcome]
         end
 
-        # silver_events, item_sales and vendor_visits are stored for the
-        # player's own queries; no report reads them yet
+        # silver_events (read by report silver), item_sales and vendor_visits
+        # (read by the site's Income page) are also open to the player's own queries
         db.create_table?(:silver_events) do
           String :event_id, primary_key: true
           String :cycle_id
@@ -1124,10 +1142,12 @@ module GS4Analytics
           primary_key %i[game character started_at]
         end
 
-        # Where a character stands: written when something changes (level,
-        # training points, Death's Sting, Lumnis...), experience at most every
-        # few minutes, and at least hourly. See ProgressManager.
-        db.create_table?(:progress) do
+        # Where a character stands: written when a milestone changes (level,
+        # Lumnis...) or a new EXPERIENCE reading arrives (fame, deeds, Death's
+        # Sting, training points; nil in other rows), when the sting wears off,
+        # and at least hourly. See ProgressManager. Keyed by its primary key
+        # alone (WITHOUT ROWID): no separate rowid and index to store.
+        db.create_table?(:progress, without_rowid: true) do
           String :game, null: false
           String :character, null: false
           Integer :timestamp, null: false
@@ -1163,10 +1183,18 @@ module GS4Analytics
   # Vitals: the character numbers stored at the start and end of a cycle
   # ==========================================================================
   module Vitals
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
     module_function
 
-    def read
+    # Fame comes only from EXPERIENCE output, so it's as old as the last one
+    # typed. A cycle takes it only when a reading landed after +since+ (the
+    # cycle's start, for its end; a couple of minutes back, for a start), so a
+    # rest is never credited with a whole hunt's fame. nil otherwise.
+    FRESH_SECONDS = 120
+
+    def read(since: Time.now.to_i - FRESH_SECONDS)
       exp = defined?(Experience) ? Experience : Util.safely { Lich::Gemstone::Experience }
+      read_at = Util.safely { exp.updated_at }&.to_i
       {
         exp_total: Util.safely(0) { exp.txp },
         exp_regular: Util.safely { exp.exp },
@@ -1174,7 +1202,7 @@ module GS4Analytics
         exp_field: Util.safely(0) { exp.fxp_current },
         # nil when Lich can't say, so a stored capacity is never overwritten by 0
         exp_max: Util.safely { exp.fxp_max.to_i.then { |max| max.positive? ? max : nil } },
-        fame: Util.safely(0) { exp.fame },
+        fame: read_at && read_at >= since ? Util.safely { exp.fame } : nil,
         encumbrance: Util.safely(0.0) { Char.percent_encumbrance }
       }
     end
@@ -1191,21 +1219,31 @@ module GS4Analytics
 
     HOOK = 'GS4Analytics::ProgressManager'
     TAGS = /<[^>]+>/
-    # EXPERIENCE: "      PTPs/MTPs: 36/0                        ATPs: 6"
-    TP_RE = %r{PTPs/MTPs:\s*([\d,]+)\s*/\s*([\d,]+)(?:\s+ATPs:\s*([\d,]+))?}
+    # EXPERIENCE: "      PTPs/MTPs: 36/0                        ATPs: 6", at the start of the
+    # line (tags stripped), so another player saying the same words can't set them
+    TP_RE = %r{\A\s*PTPs/MTPs:\s*([\d,]+)\s*/\s*([\d,]+)(?:\s+ATPs:\s*([\d,]+))?}
+    # The Death's Sting has worn off (the variant ending "yet a lingering
+    # weakness remains" means it has eased, not gone)
+    STING_GONE_RE = /\AYou feel the sting of a recent death slowly fade away\.\s*\z/
     CHECK_EVERY = 60 # seconds between reads of the game state
-    EXP_EVERY = 300  # experience moves every pulse: written at most this often
-    HEARTBEAT = 3600 # a row at least this often, changed or not
+    HEARTBEAT = 3600 # a row at least this often; experience moving alone waits for it
     # A change to any of these is written at once
-    MILESTONES = %i[level deaths_sting ptp mtp atp lumnis rpa fashlonae deeds].freeze
-    GAINS = %i[exp ascension_exp fame long_term_exp].freeze
+    MILESTONES = %i[level lumnis rpa fashlonae].freeze
+    # These come only from EXPERIENCE output, so a row has them only when a
+    # reading arrived since the row before it (nil otherwise): an old reading
+    # is never stamped as current. A new reading is written at once.
+    READINGS = %i[fame deeds long_term_exp deaths_sting].freeze
 
     class << self
       def start(who)
         @who = who
         @last = nil
         @written_at = nil
-        @tp = {}
+        # The EXPERIENCE reading there already (infomon keeps it across logins):
+        # only one that arrives after starting counts as new
+        @read_at = read_at_now
+        @tp = nil
+        @sting_gone_at = nil
         DownstreamHook.remove(HOOK)
         DownstreamHook.add(HOOK, proc { |line| on_line(line) })
         @thread = Thread.new do
@@ -1235,12 +1273,25 @@ module GS4Analytics
         values = read
         return false if values[:exp].nil? && values[:level].nil? # nothing from the game yet
 
-        return false unless final || due?(values, now)
+        # The sting wore off: written at the moment it did, as a reading of None
+        if (gone = @sting_gone_at)
+          @sting_gone_at = nil
+          who = @who
+          Database.async { Database.record_progress(who, gone, values.merge(deaths_sting: 'None')) }
+        end
+        fresh = fresh_reading?
+        return false unless final || fresh || due?(values, now)
 
+        row = fresh ? values : values.merge(READINGS.to_h { |key| [key, nil] })
+        if @tp # training points seen in EXPERIENCE since the last row
+          row = row.merge(@tp)
+          @tp = nil
+        end
+        @read_at = values[:read_at]
         @last = values
         @written_at = now
         who = @who
-        Database.async { Database.record_progress(who, now, values) }
+        Database.async { Database.record_progress(who, now, row) }
         true
       end
 
@@ -1258,23 +1309,36 @@ module GS4Analytics
           deaths_sting: Util.safely { exp.deaths_sting }&.to_s,
           lumnis: Util.safely { XMLData.lumnis }&.to_i,
           rpa: Util.safely { XMLData.rpa }&.to_f,
-          fashlonae: Util.safely { XMLData.fashlonae }&.to_i
-        }.merge(@tp)
+          fashlonae: Util.safely { XMLData.fashlonae }&.to_i,
+          read_at: Util.safely { exp.updated_at }&.to_i # when EXPERIENCE was last read
+        }
       end
 
       private
 
       def due?(values, now)
         return true if @last.nil? || now - @written_at >= HEARTBEAT
-        return true if MILESTONES.any? { |key| values[key] != @last[key] }
 
-        GAINS.any? { |key| values[key] != @last[key] } && now - @written_at >= EXP_EVERY
+        MILESTONES.any? { |key| values[key] != @last[key] } || !@tp.nil?
+      end
+
+      # An EXPERIENCE reading no row has taken yet
+      def fresh_reading?
+        at = read_at_now
+        !at.nil? && at != @read_at
+      end
+
+      def read_at_now
+        exp = defined?(Experience) ? Experience : Util.safely { Lich::Gemstone::Experience }
+        Util.safely { exp.updated_at }&.to_i
       end
 
       # Runs on the game-text thread: only remembers what it read
       def on_line(line)
         if line.include?('PTPs/MTPs') && (found = line.gsub(TAGS, '').match(TP_RE))
           @tp = { ptp: found[1].delete(',').to_i, mtp: found[2].delete(',').to_i, atp: found[3]&.delete(',')&.to_i }.compact
+        elsif line.include?('sting of a recent death') && line.gsub(TAGS, '').strip.match?(STING_GONE_RE)
+          @sting_gone_at = Time.now.to_i
         end
         line
       rescue StandardError => e
@@ -1294,7 +1358,12 @@ module GS4Analytics
 
     # Most specific first: a locksmith pool room is often tagged locksmith too
     SHOP_TAGS = ['gemshop', 'pawnshop', 'furrier', 'alchemist', 'consignment', 'herbalist', 'general store',
-                 'locksmith pool', 'locksmith', 'bank', 'chronomage', 'debt'].freeze
+                 'locksmith pool', 'locksmith', 'bank', 'chronomage', 'debts', 'debt'].freeze
+    # The map spells one town several ways ("the city of Ta'Vaalor", "Ta'Vaalor"),
+    # and some shops sit in a district ("the lowlands of Marshtown" for
+    # Solhaven's locksmith). A shop's town is the nearest town-tagged room's
+    # location, without its "the city of" style prefix.
+    TOWN_PREFIX = /\A(?:the )?(?:town|city|free port|village|tunnels and caverns) of /i
     MIN_SECONDS = 5 # walking through without doing anything is not a visit
 
     class << self
@@ -1347,7 +1416,18 @@ module GS4Analytics
         tag = SHOP_TAGS.find { |name| tags.include?(name) }
         return unless tag
 
-        { vendor: tag, room_id: Util.safely { room.id }, town: Util.safely { room.location }&.to_s }
+        { vendor: tag, room_id: Util.safely { room.id }, town: town_of(room) }
+      end
+
+      # Worked out once per room: finding the nearest town room walks the map
+      def town_of(room)
+        (@towns ||= {}).fetch(room.id) do
+          town = Util.safely do
+            near = room.find_nearest_by_tag('town')
+            near && Room[near]&.location
+          end
+          @towns[room.id] = (town || Util.safely { room.location }).to_s.sub(TOWN_PREFIX, '').then { |t| t.empty? ? nil : t }
+        end
       end
 
       def finish(now)
@@ -1379,12 +1459,17 @@ module GS4Analytics
     BOX_FOUND_RE = /\A(?:He|She|It) carried an? .+ on (?:him|her|it)!/
     # Silver spent: the town locksmith's quote then payment, the locksmith
     # pool's tip and fee, and the wandering priestess's flasks
-    LOCK_QUOTE_RE = /Gimme ([\d,]+) silvers?, and I'll have it open/
+    # Only a quote to you: "... tells you, "...  Gimme 5,871 silvers, and I'll have it open ..."
+    # (one to another player in the room reads "tells <Name>, ...")
+    LOCK_QUOTE_RE = /tells you, ".*?Gimme ([\d,]+) silvers?, and I'll have it open/
     LOCK_PAID_RE = /\AThe locksmith (\S+) accepts your silvers\./
     POOL_PAID_RE = /\A(\S+) takes your .+? and says, "Your tip of ([\d,]+) silvers? has been recorded, and the ([\d,]+) silvers? fee has been collected/
     PRIESTESS_RE = /\AYou hand the priestess ([\d,]+) silvers?\./
     PROMPT_RE  = /<prompt/
-    CHARM_RE   = /They locate a pile of ([\d,]+) coins?, reclaiming them/
+    # Your own fossil charm only: another character's ends "returning to him/her"
+    CHARM_RE   = /They locate a pile of ([\d,]+) coins?[^,]*, reclaiming them and returning to you\b/
+    # A warehouse's storage fee, paid from hand
+    WAREHOUSE_RE = /recorded a storage fee of ([\d,]+) silvers? for you and thanks you for paying it/
     DIRECT_RE  = /You gather the remaining ([\d,]+) coins? from inside your/
     BANK_SKIP  = /amounts on deposit|inter-town|urchin/i
     BANK_START = /amounts on deposit/
@@ -1607,6 +1692,8 @@ module GS4Analytics
           record_expense(digits(found[2]) + digits(found[3]), 'locksmith pool', found[1])
         elsif (found = text.match(PRIESTESS_RE))
           record_expense(digits(found[1]), 'priestess', nil)
+        elsif (found = text.match(WAREHOUSE_RE))
+          record_expense(digits(found[1]), 'warehouse', nil)
         end
       end
 
@@ -1624,6 +1711,11 @@ module GS4Analytics
 
       def record_sale(vendor, item, noun, amount)
         vendor_type, vendor_name = split_vendor(vendor.strip)
+        # In a shop the map names (gemshop, pawnshop, furrier, consignment...)
+        # the shop is the type, and whoever spoke is the name: the consignment
+        # clerk calls itself a pawnbroker, and named shopkeepers name no trade
+        shop = ShopWatcher.current&.[](:vendor)
+        vendor_type, vendor_name = shop, vendor.strip if shop && shop != 'bank'
         item = item.strip
         noun ||= item.split.last
         who = @who
@@ -2305,11 +2397,14 @@ module GS4Analytics
 
       def transition_to(target)
         Log.debug("State #{@current_state} -> #{target}")
-        # A hunt that ends with neither a rest nor a death was cut off, but
-        # that can only be told when something reports resting at all
+        # A hunt that ends with neither a rest nor a death was stopped: most
+        # often by hand at the end of a session. Lich can't tell that from a
+        # hunting script dying, so it isn't called a crash (the site and older
+        # databases read 'unhandled exit' as one). Only said when something
+        # reports resting at all.
         if @current_state == :hunt && target == :idle && @current_cycle_id && rest_detectable? &&
            !BIGSHOT_REST_STATUSES.include?(@last_bigshot_status)
-          note_reason(@current_cycle_id, 'unhandled exit')
+          note_reason(@current_cycle_id, 'hunt stopped')
         end
         @last_bigshot_status = nil
         name_interrupting_scripts if @current_state == :hunt && target == :rest
@@ -2408,7 +2503,7 @@ module GS4Analytics
 
         @current_cycle_id = nil
         link_silver
-        vitals = Vitals.read
+        vitals = Vitals.read(since: @cycle_started_at || (Time.now.to_i - Vitals::FRESH_SECONDS))
         # Only a hunt is ended by a rest reason. Bigshot keeps $rest_reason
         # until its next hunt, so the idle time after a rest would take it too.
         reason = @current_state == :hunt ? rest_reason : ''
@@ -3658,7 +3753,7 @@ module GS4Analytics
         reply(client, 503, 'text/plain', e.message, origin)
       rescue StandardError => e
         Log.error('dashboard', e)
-        reply(client, 500, 'text/plain', 'Internal error')
+        reply(client, 500, 'text/plain', 'Internal error', origin)
       ensure
         client.close unless client.closed?
       end

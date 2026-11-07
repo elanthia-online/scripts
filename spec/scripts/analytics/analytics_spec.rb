@@ -56,12 +56,40 @@ RSpec.describe 'analytics.lic' do
 
     it 'records each stop with its time, silver, spending, room and town; passing through is not a stop' do
       expect(shops['visits']).to eq([['gemshop', 60, 6200, 0, 20, "Wehnimer's Landing"],
-                                     ['locksmith pool', 30, 0, 300, 30, 'Icemule Trace'],
+                                     ['locksmith pool', 30, 0, 300, 30, 'Solhaven'],
+                                     ['consignment', 10, 400, 0, 40, 'Solhaven'],
                                      ['api', 50, 777, nil, nil, nil]])
+    end
+
+    it "names a stop's town after the nearest town room, so one town is one name" do
+      # The pool's own location is "the lowlands of Marshtown"; the town room says "the free port of Solhaven"
+      expect(shops['visits'].map(&:last).compact.uniq).to eq(["Wehnimer's Landing", 'Solhaven'])
+    end
+
+    it 'files a sale under the shop it happened in, and whoever spoke as the name' do
+      expect(shops['sales']).to match_array([['gemshop', 'jeweler', 5000], ['consignment', 'pawnbroker', 400]])
     end
 
     it 'leaves visits to the selling script when track_shops is off' do
       expect(shops['off']).to be_nil
+    end
+  end
+
+  describe 'the API on an unexpected error' do
+    it "answers 500 with the site's CORS header, so the page can tell it from a script that isn't running" do
+      expect(result('dashboard')['error_500']).to eq(['500', 'https://analytics.elanthia.online'])
+    end
+  end
+
+  describe 'the writer while stopping' do
+    subject(:writes) { result('close_writes') }
+
+    it 'writes a job queued while close drains the queue, in place' do
+      expect(writes['late']).to eq(1)
+    end
+
+    it 'writes a job once when a ;kill lands right after its COMMIT' do
+      expect(writes.values_at('writer_alive', 'once')).to eq([false, 1])
     end
   end
 
@@ -72,27 +100,38 @@ RSpec.describe 'analytics.lic' do
       expect(progress.values_at('hook', 'hook_removed')).to eq([true, true])
     end
 
-    it 'writes a milestone at once, experience alone at most every five minutes, and a heartbeat hourly' do
-      # too soon, after EXP_EVERY, Death's Sting, training points, unchanged, heartbeat
-      expect(progress['checks']).to eq([false, true, true, true, false, true])
+    it 'writes a milestone or a new EXPERIENCE reading at once, experience alone at the hourly heartbeat' do
+      # gain soon, gain later, sting changed but not read, a new reading, another player's TP line,
+      # the real TP line, unchanged, heartbeat
+      expect(progress['checks']).to eq([false, false, false, true, false, true, false, true])
     end
 
-    it 'records what Lich knows without sending a command' do
+    it 'never stamps an old EXPERIENCE reading as current' do
+      # The reading from before the script started isn't in the first row
       expect(progress['first']).to eq('level' => 100, 'exp' => 900_000, 'ascension_exp' => 100_000, 'until_next' => 1500,
-                                      'fame' => 5000, 'deeds' => 12, 'long_term_exp' => 59, 'deaths_sting' => 'None',
-                                      'ptp' => nil, 'lumnis' => nil)
-      expect(progress['stings']).to eq(%w[None Light])
-      expect(progress['tps']).to eq('ptp' => 36, 'mtp' => 0, 'atp' => 6)
+                                       'fame' => nil, 'deeds' => nil, 'long_term_exp' => nil, 'deaths_sting' => nil,
+                                       'ptp' => nil, 'lumnis' => nil)
+      expect(progress['reading']).to eq('deaths_sting' => 'Light', 'fame' => 5000, 'deeds' => 12, 'long_term_exp' => 59)
+      expect(progress['heartbeat']).to eq('exp' => 900_500, 'deaths_sting' => nil, 'fame' => nil)
     end
 
-    it 'writes a row per check that was due, plus the first and the last' do
-      expect(progress['rows']).to eq(6) # first, after EXP_EVERY, sting, training points, heartbeat, last
+    it 'takes unspent training points only from the EXPERIENCE line itself, once' do
+      expect(progress['tps']).to eq([{ 'ptp' => 36, 'mtp' => 0, 'atp' => 6 }])
     end
 
-    it 'keeps regular and ascension experience apart on cycles' do
+    it "writes the Death's Sting wearing off when it does (not when it only eases)" do
+      expect(progress['gone']).to eq([0, 1])
+    end
+
+    it 'writes the first row, each due check, the sting wearing off and the last row' do
+      expect(progress['rows']).to eq(6)
+    end
+
+    it 'keeps regular and ascension experience apart on cycles, and gives them fame only from a fresh reading' do
       expect(progress['cycle']).to eq('exp_regular_start' => 900_500, 'exp_regular_end' => 900_500,
                                       'exp_asc_start' => 100_000, 'exp_asc_end' => 100_000, 'exp_total_start' => 1_000_000)
-      expect(progress['schema']).to eq('8')
+      expect(progress['cycle_fame']).to eq([nil, 5000])
+      expect(progress['schema']).to eq('9')
     end
   end
 
@@ -178,6 +217,10 @@ RSpec.describe 'analytics.lic' do
 
   describe 'a hunt interrupted by another script' do
     subject(:trip) { result('interrupted_hunt') }
+
+    it "calls a hunt stopped with neither a rest nor a death 'hunt stopped', not a crash" do
+      expect(trip['stopped_reason']).to eq('hunt stopped')
+    end
 
     it 'counts a rest-step script running after a hunt as resting' do
       expect(trip.values_at('hunt_then_trip', 'hunt_nothing_running')).to eq([[true, false], [true, false]])
@@ -296,7 +339,12 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'records silver spent at the locksmith (once per quote), the locksmith pool and the priestess' do
-      expect(spending['spent']).to eq([['locksmith', 'Jyhm', 4033], ['locksmith pool', 'Jahck', 750], ['priestess', nil, 1200]])
+      expect(spending['spent']).to eq([['locksmith', 'Jyhm', 4033], ['locksmith pool', 'Jahck', 750], ['priestess', nil, 1200],
+                                       ['warehouse', nil, 1210]])
+    end
+
+    it "pays the quote the locksmith gave you, not one given to someone else meanwhile" do
+      expect(spending['spent'].first).to eq(['locksmith', 'Jyhm', 4033])
     end
   end
 
@@ -349,7 +397,7 @@ RSpec.describe 'analytics.lic' do
 
     it 'is refused before anything is written into it, saying what to do' do
       expect(guard['writer'].first).to be(true)
-      expect(guard['writer'].last).to include('schema 6', 'this one uses 8', 'Rename or move it')
+      expect(guard['writer'].last).to include('schema 6', 'this one uses 9', 'Rename or move it')
       expect(guard['untouched']).to eq(%w[cycles metadata])
     end
 
@@ -363,7 +411,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'starts a fresh database in an empty file' do
-      expect(guard['empty_file']).to eq('8')
+      expect(guard['empty_file']).to eq('9')
     end
   end
 
