@@ -121,6 +121,7 @@ RSpec.describe 'analytics.lic' do
 
     it "writes the Death's Sting wearing off when it does (not when it only eases)" do
       expect(progress['gone']).to eq([0, 1])
+      expect(progress['gone_row']).to eq('fame' => nil, 'deeds' => nil, 'long_term_exp' => nil)
     end
 
     it 'writes the first row, each due check, the sting wearing off and the last row' do

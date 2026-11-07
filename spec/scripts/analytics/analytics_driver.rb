@@ -1598,6 +1598,7 @@ when 'progress'
     'heartbeat' => at.call(4100)&.slice('exp', 'deaths_sting', 'fame'),
     'tps' => rows.select { |r| r['ptp'] }.map { |r| r.slice('ptp', 'mtp', 'atp') },
     'gone' => [eased, rows.count { |r| r['deaths_sting'] == 'None' }], 'cycle_fame' => [stale[:fame], fresh[:fame]],
+    'gone_row' => rows.find { |r| r['deaths_sting'] == 'None' }&.slice('fame', 'deeds', 'long_term_exp'),
     'cycle' => cycle, 'schema' => A::Database.metadata('schema_version')
   }
 
