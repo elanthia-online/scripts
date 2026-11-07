@@ -2073,3 +2073,343 @@ RSpec.describe 'bigshot cast_signs' do
     end
   end
 end
+
+# cmd_wand waves from your hands unless the command says "reserve", which
+# moves the wand into the RESERVE slot first (the reverse of cmd_wandolier,
+# which uses RESERVE unless told "noreserve"). It also takes a stance word.
+module BigshotWandSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  CMD_WAND_SRC = extract(/^  def cmd_wand\(target, args = nil\).*?^  end$/m, 'cmd_wand')
+  WAND_NAME_PATTERN_SRC = extract(/^  def wand_name_pattern\(name\).*?^  end$/m, 'wand_name_pattern')
+  # cmd_wandolier must share the escaped matcher rather than build its own.
+  extract(/^  def cmd_wandolier\(target, args\)(?:(?!^  end$).)*wand_name_pattern\(@WAND\[\$bigshot_wand\]\)/m,
+          'cmd_wandolier uses wand_name_pattern')
+  DISPATCH_SRC = extract(/^    elsif \(command =~ (\/\^wand\\b.*?\/i)\)\n      cmd_wand\(npc, \$1\)$/, 'cmd wand dispatch')
+  DISPATCH_RE = Regexp.new(DISPATCH_SRC[/\/(\^wand.*?)\/i/, 1], Regexp::IGNORECASE)
+  # Fails loudly if the out-of-mana fallback stops calling cmd_wand with no args.
+  extract(/^      if \(@WAND_IF_OOM\)\n        cmd_wand\(target\); return;$/, 'wand_if_oom fallback')
+  # Fails loudly if rest stops starting the next hunt back on the first wand type.
+  extract(/^  def rest\(\)(?:(?!^  end$).)*^    \$bigshot_wand = 0$/m, 'rest resets wand index')
+
+  Item = Struct.new(:id, :name)
+  Target = Struct.new(:id)
+
+  class Harness
+    class GameObj
+      class << self
+        attr_accessor :right_hand, :left_hand, :reserve
+      end
+    end
+
+    attr_accessor :FRESH_WAND_CONTAINER, :DEAD_WAND_CONTAINER, :WAND, :wave_result
+    attr_reader :sent, :stances, :messages
+
+    def initialize(wands_in_container: [Item.new('100', 'oaken wand')])
+      @FRESH_WAND_CONTAINER = 'cloak'
+      @DEAD_WAND_CONTAINER = nil
+      @WAND = ['oaken wand']
+      @HUNTING_STANCE = 'defensive'
+      @container = wands_in_container.dup
+      @sent = []
+      @stances = []
+      @messages = []
+      @wave_result = 'd100 roll'
+      GameObj.right_hand = Item.new(nil, 'Empty')
+      GameObj.left_hand = Item.new(nil, 'Empty')
+      GameObj.reserve = []
+      $bigshot_wand = 0
+    end
+
+    def debug_msg(*); end
+    def message(_color, text) = @messages << text
+    def change_stance(stance) = @stances << stance
+    def bs_put(cmd) = @sent << cmd
+
+    def fput(cmd)
+      @sent << cmd
+      GameObj.reserve ||= [] if cmd == 'reserve list'
+      return unless cmd =~ /^reserve #(\d+)$/
+
+      held = GameObj.right_hand
+      return unless held.id == Regexp.last_match(1)
+
+      @reserved = held
+      GameObj.reserve << held unless reserve_list_stale
+      GameObj.right_hand = Item.new(nil, 'Empty')
+    end
+
+    def dothistimeout(cmd, _timeout, _pattern)
+      @sent << cmd
+      return clear_reserve(Regexp.last_match(1)) if cmd =~ /^reserve clear #(\d+)$/
+
+      wand = @container.find { |w| cmd.include?(w.name) }
+      return 'Get what?' unless wand
+
+      @container.delete(wand)
+      GameObj.right_hand = wand
+      get_reply || "You remove #{wand.name}."
+    end
+
+    attr_accessor :hands_full, :reserve_list_stale
+
+    # RESERVE CLEAR moves the item back into a hand, if one is free
+    def clear_reserve(id)
+      item = GameObj.reserve.find { |o| o.id == id } || (@reserved if @reserved&.id == id)
+      return nil if item.nil? || hands_full
+
+      GameObj.reserve.delete(item)
+      GameObj.right_hand = item
+      "You remove #{item.name} from your reserves and hold it in your hand."
+    end
+
+    def get_res(cmd, _pattern)
+      @sent << cmd
+      @wave_result
+    end
+
+    attr_accessor :get_reply
+
+    class_eval(WAND_NAME_PATTERN_SRC)
+    class_eval(CMD_WAND_SRC)
+  end
+end
+
+RSpec.describe 'bigshot cmd_wand' do
+  let(:bs) { BigshotWandSpec::Harness.new }
+  let(:target) { BigshotWandSpec::Target.new('555') }
+
+  after do
+    $bigshot_wand = 0
+    $bigshot_should_rest = nil
+    $rest_reason = nil
+  end
+
+  describe 'command parsing' do
+    it 'passes stance and reserve tokens through to cmd_wand' do
+      expect('wand guarded reserve'[BigshotWandSpec::DISPATCH_RE, 1].split).to eq(%w[guarded reserve])
+    end
+
+    it 'still matches a bare "wand"' do
+      expect('wand'[BigshotWandSpec::DISPATCH_RE, 1]).to eq('')
+    end
+
+    it 'does not swallow "wandolier"' do
+      expect('wandolier guarded').not_to match(BigshotWandSpec::DISPATCH_RE)
+    end
+  end
+
+  describe 'plain "wand" (the default)' do
+    it 'gets the wand, waves it from your hand at the target and never touches RESERVE' do
+      bs.cmd_wand(target)
+
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'wave #100 at #555'])
+      expect(bs.class::GameObj.right_hand.id).to eq('100')
+      expect(bs.class::GameObj.reserve).to be_empty
+    end
+
+    it 'waves in offensive stance, then returns to the hunting stance' do
+      bs.cmd_wand(target, '')
+      expect(bs.stances).to eq(%w[offensive defensive])
+    end
+
+    it 'ignores a wand already sitting in RESERVE and gets one for your hand' do
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'wave #100 at #555'])
+    end
+
+    it 'drops a dead wand by id' do
+      bs.wave_result = nil
+      bs.cmd_wand(target)
+      expect(bs.sent.last).to eq('drop #100')
+    end
+
+    it 'puts a dead wand in the dead wand container by id' do
+      bs.wave_result = nil
+      bs.DEAD_WAND_CONTAINER = 'sack'
+      bs.cmd_wand(target)
+      expect(bs.sent.last).to eq('put #100 in my sack')
+    end
+  end
+
+  describe '"wand reserve"' do
+    it 'moves the wand into RESERVE and waves it from there' do
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'reserve #100', 'wave #100 at #555'])
+      expect(bs.class::GameObj.right_hand.name).to eq('Empty')
+      expect(bs.class::GameObj.reserve.map(&:id)).to eq(['100'])
+    end
+
+    it 'waves a wand already in RESERVE without getting another' do
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent).to eq(['wave #200 at #555'])
+    end
+
+    it 'asks for the reserve list when RESERVE has not been seen yet' do
+      bs.class::GameObj.reserve = nil
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.first).to eq('reserve list')
+    end
+
+    it 'takes a dead wand out of RESERVE before dropping it' do
+      bs.wave_result = nil
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last(3)).to eq(['wave #100 at #555', 'reserve clear #100', 'drop #100'])
+      expect(bs.class::GameObj.reserve).to be_empty
+    end
+
+    it 'takes a dead wand out of RESERVE before putting it in the dead wand container' do
+      bs.wave_result = nil
+      bs.DEAD_WAND_CONTAINER = 'sack'
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.last(2)).to eq(['reserve clear #100', 'put #100 in my sack'])
+    end
+
+    it 'takes a dead wand out of RESERVE even if the reserve list has not refreshed yet' do
+      bs.wave_result = nil
+      bs.reserve_list_stale = true
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last(3)).to eq(['wave #100 at #555', 'reserve clear #100', 'drop #100'])
+    end
+
+    it 'warns and keeps hunting when a dead wand cannot come out of RESERVE' do
+      bs.wave_result = nil
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.hands_full = true
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last).to eq('reserve clear #200')
+      expect(bs.messages.last).to match(/Couldn't take the dead wand out of RESERVE/)
+      expect($bigshot_should_rest).to be_falsey
+    end
+
+    it 'refreshes the reserve list when the reserved wand is gone' do
+      bs.wave_result = 'What were you referring to?'
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.last).to eq('reserve list')
+    end
+  end
+
+  it 'uses the given stance' do
+    bs.cmd_wand(target, ' guarded reserve')
+    expect(bs.stances).to eq(%w[guarded defensive])
+  end
+
+  it 'moves on to the next wand type when the container has none of the first' do
+    bs = BigshotWandSpec::Harness.new(wands_in_container: [BigshotWandSpec::Item.new('300', 'iron wand')])
+    bs.WAND = ['oaken wand', 'iron wand']
+    bs.cmd_wand(target)
+    expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'wave #300 at #555'])
+  end
+
+  describe 'with blank entries in the wand setting' do
+    let(:sword) { BigshotWandSpec::Item.new('900', 'broadsword') }
+    let(:iron) { BigshotWandSpec::Item.new('300', 'iron wand') }
+    let(:bs) { BigshotWandSpec::Harness.new(wands_in_container: [iron]) }
+
+    before { bs.class::GameObj.right_hand = sword }
+
+    [['oaken wand', '', 'iron wand'], ['oaken wand', ' ', 'iron wand']].each do |setting|
+      it "skips the blank entry in #{setting.inspect} and leaves the held weapon alone" do
+        bs.WAND = setting
+        bs.cmd_wand(target)
+        expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'wave #300 at #555'])
+      end
+    end
+
+    it 'skips a blank entry in reserve mode too' do
+      bs.WAND = ['oaken wand', '', 'iron wand']
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'reserve #300', 'wave #300 at #555'])
+    end
+
+    it 'skips a leading blank entry' do
+      bs.WAND = ['', 'iron wand']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get iron wand from my cloak', 'wave #300 at #555'])
+    end
+
+    it 'rests when only a blank entry is left after the last wand type' do
+      bs.WAND = ['oaken wand', '']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get oaken wand from my cloak'])
+      expect($rest_reason).to eq('No fresh wands!')
+    end
+  end
+
+  it 'rests when no wand type is left' do
+    bs = BigshotWandSpec::Harness.new(wands_in_container: [])
+    bs.cmd_wand(target)
+    expect($bigshot_should_rest).to be true
+    expect($rest_reason).to eq('No fresh wands!')
+  end
+
+  it 'accepts a wand that slides out of its container' do
+    bs.get_reply = 'You slide an oaken wand out of your cloak.'
+    bs.cmd_wand(target)
+    expect(bs.sent.last).to eq('wave #100 at #555')
+    expect(bs.messages).to be_empty
+  end
+
+  describe 'wand name matching' do
+    it 'matches the setting words in order' do
+      expect('polished oaken wand').to match(bs.wand_name_pattern('oaken wand'))
+      expect('oaken polished wand').to match(bs.wand_name_pattern('polished wand'))
+      expect('wand of oak').not_to match(bs.wand_name_pattern('oak wand'))
+    end
+
+    it 'treats regex characters in the name literally' do
+      expect('wand (glowing)').to match(bs.wand_name_pattern('wand (glowing)'))
+      expect('c++ wand').to match(bs.wand_name_pattern('c++ wand'))
+      expect('cccc wand').not_to match(bs.wand_name_pattern('c++ wand'))
+    end
+
+    it 'waves a wand whose name has regex characters' do
+      bs = BigshotWandSpec::Harness.new(wands_in_container: [BigshotWandSpec::Item.new('400', 'wand (glowing)')])
+      bs.WAND = ['wand (glowing)']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get wand (glowing) from my cloak', 'wave #400 at #555'])
+    end
+  end
+
+  describe 'with no wand name to use' do
+    let(:sword) { BigshotWandSpec::Item.new('900', 'broadsword') }
+
+    before { bs.class::GameObj.right_hand = sword }
+
+    [nil, ' reserve'].each do |args|
+      it "leaves the held weapon alone when every wand type is used up (args: #{args.inspect})" do
+        $bigshot_wand = 1
+        bs.cmd_wand(target, args)
+        expect(bs.sent).to be_empty
+        expect(bs.messages.last).to match(/no wand type left/)
+      end
+    end
+
+    [nil, [], ['']].each do |setting|
+      it "leaves the held weapon alone when the wand setting is #{setting.inspect}" do
+        bs.WAND = setting
+        bs.cmd_wand(target)
+        expect(bs.sent).to be_empty
+        expect(bs.messages.last).to match(/no wand type left/)
+      end
+    end
+  end
+
+  it 'reports a missing fresh wand container' do
+    bs.FRESH_WAND_CONTAINER = nil
+    bs.cmd_wand(target)
+    expect(bs.messages.last).to match(/fresh wand container not defined/)
+    expect(bs.sent).to be_empty
+  end
+end
