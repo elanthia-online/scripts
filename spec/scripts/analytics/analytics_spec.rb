@@ -393,6 +393,28 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'dashboard.autostart' do
+    subject(:auto) { result('autostart') }
+
+    it 'is off by default' do
+      expect(auto['default']).to be(false)
+    end
+
+    it 'starts the dashboard when nothing serves it yet, and does nothing when this session already does' do
+      expect(auto['fresh']).to eq([true, true])
+      expect(auto['again']).to eq([true, true])
+    end
+
+    it "leaves it to another session that already serves it on the port, and says so" do
+      expect(auto['elsewhere']).to eq([false, true])
+    end
+
+    it 'says the port is in use when something else holds it, and finds nothing on a free port' do
+      expect(auto['taken']).to eq([false, true])
+      expect(auto['nobody']).to be(false)
+    end
+  end
+
   describe 'the zone it runs in' do
     subject(:zone) { result('zone') }
 

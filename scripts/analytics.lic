@@ -33,6 +33,7 @@
 
 require 'date'
 require 'fileutils'
+require 'io/wait'
 require 'json'
 require 'monitor'
 require 'securerandom'
@@ -277,7 +278,7 @@ module GS4Analytics
         daily_digest: true,
         death: true
       },
-      dashboard: { port: 8080, site_url: 'https://analytics.elanthia.online/', allowed_origins: [] }
+      dashboard: { autostart: false, port: 8080, site_url: 'https://analytics.elanthia.online/', allowed_origins: [] }
     }.freeze
 
     HEADER = <<~TEXT
@@ -304,8 +305,9 @@ module GS4Analytics
       # alerts                 no_kill_minutes 10, silver_drop_pct 50,
       #                        silver_check_after_hours 2, daily_digest true, death true
       # discord                send alerts through ;discordhook. true
-      # dashboard              port 8080, site_url (the hosted page),
-      #                        allowed_origins [] (a fork's https://... origin)
+      # dashboard              autostart false (feed the dashboard whenever the collector
+      #                        starts, unless another session already does), port 8080,
+      #                        site_url (the hosted page), allowed_origins [] (a fork's origin)
       # verbose                extra log lines. false
 
     TEXT
@@ -3697,6 +3699,29 @@ module GS4Analytics
       def running? = !@server.nil?
       attr_reader :port
 
+      # Whether this API already answers on +port+ (another Lich session's,
+      # since they share the database): a short /api/meta request on this
+      # computer, true only when the reply says it's analytics.lic
+      def answering?(port, wait: 1.5)
+        socket = Socket.tcp('127.0.0.1', port, connect_timeout: wait)
+        socket.write("GET /api/meta HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        reply = +''
+        deadline = Time.now + wait
+        while (left = deadline - Time.now).positive? && socket.wait_readable(left)
+          chunk = socket.read_nonblock(4096, exception: false)
+          break if chunk.nil? # the reply is complete (Connection: close)
+
+          reply << chunk if chunk.is_a?(String)
+          break if reply.bytesize > 65_536
+        end
+        body = reply.split("\r\n\r\n", 2)[1].to_s
+        JSON.parse(body)['app'] == 'analytics'
+      rescue StandardError
+        false
+      ensure
+        socket&.close
+      end
+
       # Where / redirects and what the CLI prints: the hosted page, connected
       # to this port
       def url(port = @port)
@@ -3900,7 +3925,11 @@ module GS4Analytics
         cfg = Settings.load(who)
         Collector.start(who, cfg)
         flag = args.find { |arg| arg.match?(/\A--dashboard(=\d+)?\z/) }
-        start_dashboard(flag[/\d+/]&.to_i || cfg[:dashboard][:port], args.include?('--lan') || cfg[:dashboard][:lan]) if flag
+        if flag
+          start_dashboard(flag[/\d+/]&.to_i || cfg[:dashboard][:port], args.include?('--lan') || cfg[:dashboard][:lan])
+        elsif cfg[:dashboard][:autostart]
+          autostart_dashboard(cfg[:dashboard][:port].to_i)
+        end
         install_hook
         Log.info("Ready. ;#{Script.current.name} help lists the commands that also work while this runs.")
         loop { execute(@commands.pop) }
@@ -3996,6 +4025,16 @@ module GS4Analytics
         Log.info("Dashboard: #{Dashboard.url} (reads this computer's analytics.lic on port #{port})")
       rescue Errno::EADDRINUSE
         Log.info("Port #{port} is already in use. Try ;#{Script.current.name} serve <other port>.")
+      end
+
+      # dashboard.autostart: feed the dashboard unless it already is, here or by
+      # another character's session on the same port (they share the database,
+      # so one is enough). A port held by something else is said once, as for serve.
+      def autostart_dashboard(port)
+        return if Dashboard.running?
+        return Log.info("Dashboard: already fed by another session on port #{port}.") if Dashboard.answering?(port)
+
+        start_dashboard(port, false)
       end
 
       def status

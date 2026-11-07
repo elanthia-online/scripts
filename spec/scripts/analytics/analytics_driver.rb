@@ -544,6 +544,51 @@ when 'dashboard'
   A::Dashboard.stop
   result['stopped'] = [!A::Dashboard.running?, A::Dashboard.instance_variable_get(:@api_conn).nil?]
 
+when 'autostart'
+  # dashboard.autostart: starts the API unless it already runs, here or in
+  # another session (stood in for by a listener that answers as analytics.lic)
+  A::Database.connect!
+  port = 39_000 + (Process.pid % 1000)
+  cli = A::CLI
+  default = A::Settings::DEFAULTS[:dashboard][:autostart]
+  OUT.clear
+  cli.send(:autostart_dashboard, port)
+  fresh = [A::Dashboard.running?, OUT.any? { |l| l.include?("live=#{port}") }]
+  OUT.clear
+  cli.send(:autostart_dashboard, port) # again in this session: nothing to do
+  again = [A::Dashboard.running?, OUT.empty?]
+  A::Dashboard.stop
+  # another session's API on the port
+  other = lambda do |body|
+    server = TCPServer.new('127.0.0.1', port)
+    thread = Thread.new do
+      loop do
+        client = server.accept
+        client.readpartial(4096)
+        client.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n#{body}")
+        client.close
+      end
+    rescue IOError, Errno::EBADF
+      nil
+    end
+    [server, thread]
+  end
+  server, thread = other.call(JSON.generate('app' => 'analytics', 'api' => 1))
+  OUT.clear
+  cli.send(:autostart_dashboard, port)
+  elsewhere = [A::Dashboard.running?, OUT.any? { |l| l.include?('already fed by another session') }]
+  server.close
+  thread.kill
+  # something else holds the port: said, not taken for analytics.lic
+  server, thread = other.call('{"app":"something else"}')
+  OUT.clear
+  cli.send(:autostart_dashboard, port)
+  taken = [A::Dashboard.running?, OUT.any? { |l| l.include?("Port #{port} is already in use") }]
+  server.close
+  thread.kill
+  result = { 'default' => default, 'fresh' => fresh, 'again' => again, 'elsewhere' => elsewhere, 'taken' => taken,
+             'nobody' => A::Dashboard.answering?(port, wait: 0.5) }
+
 when 'cli'
   A::Database.connect!
   seed_history
