@@ -148,13 +148,16 @@ module GS4Analytics
     end
 
     # What a task the taskmaster offered was, as far as it was known when it
-    # ended: "cull: kobold", "escort to Zul Logoth", "bandit task from Vornavis"
+    # ended: "cull: kobold", "escort to Zul Logoth", "bandit task from Vornavis".
+    # Until the guard names the target, the taskmaster's words say more.
     def offer_label(row)
-      type = row['bounty_type'].to_s
-      return "#{type}: #{bounty_target(type, row['creature'], row['area'])}".sub(/: \z/, '') unless type.empty?
-
       assignment = row['assignment'].to_s
       return "escort to #{row['area']}".sub(/ to \z/, '') if assignment == 'escort'
+
+      type = row['bounty_type'].to_s
+      target = bounty_target(type, row['creature'], row['area'])
+      return "#{type}: #{target}" unless type.empty? || target.empty?
+
       return "#{assignment.delete_suffix('_assignment')} task from #{row['town']}".sub(/ from \z/, '') if assignment.end_with?('_assignment')
 
       row['description'].to_s[0, 60].then { |text| text.empty? ? 'unknown' : text }
@@ -445,7 +448,7 @@ module GS4Analytics
     STOP_WAIT_S          = 30
     # Bank snapshot types that only move the total: a deposit or withdrawal
     # names no bank. Every other type is a BANK ACCOUNT listing.
-    TOTAL_ONLY = %w[deposit withdraw].freeze
+    TOTAL_ONLY = %w[deposit withdraw unstated].freeze
     # Rows from our own reads are keyed by column name as a String, which is
     # how every report and manager indexes them
     STRING_KEYS = ->(row) { row.transform_keys(&:to_s) }
@@ -639,6 +642,10 @@ module GS4Analytics
         db[:progress].insert_conflict(target: %i[game character timestamp], update: merge).insert(row)
       end
 
+      def set_trigger(cycle_id, script)
+        db[:cycles].where(cycle_id: cycle_id).update(trigger_script: script)
+      end
+
       def set_rest_reason(cycle_id, reason)
         db[:cycles].where(cycle_id: cycle_id).update(rest_reason: Util.norm(reason))
       end
@@ -760,6 +767,7 @@ module GS4Analytics
       def record_offer(who, cycle_id, offer, id:, at:)
         db[:bounty_offers].insert(clean(offer_id: id, cycle_id: cycle_id, game: who.game,
                                         character: who.name, offered_at: at, assignment: offer[:assignment],
+                                        bounty_type: offer[:bounty_type],
                                         town: offer[:town], area: offer[:area], description: offer[:description],
                                         expedited: offer[:expedited] ? true : false,
                                         vouchers_left: offer[:vouchers_left], outcome: 'open'))
@@ -798,8 +806,8 @@ module GS4Analytics
       # +results+ maps bank name to balance and carries a '__total__' entry.
       # Individual banks are written only when their balance changed; the
       # total always is, since it carries the silver-per-hour deltas.
-      def store_bank_snapshot(who, cycle_id, snapshot_type, results)
-        now = Time.now.to_i
+      def store_bank_snapshot(who, cycle_id, snapshot_type, results, at: Time.now.to_i)
+        now = at
         previous = latest_balances(who)
 
         # A bank emptied to zero drops out of BANK ACCOUNT. Record the zero so a
@@ -1488,6 +1496,7 @@ module GS4Analytics
     class << self
       def start(who)
         @lock = Mutex.new
+        @moving = Mutex.new
         @who = who
         @room = nil
         @visit = nil
@@ -1500,17 +1509,28 @@ module GS4Analytics
         @who = nil
       end
 
-      # From the cycle watcher's poll: has the character moved?
+      # From the cycle watcher's poll: has the character moved? Also from the
+      # game-text thread before a sale or payment is filed, since the poll can
+      # be up to half a second behind the shop the silver changed hands in.
+      # Cheap either way: the map walk for the town waits for the visit's end.
       def tick(now = Time.now.to_i)
         return unless @who && Settings.current[:track_shops]
 
-        id = Util.safely { XMLData.room_id }
-        return if id == @room
+        @moving.synchronize do
+          id = Util.safely { XMLData.room_id }
+          next if id == @room
 
-        @room = id
-        finish(now)
-        shop = shop_here if id
-        @lock.synchronize { @visit = shop.merge(start: now, silver: 0, spent: 0, kinds: Hash.new(0), cycle_id: CycleManager.current_cycle_id) } if shop
+          @room = id
+          finish(now)
+          shop = shop_here if id
+          @lock.synchronize { @visit = shop.merge(start: now, silver: 0, spent: 0, kinds: Hash.new(0), cycle_id: CycleManager.current_cycle_id) } if shop
+        end
+      end
+
+      # The shop the character is in now, caught up first: what a sale is filed under
+      def vendor_here
+        tick
+        @lock&.synchronize { @visit&.[](:vendor) }
       end
 
       # From the game-text thread: silver taken in or paid out in the shop
@@ -1525,7 +1545,10 @@ module GS4Analytics
         end
       end
 
-      def current = @lock&.synchronize { @visit&.dup }
+      def current
+        visit = @lock&.synchronize { @visit&.dup }
+        visit && visit.merge(town: town_of(visit[:room]))
+      end
 
       private
 
@@ -1537,7 +1560,7 @@ module GS4Analytics
         tag = SHOP_TAGS.find { |name| tags.include?(name) }
         return unless tag
 
-        { vendor: tag, room_id: Util.safely { room.id }, town: town_of(room) }
+        { vendor: tag, room_id: Util.safely { room.id }, room: room }
       end
 
       # Worked out once per room: finding the nearest town room walks the map
@@ -1565,7 +1588,7 @@ module GS4Analytics
         who = @who
         Database.async do
           Database.record_vendor_visit(who, visit[:cycle_id], visit[:vendor], visit[:start], now, visit[:silver],
-                                       spent: visit[:spent], room_id: visit[:room_id], town: visit[:town])
+                                       spent: visit[:spent], room_id: visit[:room_id], town: town_of(visit[:room]))
         end
       end
     end
@@ -1595,6 +1618,13 @@ module GS4Analytics
     PROMPT_RE  = /<prompt/
     # Your own fossil charm only: another character's ends "returning to him/her"
     CHARM_RE   = /They locate a pile of ([\d,]+) coins?[^,]*, reclaiming them and returning to you\b/
+    # A shop's ORDER and BUY (eherbs at the herbalist): the merchant names the
+    # price, then takes your note or hands over the goods. Both, or it's only
+    # someone else's words.
+    SOLD_RE = /\A(?<name>[A-Z][\w' -]*?) exclaims, "Sold for (?<amount>[\d,]+) silvers?!"\z/
+    BOUGHT_RE = Regexp.union(/takes your promissory note and hands you a new one\./,
+                             /\A(?:She|He) hands you .+ and says, "Here's your purchase\./,
+                             /\A(?:She|He) says, "I've placed your purchases in this package\./)
     # A warehouse's storage fee, paid from hand
     WAREHOUSE_RE = /recorded a storage fee of ([\d,]+) silvers? for you and thanks you for paying it/
     DIRECT_RE  = /You gather the remaining ([\d,]+) coins? from inside your/
@@ -1696,7 +1726,8 @@ module GS4Analytics
         forget_teller
         who = @who
         cycle_id = @cycle_id
-        Database.async { record_banks(who, cycle_id, snapshot_type, banks) }
+        at = Time.now.to_i
+        Database.async { record_banks(who, cycle_id, snapshot_type, banks, at: at) }
         Log.info("Bank snapshot recorded (#{banks.size - 1} banks, total #{Util.fmt(banks['__total__'])})")
       rescue StandardError => e
         Log.error('bank snapshot', e)
@@ -1817,7 +1848,8 @@ module GS4Analytics
         end
       end
 
-      # Silver spent at the locksmith, the locksmith pool or the priestess
+      # Silver spent at the locksmith, the locksmith pool, the priestess, the
+      # warehouse, or buying from a shop
       def read_expense(text)
         if (found = text.match(LOCK_QUOTE_RE))
           @lock_quote = { amount: digits(found[1]), at: Time.now.to_i }
@@ -1831,6 +1863,12 @@ module GS4Analytics
           record_expense(digits(found[1]), 'priestess', nil)
         elsif (found = text.match(WAREHOUSE_RE))
           record_expense(digits(found[1]), 'warehouse', nil)
+        elsif (found = text.match(SOLD_RE))
+          @sold = { amount: digits(found[:amount]), name: found[:name], at: Time.now.to_i }
+        elsif @sold && text.match?(BOUGHT_RE)
+          sold = @sold
+          @sold = nil
+          record_expense(sold[:amount], 'purchase', sold[:name]) if Time.now.to_i - sold[:at] <= 5
         end
       end
 
@@ -1839,10 +1877,11 @@ module GS4Analytics
         cycle_id = @cycle_id
         at = Time.now.to_i
         Database.async do
-          Database.record_silver(who, cycle_id, 'expense', amount, vendor_type: kind,
-                                                                                               vendor_name: name, at: at)
+          Database.record_silver(who, cycle_id, 'expense', amount, vendor_type: kind, vendor_name: name, at: at)
         end
-        ShopWatcher.note(spent: amount, kind: kind)
+        ShopWatcher.tick
+        # A purchase is what the shop is for, so it doesn't rename the stop
+        ShopWatcher.note(spent: amount, kind: (kind unless kind == 'purchase'))
         Log.debug("Spent #{Util.fmt(amount)} (#{kind})")
       end
 
@@ -1851,7 +1890,7 @@ module GS4Analytics
         # In a shop the map names (gemshop, pawnshop, furrier, consignment...)
         # the shop is the type, and whoever spoke is the name: the consignment
         # clerk calls itself a pawnbroker, and named shopkeepers name no trade
-        shop = ShopWatcher.current&.[](:vendor)
+        shop = ShopWatcher.vendor_here
         vendor_type, vendor_name = shop, vendor.strip if shop && shop != 'bank'
         item = item.strip
         noun ||= item.split.last
@@ -1884,24 +1923,33 @@ module GS4Analytics
           @bank_lines << text
           finish_bank_capture if text.strip.start_with?('Total:') || @bank_lines.size > BANK_CAPTURE_MAX
         elsif (found = text.match(DEPOSIT_RE) || text.match(NOTES_RE) || text.match(NOTE_WORTH_RE))
-          record_total(teller_change(digits(found[1]), digits(found[2])), 'deposit')
+          record_teller(digits(found[1]), digits(found[2]), 'deposit')
         elsif (found = text.match(WITHDRAW_RE))
-          record_total(teller_change(-digits(found[1]), digits(found[2])), 'withdraw')
+          record_teller(-digits(found[1]), digits(found[2]), 'withdraw')
         end
       end
 
-      # How much this teller line moved the total. Each line quotes the balance
-      # of the bank it was made at, so two lines at the same teller differ by
-      # exactly what happened in between, including what no line states (a
-      # note withdrawn for eherbs, then the change deposited back as "note
-      # worth 9"). Elsewhere, the amount the line names.
+      # A teller line moves the total by the amount it names. Each line quotes
+      # the balance of the bank it was made at, so two lines at the same teller
+      # differ by exactly what happened in between: what no line stated (a note
+      # withdrawn for eherbs, a locksmith pool fee taken from the account) is
+      # its own 'unstated' row first, so the deposit stays what was deposited.
+      def record_teller(stated, balance, type)
+        at = Time.now.to_i
+        unstated = teller_change(stated, balance)
+        record_total(unstated, 'unstated', at) unless unstated.zero?
+        record_total(stated, type, at)
+      end
+
+      # What moved at this teller since its last line that the line doesn't
+      # state. Elsewhere (another teller, another town), nothing is known.
       def teller_change(stated, balance)
         room = Util.safely { XMLData.room_id }
         last = @teller
         @teller = { room: room, balance: balance }
-        return stated unless last && room && room != 0 && last[:room] == room
+        return 0 unless last && room && room != 0 && last[:room] == room
 
-        balance - last[:balance]
+        balance - last[:balance] - stated
       end
 
       # A listing sets the total to the truth, which already includes whatever
@@ -1919,14 +1967,16 @@ module GS4Analytics
         forget_teller
         who = @who
         cycle_id = @cycle_id
-        Database.async { record_banks(who, cycle_id, 'bank_account', banks) }
+        at = Time.now.to_i
+        Database.async { record_banks(who, cycle_id, 'bank_account', banks, at: at) }
       end
 
       # A deposit or withdrawal names no bank, and its "total" is the balance
       # of the bank it was made at, not the account. Only the amount moved is
       # certain, so the total moves by that much; with no total recorded yet
       # there is nothing to move, and the next BANK ACCOUNT sets it.
-      def record_total(change, type)
+      # Stamped when the line was read, not when a busy database lets it be written
+      def record_total(change, type, at = Time.now.to_i)
         who = @who
         cycle_id = @cycle_id
         Database.async do
@@ -1934,17 +1984,17 @@ module GS4Analytics
           total = previous && previous + change
           next Log.debug("#{type}: no usable bank total, waiting for BANK ACCOUNT") if total.nil? || total.negative?
 
-          record_banks(who, cycle_id, type, { '__total__' => total })
+          record_banks(who, cycle_id, type, { '__total__' => total }, at: at)
         end
       end
 
-      def record_banks(who, cycle_id, type, banks)
+      def record_banks(who, cycle_id, type, banks, at: Time.now.to_i)
         banks.each do |bank, balance|
           next if bank == '__total__' || balance < BANK_CAP
 
           Log.info("WARNING: #{bank} is #{Util.fmt(balance)}, at or over 2.0B")
         end
-        Database.store_bank_snapshot(who, cycle_id, type, banks)
+        Database.store_bank_snapshot(who, cycle_id, type, banks, at: at)
       end
 
       def flush_kill
@@ -1999,6 +2049,12 @@ module GS4Analytics
                          escort].freeze
     # A task that turns into its spawned form is the same bounty continuing
     CONTINUATIONS = { 'dangerous' => 'dangerous_spawned', 'rescue' => 'rescue_spawned' }.freeze
+    # The task type the taskmaster's words already settle, so an offer sent
+    # back before the guard is asked still has one. A creature assignment is a
+    # cull or a dangerous creature: only the guard says which.
+    OFFER_TYPES = { 'bandit_assignment' => 'bandit', 'escort' => 'escort', 'gem_assignment' => 'gem',
+                    'heirloom_assignment' => 'heirloom', 'herb_assignment' => 'herb', 'rescue_assignment' => 'rescue',
+                    'skin_assignment' => 'skin' }.freeze
     # [You have earned 1106 bounty points, 1100 experience points, and 11066 silver.]
     REWARD_RE = /You have earned ([\d,]+) bounty points?(?:(?:, | and )([\d,]+) experience points?)?(?:,? and ([\d,]+) silver)?/i
     ABANDON_RE = /You have abandoned your current task/i
@@ -2156,8 +2212,15 @@ module GS4Analytics
           received_at ||= at
         end
         id = @bounty_id || Database.new_id
+        # A dangerous or rescue task is only finished in its spawned form. The
+        # creature can be provoked and killed between two polls of the task, so
+        # one rewarded still in its first form went through the spawned one.
+        retype = @bounty_id && CONTINUATIONS[@type]
+        @type = retype if retype
         type = @type
+        creature = @creature
         Database.async do
+          Database.retype_bounty(id, type, creature) if retype
           Database.start_bounty(who, cycle, type, *start, received_at: received_at, id: id) if start
           Database.complete_bounty(id, silver, exp, bp, at: at)
           Database.record_silver(who, cycle, 'bounty', silver, bounty_type: type, at: at)
@@ -2221,7 +2284,8 @@ module GS4Analytics
         return { assignment: 'unknown' } unless result.is_a?(Hash) && result[:type].is_a?(Symbol)
 
         needs = result[:requirements] || {}
-        { assignment: result[:type].to_s, town: (result[:town] || needs[:town])&.to_s,
+        assignment = result[:type].to_s
+        { assignment: assignment, bounty_type: OFFER_TYPES[assignment], town: (result[:town] || needs[:town])&.to_s,
           area: (needs[:destination] || needs[:area])&.to_s }
       end
 
@@ -2502,6 +2566,17 @@ module GS4Analytics
         check_weapons if @current_state == :hunt && @cfg[:weapon_loadout]
         check_idle(signals.values.any?)
         update_state(signals)
+        name_trigger if @unnamed
+      end
+
+      # The cycle's script, once one of those set for its type is running
+      def name_trigger
+        name = Array(@cfg[SCRIPT_KEYS[@unnamed]]).find { |script| running?(script) }
+        return unless name && @current_cycle_id
+
+        id = @current_cycle_id
+        @unnamed = nil
+        Database.async { Database.set_trigger(id, name) }
       end
 
       def touch_login
@@ -2626,6 +2701,8 @@ module GS4Analytics
         trigger = Array(@cfg[SCRIPT_KEYS[type]]).find { |name| running?(name) } || type.to_s
         row = [@who, type, trigger, profile, Vitals.read]
         id = Database.new_id
+        # Read from the game before its script started (a death): named when it does
+        @unnamed = trigger == type.to_s && SCRIPT_KEYS[type] ? type : nil
         # A cycle dropped as too short leaves no gap: this one starts where it did
         at = @carry_from || Time.now.to_i
         @carry_from = nil

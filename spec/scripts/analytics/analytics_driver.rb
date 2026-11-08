@@ -987,6 +987,8 @@ when 'notes'
             'transaction and says, "Thank you, <a exist="-1" noun="Splinter">Splinter</a>.  This brings your total to 1,015,660 silvers.  Have a nice day!"')
   settle.call
   steps << total.call
+  moves = A::Database.all("SELECT snapshot_type, delta_silver, timestamp FROM bank_snapshots WHERE bank_name = '__total__' " \
+                          'ORDER BY rowid DESC LIMIT 3').reverse
   feed.call('<inv id="stow"> a <a exist="2" noun="wand">wand</a></inv>You hand over your notes to the teller, who nods, carefully ' \
             'recording each amount.  She says, "That\'s a total of 50,000 silvers, bringing your balance to 1,065,660 silvers."')
   settle.call
@@ -999,7 +1001,9 @@ when 'notes'
             '      Total: 1,563,160')
   settle.call
   listing = A::Database.one("SELECT balance, delta_silver FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid DESC LIMIT 1").values
-  result = { 'sales' => sales, 'vendors' => vendors, 'totals' => steps, 'listing' => listing }
+  result = { 'sales' => sales, 'vendors' => vendors, 'totals' => steps, 'listing' => listing,
+             'moves' => moves.map { |row| row.values_at('snapshot_type', 'delta_silver') },
+             'one_stamp' => moves.last(2).map { |row| row['timestamp'] }.uniq.size }
   A::SilverManager.stop
 
 when 'teller_listing'
@@ -1191,6 +1195,20 @@ when 'interrupted_hunt'
   A::Database.flush
   result['stopped_reason'] = A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', stopped_id)['rest_reason']
 
+  # A death read from the game before the death script starts: the cycle is
+  # named for the script once it runs
+  start_state.call(:hunt, :hunt)
+  set.call(:@cfg, cfg.merge(death_script: %w[dead-splinter]))
+  $running = []
+  manager.send(:transition_to, :dead)
+  manager.send(:name_trigger)
+  A::Database.flush
+  before = A::Database.one('SELECT trigger_script FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)['trigger_script']
+  $running = ['dead-splinter']
+  manager.send(:name_trigger)
+  A::Database.flush
+  result['death_trigger'] = [before, A::Database.one('SELECT trigger_script FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)['trigger_script']]
+
 when 'town_bounty'
   # A bounty finished in town, with no hunt running, still gets its type and area
   A::Database.connect!
@@ -1311,7 +1329,21 @@ when 'bounty_progress'
   task.call(:taskmaster, '', '', nil)
   manager.send(:check_task)
   manager.send(:handle_reward, 1050, 1000, 5130)
-  result = { 'cull' => steps, 'before_hunt' => before_hunt, 'town_gem' => last.call }
+  town_gem = last.call
+
+  # A dangerous creature provoked and killed between two polls: the task goes
+  # from dangerous to done without the poll seeing it spawn
+  manager.send(:clear_tracking)
+  $running = ['bigshot']
+  task.call(:dangerous, 'shambling lurk', 'the Sanctum', nil)
+  manager.send(:check_task)
+  task.call(:guard, '', '', nil)
+  manager.send(:check_task)
+  manager.send(:handle_reward, 1100, 1100, 9430)
+  A::Database.flush
+  spawned = [A::Database.one('SELECT bounty_type, status FROM bounties ORDER BY rowid DESC LIMIT 1').values,
+             A::Database.one("SELECT bounty_type FROM silver_events WHERE source_category = 'bounty' ORDER BY rowid DESC LIMIT 1")['bounty_type']]
+  result = { 'cull' => steps, 'before_hunt' => before_hunt, 'town_gem' => town_gem, 'spawned' => spawned }
 
 when 'kill_time'
   # A kill's day is the day of the search, even if its write runs later
@@ -1458,7 +1490,13 @@ when 'spending'
             'You hand the priestess 1,200 silvers.  "Thank you," she says.  She removes a glass decanter, and fills a simple ' \
             'indigo flask with a clear fluid, and then hands it to you.',
             'You hear the voice of the clerk from behind one of the thin walls telling you he has recorded a storage fee of ' \
-            '1210 silvers for you and thanks you for paying it promptly.')
+            '1210 silvers for you and thanks you for paying it promptly.',
+            # Herbs bought with a note (eherbs), then another player's words alone: not ours
+            'Kelph exclaims, "Sold for 360 silvers!"', 'Kelph takes your promissory note and hands you a new one.',
+            'She hands you some pothinir grass and says, "Here\'s your purchase.  Thanks for your patronage."',
+            'Syiah Kintaru exclaims, "Sold for 90 silvers!"',
+            'He hands you some ambrominas leaf and says, "Here\'s your purchase.  Thanks for your patronage."',
+            'Penny exclaims, "Sold for 5,000 silvers!"', 'Penny grins.')
   sleep 0.3
   A::Database.flush
   result = {
@@ -1806,12 +1844,21 @@ when 'shops'
   W.start(WHO)
   W.tick(t + 300) # with track_shops off, nothing is opened
   off = W.current
+  # A sale read before the poll has seen the character step into the shop
+  A::Settings.instance_variable_set(:@current, cfg)
+  W.start(WHO)
+  $room_id = 10
+  W.tick
+  $room_id = 20
+  DownstreamHook.run('The jeweler takes your sapphire, glances at it, and hands you 2,269 silvers.')
+  raced = W.current&.slice(:vendor, :silver)&.transform_keys(&:to_s)
+  W.stop
   A::SilverManager.stop
   A::Database.flush
   visits = A::Database.all('SELECT vendor, duration_seconds, silver, spent, room_id, town FROM vendor_visits ORDER BY start_time')
   sales = A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY timestamp, amount")
   result = { 'open' => open_visit && open_visit.transform_keys(&:to_s), 'visits' => visits.map(&:values), 'off' => off,
-             'sales' => sales.map(&:values) }
+             'sales' => sales.map(&:values), 'raced' => raced }
 
 when 'reload'
   # Loading the body again must not warn about redefined constants

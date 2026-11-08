@@ -59,7 +59,8 @@ RSpec.describe 'analytics.lic' do
                                      ['locksmith pool', 30, 0, 300, 30, 'Solhaven'],
                                      ['consignment', 2, 400, 0, 40, 'Solhaven'],
                                      ['priestess', 8, 0, 1200, 50, 'Solhaven'],
-                                     ['api', 50, 777, nil, nil, nil]])
+                                     ['api', 50, 777, nil, nil, nil],
+                                     ['gemshop', 0, 2269, 0, 20, "Wehnimer's Landing"]])
     end
 
     it 'names a stop where silver was only paid out, all for something else, by what it was paid for' do
@@ -73,7 +74,12 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'files a sale under the shop it happened in, and whoever spoke as the name' do
-      expect(shops['sales']).to match_array([['gemshop', 'jeweler', 5000], ['consignment', 'pawnbroker', 400]])
+      expect(shops['sales']).to match_array([['gemshop', 'jeweler', 5000], ['consignment', 'pawnbroker', 400],
+                                             ['gemshop', 'jeweler', 2269]])
+    end
+
+    it 'files a sale read the moment the character steps in under the shop, before the poll sees the move' do
+      expect(shops['raced']).to eq('vendor' => 'gemshop', 'silver' => 2269)
     end
 
     it 'leaves visits to the selling script when track_shops is off' do
@@ -254,6 +260,10 @@ RSpec.describe 'analytics.lic' do
       expect(trip['stopped_reason']).to eq('hunt stopped')
     end
 
+    it 'names a death read from the game for the death script once that starts' do
+      expect(trip['death_trigger']).to eq(%w[dead dead-splinter])
+    end
+
     it 'counts a rest-step script running after a hunt as resting' do
       expect(trip.values_at('hunt_then_trip', 'hunt_nothing_running')).to eq([[true, false], [true, false]])
     end
@@ -325,19 +335,23 @@ RSpec.describe 'analytics.lic' do
     it 'keeps the first count seen for a task finished in town' do
       expect(progress['town_gem']).to eq([9, 9, 'completed'])
     end
+
+    it 'files a dangerous task rewarded before the poll saw it spawn as the spawned task' do
+      expect(progress['spawned']).to eq([%w[dangerous_spawned completed], 'dangerous_spawned'])
+    end
   end
 
   describe 'task offers' do
     subject(:offers) { result('offers') }
 
-    it 'records every task offered, what it turned out to be, and how it ended' do
+    it "records every task offered, its type when the taskmaster's words settle it, what it turned out to be, and how it ended" do
       expect(offers['rows']).to eq(
         [['creature_assignment', 'Vornavis', 'shadow of the Sanctum', 'cull', 'lithe veiled sentinel', 20, false, nil, 'completed'],
-         ['bandit_assignment', 'Vornavis', nil, nil, nil, nil, false, nil, 'removed'],
+         ['bandit_assignment', 'Vornavis', nil, 'bandit', nil, nil, false, nil, 'removed'],
          ['creature_assignment', 'Vornavis', nil, nil, nil, nil, false, nil, 'removed'],
-         ['escort', nil, 'Zul Logoth', nil, nil, nil, true, 8132, 'removed'],
+         ['escort', nil, 'Zul Logoth', 'escort', nil, nil, true, 8132, 'removed'],
          ['unknown', nil, nil, nil, nil, nil, false, nil, 'replaced'],
-         ['gem_assignment', 'Solhaven', nil, nil, nil, nil, false, nil, 'expired']]
+         ['gem_assignment', 'Solhaven', nil, 'gem', nil, nil, false, nil, 'expired']]
       )
     end
 
@@ -372,7 +386,11 @@ RSpec.describe 'analytics.lic' do
 
     it 'records silver spent at the locksmith (once per quote), the locksmith pool and the priestess' do
       expect(spending['spent']).to eq([['locksmith', 'Jyhm', 4033], ['locksmith pool', 'Jahck', 750], ['priestess', nil, 1200],
-                                       ['warehouse', nil, 1210]])
+                                       ['warehouse', nil, 1210], ['purchase', 'Kelph', 360], ['purchase', 'Syiah Kintaru', 90]])
+    end
+
+    it "records a shop purchase only when the merchant hands it over, not another player's words" do
+      expect(spending['spent'].map(&:last)).not_to include(5000)
     end
 
     it "pays the quote the locksmith gave you, not one given to someone else meanwhile" do
@@ -754,6 +772,11 @@ RSpec.describe 'analytics.lic' do
 
     it 'moves the total for note deposits, and by what the same teller\'s balances show for a note round trip' do
       expect(notes['totals']).to eq([1_515_750, 1_515_660, 1_565_660, 1_563_160])
+    end
+
+    it 'keeps a deposit what was deposited, and what no line stated (the note spent) as its own row' do
+      expect(notes['moves']).to eq([['deposit', 15_750], ['unstated', -99], ['deposit', 9]])
+      expect(notes['one_stamp']).to eq(1)
     end
 
     it 'agrees with the next BANK ACCOUNT listing' do
