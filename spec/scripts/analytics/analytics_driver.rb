@@ -402,6 +402,18 @@ when 'collector'
   # Coins off the floor (GET COINS); another line that only mentions coins isn't
   DownstreamHook.run('You gather the remaining 1,234 coins.')
   DownstreamHook.run('Bob says, "You gather the remaining 99 coins."')
+  # A creature that melts when searched drops its coins and they're gathered
+  # before the prompt: the corpse's silver, counted once with the kill. A second
+  # gather of the same amount, and GET COINS for another pile, are floor silver.
+  DownstreamHook.run('You search the <pushBold/><a exist="3" noun="monstrosity">flesh monstrosity</a><popBold/>.')
+  DownstreamHook.run('<pushBold/><a exist="3" noun="monstrosity">It</a><popBold/> had 531 silvers on ' \
+                     '<pushBold/><a exist="3" noun="monstrosity">it</a><popBold/>.')
+  DownstreamHook.run('With a sound like a swamp bubble erupting, <pushBold/>a <a exist="3" noun="monstrosity">patchwork flesh ' \
+                     'monstrosity</a><popBold/> melts into viscous glop.')
+  DownstreamHook.run('You gather the remaining 531 <a exist="4" noun="coins">coins</a>.')
+  DownstreamHook.run('You gather the remaining 531 <a exist="5" noun="coins">coins</a>.')
+  DownstreamHook.run('You gather the remaining 242 <a exist="6" noun="coins">coins</a>.')
+  DownstreamHook.run('<prompt time="1793074672">&gt;</prompt>')
   # A selling script reporting its own visits (only heard with track_shops off)
   A::Settings.instance_variable_set(:@current, cfg.merge(track_shops: false))
   A::SilverManager.record_vendor_visit('gemshop', NOW - 100, NOW - 50, 12_345)
@@ -413,7 +425,7 @@ when 'collector'
     'hook_registered' => hook, 'cfg_hunt' => cfg[:hunt_script],
     'kills' => kills.map(&:values),
     'box' => A::Database.all("SELECT amount FROM silver_events WHERE source_category = 'box' ORDER BY amount").map { |r| r['amount'] },
-    'floor' => A::Database.all("SELECT amount FROM silver_events WHERE source_category = 'floor'").map { |r| r['amount'] },
+    'floor' => A::Database.all("SELECT amount FROM silver_events WHERE source_category = 'floor'").map { |r| r['amount'] }.sort,
     'visit_seconds' => A::Database.one('SELECT duration_seconds FROM vendor_visits')['duration_seconds'],
     'unit_price' => A::Database.one('SELECT unit_price FROM item_sales')['unit_price']
   }

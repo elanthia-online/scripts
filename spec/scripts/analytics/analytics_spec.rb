@@ -605,7 +605,7 @@ RSpec.describe 'analytics.lic' do
 
     it 'records each kill, ended by the prompt, the next search or stopping, with its silver' do
       expect(collector['kills']).to eq(
-        [['halfling cannibal', 1234, 'GS3', 'Splinter'], ['shambling lurk', 0, 'GS3', 'Splinter'],
+        [['flesh monstrosity', 531, 'GS3', 'Splinter'], ['halfling cannibal', 1234, 'GS3', 'Splinter'], ['shambling lurk', 0, 'GS3', 'Splinter'],
          ['veiled sentinel', 345, 'GS3', 'Splinter']]
       )
     end
@@ -615,7 +615,11 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'records coins picked up off the floor, and only that line' do
-      expect(collector['floor']).to eq([1234])
+      expect(collector['floor']).to include(1234)
+    end
+
+    it "doesn't count a melted corpse's gathered coins again as floor silver" do
+      expect(collector['floor']).to eq([242, 531, 1234])
     end
 
     it 'records a vendor visit and the price per item' do
