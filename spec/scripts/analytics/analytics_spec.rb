@@ -102,6 +102,13 @@ RSpec.describe 'analytics.lic' do
   describe 'progress' do
     subject(:progress) { result('progress') }
 
+    it 'merges EXPERIENCE and RESOURCE readings from the same second into one row' do
+      expect(progress['together']).to eq(
+        [{ 'fame' => 8000, 'deeds' => 14, 'deaths_sting' => 'None', 'resource_name' => 'Devotion',
+           'resource_weekly' => 13_000, 'voln_favor' => 99_000 }]
+      )
+    end
+
     it 'watches EXPERIENCE output for training points, and stops watching when stopped' do
       expect(progress.values_at('hook', 'hook_removed')).to eq([true, true])
     end

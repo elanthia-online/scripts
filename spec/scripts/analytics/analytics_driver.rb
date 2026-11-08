@@ -1720,6 +1720,13 @@ when 'progress'
   id = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'crags', fresh, at: NOW - 600)
   A::Database.end_cycle(id, fresh, nil, at: NOW - 60)
   P.stop(now: t + 5000) # and a last row
+  # EXPERIENCE and RESOURCE typed together: two readings in one second, one row with both
+  A::Database.flush
+  base = { level: 100, exp: 900_500 }
+  A::Database.record_progress(WHO, t + 9000, base.merge(fame: 8000, deeds: 14, deaths_sting: 'None'))
+  A::Database.record_progress(WHO, t + 9000, base.merge(resource_name: 'Devotion', resource_weekly: 13_000, voln_favor: 99_000))
+  together = A::Database.all('SELECT fame, deeds, deaths_sting, resource_name, resource_weekly, voln_favor FROM progress WHERE timestamp = ?', t + 9000)
+  A::Database.send(:db)[:progress].where(timestamp: t + 9000).delete
   A::Database.flush
   rows = A::Database.all('SELECT * FROM progress ORDER BY timestamp')
   cycle = A::Database.one('SELECT exp_regular_start, exp_regular_end, exp_asc_start, exp_asc_end, exp_total_start FROM cycles')
@@ -1738,7 +1745,7 @@ when 'progress'
     'tps' => rows.select { |r| r['ptp'] }.map { |r| r.slice('ptp', 'mtp', 'atp') },
     'gone' => [eased, rows.count { |r| r['deaths_sting'] == 'None' }], 'cycle_fame' => [stale[:fame], fresh[:fame]],
     'gone_row' => sting.call('None')&.slice('fame', 'deeds', 'long_term_exp'),
-    'cycle' => cycle, 'schema' => A::Database.metadata('schema_version')
+    'cycle' => cycle, 'schema' => A::Database.metadata('schema_version'), 'together' => together
   }
 
 when 'shops'
