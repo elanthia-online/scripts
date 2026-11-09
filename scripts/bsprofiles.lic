@@ -292,9 +292,70 @@ module BSProfiles
     templates.select { |t| uids.any? { |u| t.found_at_uid?(u) } }
   end
 
+  # Every uid a creature spawns at, across its areas. Built once per creature.
+  def template_uids(t)
+    @template_uids ||= {}.compare_by_identity
+    @template_uids[t] ||= t.areas.flat_map { |a| area_uids(a) }.uniq
+  end
+
+  # The values a creature filter offers, from the creatures themselves, so
+  # a family added to Lich shows up by itself.
+  def template_values(field)
+    @template_values ||= {}
+    @template_values[field] ||= templates.map { |t| t.respond_to?(field) ? t.send(field).to_s : '' }.reject(&:empty?).uniq.sort
+  end
+
+  # A creature's classifications in one spelling: the templates write
+  # "Non-corporeal undead" and "Non Corporeal undead" for the same class.
+  def classes_of(t)
+    @classes_of ||= {}.compare_by_identity
+    @classes_of[t] ||= Array(t.respond_to?(:otherclass) ? t.otherclass : nil).filter_map do |c|
+      words = c.to_s.downcase.gsub(/[-_[:space:]]+/, ' ').strip
+      words.empty? ? nil : words[0].upcase + words[1..]
+    end.uniq
+  end
+
+  def template_classes
+    @template_classes ||= templates.flat_map { |t| classes_of(t) }.uniq.sort
+  end
+
+  # A recorded trait, or nil when nobody has recorded it.
+  def trait_of(t, reader)
+    t.respond_to?(reader) ? t.send(reader) : nil
+  rescue StandardError
+    nil
+  end
+
   # Expand one area's uid list (ranges and ints) to uids.
   def area_uids(area)
     Array(area[:uids]).flat_map { |r| r.respond_to?(:to_a) ? r.to_a : [r] }.map(&:to_i).uniq.sort
+  end
+
+  # The rooms bigshot hunts: a walk from +start+ that never enters a
+  # boundary room. Stops at +limit+ rooms, which means the fence leaks.
+  def reachable(start, boundaries, limit: 3000)
+    fence = boundaries.to_h { |id| [id.to_i, true] }
+    seen = { start.to_i => true }
+    queue = [start.to_i]
+    until queue.empty?
+      room = Map[queue.shift] or next
+      (room.wayto || {}).each_key do |dest|
+        d = dest.to_i
+        next if seen[d] || fence[d]
+        return { rooms: seen.keys, cut: true } if seen.size >= limit
+
+        seen[d] = true
+        queue << d
+      end
+    end
+    { rooms: seen.keys, cut: false }
+  end
+
+  # Every installed map image, by display name.
+  def all_sheets
+    @all_sheets ||= Map.list.compact.filter_map { |r| r.image if r.image && r.image_coords }.uniq
+                       .select { |img| File.exist?(File.join(map_dir, img)) }
+                       .sort_by { |img| map_display_name(img).downcase }
   end
 
   # Rooms bordering +ids+ without being in it (bigshot's boundary list).
@@ -360,28 +421,26 @@ module BSProfiles
     end.compact
   end
 
-  def md(text)
-    text.to_s.gsub(/([\\`*_{}\[\]()#+!|<>])/) { "\\#{Regexp.last_match(1)}" }
-  end
-
-  # Markdown for the creature detail panel.
-  def detail_markdown(t)
+  # The creature detail panel as [style, text] lines: :title, :head, :line, :link.
+  # WebUI's markdown only renders links, so the panel is built from text pieces.
+  def detail_lines(t)
     out = []
     line = lambda do |label, value|
       v = fmt(value)
-      out << "**#{md(label)}:** #{md(v)}  " if v
+      out << [:line, "#{label}: #{v}"] if v
     end
-    head = lambda { |text| out << '' << "#### #{md(text)}" }
+    head = lambda { |text| out << [:head, text] }
+    md = ->(text) { text.to_s }
 
-    out << "### #{md(t.name)}  level #{t.level}"
+    out << [:title, "#{t.name}, level #{t.level}"]
     kind = [t.family, t.type, t.size].compact.reject(&:empty?).join(' ')
     kind += ', undead' if t.undead
     kind += ", #{t.boss_type || 'boss'}" if t.boss
-    out << md(kind) unless kind.empty?
+    out << [:line, kind] unless kind.empty?
     line.call('Max HP', t.max_hp)
     line.call('Speed', t.speed)
     line.call('Boon-capable', t.bcs) unless t.bcs.nil?
-    out << "**Wiki:** #{t.url}  " if fmt(t.url)
+    out << [:link, t.url.to_s] if fmt(t.url)
 
     atk = t.attack_attributes
     head.call('Attacks')
@@ -426,10 +485,10 @@ module BSProfiles
       tips = (info[:class_tips] || {}).select { |_, v| Array(v).any? { |s| !s.to_s.empty? } }
       if general.any? || tips.any?
         head.call('Tips')
-        general.each { |g| out << "#{md(g)}  " }
+        general.each { |g| out << [:line, md.call(g)] }
         tips.each do |klass, list|
-          out << "**#{md(klass.to_s.capitalize)}**  "
-          Array(list).each { |s| out << "#{md(s.to_s)}  " }
+          out << [:line, "#{klass.to_s.capitalize}:"]
+          Array(list).each { |s| out << [:line, "  #{s}"] }
         end
       end
     end
@@ -438,10 +497,10 @@ module BSProfiles
     t.areas.each do |a|
       uids = area_uids(a)
       mapped = uids.count { |u| !Map.ids_from_uid(u).empty? }
-      out << "#{md(a[:name])}: #{uids.size} uid(s), #{mapped} mapped  "
+      out << [:line, "#{a[:name]}: #{uids.size} uid(s), #{mapped} mapped"]
     end
 
-    out.join("\n")
+    out
   end
 
   # ------------------------------------------------------------------ map --
@@ -449,20 +508,14 @@ module BSProfiles
   # Display name for a map image, from the mapdb's meta:mapname tag when a
   # room on that map carries one, else the file name.
   def map_display_name(image)
-    @map_names ||= {}
-    return @map_names[image] if @map_names.key?(image)
-
-    name = nil
-    Map.list.compact.each do |r|
-      next unless r.image == image
+    # Every sheet's name in one pass over the rooms, not one pass per sheet.
+    @map_names ||= Map.list.compact.each_with_object({}) do |r, names|
+      next if r.image.nil? || names.key?(r.image)
 
       tag = Array(r.tags).find { |t| t.to_s.start_with?('meta:mapname:') }
-      next unless tag
-
-      name = tag.to_s.sub('meta:mapname:', '')
-      break
+      names[r.image] = tag.to_s.sub('meta:mapname:', '') if tag
     end
-    @map_names[image] = name || File.basename(image.to_s, '.*')
+    @map_names[image] || File.basename(image.to_s, '.*')
   end
 
   # ;map's dark-mode preference. It lives in map.lic's own script settings,
@@ -566,36 +619,31 @@ module BSProfiles
 
   TABS = [
     ['Resting', [
-      [:frame, 'Should Rest?', [
-        [:cols, [
-          [:frame, nil, [
-            [:pair, 'percentmind >=', :spin, 'fried'],
-            [:pair, 'extra kills >=', :spin, 'overkill'],
-            [:pair, 'used lte boosts >=', :spin, 'lte_boost'],
-            [:pair, 'percentmana <=', :spin, 'oom'],
-            [:pair, 'percent encumbrance >=', :spin, 'encumbered']
-          ]],
-          [:frame, nil, [
-            [:pair, 'creeping dread >=', :spin, 'creeping_dread'],
-            [:pair, 'crushing dread >=', :spin, 'crushing_dread'],
-            [:check, 'wot_poison', 'Wall of Thorns Poison'],
-            [:check, 'confusion', 'Confusion Debuff'],
-            [:check, 'box_in_hand', 'Box in hand after looting']
-          ]]
+      [:cols, [
+        [:frame, 'Where to Rest', [
+          [:pair, 'Return Waypoint IDs:', :entry, 'return_waypoint_ids'],
+          [:pair, 'Resting Room ID:', :entry, 'resting_room_id'],
+          [:pair, 'Pre-rest Commands:', :entry, 'resting_commands'],
+          [:pair, 'Active Resting Scripts:', :entry, 'resting_scripts'],
+          [:pair, 'Fog Options', :select, 'fog_return', FOG_OPTIONS],
+          [:pair, 'Custom fog commands:', :entry, 'custom_fog'],
+          [:check, 'fog_optional', 'Fog ONLY if wounded or encumbered'],
+          # bounty_eval is left off: other scripts set it, not the player.
+          # It still loads and saves with the profile, untouched.
+          [:check, 'fog_rift', 'Fog twice if returning from the rift']
         ]],
-        [:area, 'wounded_eval', 'Wounded Eval'],
-        [:area, 'bounty_eval', 'Bounty Eval']
+        [:frame, 'Should Rest?', [
+          [:pair, 'percentmind >=', :spin, 'fried'],
+          [:pair, 'extra kills >=', :spin, 'overkill'],
+          [:pair, 'used lte boosts >=', :spin, 'lte_boost'],
+          [:pair, 'percentmana <=', :spin, 'oom'],
+          [:pair, 'percent encumbrance >=', :spin, 'encumbered'],
+          [:pair, 'creeping dread >=', :spin, 'creeping_dread'],
+          [:pair, 'crushing dread >=', :spin, 'crushing_dread'],
+          [:checks, [['wot_poison', 'Wall of Thorns Poison'], ['confusion', 'Confusion Debuff'], ['box_in_hand', 'Box in hand after looting']]]
+        ]]
       ]],
-      [:frame, 'Where to Rest', [
-        [:pair, 'Return Waypoint IDs:', :entry, 'return_waypoint_ids'],
-        [:pair, 'Resting Room ID:', :entry, 'resting_room_id'],
-        [:pair, 'Pre-rest Commands:', :entry, 'resting_commands'],
-        [:pair, 'Active Resting Scripts:', :entry, 'resting_scripts'],
-        [:pair, 'Fog Options', :select, 'fog_return', FOG_OPTIONS],
-        [:pair, 'Custom fog commands:', :entry, 'custom_fog'],
-        [:check, 'fog_optional', 'Fog ONLY if wounded or encumbered'],
-        [:check, 'fog_rift', 'Fog twice if returning from the rift']
-      ]]
+      [:area, 'wounded_eval', 'Wounded Eval']
     ]],
     ['Hunting', [
       [:cols, [
@@ -736,6 +784,21 @@ module BSProfiles
       'defensive' => %w[blink bolt_shield boosted_defense confuse crit_padding]
     }.freeze
     MODES = %w[common ignore flee].freeze
+    # The adjectives that show each boon in a creature's name, as bigshot's
+    # initialize_boon_data has them. Flee entries are "<adjective> <name>".
+    ADJECTIVES = {
+      'blink' => %w[flickering wavering], 'bolt_shield' => %w[shielded], 'boosted_hp' => %w[robust stalwart],
+      'boosted_mana' => %w[luminous lustrous], 'boosted_defense' => %w[sinuous flexile], 'boosted_offense' => %w[combative belligerent],
+      'cheat_death' => %w[glorious illustrious], 'confuse' => %w[blurry shifting], 'counter_attack' => %w[apt ready],
+      'crit_death_immune' => %w[resolute unflinching], 'crit_padding' => %w[stout hardy], 'crit_weighting' => %w[shimmering gleaming],
+      'damage_padding' => %w[flinty tough], 'dmg_weighting' => %w[barbed spiny], 'diseased' => %w[pestilent afflicted diseased],
+      'dispelling' => %w[dazzling flashy], 'elem_flares' => %w[glittering], 'elemental_negation' => %w[sparkling shining],
+      'extra_elem' => %w[glowing], 'extra_spirit' => %w[radiant], 'extra_other' => %w[twinkling], 'ethereal' => %w[ethereal wispy ghostly],
+      'frenzy' => %w[raging frenzied], 'jack' => %w[adroit deft], 'magic_resistance' => %w[rune-covered tattooed],
+      'mind_blast' => %w[canny keen], 'parting_shot' => %w[dreary drab], 'physical_negation' => %w[indistinct nebulous],
+      'poisonous' => ['sickly green', 'oozing'], 'regen' => %w[slimy muculent], 'soul' => %w[tenebrous shadowy],
+      'stun_immune' => %w[steadfast unyielding], 'terrifying' => %w[ghastly grotesque], 'weaken' => %w[spindly lanky]
+    }.freeze
     TITLES = { 'immunity' => 'Immunity', 'misc' => 'Stats / Misc', 'offensive' => 'Offensive', 'defensive' => 'Defensive' }.freeze
     LABELS = {
       'crit_death_immune' => ['Crit Death Immune', 'Similar to constructs or golems'],
@@ -882,12 +945,23 @@ module BSProfiles
   # --------------------------------------------------------------- editor --
   class Editor
     PAGE_ID = 'bsprofiles'.freeze
+    WINDOW_SIZE = [1100, 760].freeze
     DIFF_COLOR = { r: 165, g: 29, b: 45, a: 1.0 }.freeze
-    MAP_COLORS = {
-      checked: { r: 0, g: 153, b: 0, a: 1.0 }, area: { r: 140, g: 140, b: 140, a: 1.0 }, start: { r: 217, g: 0, b: 0, a: 1.0 },
-      rally: { r: 0, g: 76, b: 230, a: 1.0 }, boundary: { r: 242, g: 128, b: 0, a: 1.0 }, perimeter: { r: 179, g: 0, b: 204, a: 1.0 }
+    # The room settings a map click can set, in the order the picker lists them.
+    MAP_ROLES = {
+      'hunting_room_id' => 'Start room', 'rallypoint_room_ids' => 'Rally point', 'hunting_boundaries' => 'Boundary',
+      'resting_room_id' => 'Resting room', 'return_waypoint_ids' => 'Return waypoint'
     }.freeze
-    MAP_ENTRIES = %w[hunting_room_id rallypoint_room_ids hunting_boundaries].freeze
+    LIST_ROLES = %w[rallypoint_room_ids hunting_boundaries return_waypoint_ids].freeze
+    MAP_COLORS = {
+      'hunt' => { r: 30, g: 150, b: 50, a: 0.9 }, 'hunting_room_id' => { r: 0, g: 90, b: 230, a: 1.0 },
+      'rallypoint_room_ids' => { r: 240, g: 140, b: 0, a: 1.0 }, 'hunting_boundaries' => { r: 220, g: 40, b: 40, a: 1.0 },
+      'resting_room_id' => { r: 230, g: 60, b: 160, a: 1.0 }, 'return_waypoint_ids' => { r: 140, g: 50, b: 200, a: 1.0 }
+    }.freeze
+    MAP_SIDE_SLACK = 110     # window width the map's view does not get
+    MAP_LEGEND = "Drag to pan. Ctrl + wheel zooms.\nLeft-click gives a room the role chosen above; right-click clears it.\n" \
+                 "Blue ring: start. Orange ring: rally point. Red X: boundary.\nPink box: resting room. Purple box: return waypoint.\n" \
+                 'Green outline: the rooms bigshot will hunt.'
     MAP_MIN_SCALE = 0.2
     MAP_MAX_SCALE = 6.0
     LAYER_BUDGET = 500
@@ -923,37 +997,43 @@ module BSProfiles
       @lvl_min, @lvl_max = BSProfiles.default_band
       @cr_name = ''
       @cr_area = ''
-      @cr_undead = 'any'
-      @cr_room = ''
-      @cr_list = []
       @cr_selected = nil
-      @template = nil
+      @cr_filters = {}      # eohunter's filters: flags, type, class, family, traits
+      @cr_filter_rev = 0
       @area_index = 0
-      @rooms = []        # [{id:, uid:, title:, checked:}]
-      @room_selected = []
-      @unmapped = 0
-      @cospawns = []     # [{name:, level:, checked:}]
+      @roster_rev = 0
+      @hunt_creatures = []
+      @hunt_creatures_for = nil
+      # The roster opens on the hunt when the profile has one to list.
+      @cr_mode = @settings['hunting_room_id'].to_s.strip.empty? ? 'search' : 'hunt'
       # map
       @map_scale = 1.0
       @map_current = nil
-      @map_list = []
-      @map_click_toggles = true
-      @map_show_perimeter = true
+      @map_role = 'hunting_room_id'
+      @map_focus = nil
+      @map_rev = 0          # bumped to jump the view to a new sheet or find
+      @map_cut = false
+      @find_text = ''
+      @hunt_rooms = nil
+      @sheet_rooms = {}
+      @entry_rev = Hash.new(0)
+      @load_rev = 0
+      @window_width = WINDOW_SIZE.first
       @map_dark = BSProfiles.map_dark_default
       @map_sizes = {}
       @map_route = nil
       @map_dark_route = nil
       @save_name = ''
       @load_choice = ''
-      refresh_creature_list
     end
 
     # ---------------------------------------------------------- lifecycle --
 
     def run
       editor = self
-      @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: title, props: { size: [1100, 760] },
-                                   on: { close: ->(_ev) { editor.viewer_closed } }) do |ui|
+      @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: title, props: { size: WINDOW_SIZE, bare: true, density: :compact, viewport: true },
+                                   on: { close: ->(_ev) { editor.viewer_closed },
+                                         configure: ->(ev) { editor.on_configure(ev) } }) do |ui|
         editor.render(ui)
       end
       register_maps
@@ -975,6 +1055,13 @@ module BSProfiles
 
     def viewer_closed
       @closed << :viewer
+    end
+
+    # The tabs and panels fill the window by themselves, so a resize needs no
+    # re-render. The width is kept for the map's Fit button.
+    def on_configure(event)
+      width = event.payload[:width].to_i
+      @window_width = width if width > MAP_SIDE_SLACK + 100
     end
 
     def close_clicked
@@ -1017,12 +1104,29 @@ module BSProfiles
       s['profile_current'] = @profile
       s['save_profile_name'] = ''
       @settings = s
+      @hunt_rooms = nil     # another profile's rooms
       @boons.load(@settings)
     end
 
     def set(key, value)
       @settings[key.to_s] = value
       @dirty = true
+      @hunt_rooms = nil if MAP_ROLES.key?(key.to_s)
+    end
+
+    # A change made by the map or a button, not typed in the field: the
+    # field gets a new key, as the browser only seeds a field's value once.
+    def set_from_tool(key, value)
+      set(key, value)
+      @entry_rev[key.to_s] += 1
+    end
+
+    # Loading a profile reseeds every field; a tool's change reseeds its own.
+    def entry_key(id)
+      rev = @entry_rev[id.to_s]
+      return id if rev.zero? && @load_rev.zero?
+
+      "#{id}-l#{@load_rev}-r#{rev}"
     end
 
     def mark_dirty
@@ -1061,6 +1165,7 @@ module BSProfiles
       data = BSProfiles.load(name) or return status(:profiles, "No profile named #{name}.")
       @profile = name
       load_settings(data)
+      @load_rev += 1
       @dirty = false
       @cmp_b = name
       @cmp_rows = nil
@@ -1138,56 +1243,117 @@ module BSProfiles
 
     # ---------------------------------------------------------- creatures --
 
+    # ------------------------------------------------------------ roster --
+    #
+    # The Creatures tab lists what lives in the rooms bigshot will hunt, or a
+    # search of every creature, and writes three of bigshot's lists:
+    #   Hunt   -> targets           (the noun)
+    #   Ignore -> invalid_targets   (the noun)
+    #   Flee   -> always_flee_from  (the full name, or "<boon adjective> <name>"
+    #             for each boon ticked, so a creature can be hunted plain and
+    #             fled when it spawns with that boon)
+
     def reset_filters
       @lvl_min, @lvl_max = BSProfiles.default_band
-      @cr_room = ''
       @cr_name = ''
       @cr_area = ''
-      @cr_undead = 'any'
-      refresh_creature_list
     end
 
-    def creatures_at_room
-      if @cr_room.to_s.strip.empty?
-        fallback = @settings['hunting_room_id'].to_s.strip
-        return status(:creatures, 'type a room, or set a hunting room on the Hunting tab first') if fallback.empty?
+    def cr_mode = @cr_mode
 
-        @cr_room = fallback
-      end
-      refresh_creature_list
+    def cr_mode=(mode)
+      @cr_mode = mode == 'search' ? 'search' : 'hunt'
     end
 
-    def refresh_creature_list
-      lo = @lvl_min.to_i
-      hi = @lvl_max.to_i
-      lo, hi = hi, lo if lo > hi
+    # [[template, rooms it lives in], ...] for the roster being shown.
+    def roster
+      base = @cr_mode == 'search' ? search_creatures.map { |t| [t, nil] } : hunt_creatures
+      base.select { |t, _| creature_passes?(t) }
+    end
+
+    # --- filters, as eohunter's creature search has them -----------------
+    #
+    # Undead, boss and boon-capable are recorded for nearly every creature.
+    # The traits are recorded for only some, and nil there means nobody has
+    # checked, not "no": a creature with nothing recorded is kept, or a
+    # sleepable filter would quietly hide half the game.
+    TRAITS = { sleepable: ['Sleepable', :sleepable?], witherable: ['Witherable', :witherable?], sympathy: ['Sympathy', :sympathy?],
+               muggable: ['Muggable', :muggable?], blood: ['Has blood', :has_blood?], bones: ['Has bones', :has_bones?],
+               limbs: ['Has limbs', :has_limbs?] }.freeze
+    FLAGS = { undead: 'Undead', bcs: 'Boon-capable', boss: 'Boss' }.freeze
+    YES_NO = [{ value: '', label: 'any' }, { value: 'yes', label: 'yes' }, { value: 'no', label: 'no' }].freeze
+
+    def cr_filter(key) = @cr_filters[key]
+
+    def set_cr_filter(key, value)
+      @cr_filters[key] = case value
+                         when 'yes' then true
+                         when 'no' then false
+                         when '' then nil
+                         else value
+                         end
+    end
+
+    def yes_no(value)
+      { true => 'yes', false => 'no' }.fetch(value, '')
+    end
+
+    def creature_passes?(t)
+      f = @cr_filters
       name = @cr_name.to_s.strip.downcase
-      area = @cr_area.to_s.empty? ? nil : @cr_area
-      room = nil
-      room_text = @cr_room.to_s.strip
-      unless room_text.empty?
-        room = BSProfiles.resolve_room(room_text)
-        return status(:creatures, "room '#{room_text}' not found in the map database") if room.nil?
-      end
+      return false unless name.empty? || t.name.to_s.downcase.include?(name)
+      return false unless FLAGS.keys.all? { |flag| f[flag].nil? || (t.send(flag) ? true : false) == f[flag] }
+      return false unless f[:type].to_s.empty? || t.type.to_s == f[:type]
+      return false unless f[:family].to_s.empty? || t.family.to_s == f[:family]
+      return false unless f[:klass].to_s.empty? || BSProfiles.classes_of(t).include?(f[:klass])
 
+      TRAITS.all? do |trait, (_, reader)|
+        want = f[trait]
+        next true if want.nil?
+
+        held = BSProfiles.trait_of(t, reader)
+        held.nil? || held == want
+      end
+    end
+
+    def clear_filters
+      @cr_name = ''
+      @cr_filters = {}
+      @cr_filter_rev += 1
+    end
+
+    def search_creatures
+      lo, hi = [@lvl_min.to_i, @lvl_max.to_i].minmax
+      area = @cr_area.to_s.empty? ? nil : @cr_area
       list = BSProfiles.templates.select { |t| t.level.to_i.between?(lo, hi) }
-      list = list.select { |t| t.name.to_s.downcase.include?(name) } unless name.empty?
       list = list.select { |t| t.areas.any? { |a| a[:name].to_s == area } } if area
-      case @cr_undead
-      when 'undead' then list = list.select(&:undead)
-      when 'living' then list = list.reject(&:undead)
+      list
+    end
+
+    # Creatures whose spawn rooms overlap the hunt, with how many of its rooms.
+    # Kept until the hunt changes.
+    def hunt_creatures
+      hunt = hunt_rooms
+      return @hunt_creatures if @hunt_creatures_for.equal?(hunt)
+
+      uids = hunt[:rooms].flat_map { |id| Array(Map[id]&.uid) }.map(&:to_i).to_h { |u| [u, true] }
+      @hunt_creatures_for = hunt
+      @hunt_creatures = BSProfiles.templates.filter_map do |t|
+        n = BSProfiles.template_uids(t).count { |u| uids[u] }
+        [t, n] if n.positive?
+      end.sort_by { |t, _| [t.level.to_i, t.name.to_s] }
+    end
+
+    def roster_summary
+      if @cr_mode == 'search'
+        lo, hi = [@lvl_min.to_i, @lvl_max.to_i].minmax
+        return "#{roster.size} creature(s), level #{lo}-#{hi}#{@cr_area.to_s.empty? ? '' : ", #{@cr_area}"}."
       end
-      list = BSProfiles.templates_at_room(room) & list if room
-      @cr_list = list
-      where = room ? " at room #{room.id}" : ''
-      kind = { 'undead' => ', undead', 'living' => ', living' }[@cr_undead].to_s
-      @cr_count = "#{list.size} creature(s), level #{lo}-#{hi}#{kind}#{area ? ", #{area}" : ''}#{where}"
-      first = list.first
-      if first
-        show_creature(first)
-      else
-        clear_creature
-      end
+      return 'No start room yet. Set one on the Map tab, or search for a creature and use Fence this area.' if role_ids('hunting_room_id').empty?
+
+      shown = roster.size
+      all = hunt_creatures.size
+      "#{shown == all ? all : "#{shown} of #{all}"} creature(s) living in the #{hunt_rooms[:rooms].size} room(s) bigshot will hunt."
     end
 
     def creature_key(t)
@@ -1195,139 +1361,122 @@ module BSProfiles
     end
 
     def template_for_key(key)
-      idx = key.to_s.sub(/\Ac/, '').to_i
-      BSProfiles.templates[idx]
+      BSProfiles.templates[key.to_s.sub(/\Ac/, '').to_i]
     end
 
-    def clear_creature
-      @template = nil
-      @cr_selected = nil
-      @rooms = []
-      @room_selected = []
-      @cospawns = []
-      @unmapped = 0
-      refresh_map_tab
-    end
-
-    def show_creature(t)
-      @template = t
-      @cr_selected = creature_key(t)
+    def select_creature(key)
+      @cr_selected = key
       @area_index = 0
-      select_area(0)
+    end
+
+    # The selected creature, if it is in the roster being shown.
+    def template
+      t = @cr_selected && template_for_key(@cr_selected)
+      t if t && roster.any? { |r, _| r.equal?(t) }
+    end
+
+    # --- list fields: comma text, a target may carry a command letter ---
+
+    def list_items(id)
+      @settings[id].to_s.split(/\s*,\s*/).map(&:strip).reject(&:empty?)
+    end
+
+    def item_word(item)
+      item.sub(/\([^)]*\)\z/, '').strip
+    end
+
+    def listed?(id, word)
+      list_items(id).any? { |i| item_word(i).casecmp?(word) }
+    end
+
+    def list_add(id, word)
+      return if listed?(id, word)
+
+      set_from_tool(id, (list_items(id) + [word]).join(', '))
+    end
+
+    def list_remove(id, word)
+      return unless listed?(id, word)
+
+      set_from_tool(id, list_items(id).reject { |i| item_word(i).casecmp?(word) }.join(', '))
+    end
+
+    def hunt?(t) = listed?('targets', BSProfiles.noun_for(t))
+    def ignore?(t) = listed?('invalid_targets', BSProfiles.noun_for(t))
+    def flee?(t) = listed?('always_flee_from', t.name.to_s) || listed?('always_flee_from', BSProfiles.noun_for(t))
+
+    # Boons this creature is fled for: every adjective of the boon is listed.
+    def boon_flees(t)
+      BoonMatrix::ADJECTIVES.select do |_, adjs|
+        adjs.all? { |adj| listed?('always_flee_from', "#{adj} #{t.name}") }
+      end.keys
+    end
+
+    # Hunt and Ignore exclude each other; Flee stands alone, and a creature
+    # can be hunted and fled at once.
+    def set_role(t, column, on)
+      noun = BSProfiles.noun_for(t)
+      case column
+      when 'hunt'
+        on ? (list_add('targets', noun); list_remove('invalid_targets', noun)) : list_remove('targets', noun)
+      when 'ignore'
+        on ? (list_add('invalid_targets', noun); list_remove('targets', noun)) : list_remove('invalid_targets', noun)
+      when 'flee'
+        if on
+          list_add('always_flee_from', t.name.to_s)
+        else
+          list_remove('always_flee_from', t.name.to_s)
+          list_remove('always_flee_from', noun)
+        end
+      end
+    end
+
+    def set_boon_flee(t, boon, on)
+      BoonMatrix::ADJECTIVES.fetch(boon).each do |adj|
+        entry = "#{adj} #{t.name}"
+        on ? list_add('always_flee_from', entry) : list_remove('always_flee_from', entry)
+      end
+    end
+
+    def hunt_all(flag)
+      roster.each { |t, _| set_role(t, 'hunt', flag) }
+      status(:creatures, flag ? 'Every creature listed is now hunted.' : 'No creature listed is hunted now.')
     end
 
     def select_area(index)
       @area_index = index.to_i
-      @rooms = []
-      @room_selected = []
-      @cospawns = []
-      @unmapped = 0
-      area = @template && @template.areas[@area_index]
-      return refresh_map_tab if area.nil?
-
-      uids = BSProfiles.area_uids(area)
-      uids.each do |uid|
-        ids = Map.ids_from_uid(uid)
-        if ids.empty?
-          @unmapped += 1
-          next
-        end
-        ids.each do |id|
-          room = Map[id]
-          @rooms << { id: id.to_i, uid: uid, title: Array(room&.title).first.to_s.gsub(/[\[\]]/, ''), checked: true }
-        end
-      end
-      BSProfiles.cospawns(@template, uids).each do |o|
-        @cospawns << { name: o.name.to_s, level: o.level.to_i, checked: false, key: creature_key(o) }
-      end
-      refresh_map_tab
     end
 
-    def room_summary
-      checked = @rooms.count { |r| r[:checked] }
-      extra = @unmapped.positive? ? ", #{@unmapped} uid(s) not in the map database" : ''
-      "#{checked} of #{@rooms.size} mapped room(s) checked#{extra}"
+    def creature_area
+      t = template
+      t && t.areas[@area_index.to_i]
     end
 
-    def checked_rooms
-      @rooms.select { |r| r[:checked] }.map { |r| r[:id] }.uniq.sort
+    # The mapped room ids of the selected creature's chosen area.
+    def area_room_ids
+      area = creature_area or return []
+      BSProfiles.area_uids(area).flat_map { |u| Map.ids_from_uid(u) }.map(&:to_i).uniq
     end
 
-    def set_all_rooms(flag)
-      @rooms.each { |r| r[:checked] = flag }
+    # The sheet most of +ids+ are drawn on.
+    def sheet_for(ids)
+      ids.filter_map { |id| Map[id]&.image }.reject(&:empty?).tally.max_by { |_, n| n }&.first
     end
 
-    def toggle_room(id, flag = nil)
-      hit = false
-      @rooms.each do |r|
-        next unless r[:id] == id.to_i
+    # Bigshot hunts every room it can walk to from the start room without
+    # entering a boundary room, so the boundaries are the ring around the area.
+    def fence_area
+      ids = area_room_ids
+      return status(:creatures, "None of this area's rooms are in the map database.") if ids.empty?
 
-        r[:checked] = flag.nil? ? !r[:checked] : flag
-        hit = true
-      end
-      hit
-    end
-
-    def selected_room_ids
-      @room_selected.map(&:to_i).select(&:positive?).uniq
-    end
-
-    def set_entry(id, text)
-      set(id, text.to_s)
-      refresh_map_tab if MAP_ENTRIES.include?(id.to_s)
-    end
-
-    def append_list_entry(id, item)
-      current = @settings[id].to_s.strip
-      items = current.empty? ? [] : current.split(/\s*,\s*/)
-      return if items.any? { |i| i.sub(/\(.*\)\z/, '').strip.casecmp?(item) }
-
-      set_entry(id, (items + [item]).join(', '))
-    end
-
-    def room_to_entry(id)
-      ids = selected_room_ids
-      return status(:creatures, 'highlight a room row first') if ids.empty?
-
-      set_entry(id, ids.first.to_s)
-      status(:creatures, "#{id} set to #{ids.first}")
-    end
-
-    def rooms_to_entry(id)
-      ids = selected_room_ids
-      return status(:creatures, 'highlight one or more room rows first') if ids.empty?
-
-      set_entry(id, ids.join(', '))
-      status(:creatures, "#{id} set to #{ids.join(', ')}")
-    end
-
-    def boundaries_from(ids, replace:, what:)
-      return status(:creatures, 'no rooms checked') if ids.empty?
-
-      if replace
-        set_entry('hunting_boundaries', ids.join(', '))
-      else
-        current = @settings['hunting_boundaries'].to_s.split(/\s*,\s*/).map(&:strip).reject(&:empty?)
-        set_entry('hunting_boundaries', (current + ids.map(&:to_s)).uniq.join(', '))
-      end
-      status(:creatures, "hunting_boundaries #{replace ? 'set from' : 'extended with'} #{what}: #{ids.size} room(s)")
-    end
-
-    def noun_to_entry(id)
-      return status(:creatures, 'pick a creature first') if @template.nil?
-
-      noun = BSProfiles.noun_for(@template)
-      append_list_entry(id, noun)
-      status(:creatures, "#{id}: added #{noun}")
-    end
-
-    def cospawns_to_entry(id)
-      names = @cospawns.select { |c| c[:checked] }.map { |c| c[:name] }
-      return status(:creatures, 'no co-spawns checked') if names.empty?
-
-      nouns = names.map { |n| n.split.last.to_s }.uniq
-      nouns.each { |n| append_list_entry(id, n) }
-      status(:creatures, "#{id}: added #{nouns.join(', ')}")
+      name = creature_area[:name]
+      set_from_tool('hunting_boundaries', BSProfiles.perimeter(ids).join(', '))
+      set_from_tool('hunting_room_id', ids.min.to_s) if @settings['hunting_room_id'].to_s.strip.empty?
+      invalidate_hunt
+      sheet = sheet_for(ids)
+      show_sheet(sheet, focus: ids.first) if sheet
+      @cr_mode = 'hunt'
+      status(:creatures, "Boundaries now fence #{name} (#{ids.size} rooms). This list shows what lives there.")
     end
 
     # ---------------------------------------------------------------- map --
@@ -1343,36 +1492,147 @@ module BSProfiles
       respond "bsprofiles: the map directory cannot be served (#{e.message}); the Map tab shows markers only."
     end
 
-    def entry_room_ids(id)
-      @settings[id].to_s.split(/\s*,\s*/).map { |s| BSProfiles.resolve_room(s)&.id }.compact
+    # Room ids a role holds, as written in the profile.
+    def role_ids(role)
+      @settings[role].to_s.split(/\s*,\s*/).filter_map { |s| BSProfiles.resolve_room(s)&.id&.to_i }
     end
 
-    # {room_id => [kinds]} for every room the map should show.
-    def map_rooms_of_interest
-      rooms = Hash.new { |h, k| h[k] = [] }
-      @rooms.each { |r| rooms[r[:id]] << (r[:checked] ? :checked : :area) }
-      entry_room_ids('hunting_room_id').each { |id| rooms[id] << :start }
-      entry_room_ids('rallypoint_room_ids').each { |id| rooms[id] << :rally }
-      entry_room_ids('hunting_boundaries').each { |id| rooms[id] << :boundary }
-      BSProfiles.perimeter(checked_rooms).each { |id| rooms[id] << :perimeter } if @map_show_perimeter
-      rooms
+    def roles_of(id)
+      MAP_ROLES.keys.select { |role| role_ids(role).include?(id) }
     end
 
-    def refresh_map_tab
-      interest = map_rooms_of_interest
-      counts = Hash.new(0)
-      area_counts = Hash.new(0)
-      interest.each do |id, kinds|
-        room = Map[id]
-        next if room.nil? || room.image.to_s.empty?
-        next unless File.exist?(File.join(BSProfiles.map_dir, room.image))
-
-        counts[room.image] += 1
-        area_counts[room.image] += 1 if kinds.include?(:checked) || kinds.include?(:area)
+    # The rooms bigshot will hunt: everything reachable from the start room
+    # without stepping into a boundary room.
+    def hunt_rooms
+      @hunt_rooms ||= begin
+        start = role_ids('hunting_room_id').first
+        start ? BSProfiles.reachable(start, role_ids('hunting_boundaries')) : { rooms: [], cut: false }
       end
-      @map_list = counts.keys.sort_by { |img| [-area_counts[img], -counts[img], img] }
-      @map_counts = counts
-      @map_current = @map_list.include?(@map_current) ? @map_current : @map_list.first
+    end
+
+    def invalidate_hunt
+      @hunt_rooms = nil
+    end
+
+    # Left-click: a single-room role moves to the room, or comes off it if it
+    # is already there; a list role toggles the room in and out.
+    def assign_room(role, id)
+      label = MAP_ROLES.fetch(role)
+      if LIST_ROLES.include?(role)
+        list = @settings[role].to_s.split(/\s*,\s*/).map(&:strip).reject(&:empty?)
+        if list.include?(id.to_s)
+          set_from_tool(role, (list - [id.to_s]).join(', '))
+          status(:map, "Room #{id} is no longer a #{label.downcase}.")
+        else
+          set_from_tool(role, (list + [id.to_s]).join(', '))
+          status(:map, "Room #{id} is now a #{label.downcase}.")
+        end
+      elsif @settings[role].to_s.strip == id.to_s
+        set_from_tool(role, '')
+        status(:map, "#{label} cleared.")
+      else
+        set_from_tool(role, id.to_s)
+        status(:map, "#{label}: room #{id}.")
+      end
+      invalidate_hunt
+    end
+
+    # Right-click: take the room out of every role it holds.
+    def clear_room(id)
+      roles = roles_of(id)
+      return status(:map, "Room #{id} has no role to clear.") if roles.empty?
+
+      roles.each do |role|
+        if LIST_ROLES.include?(role)
+          set_from_tool(role, @settings[role].to_s.split(/\s*,\s*/).map(&:strip).reject { |s| s.empty? || s == id.to_s }.join(', '))
+        else
+          set_from_tool(role, '')
+        end
+      end
+      invalidate_hunt
+      status(:map, "Room #{id} cleared: #{roles.map { |r| MAP_ROLES[r].downcase }.join(', ')}.")
+    end
+
+    def map_clicked(payload)
+      id = payload[:region].to_s[/\Aroom-(\d+)\z/, 1]&.to_i || room_at(payload[:x].to_i, payload[:y].to_i)
+      return status(:map, 'No room there.') unless id
+
+      payload[:button].to_s == 'secondary' ? clear_room(id) : assign_room(@map_role, id)
+    end
+
+    # Rooms drawn on a sheet, with their boxes.
+    def sheet_rooms(sheet)
+      @sheet_rooms[sheet] ||= Map.list.compact.select { |r| r.image == sheet && r.image_coords }
+    end
+
+    def room_at(x, y)
+      return nil if @map_current.nil?
+
+      hit = sheet_rooms(@map_current).find do |r|
+        x1, y1, x2, y2 = r.image_coords.map(&:to_i)
+        x.between?([x1, x2].min, [x1, x2].max) && y.between?([y1, y2].min, [y1, y2].max)
+      end
+      hit&.id&.to_i
+    end
+
+    # Sheets holding the profile's rooms first, with how many, then every
+    # other installed sheet, so an empty profile can start anywhere.
+    def map_sheet_options
+      counts = Hash.new(0)
+      ids = MAP_ROLES.keys.flat_map { |role| role_ids(role) } + hunt_rooms[:rooms]
+      ids.uniq.each do |id|
+        img = Map[id]&.image.to_s
+        counts[img] += 1 unless img.empty?
+      end
+      options = counts.sort_by { |img, n| [-n, img] }.map { |img, n| { value: img, label: "#{BSProfiles.map_display_name(img)}  (#{n} rooms)" } }
+      others = BSProfiles.all_sheets.reject { |img| counts.key?(img) }
+      options += others.map { |img| { value: img, label: BSProfiles.map_display_name(img) } }
+      options = [{ value: '', label: '(no maps installed)' }] if options.empty?
+      options.first(511)
+    end
+
+    # The sheet the map opens on: the start room's, else the one most of
+    # the profile's rooms are on.
+    def default_sheet
+      start = role_ids('hunting_room_id').first
+      img = start && Map[start]&.image
+      return img if img && !img.empty?
+
+      map_sheet_options.first&.dig(:value).then { |v| v.to_s.empty? ? nil : v }
+    end
+
+    def map_current
+      @map_current ||= default_sheet
+    end
+
+    def show_sheet(sheet, focus: nil)
+      @map_current = sheet
+      @map_focus = focus
+      @map_rev += 1
+    end
+
+    # Find a room id, uNNNN, an area name or part of a room title.
+    def find_on_map
+      text = @find_text.to_s.strip
+      return status(:map, 'Type a room id, uNNNN, an area name or part of a room title.') if text.empty?
+
+      room = BSProfiles.resolve_room(text) if text.match?(/\Au?\d+\z/i)
+      unless room
+        area = BSProfiles.templates.flat_map(&:areas).find { |a| a[:name].to_s.casecmp?(text) }
+        if area
+          ids = BSProfiles.area_uids(area).flat_map { |u| Map.ids_from_uid(u) }.map(&:to_i)
+          room = ids.filter_map { |id| Map[id] }.find { |r| r.image && r.image_coords }
+        end
+      end
+      unless room
+        needle = text.downcase
+        room = Map.list.compact.find { |r| r.image && r.image_coords && Array(r.title).any? { |t| t.to_s.downcase.include?(needle) } }
+      end
+      return status(:map, "Nothing found for '#{text}'.") unless room
+      return status(:map, "Room #{room.id} has no map image.") unless room.image && room.image_coords
+
+      show_sheet(room.image, focus: room.id.to_i)
+      status(:map, "Room #{room.id}: #{Array(room.title).first.to_s.gsub(/[\[\]]/, '')}.")
     end
 
     def map_size(image)
@@ -1393,61 +1653,87 @@ module BSProfiles
       @map_scale = scale.clamp(MAP_MIN_SCALE, MAP_MAX_SCALE).round(3)
     end
 
-    # The composite's layers in the image's own pixels; `scale` does the zoom.
-    def map_layers
-      return [] if @map_current.nil?
+    # Zoom so the sheet's width fills the view.
+    def map_fit
+      w, = map_size(map_current) if map_current
+      return unless w.to_i.positive?
 
-      layers = []
-      src = map_source(@map_current)
-      w, h = map_size(@map_current)
-      layers << { kind: 'image', x: 0, y: 0, w: w, h: h, src: src } if src
-      interest = map_rooms_of_interest
-      shown = 0
-      cut = false
-      interest.each do |id, kinds|
-        room = Map[id]
-        next if room.nil? || room.image != @map_current
-        next unless (coords = room.image_coords)
-
-        x1, y1, x2, y2 = coords.map(&:to_i)
-        bw = [x2 - x1, 10].max
-        bh = [y2 - y1, 10].max
-        marks = []
-        if kinds.include?(:checked)
-          marks << { kind: 'marker', shape: 'cross', x: x1, y: y1, w: bw, h: bh, color: MAP_COLORS[:checked], line_width: 3 }
-        elsif kinds.include?(:area)
-          marks << { kind: 'marker', shape: 'cross', x: x1, y: y1, w: bw, h: bh, color: MAP_COLORS[:area], line_width: 1 }
-        end
-        marks << { kind: 'marker', shape: 'cross', x: x1, y: y1, w: bw, h: bh, color: MAP_COLORS[:perimeter], line_width: 2 } if kinds.include?(:perimeter)
-        marks << { kind: 'rectangle', mode: 'stroke', x: x1 - 3, y: y1 - 3, w: bw + 6, h: bh + 6, color: MAP_COLORS[:boundary], line_width: 3 } if kinds.include?(:boundary)
-        marks << { kind: 'marker', shape: 'ring', x: x1 - 5, y: y1 - 5, w: bw + 10, h: bh + 10, color: MAP_COLORS[:rally], line_width: 3 } if kinds.include?(:rally)
-        marks << { kind: 'marker', shape: 'ring', x: x1 - 5, y: y1 - 5, w: bw + 10, h: bh + 10, color: MAP_COLORS[:start], line_width: 3 } if kinds.include?(:start)
-        if @map_click_toggles && (kinds.include?(:checked) || kinds.include?(:area))
-          title = Array(room.title).first.to_s.gsub(/[\[\]]/, '')
-          marks << { kind: 'region', key: "room-#{id}", x1: x1, y1: y1, x2: x2, y2: y2, label: "#{id}: #{title}"[0, 200], activates: true }
-        end
-        if layers.size + marks.size > LAYER_BUDGET
-          cut = true
-          next
-        end
-        layers.concat(marks)
-        shown += 1
-      end
-      checked = interest.count { |_, k| k.include?(:checked) }
-      @map_status = "#{BSProfiles.map_display_name(@map_current)}: #{shown} of #{interest.size} room(s) of interest are on this map, " \
-                    "#{checked} ticked. Zoom #{(@map_scale * 100).round}%.#{cut ? ' Too many rooms to mark them all.' : ''}"
-      layers
+      map_zoom((@window_width - MAP_SIDE_SLACK).to_f / w)
     end
 
-    def map_region_clicked(region)
-      id = region.to_s[/\Aroom-(\d+)\z/, 1]
-      return if id.nil?
+    # A mark per role, the hunt's rooms outlined, and a hover label on every
+    # marked room. Clicks are worked out from the point, so unmarked rooms
+    # need no layer of their own.
+    def map_layers
+      sheet = map_current
+      return [] if sheet.nil?
 
-      if toggle_room(id)
-        status(:map, "Room #{id} #{@rooms.find { |r| r[:id] == id.to_i }[:checked] ? 'ticked' : 'unticked'}.")
-      else
-        status(:map, "Room #{id} is not in the chosen area's room list, so it cannot be ticked here.")
+      layers = []
+      src = map_source(sheet)
+      w, h = map_size(sheet)
+      layers << { kind: 'image', x: 0, y: 0, w: w, h: h, src: src } if src
+      by_id = sheet_rooms(sheet).to_h { |r| [r.id.to_i, r] }
+      marks = []
+      labels = []
+      hunt = hunt_rooms[:rooms]
+      (hunt & by_id.keys).each do |id|
+        x1, y1, x2, y2 = by_id[id].image_coords.map(&:to_i)
+        marks << { kind: 'rectangle', mode: 'stroke', x: x1, y: y1, w: [x2 - x1, 4].max, h: [y2 - y1, 4].max,
+                   color: MAP_COLORS['hunt'], line_width: 2 }
       end
+      MAP_ROLES.each_key do |role|
+        (role_ids(role) & by_id.keys).each do |id|
+          marks.concat(role_marks(role, by_id[id].image_coords))
+          labels << id
+        end
+      end
+      focus = @map_focus if @map_focus && by_id.key?(@map_focus)
+      labels << focus if focus
+      labels.uniq.each do |id|
+        r = by_id[id]
+        x1, y1, x2, y2 = r.image_coords.map(&:to_i)
+        tag = roles_of(id).map { |role| MAP_ROLES[role] }.join(', ')
+        title = Array(r.title).first.to_s.gsub(/[\[\]]/, '')
+        labels_text = "#{id}: #{title}#{tag.empty? ? '' : " (#{tag})"}"[0, 200]
+        marks << { kind: 'region', key: "room-#{id}", x1: x1, y1: y1, x2: x2, y2: y2, label: labels_text, activates: false }
+      end
+      room_budget = LAYER_BUDGET - layers.size
+      @map_cut = marks.size > room_budget
+      # Role marks and labels are kept before hunt outlines when cut.
+      marks = marks.reject { |m| m[:kind] == 'rectangle' && m[:line_width] == 2 }.first(room_budget) if @map_cut
+      layers.concat(marks)
+    end
+
+    # Start, rally and boundary are symbols; the rest rooms are boxes, so
+    # a room holding two roles shows both.
+    def role_marks(role, coords)
+      x1, y1, x2, y2 = coords.map(&:to_i)
+      left = [x1, x2].min
+      top = [y1, y2].min
+      w = [(x2 - x1).abs, 6].max
+      h = [(y2 - y1).abs, 6].max
+      color = MAP_COLORS.fetch(role)
+      case role
+      when 'hunting_room_id', 'rallypoint_room_ids'
+        pad = role == 'hunting_room_id' ? 6 : 3
+        [{ kind: 'marker', shape: 'ring', x: left - pad, y: top - pad, w: w + (2 * pad), h: h + (2 * pad), color: color, line_width: 3 }]
+      when 'hunting_boundaries'
+        [{ kind: 'marker', shape: 'cross', x: left + 2, y: top + 2, w: w - 4, h: h - 4, color: color, line_width: 3 }]
+      else
+        pad = role == 'resting_room_id' ? 4 : 8
+        [{ kind: 'rectangle', mode: 'stroke', x: left - pad, y: top - pad, w: w + (2 * pad), h: h + (2 * pad), color: color, line_width: 3 }]
+      end
+    end
+
+    def map_status
+      start = role_ids('hunting_room_id').first
+      hunt = hunt_rooms
+      parts = [start ? "Start room #{start}." : 'No start room yet.']
+      parts << "Bigshot will hunt #{hunt[:rooms].size} room(s)#{hunt[:cut] ? ' or more: the walk stopped at its limit, so check the boundaries' : ''}." if start
+      parts << "#{role_ids('hunting_boundaries').size} boundary room(s), #{role_ids('rallypoint_room_ids').size} rally point(s)."
+      parts << "Zoom #{(@map_scale * 100).round}%."
+      parts << 'Too many marks to draw them all on this map.' if @map_cut
+      parts.join(' ')
     end
 
     # ------------------------------------------------------------- render --
@@ -1476,7 +1762,7 @@ module BSProfiles
         ui.scroll(slot: 'Boon Creatures', key: 'tab-boons', fill: true) { editor.render_boons(ui) }
         ui.scroll(slot: 'Compare', key: 'tab-compare', fill: true) { editor.render_compare(ui) }
         ui.scroll(slot: 'Creatures', key: 'tab-creatures', fill: true) { editor.render_creatures(ui) }
-        ui.scroll(slot: 'Map', key: 'tab-map', fill: true) { editor.render_map(ui) }
+        ui.scroll(slot: 'Map', key: 'tab-map', fill: true, scrollbars: false) { editor.render_map(ui) }
       end
       render_footer(ui)
     end
@@ -1507,50 +1793,76 @@ module BSProfiles
 
     # ---- bigshot tabs ----
 
-    def render_section(ui, section, key)
+    def render_section(ui, section, key, fill: false)
       editor = self
       case section[0]
       when :frame
         _, label, rows = section
         props = { key: key }
         props[:label] = label if label
+        props[:fill] = true if fill   # side by side: as tall as its neighbour
         ui.group(**props) do
           ui.stack(key: "#{key}-s", gap: 4, margin: 4) do
-            rows.each_with_index { |row, i| editor.render_row(ui, row, "#{key}-#{i}") }
+            # Each run of label/input rows is one two-column grid: the label
+            # column is as wide as its longest label, so every input starts
+            # just after it and in line, and the inputs take the rest.
+            rows.each_with_index.chunk_while { |(a, _), (b, _)| a[0] == :pair && b[0] == :pair }.each do |run|
+              row, i = run.first
+              if row[0] == :pair
+                ui.grid(key: "#{key}-g#{i}", cols: 2, homogeneous: false, expand_columns: [2], row_gap: 4, column_gap: 10) do
+                  run.each do |(pair, j)|
+                    _, label, kind, id, extra = pair
+                    ui.text(key: "#{key}-#{j}-l", content: label, **editor.tipp(id))
+                    editor.render_input(ui, kind, id, extra, nil)
+                  end
+                end
+              else
+                editor.render_row(ui, row, "#{key}-#{i}")
+              end
+            end
           end
         end
       when :cols
         parts = section[1]
-        ui.columns(key: key, count: parts.size, gap: 8) do
+        ui.columns(key: key, count: parts.size, gap: 8, row_align: :stretch) do
           parts.each_with_index { |part, i| editor.render_section_in_slot(ui, part, "#{key}-c#{i}", i.to_s) }
         end
+      else
+        # A single row at tab level, such as a full-width text box.
+        render_row(ui, section, key)
       end
     end
 
     def render_section_in_slot(ui, section, key, slot)
       editor = self
-      ui.stack(slot: slot, key: key, gap: 8) { editor.render_section(ui, section, "#{key}-i") }
+      ui.stack(slot: slot, key: key, gap: 8) { editor.render_section(ui, section, "#{key}-i", fill: true) }
     end
 
-    def render_row(ui, row, key)
+    def render_row(ui, row, key, wide_label: false)
       editor = self
       case row[0]
       when :pair
         _, label, kind, id, extra = row
-        ui.columns(key: key, count: 2, weights: [2, 3], compact: true, row_align: :center) do
+        weights = wide_label ? [3, 2] : [2, 3]
+        ui.columns(key: key, count: 2, weights: weights, compact: true, row_align: :center) do
           ui.text(slot: '0', key: "#{key}-l", content: label, **editor.tipp(id))
           editor.render_input(ui, kind, id, extra, '1')
         end
       when :check
         render_check(ui, row[1], row[2])
       when :checks
-        ui.stack(key: key, orientation: :horizontal, gap: 16) do
-          row[1].each { |id, label| editor.render_check(ui, id, label) }
+        # Fixed columns, so the second checkbox lines up from row to row.
+        # The right column is wider: its labels run longer.
+        # A pair gives the longer right-hand labels more room; three or more
+        # share the row evenly.
+        weights = row[1].size == 2 ? [2, 3] : Array.new(row[1].size, 1)
+        ui.columns(key: key, count: row[1].size, weights: weights, compact: true, row_align: :start, gap: 8) do
+          row[1].each_with_index { |(id, label), i| editor.render_check(ui, id, label, slot: i.to_s) }
         end
       when :area
         _, id, label = row
         ui.group(key: key, label: label) do
-          ui.textarea(key: id, value: editor.settings[id].to_s, rows: 4, **editor.tipp(id),
+          ui.textarea(key: editor.entry_key(id), value: editor.settings[id].to_s, rows: 4, **editor.tipp(id),
                       on: { change: editor.cb { |ev| editor.set(id, ev.payload[:value].to_s) } })
         end
       when :note
@@ -1560,9 +1872,10 @@ module BSProfiles
       end
     end
 
-    def render_check(ui, id, label)
+    def render_check(ui, id, label, slot: nil)
       editor = self
-      ui.checkbox(key: id, label: label, checked: @settings[id] ? true : false, **tipp(id),
+      placement = slot ? { slot: slot } : {}
+      ui.checkbox(key: editor.entry_key(id), label: label, checked: @settings[id] ? true : false, **placement, **tipp(id),
                   on: { change: editor.cb { |ev| editor.set(id, ev.payload[:value] ? true : false) } })
     end
 
@@ -1571,14 +1884,14 @@ module BSProfiles
       value = @settings[id]
       case kind
       when :entry
-        ui.text_input(slot: slot, key: id, value: value.to_s, **tipp(id),
+        ui.text_input(slot: slot, key: entry_key(id), value: value.to_s, **tipp(id),
                       on: { change: editor.cb { |ev| editor.set(id, ev.payload[:value].to_s.strip) } })
       when :spin
         min, max, step = SPINS.fetch(id, [0, 100_000, 1])
         float = step.is_a?(Float)
         num = float ? value.to_f : value.to_i
         num = num.clamp(min, max)
-        ui.number_input(slot: slot, key: id, value: num, min: min, max: max, step: step, stepper_buttons: true,
+        ui.number_input(slot: slot, key: editor.entry_key(id), value: num, min: min, max: max, step: step, stepper_buttons: true,
                         digits: float ? 1 : 0, **tipp(id),
                         on: { change: editor.cb { |ev|
                           v = ev.payload[:value]
@@ -1588,12 +1901,23 @@ module BSProfiles
         options = extra.map { |v, l| { value: v.to_s, label: l } }
         current = value.to_s
         current = options.first[:value] unless options.any? { |o| o[:value] == current }
-        ui.select(slot: slot, key: id, options: options, value: current, **tipp(id),
+        ui.select(slot: slot, key: editor.entry_key(id), options: options, value: current, **tipp(id),
                   on: { change: editor.cb { |ev| editor.set(id, ev.payload[:value].to_s) } })
       when :combo
-        options = extra.map { |v| { value: v.to_s, label: v.to_s } }
-        ui.select(slot: slot, key: id, options: options, editable: true, value: value.to_s, **tipp(id),
-                  on: { change: editor.cb { |ev| editor.set(id, ev.payload[:value].to_s.strip) } })
+        # A plain drop-down: the editable kind draws a text box with a detached
+        # button. Blank first, as bigshot allows none. A value the profile holds
+        # that is not on the list stays a choice, so loading never changes it.
+        current = value.to_s.strip
+        options = [{ value: '', label: '(none)' }] + extra.map { |v| { value: v.to_s, label: v.to_s } }
+        match = options.find { |o| o[:value].casecmp?(current) }
+        if match
+          # Keep the profile's own spelling ("offensive") under the list's label.
+          options = options.map { |o| o.equal?(match) ? { value: current, label: o[:label] } : o }
+        else
+          options << { value: current, label: current }
+        end
+        ui.select(slot: slot, key: editor.entry_key(id), options: options, value: current, **tipp(id),
+                  on: { change: editor.cb { |ev| editor.set(id, ev.payload[:value].to_s) } })
       end
     end
 
@@ -1667,7 +1991,7 @@ module BSProfiles
         end
         ui.text(key: 'boons-info', content: BOON_INFO, wrap: true, emphasis: :subtle)
         BoonMatrix::GROUPS.each do |group, items|
-          ui.expander(key: "boons-#{group}", label: BoonMatrix::TITLES[group], open: true) do
+          ui.expander(key: "boons-#{group}", label: BoonMatrix::TITLES[group], open: false) do
             editor.render_boon_table(ui, group, items)
           end
         end
@@ -1750,212 +2074,260 @@ module BSProfiles
 
     # ---- creatures ----
 
+    # The roster on the left: what lives in the hunt (or a search), with Hunt,
+    # Ignore and Flee ticks. The chosen creature on the right: which boons to
+    # flee it for, then its details.
     def render_creatures(ui)
       editor = self
-      ui.stack(key: 'creatures', gap: 6, margin: 8) do
+      ui.stack(key: 'creatures', gap: 6, margin: 8, fill: true) do
+        ui.columns(key: 'cr-top', count: 2, weights: [1, 3], compact: true, row_align: :end, gap: 8) do
+          ui.select(slot: '0', key: 'cr_mode', label: 'Show', value: editor.cr_mode,
+                    options: [{ value: 'hunt', label: 'Creatures in my hunt' }, { value: 'search', label: 'Search all creatures' }],
+                    tooltip: "Creatures in my hunt: what lives in the rooms outlined green on the Map tab.\nSearch: every creature, by level, name and area.",
+                    on: { change: editor.cb { |ev| editor.cr_mode = ev.payload[:value].to_s } })
+          ui.text(slot: '1', key: 'cr-summary', content: editor.roster_summary, emphasis: :subtle, wrap: true)
+        end
         editor.render_creature_filters(ui)
-        ui.columns(key: 'cr-cols', count: 3, weights: [3, 4, 4], gap: 8) do
-          ui.stack(slot: '0', key: 'cr-left', gap: 4) do
-            editor.render_creature_table(ui)
-            ui.text(key: 'cr-count', content: editor.cr_count.to_s, emphasis: :subtle, tooltip: 'How many creatures match the current filters.')
-          end
-          ui.scroll(slot: '1', key: 'cr-detail-scroll', max_height: 560) do
-            if editor.template
-              ui.markdown(key: 'cr-detail', content: BSProfiles.detail_markdown(editor.template))
-            else
-              ui.text(key: 'cr-detail-empty', content: 'Select a creature.', emphasis: :subtle)
+        ui.text(key: 'cr-status', content: editor.status_text(:creatures), tone: :caution, wrap: true) unless editor.status_text(:creatures).empty?
+        ui.split(key: 'cr-cols', orientation: :horizontal, position: 60, fill: true) do
+          ui.stack(slot: 'first', key: 'cr-left', gap: 4, fill: true, margin: { right: 6 }) do
+            editor.render_roster(ui)
+            ui.columns(key: 'cr-bulk', count: 3, weights: [1, 1, 3], compact: true, row_align: :center, gap: 6) do
+              ui.button(slot: '0', key: 'hunt_all', label: 'Hunt all', tooltip: 'Tick Hunt for every creature listed.',
+                        on: { activate: editor.cb { editor.hunt_all(true) } })
+              ui.button(slot: '1', key: 'hunt_none', label: 'Hunt none', tooltip: 'Untick Hunt for every creature listed.',
+                        on: { activate: editor.cb { editor.hunt_all(false) } })
+              ui.text(slot: '2', key: 'cr-count', content: editor.cr_mode == 'search' ? editor.roster_summary : '', emphasis: :subtle, wrap: true)
             end
           end
-          ui.stack(slot: '2', key: 'cr-right', gap: 6) { editor.render_creature_right(ui) }
+          ui.scroll(slot: 'second', key: 'cr-right-scroll', fill: true) do
+            ui.stack(key: 'cr-right', gap: 6, margin: { right: 8 }) { editor.render_creature_detail(ui) }
+          end
         end
       end
     end
 
-    attr_reader :cr_count, :template
-
+    # eohunter's creature filters: level, name, undead, boons and area on the
+    # first row (level and area only for the search, as the hunt list is
+    # already the hunt area), body type, class and family on the second, and
+    # boss and the recorded traits under More filters.
     def render_creature_filters(ui)
       editor = self
-      band_tip = "Only creatures in this level range are listed.\nOpens at your level -5 to +10. Set 1 to 120 to see everything."
-      ui.columns(key: 'cr-filters', count: 8, weights: [1, 1, 2, 3, 2, 2, 2, 1], compact: true, row_align: :end, gap: 6) do
-        ui.number_input(slot: '0', key: 'lvl_min', label: 'Level', value: editor.lvl_min, min: 1, max: 120, step: 1, tooltip: "Lowest level to list.\n#{band_tip}",
-                        on: { change: editor.cb { |ev| editor.lvl_min = ev.payload[:value].to_i; editor.refresh_creature_list } })
-        ui.number_input(slot: '1', key: 'lvl_max', label: 'to', value: editor.lvl_max, min: 1, max: 120, step: 1, tooltip: "Highest level to list.\n#{band_tip}",
-                        on: { change: editor.cb { |ev| editor.lvl_max = ev.payload[:value].to_i; editor.refresh_creature_list } })
-        ui.text_input(slot: '2', key: 'cr_name', label: 'Name', value: editor.cr_name, placeholder: 'name contains', search: true,
-                      tooltip: 'Keep only creatures whose name contains this text.',
-                      on: { change: editor.cb { |ev| editor.cr_name = ev.payload[:value].to_s; editor.refresh_creature_list } })
-        areas = [{ value: '', label: 'All areas' }] + BSProfiles.area_names.map { |n| { value: n, label: n } }
-        ui.select(slot: '3', key: 'cr_area', label: 'Area', options: areas, value: editor.cr_area,
-                  tooltip: 'Keep only creatures that spawn in this area. Combine with the level band to see what a hunting ground holds for you.',
-                  on: { change: editor.cb { |ev| editor.cr_area = ev.payload[:value].to_s; editor.refresh_creature_list } })
-        ui.select(slot: '4', key: 'cr_undead', label: 'Kind', value: editor.cr_undead,
-                  options: [{ value: 'any', label: 'Any' }, { value: 'undead', label: 'Undead' }, { value: 'living', label: 'Living' }],
-                  tooltip: "Any: all creatures. Undead: only undead. Living: only non-undead.\nUseful for clerics and paladins, or for skipping undead when hunting for blood.",
-                  on: { change: editor.cb { |ev| editor.cr_undead = ev.payload[:value].to_s; editor.refresh_creature_list } })
-        ui.text_input(slot: '5', key: 'cr_room', label: 'Room', value: editor.cr_room, placeholder: 'room id or uNNN',
-                      tooltip: "A Lich room id (29882) or a game uid (u7503101).\nPress Enter or click Creatures at room. Blank uses the profile's hunting room.",
-                      on: { change: editor.cb { |ev| editor.cr_room = ev.payload[:value].to_s }, submit: editor.cb { editor.creatures_at_room } })
-        ui.button(slot: '6', key: 'cr_here', label: 'Creatures at room',
-                  tooltip: "Limit the list to creatures whose spawn areas include this room.\nBlank uses the profile's hunting room. Clear the room to go back to the level band.",
-                  on: { activate: editor.cb { editor.creatures_at_room } })
-        ui.button(slot: '7', key: 'cr_reset', label: 'Reset', tooltip: 'Back to the level band around your character, all areas, no name filter.',
-                  on: { activate: editor.cb { editor.reset_filters } })
-      end
-    end
-
-    attr_accessor :lvl_min, :lvl_max, :cr_name, :cr_area, :cr_undead, :cr_room
-
-    def render_creature_table(ui)
-      editor = self
-      rows = @cr_list.map do |t|
-        { key: creature_key(t), cells: { 'lvl' => t.level.to_i, 'name' => t.name.to_s, 'areas' => t.areas.map { |a| a[:name].to_s }.uniq.join(', ') } }
-      end
-      selected = rows.any? { |r| r[:key] == @cr_selected } ? [@cr_selected] : []
-      ui.table(key: 'cr-table', headers: true, selection: :single, selected: selected, max_height: 480, sortable: true,
-               tooltip: 'Creatures matching the filters. Click a row to see its details, areas and rooms. Click a column header to sort.',
-               columns: [{ key: 'lvl', label: 'Lvl', width: 50, sortable: true, align: :end },
-                         { key: 'name', label: 'Creature', sortable: true, resizable: true, expand: true },
-                         { key: 'areas', label: 'Areas', sortable: true, resizable: true }],
-               rows: rows,
-               on: { selection_change: editor.cb { |ev|
-                 key = Array(ev.payload[:rows]).first
-                 t = key && editor.template_for_key(key)
-                 t ? editor.show_creature(t) : editor.clear_creature
-               } })
-    end
-
-    def render_creature_right(ui)
-      editor = self
-      areas = if @template
-                @template.areas.each_with_index.map do |area, i|
-                  uids = BSProfiles.area_uids(area)
-                  mapped = uids.count { |u| !Map.ids_from_uid(u).empty? }
-                  { value: i.to_s, label: "#{area[:name]}  (#{mapped}/#{uids.size} rooms mapped)  [#{i + 1}/#{@template.areas.size}]" }
-                end
-              else
-                [{ value: '0', label: '(select a creature)' }]
-              end
-      ui.select(key: 'area_combo', label: 'Area', options: areas, value: @area_index.to_s,
-                tooltip: "The selected creature's spawn areas, with how many of the area's rooms are in your map database.\nPicking one fills the room list and the co-spawn list below.",
-                on: { change: editor.cb { |ev| editor.select_area(ev.payload[:value].to_i) } })
-      room_rows = @rooms.map do |r|
-        { key: r[:id].to_s, cells: { 'use' => r[:checked], 'room' => r[:id].to_s, 'uid' => "u#{r[:uid]}", 'title' => r[:title] } }
-      end
-      room_keys = room_rows.map { |r| r[:key] }
-      ui.table(key: 'room-table', headers: true, selection: :multi, selected: @room_selected.map(&:to_s) & room_keys, max_height: 180, scrollable: true,
-               tooltip: "Mapped rooms in the chosen area. Tick the rooms you want the fence to enclose,\nhighlight rows (Ctrl+click for several) to use as the start room or rally points.",
-               columns: [{ key: 'use', label: '', width: 36, editor: { type: :checkbox } },
-                         { key: 'room', label: 'Room', width: 70 }, { key: 'uid', label: 'UID', width: 80 },
-                         { key: 'title', label: 'Title', expand: true, resizable: true }],
-               rows: room_rows,
-               on: { cell_edit: editor.cb { |ev| editor.toggle_room(ev.payload[:row], ev.payload[:value] ? true : false) },
-                     selection_change: editor.cb { |ev| editor.room_selected = Array(ev.payload[:rows]) } })
-      ui.columns(key: 'room-btns', count: 3, weights: [1, 1, 3], compact: true, row_align: :center) do
-        ui.button(slot: '0', key: 'check_all', label: 'Check all', tooltip: 'Tick every mapped room in the list.',
-                  on: { activate: editor.cb { editor.set_all_rooms(true) } })
-        ui.button(slot: '1', key: 'uncheck_all', label: 'Uncheck all', tooltip: 'Clear every tick in the list.',
-                  on: { activate: editor.cb { editor.set_all_rooms(false) } })
-        ui.text(slot: '2', key: 'room-summary', content: editor.room_summary, emphasis: :subtle,
-                tooltip: 'Ticked rooms are what the Boundaries buttons use. Uids not in the map database cannot be used.')
-      end
-      ui.text(key: 'cos-label', content: 'Also spawns in this area')
-      cos_rows = @cospawns.map { |c| { key: c[:key], cells: { 'use' => c[:checked], 'lvl' => c[:level], 'name' => c[:name] } } }
-      ui.table(key: 'cos-table', headers: true, selection: :none, max_height: 150, scrollable: true, sortable: true, activation: :double,
-               tooltip: "Other creatures that spawn in the chosen area, so you know what else you will meet there.\n" \
-                        'Tick the ones you also want to hunt, then use the co-spawn buttons below. Double-click a row to view that creature.',
-               columns: [{ key: 'use', label: '', width: 36, editor: { type: :checkbox } },
-                         { key: 'lvl', label: 'Lvl', width: 50, sortable: true, align: :end },
-                         { key: 'name', label: 'Creature', sortable: true, expand: true }],
-               rows: cos_rows,
-               on: { cell_edit: editor.cb { |ev| editor.toggle_cospawn(ev.payload[:row], ev.payload[:value]) },
-                     row_activate: editor.cb { |ev|
-                       t = editor.template_for_key(ev.payload[:row])
-                       editor.show_creature(t) if t
-                     } })
-      ui.group(key: 'send', label: 'Send to profile',
-               tooltip: "These buttons write into the profile being edited (the Hunting and Commands tabs).\nNothing is saved to disk until you save on the Profiles tab.") do
-        ui.grid(key: 'send-grid', cols: 2, gap: 4) do
-          ui.button(key: 'start_btn', label: 'Start room <- row', on: { activate: editor.cb { editor.room_to_entry('hunting_room_id') } },
-                    tooltip: "Set the profile's hunting start room (hunting_room_id) to the highlighted room.\nIf several rows are highlighted the first one is used.")
-          ui.button(key: 'rest_btn', label: 'Rally points <- rows', on: { activate: editor.cb { editor.rooms_to_entry('rallypoint_room_ids') } },
-                    tooltip: "Replace the profile's rally points (rallypoint_room_ids) with the highlighted rooms.\nCtrl+click or Shift+click to highlight more than one row.\n" \
-                             "Bigshot stops at a rally point before the start room to cast hunting spells and start hunting scripts, and a group leader waits there for the group.\nBlank means bigshot uses the start room.")
-          ui.button(key: 'perim_btn', label: 'Boundaries <- perimeter',
-                    on: { activate: editor.cb { editor.boundaries_from(BSProfiles.perimeter(editor.checked_rooms), replace: true, what: 'perimeter') } },
-                    tooltip: "Replace hunting_boundaries with the ring of rooms just outside the ticked rooms.\n" \
-                             "This is how bigshot's boundaries work: it hunts every room it can reach from the start room without stepping into a boundary room.\nTick the rooms you want to hunt, and this builds the fence around them.")
-          ui.button(key: 'fence_add_btn', label: 'Boundaries += perimeter',
-                    on: { activate: editor.cb { editor.boundaries_from(BSProfiles.perimeter(editor.checked_rooms), replace: false, what: 'perimeter') } },
-                    tooltip: "Add the perimeter of the ticked rooms to hunting_boundaries, keeping what is already there.\nUse this to fence a second area into the same profile.")
-          ui.button(key: 'target_btn', label: 'Targets += creature', on: { activate: editor.cb { editor.noun_to_entry('targets') } },
-                    tooltip: "Add the selected creature's noun to the profile's target list (Commands tab).\nAdd a command letter afterwards if you want it, e.g. wendigo(a). Already-listed nouns are skipped.")
-          ui.button(key: 'quick_btn', label: 'Quick targets += creature', on: { activate: editor.cb { editor.noun_to_entry('quickhunt_targets') } },
-                    tooltip: "Add the selected creature's noun to the quick-hunt target list used by ;bigshot quick.")
-          ui.button(key: 'cos_target_btn', label: 'Targets += checked co-spawns', on: { activate: editor.cb { editor.cospawns_to_entry('targets') } },
-                    tooltip: 'Add the noun of every ticked co-spawn to the profile\'s target list. Already-listed nouns are skipped.')
-          ui.button(key: 'cos_quick_btn', label: 'Quick += checked co-spawns', on: { activate: editor.cb { editor.cospawns_to_entry('quickhunt_targets') } },
-                    tooltip: 'Add the noun of every ticked co-spawn to the quick-hunt target list.')
+      search = @cr_mode == 'search'
+      rev = @cr_filter_rev
+      weights = search ? [1, 1, 2, 1, 1, 3] : [2, 1, 1, 2]
+      ui.columns(key: "cr-filters-#{@cr_mode}-#{rev}", count: weights.size, weights: weights, compact: true, row_align: :end, gap: 6) do
+        n = 0
+        at = -> { ((n += 1) - 1).to_s }
+        if search
+          ui.number_input(slot: at.call, key: 'lvl_min', label: 'Level', value: editor.lvl_min, min: 1, max: 120, step: 1,
+                          tooltip: 'Lowest level to list.', on: { change: editor.cb { |ev| editor.lvl_min = ev.payload[:value].to_i } })
+          ui.number_input(slot: at.call, key: 'lvl_max', label: 'to', value: editor.lvl_max, min: 1, max: 120, step: 1,
+                          tooltip: 'Highest level to list.', on: { change: editor.cb { |ev| editor.lvl_max = ev.payload[:value].to_i } })
+        end
+        ui.text_input(slot: at.call, key: 'cr_name', label: 'Name', value: editor.cr_name, placeholder: 'any creature', search: true,
+                      change_mode: :input, on: { change: editor.cb { |ev| editor.cr_name = ev.payload[:value].to_s } })
+        [[:undead, 'Undead creatures only, living only, or either.'],
+         [:bcs, 'Creatures that can spawn with boons, ones that never do, or either.']].each do |flag, tip|
+          ui.select(slot: at.call, key: "f-#{flag}", label: FLAGS[flag], options: YES_NO, value: editor.yes_no(editor.cr_filter(flag)),
+                    tooltip: tip, on: { change: editor.cb { |ev| editor.set_cr_filter(flag, ev.payload[:value].to_s) } })
+        end
+        if search
+          areas = [{ value: '', label: 'All areas' }] + BSProfiles.area_names.map { |a| { value: a, label: a } }
+          ui.select(slot: at.call, key: 'cr_area', label: 'Area', options: areas.first(512), value: editor.cr_area,
+                    on: { change: editor.cb { |ev| editor.cr_area = ev.payload[:value].to_s } })
+        else
+          ui.text(slot: at.call, key: 'cr-filter-pad', content: '')
         end
       end
-      ui.text(key: 'cr-status', content: editor.status_text(:creatures), tone: :caution, wrap: true, tooltip: 'Result of the last action on this tab.') unless editor.status_text(:creatures).empty?
+      ui.columns(key: "cr-kinds-#{rev}", count: 4, weights: [2, 2, 2, 1], compact: true, row_align: :end, gap: 6) do
+        [[:type, 'Type', BSProfiles.template_values(:type), 'Body type, as the creature templates record it.'],
+         [:klass, 'Class', BSProfiles.template_classes, 'A further classification such as non-corporeal undead. Few creatures carry one.'],
+         [:family, 'Family', BSProfiles.template_values(:family), 'The creature family: rolton, troll, wraith.']].each_with_index do |(key, label, values, tip), i|
+          options = [{ value: '', label: 'any' }] + values.first(511).map { |v| { value: v, label: v } }
+          ui.select(slot: i.to_s, key: "f-#{key}", label: label, options: options, value: editor.cr_filter(key).to_s, tooltip: tip,
+                    on: { change: editor.cb { |ev| editor.set_cr_filter(key, ev.payload[:value].to_s) } })
+        end
+        ui.button(slot: '3', key: 'cr_clear', label: 'Clear filters', tooltip: 'Back to no filters. The level band and area stay.',
+                  on: { activate: editor.cb { editor.clear_filters } })
+      end
+      ui.expander(key: 'cr-more', label: 'More filters', open: false) do
+        fields = [[:boss, FLAGS[:boss], 'Boss creatures only, ordinary ones only, or either.']] +
+                 TRAITS.map { |trait, (label, _)| [trait, label, nil] }
+        fields.each_slice(4).with_index do |row, r|
+          ui.columns(key: "cr-traits-#{r}-#{rev}", count: 4, weights: [1, 1, 1, 1], compact: true, row_align: :end, gap: 6) do
+            row.each_with_index do |(field, label, tip), i|
+              tip ||= "A creature with nothing recorded for #{label.downcase} is kept either way."
+              ui.select(slot: i.to_s, key: "f-#{field}", label: label, options: YES_NO, value: editor.yes_no(editor.cr_filter(field)),
+                        tooltip: tip, on: { change: editor.cb { |ev| editor.set_cr_filter(field, ev.payload[:value].to_s) } })
+            end
+          end
+        end
+      end
     end
 
-    attr_accessor :room_selected
+    attr_accessor :lvl_min, :lvl_max, :cr_name, :cr_area
 
-    def toggle_cospawn(key, flag)
-      c = @cospawns.find { |x| x[:key] == key.to_s } or return
-      c[:checked] = flag ? true : false
+    def render_roster(ui)
+      editor = self
+      list = roster
+      rows = list.map do |t, rooms|
+        boons = boon_flees(t).map { |b| BoonMatrix::LABELS.fetch(b, [b]).first }
+        cells = { 'lvl' => t.level.to_i, 'name' => t.name.to_s,
+                  'hunt' => hunt?(t), 'ignore' => ignore?(t), 'flee' => flee?(t),
+                  'boons' => boons.empty? ? '' : boons.join(', ') }
+        # Search has no Rooms column, and the table refuses a cell without one.
+        cells['rooms'] = rooms.to_s unless @cr_mode == 'search'
+        { key: creature_key(t), cells: cells }
+      end
+      selected = rows.any? { |r| r[:key] == @cr_selected } ? [@cr_selected] : []
+      columns = [{ key: 'lvl', label: 'Lvl', width: 44, sortable: true, align: :end },
+                 { key: 'name', label: 'Creature', sortable: true, expand: true }]
+      columns << { key: 'rooms', label: 'Rooms', width: 60, sortable: true, align: :end } if @cr_mode != 'search'
+      columns += [{ key: 'hunt', label: 'Hunt', width: 52, editor: { type: :checkbox } },
+                  { key: 'ignore', label: 'Ignore', width: 58, editor: { type: :checkbox } },
+                  { key: 'flee', label: 'Flee', width: 48, editor: { type: :checkbox } },
+                  { key: 'boons', label: 'Flee if boon', width: 120 }]
+      ui.table(key: 'cr-roster', headers: true, selection: :single, selected: selected,
+               fill: true, sortable: true,
+               tooltip: "Hunt adds the noun to Valid Targets; Ignore to \"...but don't count these\"; Flee the name to \"...and always flee from\".\n" \
+                        'Hunt and Ignore exclude each other. Creatures sharing a noun share Hunt and Ignore. Click a row for its boons and details.',
+               columns: columns, rows: rows,
+               on: { cell_edit: editor.cb { |ev|
+                       t = editor.template_for_key(ev.payload[:row])
+                       editor.roster_edit(t, ev.payload[:column].to_s, ev.payload[:value] ? true : false) if t
+                     },
+                     selection_change: editor.cb { |ev| key = Array(ev.payload[:rows]).first; editor.select_creature(key) if key } })
+    end
+
+    def roster_edit(t, column, on)
+      set_role(t, column, on)
+      @roster_rev += 1
+    end
+
+    def render_creature_detail(ui)
+      editor = self
+      t = template
+      unless t
+        ui.text(key: 'cr-none', content: 'Click a creature to choose which boons to flee it for, and to see its details.', emphasis: :subtle, wrap: true)
+        return
+      end
+
+      # The blocks below run as the page builder, so editor state is read
+      # out here first.
+      fled = boon_flees(t)
+      selected = @cr_selected
+      ui.text(key: 'cr-title', content: "#{t.name}, level #{t.level}", emphasis: :strong, wrap: true)
+      # The flow: pick a creature, fence its area, then choose from what lives
+      # there. Fence is the next step, so it comes first.
+      unless t.areas.empty?
+        if t.areas.size > 1
+          options = t.areas.each_with_index.map { |a, i| { value: i.to_s, label: a[:name].to_s } }
+          ui.select(key: "area_combo-#{selected}", label: 'Area', options: options.first(512), value: @area_index.to_s,
+                    on: { change: editor.cb { |ev| editor.select_area(ev.payload[:value].to_i) } })
+        end
+        ui.button(key: 'fence_btn', label: "Fence #{(t.areas[@area_index.to_i] || t.areas.first)[:name]}", variant: :primary,
+                  on: { activate: editor.cb { editor.fence_area } },
+                  tooltip: "Set Boundary Room IDs to the ring of rooms just outside this area, so bigshot stays inside it,\n" \
+                           "and list every creature that lives there. Also sets the start room if there is none yet.\n" \
+                           'Adjust the boundaries on the Map tab.')
+      end
+      # Here if you need it, not for everyone: closed until opened.
+      fled_names = fled.map { |b| BoonMatrix::LABELS.fetch(b, [b]).first }
+      ui.expander(key: "cr-boons-#{selected}", label: fled_names.empty? ? 'Flee when it has a boon' : "Flee when it has: #{fled_names.join(', ')}",
+                  open: false) do
+        ui.text(key: 'cr-boons-hint', emphasis: :subtle, wrap: true,
+                content: "Still hunted without the boon. Adds \"<adjective> #{t.name}\" to \"...and always flee from\" for each " \
+                         'adjective of the boon. A spawn with two boons is not caught, as bigshot matches whole names. ' \
+                         'The Boon Creatures tab sets boons for every creature.')
+        ui.grid(key: "cr-boon-grid-#{selected}", cols: 2, gap: 2) do
+          BoonMatrix::GROUPS.values.flatten.sort_by { |b| BoonMatrix::LABELS.fetch(b, [b]).first }.each do |boon|
+            label, note = BoonMatrix::LABELS.fetch(boon, [boon, ''])
+            adjs = BoonMatrix::ADJECTIVES.fetch(boon, [])
+            next if adjs.empty?
+
+            tip = "Shows as: #{adjs.join(', ')}#{note.to_s.empty? ? '' : ".\n#{note}"}"
+            ui.checkbox(key: "cr-boon-#{boon}", label: label, checked: fled.include?(boon), tooltip: tip,
+                        on: { change: editor.cb { |ev| editor.set_boon_flee(t, boon, ev.payload[:value] ? true : false); editor.bump_roster } })
+          end
+        end
+      end
+      ui.expander(key: 'cr-details', label: 'Details', open: false) do
+        ui.stack(key: 'cr-detail', gap: 2, margin: 4) do
+          BSProfiles.detail_lines(t).drop(1).each_with_index do |(style, text), i|
+            k = "cr-d-#{i}"
+            case style
+            when :head then ui.text(key: k, content: text, emphasis: :strong, margin: { top: 8 })
+            when :link then ui.markdown(key: k, content: "Wiki: [#{text}](#{text})")
+            else ui.text(key: k, content: text, wrap: true)
+            end
+          end
+        end
+      end
+    end
+
+    def bump_roster
+      @roster_rev += 1
     end
 
     # ---- map ----
 
     def render_map(ui)
       editor = self
-      ui.stack(key: 'map', gap: 6, margin: 8) do
-        ui.columns(key: 'map-bar', count: 7, weights: [4, 1, 1, 1, 2, 2, 1], compact: true, row_align: :end, gap: 6) do
-          options = editor.map_list.map { |img| { value: img, label: "#{BSProfiles.map_display_name(img)}  (#{editor.map_counts[img]} rooms)" } }
-          options = [{ value: '', label: '(no maps for these rooms)' }] if options.empty?
-          ui.select(slot: '0', key: 'map_combo', label: 'Map', options: options, value: editor.map_current.to_s,
-                    tooltip: "Maps that contain rooms from the chosen area or the profile.\nThe count is how many of those rooms are on that map.",
-                    on: { change: editor.cb { |ev| editor.map_current = ev.payload[:value].to_s.empty? ? nil : ev.payload[:value].to_s } })
-          ui.button(slot: '1', key: 'zoom_out', label: '-', tooltip: 'Zoom out. Ctrl + mouse wheel over the map also zooms.',
+      ui.stack(key: 'map', gap: 6, margin: 8, fill: true) do
+        ui.columns(key: 'map-bar', count: 3, weights: [3, 3, 2], compact: true, row_align: :end, gap: 6) do
+          ui.select(slot: '0', key: "map_combo-#{editor.map_rev}", label: 'Map', options: editor.map_sheet_options, value: editor.map_current.to_s,
+                    tooltip: "Maps holding the profile's rooms come first, with how many. Every other map follows.",
+                    on: { change: editor.cb { |ev| v = ev.payload[:value].to_s; editor.show_sheet(v) unless v.empty? } })
+          ui.text_input(slot: '1', key: 'map_find', label: 'Find', value: editor.find_text, change_mode: :input,
+                        placeholder: 'room id, uNNNN, area or room title',
+                        tooltip: 'Press Enter to open the map with that room or area.',
+                        on: { change: editor.cb { |ev| editor.find_text = ev.payload[:value].to_s },
+                              submit: editor.cb { editor.find_on_map } })
+          ui.select(slot: '2', key: 'map_role', label: 'Left-click sets', value: editor.map_role,
+                    options: MAP_ROLES.map { |role, label| { value: role, label: label } },
+                    tooltip: "What a left-click on a room makes it. Clicking a room that already has it takes it off.\nA right-click clears every role a room has.",
+                    on: { change: editor.cb { |ev| editor.map_role = ev.payload[:value].to_s } })
+        end
+        ui.columns(key: 'map-tools', count: 6, weights: [1, 1, 1, 1, 1, 6], compact: true, row_align: :center, gap: 6) do
+          ui.button(slot: '0', key: 'zoom_out', label: '-', tooltip: 'Zoom out. Ctrl + mouse wheel over the map also zooms.',
                     on: { activate: editor.cb { editor.map_zoom(editor.map_scale / 1.25) } })
-          ui.button(slot: '2', key: 'zoom_in', label: '+', tooltip: 'Zoom in. Ctrl + mouse wheel over the map also zooms.',
+          ui.button(slot: '1', key: 'zoom_in', label: '+', tooltip: 'Zoom in. Ctrl + mouse wheel over the map also zooms.',
                     on: { activate: editor.cb { editor.map_zoom(editor.map_scale * 1.25) } })
+          ui.button(slot: '2', key: 'zoom_fit', label: 'Fit', tooltip: 'Fit the map to the window width.',
+                    on: { activate: editor.cb { editor.map_fit } })
           ui.button(slot: '3', key: 'zoom_100', label: '100%', tooltip: 'Show the map at its natural size.',
                     on: { activate: editor.cb { editor.map_zoom(1.0) } })
-          ui.checkbox(slot: '4', key: 'map_click_toggles', label: 'Click toggles room', checked: editor.map_click_toggles,
-                      tooltip: 'When on, clicking a room on the map ticks or unticks it in the Creatures tab room list.',
-                      on: { change: editor.cb { |ev| editor.map_click_toggles = ev.payload[:value] ? true : false } })
-          ui.checkbox(slot: '5', key: 'map_show_perimeter', label: 'Preview perimeter', checked: editor.map_show_perimeter,
-                      tooltip: "Show the rooms that \"Boundaries <- perimeter\" would set right now: the ring just outside the ticked rooms.\nPurple X. Changes as you tick and untick.",
-                      on: { change: editor.cb { |ev| editor.map_show_perimeter = ev.payload[:value] ? true : false; editor.refresh_map_tab } })
-          ui.checkbox(slot: '6', key: 'map_dark', label: 'Dark', checked: editor.map_dark,
-                      tooltip: "Use the dark map images from the maps-dark folder when they exist, as ;map does.\nStarts from ;map's own dark mode setting.",
+          ui.checkbox(slot: '4', key: 'map_dark', label: 'Dark', checked: editor.map_dark,
+                      tooltip: "Use the dark map images when they exist, as ;map does.\nStarts from ;map's own dark mode setting.",
                       on: { change: editor.cb { |ev| editor.map_dark = ev.payload[:value] ? true : false } })
+          ui.text(slot: '5', key: 'map-status', content: editor.map_status, emphasis: :subtle, wrap: true)
         end
-        ui.text(key: 'map-legend', emphasis: :subtle, wrap: true,
-                content: 'Green X ticked room   Grey X area room, not ticked   Red O start room   Blue O rally point   Orange box boundary   Purple X perimeter preview',
-                tooltip: 'Start room, rally points and boundaries come from the profile being edited, so this shows the fence as bigshot will see it.')
-        if editor.map_current
-          w, h = editor.map_size(editor.map_current)
-          ui.scroll(key: 'map-scroll', max_height: 560, fill: true) do
-            ui.composite(key: 'map-canvas', width: w, height: h, scale: editor.map_scale, layers: editor.map_layers,
-                         on: { region_activate: editor.cb { |ev| editor.map_region_clicked(ev.payload[:region]) },
+        sheet = editor.map_current
+        if sheet
+          w, h = editor.map_size(sheet)
+          focus = editor.map_focus || editor.role_ids('hunting_room_id').first
+          layers = editor.map_layers
+          scroll_to = layers.any? { |l| l[:kind] == 'region' && l[:key] == "room-#{focus}" } ? { scroll_to: "room-#{focus}" } : {}
+          # No scrollbars: drag the map to pan, as in ;map. Sized so the tab
+          # around it never needs a scrollbar either.
+          ui.scroll(key: 'map-scroll', fill: true, scrollbars: false) do
+            # A new key per sheet or Find, so the view jumps there once and then
+            # stays put while rooms are clicked.
+            ui.composite(key: "map-canvas-#{editor.map_rev}", width: w, height: h, scale: editor.map_scale, layers: layers,
+                         surface_events: true, **scroll_to, tooltip: MAP_LEGEND,
+                         on: { surface_activate: editor.cb { |ev| editor.map_clicked(ev.payload) },
                                zoom: editor.cb { |ev| editor.map_zoom(ev.payload[:direction].to_s == 'in' ? editor.map_scale * 1.15 : editor.map_scale / 1.15) } })
           end
-          ui.text(key: 'map-status', content: editor.map_status.to_s, emphasis: :subtle, wrap: true,
-                  tooltip: 'Which map is shown and how many of the rooms of interest are on it.')
         else
-          ui.text(key: 'map-empty', emphasis: :subtle,
-                  content: 'No map images for these rooms. Pick an area on the Creatures tab, or set rooms on the Hunting tab.')
+          ui.text(key: 'map-empty', emphasis: :subtle, content: 'No map images are installed.')
         end
         ui.text(key: 'map-action', content: editor.status_text(:map), tone: :caution) unless editor.status_text(:map).empty?
       end
     end
 
-    attr_accessor :map_current, :map_click_toggles, :map_show_perimeter, :map_dark
-    attr_reader :map_list, :map_counts, :map_scale, :map_status
+    attr_accessor :map_dark, :map_role, :find_text
+    attr_reader :map_scale, :map_rev, :map_focus
   end
 end
 
