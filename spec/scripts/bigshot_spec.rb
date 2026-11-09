@@ -1683,3 +1683,733 @@ RSpec.describe 'bigshot once/room command registry' do
     expect(bs.COMMANDS_REGISTRY.keys).to eq([123])
   end
 end
+
+# cast_signs walks the "signs" setting. Entries can carry extra spell options
+# after the number ("520 fire", "605 evoke"); those go out through cast_spell
+# as an incant. Group evokes need lore ranks, fall back to a plain cast when
+# solo, and spells with a group cooldown evoke while any member is ready
+# rather than while the spell is down on the caster.
+module BigshotCastSignsSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  CAST_SIGNS_SRC = extract(/^  def cast_signs\(single_cast = false\).*?^  end$/m, 'cast_signs')
+  CAST_SPELL_SRC = extract(/^  def cast_spell\(.*?^  end$/m, 'cast_spell')
+
+  # The real cast-proc text Lich runs for a spell, from effect-list.xml.
+  def self.cast_proc(num)
+    require 'rexml/document'
+    @effect_list ||= REXML::Document.new(File.read(find_lic_source('effect-list.xml', from: __dir__)))
+    REXML::XPath.first(@effect_list, "//spell[@number='#{num}']/cast-proc")&.text or
+      raise "no cast-proc for #{num} in effect-list.xml"
+  end
+
+  HINDRANCE = '[Spell Hindrance for Robe is 5% with current Lore ranks.]'
+
+  class Harness
+    module Char
+      class << self
+        attr_accessor :mana
+      end
+    end
+
+    module Stats
+      class << self
+        attr_accessor :prof, :level
+      end
+    end
+
+    module Skills
+      class << self
+        attr_accessor :slblessings, :elair
+      end
+    end
+
+    module UserVars
+      class << self
+        attr_accessor :element
+      end
+    end
+
+    # Bigshot's own follower tracker. Inside Bigshot a bare Group means this,
+    # not the game group, so the code under test must name
+    # Lich::Gemstone::Group; a bare Group.members raises here as it does live.
+    class Group; end
+
+    module Lich
+      module Gemstone
+        module Group
+          class << self
+            attr_accessor :members, :ready
+
+            # Names a group casting would reach now; defaults to every member.
+            def spell_cooldown_ready(spell)
+              (ready || {}).fetch(spell.num) { members }
+            end
+          end
+        end
+      end
+    end
+
+    module Effects
+      class Registry
+        attr_accessor :names
+
+        def active?(name)
+          (names || []).include?(name)
+        end
+      end
+
+      Cooldowns = Registry.new
+      Buffs = Registry.new
+    end
+
+    # Spell double: records each cast call and spends the mana, so the
+    # hindrance retry loop sees mana drop the way it does in game. With a
+    # cast_proc set, cast evals it the way Lich's Spell#cast does (target as
+    # a local, options never passed in) and records the commands it sends.
+    class Spell
+      class << self
+        def book
+          @book ||= {}
+        end
+
+        def [](num)
+          book[num.to_i] ||= new(num.to_i)
+        end
+      end
+
+      attr_accessor :num, :name, :known, :active, :mana_cost, :affordable, :group_cooldown, :last_cast, :results,
+                    :cast_proc
+      attr_reader :calls, :sent
+
+      def initialize(num)
+        @num = num
+        @name = "Spell #{num}"
+        @known = true
+        @active = false
+        @mana_cost = 5
+        @affordable = true
+        @last_cast = Time.at(0)
+        @calls = []
+        @sent = []
+        @results = []
+      end
+
+      def known? = known
+      def active? = active
+      def affordable? = affordable
+
+      def cast(*args)
+        return record(:cast, *args) unless cast_proc
+
+        target = args.first # rubocop:disable Lint/UselessAssignment -- read by the eval'd cast-proc
+        record(:cast_proc, *args)
+        eval(cast_proc) # mirrors Lich's Spell#cast
+      end
+
+      # Lich's force_incant is cast(nil, ...), so a cast-proc runs with no target
+      def force_incant(extra = nil)
+        return cast(nil) if cast_proc
+
+        record(:force_incant, extra)
+      end
+
+      private
+
+      def checkprep
+        'None'
+      end
+
+      def dothistimeout(cmd, *)
+        @sent << cmd
+        'A layer of raw elemental energy forms around you.'
+      end
+
+      def record(*call)
+        @calls << call
+        Char.mana -= mana_cost
+        results.shift || 'You gesture.'
+      end
+    end
+
+    attr_accessor :SIGNS, :bard_renewal_cost
+
+    def initialize(signs)
+      @SIGNS = signs
+      @DEBUG_COMMANDS = false
+      @CHECK_FAVOR = false
+      @USE_WRACKING = false
+      @bard_renewal_cost = 0
+    end
+
+    def debug_msg(*); end
+    def wrack; end
+
+    def dead?
+      false
+    end
+
+    def bard_renewal
+      @bard_renewal_cost
+    end
+
+    class_eval(CAST_SPELL_SRC)
+    class_eval(CAST_SIGNS_SRC)
+  end
+end
+
+RSpec.describe 'bigshot cast_signs' do
+  let(:h) { BigshotCastSignsSpec::Harness }
+
+  before do
+    h::Spell.book.clear
+    h::Char.mana = 100
+    h::Stats.prof = 'Cleric'
+    h::Skills.slblessings = 0
+    h::Skills.elair = 0
+    h::Lich::Gemstone::Group.members = []
+    h::Lich::Gemstone::Group.ready = nil
+    h::Effects::Cooldowns.names = []
+  end
+
+  def cast_signs(*signs, single_cast: false)
+    h.new(signs).cast_signs(single_cast)
+  end
+
+  def calls(num)
+    h::Spell[num].calls
+  end
+
+  def group!(*names)
+    h::Lich::Gemstone::Group.members = names
+  end
+
+  context 'with a plain spell number' do
+    it 'casts it with no arguments, as before' do
+      cast_signs('9903')
+      expect(calls(9903)).to eq([[:cast]])
+    end
+
+    it 'skips a spell that is already active' do
+      h::Spell[9903].active = true
+      cast_signs('9903')
+      expect(calls(9903)).to be_empty
+    end
+
+    it 'stops after the first cast with single_cast' do
+      cast_signs('9903', '9904', single_cast: true)
+      expect(calls(9903)).to eq([[:cast]])
+      expect(calls(9904)).to be_empty
+    end
+  end
+
+  context 'with extra spell options' do
+    it 'incants the spell with them' do
+      cast_signs('503 open')
+      expect(calls(503)).to eq([[:force_incant, 'open']])
+    end
+
+    it 'applies the 515 mana check to the parsed spell number' do
+      h::Spell[597].active = true
+      h::Spell[520].mana_cost = 10
+      h::Char.mana = 12
+      cast_signs('520 fire')
+      expect(calls(520)).to be_empty
+    end
+  end
+
+  # Spell#cast runs a cast-proc in place of its own incant, and the proc never
+  # sees the options, only the target. Mage Armor's proc reads the element
+  # from the target, falling back to UserVars.element.
+  describe 'Mage Armor (520), through its real cast-proc' do
+    before do
+      h::Spell[520].cast_proc = BigshotCastSignsSpec.cast_proc(520)
+      h::UserVars.element = 'water'
+    end
+
+    it 'sends the element from the entry, not UserVars.element' do
+      cast_signs('520 fire')
+      expect(h::Spell[520].sent).to eq(['incant 520 fire'])
+    end
+
+    it 'still uses UserVars.element for a plain 520' do
+      cast_signs('520')
+      expect(h::Spell[520].sent).to eq(['incant 520 water '])
+    end
+  end
+
+  describe 'Barkskin (605) evoke' do
+    before { h::Skills.slblessings = 50 }
+
+    it 'evokes for the group with 50 SL:Blessings ranks' do
+      group!('Grhim')
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:force_incant, 'evoke']])
+    end
+
+    it 'plain-casts when solo' do
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:cast]])
+    end
+
+    it 'plain-casts when short on ranks' do
+      group!('Grhim')
+      h::Skills.slblessings = 49
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:cast]])
+    end
+
+    it 'skips the evoke under 15 mana' do
+      group!('Grhim')
+      h::Char.mana = 14
+      cast_signs('605 evoke')
+      expect(calls(605)).to be_empty
+    end
+
+    it 'stops retrying a hindered evoke below 15 mana, not 5' do
+      group!('Grhim')
+      h::Char.mana = 20
+      h::Spell[605].results = [BigshotCastSignsSpec::HINDRANCE] * 5
+      cast_signs('605 evoke')
+      # 20 -> 15 (still covers 15), retry -> 10, short for an evoke: stop
+      expect(calls(605).size).to eq(2)
+    end
+
+    it 'prices the 515 cooldown penalty on the 15-mana evoke, not the 5-mana cast' do
+      group!('Grhim')
+      h::Spell[597].active = true
+      { 17 => 0, 19 => 0, 20 => 1 }.each do |mana, casts|
+        h::Spell[605].calls.clear
+        h::Char.mana = mana
+        cast_signs('605 evoke')
+        expect(calls(605).size).to eq(casts), "at #{mana} mana"
+      end
+    end
+
+    it 'skips while Barkskin is on cooldown' do
+      group!('Grhim')
+      h::Effects::Cooldowns.names = ['Barkskin']
+      cast_signs('605 evoke')
+      expect(calls(605)).to be_empty
+    end
+  end
+
+  describe 'group evokes with a group cooldown (211, 215, 219, 506)' do
+    {
+      211 => [:slblessings, 25],
+      215 => [:slblessings, 35],
+      219 => [:slblessings, 50],
+      506 => [:elair, 50]
+    }.each do |num, (lore, ranks)|
+      context "#{num} evoke" do
+        before do
+          h::Spell[num].group_cooldown = 180
+          h::Spell[num].active = true # our own long self-cast is up
+          h::Skills.public_send("#{lore}=", ranks)
+          group!('Grhim', 'Dicate')
+        end
+
+        it 'evokes while a member is off cooldown, even with our own self-cast up' do
+          h::Lich::Gemstone::Group.ready = { num => ['Dicate'] }
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to eq([[:force_incant, 'evoke']])
+        end
+
+        it 'waits while every member is on cooldown' do
+          h::Lich::Gemstone::Group.ready = { num => [] }
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to be_empty
+        end
+
+        it "plain-casts below #{ranks} ranks once our own cast is down" do
+          h::Skills.public_send("#{lore}=", ranks - 1)
+          h::Spell[num].active = false
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to eq([[:cast]])
+        end
+      end
+    end
+
+    it 'checks EL:Air, not SL:Blessings, for 506' do
+      h::Spell[506].group_cooldown = 240
+      h::Skills.slblessings = 100
+      group!('Grhim')
+      cast_signs('506 evoke')
+      expect(calls(506)).to eq([[:cast]])
+    end
+
+    it 'still skips 211 while we are on our own Bravery cooldown' do
+      h::Spell[211].group_cooldown = 180
+      h::Spell[211].name = 'Bravery'
+      h::Effects::Cooldowns.names = ['Bravery']
+      h::Skills.slblessings = 25
+      group!('Grhim')
+      cast_signs('211 evoke')
+      expect(calls(211)).to be_empty
+    end
+  end
+
+  describe 'hindrance retries' do
+    before { h::Spell[9903].results = [BigshotCastSignsSpec::HINDRANCE] * 5 }
+
+    it 'retries up to 3 times' do
+      cast_signs('9903')
+      expect(calls(9903).size).to eq(3)
+    end
+
+    it 'stops once mana would dip into the Bard song renewal reserve' do
+      h::Stats.prof = 'Bard'
+      h::Char.mana = 30
+      bs = h.new(['9903'])
+      bs.bard_renewal_cost = 20
+      bs.cast_signs
+      # 30 -> 25 (still covers 20 + 5), retry -> 20, below the reserve: stop
+      expect(calls(9903).size).to eq(2)
+    end
+  end
+end
+
+# cmd_wand waves from your hands unless the command says "reserve", which
+# moves the wand into the RESERVE slot first (the reverse of cmd_wandolier,
+# which uses RESERVE unless told "noreserve"). It also takes a stance word.
+module BigshotWandSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  CMD_WAND_SRC = extract(/^  def cmd_wand\(target, args = nil\).*?^  end$/m, 'cmd_wand')
+  WAND_NAME_PATTERN_SRC = extract(/^  def wand_name_pattern\(name\).*?^  end$/m, 'wand_name_pattern')
+  # cmd_wandolier must share the escaped matcher rather than build its own.
+  extract(/^  def cmd_wandolier\(target, args\)(?:(?!^  end$).)*wand_name_pattern\(@WAND\[\$bigshot_wand\]\)/m,
+          'cmd_wandolier uses wand_name_pattern')
+  DISPATCH_SRC = extract(/^    elsif \(command =~ (\/\^wand\\b.*?\/i)\)\n      cmd_wand\(npc, \$1\)$/, 'cmd wand dispatch')
+  DISPATCH_RE = Regexp.new(DISPATCH_SRC[/\/(\^wand.*?)\/i/, 1], Regexp::IGNORECASE)
+  # Fails loudly if the out-of-mana fallback stops calling cmd_wand with no args.
+  extract(/^      if \(@WAND_IF_OOM\)\n        cmd_wand\(target\); return;$/, 'wand_if_oom fallback')
+  # Fails loudly if rest stops starting the next hunt back on the first wand type.
+  extract(/^  def rest\(\)(?:(?!^  end$).)*^    \$bigshot_wand = 0$/m, 'rest resets wand index')
+
+  Item = Struct.new(:id, :name)
+  Target = Struct.new(:id)
+
+  class Harness
+    class GameObj
+      class << self
+        attr_accessor :right_hand, :left_hand, :reserve
+      end
+    end
+
+    attr_accessor :FRESH_WAND_CONTAINER, :DEAD_WAND_CONTAINER, :WAND, :wave_result
+    attr_reader :sent, :stances, :messages
+
+    def initialize(wands_in_container: [Item.new('100', 'oaken wand')])
+      @FRESH_WAND_CONTAINER = 'cloak'
+      @DEAD_WAND_CONTAINER = nil
+      @WAND = ['oaken wand']
+      @HUNTING_STANCE = 'defensive'
+      @container = wands_in_container.dup
+      @sent = []
+      @stances = []
+      @messages = []
+      @wave_result = 'd100 roll'
+      GameObj.right_hand = Item.new(nil, 'Empty')
+      GameObj.left_hand = Item.new(nil, 'Empty')
+      GameObj.reserve = []
+      $bigshot_wand = 0
+    end
+
+    def debug_msg(*); end
+    def message(_color, text) = @messages << text
+    def change_stance(stance) = @stances << stance
+    def bs_put(cmd) = @sent << cmd
+
+    def fput(cmd)
+      @sent << cmd
+      GameObj.reserve ||= [] if cmd == 'reserve list'
+      return unless cmd =~ /^reserve #(\d+)$/
+
+      held = GameObj.right_hand
+      return unless held.id == Regexp.last_match(1)
+
+      @reserved = held
+      GameObj.reserve << held unless reserve_list_stale
+      GameObj.right_hand = Item.new(nil, 'Empty')
+    end
+
+    def dothistimeout(cmd, _timeout, _pattern)
+      @sent << cmd
+      return clear_reserve(Regexp.last_match(1)) if cmd =~ /^reserve clear #(\d+)$/
+
+      wand = @container.find { |w| cmd.include?(w.name) }
+      return 'Get what?' unless wand
+
+      @container.delete(wand)
+      GameObj.right_hand = wand
+      get_reply || "You remove #{wand.name}."
+    end
+
+    attr_accessor :hands_full, :reserve_list_stale
+
+    # RESERVE CLEAR moves the item back into a hand, if one is free
+    def clear_reserve(id)
+      item = GameObj.reserve.find { |o| o.id == id } || (@reserved if @reserved&.id == id)
+      return nil if item.nil? || hands_full
+
+      GameObj.reserve.delete(item)
+      GameObj.right_hand = item
+      "You remove #{item.name} from your reserves and hold it in your hand."
+    end
+
+    def get_res(cmd, _pattern)
+      @sent << cmd
+      @wave_result
+    end
+
+    attr_accessor :get_reply
+
+    class_eval(WAND_NAME_PATTERN_SRC)
+    class_eval(CMD_WAND_SRC)
+  end
+end
+
+RSpec.describe 'bigshot cmd_wand' do
+  let(:bs) { BigshotWandSpec::Harness.new }
+  let(:target) { BigshotWandSpec::Target.new('555') }
+
+  after do
+    $bigshot_wand = 0
+    $bigshot_should_rest = nil
+    $rest_reason = nil
+  end
+
+  describe 'command parsing' do
+    it 'passes stance and reserve tokens through to cmd_wand' do
+      expect('wand guarded reserve'[BigshotWandSpec::DISPATCH_RE, 1].split).to eq(%w[guarded reserve])
+    end
+
+    it 'still matches a bare "wand"' do
+      expect('wand'[BigshotWandSpec::DISPATCH_RE, 1]).to eq('')
+    end
+
+    it 'does not swallow "wandolier"' do
+      expect('wandolier guarded').not_to match(BigshotWandSpec::DISPATCH_RE)
+    end
+  end
+
+  describe 'plain "wand" (the default)' do
+    it 'gets the wand, waves it from your hand at the target and never touches RESERVE' do
+      bs.cmd_wand(target)
+
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'wave #100 at #555'])
+      expect(bs.class::GameObj.right_hand.id).to eq('100')
+      expect(bs.class::GameObj.reserve).to be_empty
+    end
+
+    it 'waves in offensive stance, then returns to the hunting stance' do
+      bs.cmd_wand(target, '')
+      expect(bs.stances).to eq(%w[offensive defensive])
+    end
+
+    it 'ignores a wand already sitting in RESERVE and gets one for your hand' do
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'wave #100 at #555'])
+    end
+
+    it 'drops a dead wand by id' do
+      bs.wave_result = nil
+      bs.cmd_wand(target)
+      expect(bs.sent.last).to eq('drop #100')
+    end
+
+    it 'puts a dead wand in the dead wand container by id' do
+      bs.wave_result = nil
+      bs.DEAD_WAND_CONTAINER = 'sack'
+      bs.cmd_wand(target)
+      expect(bs.sent.last).to eq('put #100 in my sack')
+    end
+  end
+
+  describe '"wand reserve"' do
+    it 'moves the wand into RESERVE and waves it from there' do
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'reserve #100', 'wave #100 at #555'])
+      expect(bs.class::GameObj.right_hand.name).to eq('Empty')
+      expect(bs.class::GameObj.reserve.map(&:id)).to eq(['100'])
+    end
+
+    it 'waves a wand already in RESERVE without getting another' do
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent).to eq(['wave #200 at #555'])
+    end
+
+    it 'asks for the reserve list when RESERVE has not been seen yet' do
+      bs.class::GameObj.reserve = nil
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.first).to eq('reserve list')
+    end
+
+    it 'takes a dead wand out of RESERVE before dropping it' do
+      bs.wave_result = nil
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last(3)).to eq(['wave #100 at #555', 'reserve clear #100', 'drop #100'])
+      expect(bs.class::GameObj.reserve).to be_empty
+    end
+
+    it 'takes a dead wand out of RESERVE before putting it in the dead wand container' do
+      bs.wave_result = nil
+      bs.DEAD_WAND_CONTAINER = 'sack'
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.last(2)).to eq(['reserve clear #100', 'put #100 in my sack'])
+    end
+
+    it 'takes a dead wand out of RESERVE even if the reserve list has not refreshed yet' do
+      bs.wave_result = nil
+      bs.reserve_list_stale = true
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last(3)).to eq(['wave #100 at #555', 'reserve clear #100', 'drop #100'])
+    end
+
+    it 'warns and keeps hunting when a dead wand cannot come out of RESERVE' do
+      bs.wave_result = nil
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.hands_full = true
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last).to eq('reserve clear #200')
+      expect(bs.messages.last).to match(/Couldn't take the dead wand out of RESERVE/)
+      expect($bigshot_should_rest).to be_falsey
+    end
+
+    it 'refreshes the reserve list when the reserved wand is gone' do
+      bs.wave_result = 'What were you referring to?'
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.last).to eq('reserve list')
+    end
+  end
+
+  it 'uses the given stance' do
+    bs.cmd_wand(target, ' guarded reserve')
+    expect(bs.stances).to eq(%w[guarded defensive])
+  end
+
+  it 'moves on to the next wand type when the container has none of the first' do
+    bs = BigshotWandSpec::Harness.new(wands_in_container: [BigshotWandSpec::Item.new('300', 'iron wand')])
+    bs.WAND = ['oaken wand', 'iron wand']
+    bs.cmd_wand(target)
+    expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'wave #300 at #555'])
+  end
+
+  describe 'with blank entries in the wand setting' do
+    let(:sword) { BigshotWandSpec::Item.new('900', 'broadsword') }
+    let(:iron) { BigshotWandSpec::Item.new('300', 'iron wand') }
+    let(:bs) { BigshotWandSpec::Harness.new(wands_in_container: [iron]) }
+
+    before { bs.class::GameObj.right_hand = sword }
+
+    [['oaken wand', '', 'iron wand'], ['oaken wand', ' ', 'iron wand']].each do |setting|
+      it "skips the blank entry in #{setting.inspect} and leaves the held weapon alone" do
+        bs.WAND = setting
+        bs.cmd_wand(target)
+        expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'wave #300 at #555'])
+      end
+    end
+
+    it 'skips a blank entry in reserve mode too' do
+      bs.WAND = ['oaken wand', '', 'iron wand']
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'reserve #300', 'wave #300 at #555'])
+    end
+
+    it 'skips a leading blank entry' do
+      bs.WAND = ['', 'iron wand']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get iron wand from my cloak', 'wave #300 at #555'])
+    end
+
+    it 'rests when only a blank entry is left after the last wand type' do
+      bs.WAND = ['oaken wand', '']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get oaken wand from my cloak'])
+      expect($rest_reason).to eq('No fresh wands!')
+    end
+  end
+
+  it 'rests when no wand type is left' do
+    bs = BigshotWandSpec::Harness.new(wands_in_container: [])
+    bs.cmd_wand(target)
+    expect($bigshot_should_rest).to be true
+    expect($rest_reason).to eq('No fresh wands!')
+  end
+
+  it 'accepts a wand that slides out of its container' do
+    bs.get_reply = 'You slide an oaken wand out of your cloak.'
+    bs.cmd_wand(target)
+    expect(bs.sent.last).to eq('wave #100 at #555')
+    expect(bs.messages).to be_empty
+  end
+
+  describe 'wand name matching' do
+    it 'matches the setting words in order' do
+      expect('polished oaken wand').to match(bs.wand_name_pattern('oaken wand'))
+      expect('oaken polished wand').to match(bs.wand_name_pattern('polished wand'))
+      expect('wand of oak').not_to match(bs.wand_name_pattern('oak wand'))
+    end
+
+    it 'treats regex characters in the name literally' do
+      expect('wand (glowing)').to match(bs.wand_name_pattern('wand (glowing)'))
+      expect('c++ wand').to match(bs.wand_name_pattern('c++ wand'))
+      expect('cccc wand').not_to match(bs.wand_name_pattern('c++ wand'))
+    end
+
+    it 'waves a wand whose name has regex characters' do
+      bs = BigshotWandSpec::Harness.new(wands_in_container: [BigshotWandSpec::Item.new('400', 'wand (glowing)')])
+      bs.WAND = ['wand (glowing)']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get wand (glowing) from my cloak', 'wave #400 at #555'])
+    end
+  end
+
+  describe 'with no wand name to use' do
+    let(:sword) { BigshotWandSpec::Item.new('900', 'broadsword') }
+
+    before { bs.class::GameObj.right_hand = sword }
+
+    [nil, ' reserve'].each do |args|
+      it "leaves the held weapon alone when every wand type is used up (args: #{args.inspect})" do
+        $bigshot_wand = 1
+        bs.cmd_wand(target, args)
+        expect(bs.sent).to be_empty
+        expect(bs.messages.last).to match(/no wand type left/)
+      end
+    end
+
+    [nil, [], ['']].each do |setting|
+      it "leaves the held weapon alone when the wand setting is #{setting.inspect}" do
+        bs.WAND = setting
+        bs.cmd_wand(target)
+        expect(bs.sent).to be_empty
+        expect(bs.messages.last).to match(/no wand type left/)
+      end
+    end
+  end
+
+  it 'reports a missing fresh wand container' do
+    bs.FRESH_WAND_CONTAINER = nil
+    bs.cmd_wand(target)
+    expect(bs.messages.last).to match(/fresh wand container not defined/)
+    expect(bs.sent).to be_empty
+  end
+end
