@@ -1007,7 +1007,7 @@ when 'notes'
   A::SilverManager.stop
 
 when 'other_towns'
-  # Wording from other towns (Cold River, Mist Harbor), each line ending in
+  # Wording from other towns (Cold River, Mist Harbor, Kraken's Fall, Icemule), each line ending in
   # "\r\n" as the game sends it
   A::Database.connect!
   A::Settings.load(WHO)
@@ -1041,10 +1041,54 @@ when 'other_towns'
     '168,005 silvers, bringing your account balance up to 1,173,005."'
   )
   settle.call
+  feed.call(
+    # Kraken's Fall pays in kraken chits: a pouch, a single gem, and the pawnshop
+    'The jeweler Krosane takes the canvas sack, inspects the contents carefully, and removes the gems he is interested in.  He hands it ' \
+    'back to you and says, "I don\'t have that much spare silver, so I will have to give you a salt-stained kraken chit for it."',
+    'The jeweler Krosane removes the gems and hands you a salt-stained kraken chit for 41,220 silvers.',
+    'The jeweler Krosane takes the diamond earrings, gives it a careful examination and and says, "I don\'t have that much spare ' \
+    'silver, so I will have to give you a bank note for it."  He then hands you a salt-stained kraken chit for 20,910 silvers.',
+    'You offer to sell your faewood runestaff to Bushybrow.',
+    'Bushybrow says, "I\'m afraid I don\'t have that much silver on hand, Splinter, so I\'ll have to give you a salt-stained kraken chit for it."',
+    'He scribbles out a salt-stained kraken chit for 25,000 silvers and hands it to you.',
+    # Icemule's locksmith is "The merchant", and the locksmith pools' workers
+    'You ring the bell, and ask Blackfinger if he can open your mithril chest.',
+    'He looks over the mithril chest, frowns, and tells you, "Havin\' some trouble, eh?  Of course I could open this, but it\'ll cost ya.  ' \
+    'Gimme 5,896 silvers, and I\'ll have it open before you know it."',
+    'The merchant Blackfinger accepts your silvers.',
+    'The worker takes your trunk and says, "Your tip of 750 silvers has been recorded, and the 1,902 silver fee has been collected.  ' \
+    'We\'ll get someone on that right away."',
+    'Starling Swiftwhistle takes your coffer and says, "Your tip of 750 silvers has been recorded, and the 2,302 silver fee has been ' \
+    'collected.  We\'ll get someone on that right away."',
+    # A debt paid off at the town clerk
+    'The town clerk accepts your silvers.',
+    'The town clerk says, "Looks like 265 silvers clears up all your debts in Solhaven.  Good luck keeping it that way."',
+    # A fossil charm: a box's coins are box silver. Coins on the ground are a
+    # crumbled corpse's, already counted with its kill (this one or an earlier
+    # one), or else floor silver. Another character's charm isn't ours.
+    'You search the infernal death knight.', 'She had 322 silvers on her.', '<prompt time="1793074672">&gt;</prompt>',
+    'You search the tatterdemalion ghast.', 'He had 513 silvers on him.', '<prompt time="1793074672">&gt;</prompt>',
+    'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers.  They locate a ' \
+    'stack of 322 coins on the ground, reclaiming them and returning to you.  The winged armored bugs retreat back inside the charm.',
+    'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers.  They locate some ' \
+    'loose 513 coins on the floor, reclaiming them and returning to you.  The winged armored bugs retreat back inside the charm.',
+    'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers.  They locate a ' \
+    'stack of 322 coins on the ground, reclaiming them and returning to you.  The winged armored bugs retreat back inside the charm.',
+    'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers.  They locate a ' \
+    'pile of 111 coins on the floor, reclaiming them and returning to you.  The winged armored bugs retreat back inside the charm.',
+    'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers inside a badly ' \
+    'damaged silver box.  They locate a heap of 1,307 coins, reclaiming them and returning to you.  The winged armored bugs retreat.',
+    'Raphael summons a swarm of winged armored bugs from his shell fossil charm, which takes off in search of silvers.  They locate ' \
+    'a stack of 640 coins on the floor, reclaiming them and returning to him.'
+  )
+  settle.call
   result = {
     'sales' => A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY rowid").map(&:values),
     'spent' => A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'expense' ORDER BY rowid").map(&:values),
-    'bank'  => A::Database.all("SELECT snapshot_type, delta_silver, balance FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid").map(&:values)
+    'bank'  => A::Database.all("SELECT snapshot_type, delta_silver, balance FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid").map(&:values),
+    'coins' => A::Database.all("SELECT source_category, vendor_name, amount FROM silver_events WHERE source_category IN ('box', 'floor') " \
+                               'ORDER BY rowid').map(&:values),
+    'kills' => A::Database.all('SELECT creature, total_silver FROM kill_stats ORDER BY creature').map(&:values)
   }
   A::SilverManager.stop
 
@@ -1395,12 +1439,13 @@ when 'bounty_progress'
              A::Database.one("SELECT bounty_type FROM silver_events WHERE source_category = 'bounty' ORDER BY rowid DESC LIMIT 1")['bounty_type']]
   spawned_offer = A::Database.one('SELECT bounty_type FROM bounty_offers WHERE offer_id = ?', offer_id)['bounty_type']
 
-  # An escort's destination, read from the taskmaster's words, survives a poll that names none
+  # An escort's destination, read from the taskmaster's words, survives a poll
+  # that names none: the live poll gives blanks, not nils
   escort_id = A::Database.new_id
   A::Database.record_offer(WHO, nil, { assignment: 'escort', bounty_type: 'escort', area: 'Zul Logoth', description: 'an escort' },
                            id: escort_id, at: NOW)
-  A::Database.refine_offer(escort_id, 'escort', '', nil, nil)
-  escort = A::Database.one('SELECT bounty_type, area FROM bounty_offers WHERE offer_id = ?', escort_id).values
+  A::Database.refine_offer(escort_id, 'escort', '', '', nil)
+  escort = A::Database.one('SELECT bounty_type, area, creature FROM bounty_offers WHERE offer_id = ?', escort_id).values
   result = { 'cull' => steps, 'before_hunt' => before_hunt, 'town_gem' => town_gem, 'spawned' => spawned,
              'spawned_offer' => spawned_offer, 'escort' => escort }
 

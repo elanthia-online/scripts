@@ -350,19 +350,27 @@ RSpec.describe 'analytics.lic' do
     end
 
     it "keeps an escort offer's destination when the task poll names none" do
-      expect(progress['escort']).to eq(['escort', 'Zul Logoth'])
+      expect(progress['escort']).to eq(['escort', 'Zul Logoth', nil])
     end
   end
 
   describe 'wording from other towns, with the line endings the game sends' do
     subject(:towns) { result('other_towns') }
 
-    it 'records pouches paid with a bond note or a plain note, and not another player\'s' do
-      expect(towns['sales']).to eq([['vendor', 'Bramblefist', 122_375], ['gemcutter', nil, 45_630]])
+    it 'records pouches paid with a bond note, a plain note or a kraken chit, and not another player\'s' do
+      expect(towns['sales']).to eq([['vendor', 'Bramblefist', 122_375], ['gemcutter', nil, 45_630], ['jeweler', 'Krosane', 41_220],
+                                    ['jeweler', 'Krosane', 20_910], ['vendor', 'Bushybrow', 25_000]])
     end
 
-    it 'records a locksmith paid by name, and a purchase' do
-      expect(towns['spent']).to eq([['locksmith', 'Tisanoff', 5809], ['purchase', 'Kelph', 450]])
+    it 'records a locksmith paid by name or as the merchant, a purchase, the locksmith pools and a debt' do
+      expect(towns['spent']).to eq([['locksmith', 'Tisanoff', 5809], ['purchase', 'Kelph', 450], ['locksmith', 'Blackfinger', 5896],
+                                    ['locksmith pool', 'worker', 2652], ['locksmith pool', 'Starling Swiftwhistle', 3052],
+                                    ['debts', nil, 265]])
+    end
+
+    it "counts a fossil charm's box coins as box silver, and coins on the ground only when no corpse just had them" do
+      expect(towns['kills']).to eq([['infernal death knight', 322], ['tatterdemalion ghast', 513]])
+      expect(towns['coins']).to eq([['floor', nil, 322], ['floor', nil, 111], ['box', 'charm', 1307]])
     end
 
     it 'moves the total for a teller that states no balance, and by the notes line that does' do
