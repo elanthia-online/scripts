@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.17.2
+       version: 5.17.4
       required: Lich >= 5.22.0
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,6 +17,14 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
+  v5.17.4  (2026-11-06)
+    - fix: wand now takes a stance and "reserve", e.g. "wand guarded reserve"; plain "wand" still uses your hands
+    - fix: wand could wrongly report a timeout when getting a fresh wand
+    - fix: wand and wandolier could miss wands with symbols in their name
+  v5.17.3  (2026-10-24)
+    - signs can now take extra spell options, e.g. "520 fire", "620 cold" or "605 evoke" (Barkskin evoke only when grouped, otherwise a normal cast)
+    - "211 evoke", "215 evoke" and "219 evoke" in signs now evoke Bravery/Heroism/Spell Shield for your group whenever a member is ready for it again
+    - "506 evoke" in signs evokes Celerity for your group (needs 50 ranks of Elemental Lore, Air) whenever a member is ready for it again
   v5.17.2  (2026-10-20)
     - fix: followers now reuse "once" and "room" commands in each new room, like the leader, instead of never again after the first use
   v5.17.1  (2026-10-18)
@@ -1712,6 +1720,7 @@ class Bigshot
       signs_tooltip += "Sign of Warding - 9903\nSign of Striking - 9904\nSign of Thought - 9906\nSign of Defending - 9907\nSign of Smiting - 9908\nSign of Staunching - 9909\nSign of Deflection - 9910\n"
       signs_tooltip += "Sign of Swords - 9912\nSign of Shields - 9913\nSign of Dissipation - 9914\nSign of Madness - 9916\n\n"
       signs_tooltip += "Symbol of Courage - 9805\nSymbol of Protection - 9806\nSymbol of Supremacy - 9816\n\nBarkskin - 605\nFasthr's Reward - 115\n\nSeanette's Shout - 122420\n\n"
+      signs_tooltip += "Extra spell options can follow the number, e.g. 520 fire, 620 cold, 605 evoke, 211 evoke, 215 evoke, 219 evoke, 506 evoke\n"
       self['signs'].tooltip_text = signs_tooltip
       # Loot Script
       self['loot_script'].tooltip_text = ''
@@ -3749,8 +3758,8 @@ class Bigshot
       cmd_throw(npc)
     elsif (command =~ /^k?weed/i)
       cmd_weed(command, npc)
-    elsif (command =~ /^wand\b/i)
-      cmd_wand(npc)
+    elsif (command =~ /^wand\b((?:\s+\w+){0,2})/i)
+      cmd_wand(npc, $1)
     elsif (command =~ /^wandolier((?:\s+\w+){0,2})/i)
       cmd_wandolier(npc, $1)
     elsif (command =~ /^hide\s?(\d+)?/i)
@@ -5469,8 +5478,10 @@ class Bigshot
   # @param extra [String, nil] extra cast arguments
   # @param force [Boolean] cast even when the usual guards would skip it
   # @param max_attempts [Integer] retry ceiling
+  # @param reserve [Integer] mana to keep in hand; stop retrying below it (e.g. bard song renewal)
+  # @param cost [Integer, nil] mana this cast really takes, when it differs from the spell's (e.g. Barkskin evoke)
   # @return [void]
-  def cast_spell(spell_id: nil, target: nil, extra: nil, force: false, max_attempts: 3)
+  def cast_spell(spell_id: nil, target: nil, extra: nil, force: false, max_attempts: 3, reserve: 0, cost: nil)
     attempts = 0
 
     loop do
@@ -5499,7 +5510,7 @@ class Bigshot
         return :blocked
       when /^\[Spell Hindrance for/
         attempts += 1
-        return :hindrance if attempts >= max_attempts
+        return :hindrance if attempts >= max_attempts || Char.mana < reserve + (cost || Spell[spell_id].mana_cost)
         # otherwise loop again
       else
         return :success
@@ -5606,47 +5617,97 @@ class Bigshot
     @last = selected_spell
   end
 
+  # Builds a case-insensitive pattern that matches a wand setting's words in
+  # order, e.g. "oaken wand" matches "polished oaken wand". Each word is
+  # escaped so names with regex characters still match literally.
+  #
+  # @param name [String] wand name from the wand setting
+  # @return [Regexp]
+  def wand_name_pattern(name)
+    /#{name.to_s.split(' ').map { |word| Regexp.escape(word) }.join('.*?')}/i
+  end
+
   # Attacks with a wand from the configured container.
   #
+  # Waves from your hands by default. "reserve" moves the wand into the
+  # RESERVE slot first and waves it from there; a stance word (e.g.
+  # "wand guarded reserve") picks the stance to wave in, default offensive.
+  #
   # @param target [BigshotCreature, Lich::Common::GameObj] the target creature
+  # @param args [String, nil] optional stance and "reserve" tokens
   # @return [void]
-  def cmd_wand(target)
-    debug_msg(@DEBUG_COMMANDS, "cmd_wand | target: #{target}")
+  def cmd_wand(target, args = nil)
+    debug_msg(@DEBUG_COMMANDS, "cmd_wand | target: #{target} | args: #{args}")
 
-    if (@FRESH_WAND_CONTAINER)
-      until ((GameObj.right_hand.name.to_s + GameObj.left_hand.name.to_s) =~ /#{@WAND[$bigshot_wand].split(' ').join('.*?')}/i)
-        result = dothistimeout("get #{@WAND[$bigshot_wand]} from my #{@FRESH_WAND_CONTAINER}", 3, /You remove|You slip|Get what/)
-        if (result =~ /Get what/)
-          $bigshot_wand += 1
-          if @WAND[$bigshot_wand].nil?
-            message("yellow", "ERROR: Couldn't find fresh wand. Gonna rest.")
-            $bigshot_should_rest = true
-            $rest_reason = "No fresh wands!"
-            return
-          end
-        elsif (result.nil?)
-          message("yellow", "ERROR: Timed out looking for wand."); return;
-        end
-      end
+    # A blank name matches anything, so the held weapon would be waved and dropped
+    $bigshot_wand += 1 while @WAND.to_a[$bigshot_wand]&.strip&.empty?
+    if @WAND.to_a[$bigshot_wand].to_s.strip.empty?
+      message("yellow", "ERROR: Wand command called but no wand type left to use. Check your wand setting.")
+      return
+    end
 
-      change_stance('offensive')
-      result = get_res("wave my #{@WAND[$bigshot_wand]} at ##{target.id}", /d100|You hurl|is already dead|You do not see that here|You are in no condition|I could not find/)
-      change_stance(@HUNTING_STANCE)
+    tokens  = args.to_s.downcase.split(/\s+/).reject(&:empty?)
+    reserve = tokens.include?('reserve')
+    stance  = (tokens & %w[offensive advance forward neutral guarded defensive]).first || 'offensive'
 
-      if (result =~ /You are in no condition/)
-        message("yellow", "ERROR: Wounded. Gonna rest.")
-        $bigshot_should_rest = true
-        $rest_reason = "Too injured to wave wands!"
-        return
-      elsif (result.nil?)
-        if (@DEAD_WAND_CONTAINER)
-          bs_put "put my #{@WAND[$bigshot_wand]} in my #{@DEAD_WAND_CONTAINER}"
-        else
-          bs_put "drop my #{@WAND[$bigshot_wand]}"
-        end
-      end
-    else
+    unless @FRESH_WAND_CONTAINER
       message("yellow", "ERROR: Wand command called but fresh wand container not defined.")
+      return
+    end
+
+    fput("reserve list") if reserve && GameObj.reserve.nil?
+    wand_obj = nil
+
+    loop do
+      wand_pattern = wand_name_pattern(@WAND[$bigshot_wand])
+      places = [GameObj.right_hand, GameObj.left_hand]
+      places.concat(GameObj.reserve.to_a) if reserve
+      wand_obj = places.compact.find { |o| o.name.to_s =~ wand_pattern }
+      break if wand_obj
+
+      result = dothistimeout("get #{@WAND[$bigshot_wand]} from my #{@FRESH_WAND_CONTAINER}", 3, /You (?:remove|slip|slide)|Get what/)
+      if (result =~ /Get what/)
+        $bigshot_wand += 1
+        $bigshot_wand += 1 while @WAND.to_a[$bigshot_wand]&.strip&.empty?
+        if @WAND[$bigshot_wand].nil?
+          message("yellow", "ERROR: Couldn't find fresh wand. Gonna rest.")
+          $bigshot_should_rest = true
+          $rest_reason = "No fresh wands!"
+          return
+        end
+      elsif (result.nil?)
+        message("yellow", "ERROR: Timed out looking for wand."); return;
+      end
+    end
+
+    if reserve && [GameObj.right_hand, GameObj.left_hand].compact.any? { |o| o.id == wand_obj.id }
+      fput("reserve ##{wand_obj.id}")
+    end
+
+    change_stance(stance)
+    result = get_res("wave ##{wand_obj.id} at ##{target.id}", /d100|You hurl|is already dead|You do not see that here|You are in no condition|I could not find|What were you referring to/)
+    change_stance(@HUNTING_STANCE)
+
+    if (result =~ /You are in no condition/)
+      message("yellow", "ERROR: Wounded. Gonna rest.")
+      $bigshot_should_rest = true
+      $rest_reason = "Too injured to wave wands!"
+      return
+    elsif result =~ /What were you referring to/
+      fput('reserve list') if reserve
+    elsif (result.nil?)
+      # PUT and DROP only work on held items; RESERVE CLEAR moves it to a hand
+      if reserve && [GameObj.right_hand, GameObj.left_hand].compact.none? { |o| o.id == wand_obj.id }
+        unless dothistimeout("reserve clear ##{wand_obj.id}", 3, /from your reserves/)
+          message("yellow", "ERROR: Couldn't take the dead wand out of RESERVE. Free a hand and RESERVE CLEAR it.")
+          return
+        end
+      end
+      if (@DEAD_WAND_CONTAINER)
+        bs_put "put ##{wand_obj.id} in my #{@DEAD_WAND_CONTAINER}"
+      else
+        bs_put "drop ##{wand_obj.id}"
+      end
     end
   end
 
@@ -5666,7 +5727,7 @@ class Bigshot
       wand_obj = nil
 
       loop do
-        wand_obj = [GameObj.right_hand, GameObj.left_hand, *GameObj.reserve.to_a].compact.find { |o| o.name.to_s =~ /#{@WAND[$bigshot_wand].split(' ').join('.*?')}/i }
+        wand_obj = [GameObj.right_hand, GameObj.left_hand, *GameObj.reserve.to_a].compact.find { |o| o.name.to_s =~ wand_name_pattern(@WAND[$bigshot_wand]) }
         break if wand_obj
 
         result = dothistimeout("get #{@WAND[$bigshot_wand]} from my #{@FRESH_WAND_CONTAINER}", 3, /You (?:remove|slip|slide)|Get what/)
@@ -7148,6 +7209,7 @@ class Bigshot
 
     # reset hunting globals
     $bigshot_should_rest = false
+    $bigshot_wand = 0
     $bigshot_overkill_counter = 0
     $bigshot_lte_boost_counter = 0
     @BOON_CACHE = {}
@@ -8922,12 +8984,27 @@ class Bigshot
         next
       end
 
+      # "520 fire", "605 evoke": number plus optional incant args
+      extra = i[/^\s*\d+\s+(.+)$/, 1]&.strip
+      i = i.to_i
+
+      # Group evokes need lore ranks (SL:Blessings for 211/215/219/605, EL:Air for 506);
+      # solo or short on ranks, plain-cast instead.
+      lore, ranks = { 211 => [:slblessings, 25], 215 => [:slblessings, 35], 219 => [:slblessings, 50],
+                      506 => [:elair, 50], 605 => [:slblessings, 50] }[i]
+      if lore && extra =~ /evoke/i
+        extra = nil if Lich::Gemstone::Group.members.empty? || Skills.public_send(lore) < ranks
+      end
+
+      # Barkskin evoke costs 15, not the cast's 5; short on mana, the game takes nerve wounds
+      cost = 15 if i == 605 && extra =~ /evoke/i
+      next if cost && Char.mana < cost
+
       # There is a 5 mana penality if you ignore the 515 cooldown
-      if Spell[597].active? && Spell[i].mana_cost.positive? && Spell[i].mana_cost + 5 > Char.mana
+      if Spell[597].active? && Spell[i].mana_cost.positive? && (cost || Spell[i].mana_cost) + 5 > Char.mana
         next
       end
 
-      i = i.to_i
       next if [9903, 9904, 9905, 9906, 9907, 9908, 9909, 9910, 9912, 9913, 9914, 9918].include?(i) and Spell[9012].active?
       next if i == 9918
       next if (i == 9605 && Effects::Cooldowns.active?("Surge of Strength"))
@@ -9032,12 +9109,22 @@ class Bigshot
       mana_cost = sign.mana_cost > 1 ? sign.mana_cost : 0 # Many erroneously return 1
       wrack() if !sign.affordable? and mana_cost > Char.mana and @USE_WRACKING
 
-      if (!sign.active? && sign.affordable?)
+      # A group evoke with a group cooldown (211, 215, 219, 506) is wanted while any member is off
+      # cooldown, even with our own long self-cast up; everything else, while not active
+      wanted = if extra =~ /evoke/i && sign.group_cooldown
+                 Lich::Gemstone::Group.spell_cooldown_ready(sign).any?
+               else
+                 !sign.active?
+               end
+
+      if (wanted && sign.affordable?)
         next if (Stats.prof == "Bard" && !(Char.mana >= (bard_renewal + sign.mana_cost)))
         next unless Time.now > sign.last_cast + 1.5
-        loop do
-          result = sign.cast
-          break if (result.to_s !~ /Spell Hindrance/ || !sign.affordable? || !(Char.mana >= (bard_renewal + sign.mana_cost)) || dead?)
+        if extra && sign.cast_proc
+          # A cast-proc (e.g. Mage Armor's) ignores incant options and reads only the target
+          cast_spell(spell_id: i, target: extra, reserve: bard_renewal, cost: cost)
+        else
+          cast_spell(spell_id: i, extra: extra, force: !extra.nil?, reserve: bard_renewal, cost: cost)
         end
         break if single_cast
       end
