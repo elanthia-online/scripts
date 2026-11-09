@@ -81,6 +81,19 @@ RSpec.describe 'ELoot::Setup' do
     expect(code).not_to match(/\bGtk\b|\bGdk\b|glade|<interface>/i)
   end
 
+  it 'uses the current constants when the script is re-run in the same session' do
+    setup_class
+    stale = setup_source.gsub(/\r\n/, "\n")
+    namespace.const_get(:Setup).send(:remove_const, :HOARD_LABELS)
+    namespace.const_get(:Setup).const_set(:HOARD_LABELS, { gem: {}, alchemy: {} }.freeze)
+
+    namespace.module_eval(stale, eloot_path)
+
+    nodes = render(build)
+    expect(node(nodes, 'gem_everything-entry-0')[:placeholder]).to eq('Gems to Exclude')
+    expect(node(nodes, 'alchemy_list-entry-0')[:placeholder]).to eq('Ingredients to Include')
+  end
+
   it 'is available only when Lich can present a window' do
     expect(setup_class.available?).to be_falsey
   end
