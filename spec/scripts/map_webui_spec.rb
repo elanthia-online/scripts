@@ -103,6 +103,34 @@ RSpec.describe 'ElanthiaMap::Window' do
     expect(returned).to eq([:focus])
   end
 
+  it 'returns focus once when the window first opens, not when a viewer reconnects' do
+    returned = []
+    window.define_singleton_method(:return_focus) { returned << :focus }
+    window.instance_variable_set(:@attached, false)
+
+    2.times { window.on_attach }
+
+    expect(returned).to eq([:focus])
+  end
+
+  it 'finds the frontend from the parent process when no launch set its PID' do
+    calls = []
+    frontend = Module.new do
+      define_singleton_method(:pid) { calls.include?(:detect) ? 5888 : nil }
+      define_singleton_method(:detect_pid) { calls << :detect }
+      define_singleton_method(:refocus) { calls << :refocus }
+    end
+    namespace.const_set(:Frontend, frontend)
+    window.define_singleton_method(:diag) { |*| nil }
+    namespace.const_get(:ElanthiaMap).const_get(:Window).send(:const_set, :Frontend, frontend)
+    before = Thread.list
+
+    window.return_focus
+    (Thread.list - before).each(&:join)
+
+    expect(calls).to eq(%i[detect refocus])
+  end
+
   it 'returns focus after clicking a room with a note' do
     returned = []
     window.define_singleton_method(:return_focus) { returned << :focus }
