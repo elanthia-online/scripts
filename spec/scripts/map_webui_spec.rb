@@ -113,22 +113,40 @@ RSpec.describe 'ElanthiaMap::Window' do
     expect(returned).to eq([:focus])
   end
 
-  it 'finds the frontend from the parent process when no launch set its PID' do
-    calls = []
-    frontend = Module.new do
-      define_singleton_method(:pid) { calls.include?(:detect) ? 5888 : nil }
-      define_singleton_method(:detect_pid) { calls << :detect }
-      define_singleton_method(:refocus) { calls << :refocus }
+  context 'with a frontend to return to' do
+    let(:calls) { [] }
+
+    before do
+      log = calls
+      frontend = Module.new do
+        define_singleton_method(:pid) { 5888 }
+        define_singleton_method(:refocus) { log << :refocus }
+      end
+      namespace.const_get(:ElanthiaMap).const_get(:Window).send(:const_set, :Frontend, frontend)
+      window.define_singleton_method(:diag) { |*| nil }
     end
-    namespace.const_set(:Frontend, frontend)
-    window.define_singleton_method(:diag) { |*| nil }
-    namespace.const_get(:ElanthiaMap).const_get(:Window).send(:const_set, :Frontend, frontend)
-    before = Thread.list
 
-    window.return_focus
-    (Thread.list - before).each(&:join)
+    def return_focus_and_wait
+      before = Thread.list
+      window.return_focus
+      (Thread.list - before).each(&:join)
+    end
 
-    expect(calls).to eq(%i[detect refocus])
+    it 'refocuses it' do
+      stub_const('ENV', ENV.to_h.reject { |key, _| key == 'HYDRA_SEAT' })
+
+      return_focus_and_wait
+
+      expect(calls).to eq([:refocus])
+    end
+
+    it 'leaves focus alone under Hydra, which cannot be told which character this is' do
+      stub_const('ENV', ENV.to_h.merge('HYDRA_SEAT' => 'GSIV:Nisugi'))
+
+      return_focus_and_wait
+
+      expect(calls).to be_empty
+    end
   end
 
   it 'returns focus after clicking a room with a note' do
