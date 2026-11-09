@@ -127,11 +127,34 @@ RSpec.describe 'ElanthiaMap::Window' do
     expect(window.menu_key('tags-0')).not_to eq(before)
   end
 
+  it 'keeps Find open and explains when nothing matches' do
+    namespace.const_get(:Room).define_singleton_method(:[]) { |_text| nil }
+    window.define_singleton_method(:refresh) { nil }
+    window.instance_variable_set(:@panel, :find)
+    window.instance_variable_set(:@find_text, 'nowhere')
+
+    window.on_find
+
+    expect(window.instance_variable_get(:@panel)).to eq(:find)
+    expect(window.find_status).to eq('No matching room.')
+  end
+
+  it 'moves focus to the Find box each time it opens, with any old error cleared' do
+    window.define_singleton_method(:refresh) { nil }
+    window.instance_variable_set(:@find_focus, 0)
+    window.instance_variable_set(:@find_status, 'No matching room.')
+
+    window.on_open_panel(:find)
+
+    expect(window.find_focus).to eq(1)
+    expect(window.find_status).to eq('')
+  end
+
   it 'keeps the scroller inside the window, leaving room for an open panel' do
     window.instance_variable_set(:@char_settings, { window_height: 600 })
 
     expect(window.view_height).to eq(598)
     window.instance_variable_set(:@panel, :find)
-    expect(window.view_height).to eq(408)
+    expect(window.view_height).to eq(502)
   end
 end
