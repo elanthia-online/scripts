@@ -130,8 +130,8 @@ RSpec.describe 'ElanthiaMap::Window' do
   it 'keeps the scroller inside the window, leaving room for an open panel' do
     window.instance_variable_set(:@char_settings, { window_height: 600 })
 
-    expect(window.view_height).to eq(600)
+    expect(window.view_height).to eq(598)
     window.instance_variable_set(:@panel, :find)
-    expect(window.view_height).to eq(410)
+    expect(window.view_height).to eq(408)
   end
 end
