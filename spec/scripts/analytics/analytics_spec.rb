@@ -157,8 +157,12 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'writes the first row, each reading, each due check, the sting wearing off and the last row' do
-      # first, Sharp, training points, resource, heartbeat, Light, None, last
-      expect(progress['rows']).to eq(8)
+      # first, Sharp, training points, resource, heartbeat, Light, None, EXPERIENCE with RESOURCE, last
+      expect(progress['rows']).to eq(9)
+    end
+
+    it 'puts EXPERIENCE and RESOURCE typed together on one row, though their output ends a second apart' do
+      expect(progress['paired']).to eq([{ 'fame' => 8100, 'resource_weekly' => 13_000 }])
     end
 
     it 'keeps regular and ascension experience apart on cycles, and gives them fame only from a fresh reading' do
@@ -264,6 +268,10 @@ RSpec.describe 'analytics.lic' do
       expect(trip['death_trigger']).to eq(%w[dead dead-splinter])
     end
 
+    it "calls the rest after a death 'after death', not the reason bigshot gave before it" do
+      expect(trip['after_death']).to eq('after death')
+    end
+
     it 'counts a rest-step script running after a hunt as resting' do
       expect(trip.values_at('hunt_then_trip', 'hunt_nothing_running')).to eq([[true, false], [true, false]])
     end
@@ -338,6 +346,28 @@ RSpec.describe 'analytics.lic' do
 
     it 'files a dangerous task rewarded before the poll saw it spawn as the spawned task' do
       expect(progress['spawned']).to eq([%w[dangerous_spawned completed], 'dangerous_spawned'])
+      expect(progress['spawned_offer']).to eq('dangerous_spawned')
+    end
+
+    it "keeps an escort offer's destination when the task poll names none" do
+      expect(progress['escort']).to eq(['escort', 'Zul Logoth'])
+    end
+  end
+
+  describe 'wording from other towns, with the line endings the game sends' do
+    subject(:towns) { result('other_towns') }
+
+    it 'records pouches paid with a bond note or a plain note, and not another player\'s' do
+      expect(towns['sales']).to eq([['vendor', 'Bramblefist', 122_375], ['gemcutter', nil, 45_630]])
+    end
+
+    it 'records a locksmith paid by name, and a purchase' do
+      expect(towns['spent']).to eq([['locksmith', 'Tisanoff', 5809], ['purchase', 'Kelph', 450]])
+    end
+
+    it 'moves the total for a teller that states no balance, and by the notes line that does' do
+      expect(towns['bank']).to eq([['bank_account', nil, 1_000_000], ['deposit', 30_000, 1_030_000], ['withdraw', -25_000, 1_005_000],
+                                   ['deposit', 168_005, 1_173_005]])
     end
   end
 

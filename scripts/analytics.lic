@@ -744,6 +744,7 @@ module GS4Analytics
       # A task that turned into its spawned form is the same bounty continuing
       def retype_bounty(bounty_id, type, creature)
         db[:bounties].where(bounty_id: bounty_id).update(clean(bounty_type: type, creature: creature))
+        db[:bounty_offers].where(bounty_id: bounty_id).update(bounty_type: Util.norm(type))
       end
 
       def active_bounties(who)
@@ -774,13 +775,21 @@ module GS4Analytics
       end
 
       # What the guard or dealer said the task is, once it's known
+      # What the poll didn't say (an escort's destination, read from the
+      # taskmaster's words) stays as it was
       def refine_offer(offer_id, type, creature, area, count)
+        keep = ->(col, value) { Sequel.function(:coalesce, Util.norm(value), col) }
         db[:bounty_offers].where(offer_id: offer_id)
-                          .update(clean(bounty_type: type, creature: creature, area: area, count: count))
+                          .update(bounty_type: Util.norm(type), creature: keep.call(:creature, creature),
+                                  area: keep.call(:area, area), count: keep.call(:count, count))
       end
 
+      # The offer takes its bounty's type, which may have moved on since the
+      # offer was named (a dangerous task rewarded as dangerous_spawned)
       def link_offer(offer_id, bounty_id)
-        db[:bounty_offers].where(offer_id: offer_id).update(bounty_id: bounty_id)
+        type = db[:bounties].where(bounty_id: bounty_id).select(:bounty_type)
+        db[:bounty_offers].where(offer_id: offer_id)
+                          .update(bounty_id: bounty_id, bounty_type: Sequel.function(:coalesce, type, :bounty_type))
       end
 
       # Only an open offer is ended, so a late event can't rewrite an outcome
@@ -1311,6 +1320,8 @@ module GS4Analytics
     # weakness remains" means it has eased, not gone)
     STING_GONE_RE = /\AYou feel the sting of a recent death slowly fade away\.\s*\z/
     CHECK_EVERY = 60 # seconds between reads of the game state
+    # EXPERIENCE and RESOURCE typed together finish this close: one reading time
+    PAIR_SECONDS = 3
     HEARTBEAT = 3600 # a row at least this often; experience moving alone waits for it
     # A change to any of these is written at once
     MILESTONES = %i[level lumnis rpa fashlonae].freeze
@@ -1420,12 +1431,26 @@ module GS4Analytics
 
       def digits(text) = text.delete(',').to_i
 
+      # When a reading of this kind was taken. EXPERIENCE and RESOURCE typed
+      # together are one moment, though their output can end either side of a
+      # second: the second of the pair takes the first's time, so they share a row.
+      def stamp(kind)
+        now = Time.now.to_i
+        last = @stamped
+        if last && last[:kind] != kind && now - last[:at] <= PAIR_SECONDS
+          @stamped = nil
+          return last[:at]
+        end
+        @stamped = { kind: kind, at: now }
+        now
+      end
+
       # One RESOURCE block: its values, written as a reading when the prompt ends it
       def read_resource(line, text)
         if text.match?(RES_START_RE)
           @resource = {}
         elsif line.include?('<prompt')
-          @readings << @resource.merge(at: Time.now.to_i) unless @resource.empty?
+          @readings << @resource.merge(at: stamp(:resource)) unless @resource.empty?
           @resource = nil
         elsif (found = text.match(RESOURCE_RE))
           @resource.merge!(resource_name: found[1], resource_weekly: digits(found[2]), resource_total: digits(found[3]))
@@ -1460,7 +1485,7 @@ module GS4Analytics
           @block[:long_term_exp] = digits(found[1])
           @block[:deeds] = found[2].to_i
         elsif @block && text.match?(END_RE)
-          at = Time.now.to_i
+          at = stamp(:experience)
           @readings << @block.merge(at: at)
           @read_at = at
           @block = nil
@@ -1612,7 +1637,9 @@ module GS4Analytics
     # Only a quote to you: "... tells you, "...  Gimme 5,871 silvers, and I'll have it open ..."
     # (one to another player in the room reads "tells <Name>, ...")
     LOCK_QUOTE_RE = /tells you, ".*?Gimme ([\d,]+) silvers?, and I'll have it open/
-    LOCK_PAID_RE = /\AThe locksmith (\S+) accepts your silvers\./
+    # "The locksmith Jyhm accepts your silvers." or, in Cold River, "Tisanoff accepts your silvers."
+    # Only after a quote to you, so another player's name here can't count
+    LOCK_PAID_RE = /\A(?:The locksmith )?(\S+) accepts your silvers\./
     POOL_PAID_RE = /\A(\S+) takes your .+? and says, "Your tip of ([\d,]+) silvers? has been recorded, and the ([\d,]+) silvers? fee has been collected/
     PRIESTESS_RE = /\AYou hand the priestess ([\d,]+) silvers?\./
     PROMPT_RE  = /<prompt/
@@ -1621,7 +1648,7 @@ module GS4Analytics
     # A shop's ORDER and BUY (eherbs at the herbalist): the merchant names the
     # price, then takes your note or hands over the goods. Both, or it's only
     # someone else's words.
-    SOLD_RE = /\A(?<name>[A-Z][\w' -]*?) exclaims, "Sold for (?<amount>[\d,]+) silvers?!"\z/
+    SOLD_RE = /\A(?<name>[A-Z][\w' -]*?) exclaims, "Sold for (?<amount>[\d,]+) silvers?!"\s*\z/
     BOUGHT_RE = Regexp.union(/takes your promissory note and hands you a new one\./,
                              /\A(?:She|He) hands you .+ and says, "Here's your purchase\./,
                              /\A(?:She|He) says, "I've placed your purchases in this package\./)
@@ -1635,25 +1662,32 @@ module GS4Analytics
     BANK_START = /amounts on deposit/
     # "<vendor> takes your <item>, ... hands you N silver ..." (also "takes the <item>"),
     # or "... hands you a Vornavis promissory note for N silvers" when the vendor is short
-    SALE_RE    = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), .*?\bhands you (?:an? [^,]*?promissory note for )?(?<amount>[\d,]+) silvers?/
+    SALE_RE    = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), .*?\bhands you (?:an? (?:[^,]*? )?note for )?(?<amount>[\d,]+) silvers?/
     # A gem pouch or other container bought from: paid with the container
     # ("along with N silver"), or with a note given on the next line.
     # "Ragnoz takes the silk cloak, inspects the contents carefully and removes
     # the item he is interested in.  Ragnoz hands it back to you, along with 819 silver."
-    POUCH_RE   = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), inspects the contents carefully,? and removes the (?<what>gems|items?) (?:she|he) (?:is|are) interested in\.\s+.+? hands it back to you(?:, along with (?<amount>[\d,]+) silvers?| and says, .*promissory note)/
-    POUCH_NOTE_RE = /\A(?:The )?(?<vendor>[^,]+?) removes the gems and hands you an? [^,]*?promissory note for (?<amount>[\d,]+) silvers?/
+    POUCH_RE   = /\A(?:The )?(?<vendor>[^,]+?) takes (?:your|the) (?<item>[^,]+?), inspects the contents carefully,? and removes the (?<what>gems|items?) (?:she|he) (?:is|are) interested in\.\s+.+? hands it back to you(?:, along with (?<amount>[\d,]+) silvers?| and says, .*\bnote for it)/
+    # The note is a town's own: "a Mist Harbor promissory note", "a Northwatch bond
+    # note" (Cold River's gemcutter), or just "a note" (Cold River's furrier)
+    POUCH_NOTE_RE = /\A(?:The )?(?<vendor>[^,]+?) removes the (?:gems|items?) and hands you an? (?:[^,]*? )?note for (?<amount>[\d,]+) silvers?/
     NOUN_RE    = /takes (?:your|the) <a [^>]*noun="([^"]+)"/
     # A vendor short of coin pays with a note it writes out, two lines after
     # the offer: "You offer to sell your veil iron shield to Walsor Gryhm." ...
     # "He scribbles out a Vornavis promissory note for 23,760 silvers and hands it to you."
     OFFER_RE   = /You offer to sell your (?<item>.+?) to (?:the )?(?<vendor>[^.]+)\.\s*\z/
     OFFER_NOUN_RE = /sell your <a [^>]*noun="([^"]+)"/
-    SCRIBBLE_RE = /\A(?:He|She) scribbles out an? [^,]*?promissory note for (?<amount>[\d,]+) silvers? and hands it to you/
+    SCRIBBLE_RE = /\A(?:He|She) scribbles out an? (?:[^,]*? )?note for (?<amount>[\d,]+) silvers? and hands it to you/
     # Teller lines: [amount moved, the balance of this bank afterwards]
     DEPOSIT_RE = /You deposit ([\d,]+) silvers? into your account\..*?brings your total to ([\d,]+) silvers?/
     WITHDRAW_RE = /hands you ([\d,]+) silvers?, and says, "This brings your total to ([\d,]+) silvers?/
     NOTES_RE = /You hand over your notes to the teller.*?That's a total of ([\d,]+) silvers?, bringing your balance to ([\d,]+) silvers?/
     NOTE_WORTH_RE = /You deposit your note worth ([\d,]+) into your account\..*?brings your total to ([\d,]+) silvers?/
+    # Mist Harbor's Four Winds bank: the notes line has a balance, a deposit and a
+    # withdrawal don't ("The teller scribbles the transaction into a book...")
+    NOTES_BOOK_RE = /You hand your notes to the teller.*?They add up to ([\d,]+) silvers?, bringing your account balance up to ([\d,]+)/
+    DEPOSIT_BOOK_RE = /\AYou deposit ([\d,]+) silvers? into your account\.  The teller scribbles the transaction into a book/
+    WITHDRAW_BOOK_RE = /\AThe teller scribbles the transaction into a book and hands you ([\d,]+) silvers?\./
     BANK_CAPTURE_MAX = 14 # lines to wait for the Total line
     # Seconds after the collector starts before the first bank listing, so
     # login and the other autostart scripts settle first
@@ -1922,10 +1956,14 @@ module GS4Analytics
         elsif @bank_lines
           @bank_lines << text
           finish_bank_capture if text.strip.start_with?('Total:') || @bank_lines.size > BANK_CAPTURE_MAX
-        elsif (found = text.match(DEPOSIT_RE) || text.match(NOTES_RE) || text.match(NOTE_WORTH_RE))
+        elsif (found = text.match(DEPOSIT_RE) || text.match(NOTES_RE) || text.match(NOTE_WORTH_RE) || text.match(NOTES_BOOK_RE))
           record_teller(digits(found[1]), digits(found[2]), 'deposit')
         elsif (found = text.match(WITHDRAW_RE))
           record_teller(-digits(found[1]), digits(found[2]), 'withdraw')
+        elsif (found = text.strip.match(DEPOSIT_BOOK_RE))
+          record_teller(digits(found[1]), nil, 'deposit')
+        elsif (found = text.strip.match(WITHDRAW_BOOK_RE))
+          record_teller(-digits(found[1]), nil, 'withdraw')
         end
       end
 
@@ -1944,6 +1982,12 @@ module GS4Analytics
       # What moved at this teller since its last line that the line doesn't
       # state. Elsewhere (another teller, another town), nothing is known.
       def teller_change(stated, balance)
+        # A teller that states no balance leaves nothing to compare the next line with
+        if balance.nil?
+          forget_teller
+          return 0
+        end
+
         room = Util.safely { XMLData.room_id }
         last = @teller
         @teller = { room: room, balance: balance }
@@ -2723,9 +2767,10 @@ module GS4Analytics
         @rest_tick = monotonic
         # Normally bigshot's $rest_reason; if it's blank (rest script started
         # by hand, or bigshot already cleared it) use the hunt that just ended
-        reason = rest_reason
+        # After a death, bigshot's reason is the one from before it: the hunt that
+        # died says why ("died (wounded.)"), and this rest recovers from the death
+        reason = @after_death ? 'after death' : rest_reason
         reason = recent_hunt_reason if reason.empty?
-        reason = 'after death' if reason.empty? && @after_death # the hunt that died says why; this rest recovers from it
         return if reason.empty?
 
         note_reason(cycle_id, reason)

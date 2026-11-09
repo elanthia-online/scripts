@@ -1006,6 +1006,48 @@ when 'notes'
              'one_stamp' => moves.last(2).map { |row| row['timestamp'] }.uniq.size }
   A::SilverManager.stop
 
+when 'other_towns'
+  # Wording from other towns (Cold River, Mist Harbor), each line ending in
+  # "\r\n" as the game sends it
+  A::Database.connect!
+  A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  feed = ->(*lines) { lines.each { |line| DownstreamHook.run("#{line}\r\n") } }
+  settle = -> { sleep 0.3; A::Database.flush }
+  feed.call('You currently have the following amounts on deposit:', '      Mist Harbor: 1,000,000', '      Total: 1,000,000')
+  settle.call
+  feed.call(
+    # The furrier pays a pouch of skins with "a note", the gemcutter with a bond note
+    'Bramblefist takes the black cordovan apron, inspects the contents carefully and removes the items he is interested in.  ' \
+    'Bramblefist hands it back to you and says, "I don\'t have that much spare silver, so I will have to give you a Northwatch bond note for it."',
+    'Bramblefist removes the items and hands you a note for 122,375 silvers.',
+    'The gemcutter takes the canvas bag, inspects the contents carefully, and removes the gems he is interested in.  He hands it back ' \
+    'to you and says, "I don\'t have that much spare silver, so I will have to give you a Northwatch bond note for it."',
+    'The gemcutter removes the gems and hands you a Northwatch bond note for 45,630 silvers.',
+    # Someone else's pouch at the same jeweler: not ours
+    'The jeweler Etaenia takes the climbing pack, inspects the contents carefully, and removes the gems she is interested in.  ' \
+    'She hands it back to April and says, "I don\'t have that much spare silver, so I will have to give you a Mist Harbor promissory note for it."',
+    # A locksmith who isn't introduced as "The locksmith"
+    'You ring the chime, and ask Tisanoff if he can open your hickory chest.',
+    'He looks over the hickory chest, frowns, and tells you, "Havin\' some trouble, eh?  Of course I could open this, but it\'ll cost ya.  ' \
+    'Gimme 5,809 silvers, and I\'ll have it open before you know it."',
+    'Tisanoff accepts your silvers.',
+    # A purchase
+    'Kelph exclaims, "Sold for 450 silvers!"', 'Kelph takes your promissory note and hands you a new one.',
+    # The Four Winds teller states no balance for a deposit or a withdrawal
+    'You deposit 30,000 silvers into your account.  The teller scribbles the transaction into a book and says, "Thank you, Splinter.  Have a fabulous day!"',
+    'The teller scribbles the transaction into a book and hands you 25,000 silvers.',
+    'You hand your notes to the teller, who glances over each one and scribbles the amounts in a book.  She says, "They add up to ' \
+    '168,005 silvers, bringing your account balance up to 1,173,005."'
+  )
+  settle.call
+  result = {
+    'sales' => A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY rowid").map(&:values),
+    'spent' => A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'expense' ORDER BY rowid").map(&:values),
+    'bank'  => A::Database.all("SELECT snapshot_type, delta_silver, balance FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid").map(&:values)
+  }
+  A::SilverManager.stop
+
 when 'teller_listing'
   # A listing between two lines at the same teller already includes what
   # happened in between, so the second line must not count it again
@@ -1208,6 +1250,11 @@ when 'interrupted_hunt'
   manager.send(:name_trigger)
   A::Database.flush
   result['death_trigger'] = [before, A::Database.one('SELECT trigger_script FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)['trigger_script']]
+  # The rest after the death, with bigshot's reason from before it still set
+  $rest_reason = 'wounded.'
+  manager.send(:transition_to, :rest)
+  A::Database.flush
+  result['after_death'] = A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)['rest_reason']
 
 when 'town_bounty'
   # A bounty finished in town, with no hunt running, still gets its type and area
@@ -1335,6 +1382,9 @@ when 'bounty_progress'
   # from dangerous to done without the poll seeing it spawn
   manager.send(:clear_tracking)
   $running = ['bigshot']
+  offer_id = A::Database.new_id
+  A::Database.record_offer(WHO, nil, { assignment: 'creature_assignment', description: 'a dangerous creature' }, id: offer_id, at: NOW)
+  manager.instance_variable_set(:@offer, { id: offer_id, detail: nil, words: 'a dangerous creature' })
   task.call(:dangerous, 'shambling lurk', 'the Sanctum', nil)
   manager.send(:check_task)
   task.call(:guard, '', '', nil)
@@ -1343,7 +1393,16 @@ when 'bounty_progress'
   A::Database.flush
   spawned = [A::Database.one('SELECT bounty_type, status FROM bounties ORDER BY rowid DESC LIMIT 1').values,
              A::Database.one("SELECT bounty_type FROM silver_events WHERE source_category = 'bounty' ORDER BY rowid DESC LIMIT 1")['bounty_type']]
-  result = { 'cull' => steps, 'before_hunt' => before_hunt, 'town_gem' => town_gem, 'spawned' => spawned }
+  spawned_offer = A::Database.one('SELECT bounty_type FROM bounty_offers WHERE offer_id = ?', offer_id)['bounty_type']
+
+  # An escort's destination, read from the taskmaster's words, survives a poll that names none
+  escort_id = A::Database.new_id
+  A::Database.record_offer(WHO, nil, { assignment: 'escort', bounty_type: 'escort', area: 'Zul Logoth', description: 'an escort' },
+                           id: escort_id, at: NOW)
+  A::Database.refine_offer(escort_id, 'escort', '', nil, nil)
+  escort = A::Database.one('SELECT bounty_type, area FROM bounty_offers WHERE offer_id = ?', escort_id).values
+  result = { 'cull' => steps, 'before_hunt' => before_hunt, 'town_gem' => town_gem, 'spawned' => spawned,
+             'spawned_offer' => spawned_offer, 'escort' => escort }
 
 when 'kill_time'
   # A kill's day is the day of the search, even if its write runs later
@@ -1735,7 +1794,7 @@ when 'progress'
   ignored = P.check(now: t + 415)
   DownstreamHook.run('<output class="mono"/>       PTPs/MTPs: 36/0                        ATPs: 6')
   tps = P.check(now: t + 420)
-  sleep 1.1
+  sleep 4.1 # more than PAIR_SECONDS (in whole seconds) after the EXPERIENCE: a RESOURCE of its own
   # RESOURCE output, as the game sends it, ended by the prompt
   ['<output class="mono"/>', 'Health: 280/<pushBold/>300<popBold/>     Mana: 40/80     Stamina: 120/120     Spirit: 10/10',
    'Devotion: 12,345/50,000 (Weekly)           67,890/200,000 (Total)', 'Suffused Devotion: 4,321', 'Voln Favor: 98,765',
@@ -1743,7 +1802,7 @@ when 'progress'
   resource = P.check(now: t + 450)
   same = P.check(now: t + 500)         # nothing changed
   beat = P.check(now: t + 4100)        # the hourly heartbeat
-  sleep 1.1
+  sleep 4.1 # apart from the RESOURCE before it
   experience.call(fame: '7,800', sting: 'Light', lte: 61, deeds: 13) # a potion eases it
   sleep 1.1
   DownstreamHook.run('You feel the sting of a recent death slowly fade away, yet a lingering weakness remains.')
@@ -1757,6 +1816,13 @@ when 'progress'
   fresh = A::Vitals.read(since: Time.now.to_i - 60)
   id = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'crags', fresh, at: NOW - 600)
   A::Database.end_cycle(id, fresh, nil, at: NOW - 60)
+  # EXPERIENCE and RESOURCE typed together, their output ending either side of a second: one row
+  sleep 4.1
+  experience.call(fame: '8,100', sting: 'Light', lte: 62, deeds: 14)
+  sleep 1.1
+  ['<output class="mono"/>', 'Health: 300/300     Mana: 80/80     Stamina: 120/120     Spirit: 10/10',
+   'Devotion: 13,000/50,000 (Weekly)           68,000/200,000 (Total)', '<prompt time="2">&gt;</prompt>'].each { |line| DownstreamHook.run(line) }
+  P.check(now: t + 4300)
   P.stop(now: t + 5000) # and a last row
   # EXPERIENCE and RESOURCE typed together: two readings in one second, one row with both
   A::Database.flush
@@ -1783,7 +1849,8 @@ when 'progress'
     'tps' => rows.select { |r| r['ptp'] }.map { |r| r.slice('ptp', 'mtp', 'atp') },
     'gone' => [eased, rows.count { |r| r['deaths_sting'] == 'None' }], 'cycle_fame' => [stale[:fame], fresh[:fame]],
     'gone_row' => sting.call('None')&.slice('fame', 'deeds', 'long_term_exp'),
-    'cycle' => cycle, 'schema' => A::Database.metadata('schema_version'), 'together' => together
+    'cycle' => cycle, 'schema' => A::Database.metadata('schema_version'), 'together' => together,
+    'paired' => rows.select { |r| r['fame'] == 8100 }.map { |r| r.slice('fame', 'resource_weekly') }
   }
 
 when 'shops'
