@@ -20,6 +20,8 @@
     ;bsprofiles                     open the editor on a blank profile
     ;bsprofiles edit <name>         open the editor on a saved profile
     ;bsprofiles new <name>          create <name> from defaults, then open it
+    ;bsprofiles bigshot             edit bigshot's live settings, saved on
+                                    Close (what ;bigshot setup opens)
 
   Command line (no GUI needed)
     ;bsprofiles list                list saved profiles
@@ -52,9 +54,16 @@
   game: gs
   tags: bigshot, profiles, hunting, utility, webui
   required: Lich > 5.24.0 (WebUI)
-  version: 2.0.0
+  version: 2.1.0
 
   changelog:
+    2.1.0 (2026-11-09)
+      - ;bsprofiles bigshot: bigshot's own setup window. Edits bigshot's live
+        settings; Close saves them, closing the window discards, as bigshot's
+        old GTK window did. No Apply button. ;bigshot setup opens it.
+      - Close is recorded before the page closes, so it is never mistaken for
+        closing the window.
+      - bigshot's old boon_flee_from toggle is turned into flee ticks on load.
     2.0.0 (2026-11-06)
       - Rewritten from GTK to Lich's native WebUI. No GTK anywhere.
       - The editor no longer subclasses Bigshot::Setup; the layout lives here.
@@ -139,7 +148,8 @@ module BSProfiles
   def bigshot_source
     raise "bigshot.lic not found at #{bigshot_path}" unless File.exist?(bigshot_path)
 
-    @bigshot_source ||= File.read(bigshot_path)
+    # bigshot.lic has Windows line endings; the patterns below expect \n.
+    @bigshot_source ||= File.read(bigshot_path).gsub("\r\n", "\n")
   end
 
   def bigshot_version
@@ -983,7 +993,17 @@ module BSProfiles
       new(data, name).run
     end
 
-    def initialize(settings, profile_name)
+    # ;bigshot setup: edit bigshot's live settings (UserVars.op), as bigshot's
+    # own setup window did. Close saves them back; closing the window
+    # discards. Profiles load and save on the Profiles tab as usual.
+    def self.open_for_bigshot
+      data = (UserVars.op || {}).to_h.transform_keys(&:to_s)
+      BSProfiles.templates
+      new(data, data['profile_current'].to_s, live: true).run
+    end
+
+    def initialize(settings, profile_name, live: false)
+      @live = live
       @owner = Script.current
       @profile = profile_name.to_s
       @dirty = false
@@ -994,7 +1014,9 @@ module BSProfiles
       load_settings(settings)
       # compare
       @cmp_a = EDITOR_CHOICE
-      @cmp_b = @profile.empty? ? EDITOR_CHOICE : @profile
+      # bigshot remembers the last profile by name; it may since have been
+      # renamed or deleted, and the picker refuses a name it does not list.
+      @cmp_b = !@profile.empty? && BSProfiles.exist?(@profile) ? @profile : EDITOR_CHOICE
       @cmp_only_diff = true
       @cmp_rows = nil
       # creatures
@@ -1049,8 +1071,18 @@ module BSProfiles
         respond 'bsprofiles: could not open a browser window for the editor.'
         return
       end
-      @closed.pop
-      Lich::Messaging.msg('plain', " bsprofiles: editor closed.#{@dirty ? ' Nothing was written: there were UNSAVED changes.' : ''}")
+      how = @closed.pop
+      if @live
+        # bigshot's rule: Close saves, closing the window any other way does not.
+        if how == :close
+          save_to_bigshot
+          Lich::Messaging.msg('plain', ' Bigshot UI closed, saving any changes')
+        else
+          Lich::Messaging.msg('plain', ' Bigshot UI closed WITHOUT saving any changes')
+        end
+      else
+        Lich::Messaging.msg('plain', " bsprofiles: editor closed.#{@dirty ? ' Nothing was written: there were UNSAVED changes.' : ''}")
+      end
     ensure
       begin
         Lich::WebUI.terminate_owner(@owner)
@@ -1072,15 +1104,22 @@ module BSProfiles
       @window_height = height if height > MAP_TOP_SLACK + 100
     end
 
+    # :close goes first: closing the page can report the window closed at
+    # once, and in bigshot mode that would mean discard.
     def close_clicked
-      Lich::WebUI.close(@page)
       @closed << :close
+      Lich::WebUI.close(@page)
     end
 
     def title
       label = @profile.empty? ? 'new profile' : @profile
+      return "Big Shot: v#{$bigshot_version}#{@profile.empty? ? '' : " (#{@profile})"}" if @live
+
       "Bigshot Profiles: #{label}#{@dirty ? ' *' : ''}"
     end
+
+    # Editing bigshot's live settings, from ;bigshot setup.
+    def live? = @live
 
     # Run a UI callback: contain errors, then re-render.
     def act
@@ -1109,6 +1148,13 @@ module BSProfiles
       s = (data || {}).transform_keys(&:to_s)
       BSProfiles.schema.each { |key, meta| s[key.to_s] = meta[:default] if s[key.to_s].nil? }
       s.delete_if { |key, _| !BSProfiles.schema.key?(key.to_sym) }
+      # bigshot's old "flee from boon creatures" toggle means every boon is a
+      # flee boon; bigshot's own setup turned it into ticks the same way.
+      if s['boon_flee_from'] == true
+        s['boons_all'] = Array(s['boons_all']) | ['flee']
+        BoonMatrix::GROUPS.each { |group, items| s[group] = Array(s[group]) | (['flee'] + items.map { |i| "#{i}_flee" }) }
+        s['boon_flee_from'] = false
+      end
       s['profile_current'] = @profile
       s['save_profile_name'] = ''
       @settings = s
@@ -1156,11 +1202,15 @@ module BSProfiles
       @dirty = false
     end
 
-    def apply_to_bigshot
+    def save_to_bigshot
       data = snapshot
       data['profile_current'] = @profile
       data['save_profile_name'] = ''
       UserVars.op = data
+    end
+
+    def apply_to_bigshot
+      save_to_bigshot
       Lich::Messaging.msg('plain', " bsprofiles: editor settings applied to bigshot (UserVars.op)#{@dirty ? ' - remember they are not saved to a profile yet' : ''}.")
       status(:footer, 'Applied to bigshot.')
     end
@@ -1792,6 +1842,24 @@ module BSProfiles
                 @dirty ? "#{@profile}  (unsaved changes)" : "#{@profile}  (saved)"
               end
       ui.divider(key: 'footer-div')
+      if @live
+        # From ;bigshot setup: the settings are bigshot's own, so Close is the
+        # save, as in bigshot's old window, and there is nothing to apply.
+        # Read out here: the block below runs as the page builder.
+        from = @profile.empty? ? '' : ", from profile #{@profile}"
+        ui.columns(key: 'footer', count: 2, weights: [7, 1], compact: true, row_align: :center, margin: 6) do
+          ui.text(slot: '0', key: 'footer-text', wrap: true,
+                  content: "Bigshot v#{$bigshot_version} settings#{from}    " \
+                           "Profiles: #{BSProfiles.names.size} in #{BSProfiles.dir}" \
+                           "#{editor.status_text(:footer).empty? ? '' : "    #{editor.status_text(:footer)}"}",
+                  tooltip: "Close saves these settings for bigshot. Closing the window any other way discards the changes.\n" \
+                           'Profile files are only written by Update Profile or Save Current Settings as... on the Profiles tab.')
+          ui.button(slot: '1', key: 'close', label: 'Close', variant: :primary,
+                    tooltip: 'Save these settings for bigshot and close. Closing the window instead discards the changes.',
+                    on: { activate: ->(_ev) { editor.close_clicked } })
+        end
+        return
+      end
       ui.columns(key: 'footer', count: 3, weights: [6, 1, 1], compact: true, row_align: :center, margin: 6) do
         ui.text(slot: '0', key: 'footer-text', wrap: true,
                 content: "Editing: #{state}    Profiles: #{BSProfiles.names.size} in #{BSProfiles.dir}    Bigshot: v#{$bigshot_version}" \
@@ -1979,9 +2047,15 @@ module BSProfiles
                       on: { change: editor.cb { |ev| editor.set('notes', ev.payload[:value].to_s) } })
         end
         ui.text(key: 'p-info', wrap: true, emphasis: :subtle,
-                content: "Standalone profile editor. Profiles are read from and written to:\n#{BSProfiles.dir}\n\n" \
-                         "Close does not save. Use Update Profile or Save Current Settings as...\n" \
-                         "Apply to Bigshot (bottom right) copies these settings into bigshot's live settings.\n\n#{BIGSHOT_INFO}")
+                content: if editor.live?
+                           "Bigshot's settings. Close (bottom right) saves them for bigshot; closing the window discards changes.\n" \
+                             "Profiles are read from and written to:\n#{BSProfiles.dir}\n\n" \
+                             "Load Profile brings a profile's settings in here; Close then makes them bigshot's.\n\n#{BIGSHOT_INFO}"
+                         else
+                           "Standalone profile editor. Profiles are read from and written to:\n#{BSProfiles.dir}\n\n" \
+                             "Close does not save. Use Update Profile or Save Current Settings as...\n" \
+                             "Apply to Bigshot (bottom right) copies these settings into bigshot's live settings.\n\n#{BIGSHOT_INFO}"
+                         end)
       end
     end
 
@@ -2379,6 +2453,13 @@ when '', 'edit'
     BSProfiles::Editor.open(rest.empty? ? nil : rest)
   else
     respond no_gui
+  end
+when 'bigshot'
+  # ;bigshot setup starts this: bigshot's live settings, saved on Close.
+  if gui_ok
+    BSProfiles::Editor.open_for_bigshot
+  else
+    respond 'bsprofiles: bigshot setup needs the Lich WebUI (not available with --no-gui). ;bigshot profile load <name> still works.'
   end
 when 'new'
   if rest.empty?
