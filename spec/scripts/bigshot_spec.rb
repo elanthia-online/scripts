@@ -1,28 +1,64 @@
-# We do NOT load the .lic file: it needs the whole Lich runtime (Settings,
-# XMLData, Spell, GTK, DRb ...). Instead the real method bodies are extracted
-# from scripts/bigshot.lic and evaluated against stubs, so these specs exercise
-# production code and fail if that code changes shape.
+# frozen_string_literal: true
+
+require_relative '../spec_helper'
+
+# Specs for bigshot.lic. We do NOT load the .lic file: it needs the whole
+# Lich runtime (Settings, XMLData, Spell, GTK, DRb ...). Instead the real
+# method/class bodies are extracted from scripts/bigshot.lic and evaluated
+# against stubs, so these specs exercise production code and fail if that
+# code changes shape. Path lookup and loud-failure-on-miss extraction use
+# the shared helpers in spec/spec_helper.rb.
 #
-# Every stub lives inside BigshotPrioritySpec::Harness rather than at top level,
-# so running the whole suite in one process cannot collide with the real GameObj
-# used by the gameobj-data specs.
+# This file covers three independent slices of bigshot, each kept in its
+# own namespaced module (BigshotPrioritySpec, BigshotCreatureAdapterSpec,
+# BigshotLootingWatchSpec) with its own Harness rather than one shared
+# harness:
+#   - Priority Hunt targeting/ranking (BigshotPrioritySpec) needs a
+#     Creature/GameObj pairing shaped around room rosters and ranking.
+#   - The BigshotCreature adapter and native crtrStatus/HP/UCS reads
+#     (BigshotCreatureAdapterSpec) need a richer CreatureInstance double
+#     (statuses, flags, low_hp/fatal_crit/smote/ucs) that priority's tests
+#     never touch.
+#   - looting_watch's own-pause-vs-watched-script-pause race
+#     (BigshotLootingWatchSpec) needs a Script double that can actually
+#     block a thread, which has nothing to do with room state at all.
+# Merging these into one shared harness would blur what each section is
+# actually asserting and risk one section's stub state leaking into
+# another's; keeping them separately namespaced (as they were as separate
+# files) avoids that while still living under this repo's one-spec-per-
+# script convention.
 #
 # Deliberately no NilClass patch here. Lich patches NilClass#method_missing to
 # return nil (lich-5 lib/common/class_exts/nilclass.rb), which is what let the
 # removed room-composition cache paper over nil comparisons. This code must not
 # depend on that.
+#
+# Deliberately no shared GameObj stub from spec_helper.rb either: each
+# section below nests its own GameObj inside its own Harness, per
+# spec_helper.rb's own header note that a shared top-level GameObj stub
+# would corrupt the real, top-level GameObj class spec/gameobj-data
+# exercises directly.
+#
+# Phase 1 of the GameObj -> Creature/Combat migration moved the room-creature
+# source of truth from GameObj.targets to Lich::Gemstone::Creature.targets,
+# behind a BigshotCreature adapter that still exposes GameObj-shaped
+# .status/.type (by delegating to the matching GameObj entry). This harness
+# models both halves: a Creature stub standing in for the room roster, and a
+# GameObj stub standing in for the matching entries the adapter falls back to.
 
 module BigshotPrioritySpec
-  SOURCE_PATH = File.expand_path('../../scripts/bigshot.lic', __dir__)
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
 
   def self.extract(pattern, label)
-    found = SOURCE[pattern]
-    raise "could not extract #{label} from bigshot.lic" unless found
-
-    found
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
   end
 
+  BIGSHOT_CREATURE_SRC = extract(/^class BigshotCreature\n.*?^end$/m, 'BigshotCreature')
+  BS_TARGETS_SRC = extract(/^  def bs_targets\(\*filters\).*?^  end$/m, 'bs_targets')
+  BS_HOSTILE_SRC = extract(/^  def bs_hostile_creatures\(\*filters\).*?^  end$/m, 'bs_hostile_creatures')
+  UNREPORTED_TARGET_SRC = extract(/^  def unreported_target\?\(creature\).*?^  end$/m, 'unreported_target?')
+  BS_ROOM_CREATURES_SRC = extract(/^  def bs_room_creatures\(\*filters\).*?^  end$/m, 'bs_room_creatures')
   PRIORITY_SRC = extract(/^  def priority\(target\).*?^  end$/m, 'priority')
   MATCHERS_SRC = extract(/^  def priority_matchers\n.*?^  end$/m, 'priority_matchers')
   RANK_SRC = extract(/^  def priority_rank\(npc, matchers\).*?^  end$/m, 'priority_rank')
@@ -36,7 +72,12 @@ module BigshotPrioritySpec
                                   'follower retarget block')
   EACHTARGET_SRC = extract(/^  def cmd_eachtarget\(command, npc\).*?^  end$/m, 'cmd_eachtarget')
 
-  Creature = Struct.new(:id, :name, :noun, :type, :status) do
+  # GameObj-shaped fixture data (id/name/noun/type/status). Registered both as
+  # the GameObj stub's lookup-by-id entry (what BigshotCreature#status/#type
+  # fall back to) and as the source for the Creature stub's room roster, so a
+  # single fixture describes "the same creature" the way both real systems
+  # would report it.
+  NpcFixture = Struct.new(:id, :name, :noun, :type, :status) do
     def to_s
       name
     end
@@ -46,12 +87,70 @@ module BigshotPrioritySpec
     # Stubs for the Lich globals the extracted bodies reach for. Nested here so
     # constant lookup inside the eval'd method bodies finds these, not the real
     # classes other specs load.
-    module GameObj
+
+    # Minimal double for Lich::Gemstone::Creature::CreatureInstance. Only the
+    # members id/noun/name are used by the method bodies extracted in this
+    # file; crtr_flag?/has_status?/valid_target?/template are stubbed to
+    # sensible defaults since nothing here reaches them (check_state_condition,
+    # which does use them for the crtrStatus command checks, is not extracted
+    # in this spec).
+    FakeCreatureInstance = Struct.new(:id, :noun, :name, :flags) do
+      def crtr_flag?(key)
+        !!(flags || {})[key.to_sym]
+      end
+
+      def ever_hostile?
+        !!(flags || {})[:ever_hostile]
+      end
+
+      def crtr_flags?
+        !(flags || {}).empty?
+      end
+
+      def has_status?(_name)
+        false
+      end
+
+      def valid_target?
+        true
+      end
+
+      def template
+        nil
+      end
+    end
+
+    module Creature
       class << self
         attr_writer :room_targets
 
-        def targets
+        def targets(*_filters)
           (@room_targets || []).dup
+        end
+
+        def in_room(*_filters)
+          (@room_targets || []).dup
+        end
+
+        def [](id)
+          (@room_targets || []).find { |c| c.id.to_i == id.to_i }
+        end
+      end
+    end
+
+    module GameObj
+      class << self
+        attr_writer :registry
+
+        # Every fixture here is also a Creature instance, so the
+        # bs_hostile_creatures GameObj bridge finds nothing to add - which is
+        # what we want for the ranking tests.
+        def targets
+          []
+        end
+
+        def [](id)
+          (@registry || {})[id]
         end
       end
     end
@@ -68,7 +167,7 @@ module BigshotPrioritySpec
 
     module XMLData
       class << self
-        attr_accessor :current_target_id
+        attr_accessor :current_target_id, :current_target_ids
       end
     end
 
@@ -88,8 +187,10 @@ module BigshotPrioritySpec
       @DEBUG_COMBAT = false
       @DEBUG_COMMANDS = false
       CharSettings.store = { 'untargetable' => [], 'targetable' => [] }
-      GameObj.room_targets = []
+      GameObj.registry = {}
+      Creature.room_targets = []
       XMLData.current_target_id = nil
+      XMLData.current_target_ids = []
     end
 
     def fput(command)
@@ -103,8 +204,16 @@ module BigshotPrioritySpec
       @cmd_calls << { command: command, npc: npc, check_priority: check_priority }
     end
 
-    def room(*creatures)
-      GameObj.room_targets = creatures
+    # Registers each fixture as both a GameObj entry (what the BigshotCreature
+    # adapter's .status/.type fall back to) and a Creature room-roster entry
+    # (what bs_targets/bs_room_creatures/Creature.targets iterate).
+    def room(*fixtures)
+      GameObj.registry = fixtures.each_with_object({}) { |f, h| h[f.id] = f }
+      # hostile so bs_hostile_creatures keeps them; these fixtures stand in for
+      # live attackable creatures.
+      Creature.room_targets = fixtures.map do |f|
+        FakeCreatureInstance.new(f.id.to_i, f.noun, f.name, { hostile: true })
+      end
     end
 
     def untargetable(*names)
@@ -133,6 +242,11 @@ module BigshotPrioritySpec
       !@unpickable.include?(target.name)
     end
 
+    eval(BIGSHOT_CREATURE_SRC)
+    eval(BS_TARGETS_SRC)
+    eval(BS_HOSTILE_SRC)
+    eval(UNREPORTED_TARGET_SRC)
+    eval(BS_ROOM_CREATURES_SRC)
     eval(PRIORITY_SRC)
     eval(MATCHERS_SRC)
     eval(RANK_SRC)
@@ -154,44 +268,44 @@ module BigshotPrioritySpec
 
   module Creatures
     def mastiff
-      Creature.new('101', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
+      NpcFixture.new('101', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
     end
 
     def mystic
-      Creature.new('102', 'illoke mystic', 'mystic', 'aggressive npc', nil)
+      NpcFixture.new('102', 'illoke mystic', 'mystic', 'aggressive npc', nil)
     end
 
     def giant
-      Creature.new('103', 'stone giant', 'giant', 'aggressive npc', nil)
+      NpcFixture.new('103', 'stone giant', 'giant', 'aggressive npc', nil)
     end
 
     def shaman
-      Creature.new('104', 'illoke shaman', 'shaman', 'aggressive npc boon', nil)
+      NpcFixture.new('104', 'illoke shaman', 'shaman', 'aggressive npc boon', nil)
     end
 
     def troll
-      Creature.new('105', 'ice troll', 'troll', 'aggressive npc', nil)
+      NpcFixture.new('105', 'ice troll', 'troll', 'aggressive npc', nil)
     end
 
     def second_mastiff
-      Creature.new('106', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
+      NpcFixture.new('106', 'stone mastiff', 'mastiff', 'aggressive npc', nil)
     end
 
     # From the reported thrash: order was valravn, angargeist, disir
     def valravn
-      Creature.new('280414583', 'eyeless black valravn', 'valravn', 'aggressive npc', nil)
+      NpcFixture.new('280414583', 'eyeless black valravn', 'valravn', 'aggressive npc', nil)
     end
 
     def angargeist
-      Creature.new('280405751', 'roiling crimson angargeist', 'angargeist', 'aggressive npc', nil)
+      NpcFixture.new('280405751', 'roiling crimson angargeist', 'angargeist', 'aggressive npc', nil)
     end
 
     def disir
-      Creature.new('280394883', 'shining winged disir', 'disir', 'aggressive npc', nil)
+      NpcFixture.new('280394883', 'shining winged disir', 'disir', 'aggressive npc', nil)
     end
 
     def draugr
-      Creature.new('280394876', 'withered shadow-cloaked draugr', 'draugr', 'aggressive npc', nil)
+      NpcFixture.new('280394876', 'withered shadow-cloaked draugr', 'draugr', 'aggressive npc', nil)
     end
   end
 end
@@ -312,16 +426,16 @@ RSpec.describe 'bigshot Priority Hunt' do
   end
 
   describe 'rank comparison' do
-    # GameObj.targets is the game's target dropdown (xmlparser dDBTarget), which
-    # is cleared and rebuilt wholesale, so the current target can be missing from
-    # it for a moment. Ranking off the list rather than off dropdown membership
-    # keeps that from handing the fight to a lower ranked creature.
-    it 'keeps the current target when the target itself is missing from the dropdown' do
+    # Creature.targets is rebuilt from the room roster on every call, so the
+    # current target can be momentarily missing from it (e.g. between XML
+    # updates). Ranking off the list rather than off list membership keeps
+    # that from handing the fight to a lower ranked creature.
+    it 'keeps the current target when the target itself is missing from the roster' do
       bs.room(giant)
       expect(bs.priority(mastiff)).to be true
     end
 
-    it 'switches when a higher ranked creature is in the dropdown and the target is not' do
+    it 'switches when a higher ranked creature is in the roster and the target is not' do
       bs.room(mystic)
       expect(bs.priority(mastiff)).to be false
     end
@@ -351,7 +465,7 @@ RSpec.describe 'bigshot Priority Hunt' do
       expect(bs.do_hunt_retarget(angargeist).name).to eq('roiling crimson angargeist')
     end
 
-    it 'does not hand the fight to the disir when the angargeist drops out of the dropdown' do
+    it 'does not hand the fight to the disir when the angargeist drops out of the roster' do
       bs.untargetable('eyeless black valravn')
       bs.room(disir)
 
@@ -455,5 +569,1948 @@ RSpec.describe 'bigshot Priority Hunt' do
     it 'leaves no reference to the room composition globals or the snapshot thread' do
       expect(BigshotPrioritySpec::SOURCE).not_to match(/current_room_npcs|room_npcs_last_check|npc_room_check/)
     end
+  end
+end
+
+# Spec for bigshot.lic's Phase 2 native crtrStatus/HP/UCS reads.
+#
+# Same extraction-and-eval approach as BigshotPrioritySpec above, but a
+# separate Harness: this section exercises a different slice of bigshot -
+# the BigshotCreature adapter boundary and the helpers that read
+# Combat::Tracker data (dead_or_gone?, gone?, creature_backed?,
+# npc_has_status?, npc_crtr_flag?, npc_low_hp?, npc_fatal_crit?,
+# npc_smote?, npc_ucs_position, npc_ucs_tierup, leader_target?) - rather
+# than targeting/ranking. Kept independent of BigshotPrioritySpec's Harness
+# so neither section's stub state can leak into the other.
+module BigshotCreatureAdapterSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  BIGSHOT_CREATURE_SRC = extract(/^class BigshotCreature\n.*?^end$/m, 'BigshotCreature')
+  BS_ROOM_CREATURES_SRC = extract(/^  def bs_room_creatures\(\*filters\).*?^  end$/m, 'bs_room_creatures')
+  BS_HOSTILE_SRC = extract(/^  def bs_hostile_creatures\(\*filters\).*?^  end$/m, 'bs_hostile_creatures')
+  UNREPORTED_TARGET_SRC = extract(/^  def unreported_target\?\(creature\).*?^  end$/m, 'unreported_target?')
+  BS_TARGETS_SRC = extract(/^  def bs_targets\(\*filters\).*?^  end$/m, 'bs_targets')
+  CREATURE_BACKED_SRC = extract(/^  def creature_backed\?\(npc\).*?^  end$/m, 'creature_backed?')
+  DEAD_OR_GONE_SRC = extract(/^  def dead_or_gone\?\(npc\).*?^  end$/m, 'dead_or_gone?')
+  GONE_SRC = extract(/^  def gone\?\(npc\).*?^  end$/m, 'gone?')
+  NPC_HAS_STATUS_SRC = extract(/^  def npc_has_status\?\(npc, status_name\).*?^  end$/m, 'npc_has_status?')
+  NPC_CRTR_FLAG_SRC = extract(/^  def npc_crtr_flag\?\(npc, flag\).*?^  end$/m, 'npc_crtr_flag?')
+  NPC_FROZEN_SRC = extract(/^  def npc_frozen\?\(npc\).*?^  end$/m, 'npc_frozen?')
+  NPC_PRONE_SRC = extract(/^  def npc_prone\?\(npc\).*?^  end$/m, 'npc_prone?')
+  PRONE_CONSTS_SRC = extract(/^  PRONE \|\|=.*?^  PRONE_STATUSES \|\|=.*?$/m, 'PRONE constants')
+  NPC_LOW_HP_SRC = extract(/^  def npc_low_hp\?\(npc, threshold = 25\).*?^  end$/m, 'npc_low_hp?')
+  NPC_FATAL_CRIT_SRC = extract(/^  def npc_fatal_crit\?\(npc\).*?^  end$/m, 'npc_fatal_crit?')
+  NPC_SMOTE_SRC = extract(/^  def npc_smote\?\(npc\).*?^  end$/m, 'npc_smote?')
+  NPC_UCS_POSITION_SRC = extract(/^  def npc_ucs_position\(npc\).*?^  end$/m, 'npc_ucs_position')
+  NPC_UCS_TIERUP_SRC = extract(/^  def npc_ucs_tierup\(npc\).*?^  end$/m, 'npc_ucs_tierup')
+  LEADER_TARGET_SRC = extract(/^  def leader_target\?\n.*?^  end$/m, 'leader_target?')
+
+  # Configurable double for CreatureInstance. statuses/flags start empty so
+  # each test opts in only to the state it's asserting on - a status/flag
+  # that isn't set behaves exactly like the real has_status?/crtr_flag?
+  # default (false).
+  FakeCreatureInstance = Struct.new(:id, :noun, :name, :statuses, :flags, :low_hp, :fatal_crit, :smote, :ucs_pos, :ucs_tierup, :valid_target_override) do
+    def initialize(*)
+      super
+      self.statuses ||= []
+      self.flags ||= {}
+    end
+
+    def has_status?(status_name)
+      statuses.include?(status_name.to_s)
+    end
+
+    def crtr_flag?(key)
+      !!flags[key.to_sym]
+    end
+
+    # lich-5's sticky "was <crtrStatus> ever hostile" flag. The stickiness
+    # itself is lich-5's to test; here a test just sets flags[:ever_hostile].
+    def ever_hostile?
+      !!flags[:ever_hostile]
+    end
+
+    # Real CreatureInstance#crtr_flags? is true once any <crtrStatus> has
+    # been seen; a key present as false still counts as seen.
+    def crtr_flags?
+      !flags.empty?
+    end
+
+    # Real CreatureInstance#valid_target? is false whenever the guessed
+    # max_hp/damage_taken heuristic says #dead? - independently of the live
+    # <crtrStatus> dead flag. valid_target_override lets a test put the
+    # double into that same divergent state without a real damage model.
+    def valid_target?
+      return valid_target_override unless valid_target_override.nil?
+
+      !crtr_flag?(:dead)
+    end
+
+    def template
+      nil
+    end
+
+    def low_hp?(_threshold = 25)
+      !!low_hp
+    end
+
+    def fatal_crit?
+      !!fatal_crit
+    end
+
+    def smote?
+      !!smote
+    end
+
+    def ucs_position
+      ucs_pos
+    end
+  end
+
+  # A bare GameObj-shaped double with no .creature accessor at all - what
+  # leader_target? falls back to when GameObj.target has no matching Creature
+  # registry entry, and the shape creature_backed? must recognize as false.
+  RawGameObj = Struct.new(:id, :noun, :name, :status, :type) do
+    def to_s
+      name
+    end
+  end
+
+  class Harness
+    module Creature
+      class << self
+        attr_writer :room_targets, :registry
+
+        def in_room(*_filters)
+          (@room_targets || []).dup
+        end
+
+        def [](id)
+          (@registry || {})[id.to_i]
+        end
+      end
+    end
+
+    module XMLData
+      class << self
+        attr_accessor :current_target_ids
+      end
+    end
+
+    module GameObj
+      class << self
+        attr_accessor :target
+        attr_accessor :registry
+        attr_writer :target_list
+
+        def [](id)
+          (@registry || {})[id]
+        end
+
+        # Stands in for the real GameObj.targets, which bs_hostile_creatures
+        # bridges from for creatures Creature cannot represent (bandits).
+        def targets
+          (@target_list || []).dup
+        end
+      end
+    end
+
+    def initialize
+      Creature.room_targets = []
+      Creature.registry = {}
+      GameObj.registry = {}
+      GameObj.target = nil
+      GameObj.target_list = []
+      XMLData.current_target_ids = []
+    end
+
+    # Registers a creature in both the Creature id registry and the current
+    # room roster, wrapped for the methods under test the way bs_room_creatures
+    # would wrap it.
+    def room(*fake_creatures)
+      Creature.room_targets = fake_creatures
+      Creature.registry = fake_creatures.each_with_object({}) { |c, h| h[c.id] = c }
+    end
+
+    def wrap(fake_creature)
+      BigshotCreature.new(fake_creature)
+    end
+
+    eval(BIGSHOT_CREATURE_SRC)
+    eval(BS_ROOM_CREATURES_SRC)
+    eval(BS_HOSTILE_SRC)
+    eval(UNREPORTED_TARGET_SRC)
+    eval(BS_TARGETS_SRC)
+    eval(CREATURE_BACKED_SRC)
+    eval(DEAD_OR_GONE_SRC)
+    eval(GONE_SRC)
+    eval(NPC_HAS_STATUS_SRC)
+    eval(NPC_CRTR_FLAG_SRC)
+    eval(PRONE_CONSTS_SRC)
+    eval(NPC_FROZEN_SRC)
+    eval(NPC_PRONE_SRC)
+    eval(NPC_LOW_HP_SRC)
+    eval(NPC_FATAL_CRIT_SRC)
+    eval(NPC_SMOTE_SRC)
+    eval(NPC_UCS_POSITION_SRC)
+    eval(NPC_UCS_TIERUP_SRC)
+    eval(LEADER_TARGET_SRC)
+  end
+
+  RSpec.describe 'BigshotCreature adapter and native crtrStatus/HP/UCS reads' do
+    subject(:bs) { Harness.new }
+
+    # bigshot's PRONE constant, as evaluated into the harness.
+    def described_class_prone_regex
+      Harness::PRONE
+    end
+
+    let(:goblin) { FakeCreatureInstance.new(201, 'goblin', 'a snarling goblin') }
+
+    describe '#creature_backed?' do
+      it 'is true for a BigshotCreature wrapping a real CreatureInstance' do
+        expect(bs.creature_backed?(bs.wrap(goblin))).to be true
+      end
+
+      it 'is false for a bare GameObj-shaped double with no .creature accessor' do
+        raw = RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, 'aggressive npc')
+        expect(bs.creature_backed?(raw)).to be false
+      end
+
+      it 'is false for nil' do
+        expect(bs.creature_backed?(nil)).to be false
+      end
+    end
+
+    describe '#status (BigshotCreature, no matching GameObj entry yet)' do
+      it 'is "dead" when the live dead flag is set' do
+        goblin.flags[:dead] = true
+        bs.room(goblin)
+
+        expect(bs.wrap(goblin).status).to eq('dead')
+      end
+
+      it 'is nil for a live, present creature' do
+        bs.room(goblin)
+
+        expect(bs.wrap(goblin).status).to be_nil
+      end
+
+      it 'does NOT synthesize "gone" from valid_target? for a live creature the damage heuristic misjudges' do
+        # Regression guard: real CreatureInstance#valid_target? is false
+        # whenever the guessed max_hp/damage_taken heuristic says #dead?,
+        # independently of the live <crtrStatus> dead flag. Synthesizing
+        # "gone" from that would feed straight into dead_or_gone?/gone? and
+        # misreport a live creature - the exact failure mode this migration
+        # exists to avoid (see the module-level migration notes).
+        goblin.valid_target_override = false
+        bs.room(goblin)
+
+        expect(bs.wrap(goblin).status).to be_nil
+        expect(bs.dead_or_gone?(bs.wrap(goblin))).to be false
+        expect(bs.gone?(bs.wrap(goblin))).to be false
+      end
+    end
+
+    describe '#dead_or_gone?' do
+      it 'is true when the live dead flag is set, regardless of room presence' do
+        goblin.flags[:dead] = true
+        bs.room(goblin)
+
+        expect(bs.dead_or_gone?(bs.wrap(goblin))).to be true
+      end
+
+      it 'does NOT report a live creature as gone merely because it dropped out of the room roster' do
+        # Creature.clear_room fires on every room-objs refresh and only
+        # re-registers an object when a fresh <crtrStatus> arrives for it or
+        # its id is in the client's target dropdown. Treating roster absence
+        # as death made bigshot abandon live creatures for a tick.
+        bs.room # empty roster, but the creature is alive and has no dead flag
+
+        expect(bs.dead_or_gone?(bs.wrap(goblin))).to be false
+      end
+
+      it 'is true when the GameObj status says gone' do
+        bs.room(goblin)
+        Harness::GameObj.registry = { '201' => RawGameObj.new('201', 'goblin', 'a snarling goblin', 'gone', nil) }
+
+        expect(bs.dead_or_gone?(bs.wrap(goblin))).to be true
+      end
+
+      it 'is false for a live, present creature' do
+        bs.room(goblin)
+
+        expect(bs.dead_or_gone?(bs.wrap(goblin))).to be false
+      end
+
+      it 'falls back to the GameObj status regex for a non-creature-backed npc' do
+        raw = RawGameObj.new('201', 'goblin', 'a snarling goblin', 'dead', 'aggressive npc')
+        expect(bs.dead_or_gone?(raw)).to be true
+
+        raw.status = nil
+        expect(bs.dead_or_gone?(raw)).to be false
+      end
+
+      it 'is true for nil' do
+        expect(bs.dead_or_gone?(nil)).to be true
+      end
+    end
+
+    describe '#gone?' do
+      it 'does NOT trivially return true for an already-dead creature still in the room' do
+        # Regression guard: gone? must stay narrower than dead_or_gone? or the
+        # dead_npcs loot loop (which only ever holds already-dead entries)
+        # would skip every corpse instead of looting it.
+        goblin.flags[:dead] = true
+        bs.room(goblin)
+
+        expect(bs.gone?(bs.wrap(goblin))).to be false
+      end
+
+      it 'is true once the GameObj status says gone, not merely on roster absence' do
+        bs.room # roster absence alone must not count
+        expect(bs.gone?(bs.wrap(goblin))).to be false
+
+        Harness::GameObj.registry = { '201' => RawGameObj.new('201', 'goblin', 'a snarling goblin', 'gone', nil) }
+        expect(bs.gone?(bs.wrap(goblin))).to be true
+      end
+    end
+
+    describe '#npc_has_status?' do
+      it 'reads the live status list' do
+        goblin.statuses << 'stunned'
+
+        expect(bs.npc_has_status?(bs.wrap(goblin), 'stunned')).to be true
+        expect(bs.npc_has_status?(bs.wrap(goblin), 'webbed')).to be false
+      end
+
+      it 'degrades to false rather than raising for a non-creature-backed npc' do
+        raw = RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, nil)
+        expect { bs.npc_has_status?(raw, 'stunned') }.not_to raise_error
+        expect(bs.npc_has_status?(raw, 'stunned')).to be false
+      end
+    end
+
+    describe '#npc_crtr_flag?' do
+      it 'reads the live classification flags' do
+        goblin.flags[:mini_boss] = true
+
+        expect(bs.npc_crtr_flag?(bs.wrap(goblin), :mini_boss)).to be true
+        expect(bs.npc_crtr_flag?(bs.wrap(goblin), :ascended)).to be false
+      end
+    end
+
+    describe '#npc_frozen? ("frozen" is the immobilized status)' do
+      it 'reads the native immobilized status, which the legacy string match misses' do
+        # The room text renders this as "(immobile)", so GameObj's status
+        # string never contains "frozen" for an XML-driven immobilize.
+        goblin.statuses << 'immobilized'
+        bs.room(goblin)
+        Harness::GameObj.registry = { '201' => RawGameObj.new('201', 'goblin', 'a snarling goblin', 'immobile', nil) }
+
+        expect(bs.npc_frozen?(bs.wrap(goblin))).to be true
+      end
+
+      it 'still honours the legacy GameObj "frozen" string as a fallback' do
+        bs.room(goblin) # no immobilized status set
+        Harness::GameObj.registry = { '201' => RawGameObj.new('201', 'goblin', 'a snarling goblin', 'frozen', nil) }
+
+        expect(bs.npc_frozen?(bs.wrap(goblin))).to be true
+      end
+
+      it 'is false when the creature is neither' do
+        bs.room(goblin)
+
+        expect(bs.npc_frozen?(bs.wrap(goblin))).to be false
+      end
+
+      it 'is false for a nil npc rather than raising' do
+        expect(bs.npc_frozen?(nil)).to be false
+      end
+    end
+
+    describe '#npc_prone? (crtrStatus carries several statuses; GameObj.status carries one)' do
+      it 'sees prone on a creature whose room text advertises a different status' do
+        # Straight from a real feed line:
+        #   <crtrStatus exist="153281570" hostile="1" stunned="1" prone="1" inferior="1"/>
+        #   ...<a exist="153281570" noun="dybbuk">dybbuk</a> that appears stunned.
+        # The parser assigns a single capture, so GameObj.status is "stunned"
+        # even though the creature is also prone. The old regex also returned
+        # true here (because "stunned" is itself in PRONE); this asserts the
+        # native read reaches the same answer from the accurate source.
+        dybbuk = FakeCreatureInstance.new(153281570, 'dybbuk', 'a dybbuk')
+        dybbuk.flags[:hostile] = true
+        dybbuk.flags[:inferior] = true
+        dybbuk.statuses.push('stunned', 'prone')
+        bs.room(dybbuk)
+        Harness::GameObj.registry = {
+          '153281570' => RawGameObj.new('153281570', 'dybbuk', 'a dybbuk', 'stunned', nil)
+        }
+
+        expect(bs.npc_prone?(bs.wrap(dybbuk))).to be true
+      end
+
+      it 'catches a prone creature whose single status annotation is NOT in the PRONE regex' do
+        # The case the string match misses outright rather than by luck.
+        creature = FakeCreatureInstance.new(501, 'dybbuk', 'a dybbuk')
+        creature.statuses << 'prone'
+        bs.room(creature)
+        Harness::GameObj.registry = {
+          '501' => RawGameObj.new('501', 'dybbuk', 'a dybbuk', 'disoriented', nil)
+        }
+
+        expect(bs.npc_prone?(bs.wrap(creature))).to be true
+      end
+
+      it 'treats immobilized as prone, covering frozen/entangled/held in place' do
+        creature = FakeCreatureInstance.new(502, 'goblin', 'a snarling goblin')
+        creature.statuses << 'immobilized'
+        bs.room(creature)
+
+        expect(bs.npc_prone?(bs.wrap(creature))).to be true
+      end
+
+      it 'agrees with the old regex on a prone-only creature, which really renders "lying down"' do
+        # Measured from real GS4 logs: prone alone renders
+        # "that is lying down.", so GameObj.status is "lying down" and the
+        # old ^lying regex matched it too. Both paths must say true - this
+        # guards against anyone "fixing" one of them apart from the other.
+        creature = FakeCreatureInstance.new(503, 'worm', 'a carrion worm')
+        creature.statuses << 'prone'
+        bs.room(creature)
+        Harness::GameObj.registry = {
+          '503' => RawGameObj.new('503', 'worm', 'a carrion worm', 'lying down', nil)
+        }
+
+        expect(bs.npc_prone?(bs.wrap(creature))).to be true
+      end
+
+      it 'sees prone that the status string masks behind "dead"' do
+        # The one masking case the string cannot express, from real logs:
+        #   <crtrStatus ... hostile="1" dead="1" prone="1"/> ... "that appears dead."
+        # dead_or_gone? gates before this matters, but the native read is
+        # the only path that can see it.
+        corpse = FakeCreatureInstance.new(504, 'fanatic', 'a triton fanatic')
+        corpse.statuses << 'prone'
+        corpse.flags[:dead] = true
+        bs.room(corpse)
+        Harness::GameObj.registry = {
+          '504' => RawGameObj.new('504', 'fanatic', 'a triton fanatic', 'dead', nil)
+        }
+
+        wrapped = bs.wrap(corpse)
+        expect(wrapped.status =~ described_class_prone_regex).to be_nil # string cannot see it
+        expect(bs.npc_prone?(wrapped)).to be true
+      end
+
+      it 'falls back to the regex for an npc with no CreatureInstance behind it' do
+        # Bridged bandits and leader_target?'s fallback have no statuses to
+        # read, so the status string is all there is. "lying down" is the
+        # room-players phrasing for the same state crtrStatus calls prone.
+        raw = RawGameObj.new('88802', 'bandit', 'a grizzled bandit', 'lying down', nil)
+
+        expect(bs.creature_backed?(raw)).to be false
+        expect(bs.npc_prone?(raw)).to be true
+      end
+
+      it 'is false for an upright creature, and nil-safe' do
+        bs.room(goblin)
+
+        expect(bs.npc_prone?(bs.wrap(goblin))).to be false
+        expect(bs.npc_prone?(nil)).to be false
+      end
+    end
+
+    describe 'HP/UCS readers' do
+      it 'npc_low_hp? reads the tracked low-HP state' do
+        goblin.low_hp = true
+        expect(bs.npc_low_hp?(bs.wrap(goblin))).to be true
+      end
+
+      it 'npc_fatal_crit? reads the tracked fatal-crit flag' do
+        goblin.fatal_crit = true
+        expect(bs.npc_fatal_crit?(bs.wrap(goblin))).to be true
+      end
+
+      it 'npc_smote? reads the tracked smite state' do
+        goblin.smote = true
+        expect(bs.npc_smote?(bs.wrap(goblin))).to be true
+      end
+
+      it 'npc_ucs_position/npc_ucs_tierup read the tracked UCS state' do
+        goblin.ucs_pos = 2
+        goblin.ucs_tierup = 'kick'
+
+        wrapped = bs.wrap(goblin)
+        expect(bs.npc_ucs_position(wrapped)).to eq(2)
+        expect(bs.npc_ucs_tierup(wrapped)).to eq('kick')
+      end
+
+      it 'all degrade to a safe default rather than raising for a non-creature-backed npc' do
+        raw = RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, nil)
+
+        expect(bs.npc_low_hp?(raw)).to be false
+        expect(bs.npc_fatal_crit?(raw)).to be false
+        expect(bs.npc_smote?(raw)).to be false
+        expect(bs.npc_ucs_position(raw)).to be_nil
+        expect(bs.npc_ucs_tierup(raw)).to be_nil
+      end
+    end
+
+    describe '#leader_target?' do
+      it 'returns nil when the client has no selected target' do
+        Harness::GameObj.target = nil
+        expect(bs.leader_target?).to be_nil
+      end
+
+      it 'wraps the selected target in BigshotCreature when a Creature registry entry exists' do
+        bs.room(goblin)
+        Harness::GameObj.target = RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, nil)
+
+        result = bs.leader_target?
+        expect(bs.creature_backed?(result)).to be true
+        expect(result.name).to eq('a snarling goblin')
+      end
+
+      it 'falls back to the raw GameObj when no Creature registry entry exists yet' do
+        raw = RawGameObj.new('999', 'orc', 'a hulking orc', nil, nil)
+        bs.room # instantiates bs (which resets GameObj.target) before we set it below
+        Harness::GameObj.target = raw
+
+        result = bs.leader_target?
+        expect(bs.creature_backed?(result)).to be false
+        expect(result).to equal(raw)
+      end
+    end
+
+    describe 'targeting must not depend on Combat::Tracker HP estimates' do
+      # CreatureInstance#valid_target? (and therefore Creature.targets) is
+      # false once #dead? is true, where #dead? means
+      # `max_hp - damage_taken <= 0`. damage_taken is accumulated by
+      # Combat::Tracker from every damage number in the feed, is never reset,
+      # and max_hp is often a guess (131 of 611 bundled templates carry
+      # max_hp: nil -> fallback/400). Group hunting over-attributes damage
+      # roughly per-member. If bigshot trusted that, a live creature would
+      # silently vanish from its target list mid-fight.
+      it 'keeps a creature the tracker believes is dead when the game has not flagged it dead' do
+        tracker_thinks_dead = FakeCreatureInstance.new(301, 'kraken', 'an ancient kraken')
+        tracker_thinks_dead.flags[:hostile] = true
+        # simulates damage_taken >= max_hp with no <crtrStatus> dead flag
+        def tracker_thinks_dead.valid_target? = false
+
+        bs.room(tracker_thinks_dead)
+
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(301)
+        expect(bs.bs_targets.map(&:id)).to include('301')
+      end
+
+      it 'drops a creature the game itself flags dead over <crtrStatus>' do
+        really_dead = FakeCreatureInstance.new(302, 'goblin', 'a snarling goblin')
+        really_dead.flags[:hostile] = true
+        really_dead.flags[:dead] = true
+
+        bs.room(really_dead)
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'excludes appendages and animated decoys, as GameObj.targets did' do
+        # These only ever lived in should_flee?/gameobj_npc_check inside
+        # bigshot - neither is on the sort_npcs -> find_target selection path -
+        # so dropping them here would let bigshot attack a severed limb.
+        arm = FakeCreatureInstance.new(401, 'arm', 'severed troll arm')
+        arm.flags[:hostile] = true
+        # Real GS creature names carry no leading article (the bundled
+        # templates are 'animated guardian', 'animated slush', ...), so
+        # upstream's anchored /^animated\b/ does fire on them.
+        decoy = FakeCreatureInstance.new(402, 'guardian', 'animated guardian')
+        decoy.flags[:hostile] = true
+        slush = FakeCreatureInstance.new(403, 'slush', 'animated slush')
+        slush.flags[:hostile] = true
+        kraken = FakeCreatureInstance.new(404, 'tentacle', 'ghostly kraken tentacle')
+        kraken.flags[:hostile] = true
+
+        bs.room(arm, decoy, slush, kraken)
+
+        ids = bs.bs_hostile_creatures.map(&:id)
+        expect(ids).not_to include(401)
+        expect(ids).not_to include(402)
+        # carve-outs upstream keeps, so we keep them too
+        expect(ids).to include(403)
+        expect(ids).to include(404)
+      end
+
+      it 'drops a non-hostile creature' do
+        bystander = FakeCreatureInstance.new(303, 'child', 'a frightened child')
+
+        bs.room(bystander)
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'keeps a creature that turns sympathetic after being seen hostile' do
+        # <crtrStatus> is a full snapshot, not a delta: casting Sympathy 1120
+        # replaces a creature's hostile="1" with sympathetic="1" in the very
+        # next tag - no hostile flag at all - even though it is still fully
+        # engaged in combat. Requiring hostile alone made bigshot break off
+        # mid-fight the instant Sympathy landed. lich-5's ever_hostile? is
+        # what makes this trustworthy: the creature was seen hostile first.
+        nymph = FakeCreatureInstance.new(304, 'nymph', 'a sea nymph')
+        nymph.flags[:sympathetic] = true
+        nymph.flags[:ever_hostile] = true
+        bs.room(nymph)
+
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(304)
+      end
+
+      it 'drops a creature that is sympathetic but was never seen hostile' do
+        # The failure mode ever_hostile? exists to prevent: sympathetic alone
+        # is not proof of hostility, so a creature the game never once
+        # flagged hostile must not become attackable just because it later
+        # (or always) carries sympathetic.
+        never_hostile = FakeCreatureInstance.new(306, 'nymph', 'a sea nymph')
+        never_hostile.flags[:sympathetic] = true
+
+        bs.room(never_hostile)
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'keeps a fresh mount in the target dropdown that has sent no crtrStatus yet' do
+        # Live capture: the rider's tag arrives with rider="1", but its
+        # mastodon sends nothing until first harmed, even though it is in
+        # the dropdown.
+        mount = FakeCreatureInstance.new(437850810, 'mastodon', 'heavily armored battle mastodon')
+        bs.room(mount)
+        Harness::XMLData.current_target_ids = ['437850810']
+
+        expect(bs.bs_hostile_creatures.map(&:id)).to include(437850810)
+      end
+
+      it 'drops a creature with no crtrStatus that is not in the target dropdown' do
+        mount = FakeCreatureInstance.new(437850810, 'mastodon', 'heavily armored battle mastodon')
+        bs.room(mount)
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'trusts crtrStatus over the dropdown once the game has reported the creature' do
+        # hostile present as false = the feed spoke and said "not hostile".
+        calmed = FakeCreatureInstance.new(308, 'mastodon', 'heavily armored battle mastodon')
+        calmed.flags[:hostile] = false
+        bs.room(calmed)
+        Harness::XMLData.current_target_ids = ['308']
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+
+      it 'still drops a sympathetic creature the game flags dead, even if once hostile' do
+        dead_sympathetic = FakeCreatureInstance.new(305, 'nymph', 'a sea nymph')
+        dead_sympathetic.flags[:sympathetic] = true
+        dead_sympathetic.flags[:ever_hostile] = true
+        dead_sympathetic.flags[:dead] = true
+        bs.room(dead_sympathetic)
+
+        expect(bs.bs_hostile_creatures).to be_empty
+      end
+    end
+
+    describe 'GameObj-only targets (bandits) must still reach the targeting pipeline' do
+      # bandit_track manufactures its quarry with GameObj.new_npc after
+      # scraping a manual "look", because bandits never appear in the normal
+      # room feed. Creature.register is therefore never called for them, and
+      # they could not carry crtr_flag?(:hostile) even if it were, since that
+      # flag only ever comes from a <crtrStatus> tag they never send. Sourcing
+      # targets purely from Creature silently broke $bigshot_bandits: the
+      # bandit was found, added to XMLData.current_target_ids, and then never
+      # targeted.
+      let(:bandit) { RawGameObj.new('88801', 'bandit', 'a grizzled bandit', nil, 'aggressive npc') }
+
+      it 'bridges in a GameObj target that Creature has no instance for' do
+        bs.room # Creature knows about nothing at all
+        Harness::GameObj.target_list = [bandit]
+
+        expect(bs.bs_hostile_creatures).to include(bandit)
+        expect(bs.bs_targets.map(&:id)).to include('88801')
+      end
+
+      it 'hands the bridged GameObj through unwrapped, and it degrades safely' do
+        bs.room
+        Harness::GameObj.target_list = [bandit]
+
+        picked = bs.bs_targets.find { |t| t.id == '88801' }
+        expect(picked).not_to be_nil # else the assertions below pass vacuously
+        expect(picked).to equal(bandit) # handed through, not wrapped
+        expect(bs.creature_backed?(picked)).to be false
+        expect { bs.npc_has_status?(picked, 'stunned') }.not_to raise_error
+        expect(bs.npc_has_status?(picked, 'stunned')).to be false
+      end
+
+      it 'does not double-list a creature Creature already knows about' do
+        # Anything Creature can represent stays on the native roster, so the
+        # stale client-dropdown behavior this migration escaped cannot leak
+        # back in for ordinary creatures.
+        goblin.flags[:hostile] = true
+        bs.room(goblin)
+        Harness::GameObj.target_list = [RawGameObj.new('201', 'goblin', 'a snarling goblin', nil, nil)]
+
+        expect(bs.bs_hostile_creatures.size).to eq(1)
+        expect(bs.bs_hostile_creatures.first).to equal(goblin)
+      end
+    end
+
+    describe 'GameObj.npcs presence checks that must NOT be migrated to Creature.in_room' do
+      # lib/common/xmlparser.rb only registers a room object into Creature
+      # (and re-marks it present on every subsequent room-objs refresh, which
+      # fires far more often than a full room change) when a live
+      # <crtrStatus> tag arrives for it or its id is in the client's target
+      # dropdown (XMLData.current_target_ids). GameObj.npcs has no such gate.
+      # A corpse that stops getting <crtrStatus> updates post-mortem, or a
+      # named-but-not-currently-hostile NPC (a bounty rescue target, a feared
+      # creature that hasn't aggroed yet), can be a real, present room object
+      # while invisible to Creature.in_room/bs_room_creatures. These specific
+      # call sites were migrated to Creature.in_room and then reverted after
+      # tracing that gate in the real parser source - this guards against a
+      # future re-migration repeating the mistake without knowing why.
+      it 'keeps loot()/need_to_loot?/should_flee?/the bounty child-rescue check on GameObj.npcs' do
+        expect(SOURCE).to match(/dead_npcs = GameObj\.npcs\.find_all \{ \|i\| i\.status == 'dead' && i\.type !~ \/escort\/i \}/)
+        expect(SOURCE).to match(/break unless GameObj\.npcs\.any\? \{ \|npc\| npc\.status == 'dead' && npc\.type !~ \/escort\/i \}/)
+        expect(SOURCE).to match(/GameObj\.npcs\.any\? \{ \|i\| @ALWAYS_FLEE_FROM\.include\?\(i\.noun\) or @ALWAYS_FLEE_FROM\.include\?\(i\.name\) \}/)
+        expect(SOURCE).to match(/GameObj\.npcs\.find \{ \|n\| n\.name =~ \/child\/i \}/)
+        expect(SOURCE).to match(/GameObj\.npcs\.any\? \{ \|npc\| npc\.name =~ \/\\\\bchild\\\\b\/ \}/)
+      end
+    end
+  end
+end
+
+# Spec for bigshot.lic's looting_watch pause handling.
+#
+# Regression covered: looting_watch used to check only the *watched*
+# script's (eloot's) pause state, never bigshot's own. When something (e.g.
+# ecleanse) paused bigshot and eloot back-to-back, looting_watch would
+# notice eloot's pause and return to its caller immediately, without regard
+# for bigshot's own pause - letting bigshot's thread run one more loop
+# iteration and race eloot's own independently-resumed thread over the next
+# corpse's Script.kill. The fix adds `Script.current` at the top of the
+# loop, which is the idiom lich-5 uses elsewhere (echo, fput, ...) to block
+# on the calling script's own pause.
+#
+# The stub Script.current models that blocking with a real Mutex/
+# ConditionVariable rather than sleep-based polling, and the spec
+# rendezvouses with the background thread through Queues so the assertions
+# are deterministic instead of racing real wall-clock timing.
+module BigshotLootingWatchSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  LOOTING_WATCH_SRC = extract_from_source(SOURCE, /^  def looting_watch\(script_ran\).*?^  end$/m,
+                                          label: 'looting_watch', source_path: SOURCE_PATH)
+
+  ScriptRef = Struct.new(:name)
+  Item = Struct.new(:type)
+
+  # Stand-in for Lich's Script class. #current models bigshot's own pause
+  # enforcement (Script#wait_while_paused!) with a Mutex/ConditionVariable:
+  # it blocks while the "self" script (bigshot) is paused, and pushes onto
+  # an optional queue right before it starts waiting, so a spec can
+  # rendezvous with that moment instead of guessing at timing.
+  class ScriptRegistry
+    def initialize(self_name:)
+      @self_name = self_name
+      @mutex = Mutex.new
+      @cv = ConditionVariable.new
+      @entries = {}
+      @current_calls = 0
+      @killed = []
+    end
+
+    attr_accessor :waiting_queue
+    attr_reader :current_calls, :killed
+
+    def add(name, paused: false, running: true)
+      @entries[name] = { paused: paused, running: running }
+    end
+
+    def pause(name)
+      @mutex.synchronize { @entries.fetch(name)[:paused] = true }
+    end
+
+    def unpause(name)
+      @mutex.synchronize do
+        @entries.fetch(name)[:paused] = false
+        @cv.broadcast
+      end
+    end
+
+    def paused?(name)
+      @entries.fetch(name)[:paused]
+    end
+
+    def running?(name)
+      @entries.fetch(name)[:running]
+    end
+
+    def kill(name)
+      @entries.fetch(name)[:running] = false
+      @killed << name
+    end
+
+    def current
+      @mutex.synchronize do
+        @current_calls += 1
+        if @entries.fetch(@self_name)[:paused]
+          @waiting_queue&.push(:waiting)
+          @cv.wait(@mutex) while @entries.fetch(@self_name)[:paused]
+        end
+      end
+      self
+    end
+  end
+
+  module Harness
+    module GameObj
+      class << self
+        attr_accessor :right_hand, :left_hand
+      end
+    end
+
+    module Script
+      class << self
+        attr_accessor :registry
+
+        def current
+          registry.current
+        end
+
+        def paused?(name)
+          registry.paused?(name)
+        end
+
+        def running?(name)
+          registry.running?(name)
+        end
+
+        def kill(name)
+          registry.kill(name)
+        end
+      end
+    end
+
+    class Runner
+      eval(BigshotLootingWatchSpec::LOOTING_WATCH_SRC)
+    end
+  end
+end
+
+RSpec.describe 'bigshot looting_watch' do
+  include BigshotLootingWatchSpec
+
+  let(:registry) { BigshotLootingWatchSpec::ScriptRegistry.new(self_name: 'bigshot') }
+  let(:eloot) { BigshotLootingWatchSpec::ScriptRef.new('eloot') }
+  let(:runner) { BigshotLootingWatchSpec::Harness::Runner.new }
+
+  before do
+    registry.add('bigshot')
+    registry.add('eloot')
+    BigshotLootingWatchSpec::Harness::Script.registry = registry
+    BigshotLootingWatchSpec::Harness::GameObj.right_hand = BigshotLootingWatchSpec::Item.new('')
+    BigshotLootingWatchSpec::Harness::GameObj.left_hand = BigshotLootingWatchSpec::Item.new('')
+    $bigshot_should_rest = false
+    $rest_reason = nil
+  end
+
+  after do
+    $bigshot_should_rest = false
+    $rest_reason = nil
+  end
+
+  it 'blocks on its own (bigshot) pause even while the watched script is also paused, ' \
+     'and only returns once bigshot is unpaused' do
+    registry.pause('bigshot')
+    registry.pause('eloot')
+
+    waiting = Queue.new
+    returned = Queue.new
+    registry.waiting_queue = waiting
+
+    thread = Thread.new do
+      runner.looting_watch(eloot)
+      returned.push(:done)
+    end
+
+    waiting.pop # blocks until the thread is parked inside Script.current
+
+    expect(returned).to be_empty
+    expect(registry.killed).to be_empty
+
+    registry.unpause('bigshot')
+    returned.pop # blocks until looting_watch actually returns
+
+    thread.join
+    # eloot is paused but idle (no box in hand, no rest flag), so the loop
+    # exits without killing it - matches the pre-fix behavior for this half
+    # of the condition once bigshot's own pause is no longer in the way.
+    expect(registry.killed).to be_empty
+  end
+
+  it 'still breaks immediately on the watched script pausing when bigshot itself was never paused' do
+    registry.pause('eloot')
+
+    runner.looting_watch(eloot)
+
+    expect(registry.current_calls).to eq(1)
+    expect(registry.killed).to be_empty
+  end
+
+  it 'kills the watched script when it stops running, independent of pause state' do
+    registry.unpause('eloot')
+    registry.kill('eloot')
+
+    runner.looting_watch(eloot)
+
+    expect(registry.current_calls).to eq(1)
+  end
+
+  it 'sets $bigshot_should_rest and the box reason when a box is in hand and eloot is paused' do
+    registry.pause('eloot')
+    BigshotLootingWatchSpec::Harness::GameObj.right_hand = BigshotLootingWatchSpec::Item.new('box')
+
+    runner.looting_watch(eloot)
+
+    expect($bigshot_should_rest).to be true
+    expect($rest_reason).to eq("Box in hand, couldn't store")
+    expect(registry.killed).to eq(['eloot'])
+  end
+
+  it 'kills the watched script when $bigshot_should_rest is already set and it is still running' do
+    registry.unpause('eloot')
+    $bigshot_should_rest = true
+
+    runner.looting_watch(eloot)
+
+    expect(registry.killed).to eq(['eloot'])
+  end
+end
+
+# Spec for bigshot.lic's ES/EB/EC/ED Effects command checks, including the
+# optional seconds-left suffix (e.g. ES"Animate Dead"60).
+module BigshotEffectsCheckSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  EFFECTS_CHECK_SRC = extract_from_source(SOURCE, /^  def effects_check\(modifier\).*?^  end$/m,
+                                          label: 'effects_check', source_path: SOURCE_PATH)
+
+  # Stand-in for a Lich::Gemstone::Effects::Registry, keyed by effect name
+  # to seconds remaining. Like the real one, a Regexp matches the first key
+  # and time_left is in minutes.
+  class FakeRegistry
+    attr_accessor :seconds_left
+
+    def initialize
+      @seconds_left = {}
+    end
+
+    def active?(pattern)
+      !find(pattern).nil?
+    end
+
+    def time_left(pattern)
+      (find(pattern) || 0) / 60.0
+    end
+
+    private
+
+    def find(pattern)
+      @seconds_left.find { |name, _| name =~ pattern }&.last
+    end
+  end
+
+  module Effects
+    Spells = FakeRegistry.new
+    Buffs = FakeRegistry.new
+    Cooldowns = FakeRegistry.new
+    Debuffs = FakeRegistry.new
+  end
+
+  class Harness
+    eval(EFFECTS_CHECK_SRC)
+  end
+end
+
+RSpec.describe 'bigshot Effects command checks' do
+  let(:bs) { BigshotEffectsCheckSpec::Harness.new }
+  let(:spells) { BigshotEffectsCheckSpec::Effects::Spells }
+
+  before do
+    BigshotEffectsCheckSpec::Effects.constants.each do |c|
+      BigshotEffectsCheckSpec::Effects.const_get(c).seconds_left = {}
+    end
+  end
+
+  it 'returns nil for a modifier that is not an Effects check' do
+    expect(bs.effects_check('thp66')).to be_nil
+  end
+
+  context 'without a seconds suffix' do
+    it 'skips ES when the spell is down and runs it when up' do
+      expect(bs.effects_check('ES"Animate Dead"')).to be true
+      spells.seconds_left['Animate Dead'] = 5
+      expect(bs.effects_check('ES"Animate Dead"')).to be false
+    end
+
+    it 'inverts for !ES' do
+      expect(bs.effects_check('!ES"Animate Dead"')).to be false
+      spells.seconds_left['Animate Dead'] = 5
+      expect(bs.effects_check('!ES"Animate Dead"')).to be true
+    end
+
+    it 'reads the matching registry for EB/EC/ED' do
+      BigshotEffectsCheckSpec::Effects::Buffs.seconds_left['Empowered (+30)'] = 30
+      BigshotEffectsCheckSpec::Effects::Cooldowns.seconds_left['Coup de Grace'] = 30
+      BigshotEffectsCheckSpec::Effects::Debuffs.seconds_left['Poisoned'] = 30
+
+      expect(bs.effects_check('EB"Empowered"')).to be false
+      expect(bs.effects_check('!EC"Coup de Grace"')).to be true
+      expect(bs.effects_check('ed"poisoned"')).to be false
+      expect(bs.effects_check('ES"Empowered"')).to be true
+    end
+  end
+
+  context 'with a seconds suffix' do
+    it 'ES"x"60 runs only when the spell is up with at least 60 seconds left' do
+      expect(bs.effects_check('ES"Animate Dead"60')).to be true
+      spells.seconds_left['Animate Dead'] = 59
+      expect(bs.effects_check('ES"Animate Dead"60')).to be true
+      spells.seconds_left['Animate Dead'] = 60
+      expect(bs.effects_check('ES"Animate Dead"60')).to be false
+    end
+
+    it '!ES"x"60 runs when the spell is down or has under 60 seconds left' do
+      expect(bs.effects_check('!ES"Animate Dead"60')).to be false
+      spells.seconds_left['Animate Dead'] = 59
+      expect(bs.effects_check('!ES"Animate Dead"60')).to be false
+      spells.seconds_left['Animate Dead'] = 600
+      expect(bs.effects_check('!ES"Animate Dead"60')).to be true
+    end
+  end
+end
+
+# The once/room command registry is per-room state. It is cleared in
+# reset_variables(moved = true), which prepare_for_movement runs on the
+# leader and, via the :PREP_REST event, on every follower.
+module BigshotCommandRegistrySpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  RESET_VARIABLES_SRC = extract(/^  def reset_variables\(moved = true\).*?^  end$/m, 'reset_variables')
+  PREPARE_FOR_MOVEMENT_SRC = extract(/^  def prepare_for_movement\(move_signs = true\).*?^  end$/m,
+                                     'prepare_for_movement')
+  # Fails loudly if the follower loop stops routing :PREP_REST here.
+  extract(/^      elsif \(event\.type == :PREP_REST\)\n        bs\.prepare_for_movement$/, 'follower :PREP_REST handler')
+
+  class Followers
+    attr_reader :events
+
+    def initialize
+      @events = []
+    end
+
+    def add_event(type)
+      @events << type
+    end
+
+    def roundtime?
+      false
+    end
+  end
+
+  class Harness
+    attr_accessor :COMMANDS_REGISTRY, :leading, :followers
+
+    def initialize(leading:)
+      @leading = leading
+      @followers = Followers.new
+      @COMMANDS_REGISTRY = { 123 => { 'depress(room)' => Time.now } }
+      @DEBUG_SYSTEM = @DEBUG_COMBAT = false
+    end
+
+    def debug_msg(*); end
+    def change_stance(*); end
+    def cast_signs(*); end
+    def wait_while; end
+    def sleep(*); end
+
+    def leading?
+      @leading
+    end
+
+    def solo?
+      false
+    end
+
+    class_eval(RESET_VARIABLES_SRC)
+    class_eval(PREPARE_FOR_MOVEMENT_SRC)
+  end
+end
+
+RSpec.describe 'bigshot once/room command registry' do
+  it 'is cleared when a follower handles :PREP_REST' do
+    bs = BigshotCommandRegistrySpec::Harness.new(leading: false)
+    bs.prepare_for_movement
+    expect(bs.COMMANDS_REGISTRY).to eq({})
+  end
+
+  it 'is cleared on the leader, which sends :PREP_REST to followers' do
+    bs = BigshotCommandRegistrySpec::Harness.new(leading: true)
+    bs.prepare_for_movement
+    expect(bs.COMMANDS_REGISTRY).to eq({})
+    expect(bs.followers.events).to eq([:PREP_REST])
+  end
+
+  it 'is kept when only the target changes in the same room' do
+    bs = BigshotCommandRegistrySpec::Harness.new(leading: false)
+    bs.reset_variables(false)
+    expect(bs.COMMANDS_REGISTRY.keys).to eq([123])
+  end
+end
+
+# cast_signs walks the "signs" setting. Entries can carry extra spell options
+# after the number ("520 fire", "605 evoke"); those go out through cast_spell
+# as an incant. Group evokes need lore ranks, fall back to a plain cast when
+# solo, and spells with a group cooldown evoke while any member is ready
+# rather than while the spell is down on the caster.
+module BigshotCastSignsSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  CAST_SIGNS_SRC = extract(/^  def cast_signs\(single_cast = false\).*?^  end$/m, 'cast_signs')
+  CAST_SPELL_SRC = extract(/^  def cast_spell\(.*?^  end$/m, 'cast_spell')
+
+  # The real cast-proc text Lich runs for a spell, from effect-list.xml.
+  def self.cast_proc(num)
+    require 'rexml/document'
+    @effect_list ||= REXML::Document.new(File.read(find_lic_source('effect-list.xml', from: __dir__)))
+    REXML::XPath.first(@effect_list, "//spell[@number='#{num}']/cast-proc")&.text or
+      raise "no cast-proc for #{num} in effect-list.xml"
+  end
+
+  HINDRANCE = '[Spell Hindrance for Robe is 5% with current Lore ranks.]'
+
+  class Harness
+    module Char
+      class << self
+        attr_accessor :mana
+      end
+    end
+
+    module Stats
+      class << self
+        attr_accessor :prof, :level
+      end
+    end
+
+    module Skills
+      class << self
+        attr_accessor :slblessings, :elair
+      end
+    end
+
+    module UserVars
+      class << self
+        attr_accessor :element
+      end
+    end
+
+    # Bigshot's own follower tracker. Inside Bigshot a bare Group means this,
+    # not the game group, so the code under test must name
+    # Lich::Gemstone::Group; a bare Group.members raises here as it does live.
+    class Group; end
+
+    module Lich
+      module Gemstone
+        module Group
+          class << self
+            attr_accessor :members, :ready
+
+            # Names a group casting would reach now; defaults to every member.
+            def spell_cooldown_ready(spell)
+              (ready || {}).fetch(spell.num) { members }
+            end
+          end
+        end
+      end
+    end
+
+    module Effects
+      class Registry
+        attr_accessor :names
+
+        def active?(name)
+          (names || []).include?(name)
+        end
+      end
+
+      Cooldowns = Registry.new
+      Buffs = Registry.new
+    end
+
+    # Spell double: records each cast call and spends the mana, so the
+    # hindrance retry loop sees mana drop the way it does in game. With a
+    # cast_proc set, cast evals it the way Lich's Spell#cast does (target as
+    # a local, options never passed in) and records the commands it sends.
+    class Spell
+      class << self
+        def book
+          @book ||= {}
+        end
+
+        def [](num)
+          book[num.to_i] ||= new(num.to_i)
+        end
+      end
+
+      attr_accessor :num, :name, :known, :active, :mana_cost, :affordable, :group_cooldown, :last_cast, :results,
+                    :cast_proc
+      attr_reader :calls, :sent
+
+      def initialize(num)
+        @num = num
+        @name = "Spell #{num}"
+        @known = true
+        @active = false
+        @mana_cost = 5
+        @affordable = true
+        @last_cast = Time.at(0)
+        @calls = []
+        @sent = []
+        @results = []
+      end
+
+      def known? = known
+      def active? = active
+      def affordable? = affordable
+
+      def cast(*args)
+        return record(:cast, *args) unless cast_proc
+
+        target = args.first # rubocop:disable Lint/UselessAssignment -- read by the eval'd cast-proc
+        record(:cast_proc, *args)
+        eval(cast_proc) # mirrors Lich's Spell#cast
+      end
+
+      # Lich's force_incant is cast(nil, ...), so a cast-proc runs with no target
+      def force_incant(extra = nil)
+        return cast(nil) if cast_proc
+
+        record(:force_incant, extra)
+      end
+
+      private
+
+      def checkprep
+        'None'
+      end
+
+      def dothistimeout(cmd, *)
+        @sent << cmd
+        'A layer of raw elemental energy forms around you.'
+      end
+
+      def record(*call)
+        @calls << call
+        Char.mana -= mana_cost
+        results.shift || 'You gesture.'
+      end
+    end
+
+    attr_accessor :SIGNS, :bard_renewal_cost
+
+    def initialize(signs)
+      @SIGNS = signs
+      @DEBUG_COMMANDS = false
+      @CHECK_FAVOR = false
+      @USE_WRACKING = false
+      @bard_renewal_cost = 0
+    end
+
+    def debug_msg(*); end
+    def wrack; end
+
+    def dead?
+      false
+    end
+
+    def bard_renewal
+      @bard_renewal_cost
+    end
+
+    class_eval(CAST_SPELL_SRC)
+    class_eval(CAST_SIGNS_SRC)
+  end
+end
+
+RSpec.describe 'bigshot cast_signs' do
+  let(:h) { BigshotCastSignsSpec::Harness }
+
+  before do
+    h::Spell.book.clear
+    h::Char.mana = 100
+    h::Stats.prof = 'Cleric'
+    h::Skills.slblessings = 0
+    h::Skills.elair = 0
+    h::Lich::Gemstone::Group.members = []
+    h::Lich::Gemstone::Group.ready = nil
+    h::Effects::Cooldowns.names = []
+  end
+
+  def cast_signs(*signs, single_cast: false)
+    h.new(signs).cast_signs(single_cast)
+  end
+
+  def calls(num)
+    h::Spell[num].calls
+  end
+
+  def group!(*names)
+    h::Lich::Gemstone::Group.members = names
+  end
+
+  context 'with a plain spell number' do
+    it 'casts it with no arguments, as before' do
+      cast_signs('9903')
+      expect(calls(9903)).to eq([[:cast]])
+    end
+
+    it 'skips a spell that is already active' do
+      h::Spell[9903].active = true
+      cast_signs('9903')
+      expect(calls(9903)).to be_empty
+    end
+
+    it 'stops after the first cast with single_cast' do
+      cast_signs('9903', '9904', single_cast: true)
+      expect(calls(9903)).to eq([[:cast]])
+      expect(calls(9904)).to be_empty
+    end
+  end
+
+  context 'with extra spell options' do
+    it 'incants the spell with them' do
+      cast_signs('503 open')
+      expect(calls(503)).to eq([[:force_incant, 'open']])
+    end
+
+    it 'applies the 515 mana check to the parsed spell number' do
+      h::Spell[597].active = true
+      h::Spell[520].mana_cost = 10
+      h::Char.mana = 12
+      cast_signs('520 fire')
+      expect(calls(520)).to be_empty
+    end
+  end
+
+  # Spell#cast runs a cast-proc in place of its own incant, and the proc never
+  # sees the options, only the target. Mage Armor's proc reads the element
+  # from the target, falling back to UserVars.element.
+  describe 'Mage Armor (520), through its real cast-proc' do
+    before do
+      h::Spell[520].cast_proc = BigshotCastSignsSpec.cast_proc(520)
+      h::UserVars.element = 'water'
+    end
+
+    it 'sends the element from the entry, not UserVars.element' do
+      cast_signs('520 fire')
+      expect(h::Spell[520].sent).to eq(['incant 520 fire'])
+    end
+
+    it 'still uses UserVars.element for a plain 520' do
+      cast_signs('520')
+      expect(h::Spell[520].sent).to eq(['incant 520 water '])
+    end
+  end
+
+  describe 'Barkskin (605) evoke' do
+    before { h::Skills.slblessings = 50 }
+
+    it 'evokes for the group with 50 SL:Blessings ranks' do
+      group!('Grhim')
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:force_incant, 'evoke']])
+    end
+
+    it 'plain-casts when solo' do
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:cast]])
+    end
+
+    it 'plain-casts when short on ranks' do
+      group!('Grhim')
+      h::Skills.slblessings = 49
+      cast_signs('605 evoke')
+      expect(calls(605)).to eq([[:cast]])
+    end
+
+    it 'skips the evoke under 15 mana' do
+      group!('Grhim')
+      h::Char.mana = 14
+      cast_signs('605 evoke')
+      expect(calls(605)).to be_empty
+    end
+
+    it 'stops retrying a hindered evoke below 15 mana, not 5' do
+      group!('Grhim')
+      h::Char.mana = 20
+      h::Spell[605].results = [BigshotCastSignsSpec::HINDRANCE] * 5
+      cast_signs('605 evoke')
+      # 20 -> 15 (still covers 15), retry -> 10, short for an evoke: stop
+      expect(calls(605).size).to eq(2)
+    end
+
+    it 'prices the 515 cooldown penalty on the 15-mana evoke, not the 5-mana cast' do
+      group!('Grhim')
+      h::Spell[597].active = true
+      { 17 => 0, 19 => 0, 20 => 1 }.each do |mana, casts|
+        h::Spell[605].calls.clear
+        h::Char.mana = mana
+        cast_signs('605 evoke')
+        expect(calls(605).size).to eq(casts), "at #{mana} mana"
+      end
+    end
+
+    it 'skips while Barkskin is on cooldown' do
+      group!('Grhim')
+      h::Effects::Cooldowns.names = ['Barkskin']
+      cast_signs('605 evoke')
+      expect(calls(605)).to be_empty
+    end
+  end
+
+  describe 'group evokes with a group cooldown (211, 215, 219, 506)' do
+    {
+      211 => [:slblessings, 25],
+      215 => [:slblessings, 35],
+      219 => [:slblessings, 50],
+      506 => [:elair, 50]
+    }.each do |num, (lore, ranks)|
+      context "#{num} evoke" do
+        before do
+          h::Spell[num].group_cooldown = 180
+          h::Spell[num].active = true # our own long self-cast is up
+          h::Skills.public_send("#{lore}=", ranks)
+          group!('Grhim', 'Dicate')
+        end
+
+        it 'evokes while a member is off cooldown, even with our own self-cast up' do
+          h::Lich::Gemstone::Group.ready = { num => ['Dicate'] }
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to eq([[:force_incant, 'evoke']])
+        end
+
+        it 'waits while every member is on cooldown' do
+          h::Lich::Gemstone::Group.ready = { num => [] }
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to be_empty
+        end
+
+        it "plain-casts below #{ranks} ranks once our own cast is down" do
+          h::Skills.public_send("#{lore}=", ranks - 1)
+          h::Spell[num].active = false
+          cast_signs("#{num} evoke")
+          expect(calls(num)).to eq([[:cast]])
+        end
+      end
+    end
+
+    it 'checks EL:Air, not SL:Blessings, for 506' do
+      h::Spell[506].group_cooldown = 240
+      h::Skills.slblessings = 100
+      group!('Grhim')
+      cast_signs('506 evoke')
+      expect(calls(506)).to eq([[:cast]])
+    end
+
+    it 'still skips 211 while we are on our own Bravery cooldown' do
+      h::Spell[211].group_cooldown = 180
+      h::Spell[211].name = 'Bravery'
+      h::Effects::Cooldowns.names = ['Bravery']
+      h::Skills.slblessings = 25
+      group!('Grhim')
+      cast_signs('211 evoke')
+      expect(calls(211)).to be_empty
+    end
+  end
+
+  describe 'hindrance retries' do
+    before { h::Spell[9903].results = [BigshotCastSignsSpec::HINDRANCE] * 5 }
+
+    it 'retries up to 3 times' do
+      cast_signs('9903')
+      expect(calls(9903).size).to eq(3)
+    end
+
+    it 'stops once mana would dip into the Bard song renewal reserve' do
+      h::Stats.prof = 'Bard'
+      h::Char.mana = 30
+      bs = h.new(['9903'])
+      bs.bard_renewal_cost = 20
+      bs.cast_signs
+      # 30 -> 25 (still covers 20 + 5), retry -> 20, below the reserve: stop
+      expect(calls(9903).size).to eq(2)
+    end
+  end
+end
+
+# cmd_wand waves from your hands unless the command says "reserve", which
+# moves the wand into the RESERVE slot first (the reverse of cmd_wandolier,
+# which uses RESERVE unless told "noreserve"). It also takes a stance word.
+module BigshotWandSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  CMD_WAND_SRC = extract(/^  def cmd_wand\(target, args = nil\).*?^  end$/m, 'cmd_wand')
+  WAND_NAME_PATTERN_SRC = extract(/^  def wand_name_pattern\(name\).*?^  end$/m, 'wand_name_pattern')
+  # cmd_wandolier must share the escaped matcher rather than build its own.
+  extract(/^  def cmd_wandolier\(target, args\)(?:(?!^  end$).)*wand_name_pattern\(@WAND\[\$bigshot_wand\]\)/m,
+          'cmd_wandolier uses wand_name_pattern')
+  DISPATCH_SRC = extract(/^    elsif \(command =~ (\/\^wand\\b.*?\/i)\)\n      cmd_wand\(npc, \$1\)$/, 'cmd wand dispatch')
+  DISPATCH_RE = Regexp.new(DISPATCH_SRC[/\/(\^wand.*?)\/i/, 1], Regexp::IGNORECASE)
+  # Fails loudly if the out-of-mana fallback stops calling cmd_wand with no args.
+  extract(/^      if \(@WAND_IF_OOM\)\n        cmd_wand\(target\); return;$/, 'wand_if_oom fallback')
+  # Fails loudly if rest stops starting the next hunt back on the first wand type.
+  extract(/^  def rest\(\)(?:(?!^  end$).)*^    \$bigshot_wand = 0$/m, 'rest resets wand index')
+
+  Item = Struct.new(:id, :name)
+  Target = Struct.new(:id)
+
+  class Harness
+    class GameObj
+      class << self
+        attr_accessor :right_hand, :left_hand, :reserve
+      end
+    end
+
+    attr_accessor :FRESH_WAND_CONTAINER, :DEAD_WAND_CONTAINER, :WAND, :wave_result
+    attr_reader :sent, :stances, :messages
+
+    def initialize(wands_in_container: [Item.new('100', 'oaken wand')])
+      @FRESH_WAND_CONTAINER = 'cloak'
+      @DEAD_WAND_CONTAINER = nil
+      @WAND = ['oaken wand']
+      @HUNTING_STANCE = 'defensive'
+      @container = wands_in_container.dup
+      @sent = []
+      @stances = []
+      @messages = []
+      @wave_result = 'd100 roll'
+      GameObj.right_hand = Item.new(nil, 'Empty')
+      GameObj.left_hand = Item.new(nil, 'Empty')
+      GameObj.reserve = []
+      $bigshot_wand = 0
+    end
+
+    def debug_msg(*); end
+    def message(_color, text) = @messages << text
+    def change_stance(stance) = @stances << stance
+    def bs_put(cmd) = @sent << cmd
+
+    def fput(cmd)
+      @sent << cmd
+      GameObj.reserve ||= [] if cmd == 'reserve list'
+      return unless cmd =~ /^reserve #(\d+)$/
+
+      held = GameObj.right_hand
+      return unless held.id == Regexp.last_match(1)
+
+      @reserved = held
+      GameObj.reserve << held unless reserve_list_stale
+      GameObj.right_hand = Item.new(nil, 'Empty')
+    end
+
+    def dothistimeout(cmd, _timeout, _pattern)
+      @sent << cmd
+      return clear_reserve(Regexp.last_match(1)) if cmd =~ /^reserve clear #(\d+)$/
+
+      wand = @container.find { |w| cmd.include?(w.name) }
+      return 'Get what?' unless wand
+
+      @container.delete(wand)
+      GameObj.right_hand = wand
+      get_reply || "You remove #{wand.name}."
+    end
+
+    attr_accessor :hands_full, :reserve_list_stale
+
+    # RESERVE CLEAR moves the item back into a hand, if one is free
+    def clear_reserve(id)
+      item = GameObj.reserve.find { |o| o.id == id } || (@reserved if @reserved&.id == id)
+      return nil if item.nil? || hands_full
+
+      GameObj.reserve.delete(item)
+      GameObj.right_hand = item
+      "You remove #{item.name} from your reserves and hold it in your hand."
+    end
+
+    def get_res(cmd, _pattern)
+      @sent << cmd
+      @wave_result
+    end
+
+    attr_accessor :get_reply
+
+    class_eval(WAND_NAME_PATTERN_SRC)
+    class_eval(CMD_WAND_SRC)
+  end
+end
+
+RSpec.describe 'bigshot cmd_wand' do
+  let(:bs) { BigshotWandSpec::Harness.new }
+  let(:target) { BigshotWandSpec::Target.new('555') }
+
+  after do
+    $bigshot_wand = 0
+    $bigshot_should_rest = nil
+    $rest_reason = nil
+  end
+
+  describe 'command parsing' do
+    it 'passes stance and reserve tokens through to cmd_wand' do
+      expect('wand guarded reserve'[BigshotWandSpec::DISPATCH_RE, 1].split).to eq(%w[guarded reserve])
+    end
+
+    it 'still matches a bare "wand"' do
+      expect('wand'[BigshotWandSpec::DISPATCH_RE, 1]).to eq('')
+    end
+
+    it 'does not swallow "wandolier"' do
+      expect('wandolier guarded').not_to match(BigshotWandSpec::DISPATCH_RE)
+    end
+  end
+
+  describe 'plain "wand" (the default)' do
+    it 'gets the wand, waves it from your hand at the target and never touches RESERVE' do
+      bs.cmd_wand(target)
+
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'wave #100 at #555'])
+      expect(bs.class::GameObj.right_hand.id).to eq('100')
+      expect(bs.class::GameObj.reserve).to be_empty
+    end
+
+    it 'waves in offensive stance, then returns to the hunting stance' do
+      bs.cmd_wand(target, '')
+      expect(bs.stances).to eq(%w[offensive defensive])
+    end
+
+    it 'ignores a wand already sitting in RESERVE and gets one for your hand' do
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'wave #100 at #555'])
+    end
+
+    it 'drops a dead wand by id' do
+      bs.wave_result = nil
+      bs.cmd_wand(target)
+      expect(bs.sent.last).to eq('drop #100')
+    end
+
+    it 'puts a dead wand in the dead wand container by id' do
+      bs.wave_result = nil
+      bs.DEAD_WAND_CONTAINER = 'sack'
+      bs.cmd_wand(target)
+      expect(bs.sent.last).to eq('put #100 in my sack')
+    end
+  end
+
+  describe '"wand reserve"' do
+    it 'moves the wand into RESERVE and waves it from there' do
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'reserve #100', 'wave #100 at #555'])
+      expect(bs.class::GameObj.right_hand.name).to eq('Empty')
+      expect(bs.class::GameObj.reserve.map(&:id)).to eq(['100'])
+    end
+
+    it 'waves a wand already in RESERVE without getting another' do
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent).to eq(['wave #200 at #555'])
+    end
+
+    it 'asks for the reserve list when RESERVE has not been seen yet' do
+      bs.class::GameObj.reserve = nil
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.first).to eq('reserve list')
+    end
+
+    it 'takes a dead wand out of RESERVE before dropping it' do
+      bs.wave_result = nil
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last(3)).to eq(['wave #100 at #555', 'reserve clear #100', 'drop #100'])
+      expect(bs.class::GameObj.reserve).to be_empty
+    end
+
+    it 'takes a dead wand out of RESERVE before putting it in the dead wand container' do
+      bs.wave_result = nil
+      bs.DEAD_WAND_CONTAINER = 'sack'
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.last(2)).to eq(['reserve clear #100', 'put #100 in my sack'])
+    end
+
+    it 'takes a dead wand out of RESERVE even if the reserve list has not refreshed yet' do
+      bs.wave_result = nil
+      bs.reserve_list_stale = true
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last(3)).to eq(['wave #100 at #555', 'reserve clear #100', 'drop #100'])
+    end
+
+    it 'warns and keeps hunting when a dead wand cannot come out of RESERVE' do
+      bs.wave_result = nil
+      bs.class::GameObj.reserve = [BigshotWandSpec::Item.new('200', 'oaken wand')]
+      bs.hands_full = true
+      bs.cmd_wand(target, ' reserve')
+
+      expect(bs.sent.last).to eq('reserve clear #200')
+      expect(bs.messages.last).to match(/Couldn't take the dead wand out of RESERVE/)
+      expect($bigshot_should_rest).to be_falsey
+    end
+
+    it 'refreshes the reserve list when the reserved wand is gone' do
+      bs.wave_result = 'What were you referring to?'
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent.last).to eq('reserve list')
+    end
+  end
+
+  it 'uses the given stance' do
+    bs.cmd_wand(target, ' guarded reserve')
+    expect(bs.stances).to eq(%w[guarded defensive])
+  end
+
+  it 'moves on to the next wand type when the container has none of the first' do
+    bs = BigshotWandSpec::Harness.new(wands_in_container: [BigshotWandSpec::Item.new('300', 'iron wand')])
+    bs.WAND = ['oaken wand', 'iron wand']
+    bs.cmd_wand(target)
+    expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'wave #300 at #555'])
+  end
+
+  describe 'with blank entries in the wand setting' do
+    let(:sword) { BigshotWandSpec::Item.new('900', 'broadsword') }
+    let(:iron) { BigshotWandSpec::Item.new('300', 'iron wand') }
+    let(:bs) { BigshotWandSpec::Harness.new(wands_in_container: [iron]) }
+
+    before { bs.class::GameObj.right_hand = sword }
+
+    [['oaken wand', '', 'iron wand'], ['oaken wand', ' ', 'iron wand']].each do |setting|
+      it "skips the blank entry in #{setting.inspect} and leaves the held weapon alone" do
+        bs.WAND = setting
+        bs.cmd_wand(target)
+        expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'wave #300 at #555'])
+      end
+    end
+
+    it 'skips a blank entry in reserve mode too' do
+      bs.WAND = ['oaken wand', '', 'iron wand']
+      bs.cmd_wand(target, ' reserve')
+      expect(bs.sent).to eq(['get oaken wand from my cloak', 'get iron wand from my cloak', 'reserve #300', 'wave #300 at #555'])
+    end
+
+    it 'skips a leading blank entry' do
+      bs.WAND = ['', 'iron wand']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get iron wand from my cloak', 'wave #300 at #555'])
+    end
+
+    it 'rests when only a blank entry is left after the last wand type' do
+      bs.WAND = ['oaken wand', '']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get oaken wand from my cloak'])
+      expect($rest_reason).to eq('No fresh wands!')
+    end
+  end
+
+  it 'rests when no wand type is left' do
+    bs = BigshotWandSpec::Harness.new(wands_in_container: [])
+    bs.cmd_wand(target)
+    expect($bigshot_should_rest).to be true
+    expect($rest_reason).to eq('No fresh wands!')
+  end
+
+  it 'accepts a wand that slides out of its container' do
+    bs.get_reply = 'You slide an oaken wand out of your cloak.'
+    bs.cmd_wand(target)
+    expect(bs.sent.last).to eq('wave #100 at #555')
+    expect(bs.messages).to be_empty
+  end
+
+  describe 'wand name matching' do
+    it 'matches the setting words in order' do
+      expect('polished oaken wand').to match(bs.wand_name_pattern('oaken wand'))
+      expect('oaken polished wand').to match(bs.wand_name_pattern('polished wand'))
+      expect('wand of oak').not_to match(bs.wand_name_pattern('oak wand'))
+    end
+
+    it 'treats regex characters in the name literally' do
+      expect('wand (glowing)').to match(bs.wand_name_pattern('wand (glowing)'))
+      expect('c++ wand').to match(bs.wand_name_pattern('c++ wand'))
+      expect('cccc wand').not_to match(bs.wand_name_pattern('c++ wand'))
+    end
+
+    it 'waves a wand whose name has regex characters' do
+      bs = BigshotWandSpec::Harness.new(wands_in_container: [BigshotWandSpec::Item.new('400', 'wand (glowing)')])
+      bs.WAND = ['wand (glowing)']
+      bs.cmd_wand(target)
+      expect(bs.sent).to eq(['get wand (glowing) from my cloak', 'wave #400 at #555'])
+    end
+  end
+
+  describe 'with no wand name to use' do
+    let(:sword) { BigshotWandSpec::Item.new('900', 'broadsword') }
+
+    before { bs.class::GameObj.right_hand = sword }
+
+    [nil, ' reserve'].each do |args|
+      it "leaves the held weapon alone when every wand type is used up (args: #{args.inspect})" do
+        $bigshot_wand = 1
+        bs.cmd_wand(target, args)
+        expect(bs.sent).to be_empty
+        expect(bs.messages.last).to match(/no wand type left/)
+      end
+    end
+
+    [nil, [], ['']].each do |setting|
+      it "leaves the held weapon alone when the wand setting is #{setting.inspect}" do
+        bs.WAND = setting
+        bs.cmd_wand(target)
+        expect(bs.sent).to be_empty
+        expect(bs.messages.last).to match(/no wand type left/)
+      end
+    end
+  end
+
+  it 'reports a missing fresh wand container' do
+    bs.FRESH_WAND_CONTAINER = nil
+    bs.cmd_wand(target)
+    expect(bs.messages.last).to match(/fresh wand container not defined/)
+    expect(bs.sent).to be_empty
+  end
+end
+
+# split_xx parses the hunting command settings: comma-separated commands,
+# each optionally repeated with (xN)/(xx) and split on " and ". The result
+# feeds command_check, whose modifier regex is anchored on ")$", so any
+# whitespace left on a command hides its modifiers and the command always
+# runs.
+module BigshotSplitXxSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  CLEAN_VALUE_SRC = extract_from_source(SOURCE, /^  def clean_value\(clean, value\).*?^  end$/m,
+                                        label: 'clean_value', source_path: SOURCE_PATH)
+  MODIFIER_REGEX_SRC = extract_from_source(SOURCE, /^    @COMMAND_MODIFIER_REGEX = .*$/,
+                                           label: '@COMMAND_MODIFIER_REGEX', source_path: SOURCE_PATH)
+
+  class Harness
+    eval(CLEAN_VALUE_SRC)
+
+    attr_reader :COMMAND_MODIFIER_REGEX
+
+    def initialize
+      instance_eval(MODIFIER_REGEX_SRC)
+    end
+
+    def split_xx(value)
+      clean_value('split_xx', value)
+    end
+  end
+end
+
+RSpec.describe 'bigshot split_xx command parsing' do
+  let(:bs) { BigshotSplitXxSpec::Harness.new }
+  let(:modifier_regex) { bs.COMMAND_MODIFIER_REGEX }
+
+  def commands(result)
+    result.flat_map { |c| Array(c) }
+  end
+
+  it 'leaves no surrounding whitespace on any command' do
+    [
+      'incant 214 (m20 webbed frozen) (x2)',
+      'incant 214 (m20 webbed frozen) (xx)',
+      'incant 214 (m20) , incant 903',
+      'incant 903 (x5) , kill',
+      'stance def and 1615 target, kill (x5)',
+      'a (m1) and b (m2) (x2)',
+      'a (m1)  and b (m2)',
+      'a (m1) and  b (m2)'
+    ].each do |value|
+      commands(bs.split_xx(value)).each do |c|
+        expect(c).to eq(c.strip), "#{value.inspect} produced #{c.inspect}"
+      end
+    end
+  end
+
+  it 'keeps modifiers visible on a repeated command' do
+    result = bs.split_xx('incant 214 (m20 webbed frozen) (x2)')
+    expect(result).to eq(['incant 214 (m20 webbed frozen)'] * 2)
+    expect(result.first.match(modifier_regex)[1]).to eq('m20 webbed frozen')
+  end
+
+  it 'repeats (xx) five times with modifiers visible' do
+    result = bs.split_xx('incant 214 (m20 webbed frozen) (xx)')
+    expect(result).to eq(['incant 214 (m20 webbed frozen)'] * 5)
+    expect(result.first).to match(modifier_regex)
+  end
+
+  it 'keeps modifiers visible when a space comes before the comma' do
+    result = bs.split_xx('incant 214 (m20) , incant 903')
+    expect(result).to eq(['incant 214 (m20)', 'incant 903'])
+    expect(result.first).to match(modifier_regex)
+  end
+
+  it 'keeps the repeat when a space comes before the comma' do
+    expect(bs.split_xx('incant 903 (x5) , kill')).to eq(['incant 903'] * 5 + ['kill'])
+  end
+
+  it 'keeps an and-command as an array and repeats the next command' do
+    expect(bs.split_xx('stance def and 1615 target, kill (x5)'))
+      .to eq([['stance def', '1615 target']] + ['kill'] * 5)
+  end
+
+  it 'keeps modifiers visible on each part of a repeated and-command' do
+    result = bs.split_xx('a (m1) and b (m2) (x2)')
+    expect(result).to eq([['a (m1)', 'b (m2)']] * 2)
+    result.first.each { |part| expect(part).to match(modifier_regex) }
+  end
+
+  it 'splits on and surrounded by extra spaces' do
+    expect(bs.split_xx('a (m1)  and b (m2)')).to eq([['a (m1)', 'b (m2)']])
+    expect(bs.split_xx('force 1615 (m20) and  kill')).to eq([['force 1615 (m20)', 'kill']])
+  end
+
+  it 'does not split words that contain and' do
+    expect(bs.split_xx('wave band, throw sand')).to eq(['wave band', 'throw sand'])
+  end
+
+  it 'strips the space before a repeat on a command with no modifiers' do
+    expect(bs.split_xx('incant 903, kill (x2)')).to eq(['incant 903', 'kill', 'kill'])
   end
 end
