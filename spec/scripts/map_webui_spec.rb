@@ -90,6 +90,29 @@ RSpec.describe 'ElanthiaMap::Window' do
     expect(started).to eq([['go2', ['1', '_disable_confirm_']]])
   end
 
+  it 'returns focus to the frontend after a left click, but not a right click' do
+    returned = []
+    window.define_singleton_method(:return_focus) { returned << :focus }
+    window.define_singleton_method(:diag) { |*| nil }
+    window.define_singleton_method(:defer_start_script) { |*| nil }
+
+    window.on_surface_activate(Struct.new(:payload).new({ x: 520, y: 430, button: 'secondary', modifiers: [] }))
+    expect(returned).to be_empty
+
+    window.on_surface_activate(Struct.new(:payload).new({ x: 520, y: 430, button: 'primary', modifiers: [] }))
+    expect(returned).to eq([:focus])
+  end
+
+  it 'returns focus after clicking a room with a note' do
+    returned = []
+    window.define_singleton_method(:return_focus) { returned << :focus }
+    window.define_singleton_method(:defer_start_script) { |*| nil }
+
+    window.on_region_activate(Struct.new(:payload).new({ region: 'note-5' }))
+
+    expect(returned).to eq([:focus])
+  end
+
   it 'centres through the shared scroll origin once the viewport is known' do
     window.instance_variable_set(:@viewport, { width: 400, height: 300 })
 
