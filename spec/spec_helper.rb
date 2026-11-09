@@ -143,14 +143,14 @@ end
 # A few specs need to test against real lich-5 API surface (small pure
 # logic, constants) pinned to a specific release, rather than hand-mirror it
 # and risk silently drifting from what that release actually implements.
-# See .github/workflows/rspec_tests.yaml for the pinned release CI checks
+# See .github/workflows/ci.yml for the pinned release CI checks
 # out into LICH5_PATH -- extract from it with extract_from_source above,
 # same as any other source string.
 
 # Locates a local lich-5 checkout, checked in order:
 #
 # 1. The LICH5_PATH env var -- set by CI after checking out the pinned
-#    lich-5 release (see .github/workflows/rspec_tests.yaml).
+#    lich-5 release (see .github/workflows/ci.yml).
 # 2. A sibling `lich-5` checkout next to this repo's own checkout -- this
 #    project's normal local multi-repo dev layout (lich-5, dr-scripts,
 #    scripts, and ProfanityFE as sibling directories).
@@ -179,6 +179,34 @@ def read_lich5_source(relative_path)
   return nil unless File.exist?(path)
 
   File.read(path).gsub("\r\n", "\n")
+end
+
+# Evaluates the located lich-5 checkout's real GemStone map class (plus the
+# StringProc it uses for timeto edges) inside namespace, so a spec can build
+# a small room graph and drive the real path_to, dijkstra and estimate_time
+# without defining a process-wide Lich::Common::Map that would leak into
+# every other spec. The class starts empty and marked as loaded, so it never
+# tries to read a map database from disk.
+#
+# Works on both map layouts: map_gs.rb on its own (Lich before 5.14), and
+# map_gs.rb on top of map_base.rb (5.14 and later).
+#
+# @param namespace [Module] a spec-private module to evaluate the files in
+# @return [Class, nil] namespace's Lich::Common::Map, or nil if no checkout
+#   is available -- callers should skip gracefully, as with read_lich5_source
+def load_lich5_map(namespace)
+  stringproc = read_lich5_source('lib/common/class_exts/stringproc.rb')
+  map_gs = read_lich5_source('lib/common/map/map_gs.rb')
+  return nil unless stringproc && map_gs
+
+  map_base = read_lich5_source('lib/common/map/map_base.rb')
+  namespace.module_eval(stringproc, 'lich-5/lib/common/class_exts/stringproc.rb')
+  namespace.module_eval(map_base, 'lich-5/lib/common/map/map_base.rb') if map_base
+  namespace.module_eval(map_gs.sub(/^require_relative 'map_base'\n/, ''), 'lich-5/lib/common/map/map_gs.rb')
+
+  map = namespace::Lich::Common::Map
+  map.respond_to?(:mark_loaded) ? map.mark_loaded : map.class_variable_set(:@@loaded, true)
+  map
 end
 
 # -- Generic Lich runtime stand-ins --------------------------------------

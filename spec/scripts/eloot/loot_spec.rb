@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require_relative '../spec_helper'
+require_relative '../../spec_helper'
 
 # RSpec for ELoot::Loot.pool_full_recovery? (the sell-in-place recovery decision).
 #
@@ -20,7 +20,7 @@ RSpec.describe 'ELoot::Loot.pool_full_recovery?' do
   # Sourcing the real method keeps this spec from drifting from the shipped code; if the
   # source or method cannot be found, it fails loudly rather than passing on a stale copy.
   let(:predicate) do
-    path = find_lic_source('eloot.lic', from: __dir__)
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
     body = extract_lic_method(File.read(path), 'pool_full_recovery?', source_path: path)
 
     Module.new { module_eval(body) }
@@ -86,10 +86,10 @@ end
 # empty when nothing there sells it) and visits each distinct shop once, not once per
 # item -- the whole point of selling in a batch instead of one item at a time.
 RSpec.describe 'ELoot::Loot.sell_box_contents' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
-  let(:item_class) { Struct.new(:id, :name) }
+  let(:item_class) { Struct.new(:id, :name, :noun) }
   let(:calls) { [] }
 
   # item name => Sell.check_items(items: [item]) result, so each context only has to
@@ -102,16 +102,54 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
   # Shops the current town hasn't got (ELoot.nearest_shop returns nil for these).
   let(:unavailable_shops) { [] }
 
+  # The box sits in the right hand; `hand` is whatever is in the left (at most one item).
+  # drag fills it unless the id is undraggable; a sale empties it unless the item is in
+  # unsold (appraise leaves it) or paid_in_note (a bond note replaces it).
+  let(:hand) { [] }
+  let(:undraggable) { [] }
+  let(:unsold) { [] }
+  let(:paid_in_note) { [] }
+  let(:wont_fit_back) { [] }
+  let(:notes_fit) { true }
+  let(:note) { item_class.new('note-1', 'a Northwatch bond note', 'note') }
+
   let(:harness) do
     recorder = calls
     routes = routing
     missing = unavailable_shops
+    left = hand
+    stuck = undraggable
+    kept = unsold
+    noted = paid_in_note
+    no_room = wont_fit_back
+    fits = notes_fit
+    bond = note
+    the_box = box
+    empty = item_class.new(nil, 'Empty')
+    settle = lambda do |item|
+      left.clear unless kept.include?(item.name)
+      left.replace([bond]) if noted.include?(item.name)
+    end
 
     mod = Module.new
     mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
+    mod.define_singleton_method(:in_hand?) { |item| item.id == the_box.id || left.any? { |h| h.id == item.id } }
+    mod.define_singleton_method(:get_command) do |cmd, _regex, **_kw|
+      recorder << [:put, cmd]
+      left.clear unless no_room.any? { |id| cmd.include?("##{id} ") }
+      []
+    end
+    data_obj = Object.new
+    data_obj.define_singleton_method(:put_regex) { /put/ }
+    mod.define_singleton_method(:data) { data_obj }
     # Mirrors ELoot.nearest_shop: nil when the town hasn't got the shop.
     mod.define_singleton_method(:nearest_shop) { |shop| missing.include?(shop) ? nil : "#{shop}-room" }
     mod.const_set(:ELoot, mod)
+
+    gameobj = Module.new
+    gameobj.define_singleton_method(:right_hand) { the_box }
+    gameobj.define_singleton_method(:left_hand) { left.first || empty }
+    mod.const_set(:GameObj, gameobj)
 
     room = Module.new
     current = Module.new
@@ -124,12 +162,26 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
     mod.const_set(:Room, room)
 
     inventory = Module.new
-    inventory.define_singleton_method(:drag) { |item| recorder << [:drag, item.name] }
+    inventory.define_singleton_method(:drag) do |item|
+      recorder << [:drag, item.name]
+      left.replace([item]) unless stuck.include?(item.id)
+    end
+    inventory.define_singleton_method(:single_drag) do |item, on_full: :pause|
+      recorder << [:single_drag, item.name, on_full]
+      left.clear if fits
+    end
     mod.const_set(:Inventory, inventory)
 
     mod.define_singleton_method(:check_items) { |items:| routes[items.first.name] || [] }
-    mod.define_singleton_method(:appraise) { |item, place, _data| recorder << [:appraise, item.name, place] }
-    mod.define_singleton_method(:sell_item) { |item, place, _data| recorder << [:sell_item, item.name, place] }
+    mod.define_singleton_method(:appraise) do |item, place, _data, stow: true|
+      recorder << [:appraise, item.name, place]
+      recorder << [:appraise_stowed] if stow
+      settle.call(item)
+    end
+    mod.define_singleton_method(:sell_item) do |item, place, _data|
+      recorder << [:sell_item, item.name, place]
+      settle.call(item)
+    end
     mod.const_set(:Sell, mod)
 
     mod.module_eval(extract_lic_method(source, 'sell_box_contents', source_path: eloot_path))
@@ -260,6 +312,85 @@ RSpec.describe 'ELoot::Loot.sell_box_contents' do
       expect(calls).to be_empty
     end
   end
+
+  # The pool recovery could not put a stuck item back in the box, so it is sold
+  # straight out of hand rather than dragged (which would free the box's hand).
+  context 'an item already in hand' do
+    let(:orb) { item_class.new('1', 'a heavy quartz orb') }
+    let(:hand) { [orb] }
+    let(:routing) { { 'a heavy quartz orb' => ['gemshop'] } }
+
+    it 'sells it without dragging' do
+      harness.sell_box_contents(box, data, [orb])
+
+      expect(calls).to eq([[:go2, 'gemshop-room'], [:appraise, 'a heavy quartz orb', 'Gemshop']])
+    end
+  end
+
+  context 'an item that could not be picked up' do
+    let(:gone) { item_class.new('1', 'a gold ingot') }
+    let(:box_contents) { [gone] }
+    let(:undraggable) { ['1'] }
+    let(:routing) { { 'a gold ingot' => ['gemshop'] } }
+
+    it 'is not appraised' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls.map(&:first)).not_to include(:appraise)
+    end
+  end
+
+  # v2.14.2: an item over the appraisal limit was stowed into the full containers.
+  context 'an item that appraises above the limit' do
+    let(:plate) { item_class.new('1', 'some vultite full plate') }
+    let(:ring) { item_class.new('2', 'a gold ring') }
+    let(:box_contents) { [plate, ring] }
+    let(:unsold) { ['some vultite full plate'] }
+    let(:routing) { { 'some vultite full plate' => ['pawnshop'], 'a gold ring' => ['pawnshop'] } }
+
+    it 'goes back in the box instead of a container, and selling carries on' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).not_to include([:appraise_stowed])
+      expect(calls).to include([:put, 'put #1 in #box-1'], [:appraise, 'a gold ring', 'Pawnshop'])
+    end
+
+    context 'and will not fit back in the box' do
+      let(:wont_fit_back) { ['1'] }
+
+      it 'stops before the next drag can free the box hand' do
+        harness.sell_box_contents(box, data)
+
+        expect(calls).not_to include([:drag, 'a gold ring'])
+      end
+    end
+  end
+
+  # v2.14.2: a pawnshop short on silver pays with a bond note, left in hand.
+  context 'a sale paid with a bond note' do
+    let(:staff) { item_class.new('1', 'an orase runestaff') }
+    let(:dress) { item_class.new('2', 'a pink dress') }
+    let(:box_contents) { [staff, dress] }
+    let(:paid_in_note) { ['an orase runestaff'] }
+    let(:routing) { { 'an orase runestaff' => ['pawnshop'], 'a pink dress' => ['pawnshop'] } }
+
+    it 'stows the note, never putting it in the box' do
+      harness.sell_box_contents(box, data)
+
+      expect(calls).to include([:single_drag, 'a Northwatch bond note', :signal], [:drag, 'a pink dress'])
+      expect(calls).not_to include([:put, 'put #note-1 in #box-1'])
+    end
+
+    context 'when the note will not fit anywhere' do
+      let(:notes_fit) { false }
+
+      it 'stops selling with the note still in hand' do
+        harness.sell_box_contents(box, data)
+
+        expect(calls).not_to include([:drag, 'a pink dress'])
+      end
+    end
+  end
 end
 
 # RSpec for ELoot::Loot.pool_direct_sell_recovery -- the sell-in-place recovery itself.
@@ -269,10 +400,10 @@ end
 # rest of the run's backlog) or something is left with nowhere to sell it (hand off to
 # the existing disk-park recovery instead of pausing outright).
 RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
-  let(:hand_class) { Struct.new(:id, :name) }
+  let(:hand_class) { Struct.new(:id, :name, :noun) }
   let(:empty_hand) { hand_class.new(nil, 'Empty') }
   let(:box_contents) { [] }
   let(:box) { Struct.new(:id, :name, :contents).new('box-1', 'a strongbox', box_contents) }
@@ -282,6 +413,7 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
   # sell_box_contents removes whatever it sold from the box; the spec controls the
   # outcome directly by handing sell_box_contents a block that mutates box_contents.
   let(:drains_box) { true }
+  let(:right_hand) { empty_hand }
 
   let(:harness) do
     recorder = calls
@@ -289,6 +421,7 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
     contents = box_contents
     the_box = box
     empty = empty_hand
+    right = right_hand
 
     mod = Module.new
     mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
@@ -309,7 +442,7 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
     mod.const_set(:Room, room)
 
     gameobj = Module.new
-    gameobj.define_singleton_method(:right_hand) { empty }
+    gameobj.define_singleton_method(:right_hand) { right }
     gameobj.define_singleton_method(:left_hand) { empty }
     mod.const_set(:GameObj, gameobj)
 
@@ -324,8 +457,10 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
     script.define_singleton_method(:current) { current_script }
     mod.const_set(:Script, script)
 
-    mod.define_singleton_method(:sell_box_contents) do |b, _data|
-      recorder << [:sell_box_contents, b.name]
+    mod.define_singleton_method(:sell_box_contents) do |b, _data, items = nil|
+      recorder << (items ? [:sell_box_contents, b.name, items.map(&:name)] : [:sell_box_contents, b.name])
+      next if items
+
       contents.clear if drains
     end
     mod.define_singleton_method(:pool_sell_recovery) do |b, location, _data|
@@ -383,10 +518,32 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
       expect(calls.map(&:first)).not_to include(:save_trash_box, :sell)
     end
   end
+
+  # v2.14.2: the stuck item would not go back in the box, leaving both hands full.
+  context 'the stuck item is still in hand after trying to return it' do
+    let(:right_hand) { hand_class.new('7', 'a heavy quartz orb') }
+
+    it 'sells the stuck item before the rest of the box' do
+      harness.pool_direct_sell_recovery(box, 'Icemule Trace', data)
+
+      sells = calls.select { |c| c.first == :sell_box_contents }
+      expect(sells).to eq([[:sell_box_contents, 'a strongbox', ['a heavy quartz orb']], [:sell_box_contents, 'a strongbox']])
+    end
+  end
+
+  context 'a bond note is in hand' do
+    let(:right_hand) { hand_class.new('8', 'a Northwatch bond note', 'note') }
+
+    it 'is not put in the box' do
+      harness.pool_direct_sell_recovery(box, 'Icemule Trace', data)
+
+      expect(calls).not_to include(a_collection_including(:get_command, 'put #8 in #box-1'))
+    end
+  end
 end
 
 RSpec.describe 'ELoot disk-backed box routing' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -416,18 +573,24 @@ RSpec.describe 'ELoot disk-backed box routing' do
     expect(data.disk).to equal(disk_obj)
   end
 
-  it 'rescans boxes after the disk arrives at the locksmith pool' do
-    item_class = Struct.new(:id, :type, :name)
-    box = item_class.new('box-1', 'box', 'a waterlogged coffer')
-    empty = item_class.new(nil, '', 'Empty')
+  # Runs the real locksmith_pool against stubbed hands, containers and worker.
+  # `stashed` are the boxes find_boxes sees once the disk has arrived; only those can
+  # be dragged, like the game, where a box not in a container comes back "Get what?".
+  # Each give is recorded with the id of the box in the right hand at the time, and the
+  # confirmed give takes that box.
+  def run_pool(stashed:, passed: [], right: nil, left: nil)
+    box_obj = Struct.new(:id, :type, :name)
+    empty = box_obj.new(nil, '', 'Empty')
+    rec = Struct.new(:dragged, :gives, :find_boxes_calls).new([], [], 0)
 
     game_obj = Module.new
     game_obj.singleton_class.attr_accessor :right_hand, :left_hand
-    game_obj.right_hand = empty
-    game_obj.left_hand = empty
+    game_obj.right_hand = right || empty
+    game_obj.left_hand = left || empty
+
+    disk_ready = false
 
     inventory = Module.new
-    inventory.singleton_class.attr_accessor :dragged
     inventory.define_singleton_method(:free_hands) do |both: false|
       next unless both
 
@@ -435,8 +598,8 @@ RSpec.describe 'ELoot disk-backed box routing' do
       game_obj.left_hand = empty
     end
     inventory.define_singleton_method(:drag) do |item|
-      self.dragged = item
-      game_obj.right_hand = item
+      rec.dragged << item
+      game_obj.right_hand = item if disk_ready && stashed.include?(item)
     end
     inventory.define_singleton_method(:single_drag) { |_item| nil }
 
@@ -454,9 +617,6 @@ RSpec.describe 'ELoot disk-backed box routing' do
     )
 
     eloot = Module.new
-    eloot.singleton_class.attr_accessor :find_boxes_calls
-    eloot.find_boxes_calls = 0
-    disk_ready = false
     eloot.define_singleton_method(:data) { data }
     eloot.define_singleton_method(:f2p?) { false }
     eloot.define_singleton_method(:msg) { |**| nil }
@@ -467,8 +627,8 @@ RSpec.describe 'ELoot disk-backed box routing' do
     eloot.define_singleton_method(:wait_rt) { nil }
     eloot.define_singleton_method(:box_unphase) { |item| item }
     eloot.define_singleton_method(:find_boxes) do
-      self.find_boxes_calls += 1
-      disk_ready ? [box] : []
+      rec.find_boxes_calls += 1
+      disk_ready ? stashed : []
     end
 
     sell = Module.new
@@ -477,15 +637,47 @@ RSpec.describe 'ELoot disk-backed box routing' do
     sell.const_set(:GameObj, game_obj)
     sell.const_set(:Inventory, inventory)
     sell.const_set(:Loot, loot)
-    sell.define_singleton_method(:dothistimeout) do |_command, _timeout, _match|
+    sell.define_singleton_method(:fput) do |command|
+      next unless command == 'swap'
+
+      game_obj.right_hand, game_obj.left_hand = game_obj.left_hand, game_obj.right_hand
+    end
+    sell.define_singleton_method(:dothistimeout) do |command, _timeout, _match|
+      if command.end_with?('confirm')
+        game_obj.right_hand = empty
+      else
+        rec.gives << game_obj.right_hand.id
+      end
       'takes your box, totaling 150 silvers'
     end
+    sell.module_eval(extract_lic_method(source, 'pool_box_order', source_path: eloot_path))
     sell.module_eval(extract_lic_method(source, 'locksmith_pool', source_path: eloot_path))
 
-    sell.locksmith_pool([])
+    sell.locksmith_pool(passed)
+    rec
+  end
 
-    expect(eloot.find_boxes_calls).to eq(1)
-    expect(inventory.dragged).to equal(box)
+  let(:box_class) { Struct.new(:id, :type, :name) }
+
+  it 'rescans boxes after the disk arrives at the locksmith pool' do
+    box = box_class.new('box-1', 'box', 'a waterlogged coffer')
+
+    rec = run_pool(stashed: [box])
+
+    expect(rec.find_boxes_calls).to eq(1)
+    expect(rec.dragged).to eq([box])
+  end
+
+  # v2.14.2: from a live log. The held haon trunk was handed in on the maoral trunk's
+  # turn, then its own turn failed to find it and gave with an empty hand.
+  it 'hands in a box already in hand on its own turn, then the stashed ones' do
+    held = box_class.new('haon', 'box', 'haon trunk')
+    stashed = box_class.new('maoral', 'box', 'scarred maoral trunk')
+
+    rec = run_pool(stashed: [stashed], passed: [held], left: held)
+
+    expect(rec.gives).to eq(%w[haon maoral])
+    expect(rec.dragged).to eq([stashed])
   end
 end
 
@@ -502,7 +694,7 @@ end
 # or method cannot be found the spec fails loudly rather than passing on a stale copy.
 
 RSpec.describe 'ELoot::Loot.loot_specials' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:method_body) { extract_lic_method(File.read(eloot_path), 'loot_specials', source_path: eloot_path) }
 
@@ -665,7 +857,7 @@ end
 # the shipped source.
 
 RSpec.describe 'ELoot box-looting call sites' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -737,7 +929,7 @@ end
 # never opens, so the predicate and the routing are pinned here.
 
 RSpec.describe 'ELoot::Sell.town_openable?' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -832,7 +1024,7 @@ RSpec.describe 'ELoot::Sell.town_openable?' do
 end
 
 RSpec.describe 'ELoot::Sell.process_boxes routing' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -881,7 +1073,7 @@ end
 # of its own, though, so it is exercised for real against a small stand-in for Sell/ELoot.
 
 RSpec.describe 'ELoot::Sell locksmith_priority routing' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -1039,7 +1231,7 @@ RSpec.describe 'ELoot::Sell.gem_bounty_override?' do
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
     ].find { |p| File.exist?(p) }
     raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
@@ -1128,7 +1320,7 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
     ].find { |p| File.exist?(p) }
     raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
@@ -1173,6 +1365,12 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
   # which is exactly what "pool is full" already covers.
   let(:pool_result) { :noop }
 
+  # How many Sell.locksmith calls fail to clear the box (table/bell/keys/chime not
+  # found, etc.) before one finally succeeds. 0 means the very first call succeeds,
+  # matching every pre-v2.11.9 scenario below. A value >= the number of calls
+  # box_in_hand actually makes means town never succeeds at all.
+  let(:town_open_failures) { 0 }
+
   let(:harness) do
     r = right
     l = left
@@ -1186,6 +1384,7 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
     openable = town_openable
     pool_res = pool_result
     empty = empty_hand
+    remaining_failures = town_open_failures
 
     gameobj = Module.new
     gameobj.define_singleton_method(:right_hand) { r }
@@ -1209,6 +1408,12 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
     mod.define_singleton_method(:gem_bounty_override?) { override }
     mod.define_singleton_method(:locksmith) do |items|
       log << [:locksmith, items.map(&:noun)]
+
+      if remaining_failures.positive?
+        remaining_failures -= 1
+        next
+      end
+
       items.each do |it|
         l = empty if l.equal?(it)
         r = empty if r.equal?(it)
@@ -1255,6 +1460,44 @@ RSpec.describe 'ELoot::Sell.box_in_hand' do
       harness.box_in_hand
 
       expect(routing_calls(calls)).to eq([[:locksmith, ['strongbox']]])
+    end
+  end
+
+  # v2.11.9: the first town attempt failing to clear the box (no table/bell/keys/chime
+  # found, an empty "look", etc. -- anything short of a real per-box refusal, which
+  # town_openable? already screens out) used to fall straight into the unconditional
+  # pool loop below, shipping the box to the pool on the very first hiccup even with
+  # Locksmith Priority set to town first.
+  context 'Locksmith Priority set to town first, the first town attempt fails to clear the box' do
+    let(:priority) { 'locksmith' }
+    let(:town_open_failures) { 1 }
+
+    it 'gives town a second try instead of falling back to the pool immediately' do
+      harness.box_in_hand
+
+      expect(routing_calls(calls)).to eq([[:locksmith, ['strongbox']], [:locksmith, ['strongbox']]])
+    end
+
+    it 'never touches the pool once the second town attempt succeeds' do
+      harness.box_in_hand
+
+      expect(routing_calls(calls).map(&:first)).not_to include(:locksmith_pool)
+    end
+  end
+
+  context 'Locksmith Priority set to town first, town keeps failing to clear the box' do
+    let(:priority) { 'locksmith' }
+    let(:town_open_failures) { 999 }
+
+    it 'retries town at most once before falling back to the pool, rather than looping forever' do
+      begin
+        harness.box_in_hand
+      rescue RuntimeError
+        nil
+      end
+
+      calls_before_pool = routing_calls(calls).take_while { |c| c.first == :locksmith }
+      expect(calls_before_pool.length).to eq(2)
     end
   end
 
@@ -1336,7 +1579,7 @@ RSpec.describe 'ELoot::Sell.locksmith insufficient-silver retry' do
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
     ].find { |p| File.exist?(p) }
     raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
@@ -1411,7 +1654,7 @@ RSpec.describe 'ELoot::Sell.process_boxes gem-bounty predicate reuse' do
       File.expand_path('../eloot.lic', __dir__),
       File.expand_path('../../eloot.lic', __dir__),
       File.expand_path('../scripts/eloot.lic', __dir__),
-      File.expand_path('../../scripts/eloot.lic', __dir__) # spec/scripts/ -> scripts/
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
     ].find { |p| File.exist?(p) }
     raise "eloot.lic not found (looked relative to #{__dir__})" unless path
 
@@ -1448,7 +1691,7 @@ end
 # the spec fails loudly rather than passing on a stale copy.
 
 RSpec.describe 'ELoot.marked_unsellable?' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -1533,7 +1776,7 @@ RSpec.describe 'ELoot.marked_unsellable?' do
 end
 
 RSpec.describe 'ELoot.toss' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -1707,7 +1950,7 @@ end
 # source, the same way the box-looting call sites above are pinned.
 
 RSpec.describe 'ELoot trash/drop call sites' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
 
   let(:source) { File.read(eloot_path) }
 
@@ -1745,7 +1988,7 @@ RSpec.describe 'ELoot trash/drop call sites' do
 end
 
 RSpec.describe 'ELoot unskinnable-list management' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
   let(:settings) { { unskinnable: ['massive troll king', 'greater earth elemental'] } }
   let(:data) { Struct.new(:settings).new(settings) }
@@ -1826,7 +2069,7 @@ end
 # Sell.sell_item), so the spec fails loudly instead of silently drifting if the
 # shipped logic changes shape.
 RSpec.describe 'ELoot::Sell.appraise' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
   let(:item_class) { Struct.new(:id, :name, :type, :sellable) }
@@ -1842,10 +2085,18 @@ RSpec.describe 'ELoot::Sell.appraise' do
 
   let(:calls) { [] }
 
+  # '' means no appraisal container is set. When one is, store_item succeeds (the item
+  # leaves the hand) unless appraisal_container_full.
+  let(:appraisal_container) { '' }
+  let(:appraisal_container_full) { false }
+
   let(:harness) do
     recorder = calls
     reply = response
     data_obj = data
+    container = appraisal_container
+    container_full = appraisal_container_full
+    in_hand = [true]
 
     mod = Module.new
     mod.define_singleton_method(:get_command) do |command, _regex, **kw|
@@ -1855,15 +2106,23 @@ RSpec.describe 'ELoot::Sell.appraise' do
     mod.define_singleton_method(:msg) { |**kw| recorder << [:msg, kw] }
     mod.define_singleton_method(:ensure_items) { |**kw| recorder << [:ensure_items, kw] }
     mod.define_singleton_method(:data) { data_obj }
+    mod.define_singleton_method(:in_hand?) { |_item| in_hand.first }
     mod.const_set(:ELoot, mod)
 
     stow_list = Module.new
-    stow_list.define_singleton_method(:stow_list) { Hash.new('') }
+    stow_list.define_singleton_method(:stow_list) { Hash.new('').merge(appraisal_container: container) }
     mod.const_set(:StowList, stow_list)
 
     inventory = Module.new
-    inventory.define_singleton_method(:single_drag) { |item| recorder << [:single_drag, item.name] }
-    inventory.define_singleton_method(:store_item) { |container, item| recorder << [:store_item, container, item.name] }
+    inventory.define_singleton_method(:single_drag) do |item|
+      recorder << [:single_drag, item.name]
+      in_hand[0] = false
+    end
+    inventory.define_singleton_method(:store_item) do |bag, item|
+      recorder << [:store_item, bag, item.name]
+      in_hand[0] = container_full
+      !container_full
+    end
     mod.const_set(:Inventory, inventory)
 
     mod.module_eval(extract_lic_method(source, 'parse_appraisal', source_path: eloot_path))
@@ -1944,6 +2203,86 @@ RSpec.describe 'ELoot::Sell.appraise' do
       expect(data.over_max.first[:note]).to eq('gemshop declined (not jewelry), over pawnshop limit')
     end
   end
+
+  # v2.14.2: the locksmith pool recovery appraises with stow: false because its regular
+  # bags are full. An item it doesn't sell must not be stowed there, but the appraisal
+  # container is a separate bag and is still tried.
+  context 'with stow: false (locksmith pool recovery)' do
+    let(:plate) { item_class.new('1', 'some vultite full plate', 'armor', 'gemshop,pawnshop') }
+
+    context 'an over-limit item and an appraisal container with room' do
+      let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+      let(:appraisal_container) { 'leather satchel' }
+
+      it 'stores it in the appraisal container and reports it as stowed there' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(calls).to include([:store_item, 'leather satchel', 'some vultite full plate'])
+        expect(calls.map(&:first)).not_to include(:single_drag)
+        expect(data.over_max.first[:stowed]).to eq('leather satchel')
+      end
+    end
+
+    context 'an over-limit item and a full appraisal container' do
+      let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+      let(:appraisal_container) { 'leather satchel' }
+      let(:appraisal_container_full) { true }
+
+      it 'leaves it in hand without claiming it was stowed' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(calls.map(&:first)).not_to include(:single_drag)
+        expect(data.over_max.first).not_to have_key(:stowed)
+      end
+    end
+
+    context 'an over-limit item with no appraisal container' do
+      let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+
+      it 'leaves it in hand' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(calls.map(&:first)).not_to include(:single_drag, :store_item)
+        expect(data.over_max.first).not_to have_key(:stowed)
+      end
+    end
+
+    context 'the gemshop refuses it as too valuable, with pawn recheck on' do
+      let(:response) { 'The jeweler says, "I\'m not buying anything this valuable today."' }
+      let(:settings) { { sell_appraise_gemshop: 14_999, sell_appraise_pawnshop: 4_999, sell_pawn_recheck: true } }
+
+      it 'does not queue it for the recheck while it is going back in the box' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(data.pawn_recheck).to be_empty
+      end
+    end
+
+    context 'the gemshop says it is not its specialty' do
+      let(:response) { 'The jeweler Etaenia says, "That\'s not quite my field, Renian.  I only deal in gems and jewelry."' }
+
+      it 'neither stows it nor queues it for the pawnshop retry' do
+        harness.appraise(plate, 'Gemshop', stow: false)
+
+        expect(calls.map(&:first)).not_to include(:single_drag)
+        expect(data.jewelry_wrong_shop).to be_empty
+      end
+    end
+  end
+
+  # The same over-limit item through the normal sell trip (stow: true).
+  context 'an over-limit item when the appraisal container is full' do
+    let(:response) { 'The jeweler says, "I\'ll give you 50,000 for it if you want to sell it."' }
+    let(:appraisal_container) { 'leather satchel' }
+    let(:appraisal_container_full) { true }
+    let(:plate) { item_class.new('1', 'some vultite full plate', 'armor', 'gemshop,pawnshop') }
+
+    it 'does not report it as stowed there' do
+      harness.appraise(plate, 'Gemshop')
+
+      expect(data.over_max.first).not_to have_key(:stowed)
+    end
+  end
 end
 
 # retry_wrong_shop_jewelry_at_pawnshop's whole purpose (its second commit, added after
@@ -1954,7 +2293,7 @@ end
 # edit that drops or misplaces the wrapper fails a test instead of only showing up as a
 # short breakdown total in a live session.
 RSpec.describe 'ELoot::Sell.retry_wrong_shop_jewelry_at_pawnshop' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
   let(:item_class) { Struct.new(:id, :name, :type, :sellable) }
@@ -2093,7 +2432,7 @@ end
 # distinct note (added for the gemshop-declined-as-not-jewelry case above) gets its
 # own heading instead of being merged into the first one under a misleading label.
 RSpec.describe 'ELoot::Sell.over_max_rows' do
-  let(:eloot_path) { find_lic_source('eloot.lic', from: __dir__) }
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
   let(:source) { File.read(eloot_path) }
 
   let(:harness) do
@@ -2213,7 +2552,7 @@ end
 # so it cannot drift from the shipped code.
 RSpec.describe 'ELoot.shop_unavailable_in_town?' do
   let(:guard) do
-    path = find_lic_source('eloot.lic', from: __dir__)
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
     source = File.read(path)
     body = extract_lic_method(source, 'shop_unavailable_in_town?', source_path: path)
     # The predicate reads the HINTERWILDS_TOWN_UID constant defined alongside it in
@@ -2299,7 +2638,7 @@ end
 # since its whole contract is "nil means don't go".
 RSpec.describe 'ELoot.nearest_shop' do
   let(:lookup) do
-    path = find_lic_source('eloot.lic', from: __dir__)
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
     source = File.read(path)
     body = extract_lic_method(source, 'nearest_shop', source_path: path)
 
@@ -2332,5 +2671,937 @@ RSpec.describe 'ELoot.nearest_shop' do
 
   it 'returns nil when the shop is allowed but unreachable' do
     expect(with(unavailable: false, found: nil).nearest_shop('pawnshop')).to be_nil
+  end
+end
+
+# RSpec for ELoot::Hoard.hoarding_list's single-item filter.
+#
+# hoarding_list(single) previously matched with an unanchored, unescaped
+# `item.name =~ /#{single}/`, a plain substring search. Any reagent/gem whose
+# name is a substring of another's (e.g. "ayanad crystal" inside
+# "t'ayanad crystal") was incorrectly swept into the other's result, so
+# store_items would drag the wrong reagent into an already-labeled jar and the
+# game would reject it ("already contains ayanad crystals, so you think
+# better of mixing in your t'ayanad crystal"). Exercises the real method body
+# with fake containers/data -- hoarding_list's own collaborators (StowList,
+# Inventory.open_single_container, ELoot.data) are all easily stubbed.
+
+RSpec.describe 'ELoot::Hoard.hoarding_list' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__), # delivered alongside the spec
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_body) do
+    body = source[/^ {4}def self\.hoarding_list\b[\s\S]*?^ {4}end$/]
+    raise "hoarding_list could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  let(:item_class) { Struct.new(:name, :type, :id) }
+  let(:data_class) { Struct.new(:container_settings, :hoard_type, :settings, :items_to_hoard) }
+
+  let(:container_items) do
+    [
+      item_class.new('ayanad crystal', 'reagent', 'id-ayanad'),
+      item_class.new("t'ayanad crystal", 'reagent', "id-t'ayanad"),
+      item_class.new('essence of water', 'reagent', 'id-essence')
+    ]
+  end
+
+  let(:harness) do
+    items = container_items
+    container = Struct.new(:contents).new(items)
+
+    data = data_class.new([:pouch], 'alchemy', { alchemy_horde_use_overflow: false }, nil)
+
+    eloot = Module.new
+    eloot.define_singleton_method(:data) { data }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { pouch: container } }
+
+    inventory = Module.new
+    inventory.define_singleton_method(:open_single_container) { |_c| }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Inventory, inventory)
+    mod.module_eval(method_body)
+    mod
+  end
+
+  before { $sell_ignore = [] }
+
+  it "does not confuse a reagent name that is a substring of another's (ayanad crystal / t'ayanad crystal)" do
+    expect(harness.hoarding_list('ayanad crystal').map(&:name)).to eq(['ayanad crystal'])
+  end
+
+  it "still finds the longer name on its own, not swept up by the shorter one" do
+    expect(harness.hoarding_list("t'ayanad crystal").map(&:name)).to eq(["t'ayanad crystal"])
+  end
+
+  it 'still matches by exact name as before for reagents with no overlap' do
+    expect(harness.hoarding_list('essence of water').map(&:name)).to eq(['essence of water'])
+  end
+end
+
+# Companion to the spec above: proves the anchored match doesn't regress the actual
+# purpose of hoarding_list(single) -- gathering every physical copy of one exact
+# gem/reagent name scattered across the configured hoard containers (backpack, mantle,
+# overflow, ...) before jarring them together in one trip. Anchoring only narrows what
+# matches (an exact match under the old unanchored /#{single}/ is still an exact match
+# under /\A#{single}\z/), so duplicates of the same name across containers, and the gem
+# code path specifically (not just alchemy/reagent), both still work.
+RSpec.describe 'ELoot::Hoard.hoarding_list (duplicate-grouping, gem type)' do
+  let(:eloot_path) do
+    path = [
+      File.expand_path('eloot.lic', __dir__),
+      File.expand_path('../eloot.lic', __dir__),
+      File.expand_path('../../eloot.lic', __dir__),
+      File.expand_path('../scripts/eloot.lic', __dir__),
+      File.expand_path('../../../scripts/eloot.lic', __dir__) # spec/scripts/eloot/ -> scripts/
+    ].find { |p| File.exist?(p) }
+    raise "eloot.lic not found (looked relative to #{__dir__})" unless path
+
+    path
+  end
+
+  let(:source) { File.read(eloot_path) }
+
+  let(:method_body) do
+    body = source[/^ {4}def self\.hoarding_list\b[\s\S]*?^ {4}end$/]
+    raise "hoarding_list could not be extracted from #{eloot_path}" unless body
+
+    body
+  end
+
+  let(:item_class) { Struct.new(:name, :type, :id) }
+  let(:data_class) { Struct.new(:container_settings, :hoard_type, :settings, :items_to_hoard) }
+
+  let(:harness) do
+    # Two containers, each holding its own "fire opal" -- the scenario hoarding_list(single)
+    # exists for: find every copy of the same exact gem name, wherever it's stashed.
+    backpack = Struct.new(:contents).new([item_class.new('fire opal', 'gem', 'id-opal-1')])
+    mantle = Struct.new(:contents).new([item_class.new('fire opal', 'gem', 'id-opal-2')])
+
+    data = data_class.new(%i[backpack mantle], 'gem', { gem_horde_use_overflow: false }, nil)
+
+    eloot = Module.new
+    eloot.define_singleton_method(:data) { data }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { backpack: backpack, mantle: mantle } }
+
+    inventory = Module.new
+    inventory.define_singleton_method(:open_single_container) { |_c| }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Inventory, inventory)
+    mod.module_eval(method_body)
+    mod
+  end
+
+  before { $sell_ignore = [] }
+
+  it 'still gathers every copy of the exact same gem name across different containers' do
+    expect(harness.hoarding_list('fire opal').map(&:id)).to contain_exactly('id-opal-1', 'id-opal-2')
+  end
+end
+
+# RSpec for the locker selection and entry helpers behind ELoot::Hoard.go2_locker.
+#
+# Fixtures mirror the real GS mapdb: town-tagged rooms carry a prefixed location
+# ("the town of Wehnimer's Landing", id 228) while the CHE locker rooms in that town use the
+# bare name, and ~600 rooms have a `false` location. Room#dijkstra is stubbed the way
+# lich-5's really behaves: given an Array destination it stops at the first one reached, so
+# the stub refuses an Array argument.
+RSpec.describe 'ELoot::Hoard locker selection and entry' do
+  let(:room_class) do
+    Struct.new(:id, :location, :tags, :town) do
+      def find_nearest_by_tag(_tag) = town
+    end
+  end
+
+  def room(id, location, town, *tags)
+    room_class.new(id, location, tags, town)
+  end
+
+  let(:source) { File.read(find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))) }
+  let(:path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
+
+  def extract(*names)
+    names.map { |name| extract_lic_method(source, name, source_path: path) }
+  end
+
+  let(:log) { { msgs: [], go2: [], moves: [], sleeps: [], commands: [] } }
+  let(:info_lines) { [] }
+  let(:current) { Struct.new(:id, :distances, :previous).new(0, {}, {}) }
+  let(:rooms_by_id) { {} }
+
+  let(:harness) do
+    log = self.log
+    current = self.current
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |text: '', **| log[:msgs] << text }
+    eloot.define_singleton_method(:go2) { |place| log[:go2] << place; current.id = place if place.is_a?(Integer) }
+    eloot.define_singleton_method(:wait_rt) {}
+    info_lines = self.info_lines
+    eloot.define_singleton_method(:get_command) { |cmd, _regex, **| log[:commands] << cmd; info_lines }
+    eloot.module_eval(extract_lic_method(source, 'fwi?', source_path: path))
+
+    room_const = Module.new
+    room_const.define_singleton_method(:current) do
+      current.define_singleton_method(:dijkstra) do |dest = nil|
+        raise ArgumentError, 'dijkstra must not be given a destination list' if dest.is_a?(Array)
+
+        [previous, distances]
+      end
+      current
+    end
+    rooms_by_id = self.rooms_by_id
+    room_const.define_singleton_method(:[]) { |id| rooms_by_id[id] }
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:Room, room_const)
+    mod.const_set(:Hoard, mod)
+    mod.const_set(:LOCKER_MAX_PASSES, 6)
+    mod.const_set(:LOCKER_PASS_WAIT, 10)
+    mod.const_set(:LOCKER_ELSEWHERE, eval(source[%r{LOCKER_ELSEWHERE = (/.*?/i)}, 1])) # the shipped pattern, not a copy
+    mod.const_set(:LOCKER_INFO, eval(source[%r{LOCKER_INFO = (/.*?/i)}, 1]))
+    extract('che_locker_rooms', 'town_name', 'che_town_id_for', 'locker_info_town', 'lines_since', 'locker_elsewhere?', 'nearest_first', 'booth_room?', 'approach_step', 'take_step', 'enter_locker', 'enter_any_locker').each { |body| mod.module_eval(body) }
+    mod.define_singleton_method(:respond) { |*| }
+    mod.define_singleton_method(:sleep) { |secs| log[:sleeps] << secs }
+    mod.define_singleton_method(:fput) { |*| }
+    mod.define_singleton_method(:reget) { |*| ["You'll have to wait, Kimsy is presently using that locker booth."] }
+    mod.define_singleton_method(:in_locker_room?) { false }
+    mod.define_singleton_method(:locker_way_in) { 'go opening' }
+    mod
+  end
+
+  describe 'che_locker_rooms' do
+    let(:rooms) do
+      [
+        room(1, false, nil),
+        room(10, "Wehnimer's Landing", 228, 'meta:che:paupers:locker'),
+        room(11, "Wehnimer's Landing", 228, 'meta:che:paupers:locker'),
+        room(12, "Wehnimer's Landing", 228, 'meta:che:paupers:entrance_locker'),
+        room(13, "Wehnimer's Landing", 228, 'meta:che:silvergate_inn:locker'),
+        room(20, 'Solhaven', 1438, 'meta:che:paupers:locker'),
+        room(30, "Ta'Vaalor", 3519, 'meta:che:paupers:entrance_locker'),
+        room(40, 'Mist Harbor', 3668, 'meta:che:paupers:locker')
+      ]
+    end
+
+    it 'finds the house lockers when the town room and locker rooms use different location strings' do
+      expect(harness.che_locker_rooms(rooms, 'paupers', 228).map(&:id)).to eq([10, 11])
+      expect(harness.che_locker_rooms(rooms, 'paupers', 1438).map(&:id)).to eq([20])
+    end
+
+    it 'does not choke on rooms whose location is false' do
+      expect { harness.che_locker_rooms(rooms, 'paupers', 228) }.not_to raise_error
+    end
+
+    it 'ignores other houses' do
+      expect(harness.che_locker_rooms(rooms, 'silvergate_inn', 228).map(&:id)).to eq([13])
+    end
+
+    it 'falls back to entrance rooms when no locker room is mapped in the town' do
+      expect(harness.che_locker_rooms(rooms, 'paupers', 3519).map(&:id)).to eq([30])
+    end
+
+    it 'finds the Mist Harbor lockers from the Isle of Four Winds town room' do
+      expect(harness.che_locker_rooms(rooms, 'paupers', 3668).map(&:id)).to eq([40])
+    end
+
+    it 'returns nothing for no CHE, or a house with no lockers in town' do
+      expect(harness.che_locker_rooms(rooms, 'none', 228)).to eq([])
+      expect(harness.che_locker_rooms(rooms, nil, 228)).to eq([])
+      expect(harness.che_locker_rooms(rooms, 'sovyn', 228)).to eq([])
+    end
+  end
+
+  describe 'che_town_id_for (where a non-premium house member\'s single locker is)' do
+    let(:rooms) do
+      [
+        room(1, false, nil),
+        room(28_000, "Kraken's Fall", 28_813, 'meta:che:paupers:locker'),
+        room(27_907, 'the town of Kharam-Dzu', 1932, 'meta:che:paupers:locker'),
+        room(35_000, 'Icemule Trace', 2300, 'meta:che:silvergate_inn:locker'),
+        room(29_000, 'Solhaven', 1438, 'meta:che:paupers:entrance_annex')
+      ]
+    end
+
+    it 'finds the town room for the town LOCKER INFO names' do
+      expect(harness.che_town_id_for(rooms, 'paupers', "Kraken's Fall")).to eq(28_813)
+    end
+
+    it 'treats "the town of X" and "X" as the same place, whichever side carries the prefix' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'the town of Kharam-Dzu')).to eq(1932)
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Kharam-Dzu')).to eq(1932)
+      expect(harness.che_town_id_for(rooms, 'paupers', "the town of Kraken's Fall")).to eq(28_813)
+    end
+
+    it 'is case-insensitive and only looks at the character\'s own house' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'KRAKEN\'S FALL')).to eq(28_813)
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Icemule Trace')).to be_nil
+    end
+
+    it 'knows the game and map names that differ (Teras Isle / Kharam-Dzu, Isle of Four Winds / Mist Harbor)' do
+      mist = room(16_308, 'Mist Harbor', 3668, 'meta:che:paupers:locker')
+      expect(harness.che_town_id_for(rooms, 'paupers', 'the town of Teras Isle')).to eq(1932)
+      expect(harness.che_town_id_for(rooms + [mist], 'paupers', 'the Isle of Four Winds')).to eq(3668)
+    end
+
+    it 'finds the Ta\'Illistim lockers the map files under "the Lost Home"' do
+      lost = room(27_908, 'the Lost Home', 188, 'meta:che:paupers:locker')
+      expect(harness.che_town_id_for(rooms + [lost], 'paupers', "Ta'Illistim")).to eq(188)
+      expect(harness.che_town_id_for(rooms + [lost], 'paupers', 'the Lost Home')).to eq(188)
+    end
+
+    it 'is nil when the house has no lockers there, no CHE, or no town' do
+      expect(harness.che_town_id_for(rooms, 'paupers', 'Solhaven')).to be_nil
+      expect(harness.che_town_id_for(rooms, 'none', "Kraken's Fall")).to be_nil
+      expect(harness.che_town_id_for(rooms, 'paupers', nil)).to be_nil
+    end
+  end
+
+  describe 'locker_info_town' do
+    it 'reads the town from LOCKER INFO once and remembers it' do
+      info_lines.replace(['<prompt>', "Your locker is currently located in the town of Kraken's Fall."])
+      expect(harness.locker_info_town).to eq("the town of Kraken's Fall")
+      expect(harness.locker_info_town).to eq("the town of Kraken's Fall")
+      expect(log[:commands]).to eq(['locker info'])
+    end
+
+    it 'is nil when the reply has no locker location, and does not ask again' do
+      info_lines.replace(['<prompt>'])
+      expect(harness.locker_info_town).to be_nil
+      expect(harness.locker_info_town).to be_nil
+      expect(log[:commands]).to eq(['locker info'])
+    end
+  end
+
+  describe 'lines_since' do
+    it 'returns only the lines that arrived after the first snapshot' do
+      expect(harness.lines_since(%w[a b c], %w[b c d e])).to eq(%w[d e])
+    end
+
+    it 'returns everything when nothing overlaps' do
+      expect(harness.lines_since(%w[a b], %w[x y])).to eq(%w[x y])
+    end
+
+    it 'returns nothing when no new lines arrived' do
+      expect(harness.lines_since(%w[a b], %w[a b])).to eq([])
+      expect(harness.lines_since([], [])).to eq([])
+    end
+  end
+
+  describe 'a locker that is not in this town' do
+    let(:lockers) { [room(1, 'x', 228), room(2, 'x', 228)] }
+
+    before { current.distances = { 0 => 0, 1 => 1, 2 => 2 } }
+
+    let(:elsewhere) { "You can't do that because your locker isn't here!" }
+
+    # reget is called once before the step and once after it
+    def reget_sequence(*snapshots)
+      calls = 0
+      harness.define_singleton_method(:reget) { |*| snapshots[[calls, snapshots.length - 1].min].tap { calls += 1 } }
+    end
+
+    it 'stops after the first attempt instead of trying every locker and every pass' do
+      moves = log[:moves]
+      cur = current
+      harness.define_singleton_method(:move) { |_way| moves << cur.id; nil }
+      reget_sequence([], [elsewhere])
+
+      expect(harness.enter_any_locker(lockers)).to be false
+      expect(moves.length).to eq(1)
+      expect(log[:sleeps]).to be_empty
+      expect(harness.locker_elsewhere?).to be true
+      expect(log[:msgs].grep(/locker isn't in this town/)).not_to be_empty
+    end
+
+    it 'ignores the same message left over in the buffer from an earlier run' do
+      harness.define_singleton_method(:move) { |_way| nil }
+      reget_sequence([elsewhere], [elsewhere]) # nothing new arrived
+
+      expect(harness.enter_any_locker(lockers)).to be false
+      expect(harness.locker_elsewhere?).to be false
+      expect(log[:sleeps].length).to eq(5) # ordinary busy handling: all six passes
+    end
+
+    it 'does not carry the flag into the next visit' do
+      harness.define_singleton_method(:move) { |_way| nil }
+      reget_sequence([], [elsewhere])
+      harness.enter_any_locker(lockers)
+
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(harness.locker_elsewhere?).to be false
+    end
+  end
+
+  describe 'fwi?' do
+    it 'does not raise for a room whose location is false' do
+      expect(harness::ELoot.fwi?(room(1, false, nil))).to be_nil
+      expect(harness::ELoot.fwi?(room(2, 'Mist Harbor', nil))).to be_truthy
+    end
+  end
+
+  describe 'nearest_first' do
+    let(:lockers) { [room(10, 'x', 228), room(11, 'x', 228), room(12, 'x', 228)] }
+
+    it 'orders every reachable locker by path length, not just the closest' do
+      current.distances = { 10 => 9, 11 => 2, 12 => 5 }
+      expect(harness.nearest_first(lockers).map(&:id)).to eq([11, 12, 10])
+    end
+
+    it 'keeps the room we are standing in first without dropping the others' do
+      current.distances = { 10 => 0, 11 => 3, 12 => 7 }
+      expect(harness.nearest_first(lockers).map(&:id)).to eq([10, 11, 12])
+    end
+
+    it 'drops lockers that cannot be reached' do
+      current.distances = { 10 => 4 }
+      expect(harness.nearest_first(lockers).map(&:id)).to eq([10])
+    end
+
+    it 'returns an empty list untouched' do
+      expect(harness.nearest_first([])).to eq([])
+    end
+  end
+
+  describe 'enter_locker for a booth room picked from the map tags' do
+    # Mist Harbor's Twilight Hall annex: booth 17580 is only reachable by "go scarlet curtain" from 17579
+    let(:booth) { room(17580, 'Mist Harbor', 3668, 'meta:che:twilight_hall:locker') }
+    let(:lobby_class) { Struct.new(:wayto) }
+
+    before do
+      rooms_by_id[17579] = lobby_class.new({ '17580' => 'go scarlet curtain' })
+      current.previous = { 17580 => 17579 }
+    end
+
+    it 'goes to the room outside the booth, not the booth, and takes the last step itself' do
+      steps = []
+      harness.define_singleton_method(:move) { |way| steps << way; nil }
+      expect(harness.enter_locker(booth)).to be false
+      expect(log[:go2]).to eq([17579])
+      expect(steps).to eq(['go scarlet curtain'])
+      expect(log[:msgs].grep(/Locker at room #17580 is in use/)).not_to be_empty
+    end
+
+    it 'still takes the step when the room outside mentions a locker or counter object' do
+      steps = []
+      harness.define_singleton_method(:in_locker_room?) { true }
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      expect(harness.enter_locker(booth)).to be true
+      expect(steps).to eq(['go scarlet curtain'])
+    end
+
+    it 'is done without a move when we are already standing in the booth' do
+      steps = []
+      cur = current
+      cur.id = 17580
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      harness::ELoot.define_singleton_method(:go2) { |_place| }
+      current.previous = { 17580 => 17579 }
+      expect(harness.enter_locker(booth)).to be true
+      expect(steps).to be_empty
+    end
+
+    it 'is in once the step goes through' do
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_locker(booth)).to be true
+    end
+
+    it 'does not send a move if the trip to the entrance did not get us there' do
+      steps = []
+      harness.define_singleton_method(:move) { |way| steps << way; true }
+      eloot = harness::ELoot
+      eloot.define_singleton_method(:go2) { |_place| } # travel failed, still at room 0
+      expect(harness.enter_locker(booth)).to be false
+      expect(steps).to be_empty
+    end
+
+    it 'runs a scripted move and checks where we ended up' do
+      cur = current
+      rooms_by_id[17579] = lobby_class.new({ '17580' => -> { cur.id = 17580 } })
+      expect(harness.enter_locker(booth)).to be true
+    end
+
+    it 'falls back to plain go2 plus the opening when there is no single last step' do
+      current.previous = {}
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_locker(booth)).to be true
+      expect(log[:go2]).to eq([17580])
+    end
+
+    it 'keeps using go2 for the room outside a public locker' do
+      outside = room(389, "Wehnimer's Landing", 228, 'publiclockers')
+      harness.define_singleton_method(:move) { |_way| nil }
+      expect(harness.enter_locker(outside)).to be false
+      expect(log[:go2]).to eq([389])
+    end
+  end
+
+  describe 'enter_any_locker' do
+    let(:lockers) { [room(1, 'x', 228), room(2, 'x', 228)] }
+
+    before { current.distances = { 0 => 0, 1 => 1, 2 => 2 } }
+
+    def busy_until(free_room)
+      cur = current
+      moves = log[:moves]
+      harness.define_singleton_method(:move) do |_way|
+        moves << cur.id
+        cur.id == free_room ? true : nil
+      end
+    end
+
+    it 'goes to the next locker when the first is in use' do
+      busy_until(2)
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(log[:go2]).to eq([1, 2])
+      expect(log[:msgs].grep(/Locker at room #1 is in use/)).not_to be_empty
+    end
+
+    it 'tries every locker on every pass, even from a stale "in use" line in the buffer' do
+      busy_until(nil)
+      expect(harness.enter_any_locker(lockers)).to be false
+      expect(log[:moves].length).to eq(2 * 6)
+    end
+
+    it 'waits between passes and gives up after six' do
+      busy_until(nil)
+      harness.enter_any_locker(lockers)
+      expect(log[:sleeps]).to eq([10] * 5)
+    end
+
+    it 'succeeds on a later pass once a booth frees up' do
+      attempts = 0
+      harness.define_singleton_method(:move) { |_way| (attempts += 1) > 5 ? true : nil }
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(log[:sleeps]).to eq([10, 10])
+    end
+
+    it 'skips a room with no way in and carries on' do
+      cur = current
+      harness.define_singleton_method(:locker_way_in) { cur.id == 1 ? nil : 'go opening' }
+      harness.define_singleton_method(:move) { |_way| true }
+      expect(harness.enter_any_locker(lockers)).to be true
+      expect(log[:msgs].grep(/No way into the locker from room #1/)).not_to be_empty
+    end
+  end
+end
+
+# RSpec for ELoot::Hoard.filter_inventory (;eloot list <type> <filter>).
+RSpec.describe 'ELoot::Hoard.filter_inventory' do
+  let(:harness) do
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
+    mod = Module.new
+    mod.module_eval(extract_lic_method(File.read(path), 'filter_inventory', source_path: path))
+    mod
+  end
+
+  let(:entries) do
+    [
+      { item: 'uncut diamond', count: 3, full: false },
+      { item: 'small uncut diamond', count: 1, full: false },
+      { item: 'blue diamond', count: 2, full: true },
+      { item: 'uncut blue diamond', count: 1, full: false },
+      { item: 'ruby', count: 5, full: false },
+      { item: '*** empty jars ***', count: 4, full: '  -' }
+    ]
+  end
+
+  def names(filter)
+    harness.filter_inventory(entries, filter).map { |e| e[:item] }
+  end
+
+  it 'returns everything with no filter' do
+    expect(names(nil)).to eq(entries.map { |e| e[:item] })
+    expect(names('  ')).to eq(entries.map { |e| e[:item] })
+  end
+
+  it 'matches every entry containing the word' do
+    expect(names('diamond')).to eq(['uncut diamond', 'small uncut diamond', 'blue diamond', 'uncut blue diamond'])
+  end
+
+  it 'matches the whole filter as a phrase, not its individual words' do
+    expect(names('uncut diamond')).to eq(['uncut diamond', 'small uncut diamond'])
+    expect(names('uncut diamond')).not_to include('blue diamond', 'uncut blue diamond')
+  end
+
+  it 'does not match when the words are present but not adjacent or in order' do
+    expect(names('diamond uncut')).to eq([])
+    expect(names('uncut diamond')).not_to include('uncut blue diamond')
+  end
+
+  it 'is case-insensitive' do
+    expect(names('UnCut DIAMOND')).to eq(['uncut diamond', 'small uncut diamond'])
+  end
+
+  it 'ignores extra spacing in the filter or the name' do
+    expect(names("  uncut    diamond ")).to eq(['uncut diamond', 'small uncut diamond'])
+  end
+
+  it 'returns nothing when no entry matches' do
+    expect(names('emerald')).to eq([])
+  end
+end
+
+# RSpec for the command dispatcher order at the bottom of eloot.lic. The `case` matches the
+# whole argument string against unanchored regexes (/raid/, /pool/, ...), so the hoard
+# commands, whose free-text list filter can contain any of those words, must be matched first.
+RSpec.describe 'eloot command dispatcher' do
+  let(:branches) do
+    source = File.read(find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)))
+    block = source[/^  case Script\.current\.vars\[0\]\n[\s\S]*?^  else\n/]
+    raise 'could not find the command dispatcher' unless block
+
+    block.scan(/^  when (.+)$/).flatten.map do |expr|
+      expr = expr.sub(/\s+#\s.*\z/, '')
+      [expr, eval(expr)] # our own source, literals only
+    end
+  end
+
+  def first_branch(input)
+    branches.find { |_expr, pattern| pattern === input }&.first
+  end
+
+  ['list gem diamond', 'list reagent braided rose', 'list gem pool', 'list gem setup', 'list gem options',
+   'list gem debug', 'LIST Reagent raid', 'deposit gem', 'reset alchemy'].each do |input|
+    it "sends '#{input}' to the hoard branch" do
+      expect(first_branch(input)).to start_with('/\\A\\s*(list|deposit|reset)')
+    end
+  end
+
+  it 'still sends a plain "list" to the settings list' do
+    expect(first_branch('list')).to eq("'list'")
+  end
+
+  it 'still sends raid to the raid branch' do
+    expect(first_branch('raid gem diamond x3')).to eq('/raid/')
+  end
+end
+
+# RSpec for ELoot::Inventory.single_drag's stun handling: it waits out a stun with
+# wait_while instead of the old uncapped, silent raise/rescue/retry loop.
+RSpec.describe 'ELoot::Inventory.single_drag while stunned' do
+  let(:bag) { Struct.new(:name).new('backpack') }
+  let(:item) { Struct.new(:name, :type, :id).new('ruby', 'gem', 'id-ruby') }
+  let(:log) { { stored: [], msgs: [], waited: 0 } }
+
+  # Stunned for the first `stunned_checks` calls to stunned?, then clear
+  def harness_for(stunned_checks:, store_result: true)
+    log = self.log
+    state = { checks: stunned_checks }
+    bag = self.bag
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |text: '', **| log[:msgs] << text }
+    eloot.define_singleton_method(:box_phase) { |_item| }
+    eloot.define_singleton_method(:data) { Struct.new(:sacks_full).new({}) }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { default: bag } }
+
+    inventory = Module.new
+    inventory.define_singleton_method(:single_drag_box) { |_item| false }
+    inventory.define_singleton_method(:store_item) do |target, thing|
+      raise 'boom' if store_result == :raise
+
+      log[:stored] << [target.name, thing.name]
+      store_result
+    end
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Inventory, inventory)
+    mod.define_singleton_method(:stunned?) do
+      state[:checks] -= 1
+      state[:checks] >= 0
+    end
+    mod.define_singleton_method(:wait_while) do |&block|
+      loop do
+        break unless block.call
+
+        log[:waited] += 1
+      end
+    end
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
+    mod.module_eval(extract_lic_method(File.read(path), 'single_drag', source_path: path))
+    mod
+  end
+
+  it 'waits for the stun to clear, then stores the item once' do
+    harness_for(stunned_checks: 2).single_drag(item)
+    expect(log[:waited]).to eq(1)
+    expect(log[:stored]).to eq([%w[backpack ruby]])
+    expect(log[:msgs].grep(/stunned, waiting/)).not_to be_empty
+  end
+
+  it 'does not wait when not stunned' do
+    harness_for(stunned_checks: 0).single_drag(item)
+    expect(log[:waited]).to eq(0)
+    expect(log[:stored]).to eq([%w[backpack ruby]])
+  end
+
+  it 'lets an error from store_item through instead of retrying it forever' do
+    expect { harness_for(stunned_checks: 0, store_result: :raise).single_drag(item) }.to raise_error('boom')
+  end
+end
+
+# v2.14.2: after a manual ;unpause, sacks_full still listed every bag as full, so each
+# later item skipped them all and paused again without a store attempt. Runs the real
+# single_drag; the player frees space while paused (after `frees_after` pauses).
+RSpec.describe 'ELoot::Inventory.single_drag pause and unpause' do
+  let(:bag_class) { Struct.new(:name) }
+  let(:item_class) { Struct.new(:name, :type, :id) }
+  let(:backpack) { bag_class.new('backpack') }
+  let(:ruby) { item_class.new('ruby', 'gem', 'id-ruby') }
+  let(:pearl) { item_class.new('pearl', 'gem', 'id-pearl') }
+  let(:log) { { stored: [], attempts: [], pauses: 0 } }
+
+  def harness_for(frees_after:, held: [])
+    log = self.log
+    bag = backpack
+    space = [false]
+    data = Struct.new(:sacks_full).new({ 'last cleared' => ['earlier', 1, 'start'] })
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |**| nil }
+    eloot.define_singleton_method(:box_phase) { |_item| nil }
+    eloot.define_singleton_method(:data) { data }
+    eloot.define_singleton_method(:refuse_room_operation!) { |_reason| nil }
+    eloot.define_singleton_method(:reset_disk_full) { nil }
+    eloot.define_singleton_method(:in_hand?) { |item| held.include?(item) }
+
+    stow_list = Module.new
+    stow_list.define_singleton_method(:stow_list) { { default: bag } }
+
+    room = Module.new
+    current_room = Struct.new(:id, :tags).new(2400, ['town'])
+    room.define_singleton_method(:current) { current_room }
+
+    game_obj = Module.new
+    empty = item_class.new('Empty', nil, nil)
+    game_obj.define_singleton_method(:right_hand) { empty }
+    game_obj.define_singleton_method(:left_hand) { empty }
+
+    script = Module.new
+    current_script = Object.new
+    current_script.define_singleton_method(:name) { 'eloot' }
+    current_script.define_singleton_method(:vars) { ['sell'] }
+    current_script.define_singleton_method(:pause) do
+      log[:pauses] += 1
+      space[0] = true if log[:pauses] >= frees_after
+    end
+    script.define_singleton_method(:current) { current_script }
+
+    # Mirrors store_item: a "won't fit" marks the bag full in sacks_full.
+    mod = Module.new
+    mod.define_singleton_method(:single_drag_box) { |_item| false }
+    mod.define_singleton_method(:store_item) do |target, thing|
+      log[:attempts] << thing.name
+      unless space[0]
+        data.sacks_full[target.name] = ['now', 2400, thing.name]
+        next false
+      end
+
+      held.delete(thing)
+      log[:stored] << thing.name
+      true
+    end
+    mod.define_singleton_method(:stunned?) { false }
+    mod.const_set(:ELoot, eloot)
+    mod.const_set(:StowList, stow_list)
+    mod.const_set(:Room, room)
+    mod.const_set(:GameObj, game_obj)
+    mod.const_set(:Script, script)
+    mod.const_set(:Inventory, mod)
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
+    mod.module_eval(extract_lic_method(File.read(path), 'single_drag', source_path: path))
+    [mod, data]
+  end
+
+  it 'retries the item after the unpause, then stores the next item without pausing' do
+    inventory, data = harness_for(frees_after: 1, held: [ruby, pearl])
+
+    inventory.single_drag(ruby)
+    inventory.single_drag(pearl)
+
+    expect(log[:pauses]).to eq(1)
+    expect(log[:stored]).to eq(%w[ruby pearl])
+    expect(data.sacks_full['last cleared'].last).to eq('unpause')
+  end
+
+  it 'pauses once per unpause while containers stay full, and stops once space appears' do
+    inventory, = harness_for(frees_after: 2, held: [ruby])
+
+    inventory.single_drag(ruby)
+
+    expect(log[:pauses]).to eq(2)
+    expect(log[:stored]).to eq(%w[ruby])
+  end
+
+  it 'does not retry an item the player already put away' do
+    inventory, = harness_for(frees_after: 1, held: [])
+
+    inventory.single_drag(ruby)
+
+    expect(log[:attempts]).to eq(%w[ruby])
+  end
+
+  it 'never pauses with on_full: :signal' do
+    inventory, = harness_for(frees_after: 1, held: [ruby])
+
+    expect(inventory.single_drag(ruby, on_full: :signal)).to eq(:full)
+    expect(log[:pauses]).to eq(0)
+  end
+end
+
+RSpec.describe 'ELoot loot_stance' do
+  let(:eloot_path) { find_lic_source('eloot.lic', from: File.expand_path('..', __dir__)) }
+  let(:source) { File.read(eloot_path) }
+  let(:sent) { [] }
+
+  let(:eloot) do
+    recorder = sent
+    mod = Module.new
+    mod.const_set(:ELoot, mod)
+    mod.const_set(:Stance, Module.new do
+      const_set(:NAMES, %w[offensive advance forward neutral guarded defensive].freeze)
+      define_singleton_method(:change) { |s| recorder << s }
+    end)
+    mod.const_set(:Effects, Module.new do
+      const_set(:Debuffs, Module.new { define_singleton_method(:active?) { |_| false } })
+    end)
+    mod.define_singleton_method(:msg) { |**_| nil }
+    mod.define_singleton_method(:seed_missing_defaults) { |_| false }
+    mod.define_singleton_method(:save_profile) { nil }
+    mod.module_eval(extract_lic_method(source, 'change_stance', source_path: eloot_path))
+    mod.module_eval(extract_lic_method(source, 'migrate_overflow_settings', source_path: eloot_path))
+    mod
+  end
+
+  it 'changes to the chosen stance' do
+    eloot.change_stance('guarded')
+    expect(sent).to eq(['guarded'])
+  end
+
+  it 'leaves stance alone for none or a missing setting' do
+    eloot.change_stance('none')
+    eloot.change_stance(nil)
+    expect(sent).to be_empty
+  end
+
+  it 'migrates loot_defensive on to defensive and off to none' do
+    on = { loot_defensive: true }
+    off = { loot_defensive: false, loot_stance: 'none' }
+    eloot.migrate_overflow_settings(on)
+    eloot.migrate_overflow_settings(off)
+    expect(on).to eq(loot_stance: 'defensive')
+    expect(off).to eq(loot_stance: 'none')
+  end
+end
+
+RSpec.describe 'ELoot::Inventory.store_item into a container with stale contents' do
+  let(:item) { Struct.new(:id, :name).new('837915005', 'sturdy fel chest') }
+  let(:bag) { Struct.new(:id, :name, :contents).new('834445867', 'Beelz disk', []) }
+  let(:sent) { [] }
+
+  # Disks get no contents pushes from the game, so bag.contents only changes on `look in`
+  def store(look_finds_item:, in_hand: false)
+    sent = self.sent
+    bag = self.bag
+    item = self.item
+
+    eloot = Module.new
+    eloot.define_singleton_method(:msg) { |**| }
+    eloot.define_singleton_method(:in_hand?) { |_| in_hand }
+    eloot.define_singleton_method(:data) { Struct.new(:put_regex, :look_regex, :sacks_full).new(/x/, /x/, {}) }
+    eloot.define_singleton_method(:get_command) do |cmd, _regex, **|
+      sent << cmd
+      bag.contents = [item] if cmd.start_with?('look in') && look_finds_item
+      ["You put a #{item.name} in the #{bag.name}."]
+    end
+
+    mod = Module.new
+    mod.const_set(:ELoot, eloot)
+    mod.define_singleton_method(:sleep) { |_| }
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
+    mod.module_eval(extract_lic_method(File.read(path), 'store_item', source_path: path))
+    mod.store_item(bag, item)
+  end
+
+  it 'refreshes the container once and succeeds without re-dragging' do
+    expect(store(look_finds_item: true)).to be true
+    expect(sent).to eq(['_drag #837915005 #834445867', 'look in #834445867'])
+  end
+
+  it 'still gives up when the refreshed contents do not have the item' do
+    expect(store(look_finds_item: false)).to be false
+    expect(sent.grep(/_drag/).size).to eq(5)
+  end
+
+  it 'does not refresh while the item is still in hand' do
+    expect(store(look_finds_item: true, in_hand: true)).to be false
+    expect(sent.grep(/look in/)).to be_empty
+  end
+end
+
+# RSpec for ELoot::Sell.pool_box_order -- the drop-off order used by locksmith_pool.
+# v2.14.2 regression: a box already in hand was handed in on the first container box's
+# turn, then "Can't find" when its own turn came.
+RSpec.describe 'ELoot::Sell.pool_box_order' do
+  let(:order) do
+    path = find_lic_source('eloot.lic', from: File.expand_path('..', __dir__))
+    body = extract_lic_method(File.read(path), 'pool_box_order', source_path: path)
+
+    Module.new { module_eval(body) }
+  end
+
+  let(:obj) { Struct.new(:id, :name, :type) }
+  let(:empty) { obj.new(nil, 'Empty', nil) }
+  let(:held_trunk) { obj.new('1', 'haon trunk', 'box') }
+  let(:sack_trunk) { obj.new('2', 'scarred maoral trunk', 'box') }
+  let(:weapon) { obj.new('3', 'drake falchion', 'weapon') }
+
+  it 'puts a box already in hand first' do
+    result = order.pool_box_order(held: [empty, held_trunk], found: [sack_trunk], passed: [held_trunk])
+
+    expect(result.map(&:id)).to eq(%w[1 2])
+  end
+
+  it 'ignores non-box items in hand' do
+    result = order.pool_box_order(held: [weapon, empty], found: [sack_trunk], passed: [])
+
+    expect(result.map(&:id)).to eq(%w[2])
+  end
+
+  it 'keeps container boxes ahead of passed-in boxes when nothing is held' do
+    result = order.pool_box_order(held: [empty, empty], found: [sack_trunk], passed: [held_trunk])
+
+    expect(result.map(&:id)).to eq(%w[2 1])
   end
 end

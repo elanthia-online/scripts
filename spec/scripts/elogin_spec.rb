@@ -44,7 +44,7 @@ module ELoginSpec
   # accept, and when Saga conflicts with --custom-launch). Rather than
   # hand-mirror that and risk silently drifting from the real thing, this
   # pulls it from a local lich-5 checkout -- see spec_helper.rb's
-  # lich5_path/read_lich5_source and .github/workflows/rspec_tests.yaml for
+  # lich5_path/read_lich5_source and .github/workflows/ci.yml for
   # the pinned release CI checks out. LICH5_PATH is nil, and the specs that
   # need this skip gracefully, when no checkout is available locally.
   LICH5_PATH = lich5_path
