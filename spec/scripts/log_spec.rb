@@ -100,8 +100,15 @@ module_code = script_content[/^module GameLogger.*?^end/m]
 raise "Failed to extract GameLogger module from #{script_path}" if module_code.nil?
 raise "Extracted code does not look like a single module" unless module_code.scan(/^module GameLogger/).one?
 
-eval(module_code, binding, script_path,
-     script_content.lines.index { |l| l.start_with?('module GameLogger') } + 1)
+module_line = script_content.lines.index { |l| l.start_with?('module GameLogger') } + 1
+
+# Evaluates log.lic's `module GameLogger` body, as Lich does each time the
+# script starts: every run of log.lic in a session evaluates the module again
+# in the same namespace, while earlier runs may still be logging.
+LogSpecHarness.define_singleton_method(:evaluate_game_logger) do
+  eval(module_code, TOPLEVEL_BINDING, script_path, module_line)
+end
+LogSpecHarness.evaluate_game_logger
 
 RSpec.describe GameLogger do
   # Other spec files may redefine the top-level echo/get helpers after this
@@ -368,10 +375,22 @@ RSpec.describe GameLogger do
       FileUtils.rm_rf(log_dir)
     end
 
+    # Sets the options the next run_main hands to GameLogger.main, as
+    # GameLogger::Opts.parse would return them for the script's arguments.
+    # Without it, main parses Script.current.vars itself.
+    def use_options(options)
+      @run_options = options
+    end
+
+    # Runs GameLogger.main with the options from use_options, if any.
+    def start_main
+      @run_options ? GameLogger.main(@run_options) : GameLogger.main
+    end
+
     # The timeout turns a logger that spins without reading a line into a
     # failure instead of a hung suite.
     def run_main
-      Timeout.timeout(5) { GameLogger.main }
+      Timeout.timeout(5) { start_main }
     end
 
     def find_log_file
@@ -384,7 +403,7 @@ RSpec.describe GameLogger do
 
     context 'with timestamps enabled' do
       before do
-        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%F %T'))
+        use_options(OpenStruct.new(timestamp: '%F %T'))
       end
 
       it 'timestamps reget lines with $login_time' do
@@ -413,7 +432,7 @@ RSpec.describe GameLogger do
 
     context 'without timestamps' do
       before do
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
       end
 
       it 'writes reget lines without timestamps' do
@@ -435,7 +454,7 @@ RSpec.describe GameLogger do
     context 'when login was more than 30 seconds ago' do
       before do
         $login_time = frozen_time - 60
-        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%F %T'))
+        use_options(OpenStruct.new(timestamp: '%F %T'))
       end
 
       it 'does not write reget lines' do
@@ -454,7 +473,7 @@ RSpec.describe GameLogger do
     it 'writes reget marker comment when reget is used' do
       $login_time = frozen_time - 5
       $reget_lines = ['test']
-      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+      use_options(OpenStruct.new)
       run_main
       expect(log_content).to include('<!-- Above contents from reget; full logging now active -->')
     end
@@ -468,7 +487,7 @@ RSpec.describe GameLogger do
 
       it 'writes the log under LOG_DIR in the <game>-<name>/<year>/<month> layout' do
         stub_const('LOG_DIR', logs_dir)
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
 
         run_main
 
@@ -480,7 +499,7 @@ RSpec.describe GameLogger do
     end
 
     it 'writes under LICH_DIR/logs when LOG_DIR is not defined' do
-      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+      use_options(OpenStruct.new)
 
       run_main
 
@@ -489,7 +508,7 @@ RSpec.describe GameLogger do
 
     it 'writes under LICH_DIR/logs when LOG_DIR is empty' do
       stub_const('LOG_DIR', '')
-      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+      use_options(OpenStruct.new)
 
       run_main
 
@@ -498,14 +517,14 @@ RSpec.describe GameLogger do
 
     it 'creates log directory with game and character name' do
       $reget_lines = []
-      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+      use_options(OpenStruct.new)
       run_main
       expect(find_log_file).to include('GSIV-TestChar')
     end
 
     it 'handles empty reget buffer' do
       $reget_lines = []
-      GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%F %T'))
+      use_options(OpenStruct.new(timestamp: '%F %T'))
       run_main
       expect(log_content).to include('<!-- Above contents from reget; full logging now active -->')
       expect(log_content.lines.count { |l| l.include?('2026-04-23 10:00:00:') }).to eq(0)
@@ -515,7 +534,7 @@ RSpec.describe GameLogger do
     # only survived that in game through Lich's NilClass patch.
     it 'writes only the marker when reget returns nil (empty buffer)' do
       $reget_lines = nil
-      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+      use_options(OpenStruct.new)
 
       run_main
 
@@ -529,7 +548,7 @@ RSpec.describe GameLogger do
     context 'when the reget lines end in a carriage return' do
       it 'writes them without it, timestamps off' do
         $reget_lines = ["You see a door.\r", "Obvious exits: north.\r"]
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
 
         run_main
 
@@ -539,7 +558,7 @@ RSpec.describe GameLogger do
 
       it 'writes them without it, timestamps on' do
         $reget_lines = ["You see a door.\r"]
-        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%F %T'))
+        use_options(OpenStruct.new(timestamp: '%F %T'))
 
         run_main
 
@@ -558,7 +577,7 @@ RSpec.describe GameLogger do
     context 'with a --timestamp format that holds a comma' do
       it 'writes the header and each line with the whole format' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--timestamp=%b %d, %Y %T']))
+        use_options(GameLogger::Opts.parse(['--timestamp=%b %d, %Y %T']))
         LogSpecHarness.feed('You see a door.')
 
         run_main
@@ -577,7 +596,7 @@ RSpec.describe GameLogger do
     context 'with a --timestamp format that holds an equals sign' do
       it 'prefixes each line with the whole format' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--timestamp=%H=%M']))
+        use_options(GameLogger::Opts.parse(['--timestamp=%H=%M']))
         LogSpecHarness.feed('You see a door.')
 
         run_main
@@ -602,7 +621,7 @@ RSpec.describe GameLogger do
       [['--timestamp'], ['timestamp'], ['--timestamp=']].each do |args|
         it "logs without timestamps for #{args.first} and says the option was ignored" do
           $reget_lines = []
-          GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(args))
+          use_options(GameLogger::Opts.parse(args))
           LogSpecHarness.feed('You see a door.')
 
           run_main
@@ -623,7 +642,7 @@ RSpec.describe GameLogger do
 
       it 'keeps the DR yaml timestamp format when the yaml enables timestamps' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--timestamp']))
+        use_options(GameLogger::Opts.parse(['--timestamp']))
         LogSpecHarness.feed('You see a door.')
 
         run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
@@ -641,7 +660,7 @@ RSpec.describe GameLogger do
       { 'no format' => nil, 'an empty format' => '', 'a non-String format' => 5 }.each do |label, format|
         it "stamps with %F %T %Z and says so for #{label} (#{format.inspect})" do
           $reget_lines = []
-          GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse([]))
+          use_options(GameLogger::Opts.parse([]))
           LogSpecHarness.feed('You see a door.')
 
           run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: format))
@@ -661,7 +680,7 @@ RSpec.describe GameLogger do
 
       it 'uses a --timestamp=FMT without a message' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--timestamp=%H:%M']))
+        use_options(GameLogger::Opts.parse(['--timestamp=%H:%M']))
         LogSpecHarness.feed('You see a door.')
 
         run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
@@ -672,7 +691,7 @@ RSpec.describe GameLogger do
 
       it 'logs without timestamps and without a message when the yaml leaves timestamps off' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse([]))
+        use_options(GameLogger::Opts.parse([]))
         LogSpecHarness.feed('You see a door.')
 
         run_main_with_settings(OpenStruct.new(log_timestamp: false, log_timestamp_format: nil))
@@ -687,7 +706,7 @@ RSpec.describe GameLogger do
       %w[0 -5 abc].each do |given|
         it "logs the game with 30000 lines per file for --lines=#{given} instead of spinning" do
           $reget_lines = []
-          GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(["--lines=#{given}"]))
+          use_options(GameLogger::Opts.parse(["--lines=#{given}"]))
           LogSpecHarness.feed('line 1', 'line 2')
 
           run_main
@@ -702,7 +721,7 @@ RSpec.describe GameLogger do
       [['--lines'], ['lines']].each do |args|
         it "logs the game for #{args.first} with no value instead of crashing at startup" do
           $reget_lines = []
-          GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(args))
+          use_options(GameLogger::Opts.parse(args))
           LogSpecHarness.feed('line 1')
 
           run_main
@@ -716,7 +735,7 @@ RSpec.describe GameLogger do
     context 'with --lines=1,000' do
       it 'starts a new file after 1000 game lines' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1,000']))
+        use_options(GameLogger::Opts.parse(['--lines=1,000']))
         LogSpecHarness.feed((1..1001).map { |n| "line #{n}" })
 
         run_main
@@ -739,7 +758,7 @@ RSpec.describe GameLogger do
     context 'with a typed command' do
       it 'logs it as >command with the leading <c> removed' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
         LogSpecHarness.idle_timeout = 0.5
         LogSpecHarness.type('<c>look')
 
@@ -788,7 +807,7 @@ RSpec.describe GameLogger do
       # lines (the header, the reget marker and the footer dropped; the
       # footer is checked here, as every file ends with one).
       def log_with(*args)
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(args))
+        use_options(GameLogger::Opts.parse(args))
         run_main
         expect(log_lines.last).to eq(default_stamp)
         log_lines[2..-2]
@@ -1227,7 +1246,7 @@ RSpec.describe GameLogger do
       end
 
       it "logs the first line after midnight in the new day's file" do
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
         LogSpecHarness.feed('line 1', next_day, 'line 2')
 
         run_main
@@ -1239,7 +1258,7 @@ RSpec.describe GameLogger do
       end
 
       it 'starts the new file on the first line after midnight even in an excluded room' do
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--exclude=u7199']))
+        use_options(GameLogger::Opts.parse(['--exclude=u7199']))
         LogSpecHarness.feed('line 1', { count: 2, uid: 7199 }, next_day, 'excluded line')
 
         run_main
@@ -1251,7 +1270,7 @@ RSpec.describe GameLogger do
       end
 
       it "logs the first line after leaving an excluded room past midnight in the new day's file" do
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--exclude=u7199']))
+        use_options(GameLogger::Opts.parse(['--exclude=u7199']))
         LogSpecHarness.feed(
           'line 1', { count: 2, uid: 7199 }, 'excluded 1', next_day, 'excluded 2', { count: 3, uid: 1234 }, 'line 2'
         )
@@ -1264,7 +1283,7 @@ RSpec.describe GameLogger do
 
       # The clock stays at 10:00:05, so the second file gets an _01 suffix.
       it 'counts only written lines toward --lines, not lines in an excluded room' do
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=2', '--exclude=u7199']))
+        use_options(GameLogger::Opts.parse(['--lines=2', '--exclude=u7199']))
         LogSpecHarness.feed('a', { count: 2, uid: 7199 }, 'x1', 'x2', 'x3', { count: 3, uid: 1234 }, 'b', 'c')
 
         run_main
@@ -1276,7 +1295,7 @@ RSpec.describe GameLogger do
       end
 
       it 'counts only written lines toward --lines, not filtered stream lines' do
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=2']))
+        use_options(GameLogger::Opts.parse(['--lines=2']))
         LogSpecHarness.feed('a', '<pushStream id="inv"/>', '<popStream/>', 'b', 'c')
 
         run_main
@@ -1289,7 +1308,7 @@ RSpec.describe GameLogger do
 
       # R-25: a rotation within one second appended to the same file.
       it 'gives each file started within the same second its own _NN name' do
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        use_options(GameLogger::Opts.parse(['--lines=1']))
         LogSpecHarness.feed('a', 'b', 'c')
 
         run_main
@@ -1307,7 +1326,7 @@ RSpec.describe GameLogger do
       # the first one came after midnight it went to the new day's file and
       # the waiting file kept only its header and footer, under the old day.
       it 'opens the file after a --lines rotation only when its first line comes, also past midnight' do
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        use_options(GameLogger::Opts.parse(['--lines=1']))
         LogSpecHarness.feed('a', next_day, 'b')
 
         run_main
@@ -1322,7 +1341,7 @@ RSpec.describe GameLogger do
         month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
         FileUtils.mkdir_p(month)
         File.write(File.join(month, '2026-04-23_10-00-05.log'), "earlier run\n")
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
         LogSpecHarness.feed('a')
 
         run_main
@@ -1348,7 +1367,7 @@ RSpec.describe GameLogger do
       end
 
       it 'ends the file with the footer once, after the last line' do
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
         LogSpecHarness.feed('line 1')
 
         run_main
@@ -1357,7 +1376,7 @@ RSpec.describe GameLogger do
       end
 
       it 'stamps the footer with the --timestamp format' do
-        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%H:%M'))
+        use_options(OpenStruct.new(timestamp: '%H:%M'))
         LogSpecHarness.feed('line 1')
 
         run_main
@@ -1367,10 +1386,10 @@ RSpec.describe GameLogger do
 
       # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
       it 'writes the footer when the thread is killed, as ;kill log does' do
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
         LogSpecHarness.idle_timeout = 5
         LogSpecHarness.feed('line 1')
-        logger = Thread.new { GameLogger.main }
+        logger = Thread.new { start_main }
         Timeout.timeout(2) { sleep 0.01 until find_log_file && File.read(find_log_file).include?("line 1\n") }
 
         logger.kill
@@ -1380,7 +1399,7 @@ RSpec.describe GameLogger do
       end
 
       it 'closes the file, logs the failed footer and lets the reason through when the footer cannot be written' do
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
         allow(Lich).to receive(:log)
         files = opened_files
         allow(GameLogger).to receive(:get) do
@@ -1402,7 +1421,7 @@ RSpec.describe GameLogger do
       # not part of stopping: it raises, as the plain puts before 1.2.4 did,
       # instead of being dropped while the logger moves on.
       it 'closes the file and raises when the footer of a full file cannot be written' do
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        use_options(GameLogger::Opts.parse(['--lines=1']))
         allow(Lich).to receive(:log)
         files = opened_files
         LogSpecHarness.feed('a', 'b')
@@ -1434,7 +1453,7 @@ RSpec.describe GameLogger do
     # file, so an error there left the File open.
     context 'when the header cannot be written' do
       it 'closes the file without a footer and raises the error' do
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
         opened = []
         header_failed = false
         allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
@@ -1458,6 +1477,100 @@ RSpec.describe GameLogger do
         expect(opened.size).to eq(1)
         expect(opened.first).to be_closed
         expect(File.read(find_log_file)).to eq('')
+      end
+    end
+
+    # R-08: the module body parsed the arguments into a module instance
+    # variable, and every run of log.lic in a session (;force log, a second
+    # logxml shim run) evaluates `module GameLogger` again in the same
+    # namespace, so a run starting later could hand its options to a run
+    # already going.
+    context 'when another run evaluates the module' do
+      let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+
+      # The script's arguments as lich-5 gives them: vars[0] the whole line,
+      # then one word each.
+      def start_script_with(*args)
+        allow(Script.current).to receive(:vars).and_return([args.join(' '), *args])
+      end
+
+      before do
+        $reget_lines = []
+      end
+
+      it 'reads no arguments and keeps no options on the module' do
+        start_script_with('--rnum', '--exclude=u7199')
+
+        LogSpecHarness.evaluate_game_logger
+
+        expect(Script.current).not_to have_received(:vars)
+        expect(GameLogger.instance_variables).to be_empty
+      end
+
+      # Lich runs each script on its own thread, so another run can evaluate
+      # the module at any point of this one, here while it reads its settings.
+      it "keeps this run's arguments when another run evaluates the module while this one starts" do
+        start_script_with('--exclude=u1234', '--timestamp=%H:%M')
+        LogSpecHarness.evaluate_game_logger
+        another_run = lambda do
+          start_script_with('--lines=5')
+          LogSpecHarness.evaluate_game_logger
+        end
+        GameLogger.define_singleton_method(:get_settings) do
+          another_run.call
+          OpenStruct.new
+        end
+        LogSpecHarness.feed('a line in room 1234')
+
+        begin
+          run_main
+        ensure
+          GameLogger.singleton_class.send(:remove_method, :get_settings)
+        end
+
+        expect(log_lines).to eq(['10:00', marker, '10:00'])
+      end
+
+      # The second run is started on the example's thread, with its own log
+      # folder, and reads no line; the first keeps logging on its thread.
+      it "keeps this run's --exclude when another run starts after this one started" do
+        example_thread = Thread.current
+        room_uid = 1234
+        reads = 0
+        allow(XMLData).to receive(:room_id) { room_uid }
+        allow(GameLogger).to receive(:get) do
+          raise StopIteration if Thread.current == example_thread
+
+          reads += 1
+          item = LogSpecHarness.get
+          while item.is_a?(Hash)
+            room_uid = item[:uid]
+            item = LogSpecHarness.get
+          end
+          item
+        end
+        start_script_with('--exclude=u7199')
+        LogSpecHarness.evaluate_game_logger
+        LogSpecHarness.idle_timeout = 5
+        LogSpecHarness.feed('line 1')
+        logger = Thread.new { start_main }
+        begin
+          Timeout.timeout(2) { sleep 0.01 until find_log_file && File.read(find_log_file).include?("line 1\n") }
+          first_file = find_log_file
+
+          stub_const('LOG_DIR', File.join(log_dir, 'second run'))
+          start_script_with('--exclude=u1234')
+          LogSpecHarness.evaluate_game_logger
+          run_main
+          LogSpecHarness.feed({ uid: 7199 }, 'a line in room 7199', { uid: 1234 }, 'line 3')
+          # The fourth read waits for a line, so "line 3" is done with.
+          Timeout.timeout(2) { sleep 0.01 until reads == 4 }
+        ensure
+          logger.kill
+          logger.join(2)
+        end
+
+        expect(File.read(first_file).lines(chomp: true)).to eq([default_stamp, marker, 'line 1', 'line 3', default_stamp])
       end
     end
 
@@ -1518,7 +1631,7 @@ RSpec.describe GameLogger do
     context 'log file header/footer format' do
       it 'uses --timestamp format for header when enabled' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%F %T %Z'))
+        use_options(OpenStruct.new(timestamp: '%F %T %Z'))
         run_main
         header_line = log_content.lines.first.chomp
         expect(header_line).to eq(frozen_time.strftime('%F %T %Z'))
@@ -1526,7 +1639,7 @@ RSpec.describe GameLogger do
 
       it 'uses default format for header when timestamps disabled' do
         $reget_lines = []
-        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        use_options(OpenStruct.new)
         run_main
         header_line = log_content.lines.first.chomp
         expect(header_line).to eq(frozen_time.strftime("%Y-%m-%d %H:%M:%S.%L %:z"))
