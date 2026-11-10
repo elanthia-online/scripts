@@ -359,6 +359,20 @@ RSpec.describe 'logxml.lic' do
       )
     end
 
+    # A file opened at once after a full one waited for a line; when the
+    # first one came after midnight it went to the new day's file and the
+    # waiting file kept only its header and footer, under the old day.
+    it 'opens the file after a full one only when its first line comes, also past midnight' do
+      run_logxml(lines: [*Array.new(30_000) { |n| "<output>#{n + 1}</output>" }, next_day, '<output>next day</output>'])
+
+      month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      expect(Dir.children(month).sort).to eq(['2026-04-23_10-00-05.xml', '2026-04-24_00-00-01.xml'])
+      expect(File.read(File.join(month, '2026-04-23_10-00-05.xml')).lines(chomp: true).last).to eq(default_footer)
+      expect(File.read(File.join(month, '2026-04-24_00-00-01.xml')).lines(chomp: true)).to eq(
+        ['2026-04-24 12:00am', '<output>next day</output>', next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')]
+      )
+    end
+
     it 'gives a new file _02 when the time-stamped name and its _01 both exist' do
       month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
       FileUtils.mkdir_p(month)
@@ -413,19 +427,38 @@ RSpec.describe 'logxml.lic' do
       )
     end
 
+    # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
+    it 'writes the footer when the thread is killed, as ;kill logxml does' do
+      waiting = Thread::Queue.new
+      logger = Thread.new do
+        run_logxml(lines: ['<output>line 1</output>']) do
+          waiting << true
+          sleep # get waits for the next line until ;kill
+        end
+      end
+      Timeout.timeout(2) { waiting.pop }
+
+      logger.kill
+      logger.join(2)
+
+      expect(logger).not_to be_alive
+      expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
+    end
+
     # A footer that fails when a file is closed for the next one is not part
     # of stopping: it raises, as the plain puts before 0.6.4 did.
     it "closes the file and raises when the footer cannot be written as the new day's file starts" do
       lich_log = stub_lich_log
+      next_day = Time.new(2026, 4, 24, 0, 0, 1)
+      next_day_footer = next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')
       opened = []
       allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
         original.call(*args, &block).tap do |file|
           next unless file.is_a?(File)
 
-          writes = 0
-          # The third write on the first file (header, line 1, footer) fails.
+          # Only the first file's footer, stamped at the new day, fails.
           allow(file).to receive(:puts).and_wrap_original do |puts, *lines|
-            raise Errno::EIO if opened.first.equal?(file) && (writes += 1) == 3
+            raise Errno::EIO if opened.first.equal?(file) && lines.first.to_s.chomp == next_day_footer
 
             puts.call(*lines)
           end
@@ -433,7 +466,7 @@ RSpec.describe 'logxml.lic' do
         end
       end
 
-      expect { run_logxml(lines: ['<output>line 1</output>', Time.new(2026, 4, 24, 0, 0, 1), '<output>line 2</output>']) }
+      expect { run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>']) }
         .to raise_error(Errno::EIO)
 
       expect(opened.size).to eq(1)

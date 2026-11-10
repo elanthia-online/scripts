@@ -1294,10 +1294,24 @@ RSpec.describe GameLogger do
         expect(log_files).to eq(
           '2026/04/2026-04-23_10-00-05.log'    => [default_stamp, marker, 'a', default_stamp],
           '2026/04/2026-04-23_10-00-05_01.log' => [default_stamp, 'b', default_stamp],
-          '2026/04/2026-04-23_10-00-05_02.log' => [default_stamp, 'c', default_stamp],
-          # a full file is followed at once by the next one, which waits
-          # for a line; here the logger stops first
-          '2026/04/2026-04-23_10-00-05_03.log' => [default_stamp, default_stamp]
+          # no _03: the file after a full one opens only when its first
+          # line comes, and here the logger stops first
+          '2026/04/2026-04-23_10-00-05_02.log' => [default_stamp, 'c', default_stamp]
+        )
+      end
+
+      # A file opened at once after a --lines rotation waited for a line; when
+      # the first one came after midnight it went to the new day's file and
+      # the waiting file kept only its header and footer, under the old day.
+      it 'opens the file after a --lines rotation only when its first line comes, also past midnight' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        LogSpecHarness.feed('a', next_day, 'b')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log' => [default_stamp, marker, 'a', default_stamp],
+          '2026/04/2026-04-24_00-00-01.log' => [next_day_stamp, 'b', next_day_stamp]
         )
       end
 
