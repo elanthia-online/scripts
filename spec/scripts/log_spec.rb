@@ -2519,17 +2519,30 @@ module LogSpecHarness::Env
             expect(xml_body).to eq(['You see a door.'])
           end
 
-          # gs_saga_login.xml:38, 59 as read with their "\r" line ends.
-          it 'leaves out the popStream line that closes a span and a Spells line when they end in "\r"' do
+          # gs_saga_login.xml:38, 59 with whitespace after them (made up:
+          # Lich hands get each line chomped, so no "\r" line end is left).
+          it 'leaves out the popStream line that closes a span and a Spells line when only whitespace follows them' do
             LogSpecHarness.feed(
-              "<pushStream id='inv'/>Your worn items are:\r",
-              "  a <a exist=\"781962601\" noun=\"bag\">tooled leather drawstring coin bag</a>\r",
-              "<popStream/>\r",
-              "<stream id=\"Spells\"><a exist=\"-10700001\" coord=\"2524,1871\" noun=\"\">Minor Elemental</a></stream>\r",
+              "<pushStream id='inv'/>Your worn items are:",
+              '  a <a exist="781962601" noun="bag">tooled leather drawstring coin bag</a>',
+              '<popStream/>  ',
+              %(<stream id="Spells"><a exist="-10700001" coord="2524,1871" noun="">Minor Elemental</a></stream>\t),
               'You see a door.'
             )
 
             expect(xml_body).to eq(['You see a door.'])
+          end
+
+          it 'leaves out each Spells element on a line and keeps the text between them' do
+            LogSpecHarness.feed('<stream id="Spells">a</stream>MAIN<stream id="Spells">b</stream>')
+
+            expect(xml_body).to eq(['MAIN'])
+          end
+
+          it 'leaves out a Spells element on a line that also opens a span' do
+            LogSpecHarness.feed(%(<stream id="Spells">a</stream>kept<pushStream id='inv'/>x<popStream/>after))
+
+            expect(xml_body).to eq(['keptafter'])
           end
 
           it 'keeps a line with only whitespace as sent, which loses no stream content' do
@@ -2558,6 +2571,29 @@ module LogSpecHarness::Env
             LogSpecHarness.feed(%(<!-- CLIENT -->say <pushStream id='inv'/><!-- ENDCLIENT -->), 'You see a door.')
 
             expect(xml_body).to eq([%(<!-- CLIENT -->say <pushStream id='inv'/><!-- ENDCLIENT -->), 'You see a door.'])
+          end
+
+          it 'does not close a span for a typed command that holds a popStream tag' do
+            LogSpecHarness.feed("<pushStream id='inv'/>Your worn items are:", '<!-- CLIENT -->say <popStream/><!-- ENDCLIENT -->', '  a gilded locus', '<popStream/>after')
+
+            expect(xml_body).to eq(['<!-- CLIENT -->say <popStream/><!-- ENDCLIENT -->', 'after'])
+          end
+
+          it "logs the upstream thread's notice inside a span, whatever name the logger runs as" do
+            notice = '<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (RuntimeError: <popStream/>) -->'
+            LogSpecHarness.feed("<pushStream id='inv'/>Your worn items are:", notice, '  a gilded locus', '<popStream/>after')
+
+            expect(xml_body).to eq([notice, 'after'])
+          end
+
+          # Only the logger's own two line forms are let through: a game line
+          # that starts with a comment is filtered, so its popStream ends the
+          # span and the lines after it are kept, as Lich keeps them; the
+          # comment is inside the span, so it is left out. (Made up.)
+          it 'ends a span at the popStream of a game line that starts with a comment' do
+            LogSpecHarness.feed("<pushStream id='inv'/>Your worn items are:", '<!-- server note --><popStream/>main text', 'next main')
+
+            expect(xml_body).to eq(['main text', 'next main'])
           end
 
           it 'counts only written lines toward --lines' do
