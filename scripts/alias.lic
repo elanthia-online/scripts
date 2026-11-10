@@ -9,11 +9,14 @@
    game: Gemstone
    tags: core, alias
    required: Lich > 5.0.1
-   version: 1.0.5
+   version: 1.1.0
 
   Help Contribute: https://github.com/elanthia-online/scripts
 
    changelog:
+      1.1.0 (2026-11-09)
+         ;alias setup is a Lich WebUI window instead of GTK: this character's and
+         global aliases on two tabs; edit, delete and add, then Save
       1.0.5 (2026-06-30)
          Updated for 5.19.0 Lich to include new hook registry semantics
       1.0.4 (2025-01-31)
@@ -46,6 +49,230 @@
          don't crash from recursive aliases
 
 =end
+
+# ;alias setup: a native Lich WebUI window with two tabs, this character's
+# aliases and global ones. Targets can be edited, aliases deleted and new
+# ones added. Nothing is written until Save; Cancel or closing the window
+# discards the changes. The window belongs to its own run of this script,
+# started by ;alias setup, so it outlives nothing: the alias service (the
+# upstream hook) keeps running and is told to reload after a save.
+class AliasSetup
+  # Lich keeps this class between runs in a session; start each run clean.
+  constants(false).each { |name| remove_const(name) }
+
+  PAGE_ID = 'alias-setup'
+
+  def self.available?
+    defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
+      defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+  end
+
+  Row = Struct.new(:trigger, :original, :target, :deleted) do
+    def changed? = deleted || target != original
+  end
+
+  # One tab: a table in the alias database, its rows, and aliases waiting to
+  # be added.
+  class List
+    attr_reader :table, :label, :rows, :added
+    attr_accessor :new_trigger, :new_target, :new_rev
+
+    def initialize(db, table, label)
+      @table = table
+      @label = label
+      @rows = []
+      db.execute("SELECT trigger,target FROM #{table};") { |r| @rows << Row.new(r[0].to_s, r[1].to_s, r[1].to_s, false) }
+      @rows.sort_by! { |r| r.trigger.downcase }
+      @added = []
+      @new_trigger = ''
+      @new_target = ''
+      @new_rev = 0
+    end
+
+    def changes = @rows.count(&:changed?) + @added.size
+  end
+
+  def initialize(db, character)
+    @owner = Script.current
+    @db = db
+    @lists = [List.new(db, character, "#{Char.name}'s Aliases"), List.new(db, 'global', 'Global Aliases')]
+    @status = ''
+    @closed = Queue.new
+    @saved = false
+  end
+
+  attr_reader :lists, :status
+
+  def changes = @lists.sum(&:changes)
+
+  def run
+    setup = self
+    @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: 'Lich - Aliases',
+                                 props: { size: [800, 580], bare: true, density: :compact, viewport: true },
+                                 on: { close: ->(_ev) { setup.viewer_closed } }) do |ui|
+      setup.render(ui)
+    end
+    Lich::API.webui_refresh(@page)
+    Lich::API.webui_start
+    unless Lich::API.webui_open(page: @page)
+      respond "\n--- alias: could not open a window for setup.\n\n"
+      return false
+    end
+    @closed.pop
+    unless @saved
+      pending = changes
+      respond "\n--- alias window closed#{pending.positive? ? " WITHOUT saving #{pending} change(s)" : ''}\n\n"
+    end
+    @saved
+  ensure
+    begin
+      Lich::WebUI.terminate_owner(@owner)
+    rescue StandardError
+      nil
+    end
+  end
+
+  def viewer_closed
+    @closed << :viewer
+  end
+
+  # Run a UI callback, then re-render.
+  def act
+    yield
+  rescue StandardError => e
+    @status = "#{e.class}: #{e.message}"
+  ensure
+    Lich::API.webui_refresh(@page) if @page && !@saved
+  end
+
+  def cb(&block)
+    setup = self
+    ->(ev) { setup.act { block.call(ev) } }
+  end
+
+  def set_target(list, trigger, text)
+    row = list.rows.find { |r| r.trigger == trigger } or return
+    row.target = text.to_s
+  end
+
+  def toggle_delete(list, trigger)
+    row = list.rows.find { |r| r.trigger == trigger } or return
+    row.deleted = !row.deleted
+  end
+
+  # The trigger is case-insensitive, as the service matches it.
+  def add(list)
+    trigger = list.new_trigger.to_s.strip
+    return @status = 'Type a trigger for the new alias.' if trigger.empty?
+    return @status = "#{trigger} is already an alias here; edit it in the list." if list.rows.any? { |r| r.trigger.casecmp?(trigger) }
+    return @status = "#{trigger} is already waiting to be added." if list.added.any? { |t, _| t.casecmp?(trigger) }
+    return @status = "Type what #{trigger} should send." if list.new_target.to_s.strip.empty?
+
+    list.added << [trigger, list.new_target.to_s]
+    list.new_trigger = ''
+    list.new_target = ''
+    list.new_rev += 1
+    @status = ''
+  end
+
+  def remove_added(list, trigger)
+    list.added.reject! { |t, _| t == trigger }
+  end
+
+  # The old window's save, table by table.
+  def save
+    count = changes
+    @lists.each do |list|
+      list.rows.each do |row|
+        if row.deleted
+          @db.execute("DELETE FROM #{list.table} WHERE trigger=?", [row.trigger.encode('UTF-8')])
+        elsif row.target != row.original
+          @db.execute("INSERT OR REPLACE INTO #{list.table} (trigger,target) VALUES(?,?);",
+                      [row.trigger.encode('UTF-8'), row.target.encode('UTF-8')])
+        end
+      end
+      list.added.each do |trigger, target|
+        if @db.get_first_value("SELECT target FROM #{list.table} WHERE trigger=? COLLATE NOCASE;", trigger.encode('UTF-8'))
+          respond "[alias: warning: new alias #{trigger} already exists; ignoring]"
+        else
+          @db.execute("INSERT INTO #{list.table} (trigger,target) VALUES(?,?);", [trigger.encode('UTF-8'), target.encode('UTF-8')])
+        end
+      end
+    end
+    @saved = true
+    respond "\n--- aliases saved#{count.positive? ? " (#{count} change(s))" : ''}\n\n"
+    Lich::WebUI.close(@page)
+    @closed << :save
+  end
+
+  def cancel
+    Lich::WebUI.close(@page)
+    @closed << :cancel
+  end
+
+  def render(ui)
+    setup = self
+    lists = @lists
+    ui.stack(key: 'alias', gap: 6, margin: 8, fill: true) do
+      ui.tabs(key: 'tabs', names: lists.map(&:label), selected: 0, on: { select: proc {} }) do
+        lists.each_with_index do |list, n|
+          ui.stack(slot: list.label, key: "tab#{n}", gap: 6, fill: true) { setup.render_list(ui, list, n) }
+        end
+      end
+      ui.text(key: 'status', content: setup.status, tone: :caution, wrap: true) unless setup.status.empty?
+      ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, gap: 6) do
+        pending = setup.changes
+        ui.text(slot: '0', key: 'summary', emphasis: :subtle, wrap: true,
+                content: "#{pending.zero? ? 'No changes.' : "#{pending} unsaved change(s)."} " \
+                         'A target may use \\r between commands and \\? for what follows the trigger. ' \
+                         'Cancel or closing the window discards changes.')
+        ui.button(slot: '1', key: 'cancel', label: 'Cancel', on: { activate: ->(_ev) { setup.cancel } })
+        ui.button(slot: '2', key: 'save', label: 'Save', variant: :primary, on: { activate: ->(_ev) { setup.save } })
+      end
+    end
+  end
+
+  def render_list(ui, list, n)
+    setup = self
+    rows = list.rows
+    added = list.added
+    ui.scroll(key: "list#{n}", fill: true) do
+      if rows.empty? && added.empty?
+        ui.text(key: "none#{n}", content: 'No aliases here yet. Add one below.', emphasis: :subtle)
+      else
+        ui.grid(key: "rows#{n}", cols: 3, homogeneous: false, expand_columns: [2], row_gap: 4, column_gap: 10) do
+          # Keyed by position: triggers may hold any character.
+          rows.each_with_index do |row, i|
+            ui.text(key: "t#{n}-#{i}", content: row.trigger, emphasis: row.deleted ? :subtle : :normal)
+            if row.deleted
+              ui.text(key: "x#{n}-#{i}", content: '(deleted when you save)', emphasis: :subtle, tooltip: 'Undo to keep it.')
+            else
+              ui.text_input(key: "v#{n}-#{i}", value: row.target, change_mode: :input,
+                            on: { change: setup.cb { |ev| setup.set_target(list, row.trigger, ev.payload[:value]) } })
+            end
+            ui.button(key: "d#{n}-#{i}", label: row.deleted ? 'Undo' : 'Delete',
+                      on: { activate: setup.cb { setup.toggle_delete(list, row.trigger) } })
+          end
+          added.each_with_index do |(trigger, target), i|
+            ui.text(key: "at#{n}-#{i}", content: trigger, emphasis: :strong)
+            ui.text(key: "av#{n}-#{i}", content: "#{target}   (new, added when you save)", emphasis: :subtle)
+            ui.button(key: "ad#{n}-#{i}", label: 'Remove', on: { activate: setup.cb { setup.remove_added(list, trigger) } })
+          end
+        end
+      end
+    end
+    ui.group(key: "new#{n}", label: 'New alias') do
+      ui.columns(key: "new-row#{n}-#{list.new_rev}", count: 3, weights: [2, 4, 1], compact: true, row_align: :end, gap: 6) do
+        ui.text_input(slot: '0', key: "nt#{n}", label: 'Trigger', value: list.new_trigger, change_mode: :input,
+                      on: { change: setup.cb { |ev| list.new_trigger = ev.payload[:value].to_s } })
+        ui.text_input(slot: '1', key: "nv#{n}", label: 'Sends', value: list.new_target, change_mode: :input,
+                      on: { change: setup.cb { |ev| list.new_target = ev.payload[:value].to_s },
+                            submit: setup.cb { setup.add(list) } })
+        ui.button(slot: '2', key: "na#{n}", label: 'Add', on: { activate: setup.cb { setup.add(list) } })
+      end
+    end
+  end
+end
 
 if Script.current.vars[1] =~ /^stop/i
   if UpstreamHook.list.include?('alias-service')
@@ -91,271 +318,28 @@ update_regex = proc {
 
 update_regex.call
 
+if Script.current.vars[1] =~ /^setup$/i
+  if AliasSetup.available?
+    saved = AliasSetup.new(db, character).run
+    do_client("#{$lich_char}alias reload") if saved && UpstreamHook.list.include?('alias-service')
+  else
+    respond "\n--- alias setup needs the Lich WebUI. Use ;alias add, ;alias remove and ;alias list instead.\n\n"
+  end
+  # With the service already running this run is only the window; without
+  # it, carry on and start the service as a plain ;alias would.
+  exit if UpstreamHook.list.include?('alias-service')
+end
+
 hook_proc = proc { |client_string|
   if client_string =~ /^(?:<c>)?#{$lich_char}alias\s+(.*)/
     args = $1
-    if (args == 'setup') and defined?(Gtk)
-      if defined?($alias_setup_window) and not $alias_setup_window.nil?
-        $alias_setup_window.present # fixme: show window
+    if args == 'setup'
+      # The window needs a running script to own it, and this hook outlives the
+      # script that added it, so the window gets its own run of the script.
+      if running?('alias')
+        respond "\n--- alias setup is already open\n\n"
       else
-        Thread.new {
-          done = false
-          Gtk.queue {
-            character = "#{XMLData.game.downcase}_#{XMLData.name.downcase}".gsub(/[^a-z_]/, '').encode('UTF-8')
-            char_aliases = Array.new
-            db.execute("SELECT trigger,target FROM #{character};") do |row|
-              char_aliases.push [row[0], row[1]]
-            end
-            char_aliases.sort! { |a, b| a[0].to_s <=> b[0].to_s }
-            char_table     = Gtk::Table.new((char_aliases.length + 1), 3)
-            char_textboxes = Array.new
-            char_aliases.each_index { |i|
-              label = Gtk::Label.new(char_aliases[i][0].to_s)
-              box = Gtk::Box.new(:horizontal)
-              box.pack_end(label, :expand => false, :fill => false, :padding => 0)
-              char_table.attach(box, 0, 1, i, (i + 1), Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 3, 3)
-              textbox      = Gtk::Entry.new
-              textbox.text = char_aliases[i][1]
-              char_table.attach(textbox, 1, 2, i, (i + 1), (Gtk::AttachOptions::EXPAND | Gtk::AttachOptions::FILL), Gtk::AttachOptions::FILL, 3, 3)
-              char_textboxes[i] = textbox
-              delete_button = Gtk::Button.new(:label => "Delete Entry")
-              char_table.attach(delete_button, 2, 3, i, (i + 1), Gtk::AttachOptions::SHRINK, Gtk::AttachOptions::FILL, 3, 3)
-              delete_button.signal_connect('clicked') {
-                report_errors {
-                  label.sensitive = false
-                  textbox.sensitive = false
-                  delete_button.sensitive = false
-                  char_textboxes[i] = nil
-                }
-              }
-            }
-            new_char_aliases = Array.new
-            char_sw = nil
-            add_new_char_row = proc {
-              i = new_char_aliases.length
-              char_table.n_rows = char_table.n_rows + 1
-              label = Gtk::Entry.new
-              label.text = "(new alias trigger)"
-              char_table.attach(label, 0, 1, (char_table.n_rows - 1), char_table.n_rows, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 3, 3)
-              textbox = Gtk::Entry.new
-              textbox.text = "(new alias target)"
-              textbox.sensitive = false
-              char_table.attach(textbox, 1, 2, (char_table.n_rows - 1), char_table.n_rows, (Gtk::AttachOptions::EXPAND | Gtk::AttachOptions::FILL), Gtk::AttachOptions::FILL, 3, 3)
-              new_char_aliases[i] = [label, textbox]
-              delete_button = Gtk::Button.new(:label => "Delete Entry")
-              delete_button.sensitive = false
-              char_table.attach(delete_button, 2, 3, (char_table.n_rows - 1), char_table.n_rows, Gtk::AttachOptions::SHRINK, Gtk::AttachOptions::FILL, 3, 3)
-              label.show
-              textbox.show
-              delete_button.show
-              label.signal_connect('focus-in-event') {
-                report_errors {
-                  if label.text == "(new alias trigger)"
-                    label.text = ''
-                  end
-                  unless textbox.sensitive?
-                    textbox.sensitive = true
-                    delete_button.sensitive = true
-                    add_new_char_row.call
-                    Thread.new {
-                      sleep 0.05
-                      inc = (char_sw.vadjustment.upper - char_sw.vadjustment.value - char_sw.vadjustment.page_size) / 10.0
-                      10.times { char_sw.vadjustment.value = char_sw.vadjustment.value + inc; sleep 0.02 }
-                      char_sw.vadjustment.value = (char_sw.vadjustment.upper - char_sw.vadjustment.page_size)
-                    }
-                  end
-                }
-              }
-              textbox.signal_connect('focus-in-event') {
-                report_errors {
-                  if textbox.text == "(new alias target)"
-                    textbox.text = ''
-                  end
-                }
-              }
-              delete_button.signal_connect('clicked') {
-                report_errors {
-                  label.sensitive = false
-                  textbox.sensitive = false
-                  delete_button.sensitive = false
-                  new_char_aliases[i][1] = nil
-                }
-              }
-            }
-            add_new_char_row.call
-
-            char_vp = Gtk::Viewport.new(nil, nil)
-            char_vp.add(char_table)
-            char_sw = Gtk::ScrolledWindow.new
-            char_sw.set_policy(:automatic, :always)
-            char_sw.add(char_vp)
-
-            global_aliases = Array.new
-            db.execute("SELECT trigger,target FROM global;") do |row|
-              global_aliases.push [row[0], row[1]]
-            end
-            global_aliases.sort! { |a, b| a[0].to_s <=> b[0].to_s }
-            global_table     = Gtk::Table.new((global_aliases.length + 1), 3)
-            global_textboxes = Array.new
-            global_aliases.each_index { |i|
-              label = Gtk::Label.new(global_aliases[i][0].to_s)
-              box = Gtk::Box.new(:horizontal)
-              box.pack_end(label, :expand => false, :fill => false, :padding => 0)
-              global_table.attach(box, 0, 1, i, (i + 1), Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 3, 3)
-              textbox      = Gtk::Entry.new
-              textbox.text = global_aliases[i][1]
-              global_table.attach(textbox, 1, 2, i, (i + 1), (Gtk::AttachOptions::EXPAND | Gtk::AttachOptions::FILL), Gtk::AttachOptions::FILL, 3, 3)
-              global_textboxes[i] = textbox
-              delete_button = Gtk::Button.new(:label => "Delete Entry")
-              global_table.attach(delete_button, 2, 3, i, (i + 1), Gtk::AttachOptions::SHRINK, Gtk::AttachOptions::FILL, 3, 3)
-              delete_button.signal_connect('clicked') {
-                report_errors {
-                  label.sensitive = false
-                  textbox.sensitive = false
-                  delete_button.sensitive = false
-                  global_textboxes[i] = nil
-                }
-              }
-            }
-            new_global_aliases = Array.new
-            global_sw = nil
-            add_new_global_row = proc {
-              i = new_global_aliases.length
-              global_table.n_rows = global_table.n_rows + 1
-              label = Gtk::Entry.new
-              label.text = "(new alias trigger)"
-              global_table.attach(label, 0, 1, (global_table.n_rows - 1), global_table.n_rows, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 3, 3)
-              textbox = Gtk::Entry.new
-              textbox.text = "(new alias target)"
-              textbox.sensitive = false
-              global_table.attach(textbox, 1, 2, (global_table.n_rows - 1), global_table.n_rows, (Gtk::AttachOptions::EXPAND | Gtk::AttachOptions::FILL), Gtk::AttachOptions::FILL, 3, 3)
-              new_global_aliases[i] = [label, textbox]
-              delete_button = Gtk::Button.new(:label => "Delete Entry")
-              delete_button.sensitive = false
-              global_table.attach(delete_button, 2, 3, (global_table.n_rows - 1), global_table.n_rows, Gtk::AttachOptions::SHRINK, Gtk::AttachOptions::FILL, 3, 3)
-              label.show
-              textbox.show
-              delete_button.show
-              label.signal_connect('focus-in-event') {
-                report_errors {
-                  if label.text == "(new alias trigger)"
-                    label.text = ''
-                  end
-                  unless textbox.sensitive?
-                    textbox.sensitive = true
-                    delete_button.sensitive = true
-                    add_new_global_row.call
-                    Thread.new {
-                      sleep 0.05
-                      inc = (global_sw.vadjustment.upper - global_sw.vadjustment.value - global_sw.vadjustment.page_size) / 10.0
-                      10.times { global_sw.vadjustment.value = global_sw.vadjustment.value + inc; sleep 0.02 }
-                      global_sw.vadjustment.value = (global_sw.vadjustment.upper - global_sw.vadjustment.page_size)
-                    }
-                  end
-                }
-              }
-              textbox.signal_connect('focus-in-event') {
-                report_errors {
-                  if textbox.text == "(new alias target)"
-                    textbox.text = ''
-                  end
-                }
-              }
-              delete_button.signal_connect('clicked') {
-                report_errors {
-                  label.sensitive = false
-                  textbox.sensitive = false
-                  delete_button.sensitive = false
-                  new_global_aliases[i][1] = nil
-                }
-              }
-            }
-            add_new_global_row.call
-
-            global_vp = Gtk::Viewport.new(nil, nil)
-            global_vp.add(global_table)
-            global_sw = Gtk::ScrolledWindow.new
-            global_sw.set_policy(:automatic, :always)
-            global_sw.add(global_vp)
-
-            # global_tab = Gtk::Box.new(:vertical) # rubocop useless assignment to variable
-            notebook = Gtk::Notebook.new
-            notebook.append_page(char_sw, Gtk::Label.new("#{Char.name}'s Aliases"))
-            notebook.append_page(global_sw, Gtk::Label.new('Global Aliases'))
-
-            $alias_setup_window = Gtk::Window.new
-            $alias_setup_window.title = "Lich - Aliases"
-            $alias_setup_window.add(notebook)
-            $alias_setup_window.signal_connect('delete_event') {
-              report_errors {
-                modified = new_char_aliases.any? { |a| (a[1] != nil) and a[1].sensitive? } || new_global_aliases.any? { |a| (a[1] != nil) and a[1].sensitive? }
-                unless modified
-                  char_aliases.each_index { |i| if char_textboxes[i].nil? or (char_aliases[i][1] != char_textboxes[i].text); modified = true; echo modified; break; end }
-                  global_aliases.each_index { |i| if global_textboxes[i].nil? or (global_aliases[i][1] != global_textboxes[i].text); modified = true; echo modified; break; end }
-                end
-                if modified
-                  dialog = Gtk::MessageDialog.new(:parent => nil, :flags =>
-                         :modal, :type => :question, :buttons => :yes_no, :message => "Save changes?")
-                  dialog.title = "Lich - #{Char.name}'s Aliases"
-                  dialog.set_icon(@default_icon)
-                  # response = nil # rubocop useless assignment to variable
-                  response = dialog.run
-                  dialog.destroy
-                  if response == Gtk::ResponseType::YES
-                    char_aliases.each_index { |i|
-                      if char_textboxes[i].nil?
-                        db.execute("DELETE FROM #{character} WHERE trigger=?", [char_aliases[i][0].encode('UTF-8')])
-                      elsif (char_aliases[i][1] != char_textboxes[i].text)
-                        db.execute("INSERT OR REPLACE INTO #{character} (trigger,target) VALUES(?,?);", [char_aliases[i][0].encode('UTF-8'), char_textboxes[i].text.encode('UTF-8')])
-                      end
-                    }
-                    new_char_aliases.each { |a|
-                      if (a[1] != nil) and a[1].sensitive?
-                        if a[0].text.empty?
-                          respond "[alias: warning: ignoring new alias with no trigger]"
-                        elsif db.get_first_value("SELECT target FROM #{character} WHERE trigger=? COLLATE NOCASE;", a[0].text.encode('UTF-8'))
-                          respond "[alias: warning: new alias #{a[0].text} already exists; ignoring]"
-                        else
-                          db.execute("INSERT INTO #{character} (trigger,target) VALUES(?,?);", [a[0].text.encode('UTF-8'), a[1].text.encode('UTF-8')])
-                        end
-                      end
-                    }
-                    global_aliases.each_index { |i|
-                      if global_textboxes[i].nil?
-                        db.execute("DELETE FROM global WHERE trigger=?", [global_aliases[i][0].encode('UTF-8')])
-                      elsif (global_aliases[i][1] != global_textboxes[i].text)
-                        db.execute("INSERT OR REPLACE INTO global (trigger,target) VALUES(?,?);", [global_aliases[i][0].encode('UTF-8'), global_textboxes[i].text.encode('UTF-8')])
-                      end
-                    }
-                    new_global_aliases.each { |a|
-                      if (a[1] != nil) and a[1].sensitive?
-                        if a[0].text.empty?
-                          respond "[alias: warning: ignoring new alias with no trigger]"
-                        elsif db.get_first_value("SELECT target FROM global WHERE trigger=? COLLATE NOCASE;", a[0].text.encode('UTF-8'))
-                          respond "[alias: warning: new alias #{a[0].text} already exists; ignoring]"
-                        else
-                          db.execute("INSERT INTO global (trigger,target) VALUES(?,?);", [a[0].text.encode('UTF-8'), a[1].text.encode('UTF-8')])
-                        end
-                      end
-                    }
-                    update_regex.call
-                  end
-                end
-                done = true
-              }
-            }
-
-            $alias_setup_window.set_default_size((Gdk::Screen.default.width / 2), (Gdk::Screen.default.height / 3))
-            $alias_setup_window.set_window_position(:center)
-            $alias_setup_window.set_icon(@default_icon)
-            $alias_setup_window.show_all
-          }
-          begin
-            wait_until { done }
-          ensure
-            Gtk.queue { $alias_setup_window.destroy; $alias_setup_window = nil }
-          end
-        }
+        Script.start('alias', 'setup')
       end
     elsif args =~ /^(\-\-global\s+)?(?:add|set)\s+(\-\-global\s+)?([^=]+)=\s*(.+)$/i
       if ($1 || $2)
@@ -425,7 +409,7 @@ hook_proc = proc { |client_string|
       output = "\n"
       output.concat "Usage:\n"
       output.concat "\n"
-      if defined?(Gtk)
+      if AliasSetup.available?
         output.concat "     #{$clean_lich_char}alias setup\n"
         output.concat "          Opens a window to configure aliases.\n"
       end
