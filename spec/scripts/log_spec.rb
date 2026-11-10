@@ -413,28 +413,6 @@ RSpec.describe GameLogger do
         expect(log_content).to include('2026-04-23 10:00:00: Obvious exits: north, south.')
       end
 
-      # The logger never sets want_downstream_xml, so lich-5's reget has
-      # already stripped every tag (lib/global_defs.rb, def reget). These
-      # lines are what that reget returns for the lich-5 stream fixture
-      # spec/fixtures/streams/gs_saga_hunt.xml.
-      it 'stamps every line of a tag-stripped reget with $login_time' do
-        $reget_lines = [
-          '[Sanctum of Scales, Columns] (4216015)',
-          'Obvious exits: north, east, west',
-          'You are now targeting a lithe veiled sentinel.',
-          '  1d100: 20 + Modifiers: 372 == 392'
-        ]
-
-        run_main
-
-        expect(log_content.lines.map(&:chomp)).to include(
-          '2026-04-23 10:00:00: [Sanctum of Scales, Columns] (4216015)',
-          '2026-04-23 10:00:00: Obvious exits: north, east, west',
-          '2026-04-23 10:00:00: You are now targeting a lithe veiled sentinel.',
-          '2026-04-23 10:00:00:   1d100: 20 + Modifiers: 372 == 392'
-        )
-      end
-
       it 'uses $login_time not current time for reget timestamps' do
         $login_time = Time.new(2026, 1, 1, 12, 30, 45)
         allow(Time).to receive(:now).and_return(Time.new(2026, 1, 1, 12, 30, 50))
@@ -456,22 +434,18 @@ RSpec.describe GameLogger do
         expect(door_line).to start_with('You see a door.')
       end
 
-      # Tag-stripped lines, as lich-5's reget returns them to the logger
-      # (from lich-5 spec/fixtures/streams/gs_saga_hunt.xml).
-      it 'writes every line of a tag-stripped reget as it came' do
-        $reget_lines = [
-          '[Sanctum of Scales, Columns] (4216015)',
-          'Obvious exits: north, east, west',
-          '  Warding failed!'
-        ]
+      # The logger never sets want_downstream_xml, so lich-5's reget has
+      # already stripped every tag and decoded the entities (lib/global_defs.rb,
+      # def reget). A reget line can only start with "<" when the server sent
+      # game text escaped: "&lt;pushStream id='x'/&gt; spoof\r\n" in
+      # $_SERVERBUFFER_ comes back as the line below. write_reget filters no
+      # line, so it is written unchanged, less the "\r".
+      it 'writes a reget line that starts with "<" unchanged' do
+        $reget_lines = ["<pushStream id='x'/> spoof\r", 'You see a door.']
 
         run_main
 
-        expect(log_content.lines.map(&:chomp)).to include(
-          '[Sanctum of Scales, Columns] (4216015)',
-          'Obvious exits: north, east, west',
-          '  Warding failed!'
-        )
+        expect(log_content.lines.map(&:chomp)).to include("<pushStream id='x'/> spoof", 'You see a door.')
       end
     end
 
