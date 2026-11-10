@@ -2339,11 +2339,158 @@ module LogSpecHarness::Env
 
           it 'numbers the line that starts with the room name resource, the u-id right after the first ]' do
             use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
-            LogSpecHarness.feed("#{title_line} (1234)", '[Town Square]')
+            LogSpecHarness.feed("#{title_line}</name><description>A fountain.</description>", '[Town Square]')
 
             run_main
 
-            expect(xml_lines[2..-2]).to eq(['<resource picture="0"/><style id="roomName" />[Town Square - 228] (u1234) (1234)', '[Town Square]'])
+            expect(xml_lines[2..-2]).to eq(
+              ['<resource picture="0"/><style id="roomName" />[Town Square - 228] (u1234)</name><description>A fountain.</description>', '[Town Square]']
+            )
+          end
+
+          # R-12, Q-05: one title decorator for both modes, so a GemStone title
+          # that already shows the room's UID gets no second one in XML mode
+          # either (logxml 0.6.6 wrote "(u1234) (1234)").
+          it 'keeps the game-shown (1234) instead of adding a second u-id' do
+            use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+            LogSpecHarness.feed("#{title_line} (1234)")
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq(['<resource picture="0"/><style id="roomName" />[Town Square - 228] (1234)'])
+          end
+
+          # R-17, Q-06: the room title line forms lich-5 numbers itself
+          # (lib/games.rb process_room_information, lich-5 5de48c46 :1333):
+          # an optional picture resource or popBold, then the roomName style
+          # or the Saga-identity <room> block. Lines made up from that pattern.
+          {
+            'the roomName style with no picture resource' => '<style id="roomName" />[Town Square]',
+            'a popBold before the roomName style'         => '<popBold/><style id="roomName" />[Town Square]',
+            'a Saga-identity <room> block'                => '<resource picture="0"/><room><name>[Town Square]</name><description>A fountain.</description></room>'
+          }.each do |label, line|
+            it "numbers #{label}, the u-id right after the first ]" do
+              use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+              LogSpecHarness.feed(line)
+
+              run_main
+
+              expect(xml_lines[2..-2]).to eq([line.sub('[Town Square]', '[Town Square - 228] (u1234)')])
+            end
+          end
+
+          # A familiar's view of its own room (Lich matches it too, with an
+          # optional familiar pushStream first) is not the character's room,
+          # so it is left alone, as logxml 0.6.6 left it. With streams on it
+          # is written.
+          it "numbers no familiar's room title line" do
+            use_options(GameLogger::Opts.parse(['--xml', '--rnum', '--streams']))
+            familiar_line = %(<pushStream id="familiar" ifClosedStyle="watching"/>#{title_line})
+            LogSpecHarness.feed(familiar_line)
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq([familiar_line])
+          end
+
+          # The title must start the line: a "]" before it would take the
+          # numbers.
+          it 'numbers no line where the room name comes after a line break' do
+            use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+            broken_line = "<output>[ok]</output>\n#{title_line}"
+            LogSpecHarness.feed(broken_line)
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq(["<output>[ok]</output>", title_line])
+          end
+
+          # Server lines verbatim from lich-5 spec/fixtures/streams.
+          context 'with the title lines the game sends' do
+            let(:room_uid) { 4_216_015 }
+
+            before do
+              allow(XMLData).to receive(:room_id) { room_uid }
+              allow(map).to receive(:ids_from_uid) { |uid| { 4_216_015 => [228], 4_217_403 => [5050], 4_217_404 => [5051] }.fetch(uid, []) }
+            end
+
+            # gs_saga_hunt.xml:23
+            let(:gs_title) { '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns] (4216015)' }
+
+            it 'keeps the game-shown (4216015) in GemStone (gs_saga_hunt.xml:23)' do
+              use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+              LogSpecHarness.feed(gs_title)
+
+              run_main
+
+              expect(xml_lines[2..-2]).to eq(['<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (4216015)'])
+            end
+
+            it 'leaves the GemStone title as sent when the room has no Lich number' do
+              allow(map).to receive(:ids_from_uid).and_return([])
+              use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+              LogSpecHarness.feed(gs_title)
+
+              run_main
+
+              expect(xml_lines[2..-2]).to eq([gs_title])
+            end
+
+            # The guard looks for this room's UID, not any number: one digit
+            # more is another room.
+            it "adds the u-id when the line shows another room's number" do
+              use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+              LogSpecHarness.feed(gs_title.sub('(4216015)', '(42160151)'))
+
+              run_main
+
+              expect(xml_lines[2..-2]).to eq(['<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015) (42160151)'])
+            end
+
+            context 'in DragonRealms' do
+              let(:room_uid) { 4_217_403 }
+              # dr_saga_hunt.xml:944, cut after </description> (the rest of
+              # the 3,315-byte line is the room's objects and exits).
+              let(:saga_title) do
+                '<resource picture="0"/><room><name>[Jeol\'gelvmoraen, Ice Grottos] (4217403)</name><description>Curiously mummified ' \
+                  'creatures, contorted into odd postures by the slow movement of the ice, rest beneath the surface of the walls and floor.  ' \
+                  'Their baleful eyes gaze blankly from behind the faceted flow, almost pleading for release from their frigid tombs.  A ' \
+                  'tracery of faint cracks emanates from beneath a twisted stone that has fallen from the ceiling; an oval of tortuous white ' \
+                  'imperfections marks the collision, stark upon a sea of blue ice.</description>'
+              end
+
+              before { allow(XMLData).to receive(:game).and_return('DR') }
+
+              it 'numbers the Saga-identity <room><name> title, with no u-id (dr_saga_hunt.xml:944)' do
+                use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+                LogSpecHarness.feed(saga_title)
+
+                run_main
+
+                expect(xml_lines[2..-2]).to eq([saga_title.sub('Ice Grottos]', 'Ice Grottos - 5050]')])
+                expect(xml_lines[2]).to start_with('<resource picture="0"/><room><name>[Jeol\'gelvmoraen, Ice Grottos - 5050] (4217403)</name>')
+              end
+
+              # dr_legacy_hunt.xml:1435
+              it 'still numbers the legacy roomName title (dr_legacy_hunt.xml:1435)' do
+                allow(XMLData).to receive(:room_id).and_return(4_217_404)
+                use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+                LogSpecHarness.feed('<resource picture="0"/><style id="roomName" />[Jeol\'gelvmoraen, Ice Grottos] (4217404)')
+
+                run_main
+
+                expect(xml_lines[2..-2]).to eq(['<resource picture="0"/><style id="roomName" />[Jeol\'gelvmoraen, Ice Grottos - 5051] (4217404)'])
+              end
+
+              it 'numbers no <room> block that comes after other text' do
+                use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+                LogSpecHarness.feed("<output>See </output>#{saga_title}")
+
+                run_main
+
+                expect(xml_lines[2..-2]).to eq(["<output>See </output>#{saga_title}"])
+              end
+            end
           end
 
           it 'numbers no line where the room name resource comes after other text' do
@@ -2688,18 +2835,11 @@ module LogSpecHarness::Env
           expect(mode.reget_line.call("<prompt time=\"1\">&gt;</prompt>\r", '%T', Time.new(2026, 1, 1))).to eq('<prompt time="1">&gt;</prompt>')
         end
 
-        {
-          'GemStone, with a Lich number'     => ['GSIV', 228, '[Town Square - 228] (u1234) (1234)'],
-          'GemStone, without a Lich number'  => ['GSIV', nil, '[Town Square] (u1234) (1234)'],
-          'DragonRealms, with a Lich number' => ['DR', 228, '[Town Square - 228] (1234)'],
-          'DragonRealms, without one'        => ['DR', nil, '[Town Square] (1234)']
-        }.each do |label, (game, lich_id, numbered)|
-          it "numbers a room title in #{label} after its first ]" do
-            line = '[Town Square] (1234)'
-
-            expect(mode.number_title.call(line, lich_id, 1234, game)).to eq(numbered)
-            expect(line).to eq('[Town Square] (1234)')
-          end
+        # R-12: the markup after the title ("</name>" in a <room> block)
+        # stays after the u-id; text mode appends it to the line.
+        it 'puts the u-id right after the title, where text mode appends it' do
+          expect(mode.uid_after_title).to be(true)
+          expect(GameLogger::Mode::TEXT.uid_after_title).to be(false)
         end
 
         it 'keeps every line with streams' do
@@ -2750,6 +2890,49 @@ module LogSpecHarness::Env
 
         it 'gives no lines for an empty reget (nil)' do
           expect(GameLogger::Logger.new(OpenStruct.new).reget_lines(nil, Time.new(2026, 7, 1))).to eq([])
+        end
+      end
+
+      # R-12, Q-05: the one room title decorator both modes use.
+      describe '.number_room_title' do
+        {
+          'GemStone, a Lich number, the UID shown'     => [['[Town Square] (1234)', 228, 'GSIV'], '[Town Square - 228] (1234)'],
+          'GemStone, no Lich number, the UID shown'    => [['[Town Square] (1234)', nil, 'GSIV'], '[Town Square] (1234)'],
+          'GemStone, a Lich number, no UID shown'      => [['[Town Square]', 228, 'GSIV'], '[Town Square - 228] (u1234)'],
+          'GemStone, another number shown'             => [['[Town Square] (12345)', 228, 'GSIV'], '[Town Square - 228] (12345) (u1234)'],
+          'GemStone, markup after the title'           => [['[Town Square]</name>', 228, 'GSIV'], '[Town Square - 228]</name> (u1234)'],
+          'GemStone, a second ] on the line'           => [['[Town Square] [lit]', nil, 'GSIV'], '[Town Square] [lit] (u1234)'],
+          'DragonRealms, a Lich number, the UID shown' => [['[Town Square] (1234)', 228, 'DR'], '[Town Square - 228] (1234)'],
+          'DragonRealms, no Lich number, no UID shown' => [['[Town Square]', nil, 'DR'], '[Town Square]']
+        }.each do |label, ((line, lich_id, game), numbered)|
+          it "numbers the title as text mode does (any u-id at the end of the line) in #{label}" do
+            expect(GameLogger::Logger.number_room_title(line, lich_id, 1234, game)).to eq(numbered)
+          end
+        end
+
+        {
+          'GemStone, a Lich number, no UID shown' => [['[Town Square]</name>', 228, 'GSIV'], '[Town Square - 228] (u1234)</name>'],
+          'GemStone, the UID shown'               => [['[Town Square] (1234)</name>', 228, 'GSIV'], '[Town Square - 228] (1234)</name>'],
+          'GemStone, a second ] on the line'      => [['[Town Square] [lit]', nil, 'GSIV'], '[Town Square] (u1234) [lit]'],
+          'DragonRealms'                          => [['[Town Square] (1234)</name>', 228, 'DR'], '[Town Square - 228] (1234)</name>']
+        }.each do |label, ((line, lich_id, game), numbered)|
+          it "numbers the title as XML mode does (any u-id right after the first ]) in #{label}" do
+            expect(GameLogger::Logger.number_room_title(line, lich_id, 1234, game, uid_after_title: true)).to eq(numbered)
+          end
+        end
+
+        it 'never changes the line it is given' do
+          line = +'[Town Square]'
+
+          GameLogger::Logger.number_room_title(line, 228, 1234, 'GSIV', uid_after_title: true)
+
+          expect(line).to eq('[Town Square]')
+        end
+
+        it 'returns the line itself when there is nothing to add' do
+          line = '[Town Square] (1234)'
+
+          expect(GameLogger::Logger.number_room_title(line, nil, 1234, 'GSIV', uid_after_title: true)).to equal(line)
         end
       end
 

@@ -327,15 +327,14 @@ module LogSpecHarness::Env
       end
 
       # The title line as the server sends it, verbatim from lich-5
-      # spec/fixtures/streams/gs_saga_hunt.xml, ends in the game's own
-      # "(uid)". logxml adds its numbers inside and right after the first "]",
-      # and keeps the game's "(uid)" (log.lic, in text mode, appends the u-id
-      # at the end and skips it when the game already shows it).
-      it "adds the numbers after the first ] of a real GS title line and keeps the game's (uid)" do
+      # spec/fixtures/streams/gs_saga_hunt.xml:23, ends in the game's own
+      # "(uid)". R-12, Q-05: as in text mode, no u-id is added when the line
+      # already shows the room's UID (0.6.6 wrote "(u4216015) (4216015)").
+      it "adds the Lich id inside the first ] of a real GS title line and keeps the game's (uid) as the only one" do
         uid_table[uid] = [228]
 
         expect(logged_lines(line: '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns] (4216015)').first).to eq(
-          '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015) (4216015)'
+          '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (4216015)'
         )
       end
 
@@ -418,6 +417,23 @@ module LogSpecHarness::Env
           expect(logged_lines(line: "#{title_line} [lit]").first).to eq(
             '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 12345] [lit]'
           )
+        end
+
+        # R-17, Q-06: the Saga-identity <room> block, verbatim from lich-5
+        # spec/fixtures/streams/dr_saga_containers_speech.xml:257, cut after
+        # </description>. 0.6.6 numbered only the roomName style.
+        it 'adds the Lich id inside the first ] of a real Saga-identity <room><name> title' do
+          uid_table[uid] = [12_345]
+          saga_title = '<resource picture="0"/><room><name>[Bosque Deriel, Hermit\'s Shacks] (230008)</name><description>Here on the ' \
+                       'route between the sacred sites of the Observatory and the Faery Ring is a semi-circular clearing.  At its center ' \
+                       'stands a hut made of lashed branches, roofed with broad leaves.  A certain sect of Elven clerics, who are renowned ' \
+                       'for their devotion to contemplation, are wont to retire into the solitudes of the woods and groves hereabouts.  ' \
+                       'They are not, however, renowned for their hospitality.</description>'
+
+          numbered = logged_lines(line: saga_title).first
+
+          expect(numbered).to start_with('<resource picture="0"/><room><name>[Bosque Deriel, Hermit\'s Shacks - 12345] (230008)</name><description>Here on the ')
+          expect(numbered).to eq(saga_title.sub("Shacks]", "Shacks - 12345]"))
         end
       end
     end
@@ -1339,15 +1355,20 @@ module LogSpecHarness::Env
         end
 
         # 0.6.1 took the Lich number from Map.current; log.lic takes it from
-        # the map's UID table (R-05). For a room both place, the bytes match.
-        it 'differs only by the footer (R-23) with --rnum in a room the map places' do
+        # the map's UID table (R-05). For a room both place, the Lich number
+        # matches; the title already shows the room's UID (1234), so the
+        # second u-id 0.6.1 added is gone (R-12).
+        it 'differs only by the footer (R-23) and the u-id kept off a title showing (1234) (R-12) with --rnum' do
           stub_const('Map', double('Map', loaded?: true, current: double('Room', id: 228)))
           allow(Map).to receive(:ids_from_uid).with(1234).and_return([228])
 
           runs = run_all(args: '--rnum')
 
-          expect(runs[:base][xml_file]).to include('[Town Square - 228] (u1234) (1234)')
-          expect(runs[:logxml]).to eq(xml_file => runs[:base][xml_file] + footer)
+          expect(runs[:base][xml_file]).to include('<style id="roomName" />[Town Square - 228] (u1234) (1234)')
+          expect(runs[:logxml]).to eq(
+            xml_file => runs[:base][xml_file].sub('[Town Square - 228] (u1234) (1234)', '[Town Square - 228] (1234)') + footer
+          )
+          expect(runs[:logxml][xml_file]).to include('<style id="roomName" />[Town Square - 228] (1234)')
           expect(runs[:log_xml]).to eq(runs[:logxml])
         end
 
