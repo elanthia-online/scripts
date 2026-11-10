@@ -27,7 +27,7 @@ module LogSpecHarness
     # (lib/global_defs.rb), in GemStone too, where a character with no
     # yaml gets an empty OpenStruct.
     attr_accessor :settings
-    # The thread the last GameLogger.start_upstream_logger call started
+    # The thread the last GameLogger::Logger.start_upstream_logger call started
     # (see UpstreamTracker), for wait_for_upstream!.
     attr_accessor :upstream_thread
     # How many times the script called hide_me.
@@ -189,13 +189,28 @@ module LogSpecHarness
     def hide_me = LogSpecHarness.hide_me
   end
 
-  # Prepended to GameLogger's singleton class: keeps the thread
-  # start_upstream_logger starts (main drops it), so a run can wait for it
-  # to end. A later evaluation of the module redefines the method under
-  # this one, so it stays in place.
+  # Prepended to each GameLogger::Logger's singleton class (see
+  # LoggerHook): keeps the thread start_upstream_logger starts (Logger#run
+  # drops it), so a run can wait for it to end.
   module UpstreamTracker
     def start_upstream_logger
       LogSpecHarness.upstream_thread = super
+    end
+  end
+
+  # Extended onto GameLogger before log.lic is first evaluated. Every
+  # evaluation sets a new GameLogger::Logger class, whose own methods call
+  # Lich's script helpers (echo, upstream_get) with no receiver; each one
+  # gets ScriptHelpers and UpstreamTracker as it is set, also when the
+  # whole script runs (run_whole_script), which starts the run at once.
+  module LoggerHook
+    def const_added(name)
+      super
+      return unless name == :Logger
+
+      logger = const_get(name, false)
+      logger.extend(ScriptHelpers)
+      logger.singleton_class.prepend(UpstreamTracker)
     end
   end
 
@@ -226,8 +241,14 @@ module_line -= magic_lines
 # still be logging.
 LogSpecHarness.define_singleton_method(:evaluate_game_logger) do
   LogSpecHarness::Env.module_eval(module_code, script_path, module_line)
-  LogSpecHarness::Env::GameLogger.extend(LogSpecHarness::ScriptHelpers)
-  LogSpecHarness::Env::GameLogger.singleton_class.prepend(LogSpecHarness::UpstreamTracker)
+end
+# GameLogger exists before log.lic is evaluated, so its module body reopens
+# this one, which has the script helpers and LoggerHook from the start.
+module LogSpecHarness::Env
+  module GameLogger
+    extend LogSpecHarness::ScriptHelpers
+    extend LogSpecHarness::LoggerHook
+  end
 end
 LogSpecHarness.evaluate_game_logger
 
@@ -1216,7 +1237,7 @@ module LogSpecHarness::Env
         # +error+.
         def type_then_fail(error)
           calls = 0
-          allow(GameLogger).to receive(:upstream_get) do
+          allow(GameLogger::Logger).to receive(:upstream_get) do
             calls += 1
             raise error if calls > 1
 
@@ -1247,7 +1268,7 @@ module LogSpecHarness::Env
           LogSpecHarness.wait_for_upstream!
           error = RuntimeError.new('boom')
           error.set_backtrace(["C:/Users/someone/Lich5/scripts/log.lic:487:in 'block in GameLogger.start_upstream_logger'"])
-          allow(GameLogger).to receive(:upstream_get).and_raise(error)
+          allow(GameLogger::Logger).to receive(:upstream_get).and_raise(error)
 
           run_main
 
@@ -1257,7 +1278,7 @@ module LogSpecHarness::Env
         end
 
         it 'leaves out "at" when the error has no backtrace' do
-          GameLogger.upstream_stopped(RuntimeError.new('boom'))
+          GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
 
           expect(LogSpecHarness.echoes).to eq(
             ['typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom. ' \
@@ -1269,9 +1290,9 @@ module LogSpecHarness::Env
           error = RuntimeError.new('boom')
           error.set_backtrace(['<internal:kernel>'])
 
-          expect(GameLogger.upstream_frame(error)).to eq('<internal:kernel>')
+          expect(GameLogger::Logger.upstream_frame(error)).to eq('<internal:kernel>')
 
-          GameLogger.upstream_stopped(error)
+          GameLogger::Logger.upstream_stopped(error)
 
           expect(LogSpecHarness.echoes.first)
             .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at <internal:kernel>. ')
@@ -1281,7 +1302,7 @@ module LogSpecHarness::Env
         it 'gives the restart without arguments when vars[0] is only whitespace' do
           allow(Script.current).to receive(:vars).and_return(['  '])
 
-          GameLogger.upstream_stopped(RuntimeError.new('boom'))
+          GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
 
           expect(LogSpecHarness.echoes.first).to end_with('(;kill log, then ;log) to log typed commands again.')
         end
@@ -1385,11 +1406,11 @@ module LogSpecHarness::Env
         # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
         it 'says nothing and leaves no line when the thread is killed, as ;kill log does' do
           waiting = Thread::Queue.new
-          allow(GameLogger).to receive(:upstream_get) do
+          allow(GameLogger::Logger).to receive(:upstream_get) do
             waiting << true
             sleep # waits for the next typed command until ;kill
           end
-          thread = GameLogger.start_upstream_logger
+          thread = GameLogger::Logger.start_upstream_logger
           Timeout.timeout(2) { waiting.pop }
 
           thread.kill
@@ -1560,7 +1581,7 @@ module LogSpecHarness::Env
           end
 
           it 'builds the title matcher once per room, not once per line' do
-            allow(GameLogger).to receive(:room_title_pattern).and_call_original
+            allow(GameLogger::Logger).to receive(:room_title_pattern).and_call_original
             LogSpecHarness.feed(
               '[Sanctum of Scales, Columns]', 'line 1', 'line 2',
               { count: 2, uid: 4_216_016, title: '[Sanctum of Scales, Pool]' },
@@ -1573,7 +1594,7 @@ module LogSpecHarness::Env
                 '[Sanctum of Scales, Pool] (u4216016)', 'line 3'
               ]
             )
-            expect(GameLogger).to have_received(:room_title_pattern).twice
+            expect(GameLogger::Logger).to have_received(:room_title_pattern).twice
           end
         end
 
@@ -1764,7 +1785,7 @@ module LogSpecHarness::Env
 
             gate << :loaded
             wait_for_loaders
-            expect(GameLogger.lich_room_id(4_216_015)).to eq(288)
+            expect(GameLogger::Logger.lich_room_id(4_216_015)).to eq(288)
           end
 
           # The UID table is cleared and rebuilt one room at a time, so mid-load
@@ -2356,22 +2377,22 @@ module LogSpecHarness::Env
         it 'names the first file of a run by the time, even when that file exists' do
           File.write(File.join(log_dir, '2026-04-23_10-00-05.log'), '')
 
-          expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: false))
+          expect(GameLogger::Logger.log_file_path(log_dir, time, '.log', rotated: false))
             .to eq(File.join(log_dir, '2026-04-23_10-00-05.log'))
         end
 
         it 'names a rotated file by the time when no file has that name' do
-          expect(GameLogger.log_file_path(log_dir, time, '.xml', rotated: true))
+          expect(GameLogger::Logger.log_file_path(log_dir, time, '.xml', rotated: true))
             .to eq(File.join(log_dir, '2026-04-23_10-00-05.xml'))
         end
 
         it 'adds _01 to a rotated file whose name exists, and _02 when that exists too' do
           File.write(File.join(log_dir, '2026-04-23_10-00-05.log'), '')
-          expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+          expect(GameLogger::Logger.log_file_path(log_dir, time, '.log', rotated: true))
             .to eq(File.join(log_dir, '2026-04-23_10-00-05_01.log'))
 
           File.write(File.join(log_dir, '2026-04-23_10-00-05_01.log'), '')
-          expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+          expect(GameLogger::Logger.log_file_path(log_dir, time, '.log', rotated: true))
             .to eq(File.join(log_dir, '2026-04-23_10-00-05_02.log'))
         end
 
@@ -2379,7 +2400,7 @@ module LogSpecHarness::Env
           names = ['2026-04-23_10-00-05.log']
           11.times do
             FileUtils.touch(File.join(log_dir, names.last))
-            names << File.basename(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+            names << File.basename(GameLogger::Logger.log_file_path(log_dir, time, '.log', rotated: true))
           end
           names << '2026-04-23_10-00-06.log'
 
@@ -2393,14 +2414,14 @@ module LogSpecHarness::Env
         it 'logs and ignores a write error while the logger stops' do
           allow(Lich).to receive(:log)
 
-          expect(GameLogger.write_footer(closed_file, nil, stopping: true)).to be_nil
+          expect(GameLogger::Logger.write_footer(closed_file, nil, stopping: true)).to be_nil
           expect(Lich).to have_received(:log).with(
             "log: the footer of #{closed_file.path} was not written while the logger stopped (IOError: closed stream)"
           )
         end
 
         it 'raises a write error when the logger is not stopping' do
-          expect { GameLogger.write_footer(closed_file, nil, stopping: false) }.to raise_error(IOError)
+          expect { GameLogger::Logger.write_footer(closed_file, nil, stopping: false) }.to raise_error(IOError)
         end
       end
 
@@ -2504,14 +2525,14 @@ module LogSpecHarness::Env
         let(:header_stamp) { ->(time) { "header at #{time.strftime('%H:%M')}" } }
 
         it 'writes the header_stamp line as the header when timestamps are off' do
-          GameLogger.with_log_file(path, nil, clock: clock, header_stamp: header_stamp) { |file| file.puts 'line 1' }
+          GameLogger::Logger.with_log_file(path, nil, clock: clock, header_stamp: header_stamp) { |file| file.puts 'line 1' }
 
           expect(File.read(path).lines(chomp: true))
             .to eq(['header at 08:30', 'line 1', "2026-07-01 08:30:00.000 #{clock.now.strftime('%:z')}"])
         end
 
         it 'writes the timestamp format as the header when timestamps are on' do
-          GameLogger.with_log_file(path, '%T', clock: clock, header_stamp: header_stamp) { |file| file.puts 'line 1' }
+          GameLogger::Logger.with_log_file(path, '%T', clock: clock, header_stamp: header_stamp) { |file| file.puts 'line 1' }
 
           expect(File.read(path).lines(chomp: true)).to eq(['08:30:00', 'line 1', '08:30:00'])
         end
@@ -2583,6 +2604,31 @@ module LogSpecHarness::Env
           expect(GameLogger::Mode::TEXT).not_to equal(text_mode)
         end
 
+        it 'names the new classes as the constants they are set to, with their own default mode' do
+          LogSpecHarness.evaluate_game_logger
+
+          expect(GameLogger::Logger.name).to eq('LogSpecHarness::Env::GameLogger::Logger')
+          expect(GameLogger::Mode.name).to eq('LogSpecHarness::Env::GameLogger::Mode')
+          expect(GameLogger::Logger::DEFAULT_MODE).to equal(GameLogger::Mode::TEXT)
+        end
+
+        # A run starting on another thread (;force log racing a start) can
+        # read these names at any line of the evaluation.
+        it 'never leaves Logger, Mode or Mode::TEXT undefined while it evaluates' do
+          missing = []
+          trace = TracePoint.new(:line) do |tp|
+            next unless File.expand_path(tp.path) == File.expand_path('../../scripts/log.lic', __dir__)
+
+            defined = GameLogger.const_defined?(:Logger, false) && GameLogger.const_defined?(:Mode, false) &&
+                      GameLogger::Mode.const_defined?(:TEXT, false) && GameLogger::Logger.const_defined?(:DEFAULT_MODE, false)
+            missing << tp.lineno unless defined
+          end
+
+          trace.enable { LogSpecHarness.evaluate_game_logger }
+
+          expect(missing).to be_empty
+        end
+
         it 'leaves a run built before it with the Logger class it was built with' do
           logger = GameLogger::Logger.new(OpenStruct.new)
 
@@ -2590,6 +2636,36 @@ module LogSpecHarness::Env
 
           expect(logger).not_to be_a(GameLogger::Logger)
           expect(logger.class::REGET_MARKER).to eq("<!-- Above contents from reget; full logging now active -->\n")
+        end
+
+        # A different log.lic evaluated in the same session (an update, then
+        # ;force log) redefines the module's methods. A run already logging
+        # calls only its own Logger class's file and room helpers, so it keeps
+        # rotating files when the new ones take other arguments (stood in for
+        # here by helpers that raise).
+        it "keeps rotating files with its own helpers after another version's evaluation" do
+          $login_time = Time.new(2026, 1, 1)
+          helpers = %i[log_root log_directory log_file_path file_stamp with_log_file write_footer lich_room_id
+                       room_title_pattern number_room_title start_upstream_logger upstream_stopped upstream_frame]
+          another_version = lambda do
+            LogSpecHarness.evaluate_game_logger
+            [GameLogger, GameLogger::Logger].product(helpers).each do |owner, name|
+              allow(owner).to receive(name).and_raise(ArgumentError, "another version's #{name}") if owner.respond_to?(name, true)
+            end
+          end
+          lines = ['line 1', 'line 2', 'line 3']
+          io = io_class.new([])
+          io.define_singleton_method(:get) do
+            another_version.call if lines.size == 3
+            lines.shift || raise(StopIteration)
+          end
+          clock_times = [Time.new(2026, 7, 1, 8, 30, 0)] * 3 + [Time.new(2026, 7, 1, 8, 30, 1)] * 4 + [Time.new(2026, 7, 1, 8, 30, 2)] * 20
+          ticking = Object.new.tap { |fake| fake.define_singleton_method(:now) { clock_times.size > 1 ? clock_times.shift : clock_times.first } }
+
+          Timeout.timeout(5) { GameLogger::Logger.new(GameLogger::Opts.parse(['--lines=1']), clock: ticking, io: io).run }
+
+          bodies = Dir[file_at('2026/07/*.log')].sort.map { |path| File.read(path).lines(chomp: true)[1..-2] }
+          expect(bodies).to eq([['line 1'], ['line 2'], ['line 3']])
         end
       end
 
@@ -2615,7 +2691,7 @@ module LogSpecHarness::Env
       it 'logs each typed command as the block formats it' do
         LogSpecHarness.type('look')
 
-        thread = GameLogger.start_upstream_logger { |command| "typed: #{command}" }
+        thread = GameLogger::Logger.start_upstream_logger { |command| "typed: #{command}" }
         thread.join(2)
 
         expect(LogSpecHarness::DOWNSTREAM.pop(true)).to eq('typed: look')
