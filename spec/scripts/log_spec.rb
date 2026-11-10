@@ -2,6 +2,7 @@ require 'tmpdir'
 require 'fileutils'
 require 'ostruct'
 require 'timeout'
+require_relative '../support/lich_script_vars'
 
 # Stand-ins for the parts of lich-5 that log.lic's `module GameLogger` uses,
 # kept off the top level: the module is evaluated inside
@@ -87,21 +88,9 @@ module LogSpecHarness
       @script = new_script(args, name: name)
     end
 
-    # lich-5's Script#initialize vars (lib/common/script.rb:1734-1750): a
-    # String is vars[0] whole, then split on spaces with quotes honoured; an
-    # Array (autostart's :args) is vars[0] joined with spaces, then the
-    # items as they are, quotes and all.
+    # lich-5's Script#initialize vars (see LichScriptVars.build).
     def script_vars(args)
-      case args
-      when String
-        return [] if args.empty?
-
-        [args] + args.scan(/[^\s"]*(?<!\\)"(?:\\"|[^"])+(?<!\\)"[^\s]*|(?:\\"|[^"\s])+/).collect { |s| s.gsub(/(?<!\\)"/, '').gsub('\\"', '"') }
-      when Array
-        args.empty? ? [] : [args.join(' '), *args]
-      else
-        []
-      end
+      LichScriptVars.build(args)
     end
 
     def feed(*lines)
@@ -515,8 +504,6 @@ module LogSpecHarness::Env
         hide_const('LOG_DIR')
         allow(Time).to receive(:now).and_return(frozen_time)
         $login_time = Time.new(2026, 4, 23, 10, 0, 0)
-        # Examples that set reget lines would otherwise leave them for the
-        # next example, whose file would start with them in random order.
       end
 
       after do
@@ -556,17 +543,35 @@ module LogSpecHarness::Env
 
         it 'timestamps reget lines with $login_time' do
           LogSpecHarness.server_buffer = ['You see a door.', 'Obvious exits: north, south.']
+
           run_main
-          expect(log_content).to include('2026-04-23 10:00:00: You see a door.')
-          expect(log_content).to include('2026-04-23 10:00:00: Obvious exits: north, south.')
+
+          expect(log_content.lines(chomp: true)).to eq(
+            [
+              '2026-04-23 10:00:05',
+              '2026-04-23 10:00:00: You see a door.',
+              '2026-04-23 10:00:00: Obvious exits: north, south.',
+              '<!-- Above contents from reget; full logging now active -->',
+              '2026-04-23 10:00:05'
+            ]
+          )
         end
 
         it 'uses $login_time not current time for reget timestamps' do
           $login_time = Time.new(2026, 1, 1, 12, 30, 45)
           allow(Time).to receive(:now).and_return(Time.new(2026, 1, 1, 12, 30, 50))
           LogSpecHarness.server_buffer = ['Test line']
+
           run_main
-          expect(log_content).to include('2026-01-01 12:30:45: Test line')
+
+          expect(log_content.lines(chomp: true)).to eq(
+            [
+              '2026-01-01 12:30:50',
+              '2026-01-01 12:30:45: Test line',
+              '<!-- Above contents from reget; full logging now active -->',
+              '2026-01-01 12:30:50'
+            ]
+          )
         end
       end
 
@@ -606,25 +611,35 @@ module LogSpecHarness::Env
           use_options(OpenStruct.new(timestamp: '%F %T'))
         end
 
-        it 'does not write reget lines' do
+        it 'writes neither the reget lines nor the marker, only the header, the lines and the footer' do
           LogSpecHarness.server_buffer = ['Should not appear']
-          run_main
-          expect(log_content).not_to include('Should not appear')
-        end
+          LogSpecHarness.feed('You see a door.')
 
-        it 'does not write reget marker comment' do
-          LogSpecHarness.server_buffer = ['ignored']
           run_main
-          expect(log_content).not_to include('Above contents from reget')
+
+          expect(log_content.lines(chomp: true)).to eq(
+            ['2026-04-23 10:00:05', '2026-04-23 10:00:05: You see a door.', '2026-04-23 10:00:05']
+          )
         end
       end
 
-      it 'writes reget marker comment when reget is used' do
+      it 'writes the reget lines and then the marker when the logger starts within 30 seconds' do
         $login_time = frozen_time - 5
         LogSpecHarness.server_buffer = ['test']
+        LogSpecHarness.feed('You see a door.')
         use_options(OpenStruct.new)
+
         run_main
-        expect(log_content).to include('<!-- Above contents from reget; full logging now active -->')
+
+        expect(log_content.lines(chomp: true)).to eq(
+          [
+            default_stamp,
+            'test',
+            '<!-- Above contents from reget; full logging now active -->',
+            'You see a door.',
+            default_stamp
+          ]
+        )
       end
 
       # R-24: Lich's --logs= sets LOG_DIR (lich.rbw), and pilepull.lic reads
@@ -1843,6 +1858,22 @@ module LogSpecHarness::Env
 
             expect(log_with('--exclude=u4216015')).to eq([])
           end
+
+          # --exclude looks the room up, but only --rnum numbers its title.
+          it 'leaves the room title alone with --exclude of u-ids and no --rnum' do
+            uid_table[4_216_015] = [228]
+            LogSpecHarness.feed('[Sanctum of Scales, Columns]', 'x')
+
+            expect(log_with('--exclude=u7199')).to eq(['[Sanctum of Scales, Columns]', 'x'])
+          end
+
+          it 'leaves the room title alone with --exclude of a Lich id and no --rnum, in a room it looked up' do
+            uid_table[4_216_015] = [300]
+            LogSpecHarness.feed('[Sanctum of Scales, Columns]', 'x')
+
+            expect(log_with('--exclude=u7199,288')).to eq(['[Sanctum of Scales, Columns]', 'x'])
+            expect(map).to have_received(:ids_from_uid).with(4_216_015)
+          end
         end
       end
 
@@ -1896,6 +1927,19 @@ module LogSpecHarness::Env
         it 'starts the new file on the first line after midnight even in an excluded room' do
           use_options(GameLogger::Opts.parse(['--exclude=u7199']))
           LogSpecHarness.feed('line 1', { count: 2, uid: 7199 }, next_day, 'excluded line')
+
+          run_main
+
+          expect(log_files).to eq(
+            '2026/04/2026-04-23_10-00-05.log' => [default_stamp, marker, 'line 1', next_day_stamp],
+            '2026/04/2026-04-24_00-00-01.log' => [next_day_stamp, next_day_stamp]
+          )
+        end
+
+        # The date is checked before the filter, as before the --exclude skip.
+        it 'starts the new file on the first line after midnight even when the filter drops it' do
+          use_options(OpenStruct.new)
+          LogSpecHarness.feed('line 1', next_day, '<pushStream id="percWindow"/> Turtle (61 roisaen)')
 
           run_main
 

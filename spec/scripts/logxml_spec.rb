@@ -2,6 +2,7 @@ require 'tmpdir'
 require 'fileutils'
 require 'ostruct'
 require 'timeout'
+require_relative '../support/lich_script_vars'
 
 # logxml.lic is a top-level script, not a module, so these examples run its
 # real body (everything after the =end header) on a fresh object whose
@@ -41,8 +42,10 @@ RSpec.describe 'logxml.lic' do
     FileUtils.rm_rf(log_dir)
   end
 
-  # Runs logxml.lic once with +vars+ as typed and the given DR settings
-  # (+nil+ for none, as in GS). Ends when the fed lines run out; a Time
+  # Runs logxml.lic once, started with +args+ (a String as typed, an Array
+  # as autostart passes its saved arguments; vars are built as lich-5 builds
+  # them, see LichScriptVars), and the given DR settings (+nil+ for none,
+  # as in GS). Ends when the fed lines run out; a Time
   # among +lines+ moves the clock before the next line is read.
   # +reget+ is what lich-5's reget answers: nil for an empty buffer. With
   # +server_buffer+ (the raw lines the server sent), reget answers as
@@ -53,18 +56,23 @@ RSpec.describe 'logxml.lic' do
   # for upstream_get; the default ends the upstream thread before it reads
   # a command. The script starts with lich-5's Script#initialize want_*
   # defaults (lib/common/script.rb): text downstream on, XML downstream,
-  # script output and upstream off.
-  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'], reget: nil, server_buffer: nil, upstream: -> { Thread.current.kill })
+  # script output and upstream off. @hide_me_calls counts hide_me.
+  def run_logxml(args: nil, settings: nil, lines: ['<output>You see a door.</output>'], reget: nil, server_buffer: nil, upstream: -> { Thread.current.kill })
     script = OpenStruct.new(
       want_downstream: true, want_downstream_xml: false, want_script_output: false, want_upstream: false,
-      vars: [vars.join(' '), *vars], downstream_buffer: [], name: 'logxml'
+      vars: LichScriptVars.build(args), downstream_buffer: [], name: 'logxml'
     )
     @logxml_script = script
     stub_const('Script', Class.new { define_singleton_method(:current) { script } })
     pending_lines = lines.map(&:dup) # fresh Strings, as get returns; logxml edits lines in place
     sink = echoes
     runner = Object.new
-    runner.define_singleton_method(:hide_me) { nil }
+    @hide_me_calls = 0
+    hidden = lambda do
+      @hide_me_calls += 1
+      nil
+    end
+    runner.define_singleton_method(:hide_me) { hidden.call }
     runner.define_singleton_method(:echo) { |msg| sink << msg.to_s }
     real_reget = method(:lich_reget)
     runner.define_singleton_method(:reget) { server_buffer ? real_reget.call(server_buffer, script.want_downstream_xml) : reget }
@@ -141,7 +149,7 @@ RSpec.describe 'logxml.lic' do
     end
 
     it 'uses a --timestamp=FMT without a message' do
-      run_logxml(vars: ['--timestamp=%H:%M'], settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
+      run_logxml(args: '--timestamp=%H:%M', settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
 
       expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
       expect(echoes).to eq([started_echo])
@@ -164,7 +172,7 @@ RSpec.describe 'logxml.lic' do
 
   context 'with an empty --timestamp=' do
     it 'logs without timestamps and says the option was ignored' do
-      run_logxml(vars: ['--timestamp='])
+      run_logxml(args: '--timestamp=')
 
       expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
       expect(echoes).to eq(
@@ -176,14 +184,14 @@ RSpec.describe 'logxml.lic' do
     end
 
     it 'treats --timestamp="" in vars[0] the same way' do
-      run_logxml(vars: ['--timestamp=""'])
+      run_logxml(args: '--timestamp=""')
 
       expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
       expect(echoes.first).to start_with('timestamp was given without a format')
     end
 
     it 'keeps the yaml format when the yaml enables timestamps' do
-      run_logxml(vars: ['--timestamp='], settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
+      run_logxml(args: '--timestamp=', settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
       expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
     end
@@ -215,8 +223,8 @@ RSpec.describe 'logxml.lic' do
       allow(map).to receive(:loaded?).and_return(true)
     end
 
-    def logged_lines(vars: ['--rnum'])
-      run_logxml(vars: vars, lines: [title_line, '<output>You see a door.</output>'])
+    def logged_lines(args: '--rnum', line: title_line)
+      run_logxml(args: args, lines: [line, '<output>You see a door.</output>'])
       expect(log_lines.last).to eq(default_footer)
       log_lines[1..-2]
     end
@@ -234,7 +242,7 @@ RSpec.describe 'logxml.lic' do
     end
 
     it "writes no ' - ]' in GS when the UID is not in the map, only the u-id" do
-      expect(logged_lines(vars: ['--roomnum']).first).to eq(
+      expect(logged_lines(args: '--roomnum').first).to eq(
         '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns] (u4216015)'
       )
     end
@@ -248,7 +256,7 @@ RSpec.describe 'logxml.lic' do
     end
 
     it 'does not look the room up without --rnum' do
-      expect(logged_lines(vars: []).first).to eq(title_line)
+      expect(logged_lines(args: nil).first).to eq(title_line)
       expect(map).not_to have_received(:ids_from_uid)
     end
 
@@ -285,7 +293,7 @@ RSpec.describe 'logxml.lic' do
       end
 
       it 'does not load the map without --rnum' do
-        logged_lines(vars: [])
+        logged_lines(args: nil)
         expect(map).not_to have_received(:loaded?)
         expect(map).not_to have_received(:load)
       end
@@ -296,6 +304,63 @@ RSpec.describe 'logxml.lic' do
       logged_lines
       expect(map).to have_received(:loaded?).once
       expect(map).not_to have_received(:load)
+    end
+
+    # The title line as the server sends it, verbatim from lich-5
+    # spec/fixtures/streams/gs_saga_hunt.xml, ends in the game's own
+    # "(uid)". logxml adds its numbers inside and right after the first "]",
+    # and keeps the game's "(uid)" (log.lic, in text mode, appends the u-id
+    # at the end and skips it when the game already shows it).
+    it "adds the numbers after the first ] of a real GS title line and keeps the game's (uid)" do
+      uid_table[uid] = [228]
+
+      expect(logged_lines(line: '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns] (4216015)').first).to eq(
+        '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015) (4216015)'
+      )
+    end
+
+    it 'puts the numbers at the first ] only' do
+      uid_table[uid] = [228]
+
+      expect(logged_lines(line: "#{title_line} [lit]").first).to eq(
+        '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015) [lit]'
+      )
+    end
+
+    it 'finds --rnum anywhere in the arguments' do
+      uid_table[uid] = [228]
+
+      run_logxml(args: '--timestamp=%T --rnum', lines: [title_line])
+
+      expect(log_lines).to eq(
+        ['10:00:05', '10:00:05: <resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015)', '10:00:05']
+      )
+    end
+
+    # ;autostart add --global logxml --timestamp=\"%F %T %Z\" --rnum (the
+    # header's example) is saved as these words; lich-5 joins them into
+    # vars[0].
+    it "reads the header's autostart example on the autostart Array path" do
+      uid_table[uid] = [228]
+
+      run_logxml(args: ['--timestamp="%F', '%T', '%Z"', '--rnum'], lines: [title_line])
+
+      expect(log_lines).to eq(
+        [
+          fallback_stamp,
+          "#{fallback_stamp}: <resource picture=\"0\"/><style id=\"roomName\" />[Sanctum of Scales, Columns - 228] (u4216015)",
+          fallback_stamp
+        ]
+      )
+    end
+
+    # Only a line that starts with the room-name resource is a title; this
+    # line (made up, not from a fixture) names the style later on.
+    it 'leaves a line alone that mentions roomName after its start' do
+      uid_table[uid] = [228]
+      line = '<output>The roomName style marks [the title].</output>'
+
+      expect(logged_lines(line: line).first).to eq(line)
     end
 
     context 'in DragonRealms' do
@@ -312,6 +377,27 @@ RSpec.describe 'logxml.lic' do
 
       it 'leaves the title alone when the UID is not in the map' do
         expect(logged_lines.first).to eq(title_line)
+      end
+
+      # Verbatim from lich-5 spec/fixtures/streams/dr_legacy_stow_movement.xml.
+      context 'in the room of a real DR title line' do
+        let(:uid) { 230_009 }
+
+        it "adds the Lich id inside the first ] and keeps the game's (uid)" do
+          uid_table[uid] = [12_345]
+
+          expect(logged_lines(line: '<resource picture="0"/><style id="roomName" />[Bosque Deriel, Dense Woods] (230009)').first).to eq(
+            '<resource picture="0"/><style id="roomName" />[Bosque Deriel, Dense Woods - 12345] (230009)'
+          )
+        end
+      end
+
+      it 'puts the Lich id inside the first ] only' do
+        uid_table[uid] = [12_345]
+
+        expect(logged_lines(line: "#{title_line} [lit]").first).to eq(
+          '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 12345] [lit]'
+        )
       end
     end
   end
@@ -332,9 +418,88 @@ RSpec.describe 'logxml.lic' do
   it 'keeps pushStream and popStream lines when started with streams' do
     stream_lines = ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>']
 
-    run_logxml(vars: ['streams'], lines: stream_lines)
+    run_logxml(args: 'streams', lines: stream_lines)
 
     expect(log_lines).to eq([default_header, *stream_lines, default_footer])
+  end
+
+  # logxml drops only lines that start with pushStream or popStream; the
+  # dialog and progress bar lines log.lic drops in text mode stay in the
+  # XML log. The minivitals line is verbatim from lich-5
+  # spec/fixtures/streams/dr_saga_login.xml; the others are the tag lines
+  # log_spec.rb's filter rows use (from lich-5 spec/fixtures/streams, the
+  # closing tag added).
+  describe 'lines that start with a dialog or progress bar tag' do
+    {
+      'dialog data'              => "<dialogData id='minivitals'><progressBar id='spirit' value='100' text='spirit 100%' left='60%' customText='t' top='0%' width='20%' height='100%'/></dialogData>",
+      'a progress bar'           => %(<progressBar id='1253901988' value='89' text="Mana Tap" left='22%' top='0' width='76%' height='15' time='00:13:28'/>),
+      'an open dialog'           => '<openDialog type="dynamic" id="injuries" title="Injuries" target="injuries" location="right" height="180" width="190" resident="true">',
+      'a close dialog'           => "<closeDialog id='AimTimerDialog'/>",
+      'a closing dialogData tag' => '</dialogData>'
+    }.each do |label, tag_line|
+      it "logs #{label} with the lines around it" do
+        run_logxml(lines: ['<output>before</output>', tag_line, '<output>after</output>'])
+
+        expect(log_lines).to eq([default_header, '<output>before</output>', tag_line, '<output>after</output>', default_footer])
+      end
+    end
+  end
+
+  # Verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml: the
+  # pushStream comes after other tags, so the line is not a stream line.
+  it 'logs a line whose pushStream comes after the start, without streams' do
+    line = "<clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:"
+
+    run_logxml(lines: [line])
+
+    expect(log_lines).to eq([default_header, line, default_footer])
+  end
+
+  # Lines verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml,
+  # leading spaces included.
+  it 'writes game lines as they come, leading spaces included' do
+    lines = ['  1d100: 20 + Modifiers: 372 == 392', '   ... 60 points of damage!']
+
+    run_logxml(lines: lines)
+
+    expect(log_lines).to eq([default_header, *lines, default_footer])
+  end
+
+  it 'stamps a typed command like a game line when timestamps are on' do
+    typed = ['<c>look']
+    upstream = -> { typed.empty? ? Thread.current.kill : typed.shift }
+
+    run_logxml(args: '--timestamp=%T', upstream: upstream) do
+      Timeout.timeout(2) { sleep 0.01 while @logxml_script.downstream_buffer.empty? }
+    end
+
+    expect(log_lines).to eq(
+      ['10:00:05', '10:00:05: <output>You see a door.</output>', '10:00:05: <!-- CLIENT --><c>look<!-- ENDCLIENT -->', '10:00:05']
+    )
+  end
+
+  it 'has each line in the file while the logger waits for the next one' do
+    on_disk = nil
+
+    run_logxml(lines: ['<output>line 1</output>']) { on_disk = File.read(log_file) }
+
+    expect(on_disk.lines(chomp: true)).to eq([default_header, '<output>line 1</output>'])
+  end
+
+  it 'hides itself once' do
+    run_logxml
+
+    expect(@hide_me_calls).to eq(1)
+  end
+
+  # lich-5 gives a script started without arguments an empty vars, so
+  # vars[1..] is nil (N35 in log_spec.rb).
+  it 'logs with no options when started without arguments (vars is empty)' do
+    run_logxml(args: '')
+
+    expect(@logxml_script.vars).to eq([])
+    expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
+    expect(echoes).to eq([started_echo])
   end
 
   # The header is 12-hour with the hour's leading zero dropped.
@@ -376,6 +541,16 @@ RSpec.describe 'logxml.lic' do
       expect(log_lines.first(3)).to eq([default_header, marker, '<output>You see a door.</output>'])
     end
 
+    # The reget is written as the server sent it: the per-line stamp is for
+    # lines read while logging, not for lines from before the logger started.
+    it 'writes the reget without timestamps when timestamps are on' do
+      run_logxml(args: '--timestamp=%T', reget: ["<output>Before the logger.</output>\r"])
+
+      expect(log_lines).to eq(
+        ['10:00:05', '<output>Before the logger.</output>', marker, '10:00:05: <output>You see a door.</output>', '10:00:05']
+      )
+    end
+
     # R-15: reget lines keep the server's "\r" (CRLF line ends).
     it 'writes the raw reget lines without their trailing carriage return' do
       run_logxml(reget: ["<pushStream id=\"room\"/>Room text\r", "<prompt time=\"1\">&gt;</prompt>\r"])
@@ -384,6 +559,29 @@ RSpec.describe 'logxml.lic' do
       expect(log_lines.first(4)).to eq(
         [default_header, '<pushStream id="room"/>Room text', '<prompt time="1">&gt;</prompt>', marker]
       )
+    end
+  end
+
+  # The reget window is under 30 seconds after login.
+  context 'at the edge of the reget window' do
+    let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+
+    it 'writes the reget and the marker when the logger starts 29.9 seconds after login' do
+      $login_time = frozen_time - 29.9
+
+      run_logxml(reget: ["<output>Before the logger.</output>\r"])
+
+      expect(log_lines).to eq(
+        [default_header, '<output>Before the logger.</output>', marker, '<output>You see a door.</output>', default_footer]
+      )
+    end
+
+    it 'writes neither the reget nor the marker when the logger starts 30 seconds after login' do
+      $login_time = frozen_time - 30
+
+      run_logxml(reget: ["<output>Before the logger.</output>\r"])
+
+      expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
     end
   end
 
@@ -649,7 +847,7 @@ RSpec.describe 'logxml.lic' do
 
     # Restarting without them would drop --timestamp, --rnum or streams.
     it 'gives the restart with the arguments the logger was started with' do
-      run_logxml(vars: %w[streams --timestamp=%H:%M], lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+      run_logxml(args: 'streams --timestamp=%H:%M', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
 
       expect(echoes.grep(/\Atyped commands/).first)
         .to end_with('restart the logger (;kill logxml, then ;logxml streams --timestamp=%H:%M) to log typed commands again.')
@@ -657,7 +855,7 @@ RSpec.describe 'logxml.lic' do
 
     # Without the strip, the hint would read ";logxml " with a trailing space.
     it 'gives the restart without arguments when vars[0] is only whitespace' do
-      run_logxml(vars: ['  '], lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+      run_logxml(args: '  ', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
 
       expect(echoes.grep(/\Atyped commands/).first).to end_with('(;kill logxml, then ;logxml) to log typed commands again.')
     end
@@ -757,7 +955,7 @@ RSpec.describe 'logxml.lic' do
   end
 
   it 'keeps a comma in a quoted --timestamp format' do
-    run_logxml(vars: ['--timestamp="%b %d, %H:%M"'])
+    run_logxml(args: '--timestamp="%b %d, %H:%M"')
 
     expect(log_lines).to eq(['Apr 23, 10:00', 'Apr 23, 10:00: <output>You see a door.</output>', 'Apr 23, 10:00'])
   end
