@@ -792,10 +792,23 @@ RSpec.describe GameLogger do
       end
     end
 
-    # R-21: the upstream thread's rescue echoed only the bare message and
-    # wrote nothing to the file, so a pasted log just lost its commands.
+    # R-21: the upstream thread's rescue echoed only the bare message, so a
+    # pasted log just lost its commands with nothing saying where or why
+    # (in lich-5 that echo reached the file only as script output, see
+    # want_script_output; this harness does not feed echoes back to get).
     context 'when the upstream thread stops on an error' do
       let(:notice) { '<!-- log: typed commands are not logged after this line; the upstream thread stopped (RuntimeError: boom) -->' }
+
+      # "file:line" of where +error+ was raised, without the directory.
+      def raised_at(error)
+        location = error.backtrace_locations.first
+        "#{File.basename(location.path)}:#{location.lineno}"
+      end
+
+      # The notice line as written for an error that reads +reason+.
+      def notice_for(reason)
+        "<!-- log: typed commands are not logged after this line; the upstream thread stopped (#{reason}) -->"
+      end
 
       # The first typed command is logged; the next upstream_get raises
       # +error+.
@@ -819,13 +832,55 @@ RSpec.describe GameLogger do
 
         expect(LogSpecHarness.echoes.grep(/\Atyped commands/)).to eq(
           [
-            "typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at #{error.backtrace.first}. " \
+            "typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at #{raised_at(error)}. " \
             'Game lines are still logged; restart the logger (;kill log, then ;log) to log typed commands again.'
           ]
         )
+        expect(raised_at(error)).to match(/\Alog_spec\.rb:\d+\z/)
       end
 
-      it 'writes one line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
+      # The backtrace path can hold the OS user name (C:/Users/<name>/...),
+      # and with want_script_output the echo is written into the log file.
+      it 'gives the file and line it was raised at without the directory' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        error = RuntimeError.new('boom')
+        error.set_backtrace(["C:/Users/someone/Lich5/scripts/log.lic:487:in 'block in GameLogger.start_upstream_logger'"])
+        allow(GameLogger).to receive(:upstream_get).and_raise(error)
+
+        run_main
+
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at log.lic:487. ')
+        expect(LogSpecHarness.echoes.join).not_to include('someone')
+      end
+
+      it 'leaves out "at" when the error has no backtrace' do
+        GameLogger.upstream_stopped(RuntimeError.new('boom'))
+
+        expect(LogSpecHarness.echoes).to eq(
+          ['typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom. ' \
+           'Game lines are still logged; restart the logger (;kill log, then ;log) to log typed commands again.']
+        )
+      end
+
+      # Restarting without them would log rooms the user excluded.
+      it 'gives the restart with the arguments the logger was started with, under its own name' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        allow(Script.current).to receive_messages(
+          name: 'mylog',
+          vars: ['--exclude=u1234 --timestamp="%H:%M"', '--exclude=u1234', '--timestamp="%H:%M"']
+        )
+        type_then_fail(RuntimeError.new('boom'))
+
+        run_main
+
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
+          .to end_with('restart the logger (;kill mylog, then ;mylog --exclude=u1234 --timestamp="%H:%M") to log typed commands again.')
+      end
+
+      it 'writes a notice line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
         use_options(OpenStruct.new)
         LogSpecHarness.idle_timeout = 0.5
         LogSpecHarness.feed('line 1')
@@ -856,6 +911,40 @@ RSpec.describe GameLogger do
         expect(log_lines[-2]).to eq('<!-- log: typed commands are not logged after this line; the upstream thread stopped (IOError: closed stream - -> see above) -->')
         expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
           .to start_with('typed commands are no longer logged: the upstream thread stopped on IOError: closed stream --> see above at ')
+      end
+
+      # gsub('--', '- -') left "a - --> b" and "x- --y": the first closed the
+      # comment early, both left a "--" XML does not allow in a comment.
+      {
+        'a ---> b'          => 'a - - -> b',
+        '--- Lich: x---y'   => '- - - Lich: x- - -y',
+        'ends in a dash -'  => 'ends in a dash -',
+        'ends in dashes --' => 'ends in dashes - -'
+      }.each do |message, spaced|
+        it "spaces out every dash run in #{message.inspect} so the comment holds no \"--\"" do
+          use_options(OpenStruct.new)
+          LogSpecHarness.idle_timeout = 0.5
+          type_then_fail(IOError.new(message))
+
+          run_main
+
+          expect(log_lines[-2]).to eq(notice_for("IOError: #{spaced}"))
+          body = log_lines[-2].delete_prefix('<!--').delete_suffix('-->')
+          expect(body).not_to include('--')
+          expect(body).not_to end_with('-')
+        end
+      end
+
+      it 'drops the whitespace around the message' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        type_then_fail(RuntimeError.new(" \tboom\n"))
+
+        run_main
+
+        expect(log_lines[-2]).to eq(notice)
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at ')
       end
 
       it 'does not write the line in an --exclude room' do
@@ -1592,7 +1681,7 @@ RSpec.describe GameLogger do
         expect { run_main }.not_to raise_error
 
         expect(log_lines.drop(2)).to eq(['line 1', default_stamp])
-        expect(Lich).to have_received(:log).with("log: closing the log file #{find_log_file} failed (IOError: device gone)")
+        expect(Lich).to have_received(:log).with("log: closing the log file #{find_log_file} failed (IOError: device gone); every line was already written, nothing to do")
       end
     end
 

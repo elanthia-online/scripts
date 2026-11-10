@@ -503,7 +503,7 @@ RSpec.describe 'logxml.lic' do
       expect { run_logxml(lines: ['<output>line 1</output>']) }.not_to raise_error
 
       expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
-      expect(lich_log).to eq(["logxml: closing the log file #{log_file} failed (IOError: device gone)"])
+      expect(lich_log).to eq(["logxml: closing the log file #{log_file} failed (IOError: device gone); every line was already written, nothing to do"])
     end
   end
 
@@ -526,6 +526,17 @@ RSpec.describe 'logxml.lic' do
       Timeout.timeout(2) { sleep 0.01 until @logxml_script.downstream_buffer.size >= 2 }
     end
 
+    # "file:line" of where +error+ was raised, without the directory.
+    def raised_at(error)
+      location = error.backtrace_locations.first
+      "#{File.basename(location.path)}:#{location.lineno}"
+    end
+
+    # The notice line as written for an error that reads +reason+.
+    def notice_for(reason)
+      "<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (#{reason}) -->"
+    end
+
     it 'echoes the error, where it was raised and how to log typed commands again' do
       error = RuntimeError.new('boom')
 
@@ -533,13 +544,38 @@ RSpec.describe 'logxml.lic' do
 
       expect(echoes.grep(/\Atyped commands/)).to eq(
         [
-          "typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at #{error.backtrace.first}. " \
+          "typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at #{raised_at(error)}. " \
           'Game lines are still logged; restart the logger (;kill logxml, then ;logxml) to log typed commands again.'
         ]
       )
+      expect(raised_at(error)).to match(/\Alogxml_spec\.rb:\d+\z/)
     end
 
-    it 'writes one line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
+    # The backtrace path can hold the OS user name (C:/Users/<name>/...).
+    it 'gives the file and line it was raised at without the directory' do
+      error = RuntimeError.new('boom')
+      error.set_backtrace(["C:/Users/someone/Lich5/scripts/logxml.lic:142:in 'block in <main>'"])
+      raise_it = lambda do
+        @logxml_script.downstream_buffer << 'first'
+        raise error
+      end
+
+      run_logxml(lines: [], upstream: raise_it) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/).first)
+        .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at logxml.lic:142. ')
+      expect(echoes.join).not_to include('someone')
+    end
+
+    # Restarting without them would drop --timestamp, --rnum or streams.
+    it 'gives the restart with the arguments the logger was started with' do
+      run_logxml(vars: %w[streams --timestamp=%H:%M], lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/).first)
+        .to end_with('restart the logger (;kill logxml, then ;logxml streams --timestamp=%H:%M) to log typed commands again.')
+    end
+
+    it 'writes a notice line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
       run_logxml(lines: ['<output>line 1</output>'], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
 
       expect(log_lines).to eq(
@@ -559,6 +595,29 @@ RSpec.describe 'logxml.lic' do
       expect(log_lines[-2]).to eq('<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (IOError: closed stream - -> see above) -->')
       expect(echoes.grep(/\Atyped commands/).first)
         .to start_with('typed commands are no longer logged: the upstream thread stopped on IOError: closed stream --> see above at ')
+    end
+
+    # gsub('--', '- -') left "a - --> b" and "x- --y": the first closed the
+    # comment early, both left a "--" XML does not allow in a comment.
+    {
+      'a ---> b'          => 'a - - -> b',
+      '--- Lich: x---y'   => '- - - Lich: x- - -y',
+      'ends in dashes --' => 'ends in dashes - -'
+    }.each do |message, spaced|
+      it "spaces out every dash run in #{message.inspect} so the comment holds no \"--\"" do
+        run_logxml(lines: [], upstream: type_then_fail(IOError.new(message))) { wait_for_upstream_stop }
+
+        expect(log_lines[-2]).to eq(notice_for("IOError: #{spaced}"))
+        body = log_lines[-2].delete_prefix('<!--').delete_suffix('-->')
+        expect(body).not_to include('--')
+        expect(body).not_to end_with('-')
+      end
+    end
+
+    it 'drops the whitespace around the message' do
+      run_logxml(lines: [], upstream: type_then_fail(RuntimeError.new(" \tboom\n"))) { wait_for_upstream_stop }
+
+      expect(log_lines[-2]).to eq(notice_for('RuntimeError: boom'))
     end
 
     # lich-5 stops a script by Thread#kill on its threads (script.rb kill);
