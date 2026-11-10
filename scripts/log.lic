@@ -21,8 +21,15 @@
                                                   (typed commands as <!-- CLIENT -->command<!-- ENDCLIENT -->, the reget
                                                   as the server sent it, a 12-hour time in the first line); the options
                                                   above work in XML mode too; the word xml, without --, does the same
-           ;log --xml streams                   - XML mode keeping the lines that start with pushStream or popStream,
-                                                  which it drops otherwise (very noisy); --streams does the same
+           ;log --xml streams                   - XML mode keeping all the stream content (very noisy); --streams does
+                                                  the same. Without streams, XML mode leaves out what Lich keeps out of
+                                                  the main-window text it hands scripts: the inv, talk, speech,
+                                                  spellfront, bounty, society and reserve streams, from their pushStream
+                                                  to the next popStream (followed across lines), and the Spells stream
+                                                  lines; the rest of each line is kept (prompts, speech, whispers,
+                                                  combat, group, room and the other streams), and a line left empty is
+                                                  not written. A stream the game opened and never closed would leave out
+                                                  the lines after it until the next popStream, as Lich's own text does
   TEXT AND XML TOGETHER:
            Lich runs one ;log at a time, so start ;log for the text and ;logxml for the XML: logxml.lic runs
            this script in XML mode under its own name, and takes the same options
@@ -36,10 +43,13 @@
        author: elanthia-online
  contributors: Tillmen, Tysong, Xanlin
          game: gs
-      version: 1.3.1
+      version: 1.3.2
      required: Lich >= 5.19.0
 
   changelog:
+    1.3.2 (2026-11-10):
+      * XML mode without streams leaves out the stream content Lich keeps out of the main-window text it hands scripts (the inv, talk, speech, spellfront, bounty, society and reserve streams, from their pushStream to the next popStream, followed across lines, and the Spells stream lines) and keeps every other byte of each line; a line left empty is not written. It dropped every line that started with pushStream or popStream, which in DragonRealms lost the prompts, speech, whispers, group lists and combat on those lines, and it kept the lines inside a stream, such as an inventory list
+      * a typed command logged while a left-out stream is open is still written, and a typed command holding a pushStream tag leaves out nothing
     1.3.1 (2026-11-10):
       * XML mode --rnum adds no " (u<uid>)" in GemStone when the room title line already shows the room's "(<uid>)", as text mode does (logxml.lic 0.6.6 wrote both); text and XML mode number room titles with one shared helper
       * XML mode --rnum numbers DragonRealms Saga room titles (<room><name>[...]</name>), and the other room title forms Lich numbers for its own room display (no picture resource, or popBold first); a familiar's view of its room and a title after a line break are left as sent, and so is a title with both a picture resource and popBold before it, which Lich does not number either (logxml.lic 0.6.6 numbered it)
@@ -298,6 +308,11 @@ module GameLogger
     Array(option).grep(String).reject(&:empty?).partition { |entry| entry.start_with?('u') }
   end
 
+  # The module {Logger} is built in before it is set as Logger (see
+  # {Logger}). It is made here, before the modes, so XML mode's line filter
+  # can name the {Logger::StreamSpanFilter} of the Logger built with it.
+  fresh = Module.new
+
   # What one log format decides, as one frozen value. The logging loop
   # ({Logger}) is written once; everything that differs between output
   # formats is a field here, so a format is a value handed to the loop, not
@@ -305,10 +320,12 @@ module GameLogger
   # mode ({Mode::XML}, and {Mode::XML_STREAMS} for its streams option);
   # {Logger.mode_for} picks one for a run.
   #
-  # The proc fields run in the logger's get loop, so they stay cheap and
-  # keep no state: {#skip_line} on every line outside an excluded room, and
-  # {#room_title} on those lines only while --rnum or --exclude tracks the
-  # room. Both modes number a room title line with the one decorator,
+  # The proc fields keep no state. {#line_filter} runs once per run and
+  # builds the run's line filter, which runs on every line the run reads
+  # and may keep state across lines (XML mode's follows stream spans);
+  # {#room_title} runs in the logger's get loop, on the lines outside an
+  # excluded room, only while --rnum or --exclude tracks the room, so it
+  # stays cheap. Both modes number a room title line with the one decorator,
   # {Logger.number_room_title}; {#uid_after_title} is the one thing they
   # tell it.
   #
@@ -339,9 +356,14 @@ module GameLogger
   #     sets when it starts, in order: +want_upstream: true+ sets
   #     Script.current.want_upstream = true. A flag not listed keeps
   #     lich-5's default.
-  # @!attribute [r] skip_line
-  #   @return [Proc] called with a game line; truthy when the line is not
-  #     written (it then does not count toward --lines)
+  # @!attribute [r] line_filter
+  #   @return [Proc] builds a run's line filter, once per run (see
+  #     {Logger#initialize}): called with no arguments, it returns an object
+  #     whose +call+ takes each game line the run reads, in order, and
+  #     returns the text written for it: the line itself, the part of it
+  #     the filter keeps, or +nil+ when nothing of it is written (it then
+  #     does not count toward --lines). Each run gets a filter of its own,
+  #     as one may keep state from line to line.
   # @!attribute [r] reget_line
   #   @return [Proc] called with one line of reget's answer, the timestamp
   #     format (+nil+ for none) and the login Time ($login_time); returns
@@ -359,7 +381,7 @@ module GameLogger
   # @!attribute [r] started_text
   #   @return [String] the echo once logging has started, before the log
   #     file's path (a space between them)
-  mode = Data.define(:extension, :header_stamp, :upstream_line, :script_flags, :skip_line, :reget_line, :room_title,
+  mode = Data.define(:extension, :header_stamp, :upstream_line, :script_flags, :line_filter, :reget_line, :room_title,
                      :uid_after_title, :started_text)
 
   # Text mode, log.lic's format: the game text as lich-5 hands it to a
@@ -381,7 +403,7 @@ module GameLogger
     header_stamp: nil,
     upstream_line: ->(command) { ">#{command.sub(/^<c>/, '')}" },
     script_flags: { want_script_output: true, want_upstream: true }.freeze,
-    skip_line: ->(line) { line =~ %r{^</?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)} },
+    line_filter: -> { ->(line) { line unless line =~ %r{^</?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)} } },
     reget_line: lambda do |line, stamp_format, login_time|
       line = line.chomp
       stamp_format ? "#{login_time.strftime(stamp_format)}: #{line}" : line
@@ -397,11 +419,13 @@ module GameLogger
   # output, and typed commands as "<!-- CLIENT -->command<!-- ENDCLIENT -->"
   # (a leading "<c>" kept). Files end in ".xml", and with timestamps off the
   # header is the date and a 12-hour time with the hour's leading zero
-  # dropped ("2026-04-23 9:05am"); the footer is the same as text mode's. A
-  # line that starts with pushStream or popStream (at the start of the line
-  # or after a line break in it) is not written. The flags are set before
-  # reget is called, so reget answers the raw XML the server sent; its lines
-  # are written as they come, unstamped and unfiltered, less their "\r".
+  # dropped ("2026-04-23 9:05am"); the footer is the same as text mode's.
+  # The stream content lich-5 keeps out of the main-window text it hands
+  # scripts is left out of each line, and every other byte of the line is
+  # kept; a line left empty is not written (see {Logger::StreamSpanFilter}).
+  # The flags are set before reget is called, so reget answers the raw XML
+  # the server sent; its lines are written as they come, unstamped and
+  # unfiltered, less their "\r".
   #
   # --rnum numbers the room title line in the forms lich-5 numbers for its
   # own room display (lib/games.rb, process_room_information): at the start
@@ -425,7 +449,7 @@ module GameLogger
     header_stamp: ->(time) { time.strftime('%Y-%m-%d %I:%M%P').sub(/0([0-9]+:)/, '\1') },
     upstream_line: ->(command) { "<!-- CLIENT -->#{command}<!-- ENDCLIENT -->" },
     script_flags: { want_script_output: false, want_upstream: true, want_downstream: false, want_downstream_xml: true }.freeze,
-    skip_line: ->(line) { line =~ /^<(?:push|pop)Stream/ },
+    line_filter: -> { fresh::Logger::StreamSpanFilter.new },
     reget_line: ->(line, _stamp_format, _login_time) { line.chomp },
     room_title: ->(line, _title_pattern) { line.match?(%r{\A(?:<resource picture="\d+"/>|<popBold/>)?(?:<style id="roomName"\s+/>|<room>)}) },
     uid_after_title: true,
@@ -435,14 +459,14 @@ module GameLogger
   mode.const_set(:XML, xml)
 
   # XML mode started with the word streams or --streams: every line is
-  # written, the pushStream and popStream lines too.
-  mode.const_set(:XML_STREAMS, mode::XML.with(skip_line: ->(_line) { false }))
+  # written as it comes, stream content too.
+  mode.const_set(:XML_STREAMS, mode::XML.with(line_filter: -> { ->(line) { line } }))
 
   # One log run, in one {Mode}: all its state (options, settings, the room
   # it is in, the file it writes) is in this object, never on the module.
   # {GameLogger.main} builds one per run of the script and runs it.
   #
-  # The logic that decides what a line becomes ({#skip_line?},
+  # The logic that decides what a line becomes ({#line_text},
   # {#decorate_title}, {#format_line}, {#reget_lines}) is in small methods
   # that read their arguments, the run's settings, its current room and
   # XMLData.game. Every time the run uses comes from the +clock+ given to
@@ -462,9 +486,10 @@ module GameLogger
   # {GameLogger.lines_per_file}, {GameLogger.exclude_entries},
   # {GameLogger.start_map_load}) stay on the module.
   #
-  # The class is defined in a throwaway module and set as Logger below,
-  # once it is whole (see {Mode}); the name it is set to is its name.
-  fresh = Module.new
+  # The class is defined in a throwaway module (+fresh+, made before
+  # {Mode}, whose XML filter is this class's {StreamSpanFilter}) and set as
+  # Logger below, once it is whole (see {Mode}); the name it is set to is
+  # its name.
   class fresh::Logger
     # The line written after the reget lines at the top of the first file.
     REGET_MARKER = "<!-- Above contents from reget; full logging now active -->\n"
@@ -472,6 +497,110 @@ module GameLogger
     # A run started less than this many seconds after login ($login_time)
     # writes reget's lines at the top of its first file.
     REGET_WINDOW = 30
+
+    # XML mode's line filter ({Mode::XML}'s {Mode#line_filter}; one per
+    # run): leaves out of each line the stream content lich-5 keeps out of
+    # the main-window text it hands scripts, and keeps every other byte, so
+    # the XML log holds what the main window shows, its markup included.
+    # lich-5 builds that text with strip_xml (lib/common/markup.rb
+    # SUPPRESSED_STREAMS and SPELLS_STREAM on lich-5 main,
+    # lib/global_defs.rb strip_xml_simple at v5.21.0; the same patterns in
+    # both) and leaves out:
+    # - a span from a pushStream of the spellfront, inv, bounty, society,
+    #   reserve, speech or talk stream to the next popStream, whatever stream
+    #   that names, followed across lines as lich-5 joins the lines of an
+    #   open stream before it strips them;
+    # - a <stream id="Spells"> element, within one line.
+    # Every other stream (combat, assess, percWindow, group, whispers,
+    # atmospherics, familiar, room, experience, loot, ...) is main-window
+    # text to lich-5 and is kept, its pushStream and popStream tags too. So
+    # are prompts and the other tags lich-5 strips from its text but which
+    # are not stream content.
+    #
+    # A line whose text is all kept is returned as it is; a line that loses
+    # stream content and has nothing left is not written. A line that
+    # starts with "<!-- " is one the logger itself puts on the downstream
+    # buffer (a typed command between CLIENT comments, the upstream thread's
+    # notice), so it is kept as it is, inside a span too, and is not read
+    # for stream tags: a typed "<pushStream id='inv'/>" opens no span. No
+    # game line in lich-5's stream fixtures starts that way; one that did
+    # would be kept, never lost.
+    #
+    # @note A stream that is opened and never closed leaves out every line
+    #   after it until a popStream (of any stream) comes, as lich-5's own
+    #   text does. In lich-5's stream fixtures every such stream is closed
+    #   within 38 lines.
+    # @note The span starts on the line the logger reads, so a run started
+    #   inside one keeps its last lines and the popStream; the reget is
+    #   written as it is and does not move the filter.
+    class StreamSpanFilter
+      # A pushStream that opens a span (lich-5's SUPPRESSED_STREAMS start).
+      SPAN_START = %r{<pushStream id=["'](?:spellfront|inv|bounty|society|reserve|speech|talk)["'][^>]*/>}
+
+      # A popStream, of any stream, which ends an open span.
+      SPAN_END = /<popStream[^>]*>/
+
+      # A Spells stream element (lich-5's SPELLS_STREAM).
+      SPELLS = %r{<stream id="Spells">.*?</stream>}m
+
+      # How a line the logger itself put on the downstream buffer starts.
+      OWN_LINE_START = '<!-- '
+
+      # A filter outside any span.
+      #
+      # @return [StreamSpanFilter]
+      def initialize
+        @in_span = false
+      end
+
+      # The text written for one game line, the lines given in the order the
+      # run reads them; moves the filter into or out of a span.
+      #
+      # @param line [String] a game line as get returns it
+      # @return [String, nil] +line+ itself when nothing of it is left out;
+      #   the rest of it, as a binary String, when stream content is left
+      #   out; +nil+ when that leaves nothing
+      def call(line)
+        return line if line.start_with?(OWN_LINE_START)
+        return line unless @in_span || line.include?('<pushStream') || line.include?('<stream id="Spells">')
+
+        began_in_span = @in_span
+        text = outside_spans(line.b).gsub(SPELLS, '')
+        # An empty line inside a span is span content too.
+        return line unless began_in_span || text.bytesize < line.bytesize
+
+        text.empty? ? nil : text
+      end
+
+      private
+
+      # The parts of +bytes+ outside the spans, from the span state the last
+      # line left; leaves the state where this line ends.
+      #
+      # @param bytes [String] a binary game line
+      # @return [String] the parts outside spans, joined
+      def outside_spans(bytes)
+        kept = String.new(encoding: Encoding::BINARY)
+        position = 0
+        loop do
+          if @in_span
+            close = SPAN_END.match(bytes, position)
+            break unless close
+
+            @in_span = false
+            position = close.end(0)
+          else
+            open = SPAN_START.match(bytes, position)
+            kept << bytes.byteslice(position, (open ? open.begin(0) : bytes.bytesize) - position)
+            break unless open
+
+            @in_span = true
+            position = open.end(0)
+          end
+        end
+        kept
+      end
+    end
 
     # The header and footer stamp when timestamps are off: the date, the
     # time to the millisecond and the UTC offset. A constant of this class
@@ -821,6 +950,7 @@ module GameLogger
       @mode = mode
       @clock = clock
       @io = io
+      @line_filter = mode.line_filter.call
     end
 
     # Runs the logger until the script is killed: starts a new log file on
@@ -882,13 +1012,20 @@ module GameLogger
       loop { log_next_file }
     end
 
-    # Whether a game line is dropped by the mode's filter
-    # ({Mode#skip_line}). Room exclusion is checked separately.
+    # The text written for a game line, by the run's line filter (built
+    # from the mode's {Mode#line_filter} with the run): text mode drops a
+    # line that starts with a stream, dialog or progress bar tag; XML mode
+    # leaves out stream content and keeps the rest ({StreamSpanFilter}),
+    # and with streams keeps every line. Room exclusion is checked
+    # separately. XML mode's filter follows stream spans from line to line,
+    # so the run gives it every line it reads, in order, those in an
+    # excluded room too.
     #
     # @param line [String] a game line as get returns it
-    # @return [Boolean] true when the line is not written
-    def skip_line?(line)
-      @mode.skip_line.call(line) ? true : false
+    # @return [String, nil] the text to write (+line+ itself when the filter
+    #   keeps all of it), or +nil+ when nothing of the line is written
+    def line_text(line)
+      @line_filter.call(line)
     end
 
     # Adds the room numbers to +line+ when --rnum is on and the mode says it
@@ -1019,14 +1156,16 @@ module GameLogger
           @carried_line = line
           break
         end
+        excluded = false
         if @track_room
           refresh_room
           refresh_lich_id
-          next if room_excluded?
-
-          line = decorate_title(line)
+          excluded = room_excluded?
+          line = decorate_title(line) unless excluded
         end
-        next if skip_line?(line)
+        # Excluded lines go through the filter too, which may follow a span.
+        line = line_text(line)
+        next if excluded || line.nil?
 
         file.puts format_line(line, @clock.now)
         written += 1

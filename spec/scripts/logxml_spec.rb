@@ -460,10 +460,12 @@ module LogSpecHarness::Env
     end
 
     # streams is a word of its own among the arguments, not a part of one.
-    it 'drops stream lines when no argument is the word streams' do
-      run_logxml(args: 'nostreams', lines: ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>'])
+    # R-06: without streams, an inventory stream is left out whole, the
+    # lines inside it too (log.lic 1.3.2).
+    it 'leaves out stream content when no argument is the word streams' do
+      run_logxml(args: 'nostreams', lines: ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>', '<output>after</output>'])
 
-      expect(log_lines).to eq([default_header, '<output>In the pack: a torch.</output>', default_footer])
+      expect(log_lines).to eq([default_header, '<output>after</output>', default_footer])
     end
 
     # logxml drops only lines that start with pushStream or popStream; the
@@ -489,22 +491,23 @@ module LogSpecHarness::Env
     end
 
     # Verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml: the
-    # pushStream comes after other tags, so the line is not a stream line.
-    it 'logs a line whose pushStream comes after the start, without streams' do
-      line = "<clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:"
+    # pushStream comes after other tags. R-06: the inventory stream is left
+    # out from its pushStream on (logxml 0.6.6 kept the whole line, as it
+    # did not start with the tag) and the tags before it are kept.
+    it 'keeps the tags before an inventory pushStream later in the line, without streams' do
+      run_logxml(lines: ["<clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:"])
 
-      run_logxml(lines: [line])
-
-      expect(log_lines).to eq([default_header, line, default_footer])
+      expect(log_lines).to eq([default_header, "<clearStream id='inv' ifClosed=''/>", default_footer])
     end
 
-    # The filter is logxml 0.6.1's /^<(?:push|pop)Stream/: "^" matches after
-    # each line break in the line too, so a line holding one before a
-    # popStream is dropped whole. (Made-up line; lich-5 chomps only the end.)
-    it 'drops a line whose popStream starts after a line break in it, without streams' do
+    # logxml 0.6.6's /^<(?:push|pop)Stream/ matched after each line break in
+    # the line too, so it dropped this line whole. R-06: with no span open,
+    # a popStream ends nothing and the whole line is kept. (Made-up line;
+    # lich-5 chomps only the end.)
+    it 'keeps a line with a popStream after a line break in it when no stream span is open, without streams' do
       run_logxml(lines: ['<output>before</output>', "<output>a torch</output>\n<popStream/>", '<output>after</output>'])
 
-      expect(log_lines).to eq([default_header, '<output>before</output>', '<output>after</output>', default_footer])
+      expect(log_lines).to eq([default_header, '<output>before</output>', '<output>a torch</output>', '<popStream/>', '<output>after</output>', default_footer])
     end
 
     # Lines verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml,
@@ -1206,7 +1209,8 @@ module LogSpecHarness::Env
     # the same harness. Every difference is a fix the ledger lists: the
     # footer when the logger stops (R-23), no "\r" at the end of reget lines
     # (R-15), no blank line for an empty reget (R-14), the first line after
-    # midnight in the new day's file (R-13), and LOG_DIR (R-24).
+    # midnight in the new day's file (R-13), LOG_DIR (R-24), and, without
+    # streams, the line inside the inventory stream left out (R-06).
     # There is no fixture for logxml.lic 0.6.6, the last version before
     # ;logxml ran log.lic. The layer review replayed the lich-5 stream
     # fixtures through 0.6.6, this shim and ;log --xml out of tree (472 runs
@@ -1306,15 +1310,26 @@ module LogSpecHarness::Env
 
       let(:xml_file) { 'LICH_DIR/logs/GSIV-TestChar/2026/04/2026-04-23_10-00-05.xml' }
 
+      # R-06: 0.6.1 dropped the pushStream and popStream lines of
+      # game_lines and kept the line between them, which is inventory stream
+      # content; log.lic 1.3.2 leaves out all three without streams.
+      # The line, with its timestamp when it has one.
+      let(:inv_span_line) { %r{^[^\n]*<output>In the pack: a torch\.</output>\n} }
+
+      def without_inv_span_line(bytes)
+        expect(bytes).to match(inv_span_line)
+        bytes.sub(inv_span_line, '')
+      end
+
       context 'when started within the reget window' do
         before { $login_time = frozen_time - 5 }
 
-        it 'differs only by the reget lines without "\r" (R-15) and the footer when it stops (R-23)' do
+        it 'differs only by the reget lines without "\r" (R-15), the inventory stream line (R-06) and the footer when it stops (R-23)' do
           runs = run_all
 
           expect(runs[:base].keys).to eq([xml_file])
           expect(runs[:base][xml_file]).to include("\r\n")
-          expect(runs[:logxml]).to eq(xml_file => without_reget_cr(runs[:base][xml_file]) + footer)
+          expect(runs[:logxml]).to eq(xml_file => without_inv_span_line(without_reget_cr(runs[:base][xml_file])) + footer)
           expect(runs[:log_xml]).to eq(runs[:logxml])
         end
 
@@ -1322,27 +1337,27 @@ module LogSpecHarness::Env
           runs = run_all(args: '--timestamp="%F %T"')
 
           expect(runs[:base][xml_file]).to start_with("2026-04-23 10:00:05\n<style")
-          expect(runs[:logxml]).to eq(xml_file => "#{without_reget_cr(runs[:base][xml_file])}2026-04-23 10:00:05\n")
+          expect(runs[:logxml]).to eq(xml_file => "#{without_inv_span_line(without_reget_cr(runs[:base][xml_file]))}2026-04-23 10:00:05\n")
           expect(runs[:log_xml]).to eq(runs[:logxml])
         end
 
         # R-14: lich-5's reget answers nil for an empty buffer, and puts(nil)
         # wrote a blank line.
-        it 'differs by no blank line for an empty reget (R-14) and the footer (R-23)' do
+        it 'differs by no blank line for an empty reget (R-14), the inventory stream line (R-06) and the footer (R-23)' do
           runs = run_all(server_buffer: [])
 
           expect(runs[:base][xml_file]).to start_with("#{default_header}\n\n#{marker}\n")
-          expect(runs[:logxml]).to eq(xml_file => runs[:base][xml_file].sub("#{default_header}\n\n", "#{default_header}\n") + footer)
+          expect(runs[:logxml]).to eq(xml_file => without_inv_span_line(runs[:base][xml_file].sub("#{default_header}\n\n", "#{default_header}\n")) + footer)
           expect(runs[:log_xml]).to eq(runs[:logxml])
         end
       end
 
       context 'when started more than 30 seconds after login' do
-        it 'differs only by the footer (R-23)' do
+        it 'differs only by the inventory stream line (R-06) and the footer (R-23)' do
           runs = run_all
 
           expect(runs[:base][xml_file]).not_to include(marker)
-          expect(runs[:logxml]).to eq(xml_file => runs[:base][xml_file] + footer)
+          expect(runs[:logxml]).to eq(xml_file => without_inv_span_line(runs[:base][xml_file]) + footer)
           expect(runs[:log_xml]).to eq(runs[:logxml])
         end
 
@@ -1358,7 +1373,7 @@ module LogSpecHarness::Env
         # the map's UID table (R-05). For a room both place, the Lich number
         # matches; the title already shows the room's UID (1234), so the
         # second u-id 0.6.1 added is gone (R-12).
-        it 'differs only by the footer (R-23) and the u-id kept off a title showing (1234) (R-12) with --rnum' do
+        it 'differs only by the inventory stream line (R-06), the footer (R-23) and the u-id kept off a title showing (1234) (R-12) with --rnum' do
           stub_const('Map', double('Map', loaded?: true, current: double('Room', id: 228)))
           allow(Map).to receive(:ids_from_uid).with(1234).and_return([228])
 
@@ -1366,20 +1381,20 @@ module LogSpecHarness::Env
 
           expect(runs[:base][xml_file]).to include('<style id="roomName" />[Town Square - 228] (u1234) (1234)')
           expect(runs[:logxml]).to eq(
-            xml_file => runs[:base][xml_file].sub('[Town Square - 228] (u1234) (1234)', '[Town Square - 228] (1234)') + footer
+            xml_file => without_inv_span_line(runs[:base][xml_file]).sub('[Town Square - 228] (u1234) (1234)', '[Town Square - 228] (1234)') + footer
           )
           expect(runs[:logxml][xml_file]).to include('<style id="roomName" />[Town Square - 228] (1234)')
           expect(runs[:log_xml]).to eq(runs[:logxml])
         end
 
         # R-24: Lich's --logs= sets LOG_DIR; 0.6.1 wrote under LICH_DIR/logs.
-        it 'writes under LOG_DIR (R-24) the same bytes and the footer (R-23)' do
+        it 'writes under LOG_DIR (R-24) the same bytes but the inventory stream line (R-06), and the footer (R-23)' do
           stub_const('LOG_DIR', logs_dir)
 
           runs = run_all
 
           expect(runs[:base].keys).to eq([xml_file])
-          expect(runs[:logxml]).to eq('LOG_DIR/GSIV-TestChar/2026/04/2026-04-23_10-00-05.xml' => runs[:base][xml_file] + footer)
+          expect(runs[:logxml]).to eq('LOG_DIR/GSIV-TestChar/2026/04/2026-04-23_10-00-05.xml' => without_inv_span_line(runs[:base][xml_file]) + footer)
           expect(runs[:log_xml]).to eq(runs[:logxml])
         end
 

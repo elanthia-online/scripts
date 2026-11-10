@@ -1692,9 +1692,9 @@ module LogSpecHarness::Env
         end
 
         # Every log file's lines, by path relative to the character folder.
-        def log_files
+        def log_files(extension = 'log')
           root = File.join(log_dir, 'logs', 'GSIV-TestChar')
-          Dir.glob(File.join(root, '**', '*.log')).to_h do |path|
+          Dir.glob(File.join(root, '**', "*.#{extension}")).to_h do |path|
             [path.delete_prefix("#{root}/"), File.read(path).lines(chomp: true)]
           end
         end
@@ -1771,6 +1771,57 @@ module LogSpecHarness::Env
             '2026/04/2026-04-23_10-00-05.log'    => [default_stamp, marker, 'a', 'b', default_stamp],
             '2026/04/2026-04-23_10-00-05_01.log' => [default_stamp, 'c', default_stamp]
           )
+        end
+
+        # R-06: XML mode follows a stream span across lines, so every line
+        # read goes through the filter, in a room excluded or not and on
+        # either side of a new file; a span left open on a line it never
+        # read would hide the main-window lines after the popStream.
+        context 'when an XML stream span is open' do
+          let(:xml_header) { '2026-04-23 10:00am' }
+          let(:span_start) { "<pushStream id='inv'/>Your worn items are:" }
+
+          it 'closes the span on a popStream read in an excluded room' do
+            use_options(GameLogger::Opts.parse(['--xml', '--exclude=u7199']))
+            LogSpecHarness.feed(span_start, { count: 2, uid: 7199 }, '<popStream/>', { count: 3, uid: 1234 }, 'You see a door.')
+
+            run_main
+
+            expect(log_files('xml')).to eq('2026/04/2026-04-23_10-00-05.xml' => [xml_header, marker, 'You see a door.', default_stamp])
+          end
+
+          it 'opens the span on a pushStream read in an excluded room' do
+            use_options(GameLogger::Opts.parse(['--xml', '--exclude=u7199']))
+            LogSpecHarness.feed({ count: 2, uid: 7199 }, span_start, { count: 3, uid: 1234 }, '  a gilded locus', '<popStream/>You see a door.')
+
+            run_main
+
+            expect(log_files('xml')).to eq('2026/04/2026-04-23_10-00-05.xml' => [xml_header, marker, 'You see a door.', default_stamp])
+          end
+
+          it "keeps the span open into the new day's file" do
+            use_options(GameLogger::Opts.parse(['--xml']))
+            LogSpecHarness.feed('line 1', span_start, next_day, '  a gilded locus', '<popStream/>', 'line 2')
+
+            run_main
+
+            expect(log_files('xml')).to eq(
+              '2026/04/2026-04-23_10-00-05.xml' => [xml_header, marker, 'line 1', next_day_stamp],
+              '2026/04/2026-04-24_00-00-01.xml' => ['2026-04-24 12:00am', 'line 2', next_day_stamp]
+            )
+          end
+
+          it 'keeps the span open into the next file after a full one' do
+            use_options(GameLogger::Opts.parse(['--xml', '--lines=2']))
+            LogSpecHarness.feed('line 1', "a#{span_start}", '  a gilded locus', '<popStream/>', 'line 2')
+
+            run_main
+
+            expect(log_files('xml')).to eq(
+              '2026/04/2026-04-23_10-00-05.xml'    => [xml_header, marker, 'line 1', 'a', default_stamp],
+              '2026/04/2026-04-23_10-00-05_01.xml' => [xml_header, 'line 2', default_stamp]
+            )
+          end
         end
 
         # R-25: a rotation within one second appended to the same file.
@@ -2299,46 +2350,213 @@ module LogSpecHarness::Env
           expect(xml_lines).to eq([xml_header, marker, '<!-- CLIENT --><c>look<!-- ENDCLIENT -->', default_stamp])
         end
 
-        describe 'lines that start with pushStream or popStream' do
-          let(:stream_lines) { ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>'] }
-
-          it 'drops them' do
-            use_options(GameLogger::Opts.parse(['--xml']))
-            LogSpecHarness.feed(stream_lines)
+        # R-06, Q-10: without streams, XML mode leaves out the stream content
+        # lich-5 keeps out of the main-window text it hands scripts
+        # (lib/common/markup.rb SUPPRESSED_STREAMS and SPELLS_STREAM on
+        # lich-5 main; lib/global_defs.rb strip_xml_simple at v5.21.0): a span
+        # from a pushStream of the inv, talk, speech, spellfront, bounty,
+        # society or reserve stream to the next popStream, followed across
+        # lines, and a <stream id="Spells"> element. Every other byte of a
+        # line is kept; a line left empty is not written. The base filter
+        # dropped every line that started with pushStream or popStream (DR
+        # prompts, speech and group lines after a popStream) and kept the
+        # inner lines of a stream. Lines verbatim from lich-5
+        # spec/fixtures/streams (file:line), less their line ends.
+        describe 'stream content Lich keeps out of the main window' do
+          def xml_body(*args)
+            use_options(GameLogger::Opts.parse(['--xml', *args]))
 
             run_main
 
-            expect(xml_lines).to eq([xml_header, marker, '<output>In the pack: a torch.</output>', default_stamp])
+            xml_lines[2..-2]
+          end
+
+          it 'keeps the speech after a talk stream and leaves out the talk copy (dr_saga_containers_speech.xml:727-729)' do
+            LogSpecHarness.feed(
+              %(<pushStream id="talk"/><preset id='speech'>You politely say</preset>, "Hello."),
+              %(<popStream/><preset id='speech'>You politely say</preset>, "Hello."),
+              '<prompt time="1792040468">&gt;</prompt>'
+            )
+
+            expect(xml_body).to eq([%(<preset id='speech'>You politely say</preset>, "Hello."), '<prompt time="1792040468">&gt;</prompt>'])
+          end
+
+          it 'keeps a whisper stream, which Lich shows, and the prompt after its popStream (dr_saga_inventory.xml:281-283)' do
+            whisper = [
+              '<pushStream id="whispers"/><preset id="whisper">Delphine whispers,</preset> "Done!"',
+              '<popStream/><preset id="whisper">Delphine whispers,</preset> "Done!"',
+              '<prompt time="1792034225">&gt;</prompt>'
+            ]
+            LogSpecHarness.feed(whisper)
+
+            expect(xml_body).to eq(whisper)
+          end
+
+          it 'keeps the group list and the prompt on its last popStream line (dr_saga_group_bank.xml:24-29)' do
+            group = [
+              "<clearStream id='group'/>",
+              '<pushStream id="group"/>Members of your group:',
+              '<popStream/><pushStream id="group"/>  You: Healthy.',
+              '<popStream/><pushStream id="group"/>  Corwin (Leader): Healthy.',
+              '<popStream/><pushStream id="group"/>There are 2 members in your group.',
+              '<popStream/><prompt time="1792035856">J&gt;</prompt>'
+            ]
+            LogSpecHarness.feed(group)
+
+            expect(xml_body).to eq(group)
+          end
+
+          it 'keeps a combat stream and the prompt after it (dr_saga_hunt.xml:8-10)' do
+            combat = [
+              '<pushStream id="combat" />* A jeol moradu slices an ice-edged sword at you.  You dodge.  ',
+              "[You're winded (100%), mighty (100%), incredibly balanced and in dominating position.]",
+              '<popStream id="combat" /><prompt time="1792034126">&gt;</prompt>'
+            ]
+            LogSpecHarness.feed(combat)
+
+            expect(xml_body).to eq(combat)
+          end
+
+          it 'keeps a percWindow line and the prompt after its popStream (dr_legacy_group.xml:13-15)' do
+            spells = ['<clearStream id="percWindow"/>', '<pushStream id="percWindow"/>Regenerate  (Indefinite)', '<popStream/><prompt time="1791327426">&gt;</prompt>']
+            LogSpecHarness.feed(spells)
+
+            expect(xml_body).to eq(spells)
+          end
+
+          it 'leaves out an inventory stream across lines and keeps the text around it (dr_saga_inventory.xml:87-88, 122-125)' do
+            LogSpecHarness.feed(
+              %(<right exist="195648338" noun="lootsack">cloth lootsack</right><clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:),
+              '  a <a exist="195648608" noun="helm">diacan lamellar helm sculpted with the visage of a Saendalen shark</a>',
+              '  a <a exist="195648312" noun="harness">leaf-green leather harness with a smooth brass clasp</a>',
+              '<popStream/>',
+              'You remove a <a exist="195648338" noun="lootsack">heavy Imperial weave cloth lootsack</a> from your belt.',
+              '<prompt time="1792034212">&gt;</prompt>'
+            )
+
+            expect(xml_body).to eq(
+              [
+                %(<right exist="195648338" noun="lootsack">cloth lootsack</right><clearStream id='inv' ifClosed=''/>),
+                'You remove a <a exist="195648338" noun="lootsack">heavy Imperial weave cloth lootsack</a> from your belt.',
+                '<prompt time="1792034212">&gt;</prompt>'
+              ]
+            )
+          end
+
+          it 'leaves out a GemStone inventory stream and keeps the room stream before it (gs_saga_login.xml:14-16, 37-38, 40)' do
+            LogSpecHarness.feed(
+              "<compDef id='sprite'></compDef><popStream id='room'/>",
+              "<streamWindow id='inv' title='My Inventory' target='wear' ifClosed='' resident='true'/><clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:",
+              '  a <a exist="781962601" noun="bag">tooled leather drawstring coin bag</a>',
+              '  a <a exist="781962517" noun="cloak">voluminous mist tartan cloak</a> lined in silver-tipped aquerne',
+              '<popStream/>',
+              "<dialogData id='combat'><progressBar id='pbarStance' value='100' text='defensive (100%)' top='51' width='130' height='16' left='0' align='n' tooltip='Percent of stance contributing to defense'/></dialogData>"
+            )
+
+            expect(xml_body).to eq(
+              [
+                "<compDef id='sprite'></compDef><popStream id='room'/>",
+                "<streamWindow id='inv' title='My Inventory' target='wear' ifClosed='' resident='true'/><clearStream id='inv' ifClosed=''/>",
+                "<dialogData id='combat'><progressBar id='pbarStance' value='100' text='defensive (100%)' top='51' width='130' height='16' left='0' align='n' tooltip='Percent of stance contributing to defense'/></dialogData>"
+              ]
+            )
+          end
+
+          it 'keeps the GemStone room stream (gs_saga_hunt.xml:17-20)' do
+            room = [
+              "<nav rm='4216015'/><streamWindow id='main' title='Story' subtitle=\" - Sanctum of Scales, Columns - 4216015\" location='center' target='drop'/>" \
+              "<streamWindow id='room' title='Room' subtitle=\" - Sanctum of Scales, Columns - 4216015\" location='center' target='drop' ifClosed='' resident='true'/>" \
+              "<clearStream id='room'/><pushStream id='room'/><compDef id='room desc'>Stark white columns stretch up toward curved glass domes in the ceiling, " \
+              'each slender pillar adorned with rows of pale peridots and accents of bronze and copper leaf.  The floor is a mosaic of blue and green hues, ' \
+              "the stones chiseled into the shape of a thick, shimmering scale.</compDef><compDef id='room objs'>  You also see" \
+              '<crtrStatus exist="784142402" health="300" maxhealth="300" hostile="1"/><b> <pushBold/>a <a exist="784142402" noun="sentinel">lithe veiled sentinel</a>' \
+              '<popBold/></b>.</compDef>',
+              "<compDef id='room players'></compDef>",
+              "<compDef id='room exits'>Obvious exits: <d>north</d>, <d>east</d>, <d>west</d></compDef>",
+              "<compDef id='sprite'></compDef><popStream id='room'/>"
+            ]
+            LogSpecHarness.feed(room)
+
+            expect(xml_body).to eq(room)
+          end
+
+          it 'leaves out the spell list lines and keeps the spell window set-up (gs_saga_login.xml:57-60)' do
+            LogSpecHarness.feed(
+              '<streamWindow id="Spells" title="Spells" ifClosed="" resident="true" scroll="manual"/>',
+              '<clearStream id="Spells"/>',
+              '<stream id="Spells"><a exist="-10700001" coord="2524,1871" noun="">Minor Elemental</a></stream>',
+              '<stream id="Spells"><a exist="-10700001" coord="2524,1870" noun="">Major Elemental</a></stream>'
+            )
+
+            expect(xml_body).to eq(['<streamWindow id="Spells" title="Spells" ifClosed="" resident="true" scroll="manual"/>', '<clearStream id="Spells"/>'])
+          end
+
+          # Lines made up from the fixture forms, for the edges.
+          it 'keeps the text between two spans on one line and after the second' do
+            LogSpecHarness.feed(%(a<pushStream id="talk"/>x<popStream/>b<pushStream id='speech'/>y<popStream/>c))
+
+            expect(xml_body).to eq(['abc'])
+          end
+
+          it 'ends a span at the first popStream, whatever stream it names, as Lich does' do
+            LogSpecHarness.feed(%(<pushStream id="talk"/><pushStream id="combat" />x<popStream id="combat" />kept<popStream/>also kept))
+
+            expect(xml_body).to eq(['kept<popStream/>also kept'])
+          end
+
+          it 'keeps a line that was empty as sent, and leaves out an empty line inside a span' do
+            LogSpecHarness.feed('', "<pushStream id='inv'/>Your worn items are:", '', '<popStream/>', '')
+
+            expect(xml_body).to eq(['', ''])
+          end
+
+          it 'keeps a line left with only spaces' do
+            LogSpecHarness.feed(%(  <pushStream id="talk"/>x<popStream/>))
+
+            expect(xml_body).to eq(['  '])
+          end
+
+          it 'keeps game text that shows a stream tag escaped' do
+            spoof = %(You say, "&lt;pushStream id='inv'/&gt;")
+            LogSpecHarness.feed(spoof, 'You see a door.')
+
+            expect(xml_body).to eq([spoof, 'You see a door.'])
+          end
+
+          # The upstream thread pushes the typed command's line onto the same
+          # buffer get reads, so it can come in the middle of a span.
+          it 'logs a typed command that comes inside an inventory stream' do
+            LogSpecHarness.feed("<pushStream id='inv'/>Your worn items are:", '<!-- CLIENT --><c>look<!-- ENDCLIENT -->', '  a gilded locus', '<popStream/>')
+
+            expect(xml_body).to eq(['<!-- CLIENT --><c>look<!-- ENDCLIENT -->'])
+          end
+
+          it 'does not open a span for a typed command that holds a pushStream tag' do
+            LogSpecHarness.feed(%(<!-- CLIENT -->say <pushStream id='inv'/><!-- ENDCLIENT -->), 'You see a door.')
+
+            expect(xml_body).to eq([%(<!-- CLIENT -->say <pushStream id='inv'/><!-- ENDCLIENT -->), 'You see a door.'])
+          end
+
+          it 'counts only written lines toward --lines' do
+            LogSpecHarness.feed("<pushStream id='inv'/>Your worn items are:", '  a gilded locus', '<popStream/>', '<output>line 1</output>')
+
+            expect(xml_body('--lines=1')).to eq(['<output>line 1</output>'])
           end
 
           { 'the word streams' => 'streams', '--streams' => '--streams' }.each do |label, argument|
-            it "keeps them with #{label}" do
-              use_options(GameLogger::Opts.parse(['--xml', argument]))
-              LogSpecHarness.feed(stream_lines)
+            it "keeps every line as sent with #{label}" do
+              lines = ["<pushStream id='inv'/>Your worn items are:", '  a gilded locus', '<popStream/>', '<stream id="Spells">Minor Elemental</stream>']
+              LogSpecHarness.feed(lines)
 
-              run_main
-
-              expect(xml_lines).to eq([xml_header, marker, *stream_lines, default_stamp])
+              expect(xml_body(argument)).to eq(lines)
             end
           end
 
           # The dialog and progress bar lines text mode drops stay in the XML log.
           it 'keeps a line that starts with a dialog tag, which text mode drops' do
-            use_options(GameLogger::Opts.parse(['--xml']))
             LogSpecHarness.feed("<dialogData id='minivitals'>", '</dialogData>')
 
-            run_main
-
-            expect(xml_lines).to eq([xml_header, marker, "<dialogData id='minivitals'>", '</dialogData>', default_stamp])
-          end
-
-          it 'counts only written lines toward --lines' do
-            use_options(GameLogger::Opts.parse(['--xml', '--lines=1']))
-            LogSpecHarness.feed('<pushStream id="inv"/>', '<output>line 1</output>')
-
-            run_main
-
-            expect(xml_lines).to eq([xml_header, marker, '<output>line 1</output>', default_stamp])
+            expect(xml_body).to eq(["<dialogData id='minivitals'>", '</dialogData>'])
           end
         end
 
@@ -2436,6 +2654,19 @@ module LogSpecHarness::Env
             run_main
 
             expect(xml_lines[2..-2]).to eq([familiar_line])
+          end
+
+          # R-06: the title test reads the line as sent, as Lich's own does,
+          # before stream content is left out, so a title that a left-out
+          # span comes before is not numbered, as Lich does not number it.
+          # (Made-up line.)
+          it 'numbers no title that comes after a left-out stream span on its line' do
+            use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+            LogSpecHarness.feed(%(<pushStream id='inv'/>a torch<popStream/>#{title_line}))
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq([title_line])
           end
 
           # The title must start the line: a "]" before it would take the
@@ -2902,9 +3133,24 @@ module LogSpecHarness::Env
           expect(GameLogger::Mode::TEXT.uid_after_title).to be(false)
         end
 
-        it 'keeps every line with streams' do
-          expect(GameLogger::Mode::XML_STREAMS.skip_line.call('<pushStream id="inv"/>')).to be(false)
-          expect(mode.skip_line.call('<pushStream id="inv"/>')).to be_truthy
+        it 'keeps every line as sent with streams' do
+          filter = GameLogger::Mode::XML_STREAMS.line_filter.call
+
+          expect(["<pushStream id='inv'/>Your worn items are:", '  a gilded locus'].map { |line| filter.call(line) })
+            .to eq(["<pushStream id='inv'/>Your worn items are:", '  a gilded locus'])
+        end
+
+        # R-06: the filter follows a span across lines, so each run needs a
+        # filter of its own (two runs, ;log --xml and ;logxml, read the same
+        # lines).
+        it 'builds a new filter for each run, so a span one run is in does not hide lines from another' do
+          first = mode.line_filter.call
+          second = mode.line_filter.call
+
+          first.call("<pushStream id='inv'/>Your worn items are:")
+
+          expect(first.call('  a gilded locus')).to be_nil
+          expect(second.call('  a gilded locus')).to eq('  a gilded locus')
         end
       end
 
@@ -2924,20 +3170,95 @@ module LogSpecHarness::Env
         end
       end
 
-      describe '#skip_line?' do
+      describe '#line_text' do
+        # Text mode drops a whole line that starts with one of these tags
+        # and keeps every other line as it is.
         {
-          'a pushStream line'                   => ['<pushStream id="inv"/>', true],
-          'a popStream line'                    => ['<popStream/>You see a rat.', true],
-          'a closing progressBar line'          => ['</progressBar>', true],
-          'a dialogData line'                   => ['<dialogData id="minivitals">', true],
-          'an openDialog line'                  => ['<openDialog id="x">', true],
-          'a game line'                         => ['You see a rat.', false],
-          'a line with the tag after its start' => ['You say, "<pushStream id=inv/>"', false],
-          'an empty line'                       => ['', false]
-        }.each do |label, (line, skipped)|
-          it "is #{skipped} for #{label}" do
-            expect(GameLogger::Logger.new(OpenStruct.new).skip_line?(line)).to be(skipped)
+          'a pushStream line'                   => ['<pushStream id="inv"/>', nil],
+          'a popStream line'                    => ['<popStream/>You see a rat.', nil],
+          'a closing progressBar line'          => ['</progressBar>', nil],
+          'a dialogData line'                   => ['<dialogData id="minivitals">', nil],
+          'an openDialog line'                  => ['<openDialog id="x">', nil],
+          'a game line'                         => ['You see a rat.', 'You see a rat.'],
+          'a line with the tag after its start' => ['You say, "<pushStream id=inv/>"', 'You say, "<pushStream id=inv/>"'],
+          'an empty line'                       => ['', '']
+        }.each do |label, (line, text)|
+          it "is #{text.inspect} for #{label} in text mode" do
+            expect(GameLogger::Logger.new(OpenStruct.new).line_text(line)).to eq(text)
           end
+        end
+
+        it 'returns the line itself when the filter keeps all of it' do
+          line = 'You see a rat.'
+
+          expect(GameLogger::Logger.new(OpenStruct.new, mode: GameLogger::Mode::XML).line_text(line)).to equal(line)
+        end
+
+        # R-06, XML mode: lines verbatim from lich-5
+        # spec/fixtures/streams/dr_saga_inventory.xml:87-88, 123-124, read in order.
+        it 'follows an inventory stream across lines in XML mode' do
+          logger = GameLogger::Logger.new(OpenStruct.new, mode: GameLogger::Mode::XML)
+          lines = [
+            %(<right exist="195648338" noun="lootsack">cloth lootsack</right><clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:),
+            '  a <a exist="195648608" noun="helm">diacan lamellar helm sculpted with the visage of a Saendalen shark</a>',
+            '<popStream/>',
+            'You remove a <a exist="195648338" noun="lootsack">heavy Imperial weave cloth lootsack</a> from your belt.'
+          ]
+
+          expect(lines.map { |line| logger.line_text(line) }).to eq(
+            [
+              %(<right exist="195648338" noun="lootsack">cloth lootsack</right><clearStream id='inv' ifClosed=''/>),
+              nil,
+              nil,
+              'You remove a <a exist="195648338" noun="lootsack">heavy Imperial weave cloth lootsack</a> from your belt.'
+            ]
+          )
+        end
+
+        # Each stream id lich-5 keeps out of the main-window text, in both
+        # quote styles the game sends; a stream it shows stays.
+        %w[spellfront inv bounty society reserve speech talk].each do |id|
+          ["'", '"'].each do |quote|
+            it "leaves out the #{id} stream with #{quote == "'" ? 'single' : 'double'} quotes in XML mode" do
+              logger = GameLogger::Logger.new(OpenStruct.new, mode: GameLogger::Mode::XML)
+
+              expect(logger.line_text("a<pushStream id=#{quote}#{id}#{quote}/>x<popStream/>b")).to eq('ab')
+            end
+          end
+        end
+
+        %w[combat assess percWindow atmospherics group whispers familiar thoughts room experience loot].each do |id|
+          it "keeps the #{id} stream in XML mode" do
+            logger = GameLogger::Logger.new(OpenStruct.new, mode: GameLogger::Mode::XML)
+            line = %(a<pushStream id="#{id}"/>x<popStream/>b)
+
+            expect(logger.line_text(line)).to eq(line)
+          end
+        end
+
+        it 'keeps a stream whose id only starts with one it leaves out (inventory) in XML mode' do
+          logger = GameLogger::Logger.new(OpenStruct.new, mode: GameLogger::Mode::XML)
+          line = %(a<pushStream id="inventory"/>x<popStream/>b)
+
+          expect(logger.line_text(line)).to eq(line)
+        end
+
+        # Game lines reach a script as binary Strings, high bytes and all.
+        it 'keeps the high bytes of a line and leaves out the span in it in XML mode' do
+          logger = GameLogger::Logger.new(OpenStruct.new, mode: GameLogger::Mode::XML)
+          e_acute = [0xc3, 0xa9].pack('C*')
+          high_byte = [0xff].pack('C')
+
+          expect(logger.line_text("caf#{e_acute} <pushStream id='talk'/>#{high_byte}<popStream/>!".b)).to eq("caf#{e_acute} !".b)
+        end
+
+        # A line Lich tagged UTF-8 with a byte that is not valid UTF-8 must
+        # not raise in the regexp match.
+        it 'leaves out the span in a line with an invalid UTF-8 byte in XML mode' do
+          logger = GameLogger::Logger.new(OpenStruct.new, mode: GameLogger::Mode::XML)
+          line = "a<pushStream id='talk'/>#{[0xff].pack('C')}<popStream/>b".b.force_encoding(Encoding::UTF_8)
+
+          expect(logger.line_text(line)).to eq('ab')
         end
       end
 
