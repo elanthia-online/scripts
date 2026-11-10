@@ -2535,14 +2535,14 @@ module LogSpecHarness::Env
 
       describe '#skip_line?' do
         {
-          'a pushStream line' => ['<pushStream id="inv"/>', true],
-          'a popStream line' => ['<popStream/>You see a rat.', true],
-          'a closing progressBar line' => ['</progressBar>', true],
-          'a dialogData line' => ['<dialogData id="minivitals">', true],
-          'an openDialog line' => ['<openDialog id="x">', true],
-          'a game line' => ['You see a rat.', false],
+          'a pushStream line'                   => ['<pushStream id="inv"/>', true],
+          'a popStream line'                    => ['<popStream/>You see a rat.', true],
+          'a closing progressBar line'          => ['</progressBar>', true],
+          'a dialogData line'                   => ['<dialogData id="minivitals">', true],
+          'an openDialog line'                  => ['<openDialog id="x">', true],
+          'a game line'                         => ['You see a rat.', false],
           'a line with the tag after its start' => ['You say, "<pushStream id=inv/>"', false],
-          'an empty line' => ['', false]
+          'an empty line'                       => ['', false]
         }.each do |label, (line, skipped)|
           it "is #{skipped} for #{label}" do
             expect(GameLogger::Logger.new(OpenStruct.new).skip_line?(line)).to be(skipped)
