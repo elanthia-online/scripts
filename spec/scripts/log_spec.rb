@@ -2346,6 +2346,16 @@ module LogSpecHarness::Env
             expect(xml_lines[2..-2]).to eq(['<resource picture="0"/><style id="roomName" />[Town Square - 228] (u1234) (1234)', '[Town Square]'])
           end
 
+          it 'numbers no line where the room name resource comes after other text' do
+            use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+            mid_line = "<output>See </output>#{title_line} (1234)"
+            LogSpecHarness.feed(mid_line)
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq([mid_line])
+          end
+
           it 'numbers no line with --exclude and without --rnum' do
             use_options(GameLogger::Opts.parse(['--xml', '--exclude=u7199']))
             LogSpecHarness.feed(title_line)
@@ -2610,6 +2620,20 @@ module LogSpecHarness::Env
       end
 
       # R-28, Q-01: which Mode a run gets.
+      describe '.log_label' do
+        it 'is the name the script runs as' do
+          LogSpecHarness.start_script('', name: 'logxml')
+
+          expect(GameLogger::Logger.log_label).to eq('logxml')
+        end
+
+        it 'is log when there is no current script' do
+          allow(LogSpecHarness).to receive(:script).and_return(nil)
+
+          expect(GameLogger::Logger.log_label).to eq('log')
+        end
+      end
+
       describe '.mode_for' do
         {
           'text mode for log with no options'                 => [[], 'log', :DEFAULT_MODE],
