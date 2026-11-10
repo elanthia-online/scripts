@@ -4,8 +4,8 @@ require 'ostruct'
 require 'timeout'
 require_relative 'lich_script_vars'
 
-# The harness log_spec.rb and logxml_spec.rb run log.lic in (logxml.lic
-# loads log.lic, see logxml_spec.rb).
+# The harness log_spec.rb and log_xml_mode_spec.rb run log.lic in
+# (log_xml_mode_spec.rb runs the whole script, see run_whole_script).
 #
 # Stand-ins for the parts of lich-5 that log.lic's `module GameLogger` uses,
 # kept off the top level: the module is evaluated inside
@@ -85,7 +85,8 @@ module LogSpecHarness
     # @param args [String, Array<String>, nil] a String as typed (;log ...),
     #   an Array as autostart passes its saved arguments, nil for none
     # @param name [String] the script's name, Script.current.name ('log',
-    #   or 'logxml' for a run started as ;logxml)
+    #   or 'logxml' for a run an install's local logxml.lic starts, which
+    #   picks XML mode)
     # @return [OpenStruct] the stand-in Script, with +downstream_buffer+
     #   set to {DOWNSTREAM}
     def new_script(args = nil, name: 'log')

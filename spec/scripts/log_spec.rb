@@ -2079,10 +2079,10 @@ module LogSpecHarness::Env
       end
 
       # R-08: the module body parsed the arguments into a module instance
-      # variable, and every run of log.lic in a session (;force log, a second
-      # logxml shim run) evaluates `module GameLogger` again in the same
-      # namespace, so a run starting later could hand its options to a run
-      # already going.
+      # variable, and every run of log.lic in a session (;force log, or a
+      # second run of a local logxml.lic shim) evaluates `module GameLogger`
+      # again in the same namespace, so a run starting later could hand its
+      # options to a run already going.
       context 'when another run evaluates the module' do
         let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
 
@@ -2232,7 +2232,8 @@ module LogSpecHarness::Env
 
       # R-28, Q-01, Q-08: XML mode is logxml.lic's format (the 0.6.6 file
       # bytes) inside log.lic, picked by --xml or by the script running as
-      # logxml; the options and the file handling are the ones text mode has.
+      # logxml (an install's local logxml.lic, USER-1); the options and the
+      # file handling are the ones text mode has.
       describe 'XML mode' do
         let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
         # The first line of an XML file with timestamps off: 12-hour, no
@@ -3200,8 +3201,8 @@ module LogSpecHarness::Env
         end
 
         # R-06: the filter follows a span across lines, so each run needs a
-        # filter of its own (two runs, ;log --xml and ;logxml, read the same
-        # lines).
+        # filter of its own (two XML runs, ;log --xml and ;force log --xml,
+        # read the same lines).
         it 'builds a new filter for each run, so a span one run is in does not hide lines from another' do
           first = mode.line_filter.call
           second = mode.line_filter.call
