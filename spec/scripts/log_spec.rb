@@ -182,6 +182,10 @@ RSpec.describe GameLogger do
         end
       end
 
+      it 'stores an empty --timestamp= as an empty string' do
+        expect(described_class.parse(['--timestamp=']).timestamp).to eq('')
+      end
+
       context 'when a bare --timestamp or the word timestamp follows a format' do
         it 'keeps the format given by --timestamp=FMT' do
           expect(described_class.parse(['--timestamp=%F', '--timestamp']).timestamp).to eq('%F')
@@ -267,7 +271,9 @@ RSpec.describe GameLogger do
       'comma separators'      => ['50,000', 50_000],
       'underscore separators' => ['50_000', 50_000],
       'a leading zero'        => ['010', 10],
-      'one'                   => ['1', 1]
+      'one'                   => ['1', 1],
+      'several comma groups'  => ['1,000,000', 1_000_000],
+      'a short first group'   => ['1_000', 1_000]
     }.each do |label, (given, expected)|
       it "accepts #{label} (#{given.inspect}) without a message" do
         expect(GameLogger.lines_per_file(given)).to eq(expected)
@@ -276,14 +282,24 @@ RSpec.describe GameLogger do
     end
 
     {
-      'zero'                   => '0',
-      'a negative number'      => '-5',
-      'a word'                 => 'abc',
-      'a number with a suffix' => '50k',
-      'a decimal'              => '1.5',
-      'a hex number'           => '0x10',
-      'a doubled separator'    => '50,,000',
-      'an empty value'         => ''
+      'zero'                              => '0',
+      'a negative number'                 => '-5',
+      'a word'                            => 'abc',
+      'a number with a suffix'            => '50k',
+      'a decimal'                         => '1.5',
+      'a hex number'                      => '0x10',
+      'a doubled separator'               => '50,,000',
+      'an empty value'                    => '',
+      'a separator between single digits' => '1,0',
+      'a two-digit group'                 => '50,00',
+      'a separator after every digit'     => '5,0,0,0',
+      'a four-digit group'                => '1,0000',
+      'a four-digit first group'          => '1234,000',
+      'a trailing separator'              => '50_',
+      'a leading separator'               => ',500',
+      'a plus sign'                       => '+50',
+      'surrounding spaces'                => ' 50 ',
+      'non-ASCII digits'                  => [0x0665, 0x0660].pack('U*')
     }.each do |label, given|
       it "falls back to 30000 and names the bad value for #{label} (#{given.inspect})" do
         expect(GameLogger.lines_per_file(given)).to eq(30_000)
@@ -293,11 +309,13 @@ RSpec.describe GameLogger do
       end
     end
 
-    it 'falls back to 30000 and says the value is missing for a bare --lines' do
+    # true comes from a bare --lines or the positional word lines, so the
+    # message names neither form.
+    it 'falls back to 30000 and says the value is missing for a bare --lines or the word lines' do
       expect(GameLogger.lines_per_file(true)).to eq(30_000)
 
       expect(LogSpecHarness.echoes).to eq(
-        ['--lines (no value) is not a valid line count; use a whole number above 0, like --lines=50000. Using the default of 30000 lines per file.']
+        ['lines was given without a value; use a whole number above 0, like --lines=50000. Using the default of 30000 lines per file.']
       )
     end
   end
@@ -459,9 +477,21 @@ RSpec.describe GameLogger do
       end
     end
 
-    context 'with a bare --timestamp or the word timestamp' do
-      [['--timestamp'], ['timestamp']].each do |args|
-        it "logs without timestamps for #{args.first} instead of crashing" do
+    let(:no_format_echo) do
+      'timestamp was given without a format, so it is ignored; to add timestamps use --timestamp="%F %T %Z".'
+    end
+
+    # Defines GameLogger.get_settings (as Lich does for DR) for one run.
+    def run_main_with_settings(settings)
+      GameLogger.define_singleton_method(:get_settings) { settings }
+      run_main
+    ensure
+      GameLogger.singleton_class.send(:remove_method, :get_settings)
+    end
+
+    context 'with a bare --timestamp, the word timestamp, or an empty --timestamp=' do
+      [['--timestamp'], ['timestamp'], ['--timestamp=']].each do |args|
+        it "logs without timestamps for #{args.first} and says the option was ignored" do
           $reget_lines = []
           GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(args))
           LogSpecHarness.feed('You see a door.')
@@ -475,26 +505,70 @@ RSpec.describe GameLogger do
               'You see a door.'
             ]
           )
+          expect(LogSpecHarness.echoes).to eq(
+            [no_format_echo, "Non-XML Logging started, currently logging to #{find_log_file}"]
+          )
         end
       end
 
       it 'keeps the DR yaml timestamp format when the yaml enables timestamps' do
         $reget_lines = []
         GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--timestamp']))
-        GameLogger.define_singleton_method(:get_settings) do
-          OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M')
-        end
         LogSpecHarness.feed('You see a door.')
 
-        begin
-          run_main
-        ensure
-          GameLogger.singleton_class.send(:remove_method, :get_settings)
-        end
+        run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
         expect(log_lines).to eq(
           ['10:00', '<!-- Above contents from reget; full logging now active -->', '10:00: You see a door.']
         )
+        expect(LogSpecHarness.echoes.first).to eq(no_format_echo)
+      end
+    end
+
+    # R-04 through the settings path: the yaml format is checked like the
+    # --timestamp one before it reaches strftime.
+    context 'when the yaml enables timestamps without a usable format' do
+      { 'no format' => nil, 'an empty format' => '', 'a non-String format' => 5 }.each do |label, format|
+        it "stamps with %F %T %Z and says so for #{label} (#{format.inspect})" do
+          $reget_lines = []
+          GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse([]))
+          LogSpecHarness.feed('You see a door.')
+
+          run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: format))
+
+          stamp = frozen_time.strftime('%F %T %Z')
+          expect(log_lines).to eq(
+            [stamp, '<!-- Above contents from reget; full logging now active -->', "#{stamp}: You see a door."]
+          )
+          expect(LogSpecHarness.echoes).to eq(
+            [
+              "log_timestamp is on in your settings, but log_timestamp_format #{format.inspect} is not a format; using \"%F %T %Z\".",
+              "Non-XML Logging started, currently logging to #{find_log_file}"
+            ]
+          )
+        end
+      end
+
+      it 'uses a --timestamp=FMT without a message' do
+        $reget_lines = []
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--timestamp=%H:%M']))
+        LogSpecHarness.feed('You see a door.')
+
+        run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
+
+        expect(log_lines.last).to eq('10:00: You see a door.')
+        expect(LogSpecHarness.echoes.size).to eq(1)
+      end
+
+      it 'logs without timestamps and without a message when the yaml leaves timestamps off' do
+        $reget_lines = []
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse([]))
+        LogSpecHarness.feed('You see a door.')
+
+        run_main_with_settings(OpenStruct.new(log_timestamp: false, log_timestamp_format: nil))
+
+        expect(log_lines.last).to eq('You see a door.')
+        expect(LogSpecHarness.echoes.size).to eq(1)
       end
     end
 
@@ -515,15 +589,17 @@ RSpec.describe GameLogger do
         end
       end
 
-      it 'logs the game for a bare --lines instead of crashing at startup' do
-        $reget_lines = []
-        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines']))
-        LogSpecHarness.feed('line 1')
+      [['--lines'], ['lines']].each do |args|
+        it "logs the game for #{args.first} with no value instead of crashing at startup" do
+          $reget_lines = []
+          GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(args))
+          LogSpecHarness.feed('line 1')
 
-        run_main
+          run_main
 
-        expect(log_lines.last).to eq('line 1')
-        expect(LogSpecHarness.echoes.first).to start_with('--lines (no value) is not a valid line count')
+          expect(log_lines.last).to eq('line 1')
+          expect(LogSpecHarness.echoes.first).to start_with('lines was given without a value;')
+        end
       end
     end
 
