@@ -1320,6 +1320,20 @@ module LogSpecHarness::Env
             end
           end
 
+          # Rooms next to each other often share a title. With the parser a
+          # room ahead of the line, the title still matches, but the UID it
+          # shows is the last room's, so the line is left as sent.
+          it "numbers no title that shows another room's UID, the parser being a room ahead" do
+            uid_table.merge!(4_216_015 => [228], 4_216_016 => [229])
+            LogSpecHarness.feed(
+              { count: 2, uid: 4_216_016 },
+              '[Sanctum of Scales, Columns] (4216015)',
+              '[Sanctum of Scales, Columns] (4216016)'
+            )
+
+            expect(log_with('--rnum')).to eq(['[Sanctum of Scales, Columns] (4216015)', '[Sanctum of Scales, Columns - 229] (4216016)'])
+          end
+
           it 'builds the title matcher once per room, not once per line' do
             allow(GameLogger::Logger).to receive(:room_title_pattern).and_call_original
             LogSpecHarness.feed(
@@ -2384,6 +2398,22 @@ module LogSpecHarness::Env
 
           # Lich's pattern takes the picture resource or popBold, not both,
           # so this form (which logxml 0.6.6 numbered) is left alone too.
+          # Lich's pattern needs whitespace before the roomName style's "/>"
+          # and a whole <room> tag, so neither of these lines is a title.
+          {
+            'the roomName style with no space before />' => '<resource picture="0"/><style id="roomName"/>[Town Square]',
+            'a tag that only starts with <room'          => '<resource picture="0"/><roomDesc>[Town Square] lies here.</roomDesc>'
+          }.each do |label, line|
+            it "numbers no line with #{label}" do
+              use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+              LogSpecHarness.feed(line)
+
+              run_main
+
+              expect(xml_lines[2..-2]).to eq([line])
+            end
+          end
+
           it 'numbers no title with both a picture resource and popBold before it' do
             use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
             both_line = '<resource picture="0"/><popBold/><style id="roomName" />[Town Square]'
@@ -2451,15 +2481,30 @@ module LogSpecHarness::Env
               expect(xml_lines[2..-2]).to eq([gs_title])
             end
 
-            # The guard looks for this room's UID, not any number: one digit
-            # more is another room.
-            it "adds the u-id when the line shows another room's number" do
+            # The logger reads XMLData when it handles a line, not when the
+            # line came in, so after quick moves the parser can be on the
+            # next room while the line is still this one's title. A title
+            # that shows a UID other than the parser's is left as sent, as
+            # text mode leaves a title that does not match the parser's.
+            it "numbers no title that shows another room's UID, the parser being a room ahead" do
+              allow(XMLData).to receive(:room_id).and_return(4_217_403)
+              use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+              LogSpecHarness.feed(gs_title)
+
+              run_main
+
+              expect(xml_lines[2..-2]).to eq([gs_title])
+            end
+
+            # The UID must be this room's whole number: one digit more is
+            # another room.
+            it "numbers no title that shows this room's UID with one digit more" do
               use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
               LogSpecHarness.feed(gs_title.sub('(4216015)', '(42160151)'))
 
               run_main
 
-              expect(xml_lines[2..-2]).to eq(['<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015) (42160151)'])
+              expect(xml_lines[2..-2]).to eq([gs_title.sub('(4216015)', '(42160151)')])
             end
 
             context 'in DragonRealms' do
@@ -2914,10 +2959,12 @@ module LogSpecHarness::Env
           'GemStone, a Lich number, the UID shown'     => [['[Town Square] (1234)', 228, 'GSIV'], '[Town Square - 228] (1234)'],
           'GemStone, no Lich number, the UID shown'    => [['[Town Square] (1234)', nil, 'GSIV'], '[Town Square] (1234)'],
           'GemStone, a Lich number, no UID shown'      => [['[Town Square]', 228, 'GSIV'], '[Town Square - 228] (u1234)'],
-          'GemStone, another number shown'             => [['[Town Square] (12345)', 228, 'GSIV'], '[Town Square - 228] (12345) (u1234)'],
+          'GemStone, another room\'s UID shown'        => [['[Town Square] (12345)', 228, 'GSIV'], '[Town Square] (12345)'],
+          'GemStone, the UID shown with no space'      => [['[Town Square](1234)', 228, 'GSIV'], '[Town Square - 228](1234) (u1234)'],
           'GemStone, markup after the title'           => [['[Town Square]</name>', 228, 'GSIV'], '[Town Square - 228]</name> (u1234)'],
           'GemStone, a second ] on the line'           => [['[Town Square] [lit]', nil, 'GSIV'], '[Town Square] [lit] (u1234)'],
           'DragonRealms, a Lich number, the UID shown' => [['[Town Square] (1234)', 228, 'DR'], '[Town Square - 228] (1234)'],
+          'DragonRealms, another room\'s UID shown'    => [['[Town Square] (230008)', 228, 'DR'], '[Town Square] (230008)'],
           'DragonRealms, no Lich number, no UID shown' => [['[Town Square]', nil, 'DR'], '[Town Square]']
         }.each do |label, ((line, lich_id, game), numbered)|
           it "numbers the title as text mode does (any u-id at the end of the line) in #{label}" do
@@ -2929,6 +2976,7 @@ module LogSpecHarness::Env
           'GemStone, a Lich number, no UID shown' => [['[Town Square]</name>', 228, 'GSIV'], '[Town Square - 228] (u1234)</name>'],
           'GemStone, the UID shown'               => [['[Town Square] (1234)</name>', 228, 'GSIV'], '[Town Square - 228] (1234)</name>'],
           'GemStone, a second ] on the line'      => [['[Town Square] [lit]', nil, 'GSIV'], '[Town Square] (u1234) [lit]'],
+          'GemStone, another room\'s UID shown'   => [['[Town Square] (12345)</name>', 228, 'GSIV'], '[Town Square] (12345)</name>'],
           'DragonRealms'                          => [['[Town Square] (1234)</name>', 228, 'DR'], '[Town Square - 228] (1234)</name>']
         }.each do |label, ((line, lich_id, game), numbered)|
           it "numbers the title as XML mode does (any u-id right after the first ]) in #{label}" do
@@ -2949,6 +2997,27 @@ module LogSpecHarness::Env
             expect(GameLogger::Logger.number_room_title('[Town Square]', 228, uid, 'GSIV')).to eq(numbered)
             expect(GameLogger::Logger.number_room_title('[Town Square]', 228, uid, 'GSIV', uid_after_title: true)).to eq(numbered)
           end
+        end
+
+        # With the room's UID unknown, a UID the title shows is another
+        # room's as far as the logger can tell.
+        [0, nil, 340_282_366_920_938_463_463_374_607_431_768_211_455].each do |uid|
+          it "returns a title that shows a UID as it is when the room's UID is #{uid.inspect}" do
+            line = '[Town Square] (1234)'
+
+            expect(GameLogger::Logger.number_room_title(line, 228, uid, 'GSIV')).to equal(line)
+          end
+        end
+
+        # A line tagged UTF-8 whose bytes are not valid UTF-8 would raise
+        # ArgumentError on a Regexp match; the shown UID is read from its
+        # bytes instead.
+        it 'reads the shown UID from a line whose bytes are not valid in its encoding' do
+          high_byte = [0xff].pack('C')
+          line = "[Caf#{high_byte}] (1234)".b.force_encoding(Encoding::UTF_8)
+
+          expect(GameLogger::Logger.number_room_title(line, 228, 1234, 'GSIV').b).to eq("[Caf#{high_byte} - 228] (1234)".b)
+          expect(GameLogger::Logger.number_room_title(line, 228, 4321, 'GSIV')).to equal(line)
         end
 
         it 'never changes the line it is given' do
