@@ -193,6 +193,31 @@ RSpec.describe GameLogger do
         end
       end
 
+      it 'lets the last valued flag win when one is given twice' do
+        expect(described_class.parse(['--timestamp=%T', '--timestamp=%H']).timestamp).to eq('%H')
+        expect(described_class.parse(['--lines=100', '--lines=200']).lines).to eq('200')
+      end
+
+      context 'with a flag that has no name' do
+        before do
+          allow(described_class).to receive(:echo) { |msg| LogSpecHarness.echo(msg) }
+        end
+
+        it 'ignores -- and says so instead of crashing' do
+          result = described_class.parse(['--', '--rnum'])
+
+          expect(result.to_h).to eq(rnum: true)
+          expect(LogSpecHarness.echoes).to eq(['-- has no option name, so it is ignored.'])
+        end
+
+        it 'ignores --=x and says so instead of storing an empty name' do
+          result = described_class.parse(['--=x'])
+
+          expect(result.to_h).to eq({})
+          expect(LogSpecHarness.echoes).to eq(['--=x has no option name, so it is ignored.'])
+        end
+      end
+
       it 'still splits --exclude on commas while keeping an equals sign in a value' do
         result = described_class.parse(['--exclude=288,u7199=x'])
 
