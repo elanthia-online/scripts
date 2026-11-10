@@ -44,13 +44,21 @@ RSpec.describe 'logxml.lic' do
   # Runs logxml.lic once with +vars+ as typed and the given DR settings
   # (+nil+ for none, as in GS). Ends when the fed lines run out; a Time
   # among +lines+ moves the clock before the next line is read.
-  # +reget+ is what lich-5's reget answers: nil for an empty buffer. A
-  # block runs once the fed lines run out; then get hands out what the
-  # upstream thread pushed onto the downstream buffer (+@logxml_script+),
-  # and the logger stops. +upstream+ stands in for upstream_get; the default
-  # ends the upstream thread before it reads a command.
-  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'], reget: nil, upstream: -> { Thread.current.kill })
-    script = OpenStruct.new(want_script_output: nil, vars: [vars.join(' '), *vars], downstream_buffer: [], name: 'logxml')
+  # +reget+ is what lich-5's reget answers: nil for an empty buffer. With
+  # +server_buffer+ (the raw lines the server sent), reget answers as
+  # lich-5's does instead, from the want_downstream_xml the script has set
+  # by then (see lich_reget). A block runs once the fed lines run out; then
+  # get hands out what the upstream thread pushed onto the downstream
+  # buffer (+@logxml_script+), and the logger stops. +upstream+ stands in
+  # for upstream_get; the default ends the upstream thread before it reads
+  # a command. The script starts with lich-5's Script#initialize want_*
+  # defaults (lib/common/script.rb): text downstream on, XML downstream,
+  # script output and upstream off.
+  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'], reget: nil, server_buffer: nil, upstream: -> { Thread.current.kill })
+    script = OpenStruct.new(
+      want_downstream: true, want_downstream_xml: false, want_script_output: false, want_upstream: false,
+      vars: [vars.join(' '), *vars], downstream_buffer: [], name: 'logxml'
+    )
     @logxml_script = script
     stub_const('Script', Class.new { define_singleton_method(:current) { script } })
     pending_lines = lines.map(&:dup) # fresh Strings, as get returns; logxml edits lines in place
@@ -58,7 +66,8 @@ RSpec.describe 'logxml.lic' do
     runner = Object.new
     runner.define_singleton_method(:hide_me) { nil }
     runner.define_singleton_method(:echo) { |msg| sink << msg.to_s }
-    runner.define_singleton_method(:reget) { reget }
+    real_reget = method(:lich_reget)
+    runner.define_singleton_method(:reget) { server_buffer ? real_reget.call(server_buffer, script.want_downstream_xml) : reget }
     on_stop = block_given? ? proc { yield } : proc {}
     time_now = clock
     stopping = false
@@ -74,7 +83,31 @@ RSpec.describe 'logxml.lic' do
     end
     runner.define_singleton_method(:upstream_get) { upstream.call }
     runner.define_singleton_method(:get_settings) { settings } unless settings.nil?
+    run_body(runner)
+  end
+
+  # Runs logxml.lic's body on +runner+. A method of its own: a String
+  # instance_eval sees its caller's locals, so in run_logxml the body's
+  # bare reget read the +reget+ argument instead of calling runner.reget.
+  def run_body(runner)
     Timeout.timeout(5) { runner.instance_eval(body, script_path, body_line) }
+  end
+
+  # lich-5's reget with no arguments (lib/global_defs.rb:1601-1633) over
+  # +buffer+: the lines joined on "\n"; unless +want_xml+, the stream/tag
+  # blocks are cut, every tag removed and &gt; &lt; decoded; split on "\n"
+  # with blank lines dropped (a "\r" left at each line end stays); nil,
+  # never [], when nothing is left.
+  def lich_reget(buffer, want_xml)
+    history = buffer.join("\n")
+    unless want_xml
+      history = history.gsub(%r{<pushStream id=["'](?:spellfront|inv|bounty|society)["'][^>]*/>.*?<popStream[^>]*>}m, '')
+      history = history.gsub(%r{<stream id="Spells">.*?</stream>}m, '')
+      history = history.gsub(%r{<(compDef|inv|component|right|left|spell|prompt)[^>]*>.*?</\1>}m, '')
+      history = history.gsub(/<[^>]+>/, '').gsub('&gt;', '>').gsub('&lt;', '<')
+    end
+    lines = history.split("\n").reject { |line| line.empty? || line =~ /^[\r\n\s\t]*$/ }
+    lines.empty? ? nil : lines
   end
 
   def log_file
@@ -283,10 +316,57 @@ RSpec.describe 'logxml.lic' do
     end
   end
 
+  # The contract the ;log --xml shim must keep. lich-5 hands the XML lines
+  # to a script that wants the XML downstream, and adds the text lines to
+  # the same buffer when it wants the text downstream too, or another
+  # script's output when it wants that; typed commands reach upstream_get
+  # only with want_upstream.
+  it 'asks for the XML downstream and typed commands, and not the text downstream or script output' do
+    run_logxml
+
+    expect(@logxml_script.to_h.slice(:want_downstream, :want_downstream_xml, :want_script_output, :want_upstream)).to eq(
+      want_downstream: false, want_downstream_xml: true, want_script_output: false, want_upstream: true
+    )
+  end
+
+  it 'keeps pushStream and popStream lines when started with streams' do
+    stream_lines = ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>']
+
+    run_logxml(vars: ['streams'], lines: stream_lines)
+
+    expect(log_lines).to eq([default_header, *stream_lines, default_footer])
+  end
+
+  # The header is 12-hour with the hour's leading zero dropped.
+  it 'writes the header hour before 10 without a leading zero' do
+    clock[0] = Time.new(2026, 4, 23, 9, 5, 0)
+
+    run_logxml
+
+    expect(log_lines).to eq(['2026-04-23 9:05am', '<output>You see a door.</output>', clock[0].strftime('%Y-%m-%d %H:%M:%S.%L %:z')])
+  end
+
   context 'when started within 30 seconds of login' do
     let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
 
     before { $login_time = frozen_time - 5 }
+
+    # lich-5's reget gives the raw XML only to a script that already wants
+    # the XML downstream, so the flag is set before reget is called. Server
+    # lines verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml.
+    it 'writes the reget as the raw XML the server sent' do
+      server_lines = [
+        "<style id=\"\"/><style id=\"roomDesc\"/>The tiled ground is chipped, resembling run down cobblestones.<style id=\"\"/>\r",
+        "Obvious exits: <a exist=\"-10700001\" coord=\"2524,1864\" noun=\"north\">north</a>, <a exist=\"-10700001\" coord=\"2524,1864\" noun=\"east\">east</a>\r",
+        "<compass><dir value=\"n\"/><dir value=\"e\"/></compass><prompt time=\"1792091316\">&gt;</prompt>\r",
+        "<component id='room objs'>  You also see the <a exist=\"781927405\" noun=\"disk\">purple Aldric disk</a>.</component>\r",
+        "Your <a exist=\"781927405\" noun=\"disk\">disk</a> arrives, following you dutifully.\r"
+      ]
+
+      run_logxml(server_buffer: server_lines)
+
+      expect(log_lines.first(7)).to eq([default_header, *server_lines.map(&:chomp), marker])
+    end
 
     # R-14: lich-5's reget returns nil for an empty buffer; puts(nil)
     # wrote a blank line before the marker.
