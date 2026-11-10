@@ -718,16 +718,18 @@ RSpec.describe GameLogger do
 
         run_main
 
-        # The clock is frozen, so the second file has the same name and the
-        # rollover shows up as footer + header lines in one file; the second
-        # file's footer is written when the logger stops.
-        expect(log_lines[1001]).to eq('line 1000')
-        expect(log_lines[1002]).to eq(default_stamp)
-        expect(log_lines[1003]).to eq(default_stamp)
-        expect(log_lines[1004]).to eq('line 1001')
-        expect(log_lines[1005]).to eq(default_stamp)
-        expect(log_lines.size).to eq(1006)
-        expect(LogSpecHarness.echoes).to eq(["Non-XML Logging started, currently logging to #{find_log_file}"])
+        # R-25: the clock is frozen, so the second file starts within the
+        # same second and gets an _01 suffix instead of being appended to the
+        # first one.
+        month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+        first = File.read(File.join(month, '2026-04-23_10-00-05.log')).lines(chomp: true)
+        second = File.read(File.join(month, '2026-04-23_10-00-05_01.log')).lines(chomp: true)
+        expect(first.size).to eq(1003)
+        expect(first.last(2)).to eq(['line 1000', default_stamp])
+        expect(second).to eq([default_stamp, 'line 1001', default_stamp])
+        expect(LogSpecHarness.echoes).to eq(
+          ["Non-XML Logging started, currently logging to #{File.join(month, '2026-04-23_10-00-05.log')}"]
+        )
       end
     end
 
@@ -1257,15 +1259,17 @@ RSpec.describe GameLogger do
         expect(log_files['2026/04/2026-04-23_10-00-05.log']).to eq([default_stamp, marker, 'line 1', next_day_stamp])
       end
 
-      # The clock stays at 10:00:05, so each new file reuses the name and
-      # shows up as footer + header lines in one file.
+      # The clock stays at 10:00:05, so the second file gets an _01 suffix.
       it 'counts only written lines toward --lines, not lines in an excluded room' do
         GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=2', '--exclude=u7199']))
         LogSpecHarness.feed('a', { count: 2, uid: 7199 }, 'x1', 'x2', 'x3', { count: 3, uid: 1234 }, 'b', 'c')
 
         run_main
 
-        expect(log_lines).to eq([default_stamp, marker, 'a', 'b', default_stamp, default_stamp, 'c', default_stamp])
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log'    => [default_stamp, marker, 'a', 'b', default_stamp],
+          '2026/04/2026-04-23_10-00-05_01.log' => [default_stamp, 'c', default_stamp]
+        )
       end
 
       it 'counts only written lines toward --lines, not filtered stream lines' do
@@ -1274,7 +1278,41 @@ RSpec.describe GameLogger do
 
         run_main
 
-        expect(log_lines).to eq([default_stamp, marker, 'a', 'b', default_stamp, default_stamp, 'c', default_stamp])
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log'    => [default_stamp, marker, 'a', 'b', default_stamp],
+          '2026/04/2026-04-23_10-00-05_01.log' => [default_stamp, 'c', default_stamp]
+        )
+      end
+
+      # R-25: a rotation within one second appended to the same file.
+      it 'gives each file started within the same second its own _NN name' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        LogSpecHarness.feed('a', 'b', 'c')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log'    => [default_stamp, marker, 'a', default_stamp],
+          '2026/04/2026-04-23_10-00-05_01.log' => [default_stamp, 'b', default_stamp],
+          '2026/04/2026-04-23_10-00-05_02.log' => [default_stamp, 'c', default_stamp],
+          # a full file is followed at once by the next one, which waits
+          # for a line; here the logger stops first
+          '2026/04/2026-04-23_10-00-05_03.log' => [default_stamp, default_stamp]
+        )
+      end
+
+      it 'appends to an existing file of the same name when the logger starts' do
+        month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+        FileUtils.mkdir_p(month)
+        File.write(File.join(month, '2026-04-23_10-00-05.log'), "earlier run\n")
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        LogSpecHarness.feed('a')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log' => ['earlier run', default_stamp, marker, 'a', default_stamp]
+        )
       end
     end
 
@@ -1324,8 +1362,9 @@ RSpec.describe GameLogger do
         expect(log_lines).to eq([default_stamp, marker, 'line 1', default_stamp])
       end
 
-      it 'closes the file and lets the reason through when the footer cannot be written' do
+      it 'closes the file, logs the failed footer and lets the reason through when the footer cannot be written' do
         GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        allow(Lich).to receive(:log)
         files = opened_files
         allow(GameLogger).to receive(:get) do
           allow(files.first).to receive(:puts).and_raise(Errno::ENOSPC)
@@ -1337,6 +1376,40 @@ RSpec.describe GameLogger do
         expect(files.size).to eq(1)
         expect(files.first).to be_closed
         expect(log_lines).to eq([default_stamp, marker])
+        expect(Lich).to have_received(:log).with(
+          "log: the footer of #{find_log_file} was not written while the logger stopped (Errno::ENOSPC: No space left on device)"
+        )
+      end
+
+      # A footer that fails when a full file is closed for the next one is
+      # not part of stopping: it raises, as the plain puts before 1.2.4 did,
+      # instead of being dropped while the logger moves on.
+      it 'closes the file and raises when the footer of a full file cannot be written' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        allow(Lich).to receive(:log)
+        files = opened_files
+        LogSpecHarness.feed('a', 'b')
+        # The first write after "a" on the first file is its footer.
+        a_written = false
+        allow(GameLogger).to receive(:get).and_wrap_original do |original|
+          original.call.tap do |line|
+            next unless line == 'a'
+
+            allow(files.first).to receive(:puts).and_wrap_original do |puts, *args|
+              raise Errno::EIO if a_written
+
+              a_written = true
+              puts.call(*args)
+            end
+          end
+        end
+
+        expect { run_main }.to raise_error(Errno::EIO)
+
+        expect(files.size).to eq(1)
+        expect(files.first).to be_closed
+        expect(log_lines).to eq([default_stamp, marker, 'a'])
+        expect(Lich).not_to have_received(:log)
       end
     end
 
@@ -1371,12 +1444,57 @@ RSpec.describe GameLogger do
       end
     end
 
-    describe '.write_footer' do
-      it 'ignores a write error (best effort while stopping)' do
-        file = File.open(File.join(log_dir, 'closed.log'), 'a')
-        file.close
+    describe '.log_file_path' do
+      let(:time) { Time.new(2026, 4, 23, 10, 0, 5) }
 
-        expect(GameLogger.write_footer(file, nil)).to be_nil
+      it 'names the first file of a run by the time, even when that file exists' do
+        File.write(File.join(log_dir, '2026-04-23_10-00-05.log'), '')
+
+        expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: false))
+          .to eq(File.join(log_dir, '2026-04-23_10-00-05.log'))
+      end
+
+      it 'names a rotated file by the time when no file has that name' do
+        expect(GameLogger.log_file_path(log_dir, time, '.xml', rotated: true))
+          .to eq(File.join(log_dir, '2026-04-23_10-00-05.xml'))
+      end
+
+      it 'adds _01 to a rotated file whose name exists, and _02 when that exists too' do
+        File.write(File.join(log_dir, '2026-04-23_10-00-05.log'), '')
+        expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+          .to eq(File.join(log_dir, '2026-04-23_10-00-05_01.log'))
+
+        File.write(File.join(log_dir, '2026-04-23_10-00-05_01.log'), '')
+        expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+          .to eq(File.join(log_dir, '2026-04-23_10-00-05_02.log'))
+      end
+
+      it 'gives rotated names that sort by name in the order written, after the first file and before the next second' do
+        names = ['2026-04-23_10-00-05.log']
+        11.times do
+          FileUtils.touch(File.join(log_dir, names.last))
+          names << File.basename(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+        end
+        names << '2026-04-23_10-00-06.log'
+
+        expect(names.sort).to eq(names)
+      end
+    end
+
+    describe '.write_footer' do
+      let(:closed_file) { File.open(File.join(log_dir, 'closed.log'), 'a').tap(&:close) }
+
+      it 'logs and ignores a write error while the logger stops' do
+        allow(Lich).to receive(:log)
+
+        expect(GameLogger.write_footer(closed_file, nil, stopping: true)).to be_nil
+        expect(Lich).to have_received(:log).with(
+          "log: the footer of #{closed_file.path} was not written while the logger stopped (IOError: closed stream)"
+        )
+      end
+
+      it 'raises a write error when the logger is not stopping' do
+        expect { GameLogger.write_footer(closed_file, nil, stopping: false) }.to raise_error(IOError)
       end
     end
 

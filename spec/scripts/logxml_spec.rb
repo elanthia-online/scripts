@@ -73,6 +73,13 @@ RSpec.describe 'logxml.lic' do
     Dir.glob(File.join(log_dir, '**', '*.xml')).first
   end
 
+  # Stands in for Lich.log; returns the Array its messages are added to.
+  def stub_lich_log
+    [].tap do |logged|
+      stub_const('Lich', Module.new { define_singleton_method(:log) { |msg| logged << msg } })
+    end
+  end
+
   def log_lines
     File.read(log_file).lines(chomp: true)
   end
@@ -342,8 +349,39 @@ RSpec.describe 'logxml.lic' do
     it 'counts only written lines toward the 30000, not skipped stream lines' do
       run_logxml(lines: ['<pushStream id="inv"/>', '<popStream/>', *Array.new(30_001) { |n| "<output>#{n + 1}</output>" }])
 
-      expect(log_lines[30_000, 4]).to eq(['<output>30000</output>', default_footer, default_header, '<output>30001</output>'])
-      expect(log_lines.size).to eq(30_005)
+      # R-25: the clock is frozen, so the second file gets an _01 suffix.
+      month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      first = File.read(File.join(month, '2026-04-23_10-00-05.xml')).lines(chomp: true)
+      expect(first.size).to eq(30_002)
+      expect(first.last(2)).to eq(['<output>30000</output>', default_footer])
+      expect(File.read(File.join(month, '2026-04-23_10-00-05_01.xml')).lines(chomp: true)).to eq(
+        [default_header, '<output>30001</output>', default_footer]
+      )
+    end
+
+    it 'gives a new file _02 when the time-stamped name and its _01 both exist' do
+      month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      FileUtils.mkdir_p(month)
+      File.write(File.join(month, '2026-04-24_00-00-01.xml'), "other logger\n")
+      File.write(File.join(month, '2026-04-24_00-00-01_01.xml'), "other logger\n")
+
+      run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>'])
+
+      expect(File.read(File.join(month, '2026-04-24_00-00-01_02.xml')).lines(chomp: true)).to eq(
+        ['2026-04-24 12:00am', '<output>line 2</output>', next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')]
+      )
+      expect(File.read(File.join(month, '2026-04-24_00-00-01_01.xml'))).to eq("other logger\n")
+    end
+
+    it 'appends to an existing file of the same name when it starts' do
+      month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      FileUtils.mkdir_p(month)
+      File.write(File.join(month, '2026-04-23_10-00-05.xml'), "earlier run\n")
+
+      run_logxml
+
+      expect(Dir.children(month)).to eq(['2026-04-23_10-00-05.xml'])
+      expect(log_lines).to eq(['earlier run', default_header, '<output>You see a door.</output>', default_footer])
     end
   end
 
@@ -355,7 +393,8 @@ RSpec.describe 'logxml.lic' do
       expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
     end
 
-    it 'closes the file and lets the reason through when the footer cannot be written' do
+    it 'closes the file, logs the failed footer and lets the reason through when the footer cannot be written' do
+      lich_log = stub_lich_log
       opened = []
       allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
         original.call(*args, &block).tap { |file| opened << file if file.is_a?(File) }
@@ -366,8 +405,41 @@ RSpec.describe 'logxml.lic' do
       end
 
       expect(opened.size).to eq(1)
+      expect(opened.first).to have_received(:puts).once # the footer was tried
       expect(opened.first).to be_closed
       expect(log_lines).to eq([default_header])
+      expect(lich_log).to eq(
+        ["logxml: the footer of #{log_file} was not written while the logger stopped (Errno::ENOSPC: No space left on device)"]
+      )
+    end
+
+    # A footer that fails when a file is closed for the next one is not part
+    # of stopping: it raises, as the plain puts before 0.6.4 did.
+    it "closes the file and raises when the footer cannot be written as the new day's file starts" do
+      lich_log = stub_lich_log
+      opened = []
+      allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+        original.call(*args, &block).tap do |file|
+          next unless file.is_a?(File)
+
+          writes = 0
+          # The third write on the first file (header, line 1, footer) fails.
+          allow(file).to receive(:puts).and_wrap_original do |puts, *lines|
+            raise Errno::EIO if opened.first.equal?(file) && (writes += 1) == 3
+
+            puts.call(*lines)
+          end
+          opened << file
+        end
+      end
+
+      expect { run_logxml(lines: ['<output>line 1</output>', Time.new(2026, 4, 24, 0, 0, 1), '<output>line 2</output>']) }
+        .to raise_error(Errno::EIO)
+
+      expect(opened.size).to eq(1)
+      expect(opened.first).to be_closed
+      expect(log_lines).to eq([default_header, '<output>line 1</output>'])
+      expect(lich_log).to eq([])
     end
   end
 
