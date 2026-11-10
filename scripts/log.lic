@@ -7,6 +7,7 @@
            ;log --timestamp="%F %T %Z"          - optional timestamps
            ;log --rnum                          - optional show Lich ID on room titles
            ;log --exclude=u7199,288,2300        - optional rooms to exclude logging, supports UIDs via u#
+                                                  (a Lich room number works only when the map has the room's UID)
            ;log --lines=50000                   - optional change default(30000) lines to capture before new file started
   EXAMPLE AUTOSTART:
            ;autostart add --global log --timestamp=\"%F %T %Z\" --rnum --exclude=288,2300,u7199 --lines=50000
@@ -16,10 +17,15 @@
        author: elanthia-online
  contributors: Tillmen, Tysong, Xanlin
          game: gs
-      version: 1.2.2
+      version: 1.2.3
      required: Lich > 5.0.1
 
   changelog:
+    1.2.3 (2026-11-10):
+      * --rnum and --exclude find the Lich room number in the map's UID table once per room, never by matching the room from the logger (no LOCATION/PEER sent, no lost lines)
+      * --rnum works in DragonRealms
+      * --rnum writes no " - ]" when the room has no Lich number, and changes nothing before the first room title
+      * --exclude ignores empty entries (--exclude=,288) and a bare --exclude
     1.2.2 (2026-11-10):
       * --timestamp keeps commas and "=" in the format; a --timestamp with no format echoes and is ignored instead of crashing
       * log_timestamp on with no usable log_timestamp_format echoes and uses "%F %T %Z" instead of crashing
@@ -228,6 +234,68 @@ module GameLogger
     DEFAULT_TIMESTAMP_FORMAT
   end
 
+  # Looks up the Lich room number for a game room UID in the map's UID
+  # table. Map.ids_from_uid is a plain hash lookup: unlike Room.current and
+  # Map.current it never matches the room by text, so it cannot send
+  # LOCATION or PEER from the logger (which would clear the logger's own
+  # buffer) and costs the same in rooms the map cannot place. A room whose
+  # UID is not in the map, or not loaded yet, has no Lich number here.
+  #
+  # @param uid [Integer] the game's room UID (XMLData.room_id)
+  # @return [Integer, nil] the one Lich room number mapped to +uid+, or
+  #   +nil+ when the UID maps to no room or to more than one
+  def self.lich_room_id(uid)
+    ids = Map.ids_from_uid(uid)
+    ids.first if ids.size == 1
+  end
+
+  # Splits the --exclude option into game UID entries ("u7199") and Lich
+  # room number entries ("288"). Empty entries (--exclude=,288) and a bare
+  # --exclude (+true+) exclude nothing.
+  #
+  # @param option [String, Array<String>, true, nil] the parsed --exclude
+  #   option
+  # @return [Array(Array<String>, Array<String>)] the "u" UID entries, then
+  #   the Lich room number entries
+  def self.exclude_entries(option)
+    Array(option).grep(String).reject(&:empty?).partition { |entry| entry.start_with?('u') }
+  end
+
+  # Builds the matcher for the current room's title line, for --rnum. In
+  # DragonRealms lich-5 wraps the bracketed title from the room subtitle in
+  # one more pair of brackets (XMLData.room_title is "[[Title]]" while the
+  # game line reads "[Title] (230008)"), so one pair is removed first.
+  #
+  # @param title [String] XMLData.room_title
+  # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
+  # @return [Regexp, nil] a pattern matching a line that starts with the
+  #   title, or +nil+ when the title is empty or not "[...]" shaped (before
+  #   the first room title arrives), so no line is changed
+  def self.room_title_pattern(title, game)
+    title = title.to_s
+    title = title[1..-2] if game.to_s.start_with?('DR') && title.start_with?('[[') && title.end_with?(']]')
+    return nil unless title.length > 2 && title.start_with?('[') && title.end_with?(']')
+
+    /\A#{Regexp.escape(title)}/
+  end
+
+  # Adds the room numbers to a room title line, for --rnum: " - <number>"
+  # inside the first "]" when the room has a Lich number, and in GemStone
+  # " (u<uid>)" at the end unless the line already shows "(<uid>)". A room
+  # with no Lich number keeps its title as the game sent it (apart from the
+  # GemStone UID).
+  #
+  # @param line [String] a game line that starts with the room title
+  # @param lich_id [Integer, nil] the room's Lich number, see {lich_room_id}
+  # @param uid [Integer] the game's room UID (XMLData.room_id)
+  # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
+  # @return [String] the line with the numbers added (a new String)
+  def self.number_room_title(line, lich_id, uid, game)
+    line = line.sub(']') { " - #{lich_id}]" } if lich_id
+    line += " (u#{uid})" if game.to_s.start_with?('GS') && !line.include?("(#{uid})")
+    line
+  end
+
   @options = Opts.parse
 
   # Runs the logger until the script is killed: starts a new log file on
@@ -238,6 +306,16 @@ module GameLogger
   # --exclude rooms are skipped, and --rnum adds the room number to room
   # titles.
   #
+  # The room for --exclude and --rnum is read from XMLData and the map's UID
+  # table (see {lich_room_id}) once per room, never from Room.current or
+  # Map.current, so a Lich room number in --exclude needs the room's UID in
+  # the map.
+  #
+  # @note A line is checked against the room the parser holds when the
+  #   logger reads the line, not when the game sent it. When the logger
+  #   falls behind a room change, a room title can be left without numbers
+  #   or get the next room's numbers, and lines at the edge of an excluded
+  #   room can be skipped or logged on the wrong side.
   # @return [void]
   def self.main
     if defined?(get_settings)
@@ -257,6 +335,11 @@ module GameLogger
     end
 
     lines = lines_per_file(@options.lines)
+
+    uid_excludes, id_excludes = exclude_entries(@options.exclude)
+    track_room = show_room_numbers || !(uid_excludes.empty? && id_excludes.empty?)
+    room_count = room_uid = room_title = title_pattern = lich_id = nil
+    room_excluded = false
 
     Thread.new {
       begin
@@ -301,12 +384,20 @@ module GameLogger
       begin
         lines.times {
           line = get
-          if @options.exclude
-            next if Array(@options.exclude).include?(Room.current.id.to_s) || Array(@options.exclude).include?("u#{XMLData.room_id}")
-          end
-          if show_room_numbers && line =~ /^#{Regexp.escape(XMLData.room_title)}/
-            line.sub!(']') { " - #{Map.current.id}]" }
-            line += " (u#{XMLData.room_id})" if XMLData.game =~ /^GS/ && line !~ /\(#{XMLData.room_id}\)/
+          if track_room
+            # Work the room out again only when the parser has moved on.
+            unless XMLData.room_count == room_count && XMLData.room_id == room_uid && XMLData.room_title == room_title
+              room_count = XMLData.room_count
+              room_uid = XMLData.room_id
+              room_title = XMLData.room_title.dup
+              room_excluded = uid_excludes.include?("u#{room_uid}")
+              lich_id = (lich_room_id(room_uid) if show_room_numbers || (!room_excluded && !id_excludes.empty?))
+              room_excluded ||= !lich_id.nil? && id_excludes.include?(lich_id.to_s)
+              title_pattern = (room_title_pattern(room_title, XMLData.game) if show_room_numbers)
+            end
+            next if room_excluded
+
+            line = number_room_title(line, lich_id, room_uid, XMLData.game) if title_pattern&.match?(line)
           end
           unless line =~ /^<\/?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)/
             unless defined?(stamp_enable)
