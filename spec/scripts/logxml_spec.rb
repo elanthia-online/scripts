@@ -468,9 +468,8 @@ module LogSpecHarness::Env
       expect(log_lines).to eq([default_header, '<output>after</output>', default_footer])
     end
 
-    # logxml drops only lines that start with pushStream or popStream; the
-    # dialog and progress bar lines log.lic drops in text mode stay in the
-    # XML log. The minivitals line is verbatim from lich-5
+    # The dialog and progress bar lines log.lic drops in text mode stay in
+    # the XML log. The minivitals line is verbatim from lich-5
     # spec/fixtures/streams/dr_saga_login.xml; the others are the tag lines
     # log_spec.rb's filter rows use (from lich-5 spec/fixtures/streams, the
     # closing tag added).

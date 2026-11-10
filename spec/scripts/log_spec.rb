@@ -2510,10 +2510,33 @@ module LogSpecHarness::Env
             expect(xml_body).to eq(['', ''])
           end
 
-          it 'keeps a line left with only spaces' do
-            LogSpecHarness.feed(%(  <pushStream id="talk"/>x<popStream/>))
+          # Lich's strip drops a line it leaves blank (markup.rb strip_simple:
+          # nil for /\A\s*\z/), so a line that loses stream content and has
+          # only whitespace left is not written either.
+          it 'leaves out a line left with only spaces' do
+            LogSpecHarness.feed(%(  <pushStream id="talk"/>x<popStream/>), 'You see a door.')
 
-            expect(xml_body).to eq(['  '])
+            expect(xml_body).to eq(['You see a door.'])
+          end
+
+          # gs_saga_login.xml:38, 59 as read with their "\r" line ends.
+          it 'leaves out the popStream line that closes a span and a Spells line when they end in "\r"' do
+            LogSpecHarness.feed(
+              "<pushStream id='inv'/>Your worn items are:\r",
+              "  a <a exist=\"781962601\" noun=\"bag\">tooled leather drawstring coin bag</a>\r",
+              "<popStream/>\r",
+              "<stream id=\"Spells\"><a exist=\"-10700001\" coord=\"2524,1871\" noun=\"\">Minor Elemental</a></stream>\r",
+              'You see a door.'
+            )
+
+            expect(xml_body).to eq(['You see a door.'])
+          end
+
+          it 'keeps a line with only whitespace as sent, which loses no stream content' do
+            LogSpecHarness.feed("  \r", "\t", 'You see a door.')
+            xml_body
+
+            expect(File.read(xml_files.first).lines[2..-2]).to eq(["  \r\n", "\t\n", "You see a door.\n"])
           end
 
           it 'keeps game text that shows a stream tag escaped' do
@@ -3224,6 +3247,19 @@ module LogSpecHarness::Env
 
               expect(logger.line_text("a<pushStream id=#{quote}#{id}#{quote}/>x<popStream/>b")).to eq('ab')
             end
+          end
+        end
+
+        # The game also sends a space or more attributes before "/>" (DR
+        # combat: <pushStream id="combat" />).
+        {
+          'a space before />' => %(a<pushStream id="talk" />x<popStream/>b),
+          'another attribute' => %(a<pushStream id='inv' ifClosed=''/>x<popStream/>b)
+        }.each do |label, line|
+          it "leaves out a span whose pushStream has #{label} in XML mode" do
+            logger = GameLogger::Logger.new(OpenStruct.new, mode: GameLogger::Mode::XML)
+
+            expect(logger.line_text(line)).to eq('ab')
           end
         end
 
