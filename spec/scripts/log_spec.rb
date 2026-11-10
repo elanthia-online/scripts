@@ -1527,8 +1527,12 @@ RSpec.describe GameLogger do
         expect(log_lines).to eq(['10:00', marker, '10:00'])
       end
 
-      # The second run is started on the example's thread, with its own log
-      # folder, and reads no line; the first keeps logging on its thread.
+      # A regression guard, not an R-08 reproduction: it passes on 1.2.4 too,
+      # because main has copied --exclude into a local when it starts since
+      # 1.2.3. It goes red if main reads the module's options again for each
+      # line, as 1.2.2 and earlier did. The second run is started on the
+      # example's thread, with its own log folder, and reads no line; the
+      # first keeps logging on its thread.
       it "keeps this run's --exclude when another run starts after this one started" do
         example_thread = Thread.current
         room_uid = 1234
