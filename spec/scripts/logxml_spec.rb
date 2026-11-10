@@ -1191,6 +1191,13 @@ module LogSpecHarness::Env
     # footer when the logger stops (R-23), no "\r" at the end of reget lines
     # (R-15), no blank line for an empty reget (R-14), the first line after
     # midnight in the new day's file (R-13), and LOG_DIR (R-24).
+    # There is no fixture for logxml.lic 0.6.6, the last version before
+    # ;logxml ran log.lic. The layer review replayed the lich-5 stream
+    # fixtures through 0.6.6, this shim and ;log --xml out of tree (472 runs
+    # over options, the reget window and timestamp settings): files, echoes
+    # and script flags matched except where the 0.7.0 changelog says they
+    # change (the word rnum turns room numbers on; a bare --timestamp
+    # echoes that it is ignored).
     describe 'against logxml.lic 0.6.1 on the same input' do
       let(:base_path) { File.expand_path('../fixtures/scripts/logxml-0.6.1.lic', __dir__) }
       let(:base_lines) { File.readlines(base_path) }
