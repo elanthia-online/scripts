@@ -7,8 +7,8 @@ require 'timeout'
 # kept off the top level: the module is evaluated inside
 # LogSpecHarness::Env (see evaluate_game_logger), so its bare XMLData,
 # Script and Lich resolve to the stubs nested there, and Lich's script
-# helpers (get, echo, reget, upstream_get) come from ScriptHelpers, which
-# GameLogger extends. Nothing here reopens a top-level constant or defines
+# helpers (get, echo, reget, upstream_get, get_settings, hide_me) come from
+# ScriptHelpers, which GameLogger and Env extend. Nothing here reopens a top-level constant or defines
 # a top-level method, so other spec files keep their own (spec_helper.rb
 # asks for this). The game globals log.lic reads ($login_time) are set per
 # example and put back after.
@@ -22,6 +22,15 @@ module LogSpecHarness
   class << self
     # Seconds `get` waits for a line before it raises StopIteration.
     attr_accessor :idle_timeout
+    # What get_settings answers: lich-5 always defines it
+    # (lib/global_defs.rb), in GemStone too, where a character with no
+    # yaml gets an empty OpenStruct.
+    attr_accessor :settings
+    # The thread the last GameLogger.start_upstream_logger call started
+    # (see UpstreamTracker), for wait_for_upstream!.
+    attr_accessor :upstream_thread
+    # How many times the script called hide_me.
+    attr_reader :hide_me_calls
     # $_SERVERBUFFER_ as reget reads it: the raw lines the server sent,
     # XML tags and "\r" line ends included.
     attr_accessor :server_buffer
@@ -33,8 +42,26 @@ module LogSpecHarness
       UPSTREAM.clear
       @echoes = []
       @idle_timeout = 0
+      @wait_for_upstream = false
+      @upstream_thread = nil
+      @hide_me_calls = 0
+      @settings = OpenStruct.new
       @server_buffer = []
       @script = new_script
+    end
+
+    def hide_me
+      @hide_me_calls += 1
+      nil
+    end
+
+    # Makes `get` end the run once the logger's upstream thread has ended
+    # and the buffer is empty, so the ">command" lines and notices it
+    # pushed are read first. A thread still running after two seconds
+    # fails the example instead of ending it.
+    def wait_for_upstream!
+      @wait_for_upstream = true
+      @idle_timeout = 2
     end
 
     # A Script.current with lich-5's defaults (lib/common/script.rb,
@@ -87,11 +114,27 @@ module LogSpecHarness
 
     # lich-5's get pops the downstream buffer and blocks while it is
     # empty; here it raises StopIteration after idle_timeout instead, which
-    # ends GameLogger.main's `loop`.
+    # ends GameLogger.main's `loop` (see wait_for_upstream! for the runs
+    # that wait for typed commands).
     def get
+      return wait_for_line_or_upstream_end if @wait_for_upstream
+
       line = DOWNSTREAM.pop(timeout: idle_timeout)
       raise StopIteration if line.nil?
 
+      line
+    end
+
+    def wait_for_line_or_upstream_end
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + idle_timeout
+      # Not Kernel#loop, which would swallow the StopIteration.
+      until (line = DOWNSTREAM.pop(timeout: 0.01))
+        # alive? first: once the thread has ended, everything it pushed is
+        # in the buffer.
+        thread = upstream_thread
+        raise StopIteration if thread && !thread.alive? && DOWNSTREAM.empty?
+        raise "the upstream thread was still running after #{idle_timeout} s" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      end
       line
     end
 
@@ -127,10 +170,10 @@ module LogSpecHarness
   # it reads by bare name.
   module Env
     module XMLData
-      def self.game;       "GSIV";          end
-      def self.name;       "TestChar";      end
-      def self.room_id;    1234;            end
-      def self.room_title; "[Town Square]"; end
+      def self.game = "GSIV"
+      def self.name = "TestChar"
+      def self.room_id = 1234
+      def self.room_title = "[Town Square]"
       def self.room_count = 0
     end
 
@@ -153,6 +196,18 @@ module LogSpecHarness
     def upstream_get = LogSpecHarness.upstream_get
     def echo(msg) = LogSpecHarness.echo(msg)
     def reget = LogSpecHarness.reget
+    def get_settings = LogSpecHarness.settings
+    def hide_me = LogSpecHarness.hide_me
+  end
+
+  # Prepended to GameLogger's singleton class: keeps the thread
+  # start_upstream_logger starts (main drops it), so a run can wait for it
+  # to end. A later evaluation of the module redefines the method under
+  # this one, so it stays in place.
+  module UpstreamTracker
+    def start_upstream_logger
+      LogSpecHarness.upstream_thread = super
+    end
   end
 
   reset!
@@ -173,8 +228,20 @@ module_line = script_content.lines.index { |l| l.start_with?('module GameLogger'
 LogSpecHarness.define_singleton_method(:evaluate_game_logger) do
   LogSpecHarness::Env.module_eval(module_code, script_path, module_line)
   LogSpecHarness::Env::GameLogger.extend(LogSpecHarness::ScriptHelpers)
+  LogSpecHarness::Env::GameLogger.singleton_class.prepend(LogSpecHarness::UpstreamTracker)
 end
 LogSpecHarness.evaluate_game_logger
+
+# Everything after the =end header (hide_me, the module and the
+# GameLogger.main call), as Lich runs the script. It runs in Env, whose
+# calls with no receiver (hide_me) go to ScriptHelpers; the line number
+# keeps backtraces pointing at log.lic.
+script_body_line = script_content.lines.index { |l| l.start_with?('=end') } + 2
+script_body = script_content.lines.drop(script_body_line - 1).join
+LogSpecHarness::Env.extend(LogSpecHarness::ScriptHelpers)
+LogSpecHarness.define_singleton_method(:run_whole_script) do
+  LogSpecHarness::Env.module_eval(script_body, script_path, script_body_line)
+end
 
 # Nested in Env so GameLogger, XMLData, Script and Lich below are the ones
 # log.lic's code sees.
@@ -690,6 +757,22 @@ module LogSpecHarness::Env
 
       let(:default_stamp) { frozen_time.strftime("%Y-%m-%d %H:%M:%S.%L %:z") }
 
+      # The other examples call GameLogger.main; this one runs the script as
+      # Lich does, so the calls outside the module are covered too.
+      it 'hides the script and starts the logger once when the whole script runs' do
+        LogSpecHarness.start_script('--timestamp=%H:%M')
+        LogSpecHarness.feed('You see a door.')
+
+        Timeout.timeout(5) { LogSpecHarness.run_whole_script }
+
+        expect(LogSpecHarness.hide_me_calls).to eq(1)
+        expect(Dir.glob(File.join(log_dir, '**', '*.log')).size).to eq(1)
+        expect(log_lines).to eq(
+          ['10:00', '<!-- Above contents from reget; full logging now active -->', '10:00: You see a door.', '10:00']
+        )
+        expect(LogSpecHarness.echoes).to eq(["Non-XML Logging started, currently logging to #{find_log_file}"])
+      end
+
       # R-04
       context 'with a --timestamp format that holds a comma' do
         it 'writes the header and each line with the whole format' do
@@ -745,12 +828,11 @@ module LogSpecHarness::Env
         'timestamp was given without a format, so it is ignored; to add timestamps use --timestamp="%F %T %Z".'
       end
 
-      # Defines GameLogger.get_settings (as Lich does for DR) for one run.
+      # Runs main with get_settings answering +settings+ (in DR, the
+      # character's yaml).
       def run_main_with_settings(settings)
-        GameLogger.define_singleton_method(:get_settings) { settings }
+        LogSpecHarness.settings = settings
         run_main
-      ensure
-        GameLogger.singleton_class.send(:remove_method, :get_settings)
       end
 
       context 'with a bare --timestamp, the word timestamp, or an empty --timestamp=' do
@@ -792,6 +874,18 @@ module LogSpecHarness::Env
       # (dr-scripts profiles/base.yaml has log_timestamp and
       # log_timestamp_format), which turns timestamps on without --timestamp.
       context 'with DragonRealms yaml settings' do
+        # A characterization: main does not guard the call, so the error
+        # ends the script before anything is logged.
+        it 'lets an error from get_settings through before it opens a file or reads typed commands' do
+          use_options(OpenStruct.new)
+          allow(GameLogger).to receive(:get_settings).and_raise(RuntimeError, 'bad yaml')
+
+          expect { run_main }.to raise_error(RuntimeError, 'bad yaml')
+          expect(find_log_file).to be_nil
+          expect(LogSpecHarness.upstream_thread).to be_nil
+          expect(LogSpecHarness.echoes).to eq([])
+        end
+
         it 'stamps the header, the reget lines with the login time, each line and the footer when log_timestamp is true' do
           $login_time = frozen_time - 5
           LogSpecHarness.server_buffer = ["You see a door.\r"]
@@ -929,7 +1023,7 @@ module LogSpecHarness::Env
       context 'with a typed command' do
         it 'logs it as >command with the leading <c> removed' do
           use_options(OpenStruct.new)
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           LogSpecHarness.type('<c>look')
 
           run_main
@@ -939,7 +1033,7 @@ module LogSpecHarness::Env
 
         it 'removes a <c> only from the start, and logs a command typed without one whole' do
           use_options(OpenStruct.new)
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           LogSpecHarness.type('say <c> is the tag', '<c>say <c> too')
 
           run_main
@@ -949,7 +1043,7 @@ module LogSpecHarness::Env
 
         it 'logs typed commands and game lines in the order the buffer holds them, stamped alike' do
           use_options(OpenStruct.new(timestamp: '%H:%M:%S'))
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           LogSpecHarness.feed('You see a door.')
           LogSpecHarness.type('<c>look')
 
@@ -1105,7 +1199,7 @@ module LogSpecHarness::Env
 
         it 'echoes the error, where it was raised and how to log typed commands again' do
           use_options(OpenStruct.new)
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           error = RuntimeError.new('boom')
           type_then_fail(error)
 
@@ -1123,7 +1217,7 @@ module LogSpecHarness::Env
         # The directory (C:/Users/<name>/...) only makes the echo longer.
         it 'gives the file and line it was raised at without the directory' do
           use_options(OpenStruct.new)
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           error = RuntimeError.new('boom')
           error.set_backtrace(["C:/Users/someone/Lich5/scripts/log.lic:487:in 'block in GameLogger.start_upstream_logger'"])
           allow(GameLogger).to receive(:upstream_get).and_raise(error)
@@ -1168,7 +1262,7 @@ module LogSpecHarness::Env
         # Restarting without them would log rooms the user excluded.
         it 'gives the restart with the arguments the logger was started with, under its own name' do
           use_options(OpenStruct.new)
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           allow(Script.current).to receive_messages(
             name: 'mylog',
             vars: ['--exclude=u1234 --timestamp="%H:%M"', '--exclude=u1234', '--timestamp="%H:%M"']
@@ -1183,7 +1277,7 @@ module LogSpecHarness::Env
 
         it 'writes a notice line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
           use_options(OpenStruct.new)
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           LogSpecHarness.feed('line 1')
           type_then_fail(RuntimeError.new('boom'))
 
@@ -1194,7 +1288,7 @@ module LogSpecHarness::Env
 
         it 'stamps that line like a game line when timestamps are on' do
           use_options(OpenStruct.new(timestamp: '%H:%M'))
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           type_then_fail(RuntimeError.new('boom'))
 
           run_main
@@ -1204,7 +1298,7 @@ module LogSpecHarness::Env
 
         it 'puts a message over several lines on one line, and breaks up "--" so the comment is not closed early' do
           use_options(OpenStruct.new)
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           type_then_fail(IOError.new("closed stream\n--> see above"))
 
           run_main
@@ -1224,7 +1318,7 @@ module LogSpecHarness::Env
         }.each do |message, spaced|
           it "spaces out every dash run in #{message.inspect} so the comment holds no \"--\"" do
             use_options(OpenStruct.new)
-            LogSpecHarness.idle_timeout = 0.5
+            LogSpecHarness.wait_for_upstream!
             type_then_fail(IOError.new(message))
 
             run_main
@@ -1238,7 +1332,7 @@ module LogSpecHarness::Env
 
         it 'drops the whitespace around the message' do
           use_options(OpenStruct.new)
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           type_then_fail(RuntimeError.new(" \tboom\n"))
 
           run_main
@@ -1250,7 +1344,7 @@ module LogSpecHarness::Env
 
         it 'does not write the line in an --exclude room' do
           use_options(GameLogger::Opts.parse(['--exclude=u1234']))
-          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.wait_for_upstream!
           type_then_fail(RuntimeError.new('boom'))
 
           run_main
@@ -1286,7 +1380,8 @@ module LogSpecHarness::Env
       # logger and rescan the whole map on every line.
       describe 'room lookups for --rnum and --exclude' do
         # The parser's room as the logger sees it when it reads a line. A Hash
-        # fed between lines moves the parser to another room (see the get stub).
+        # fed between lines moves the parser to another room, and a Proc fed
+        # between lines runs there (see the get stub).
         let(:room) { { game: 'GSIV', count: 1, uid: 4_216_015, title: '[Sanctum of Scales, Columns]' } }
         # UID => Lich ids, as Map.ids_from_uid answers from the map's UID table.
         let(:uid_table) { {} }
@@ -1306,8 +1401,8 @@ module LogSpecHarness::Env
           allow(XMLData).to receive(:room_title) { room[:title] }
           allow(GameLogger).to receive(:get) do
             item = LogSpecHarness.get
-            while item.is_a?(Hash)
-              room.merge!(item)
+            until item.is_a?(String)
+              item.is_a?(Hash) ? room.merge!(item) : item.call
               item = LogSpecHarness.get
             end
             item
@@ -1339,6 +1434,36 @@ module LogSpecHarness::Env
             LogSpecHarness.feed('[Sanctum of Scales, Columns] (4216015)')
 
             expect(log_with('--rnum')).to eq(['[Sanctum of Scales, Columns - 228] (4216015)'])
+          end
+
+          it 'puts the Lich id inside the first ] only' do
+            uid_table[4_216_015] = [228]
+            LogSpecHarness.feed('[Sanctum of Scales, Columns] [lit]')
+
+            expect(log_with('--rnum')).to eq(['[Sanctum of Scales, Columns - 228] [lit] (u4216015)'])
+          end
+
+          # Another script reloading the map can give the UID another Lich
+          # id. The logger keeps the id it found while the parser stays in
+          # the room, and asks again when the parser shows the room again
+          # (a new room count, as LOOK gives), even with the same UID and title.
+          it 'keeps a found Lich id for the room until the room count changes' do
+            uid_table[4_216_015] = [228]
+            LogSpecHarness.feed(
+              '[Sanctum of Scales, Columns]',
+              -> { uid_table[4_216_015] = [229] },
+              '[Sanctum of Scales, Columns]',
+              { count: 2 },
+              '[Sanctum of Scales, Columns]'
+            )
+
+            expect(log_with('--rnum')).to eq(
+              [
+                '[Sanctum of Scales, Columns - 228] (u4216015)',
+                '[Sanctum of Scales, Columns - 228] (u4216015)',
+                '[Sanctum of Scales, Columns - 229] (u4216015)'
+              ]
+            )
           end
 
           it "writes no ' - ]' when the UID is not in the map, only the u-id" do
@@ -1713,7 +1838,7 @@ module LogSpecHarness::Env
           end
 
           it 'also skips commands typed in an excluded room' do
-            LogSpecHarness.idle_timeout = 0.5
+            LogSpecHarness.wait_for_upstream!
             LogSpecHarness.type('look')
 
             expect(log_with('--exclude=u4216015')).to eq([])
