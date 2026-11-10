@@ -23,6 +23,7 @@ RSpec.describe 'logxml.lic' do
 
   before do
     stub_const('LICH_DIR', log_dir)
+    hide_const('LOG_DIR') # unless an example sets it, as Lich's --logs= does
     stub_const('XMLData', Module.new do
       def self.game = 'GSIV'
       def self.name = 'TestChar'
@@ -273,6 +274,34 @@ RSpec.describe 'logxml.lic' do
         [default_header, '<pushStream id="room"/>Room text', '<prompt time="1">&gt;</prompt>', marker]
       )
     end
+  end
+
+  # R-24: Lich's --logs= sets LOG_DIR; pilepull.lic reads the logs there.
+  context 'with Lich started with --logs=' do
+    let(:logs_dir) { Dir.mktmpdir }
+
+    after { FileUtils.rm_rf(logs_dir) }
+
+    it 'writes the log under LOG_DIR in the <game>-<name>/<year>/<month> layout' do
+      stub_const('LOG_DIR', logs_dir)
+
+      run_logxml
+
+      expect(Dir.glob(File.join(logs_dir, '**', '*.xml'))).to eq(
+        [File.join(logs_dir, 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml')]
+      )
+      expect(log_file).to be_nil
+    end
+  end
+
+  it 'writes under LICH_DIR/logs when LOG_DIR is not defined or empty' do
+    run_logxml
+    expect(log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml'))
+
+    FileUtils.rm_rf(File.join(log_dir, 'logs'))
+    stub_const('LOG_DIR', '')
+    run_logxml
+    expect(log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml'))
   end
 
   it 'keeps a comma in a quoted --timestamp format' do

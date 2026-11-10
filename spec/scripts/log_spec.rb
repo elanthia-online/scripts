@@ -354,6 +354,9 @@ RSpec.describe GameLogger do
 
     before do
       stub_const('LICH_DIR', log_dir)
+      # Lich's LOG_DIR (lib/constants.rb) is hidden unless an example sets
+      # it, so files land under LICH_DIR/logs whatever the suite loaded.
+      hide_const('LOG_DIR')
       allow(Time).to receive(:now).and_return(frozen_time)
       $login_time = Time.new(2026, 4, 23, 10, 0, 0)
     end
@@ -451,6 +454,43 @@ RSpec.describe GameLogger do
       GameLogger.instance_variable_set(:@options, OpenStruct.new)
       run_main
       expect(log_content).to include('<!-- Above contents from reget; full logging now active -->')
+    end
+
+    # R-24: Lich's --logs= sets LOG_DIR (lich.rbw), and pilepull.lic reads
+    # these session logs from LOG_DIR.
+    context 'with Lich started with --logs=' do
+      let(:logs_dir) { Dir.mktmpdir }
+
+      after { FileUtils.rm_rf(logs_dir) }
+
+      it 'writes the log under LOG_DIR in the <game>-<name>/<year>/<month> layout' do
+        stub_const('LOG_DIR', logs_dir)
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+        run_main
+
+        expect(Dir.glob(File.join(logs_dir, '**', '*.log'))).to eq(
+          [File.join(logs_dir, 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.log')]
+        )
+        expect(Dir.glob(File.join(log_dir, '**', '*.log'))).to eq([])
+      end
+    end
+
+    it 'writes under LICH_DIR/logs when LOG_DIR is not defined' do
+      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+      run_main
+
+      expect(find_log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.log'))
+    end
+
+    it 'writes under LICH_DIR/logs when LOG_DIR is empty' do
+      stub_const('LOG_DIR', '')
+      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+      run_main
+
+      expect(find_log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.log'))
     end
 
     it 'creates log directory with game and character name' do
