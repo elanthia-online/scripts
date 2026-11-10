@@ -359,6 +359,9 @@ RSpec.describe GameLogger do
       hide_const('LOG_DIR')
       allow(Time).to receive(:now).and_return(frozen_time)
       $login_time = Time.new(2026, 4, 23, 10, 0, 0)
+      # Examples that set reget lines would otherwise leave them for the
+      # next example, whose file would start with them in random order.
+      $reget_lines = []
     end
 
     after do
