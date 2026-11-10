@@ -2,267 +2,7 @@ require 'tmpdir'
 require 'fileutils'
 require 'ostruct'
 require 'timeout'
-require_relative '../support/lich_script_vars'
-
-# Stand-ins for the parts of lich-5 that log.lic's `module GameLogger` uses,
-# kept off the top level: the module is evaluated inside
-# LogSpecHarness::Env (see evaluate_game_logger), so its bare XMLData,
-# Script and Lich resolve to the stubs nested there, and Lich's script
-# helpers (get, echo, reget, upstream_get, get_settings, hide_me) come from
-# ScriptHelpers, which GameLogger and Env extend. Nothing here reopens a top-level constant or defines
-# a top-level method, so other spec files keep their own (spec_helper.rb
-# asks for this). The game globals log.lic reads ($login_time) are set per
-# example and put back after.
-module LogSpecHarness
-  # Script.current.downstream_buffer: what `get` reads, and where the
-  # logger's upstream thread pushes its ">command" lines.
-  DOWNSTREAM = Thread::Queue.new
-  # The commands an example "typed", for upstream_get.
-  UPSTREAM = Thread::Queue.new
-
-  class << self
-    # Seconds `get` waits for a line before it raises StopIteration.
-    attr_accessor :idle_timeout
-    # What get_settings answers: lich-5 always defines it
-    # (lib/global_defs.rb), in GemStone too, where a character with no
-    # yaml gets an empty OpenStruct.
-    attr_accessor :settings
-    # The thread the last GameLogger::Logger.start_upstream_logger call started
-    # (see UpstreamTracker), for wait_for_upstream!.
-    attr_accessor :upstream_thread
-    # How many times the script called hide_me.
-    attr_reader :hide_me_calls
-    # $_SERVERBUFFER_ as reget reads it: the raw lines the server sent,
-    # XML tags and "\r" line ends included.
-    attr_accessor :server_buffer
-    # The current run's Script.current (see new_script).
-    attr_reader :script, :echoes
-
-    def reset!
-      DOWNSTREAM.clear
-      UPSTREAM.clear
-      @echoes = []
-      @idle_timeout = 0
-      @wait_for_upstream = false
-      @upstream_thread = nil
-      @hide_me_calls = 0
-      @settings = OpenStruct.new
-      @server_buffer = []
-      @script = new_script
-    end
-
-    def hide_me
-      @hide_me_calls += 1
-      nil
-    end
-
-    # Makes `get` end the run once the logger's upstream thread has ended
-    # and the buffer is empty, so the ">command" lines and notices it
-    # pushed are read first. A thread still running after two seconds
-    # fails the example instead of ending it.
-    def wait_for_upstream!
-      @wait_for_upstream = true
-      @idle_timeout = 2
-    end
-
-    # A Script.current with lich-5's defaults (lib/common/script.rb,
-    # Script#initialize): text downstream on, XML downstream, script output
-    # and upstream off, and vars built from +args+ as lich-5 builds them.
-    #
-    # @param args [String, Array<String>, nil] a String as typed (;log ...),
-    #   an Array as autostart passes its saved arguments, nil for none
-    def new_script(args = nil, name: 'log')
-      OpenStruct.new(
-        name: name,
-        vars: script_vars(args),
-        want_downstream: true,
-        want_downstream_xml: false,
-        want_script_output: false,
-        want_upstream: false,
-        downstream_buffer: DOWNSTREAM
-      )
-    end
-
-    # Starts the next run as lich-5 starts a script with these arguments.
-    def start_script(args, name: 'log')
-      @script = new_script(args, name: name)
-    end
-
-    # lich-5's Script#initialize vars (see LichScriptVars.build).
-    def script_vars(args)
-      LichScriptVars.build(args)
-    end
-
-    def feed(*lines)
-      lines.flatten.each { |line| DOWNSTREAM << (line.is_a?(String) ? line.dup : line) }
-    end
-
-    def type(*commands)
-      commands.flatten.each { |command| UPSTREAM << command.dup }
-    end
-
-    # lich-5's get pops the downstream buffer and blocks while it is
-    # empty; here it raises StopIteration after idle_timeout instead, which
-    # ends GameLogger.main's `loop` (see wait_for_upstream! for the runs
-    # that wait for typed commands).
-    def get
-      return wait_for_line_or_upstream_end if @wait_for_upstream
-
-      line = DOWNSTREAM.pop(timeout: idle_timeout)
-      raise StopIteration if line.nil?
-
-      line
-    end
-
-    def wait_for_line_or_upstream_end
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + idle_timeout
-      # Not Kernel#loop, which would swallow the StopIteration.
-      until (line = DOWNSTREAM.pop(timeout: 0.01))
-        # alive? first: once the thread has ended, everything it pushed is
-        # in the buffer.
-        thread = upstream_thread
-        raise StopIteration if thread && !thread.alive? && DOWNSTREAM.empty?
-        raise "the upstream thread was still running after #{idle_timeout} s" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
-      end
-      line
-    end
-
-    def upstream_get
-      UPSTREAM.pop(true)
-    rescue ThreadError
-      raise StopIteration
-    end
-
-    def echo(msg)
-      @echoes << msg.to_s
-    end
-
-    # lich-5's reget with no arguments (lib/global_defs.rb:1601-1633): the
-    # server buffer joined on "\n"; unless the script wants the XML
-    # downstream, the stream/tag blocks are cut, every tag removed and
-    # &gt; &lt; decoded; split on "\n" with blank lines dropped (a "\r" left
-    # at each line end stays); nil, never [], when nothing is left.
-    def reget
-      history = server_buffer.join("\n")
-      unless script.want_downstream_xml
-        history = history.gsub(%r{<pushStream id=["'](?:spellfront|inv|bounty|society)["'][^>]*/>.*?<popStream[^>]*>}m, '')
-        history = history.gsub(%r{<stream id="Spells">.*?</stream>}m, '')
-        history = history.gsub(%r{<(compDef|inv|component|right|left|spell|prompt)[^>]*>.*?</\1>}m, '')
-        history = history.gsub(/<[^>]+>/, '').gsub('&gt;', '>').gsub('&lt;', '<')
-      end
-      lines = history.split("\n").reject { |line| line.empty? || line =~ /^[\r\n\s\t]*$/ }
-      lines.empty? ? nil : lines
-    end
-  end
-
-  # The namespace log.lic's module is evaluated in, holding the constants
-  # it reads by bare name.
-  module Env
-    module XMLData
-      def self.game = "GSIV"
-      def self.name = "TestChar"
-      def self.room_id = 1234
-      def self.room_title = "[Town Square]"
-      def self.room_count = 0
-    end
-
-    module Lich
-      def self.log(_msg); end
-    end
-
-    class Script
-      def self.current = LogSpecHarness.script
-    end
-  end
-
-  # Lich's global script helpers, which log.lic calls with no receiver.
-  # GameLogger extends this module, so they win over any top-level method
-  # of the same name another spec file defines.
-  module ScriptHelpers
-    private
-
-    def get = LogSpecHarness.get
-    def upstream_get = LogSpecHarness.upstream_get
-    def echo(msg) = LogSpecHarness.echo(msg)
-    def reget = LogSpecHarness.reget
-    def get_settings = LogSpecHarness.settings
-    def hide_me = LogSpecHarness.hide_me
-  end
-
-  # Prepended to each GameLogger::Logger's singleton class (see
-  # LoggerHook): keeps the thread start_upstream_logger starts (Logger#run
-  # drops it), so a run can wait for it to end.
-  module UpstreamTracker
-    def start_upstream_logger
-      LogSpecHarness.upstream_thread = super
-    end
-  end
-
-  # Extended onto GameLogger before log.lic is first evaluated. Every
-  # evaluation sets a new GameLogger::Logger class, whose own methods call
-  # Lich's script helpers (echo, upstream_get) with no receiver; each one
-  # gets ScriptHelpers and UpstreamTracker as it is set, also when the
-  # whole script runs (run_whole_script), which starts the run at once.
-  module LoggerHook
-    def const_added(name)
-      super
-      return unless name == :Logger
-
-      logger = const_get(name, false)
-      logger.extend(ScriptHelpers)
-      logger.singleton_class.prepend(UpstreamTracker)
-    end
-  end
-
-  reset!
-end
-
-script_path = File.join(__dir__, '..', '..', 'scripts', 'log.lic')
-script_content = File.read(script_path)
-module_code = script_content[/^module GameLogger.*?^end/m]
-raise "Failed to extract GameLogger module from #{script_path}" if module_code.nil?
-raise "Extracted code does not look like a single module" unless module_code.scan(/^module GameLogger/).one?
-
-module_line = script_content.lines.index { |l| l.start_with?('module GameLogger') } + 1
-
-# Lich evaluates log.lic from its first line, so its magic comment
-# (frozen_string_literal) applies to every literal in the module and the
-# script body. Each extracted piece gets the same comment on a line of its
-# own, one line above where it starts, so literals are frozen here as they
-# are in Lich and backtraces still give log.lic's line numbers.
-magic_comment = script_content.lines.first[/\A#\s*frozen_string_literal:\s*\w+\s*\n/].to_s
-magic_lines = magic_comment.empty? ? 0 : 1
-module_code = magic_comment + module_code
-module_line -= magic_lines
-
-# Evaluates log.lic's `module GameLogger` body in LogSpecHarness::Env, as
-# Lich does each time the script starts: every run of log.lic in a session
-# evaluates the module again in the same namespace, while earlier runs may
-# still be logging.
-LogSpecHarness.define_singleton_method(:evaluate_game_logger) do
-  LogSpecHarness::Env.module_eval(module_code, script_path, module_line)
-end
-# GameLogger exists before log.lic is evaluated, so its module body reopens
-# this one, which has the script helpers and LoggerHook from the start.
-module LogSpecHarness::Env
-  module GameLogger
-    extend LogSpecHarness::ScriptHelpers
-    extend LogSpecHarness::LoggerHook
-  end
-end
-LogSpecHarness.evaluate_game_logger
-
-# Everything after the =end header (hide_me, the module and the
-# GameLogger.main call), as Lich runs the script. It runs in Env, whose
-# calls with no receiver (hide_me) go to ScriptHelpers; the line number
-# keeps backtraces pointing at log.lic.
-script_body_line = script_content.lines.index { |l| l.start_with?('=end') } + 2
-script_body = magic_comment + script_content.lines.drop(script_body_line - 1).join
-script_body_line -= magic_lines
-LogSpecHarness::Env.extend(LogSpecHarness::ScriptHelpers)
-LogSpecHarness.define_singleton_method(:run_whole_script) do
-  LogSpecHarness::Env.module_eval(script_body, script_path, script_body_line)
-end
+require_relative '../support/log_spec_harness'
 
 # Nested in Env so GameLogger, XMLData, Script and Lich below are the ones
 # log.lic's code sees.
@@ -2425,6 +2165,295 @@ module LogSpecHarness::Env
         end
       end
 
+      # R-28, Q-01, Q-08: XML mode is logxml.lic's format (the 0.6.6 file
+      # bytes) inside log.lic, picked by --xml or by the script running as
+      # logxml; the options and the file handling are the ones text mode has.
+      describe 'XML mode' do
+        let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+        # The first line of an XML file with timestamps off: 12-hour, no
+        # seconds. The last line is the footer, the same as text mode's.
+        let(:xml_header) { '2026-04-23 10:00am' }
+
+        def xml_files
+          Dir.glob(File.join(log_dir, '**', '*.xml'))
+        end
+
+        def xml_lines
+          expect(xml_files.size).to eq(1)
+          File.read(xml_files.first).lines(chomp: true)
+        end
+
+        it 'writes a .xml file with the 12-hour header and says XML logging started, with --xml' do
+          use_options(GameLogger::Opts.parse(['--xml']))
+          LogSpecHarness.feed('<output>You see a door.</output>')
+
+          run_main
+
+          expect(Dir.glob(File.join(log_dir, '**', '*.log'))).to eq([])
+          expect(xml_files).to eq([File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml')])
+          expect(xml_lines).to eq([xml_header, marker, '<output>You see a door.</output>', default_stamp])
+          expect(LogSpecHarness.echoes).to eq(["XML Logging started, currently logging to #{xml_files.first}"])
+        end
+
+        it 'runs in XML mode without --xml when the script runs as logxml' do
+          LogSpecHarness.start_script('', name: 'logxml')
+          use_options(OpenStruct.new)
+          LogSpecHarness.feed('<output>You see a door.</output>')
+
+          run_main
+
+          expect(xml_lines).to eq([xml_header, marker, '<output>You see a door.</output>', default_stamp])
+        end
+
+        it 'stays in text mode, and still drops stream lines, as log with the word streams but no --xml' do
+          LogSpecHarness.start_script('streams', name: 'log')
+          LogSpecHarness.feed('<pushStream id="inv"/>', 'You see a door.')
+
+          run_main
+
+          expect(xml_files).to eq([])
+          expect(log_lines).to eq([default_stamp, marker, 'You see a door.', default_stamp])
+        end
+
+        it 'drops the hour\'s leading zero from the header, and keeps the footer\'s' do
+          allow(Time).to receive(:now).and_return(Time.new(2026, 4, 23, 9, 5, 0))
+          $login_time = Time.new(2026, 4, 23, 8, 0, 0)
+          use_options(GameLogger::Opts.parse(['--xml']))
+
+          run_main
+
+          expect(xml_lines).to eq(['2026-04-23 9:05am', Time.new(2026, 4, 23, 9, 5, 0).strftime('%Y-%m-%d %H:%M:%S.%L %:z')])
+        end
+
+        it 'writes the header, footer and each line in the --timestamp format when one is given' do
+          use_options(GameLogger::Opts.parse(['--xml', '--timestamp=%H:%M']))
+          LogSpecHarness.feed('<output>You see a door.</output>')
+
+          run_main
+
+          expect(xml_lines).to eq(['10:00', marker, '10:00: <output>You see a door.</output>', '10:00'])
+        end
+
+        # lich-5 hands a script the XML lines with want_downstream_xml, adds
+        # the text lines with want_downstream and other scripts' echoes with
+        # want_script_output, and gives reget's raw XML only to a script that
+        # already wants the XML downstream.
+        it 'wants the XML downstream and typed commands only, set before reget is called' do
+          flags_at_reget = nil
+          allow(LogSpecHarness).to receive(:reget).and_wrap_original do |original|
+            flags_at_reget = LogSpecHarness.script.to_h.slice(:want_downstream, :want_downstream_xml, :want_script_output, :want_upstream)
+            original.call
+          end
+          use_options(GameLogger::Opts.parse(['--xml']))
+
+          run_main
+
+          expect(flags_at_reget).to eq(want_downstream: false, want_downstream_xml: true, want_script_output: false, want_upstream: true)
+        end
+
+        # Server lines verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml.
+        it 'writes the reget as the raw XML the server sent, less the "\r", unstamped and unfiltered' do
+          LogSpecHarness.server_buffer = [
+            "<pushStream id=\"room\"/>Room text<popStream/>\r",
+            "<compass><dir value=\"n\"/><dir value=\"e\"/></compass><prompt time=\"1792091316\">&gt;</prompt>\r",
+            "<component id='room objs'>  You also see the <a exist=\"781927405\" noun=\"disk\">purple Aldric disk</a>.</component>\r"
+          ]
+          use_options(GameLogger::Opts.parse(['--xml', '--timestamp=%H:%M']))
+
+          run_main
+
+          expect(File.binread(xml_files.first)).not_to include("\r")
+          expect(xml_lines).to eq(
+            [
+              '10:00',
+              '<pushStream id="room"/>Room text<popStream/>',
+              '<compass><dir value="n"/><dir value="e"/></compass><prompt time="1792091316">&gt;</prompt>',
+              "<component id='room objs'>  You also see the <a exist=\"781927405\" noun=\"disk\">purple Aldric disk</a>.</component>",
+              marker,
+              '10:00'
+            ]
+          )
+        end
+
+        it 'logs a typed command whole, its <c> kept, between CLIENT comments' do
+          use_options(GameLogger::Opts.parse(['--xml']))
+          LogSpecHarness.wait_for_upstream!
+          LogSpecHarness.type('<c>look')
+
+          run_main
+
+          expect(xml_lines).to eq([xml_header, marker, '<!-- CLIENT --><c>look<!-- ENDCLIENT -->', default_stamp])
+        end
+
+        describe 'lines that start with pushStream or popStream' do
+          let(:stream_lines) { ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>'] }
+
+          it 'drops them' do
+            use_options(GameLogger::Opts.parse(['--xml']))
+            LogSpecHarness.feed(stream_lines)
+
+            run_main
+
+            expect(xml_lines).to eq([xml_header, marker, '<output>In the pack: a torch.</output>', default_stamp])
+          end
+
+          { 'the word streams' => 'streams', '--streams' => '--streams' }.each do |label, argument|
+            it "keeps them with #{label}" do
+              use_options(GameLogger::Opts.parse(['--xml', argument]))
+              LogSpecHarness.feed(stream_lines)
+
+              run_main
+
+              expect(xml_lines).to eq([xml_header, marker, *stream_lines, default_stamp])
+            end
+          end
+
+          # The dialog and progress bar lines text mode drops stay in the XML log.
+          it 'keeps a line that starts with a dialog tag, which text mode drops' do
+            use_options(GameLogger::Opts.parse(['--xml']))
+            LogSpecHarness.feed("<dialogData id='minivitals'>", '</dialogData>')
+
+            run_main
+
+            expect(xml_lines).to eq([xml_header, marker, "<dialogData id='minivitals'>", '</dialogData>', default_stamp])
+          end
+
+          it 'counts only written lines toward --lines' do
+            use_options(GameLogger::Opts.parse(['--xml', '--lines=1']))
+            LogSpecHarness.feed('<pushStream id="inv"/>', '<output>line 1</output>')
+
+            run_main
+
+            expect(xml_lines).to eq([xml_header, marker, '<output>line 1</output>', default_stamp])
+          end
+        end
+
+        context 'with --rnum or --exclude' do
+          let(:map) { double('Map', loaded?: true) }
+          let(:title_line) { '<resource picture="0"/><style id="roomName" />[Town Square]' }
+
+          before do
+            stub_const('Map', map)
+            allow(map).to receive(:ids_from_uid) { |uid| uid == 1234 ? [228] : [] }
+          end
+
+          it 'numbers the line that starts with the room name resource, the u-id right after the first ]' do
+            use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+            LogSpecHarness.feed("#{title_line} (1234)", '[Town Square]')
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq(['<resource picture="0"/><style id="roomName" />[Town Square - 228] (u1234) (1234)', '[Town Square]'])
+          end
+
+          it 'numbers no line with --exclude and without --rnum' do
+            use_options(GameLogger::Opts.parse(['--xml', '--exclude=u7199']))
+            LogSpecHarness.feed(title_line)
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq([title_line])
+          end
+
+          it 'turns --rnum on only for the whole option, not for --rnumber' do
+            use_options(GameLogger::Opts.parse(['--xml', '--rnumber']))
+            LogSpecHarness.feed(title_line)
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq([title_line])
+            expect(map).not_to have_received(:ids_from_uid)
+          end
+
+          it 'skips the lines read in an --exclude room' do
+            use_options(GameLogger::Opts.parse(['--xml', '--exclude=u1234']))
+            LogSpecHarness.feed('<output>in room 1234</output>')
+
+            run_main
+
+            expect(xml_lines).to eq([xml_header, marker, default_stamp])
+          end
+
+          it 'skips the lines read in a room excluded by its Lich number' do
+            use_options(GameLogger::Opts.parse(['--xml', '--exclude=228']))
+            LogSpecHarness.feed('<output>in room 228</output>')
+
+            run_main
+
+            expect(xml_lines).to eq([xml_header, marker, default_stamp])
+          end
+        end
+
+        it 'starts a new .xml file after --lines written lines, with the XML header' do
+          use_options(GameLogger::Opts.parse(['--xml', '--lines=1']))
+          LogSpecHarness.feed('<output>line 1</output>', '<output>line 2</output>')
+
+          run_main
+
+          month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+          expect(Dir.children(month).sort).to eq(['2026-04-23_10-00-05.xml', '2026-04-23_10-00-05_01.xml'])
+          expect(File.read(File.join(month, '2026-04-23_10-00-05_01.xml')).lines(chomp: true))
+            .to eq([xml_header, '<output>line 2</output>', default_stamp])
+        end
+
+        context 'when the upstream thread stops on an error, run as logxml' do
+          it 'starts the notice line and the restart hint with logxml' do
+            LogSpecHarness.start_script('streams', name: 'logxml')
+            calls = 0
+            allow(LogSpecHarness).to receive(:upstream_get) do
+              calls += 1
+              raise RuntimeError, 'boom' if calls > 1
+
+              '<c>look'
+            end
+            LogSpecHarness.wait_for_upstream!
+            use_options(GameLogger::Opts.parse)
+
+            run_main
+
+            expect(xml_lines.last(3)).to eq(
+              [
+                '<!-- CLIENT --><c>look<!-- ENDCLIENT -->',
+                '<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (RuntimeError: boom) -->',
+                default_stamp
+              ]
+            )
+            expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first).to end_with('(;kill logxml, then ;logxml streams) to log typed commands again.')
+          end
+        end
+
+        it 'names logxml in the Lich log when the file cannot be closed, run as logxml' do
+          LogSpecHarness.start_script('', name: 'logxml')
+          logged = []
+          allow(Lich).to receive(:log) { |msg| logged << msg }
+          allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+            original.call(*args, &block).tap do |file|
+              next unless file.is_a?(File)
+
+              allow(file).to receive(:close).and_wrap_original do |close|
+                close.call
+                raise IOError, 'device gone'
+              end
+            end
+          end
+          use_options(OpenStruct.new)
+
+          run_main
+
+          expect(logged).to eq(["logxml: closing the log file #{xml_files.first} failed (IOError: device gone); lines are written as they come, with sync on, but the file may be missing its footer or a last write"])
+        end
+
+        it 'runs in XML mode when the whole script runs with --xml' do
+          LogSpecHarness.start_script('--xml --timestamp=%H:%M')
+          LogSpecHarness.feed('<output>You see a door.</output>')
+
+          Timeout.timeout(5) { LogSpecHarness.run_whole_script }
+
+          expect(xml_lines).to eq(['10:00', marker, '10:00: <output>You see a door.</output>', '10:00'])
+          expect(LogSpecHarness.script.want_downstream_xml).to be(true)
+        end
+      end
+
       context 'log file header/footer format' do
         it 'uses --timestamp format for header when enabled' do
           use_options(OpenStruct.new(timestamp: '%F %T %Z'))
@@ -2580,6 +2609,81 @@ module LogSpecHarness::Env
         end
       end
 
+      # R-28, Q-01: which Mode a run gets.
+      describe '.mode_for' do
+        {
+          'text mode for log with no options'                 => [[], 'log', :DEFAULT_MODE],
+          'XML mode for --xml'                                => [['--xml'], 'log', :XML_MODE],
+          'XML mode for the word xml'                         => [['xml'], 'log', :XML_MODE],
+          'XML mode for logxml with no options'               => [[], 'logxml', :XML_MODE],
+          'XML mode keeping streams for logxml streams'       => [['streams'], 'logxml', :XML_STREAMS_MODE],
+          'XML mode keeping streams for --xml --streams'      => [['--xml', '--streams'], 'log', :XML_STREAMS_MODE],
+          'text mode for log streams (no --xml)'              => [['streams'], 'log', :DEFAULT_MODE],
+          'text mode for a name that only starts with logxml' => [[], 'logxml2', :DEFAULT_MODE],
+          'text mode with no script name'                     => [[], nil, :DEFAULT_MODE]
+        }.each do |label, (args, name, expected)|
+          it "picks #{label}" do
+            mode = GameLogger::Logger.mode_for(GameLogger::Opts.parse(args), name)
+
+            expect(mode).to equal(GameLogger::Logger.const_get(expected))
+          end
+        end
+
+        it "gives the modes of this evaluation's Mode" do
+          expect(GameLogger::Logger::XML_MODE).to equal(GameLogger::Mode::XML)
+          expect(GameLogger::Logger::XML_STREAMS_MODE).to equal(GameLogger::Mode::XML_STREAMS)
+        end
+      end
+
+      describe 'Mode::XML' do
+        let(:mode) { GameLogger::Mode::XML }
+
+        it "is a frozen value with logxml's file extension, typed command line and flags" do
+          expect(mode).to be_frozen
+          expect(mode.extension).to eq('.xml')
+          expect(mode.started_text).to eq('XML Logging started, currently logging to')
+          expect(mode.upstream_line.call('<c>look')).to eq('<!-- CLIENT --><c>look<!-- ENDCLIENT -->')
+          expect(mode.script_flags).to be_frozen
+          expect(mode.script_flags).to eq(want_script_output: false, want_upstream: true, want_downstream: false, want_downstream_xml: true)
+        end
+
+        # Only the hour's leading zero goes, never a zero in the date or minutes.
+        {
+          'a morning hour before 10' => [Time.new(2026, 4, 23, 9, 5, 0), '2026-04-23 9:05am'],
+          'an evening hour'          => [Time.new(2026, 4, 23, 21, 7, 0), '2026-04-23 9:07pm'],
+          'midnight'                 => [Time.new(2026, 4, 24, 0, 0, 1), '2026-04-24 12:00am'],
+          'an hour of 10'            => [Time.new(2026, 10, 5, 10, 30, 0), '2026-10-05 10:30am'],
+          'the first hour of a year' => [Time.new(2026, 1, 1, 1, 0, 0), '2026-01-01 1:00am']
+        }.each do |label, (time, header)|
+          it "writes the header for #{label} as #{header.inspect}" do
+            expect(mode.header_stamp.call(time)).to eq(header)
+          end
+        end
+
+        it 'writes reget lines as they come, less the "\r", without a stamp' do
+          expect(mode.reget_line.call("<prompt time=\"1\">&gt;</prompt>\r", '%T', Time.new(2026, 1, 1))).to eq('<prompt time="1">&gt;</prompt>')
+        end
+
+        {
+          'GemStone, with a Lich number'    => ['GSIV', 228, '[Town Square - 228] (u1234) (1234)'],
+          'GemStone, without a Lich number' => ['GSIV', nil, '[Town Square] (u1234) (1234)'],
+          'DragonRealms, with a Lich number' => ['DR', 228, '[Town Square - 228] (1234)'],
+          'DragonRealms, without one'        => ['DR', nil, '[Town Square] (1234)']
+        }.each do |label, (game, lich_id, numbered)|
+          it "numbers a room title in #{label} after its first ]" do
+            line = '[Town Square] (1234)'
+
+            expect(mode.number_title.call(line, lich_id, 1234, game)).to eq(numbered)
+            expect(line).to eq('[Town Square] (1234)')
+          end
+        end
+
+        it 'keeps every line with streams' do
+          expect(GameLogger::Mode::XML_STREAMS.skip_line.call('<pushStream id="inv"/>')).to be(false)
+          expect(mode.skip_line.call('<pushStream id="inv"/>')).to be_truthy
+        end
+      end
+
       describe '#format_line' do
         it 'returns the line as it is without a timestamp format' do
           logger = GameLogger::Logger.new(OpenStruct.new)
@@ -2688,7 +2792,8 @@ module LogSpecHarness::Env
         it "keeps rotating files with its own helpers after another version's evaluation" do
           $login_time = Time.new(2026, 1, 1)
           helpers = %i[log_root log_directory log_file_path file_stamp with_log_file write_footer lich_room_id
-                       room_title_pattern number_room_title start_upstream_logger upstream_stopped upstream_frame]
+                       room_title_pattern number_room_title start_upstream_logger upstream_stopped upstream_frame
+                       log_label mode_for]
           another_version = lambda do
             LogSpecHarness.evaluate_game_logger
             [GameLogger, GameLogger::Logger].product(helpers).each do |owner, name|
