@@ -2695,19 +2695,22 @@ module LogSpecHarness::Env
               allow(owner).to receive(name).and_raise(ArgumentError, "another version's #{name}") if owner.respond_to?(name, true)
             end
           end
-          lines = ['line 1', 'line 2', 'line 3']
+          # Each line is read in a new room, so --rnum looks the room up again.
+          lines = ['[Town Square]', '[Town Square]', '[Town Square]']
+          room_count = 0
+          stub_const('Map', double('Map', loaded?: true, ids_from_uid: [288]))
+          allow(XMLData).to receive(:room_count) { room_count }
           io = io_class.new([])
           io.define_singleton_method(:get) do
-            another_version.call if lines.size == 3
+            another_version.call if lines.size == 2
+            room_count += 1
             lines.shift || raise(StopIteration)
           end
-          clock_times = [Time.new(2026, 7, 1, 8, 30, 0)] * 3 + [Time.new(2026, 7, 1, 8, 30, 1)] * 4 + [Time.new(2026, 7, 1, 8, 30, 2)] * 20
-          ticking = Object.new.tap { |fake| fake.define_singleton_method(:now) { clock_times.size > 1 ? clock_times.shift : clock_times.first } }
 
-          Timeout.timeout(5) { GameLogger::Logger.new(GameLogger::Opts.parse(['--lines=1']), clock: ticking, io: io).run }
+          Timeout.timeout(5) { GameLogger::Logger.new(GameLogger::Opts.parse(['--lines=1', '--rnum']), clock: clock, io: io).run }
 
           bodies = Dir[file_at('2026/07/*.log')].sort.map { |path| File.read(path).lines(chomp: true)[1..-2] }
-          expect(bodies).to eq([['line 1'], ['line 2'], ['line 3']])
+          expect(bodies).to eq([['[Town Square - 288] (u1234)']] * 3)
         end
       end
 
