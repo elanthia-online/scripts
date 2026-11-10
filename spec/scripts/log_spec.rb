@@ -1494,10 +1494,6 @@ RSpec.describe GameLogger do
         allow(Script.current).to receive(:vars).and_return([args.join(' '), *args])
       end
 
-      before do
-        $reget_lines = []
-      end
-
       it 'reads no arguments and keeps no options on the module' do
         start_script_with('--rnum', '--exclude=u7199')
 
