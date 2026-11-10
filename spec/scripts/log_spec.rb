@@ -788,6 +788,49 @@ module LogSpecHarness::Env
         end
       end
 
+      # R-31: in DragonRealms, get_settings answers the character's yaml
+      # (dr-scripts profiles/base.yaml has log_timestamp and
+      # log_timestamp_format), which turns timestamps on without --timestamp.
+      context 'with DragonRealms yaml settings' do
+        it 'stamps the header, the reget lines with the login time, each line and the footer when log_timestamp is true' do
+          $login_time = frozen_time - 5
+          LogSpecHarness.server_buffer = ["You see a door.\r"]
+          use_options(GameLogger::Opts.parse([]))
+          LogSpecHarness.feed('Obvious exits: north.')
+
+          run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: '%F %T'))
+
+          expect(log_lines).to eq(
+            [
+              '2026-04-23 10:00:05',
+              '2026-04-23 10:00:00: You see a door.',
+              '<!-- Above contents from reget; full logging now active -->',
+              '2026-04-23 10:00:05: Obvious exits: north.',
+              '2026-04-23 10:00:05'
+            ]
+          )
+          expect(LogSpecHarness.echoes.size).to eq(1)
+        end
+
+        it 'uses a --timestamp=FMT over the yaml format' do
+          use_options(GameLogger::Opts.parse(['--timestamp=%H:%M']))
+          LogSpecHarness.feed('You see a door.')
+
+          run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: '%F %T'))
+
+          expect(log_lines.last(2)).to eq(['10:00: You see a door.', '10:00'])
+        end
+
+        it 'does not stamp when log_timestamp is false, even with a format set' do
+          use_options(GameLogger::Opts.parse([]))
+          LogSpecHarness.feed('You see a door.')
+
+          run_main_with_settings(OpenStruct.new(log_timestamp: false, log_timestamp_format: '%F %T'))
+
+          expect(log_lines.last(2)).to eq(['You see a door.', default_stamp])
+        end
+      end
+
       # R-04 through the settings path: the yaml format is checked like the
       # --timestamp one before it reaches strftime.
       context 'when the yaml enables timestamps without a usable format' do
@@ -1850,6 +1893,25 @@ module LogSpecHarness::Env
           run_main
 
           expect(log_lines).to eq(['10:00', marker, '10:00: line 1', '10:00'])
+        end
+
+        # R-31: sync is on, so a line is on disk while the logger still runs
+        # (a crash or a reader such as pilepull.lic sees it at once).
+        it 'has each line in the file while the logger is still waiting for the next one' do
+          use_options(OpenStruct.new)
+          LogSpecHarness.idle_timeout = 5
+          LogSpecHarness.feed('line 1')
+          logger = Thread.new { start_main }
+          begin
+            Timeout.timeout(2) { sleep 0.01 until logger.status == 'sleep' && find_log_file && File.size(find_log_file) > 0 && LogSpecHarness::DOWNSTREAM.num_waiting == 1 }
+
+            on_disk = File.read(find_log_file).lines(chomp: true)
+          ensure
+            logger.kill
+            logger.join(2)
+          end
+
+          expect(on_disk).to eq([default_stamp, marker, 'line 1'])
         end
 
         # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
