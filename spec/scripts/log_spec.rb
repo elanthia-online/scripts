@@ -741,6 +741,15 @@ RSpec.describe GameLogger do
           expect(log_with('--rnum')).to eq(['[Gabriel] says, "hi [there]"', 'You also see a door.'])
         end
 
+        # GS main_subtitle builds "[" + subtitle[3..-1] + "]", so a " - "
+        # subtitle leaves the title as "[]".
+        it 'leaves every line alone when the room title is an empty []' do
+          room[:title] = '[]'
+          LogSpecHarness.feed('[] says nothing', 'You also see a door.')
+
+          expect(log_with('--rnum')).to eq(['[] says nothing', 'You also see a door.'])
+        end
+
         it 'leaves a line that shows the room title after its start' do
           uid_table[4_216_015] = [228]
           LogSpecHarness.feed('Gabriel says, "Meet me at [Sanctum of Scales, Columns]."')
@@ -845,6 +854,36 @@ RSpec.describe GameLogger do
           expect(log_with('--rnum')).to eq(
             ['[Sanctum of Scales, Columns] (u4216015)', '[Sanctum of Scales, Pool] (u4216015)']
           )
+        end
+
+        # Map.ids_from_uid never loads the map: until Lich or another script
+        # loads it (or adds the UID), the table answers [] for every room.
+        context 'when the map learns the UID while the logger is in the room' do
+          before do
+            answers = [[], [288]]
+            allow(map).to receive(:ids_from_uid) { answers.size > 1 ? answers.shift : answers.first }
+          end
+
+          it 'starts skipping an excluded room once the map has its UID' do
+            LogSpecHarness.feed('first line at login', 'second line', 'third line')
+
+            expect(log_with('--exclude=288')).to eq(['first line at login'])
+          end
+
+          it 'numbers the room title once the map has its UID' do
+            LogSpecHarness.feed('[Sanctum of Scales, Columns]', '[Sanctum of Scales, Columns]')
+
+            expect(log_with('--rnum')).to eq(
+              ['[Sanctum of Scales, Columns] (u4216015)', '[Sanctum of Scales, Columns - 288] (u4216015)']
+            )
+          end
+
+          it 'stops asking the map once it has answered with the Lich id' do
+            LogSpecHarness.feed('line 1', 'line 2', 'line 3', 'line 4')
+
+            expect(log_with('--rnum')).to eq(['line 1', 'line 2', 'line 3', 'line 4'])
+            expect(map).to have_received(:ids_from_uid).twice
+          end
         end
 
         it 'does not look up the Lich id when only u-ids are excluded and --rnum is off' do
