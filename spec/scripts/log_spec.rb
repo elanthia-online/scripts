@@ -2518,6 +2518,48 @@ module LogSpecHarness::Env
         expect(File.read(file_at('2026/07/2026-07-01_08-30-00.log')).lines(chomp: true)).to eq([stamp, 'line 1', stamp])
       end
 
+      # Every field the run reads from its Mode, with values Mode::TEXT does
+      # not have, so a run that used text mode's values instead would fail.
+      it "writes the file and lines as the mode it is given makes them" do
+        $login_time = Time.new(2026, 1, 1)
+        mode = GameLogger::Mode::TEXT.with(
+          extension: '.txt',
+          header_stamp: ->(time) { "hdr #{time.strftime('%H:%M')}" },
+          upstream_line: ->(command) { "!#{command}" },
+          started_text: 'Test logging to',
+          script_flags: { want_upstream: true }
+        )
+        LogSpecHarness.feed('line 1')
+        LogSpecHarness.type('look')
+        LogSpecHarness.wait_for_upstream!
+
+        Timeout.timeout(5) { GameLogger::Logger.new(GameLogger::Opts.parse([]), mode: mode, clock: clock).run }
+
+        path = file_at('2026/07/2026-07-01_08-30-00.txt')
+        expect(Dir[file_at('2026/07/*')]).to eq([path])
+        expect(File.read(path).lines(chomp: true))
+          .to eq(['hdr 08:30', 'line 1', '!look', "2026-07-01 08:30:00.000 #{clock.now.strftime('%:z')}"])
+        expect(LogSpecHarness.echoes).to eq(["Test logging to #{path}"])
+        expect(Script.current.want_upstream).to be(true)
+        expect(Script.current.want_script_output).to be(false)
+      end
+
+      # want_script_output decides whether Lich hands the logger its own
+      # echoes, so it is set before the options are read and may echo.
+      it 'sets the script flags before the --timestamp warning is echoed' do
+        $login_time = Time.new(2026, 1, 1)
+        flags_at_echo = []
+        allow(GameLogger).to receive(:echo).and_wrap_original do |original, msg|
+          flags_at_echo << Script.current.want_script_output
+          original.call(msg)
+        end
+
+        Timeout.timeout(5) { GameLogger::Logger.new(GameLogger::Opts.parse(['--timestamp']), clock: clock, io: io_class.new([])).run }
+
+        expect(LogSpecHarness.echoes.first).to start_with('timestamp was given without a format')
+        expect(flags_at_echo).to eq([true])
+      end
+
       # A mode's header_stamp (Mode::TEXT has none) makes the header line
       # when timestamps are off; the footer keeps the default stamp.
       describe '.with_log_file with a header_stamp' do
