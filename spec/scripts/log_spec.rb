@@ -894,14 +894,14 @@ module LogSpecHarness::Env
           expect(log_lines.last(2)).to eq(['>look', default_stamp])
         end
 
-        it 'removes only a leading <c>, and logs a command typed without one whole' do
+        it 'removes a <c> only from the start, and logs a command typed without one whole' do
           use_options(OpenStruct.new)
           LogSpecHarness.idle_timeout = 0.5
-          LogSpecHarness.type('<c>say <c> is the tag', 'look')
+          LogSpecHarness.type('say <c> is the tag', '<c>say <c> too')
 
           run_main
 
-          expect(log_lines.drop(2)).to eq(['>say <c> is the tag', '>look', default_stamp])
+          expect(log_lines.drop(2)).to eq(['>say <c> is the tag', '>say <c> too', default_stamp])
         end
 
         it 'logs typed commands and game lines in the order the buffer holds them, stamped alike' do
