@@ -2689,8 +2689,8 @@ module LogSpecHarness::Env
         end
 
         {
-          'GemStone, with a Lich number'    => ['GSIV', 228, '[Town Square - 228] (u1234) (1234)'],
-          'GemStone, without a Lich number' => ['GSIV', nil, '[Town Square] (u1234) (1234)'],
+          'GemStone, with a Lich number'     => ['GSIV', 228, '[Town Square - 228] (u1234) (1234)'],
+          'GemStone, without a Lich number'  => ['GSIV', nil, '[Town Square] (u1234) (1234)'],
           'DragonRealms, with a Lich number' => ['DR', 228, '[Town Square - 228] (1234)'],
           'DragonRealms, without one'        => ['DR', nil, '[Town Square] (1234)']
         }.each do |label, (game, lich_id, numbered)|
