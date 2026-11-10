@@ -83,9 +83,11 @@ end
 def hide_me; end
 def echo(msg) = LogSpecHarness.echo(msg)
 
+# lich-5's reget (global_defs.rb) answers nil, never [], when the buffer
+# holds nothing, so an empty $reget_lines reads as nil here too.
 $reget_lines = []
 def reget
-  $reget_lines
+  $reget_lines.nil? || $reget_lines.empty? ? nil : $reget_lines
 end
 
 def get = LogSpecHarness.get
@@ -464,6 +466,43 @@ RSpec.describe GameLogger do
       run_main
       expect(log_content).to include('<!-- Above contents from reget; full logging now active -->')
       expect(log_content.lines.count { |l| l.include?('2026-04-23 10:00:00:') }).to eq(0)
+    end
+
+    # R-14: lich-5's reget returns nil when the buffer is empty. log.lic
+    # only survived that in game through Lich's NilClass patch.
+    it 'writes only the marker when reget returns nil (empty buffer)' do
+      $reget_lines = nil
+      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+      run_main
+
+      expect(File.read(find_log_file).lines(chomp: true).first(2)).to eq(
+        [frozen_time.strftime("%Y-%m-%d %H:%M:%S.%L %:z"), '<!-- Above contents from reget; full logging now active -->']
+      )
+    end
+
+    # R-15: $_SERVERBUFFER_ keeps the server's CRLF line ends and reget
+    # splits on "\n", so each reget line ends in "\r".
+    context 'when the reget lines end in a carriage return' do
+      it 'writes them without it, timestamps off' do
+        $reget_lines = ["You see a door.\r", "Obvious exits: north.\r"]
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+        run_main
+
+        expect(File.binread(find_log_file)).not_to include("\r")
+        expect(log_content.lines(chomp: true)[1, 2]).to eq(['You see a door.', 'Obvious exits: north.'])
+      end
+
+      it 'writes them without it, timestamps on' do
+        $reget_lines = ["You see a door.\r"]
+        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%F %T'))
+
+        run_main
+
+        expect(File.binread(find_log_file)).not_to include("\r")
+        expect(log_content.lines(chomp: true)[1]).to eq('2026-04-23 10:00:00: You see a door.')
+      end
     end
 
     def log_lines

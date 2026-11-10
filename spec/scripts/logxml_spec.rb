@@ -37,7 +37,8 @@ RSpec.describe 'logxml.lic' do
 
   # Runs logxml.lic once with +vars+ as typed and the given DR settings
   # (+nil+ for none, as in GS). Ends when the fed lines run out.
-  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'])
+  # +reget+ is what lich-5's reget answers: nil for an empty buffer.
+  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'], reget: nil)
     script = OpenStruct.new(want_script_output: nil, vars: [vars.join(' '), *vars], downstream_buffer: [], name: 'logxml')
     stub_const('Script', Class.new { define_singleton_method(:current) { script } })
     pending_lines = lines.map(&:dup) # fresh Strings, as get returns; logxml edits lines in place
@@ -45,7 +46,7 @@ RSpec.describe 'logxml.lic' do
     runner = Object.new
     runner.define_singleton_method(:hide_me) { nil }
     runner.define_singleton_method(:echo) { |msg| sink << msg.to_s }
-    runner.define_singleton_method(:reget) { [] }
+    runner.define_singleton_method(:reget) { reget }
     runner.define_singleton_method(:get) { pending_lines.shift || raise(StopIteration) }
     runner.define_singleton_method(:upstream_get) { Thread.current.kill }
     runner.define_singleton_method(:get_settings) { settings } unless settings.nil?
@@ -247,6 +248,30 @@ RSpec.describe 'logxml.lic' do
       it 'leaves the title alone when the UID is not in the map' do
         expect(logged_lines.first).to eq(title_line)
       end
+    end
+  end
+
+  context 'when started within 30 seconds of login' do
+    let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+
+    before { $login_time = frozen_time - 5 }
+
+    # R-14: lich-5's reget returns nil for an empty buffer; puts(nil)
+    # wrote a blank line before the marker.
+    it 'writes no blank line when reget returns nil' do
+      run_logxml(reget: nil)
+
+      expect(log_lines.first(3)).to eq([default_header, marker, '<output>You see a door.</output>'])
+    end
+
+    # R-15: reget lines keep the server's "\r" (CRLF line ends).
+    it 'writes the raw reget lines without their trailing carriage return' do
+      run_logxml(reget: ["<pushStream id=\"room\"/>Room text\r", "<prompt time=\"1\">&gt;</prompt>\r"])
+
+      expect(File.binread(log_file)).not_to include("\r")
+      expect(log_lines.first(4)).to eq(
+        [default_header, '<pushStream id="room"/>Room text', '<prompt time="1">&gt;</prompt>', marker]
+      )
     end
   end
 
