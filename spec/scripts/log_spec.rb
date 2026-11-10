@@ -312,50 +312,61 @@ module LogSpecHarness::Env
           expect(result.lines).to eq('50,000')
         end
 
-        # R-09: the quote-aware rescan of vars[0] is load-bearing
+        # R-09: the quote-aware rescan of vars[0] is load-bearing. Each
+        # example starts the script as lich-5 does (Script#initialize): a
+        # typed String, or the Array autostart.lic saves and starts it with.
         context 'when called with no args (reads Script.current.vars)' do
-          it 'reads a quoted format from vars[0] on the autostart Array path' do
-            # autostart.lic stores ["--timestamp=\"%F", "%T", "%Z\"", "--rnum"] and starts the
-            # script with that Array: Lich joins it into vars[0] and splits vars[1..] on spaces.
-            allow(Script.current).to receive(:vars).and_return(
-              ['--timestamp="%F %T %Z" --rnum', '--timestamp="%F', '%T', '%Z"', '--rnum']
-            )
+          it "reads the header's autostart example whole on the autostart Array path" do
+            # ;autostart add --global log --timestamp=\"%F %T %Z\" --rnum --exclude=288,2300,u7199 --lines=50000
+            # is saved as these words; lich-5 joins them into vars[0] and keeps them as vars[1..].
+            LogSpecHarness.start_script(['--timestamp="%F', '%T', '%Z"', '--rnum', '--exclude=288,2300,u7199', '--lines=50000'])
 
             result = described_class.parse
 
-            expect(result.timestamp).to eq('%F %T %Z')
-            expect(result.rnum).to be true
-            expect(result.to_h.keys).to contain_exactly(:timestamp, :rnum)
+            expect(result.to_h).to eq(timestamp: '%F %T %Z', rnum: true, exclude: %w[288 2300 u7199], lines: '50000')
           end
 
           it 'keeps a comma in a quoted format on the autostart Array path' do
-            allow(Script.current).to receive(:vars).and_return(
-              ['--timestamp="%b %d, %Y %T" --rnum', '--timestamp="%b', '%d,', '%Y', '%T"', '--rnum']
-            )
+            LogSpecHarness.start_script(['--timestamp="%b', '%d,', '%Y', '%T"', '--rnum'])
 
             result = described_class.parse
 
-            expect(result.timestamp).to eq('%b %d, %Y %T')
-            expect(result.rnum).to be true
+            expect(result.to_h).to eq(timestamp: '%b %d, %Y %T', rnum: true)
           end
 
           it 'reads the same format when the command was typed (String path)' do
-            allow(Script.current).to receive(:vars).and_return(
-              ['--timestamp="%F %T %Z" --rnum', '--timestamp=%F %T %Z', '--rnum']
-            )
+            LogSpecHarness.start_script('--timestamp="%F %T %Z" --rnum')
 
             result = described_class.parse
 
-            expect(result.timestamp).to eq('%F %T %Z')
-            expect(result.rnum).to be true
+            expect(result.to_h).to eq(timestamp: '%F %T %Z', rnum: true)
+          end
+
+          # The rescan splits vars[0] as lich-5 splits a typed line: a \"
+          # inside quotes is a literal quote.
+          it 'keeps an escaped quote inside a quoted format as a quote' do
+            LogSpecHarness.start_script('--timestamp="%H \\"h\\" %M" --rnum')
+
+            result = described_class.parse
+
+            expect(result.to_h).to eq(timestamp: '%H "h" %M', rnum: true)
           end
 
           it 'uses vars[1..] when vars[0] has no quotes' do
-            allow(Script.current).to receive(:vars).and_return(['--rnum --lines=500', '--rnum', '--lines=500'])
+            LogSpecHarness.start_script(['--rnum', '--lines=500'])
 
             result = described_class.parse
 
             expect(result.to_h).to eq(rnum: true, lines: '500')
+          end
+
+          it 'gives no options when the script was started without arguments (vars is empty)' do
+            LogSpecHarness.start_script('')
+
+            result = described_class.parse
+
+            expect(LogSpecHarness.script.vars).to eq([])
+            expect(result.to_h).to eq({})
           end
         end
       end
@@ -439,7 +450,6 @@ module LogSpecHarness::Env
         $login_time = Time.new(2026, 4, 23, 10, 0, 0)
         # Examples that set reget lines would otherwise leave them for the
         # next example, whose file would start with them in random order.
-        LogSpecHarness.server_buffer = []
       end
 
       after do
@@ -683,7 +693,6 @@ module LogSpecHarness::Env
       # R-04
       context 'with a --timestamp format that holds a comma' do
         it 'writes the header and each line with the whole format' do
-          LogSpecHarness.server_buffer = []
           use_options(GameLogger::Opts.parse(['--timestamp=%b %d, %Y %T']))
           LogSpecHarness.feed('You see a door.')
 
@@ -704,11 +713,8 @@ module LogSpecHarness::Env
       # arguments itself, and a quoted format needs the rescan of vars[0].
       context 'when started with a quoted --timestamp and no options passed' do
         it 'stamps the header and each line with the whole format' do
-          LogSpecHarness.server_buffer = []
-          # As autostart starts it: vars[0] the joined line, vars[1..] split on spaces.
-          allow(Script.current).to receive(:vars).and_return(
-            ['--timestamp="%b %d %T"', '--timestamp="%b', '%d', '%T"']
-          )
+          # As autostart starts it, with the Array of saved words.
+          LogSpecHarness.start_script(['--timestamp="%b', '%d', '%T"'])
           LogSpecHarness.feed('You see a door.')
 
           run_main
@@ -726,7 +732,6 @@ module LogSpecHarness::Env
 
       context 'with a --timestamp format that holds an equals sign' do
         it 'prefixes each line with the whole format' do
-          LogSpecHarness.server_buffer = []
           use_options(GameLogger::Opts.parse(['--timestamp=%H=%M']))
           LogSpecHarness.feed('You see a door.')
 
@@ -751,7 +756,6 @@ module LogSpecHarness::Env
       context 'with a bare --timestamp, the word timestamp, or an empty --timestamp=' do
         [['--timestamp'], ['timestamp'], ['--timestamp=']].each do |args|
           it "logs without timestamps for #{args.first} and says the option was ignored" do
-            LogSpecHarness.server_buffer = []
             use_options(GameLogger::Opts.parse(args))
             LogSpecHarness.feed('You see a door.')
 
@@ -772,7 +776,6 @@ module LogSpecHarness::Env
         end
 
         it 'keeps the DR yaml timestamp format when the yaml enables timestamps' do
-          LogSpecHarness.server_buffer = []
           use_options(GameLogger::Opts.parse(['--timestamp']))
           LogSpecHarness.feed('You see a door.')
 
@@ -790,7 +793,6 @@ module LogSpecHarness::Env
       context 'when the yaml enables timestamps without a usable format' do
         { 'no format' => nil, 'an empty format' => '', 'a non-String format' => 5 }.each do |label, format|
           it "stamps with %F %T %Z and says so for #{label} (#{format.inspect})" do
-            LogSpecHarness.server_buffer = []
             use_options(GameLogger::Opts.parse([]))
             LogSpecHarness.feed('You see a door.')
 
@@ -810,7 +812,6 @@ module LogSpecHarness::Env
         end
 
         it 'uses a --timestamp=FMT without a message' do
-          LogSpecHarness.server_buffer = []
           use_options(GameLogger::Opts.parse(['--timestamp=%H:%M']))
           LogSpecHarness.feed('You see a door.')
 
@@ -821,7 +822,6 @@ module LogSpecHarness::Env
         end
 
         it 'logs without timestamps and without a message when the yaml leaves timestamps off' do
-          LogSpecHarness.server_buffer = []
           use_options(GameLogger::Opts.parse([]))
           LogSpecHarness.feed('You see a door.')
 
@@ -836,7 +836,6 @@ module LogSpecHarness::Env
       context 'with an invalid --lines value' do
         %w[0 -5 abc].each do |given|
           it "logs the game with 30000 lines per file for --lines=#{given} instead of spinning" do
-            LogSpecHarness.server_buffer = []
             use_options(GameLogger::Opts.parse(["--lines=#{given}"]))
             LogSpecHarness.feed('line 1', 'line 2')
 
@@ -851,7 +850,6 @@ module LogSpecHarness::Env
 
         [['--lines'], ['lines']].each do |args|
           it "logs the game for #{args.first} with no value instead of crashing at startup" do
-            LogSpecHarness.server_buffer = []
             use_options(GameLogger::Opts.parse(args))
             LogSpecHarness.feed('line 1')
 
@@ -865,7 +863,6 @@ module LogSpecHarness::Env
 
       context 'with --lines=1,000' do
         it 'starts a new file after 1000 game lines' do
-          LogSpecHarness.server_buffer = []
           use_options(GameLogger::Opts.parse(['--lines=1,000']))
           LogSpecHarness.feed((1..1001).map { |n| "line #{n}" })
 
@@ -888,7 +885,6 @@ module LogSpecHarness::Env
 
       context 'with a typed command' do
         it 'logs it as >command with the leading <c> removed' do
-          LogSpecHarness.server_buffer = []
           use_options(OpenStruct.new)
           LogSpecHarness.idle_timeout = 0.5
           LogSpecHarness.type('<c>look')
@@ -896,6 +892,141 @@ module LogSpecHarness::Env
           run_main
 
           expect(log_lines.last(2)).to eq(['>look', default_stamp])
+        end
+
+        it 'removes only a leading <c>, and logs a command typed without one whole' do
+          use_options(OpenStruct.new)
+          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.type('<c>say <c> is the tag', 'look')
+
+          run_main
+
+          expect(log_lines.drop(2)).to eq(['>say <c> is the tag', '>look', default_stamp])
+        end
+
+        it 'logs typed commands and game lines in the order the buffer holds them, stamped alike' do
+          use_options(OpenStruct.new(timestamp: '%H:%M:%S'))
+          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.feed('You see a door.')
+          LogSpecHarness.type('<c>look')
+
+          run_main
+
+          expect(log_lines).to eq(
+            ['10:00:05', '<!-- Above contents from reget; full logging now active -->', '10:00:05: You see a door.', '10:00:05: >look', '10:00:05']
+          )
+        end
+      end
+
+      # R-01: what lich-5 hands the logger. Script#initialize starts with
+      # the text downstream on and the rest off; the logger turns on script
+      # output and typed commands and leaves the XML downstream off (so
+      # reget and get give it text).
+      it 'asks for script output and typed commands, and keeps the text downstream and not the XML one' do
+        use_options(OpenStruct.new)
+
+        run_main
+
+        expect(LogSpecHarness.script.to_h.slice(:want_downstream, :want_downstream_xml, :want_script_output, :want_upstream))
+          .to eq(want_downstream: true, want_downstream_xml: false, want_script_output: true, want_upstream: true)
+      end
+
+      # R-01, R-31: the reget is written when the logger starts less than
+      # 30 seconds after login, never at 30 seconds or later.
+      context 'at the edge of the 30-second reget window' do
+        it 'writes the reget and the marker when the logger starts 29.9 seconds after login' do
+          $login_time = frozen_time - 29.9
+          LogSpecHarness.server_buffer = ["You see a door.\r"]
+          use_options(OpenStruct.new)
+
+          run_main
+
+          expect(log_lines).to eq(
+            [default_stamp, 'You see a door.', '<!-- Above contents from reget; full logging now active -->', default_stamp]
+          )
+        end
+
+        it 'writes neither the reget nor the marker when the logger starts 30 seconds after login' do
+          $login_time = frozen_time - 30
+          LogSpecHarness.server_buffer = ["You see a door.\r"]
+          use_options(OpenStruct.new)
+
+          run_main
+
+          expect(log_lines).to eq([default_stamp, default_stamp])
+        end
+      end
+
+      # R-01: game lines in text mode, verbatim from the text log base
+      # log.lic wrote under a real lich.rbw child replaying lich-5
+      # spec/fixtures/streams/gs_saga_hunt.xml
+      # (indents, "..." and "==" included), are written as they come.
+      it 'writes real text-stream lines unchanged, each stamped with the time it is read' do
+        use_options(OpenStruct.new(timestamp: '%T'))
+        LogSpecHarness.feed(
+          'Obvious exits: north, east, west',
+          'You are now targeting a lithe veiled sentinel.',
+          '  1d100: 20 + Modifiers: 372 == 392',
+          '  CS: +618 - TD: +443 + CvA: +25 + d125: +61 + Bonus: +1 == +262',
+          '   ... 60 points of damage!',
+          'He had a pink rhodochrosite stone on him!'
+        )
+
+        run_main
+
+        expect(log_lines[2..-2]).to eq(
+          [
+            '10:00:05: Obvious exits: north, east, west',
+            '10:00:05: You are now targeting a lithe veiled sentinel.',
+            '10:00:05:   1d100: 20 + Modifiers: 372 == 392',
+            '10:00:05:   CS: +618 - TD: +443 + CvA: +25 + d125: +61 + Bonus: +1 == +262',
+            '10:00:05:    ... 60 points of damage!',
+            '10:00:05: He had a pink rhodochrosite stone on him!'
+          ]
+        )
+      end
+
+      # R-01: a line that starts with one of these tags (script output can
+      # carry them) is dropped; the tags elsewhere in a line keep it. Tag
+      # lines verbatim from lich-5 spec/fixtures/streams, except the closing
+      # tag, which the filter also matches.
+      describe 'lines that start with a stream, dialog or progress bar tag' do
+        {
+          'a stream switch'          => '<pushStream id="percWindow"/> Turtle (61 roisaen)',
+          'a stream end'             => '<popStream/><pushStream id="percWindow"/> Dragon (10 roisaen)',
+          'a progress bar'           => %(<progressBar id='1253901988' value='89' text="Mana Tap" left='22%' top='0' width='76%' height='15' time='00:13:28'/>),
+          'dialog data'              => "<dialogData id='Cooldowns' clear='t'></dialogData>",
+          'an open dialog'           => '<openDialog type="dynamic" id="injuries" title="Injuries" target="injuries" location="right" height="180" width="190" resident="true">',
+          'a close dialog'           => "<closeDialog id='AimTimerDialog'/>",
+          'a closing dialogData tag' => '</dialogData>'
+        }.each do |label, tag_line|
+          it "drops #{label} and logs the lines around it" do
+            use_options(OpenStruct.new)
+            LogSpecHarness.feed('before', tag_line, 'after')
+
+            run_main
+
+            expect(log_lines.drop(2)).to eq(['before', 'after', default_stamp])
+          end
+        end
+
+        it 'logs a line whose stream tag comes after other text' do
+          line = "<right>Empty</right><clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:"
+          use_options(OpenStruct.new)
+          LogSpecHarness.feed(line)
+
+          run_main
+
+          expect(log_lines.drop(2)).to eq([line, default_stamp])
+        end
+
+        it 'logs a line that starts with another tag' do
+          use_options(OpenStruct.new)
+          LogSpecHarness.feed("<prompt time=\"1792091317\">&gt;</prompt>")
+
+          run_main
+
+          expect(log_lines.drop(2)).to eq(["<prompt time=\"1792091317\">&gt;</prompt>", default_stamp])
         end
       end
 
@@ -1122,7 +1253,6 @@ module LogSpecHarness::Env
         let(:room_class) { double('Room') }
 
         before do
-          LogSpecHarness.server_buffer = []
           stub_const('Map', map)
           stub_const('Room', room_class)
           allow(map).to receive(:ids_from_uid) { |uid| uid_table.fetch(uid, []) }
@@ -1997,7 +2127,6 @@ module LogSpecHarness::Env
 
       context 'log file header/footer format' do
         it 'uses --timestamp format for header when enabled' do
-          LogSpecHarness.server_buffer = []
           use_options(OpenStruct.new(timestamp: '%F %T %Z'))
           run_main
           header_line = log_content.lines.first.chomp
@@ -2005,7 +2134,6 @@ module LogSpecHarness::Env
         end
 
         it 'uses default format for header when timestamps disabled' do
-          LogSpecHarness.server_buffer = []
           use_options(OpenStruct.new)
           run_main
           header_line = log_content.lines.first.chomp
