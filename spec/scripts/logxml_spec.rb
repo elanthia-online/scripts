@@ -423,6 +423,13 @@ RSpec.describe 'logxml.lic' do
     expect(log_lines).to eq([default_header, *stream_lines, default_footer])
   end
 
+  # streams is a word of its own among the arguments, not a part of one.
+  it 'drops stream lines when no argument is the word streams' do
+    run_logxml(args: 'nostreams', lines: ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>'])
+
+    expect(log_lines).to eq([default_header, '<output>In the pack: a torch.</output>', default_footer])
+  end
+
   # logxml drops only lines that start with pushStream or popStream; the
   # dialog and progress bar lines log.lic drops in text mode stay in the
   # XML log. The minivitals line is verbatim from lich-5
@@ -463,6 +470,16 @@ RSpec.describe 'logxml.lic' do
     run_logxml(lines: lines)
 
     expect(log_lines).to eq([default_header, *lines, default_footer])
+  end
+
+  # lich-5 chomps each server line before a script reads it
+  # (Script.new_downstream_xml), so the blank lines in a real stream (4 in
+  # spec/fixtures/streams/gs_saga_hunt.xml, 41 in dr_saga_hunt.xml) arrive
+  # as "", and stay in the log.
+  it 'writes a blank game line as a blank line' do
+    run_logxml(lines: ['<output>line 1</output>', '', '<output>line 2</output>'])
+
+    expect(log_lines).to eq([default_header, '<output>line 1</output>', '', '<output>line 2</output>', default_footer])
   end
 
   it 'stamps a typed command like a game line when timestamps are on' do
