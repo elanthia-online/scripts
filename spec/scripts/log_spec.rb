@@ -595,7 +595,8 @@ module LogSpecHarness::Env
         # def reget). A reget line can only start with "<" when the server sent
         # game text escaped: "&lt;pushStream id='x'/&gt; spoof\r" in
         # $_SERVERBUFFER_ comes back as "<pushStream id='x'/> spoof\r".
-        # write_reget filters no line, so it is written unchanged, less the "\r".
+        # Text mode's reget_line filters no line, so it is written unchanged,
+        # less the "\r".
         it 'writes a reget line that starts with "<" unchanged' do
           LogSpecHarness.server_buffer = ["&lt;pushStream id='x'/&gt; spoof\r", "You see a door.\r"]
 
