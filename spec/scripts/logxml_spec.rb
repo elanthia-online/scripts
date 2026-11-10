@@ -16,6 +16,8 @@ RSpec.describe 'logxml.lic' do
 
   let(:log_dir) { Dir.mktmpdir }
   let(:frozen_time) { Time.new(2026, 4, 23, 10, 0, 5) }
+  # Time.now; a Time among run_logxml's lines moves it.
+  let(:clock) { [frozen_time] }
   let(:echoes) { [] }
   let(:default_header) { '2026-04-23 10:00am' }
   let(:fallback_stamp) { frozen_time.strftime('%F %T %Z') }
@@ -31,7 +33,7 @@ RSpec.describe 'logxml.lic' do
       def self.game = 'GSIV'
       def self.name = 'TestChar'
     end)
-    allow(Time).to receive(:now).and_return(frozen_time)
+    allow(Time).to receive(:now) { clock.first }
     $login_time = frozen_time - 3600
   end
 
@@ -40,7 +42,8 @@ RSpec.describe 'logxml.lic' do
   end
 
   # Runs logxml.lic once with +vars+ as typed and the given DR settings
-  # (+nil+ for none, as in GS). Ends when the fed lines run out.
+  # (+nil+ for none, as in GS). Ends when the fed lines run out; a Time
+  # among +lines+ moves the clock before the next line is read.
   # +reget+ is what lich-5's reget answers: nil for an empty buffer. A
   # block runs once the fed lines run out, just before the logger stops.
   def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'], reget: nil)
@@ -53,7 +56,9 @@ RSpec.describe 'logxml.lic' do
     runner.define_singleton_method(:echo) { |msg| sink << msg.to_s }
     runner.define_singleton_method(:reget) { reget }
     on_stop = block_given? ? proc { yield } : proc {}
+    time_now = clock
     runner.define_singleton_method(:get) do
+      time_now[0] = pending_lines.shift while pending_lines.first.is_a?(Time)
       next pending_lines.shift unless pending_lines.empty?
 
       on_stop.call
@@ -313,6 +318,33 @@ RSpec.describe 'logxml.lic' do
     stub_const('LOG_DIR', '')
     run_logxml
     expect(log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml'))
+  end
+
+  # R-13: the line was written before the date check, so the first line
+  # after midnight went into yesterday's file; skipped lines used up the
+  # 30000-line budget.
+  context 'when starting a new file' do
+    let(:next_day) { Time.new(2026, 4, 24, 0, 0, 1) }
+
+    it "logs the first line after midnight in the new day's file" do
+      run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>'])
+
+      root = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      next_day_footer = next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')
+      expect(File.read(File.join(root, '2026-04-23_10-00-05.xml')).lines(chomp: true)).to eq(
+        [default_header, '<output>line 1</output>', next_day_footer]
+      )
+      expect(File.read(File.join(root, '2026-04-24_00-00-01.xml')).lines(chomp: true)).to eq(
+        ['2026-04-24 12:00am', '<output>line 2</output>', next_day_footer]
+      )
+    end
+
+    it 'counts only written lines toward the 30000, not skipped stream lines' do
+      run_logxml(lines: ['<pushStream id="inv"/>', '<popStream/>', *Array.new(30_001) { |n| "<output>#{n + 1}</output>" }])
+
+      expect(log_lines[30_000, 4]).to eq(['<output>30000</output>', default_footer, default_header, '<output>30001</output>'])
+      expect(log_lines.size).to eq(30_005)
+    end
   end
 
   # R-23: the footer was written only when a new file started.

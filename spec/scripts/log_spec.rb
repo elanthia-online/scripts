@@ -1186,6 +1186,98 @@ RSpec.describe GameLogger do
       end
     end
 
+    # R-13: the line was written before the date check, so the first line
+    # after midnight went into yesterday's file; an --exclude `next`
+    # skipped the date check; excluded lines used up the --lines budget.
+    describe 'starting a new file' do
+      let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+      let(:next_day) { Time.new(2026, 4, 24, 0, 0, 1) }
+      let(:next_day_stamp) { next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z') }
+      # The parser's room as the logger sees it when it reads a line.
+      let(:room) { { count: 1, uid: 1234 } }
+
+      # A Time fed between lines moves the clock; a Hash moves the parser to
+      # another room.
+      before do
+        clock = frozen_time
+        allow(Time).to receive(:now) { clock }
+        allow(XMLData).to receive(:room_count) { room[:count] }
+        allow(XMLData).to receive(:room_id) { room[:uid] }
+        allow(GameLogger).to receive(:get) do
+          item = LogSpecHarness.get
+          until item.is_a?(String)
+            item.is_a?(Time) ? clock = item : room.merge!(item)
+            item = LogSpecHarness.get
+          end
+          item
+        end
+      end
+
+      # Every log file's lines, by path relative to the character folder.
+      def log_files
+        root = File.join(log_dir, 'logs', 'GSIV-TestChar')
+        Dir.glob(File.join(root, '**', '*.log')).to_h do |path|
+          [path.delete_prefix("#{root}/"), File.read(path).lines(chomp: true)]
+        end
+      end
+
+      it "logs the first line after midnight in the new day's file" do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        LogSpecHarness.feed('line 1', next_day, 'line 2')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log' => [default_stamp, marker, 'line 1', next_day_stamp],
+          '2026/04/2026-04-24_00-00-01.log' => [next_day_stamp, 'line 2', next_day_stamp]
+        )
+      end
+
+      it 'starts the new file on the first line after midnight even in an excluded room' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--exclude=u7199']))
+        LogSpecHarness.feed('line 1', { count: 2, uid: 7199 }, next_day, 'excluded line')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log' => [default_stamp, marker, 'line 1', next_day_stamp],
+          '2026/04/2026-04-24_00-00-01.log' => [next_day_stamp, next_day_stamp]
+        )
+      end
+
+      it "logs the first line after leaving an excluded room past midnight in the new day's file" do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--exclude=u7199']))
+        LogSpecHarness.feed(
+          'line 1', { count: 2, uid: 7199 }, 'excluded 1', next_day, 'excluded 2', { count: 3, uid: 1234 }, 'line 2'
+        )
+
+        run_main
+
+        expect(log_files['2026/04/2026-04-24_00-00-01.log']).to eq([next_day_stamp, 'line 2', next_day_stamp])
+        expect(log_files['2026/04/2026-04-23_10-00-05.log']).to eq([default_stamp, marker, 'line 1', next_day_stamp])
+      end
+
+      # The clock stays at 10:00:05, so each new file reuses the name and
+      # shows up as footer + header lines in one file.
+      it 'counts only written lines toward --lines, not lines in an excluded room' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=2', '--exclude=u7199']))
+        LogSpecHarness.feed('a', { count: 2, uid: 7199 }, 'x1', 'x2', 'x3', { count: 3, uid: 1234 }, 'b', 'c')
+
+        run_main
+
+        expect(log_lines).to eq([default_stamp, marker, 'a', 'b', default_stamp, default_stamp, 'c', default_stamp])
+      end
+
+      it 'counts only written lines toward --lines, not filtered stream lines' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=2']))
+        LogSpecHarness.feed('a', '<pushStream id="inv"/>', '<popStream/>', 'b', 'c')
+
+        run_main
+
+        expect(log_lines).to eq([default_stamp, marker, 'a', 'b', default_stamp, default_stamp, 'c', default_stamp])
+      end
+    end
+
     # R-23: the footer was written only when a new file started, so a file
     # closed by ;kill, logout or Lich exiting (most files) had none.
     context 'when the logger stops' do
