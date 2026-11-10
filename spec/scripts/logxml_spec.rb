@@ -503,7 +503,7 @@ RSpec.describe 'logxml.lic' do
       expect { run_logxml(lines: ['<output>line 1</output>']) }.not_to raise_error
 
       expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
-      expect(lich_log).to eq(["logxml: closing the log file #{log_file} failed (IOError: device gone); every line was already written, nothing to do"])
+      expect(lich_log).to eq(["logxml: closing the log file #{log_file} failed (IOError: device gone); lines are written as they come, with sync on, but the file may be missing its footer or a last write"])
     end
   end
 
@@ -551,7 +551,7 @@ RSpec.describe 'logxml.lic' do
       expect(raised_at(error)).to match(/\Alogxml_spec\.rb:\d+\z/)
     end
 
-    # The backtrace path can hold the OS user name (C:/Users/<name>/...).
+    # The directory (C:/Users/<name>/...) only makes the echo longer.
     it 'gives the file and line it was raised at without the directory' do
       error = RuntimeError.new('boom')
       error.set_backtrace(["C:/Users/someone/Lich5/scripts/logxml.lic:142:in 'block in <main>'"])
@@ -573,6 +573,23 @@ RSpec.describe 'logxml.lic' do
 
       expect(echoes.grep(/\Atyped commands/).first)
         .to end_with('restart the logger (;kill logxml, then ;logxml streams --timestamp=%H:%M) to log typed commands again.')
+    end
+
+    # Without the strip, the hint would read ";logxml " with a trailing space.
+    it 'gives the restart without arguments when vars[0] is only whitespace' do
+      run_logxml(vars: ['  '], lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/).first).to end_with('(;kill logxml, then ;logxml) to log typed commands again.')
+    end
+
+    it 'gives the frame as is when it has no "path:line" start' do
+      error = RuntimeError.new('boom')
+      error.set_backtrace(['<internal:kernel>'])
+
+      run_logxml(lines: [], upstream: type_then_fail(error)) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/).first)
+        .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at <internal:kernel>. ')
     end
 
     it 'writes a notice line into the log file saying typed commands are not logged after it, and keeps logging game lines' do

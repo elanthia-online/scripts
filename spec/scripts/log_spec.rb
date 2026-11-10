@@ -839,8 +839,7 @@ RSpec.describe GameLogger do
         expect(raised_at(error)).to match(/\Alog_spec\.rb:\d+\z/)
       end
 
-      # The backtrace path can hold the OS user name (C:/Users/<name>/...),
-      # and with want_script_output the echo is written into the log file.
+      # The directory (C:/Users/<name>/...) only makes the echo longer.
       it 'gives the file and line it was raised at without the directory' do
         use_options(OpenStruct.new)
         LogSpecHarness.idle_timeout = 0.5
@@ -862,6 +861,27 @@ RSpec.describe GameLogger do
           ['typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom. ' \
            'Game lines are still logged; restart the logger (;kill log, then ;log) to log typed commands again.']
         )
+      end
+
+      it 'gives the frame as is when it has no "path:line" start' do
+        error = RuntimeError.new('boom')
+        error.set_backtrace(['<internal:kernel>'])
+
+        expect(GameLogger.upstream_frame(error)).to eq('<internal:kernel>')
+
+        GameLogger.upstream_stopped(error)
+
+        expect(LogSpecHarness.echoes.first)
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at <internal:kernel>. ')
+      end
+
+      # Without the strip, the hint would read ";log " with a trailing space.
+      it 'gives the restart without arguments when vars[0] is only whitespace' do
+        allow(Script.current).to receive(:vars).and_return(['  '])
+
+        GameLogger.upstream_stopped(RuntimeError.new('boom'))
+
+        expect(LogSpecHarness.echoes.first).to end_with('(;kill log, then ;log) to log typed commands again.')
       end
 
       # Restarting without them would log rooms the user excluded.
@@ -1681,7 +1701,7 @@ RSpec.describe GameLogger do
         expect { run_main }.not_to raise_error
 
         expect(log_lines.drop(2)).to eq(['line 1', default_stamp])
-        expect(Lich).to have_received(:log).with("log: closing the log file #{find_log_file} failed (IOError: device gone); every line was already written, nothing to do")
+        expect(Lich).to have_received(:log).with("log: closing the log file #{find_log_file} failed (IOError: device gone); lines are written as they come, with sync on, but the file may be missing its footer or a last write")
       end
     end
 
