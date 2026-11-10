@@ -564,7 +564,8 @@ RSpec.describe GameLogger do
           [
             'Apr 23, 2026 10:00:05',
             '<!-- Above contents from reget; full logging now active -->',
-            'Apr 23, 2026 10:00:05: You see a door.'
+            'Apr 23, 2026 10:00:05: You see a door.',
+            'Apr 23, 2026 10:00:05'
           ]
         )
       end
@@ -578,7 +579,7 @@ RSpec.describe GameLogger do
 
         run_main
 
-        expect(log_lines.last).to eq('10=00: You see a door.')
+        expect(log_lines.last(2)).to eq(['10=00: You see a door.', '10=00'])
       end
     end
 
@@ -607,7 +608,8 @@ RSpec.describe GameLogger do
             [
               default_stamp,
               '<!-- Above contents from reget; full logging now active -->',
-              'You see a door.'
+              'You see a door.',
+              default_stamp
             ]
           )
           expect(LogSpecHarness.echoes).to eq(
@@ -624,7 +626,7 @@ RSpec.describe GameLogger do
         run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
         expect(log_lines).to eq(
-          ['10:00', '<!-- Above contents from reget; full logging now active -->', '10:00: You see a door.']
+          ['10:00', '<!-- Above contents from reget; full logging now active -->', '10:00: You see a door.', '10:00']
         )
         expect(LogSpecHarness.echoes.first).to eq(no_format_echo)
       end
@@ -643,7 +645,7 @@ RSpec.describe GameLogger do
 
           stamp = frozen_time.strftime('%F %T %Z')
           expect(log_lines).to eq(
-            [stamp, '<!-- Above contents from reget; full logging now active -->', "#{stamp}: You see a door."]
+            [stamp, '<!-- Above contents from reget; full logging now active -->', "#{stamp}: You see a door.", stamp]
           )
           expect(LogSpecHarness.echoes).to eq(
             [
@@ -661,7 +663,7 @@ RSpec.describe GameLogger do
 
         run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
 
-        expect(log_lines.last).to eq('10:00: You see a door.')
+        expect(log_lines.last(2)).to eq(['10:00: You see a door.', '10:00'])
         expect(LogSpecHarness.echoes.size).to eq(1)
       end
 
@@ -672,7 +674,7 @@ RSpec.describe GameLogger do
 
         run_main_with_settings(OpenStruct.new(log_timestamp: false, log_timestamp_format: nil))
 
-        expect(log_lines.last).to eq('You see a door.')
+        expect(log_lines.last(2)).to eq(['You see a door.', default_stamp])
         expect(LogSpecHarness.echoes.size).to eq(1)
       end
     end
@@ -688,7 +690,7 @@ RSpec.describe GameLogger do
           run_main
 
           expect(log_lines).to eq(
-            [default_stamp, '<!-- Above contents from reget; full logging now active -->', 'line 1', 'line 2']
+            [default_stamp, '<!-- Above contents from reget; full logging now active -->', 'line 1', 'line 2', default_stamp]
           )
           expect(LogSpecHarness.echoes.first).to start_with("--lines=#{given} is not a valid line count")
         end
@@ -702,7 +704,7 @@ RSpec.describe GameLogger do
 
           run_main
 
-          expect(log_lines.last).to eq('line 1')
+          expect(log_lines.last(2)).to eq(['line 1', default_stamp])
           expect(LogSpecHarness.echoes.first).to start_with('lines was given without a value;')
         end
       end
@@ -717,12 +719,14 @@ RSpec.describe GameLogger do
         run_main
 
         # The clock is frozen, so the second file has the same name and the
-        # rollover shows up as footer + header lines in one file.
+        # rollover shows up as footer + header lines in one file; the second
+        # file's footer is written when the logger stops.
         expect(log_lines[1001]).to eq('line 1000')
         expect(log_lines[1002]).to eq(default_stamp)
         expect(log_lines[1003]).to eq(default_stamp)
         expect(log_lines[1004]).to eq('line 1001')
-        expect(log_lines.size).to eq(1005)
+        expect(log_lines[1005]).to eq(default_stamp)
+        expect(log_lines.size).to eq(1006)
         expect(LogSpecHarness.echoes).to eq(["Non-XML Logging started, currently logging to #{find_log_file}"])
       end
     end
@@ -736,7 +740,7 @@ RSpec.describe GameLogger do
 
         run_main
 
-        expect(log_lines.last).to eq('>look')
+        expect(log_lines.last(2)).to eq(['>look', default_stamp])
       end
     end
 
@@ -776,11 +780,13 @@ RSpec.describe GameLogger do
       end
 
       # Runs the logger with these arguments and returns the logged game
-      # lines (the header and the reget marker dropped).
+      # lines (the header, the reget marker and the footer dropped; the
+      # footer is checked here, as every file ends with one).
       def log_with(*args)
         GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(args))
         run_main
-        log_lines.drop(2)
+        expect(log_lines.last).to eq(default_stamp)
+        log_lines[2..-2]
       end
 
       context 'with --rnum in GemStone' do
@@ -1177,6 +1183,108 @@ RSpec.describe GameLogger do
 
           expect(log_with('--exclude=u4216015')).to eq([])
         end
+      end
+    end
+
+    # R-23: the footer was written only when a new file started, so a file
+    # closed by ;kill, logout or Lich exiting (most files) had none.
+    context 'when the logger stops' do
+      let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+
+      # Records every File the logger opens.
+      def opened_files
+        @opened_files ||= [].tap do |opened|
+          allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+            original.call(*args, &block).tap { |file| opened << file if file.is_a?(File) }
+          end
+        end
+      end
+
+      it 'ends the file with the footer once, after the last line' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        LogSpecHarness.feed('line 1')
+
+        run_main
+
+        expect(log_lines).to eq([default_stamp, marker, 'line 1', default_stamp])
+      end
+
+      it 'stamps the footer with the --timestamp format' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%H:%M'))
+        LogSpecHarness.feed('line 1')
+
+        run_main
+
+        expect(log_lines).to eq(['10:00', marker, '10:00: line 1', '10:00'])
+      end
+
+      # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
+      it 'writes the footer when the thread is killed, as ;kill log does' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        LogSpecHarness.idle_timeout = 5
+        LogSpecHarness.feed('line 1')
+        logger = Thread.new { GameLogger.main }
+        Timeout.timeout(2) { sleep 0.01 until find_log_file && File.read(find_log_file).include?("line 1\n") }
+
+        logger.kill
+        logger.join(2)
+
+        expect(log_lines).to eq([default_stamp, marker, 'line 1', default_stamp])
+      end
+
+      it 'closes the file and lets the reason through when the footer cannot be written' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        files = opened_files
+        allow(GameLogger).to receive(:get) do
+          allow(files.first).to receive(:puts).and_raise(Errno::ENOSPC)
+          raise StopIteration
+        end
+
+        expect { run_main }.not_to raise_error
+
+        expect(files.size).to eq(1)
+        expect(files.first).to be_closed
+        expect(log_lines).to eq([default_stamp, marker])
+      end
+    end
+
+    # R-22: the header was written before the begin/ensure that closes the
+    # file, so an error there left the File open.
+    context 'when the header cannot be written' do
+      it 'closes the file without a footer and raises the error' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        opened = []
+        header_failed = false
+        allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+          original.call(*args, &block).tap do |file|
+            next unless file.is_a?(File)
+
+            # Only the first write (the header) fails, so a footer would land.
+            allow(file).to receive(:puts).and_wrap_original do |puts, *lines|
+              unless header_failed
+                header_failed = true
+                raise Errno::ENOSPC
+              end
+              puts.call(*lines)
+            end
+            opened << file
+          end
+        end
+
+        expect { run_main }.to raise_error(Errno::ENOSPC)
+
+        expect(opened.size).to eq(1)
+        expect(opened.first).to be_closed
+        expect(File.read(find_log_file)).to eq('')
+      end
+    end
+
+    describe '.write_footer' do
+      it 'ignores a write error (best effort while stopping)' do
+        file = File.open(File.join(log_dir, 'closed.log'), 'a')
+        file.close
+
+        expect(GameLogger.write_footer(file, nil)).to be_nil
       end
     end
 

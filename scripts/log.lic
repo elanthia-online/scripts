@@ -27,6 +27,8 @@
     1.2.4 (2026-11-10):
       * the reget lines at the top of the log no longer end in a stray carriage return, and an empty reget writes nothing
       * logs go to Lich's log folder (LOG_DIR, set by Lich's --logs= option), or LICH_DIR/logs when it is not set
+      * every log file ends with its footer line, also when the logger stops (;kill, logout, Lich exiting), not only when a new file starts
+      * a log file whose header cannot be written is closed instead of being left open
     1.2.3 (2026-11-10):
       * --rnum and --exclude find the Lich room number in the map's UID table, never by matching the room from the logger (no LOCATION/PEER sent, no lost lines)
       * with --rnum or a Lich room number in --exclude, the logger loads the map once in the background when nothing has loaded it yet (in DragonRealms, Lich's own room display does not load it by default); until the map has the room's UID, each line asks again, so the room is numbered and excluded from then on
@@ -353,6 +355,71 @@ module GameLogger
     File.join(log_root, "#{game}-#{name}", time.strftime('%Y'), time.strftime('%m'))
   end
 
+  # The header and footer line of a log file when timestamps are off.
+  DEFAULT_FILE_STAMP_FORMAT ||= '%Y-%m-%d %H:%M:%S.%L %:z'
+
+  # The header or footer line of a log file: the time now in the
+  # timestamp format, or in {DEFAULT_FILE_STAMP_FORMAT} when timestamps are
+  # off.
+  #
+  # @param stamp_format [String, nil] the strftime format, or +nil+ for no
+  #   timestamps
+  # @return [String] the line, without a line end
+  def self.file_stamp(stamp_format)
+    Time.now.strftime(stamp_format || DEFAULT_FILE_STAMP_FORMAT)
+  end
+
+  # Opens a log file for appending, writes its header line, runs the block
+  # with it, then writes its footer line and closes it. The footer is
+  # written exactly once, from an ensure, so a file ends with one also when
+  # the logger stops (;kill, logout, Lich exiting) and not only when it
+  # starts a new file; see {write_footer}. A file whose header could not be
+  # written gets no footer, and is still closed, so an error in the header
+  # never leaves the file open.
+  #
+  # @param filename [String] the log file path; an existing file is
+  #   appended to
+  # @param stamp_format [String, nil] the strftime format for the header and
+  #   footer, or +nil+ for {DEFAULT_FILE_STAMP_FORMAT}
+  # @yield [file] writes the file's lines
+  # @yieldparam file [File] the open log file, with sync on
+  # @yieldreturn [void]
+  # @return [void]
+  # @raise [SystemCallError, IOError] when the file cannot be opened, or its
+  #   header cannot be written (the file is closed first); errors raised by
+  #   the block pass through after the footer and close
+  def self.with_log_file(filename, stamp_format)
+    file = File.open(filename, 'a')
+    header_written = false
+    begin
+      file.sync = true
+      file.puts file_stamp(stamp_format)
+      header_written = true
+      yield file
+    ensure
+      write_footer(file, stamp_format) if header_written
+      begin
+        file.close
+      rescue
+        Lich.log "Can't close file!"
+      end
+    end
+  end
+
+  # Writes a log file's footer line, best effort: it runs while the logger
+  # stops, so a failed write (disk full, a closed file) is ignored rather
+  # than replacing the reason the logger stopped.
+  #
+  # @param file [File] the open log file
+  # @param stamp_format [String, nil] the strftime format, or +nil+ for
+  #   {DEFAULT_FILE_STAMP_FORMAT}
+  # @return [void]
+  def self.write_footer(file, stamp_format)
+    file.puts file_stamp(stamp_format)
+  rescue IOError, SystemCallError
+    nil
+  end
+
   # Writes the lines lich-5's reget returned at the top of the first log
   # file, as the text log shows them: the stream, progress bar and dialog
   # tag lines are left out, the server's "\r" line end is removed
@@ -384,7 +451,8 @@ module GameLogger
   # each new day and after the --lines count (see {lines_per_file}),
   # stamping lines when {timestamp_format} returns a format. The file
   # header and footer carry that format, or the date and time when there is
-  # none. Typed commands are logged as ">command" lines, lines seen in
+  # none; every file gets its footer, also when the logger stops (see
+  # {with_log_file}). Typed commands are logged as ">command" lines, lines seen in
   # --exclude rooms are skipped, and --rnum adds the room number to room
   # titles.
   #
@@ -450,23 +518,16 @@ module GameLogger
       FileUtils.mkdir_p(dir) unless File.exist?(dir)
       thisdate = Time.now.strftime("%Y-%m-%d")
       filename = File.join(dir, "#{Time.now.strftime("%Y-%m-%d_%H-%M-%S")}.log")
-      file = File.open(filename, 'a')
-      file.sync = true
-      if stamp_enable
-        file.puts "#{Time.now.strftime(stamp_format)}\n"
-      else
-        file.puts "#{Time.now.strftime("%Y-%m-%d %H:%M:%S.%L %:z")}\n"
-      end
-      unless started
-        if (Time.now - $login_time) < 30
-          write_reget(file, reget, stamp_format)
-          file.puts "<!-- Above contents from reget; full logging now active -->\n"
-        end
+      with_log_file(filename, stamp_format) do |file|
+        unless started
+          if (Time.now - $login_time) < 30
+            write_reget(file, reget, stamp_format)
+            file.puts "<!-- Above contents from reget; full logging now active -->\n"
+          end
 
-        echo "Non-XML Logging started, currently logging to #{filename}"
-        started = true
-      end
-      begin
+          echo "Non-XML Logging started, currently logging to #{filename}"
+          started = true
+        end
         lines.times {
           line = get
           if track_room
@@ -506,17 +567,6 @@ module GameLogger
           end
           break if Time.now.strftime("%Y-%m-%d") != thisdate
         }
-        if stamp_enable
-          file.puts "#{Time.now.strftime(stamp_format)}\n"
-        else
-          file.puts "#{Time.now.strftime("%Y-%m-%d %H:%M:%S.%L %:z")}\n"
-        end
-      ensure
-        begin
-          file.close
-        rescue
-          Lich.log "Can't close file!"
-        end
       end
     }
   end
