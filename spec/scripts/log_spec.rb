@@ -413,12 +413,26 @@ RSpec.describe GameLogger do
         expect(log_content).to include('2026-04-23 10:00:00: Obvious exits: north, south.')
       end
 
-      it 'filters pushStream tags from reget lines' do
-        $reget_lines = ['<pushStream id="room"/>', 'You see a door.', '<popStream/>']
+      # The logger never sets want_downstream_xml, so lich-5's reget has
+      # already stripped every tag (lib/global_defs.rb, def reget). These
+      # lines are what that reget returns for the lich-5 stream fixture
+      # spec/fixtures/streams/gs_saga_hunt.xml.
+      it 'stamps every line of a tag-stripped reget with $login_time' do
+        $reget_lines = [
+          '[Sanctum of Scales, Columns] (4216015)',
+          'Obvious exits: north, east, west',
+          'You are now targeting a lithe veiled sentinel.',
+          '  1d100: 20 + Modifiers: 372 == 392'
+        ]
+
         run_main
-        expect(log_content).not_to include('pushStream')
-        expect(log_content).not_to include('popStream')
-        expect(log_content).to include('2026-04-23 10:00:00: You see a door.')
+
+        expect(log_content.lines.map(&:chomp)).to include(
+          '2026-04-23 10:00:00: [Sanctum of Scales, Columns] (4216015)',
+          '2026-04-23 10:00:00: Obvious exits: north, east, west',
+          '2026-04-23 10:00:00: You are now targeting a lithe veiled sentinel.',
+          '2026-04-23 10:00:00:   1d100: 20 + Modifiers: 372 == 392'
+        )
       end
 
       it 'uses $login_time not current time for reget timestamps' do
@@ -442,12 +456,22 @@ RSpec.describe GameLogger do
         expect(door_line).to start_with('You see a door.')
       end
 
-      it 'still filters pushStream/popStream from reget' do
-        $reget_lines = ['<pushStream id="room"/>', 'content line', '<popStream/>']
+      # Tag-stripped lines, as lich-5's reget returns them to the logger
+      # (from lich-5 spec/fixtures/streams/gs_saga_hunt.xml).
+      it 'writes every line of a tag-stripped reget as it came' do
+        $reget_lines = [
+          '[Sanctum of Scales, Columns] (4216015)',
+          'Obvious exits: north, east, west',
+          '  Warding failed!'
+        ]
+
         run_main
-        expect(log_content).not_to include('pushStream')
-        expect(log_content).not_to include('popStream')
-        expect(log_content).to include('content line')
+
+        expect(log_content.lines.map(&:chomp)).to include(
+          '[Sanctum of Scales, Columns] (4216015)',
+          'Obvious exits: north, east, west',
+          '  Warding failed!'
+        )
       end
     end
 
