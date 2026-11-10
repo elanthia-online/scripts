@@ -7,9 +7,9 @@
            ;log --timestamp="%F %T %Z"          - optional timestamps
            ;log --rnum                          - optional show Lich ID on room titles
            ;log --exclude=u7199,288,2300        - optional rooms to exclude logging, supports UIDs via u#
-                                                  (a Lich room number, here and for --rnum, needs the map
-                                                  loaded by Lich or another script, with the room's UID in it;
-                                                  the logger never loads the map itself)
+                                                  (for a Lich room number, here and for --rnum, the logger
+                                                  loads the map in the background when it is not loaded yet;
+                                                  lines read before the load finishes are not excluded by it)
            ;log --lines=50000                   - optional change default(30000) lines to capture before new file started
   EXAMPLE AUTOSTART:
            ;autostart add --global log --timestamp=\"%F %T %Z\" --rnum --exclude=288,2300,u7199 --lines=50000
@@ -20,12 +20,14 @@
  contributors: Tillmen, Tysong, Xanlin
          game: gs
       version: 1.2.3
-     required: Lich > 5.0.1
+     required: Lich >= 5.14.0
 
   changelog:
     1.2.3 (2026-11-10):
       * --rnum and --exclude find the Lich room number in the map's UID table, never by matching the room from the logger (no LOCATION/PEER sent, no lost lines)
-      * a Lich room number needs the map loaded by Lich or another script; until the map has the room's UID, each line asks again, so the room is numbered and excluded from then on
+      * with --rnum or a Lich room number in --exclude, the logger loads the map once in the background when nothing has loaded it yet (in DragonRealms, Lich's own room display does not load it by default); until the map has the room's UID, each line asks again, so the room is numbered and excluded from then on
+      * a room title with letters outside ASCII no longer stops the logger with an encoding error under --rnum
+      * needs Lich 5.14.0 or later (Map.loaded?)
       * --rnum works in DragonRealms
       * --rnum writes no " - ]" when the room has no Lich number, and changes nothing before the first room title
       * --exclude ignores empty entries (--exclude=,288) and a bare --exclude
@@ -242,8 +244,8 @@ module GameLogger
   # Map.current it never matches the room by text, so it cannot send
   # LOCATION or PEER from the logger (which would clear the logger's own
   # buffer) and costs the same in rooms the map cannot place. It never
-  # loads the map either: until Lich or another script loads it, or adds
-  # the UID, every room has no Lich number here.
+  # loads the map either (see {start_map_load}): until the map is loaded,
+  # or learns the UID, every room has no Lich number here.
   #
   # @param uid [Integer] the game's room UID (XMLData.room_id)
   # @return [Integer, nil] the one Lich room number mapped to +uid+, or
@@ -251,6 +253,26 @@ module GameLogger
   def self.lich_room_id(uid)
     ids = Map.ids_from_uid(uid)
     ids.first if ids.size == 1
+  end
+
+  # Starts loading the map in a background thread when nothing has loaded
+  # it yet, so a Lich room number in --exclude or --rnum can be found. Lich
+  # loads the map only when something asks for it, and in DragonRealms its
+  # own room display does not by default. The load sends no game command,
+  # but it can take seconds, so it runs off the logger's get loop: a logger
+  # waiting on it during a login burst would let lich-5's 200-line
+  # downstream buffer drop lines.
+  #
+  # @return [Thread, nil] the loading thread, or +nil+ when the map was
+  #   already loaded and nothing was started
+  def self.start_map_load
+    return nil if Map.loaded?
+
+    Thread.new do
+      echo "no map database could be loaded, so Lich room numbers in --exclude and --rnum match no room; u<uid> entries still work." unless Map.load
+    rescue StandardError => e
+      echo "the map failed to load (#{e.message}), so Lich room numbers in --exclude and --rnum match no room; u<uid> entries still work."
+    end
   end
 
   # Splits the --exclude option into game UID entries ("u7199") and Lich
@@ -270,17 +292,22 @@ module GameLogger
   # one more pair of brackets (XMLData.room_title is "[[Title]]" while the
   # game line reads "[Title] (230008)"), so one pair is removed first.
   #
+  # The pattern is built from the title's bytes, so match it against
+  # +line.b+: a UTF-8 pattern with letters outside ASCII raises
+  # Encoding::CompatibilityError on a binary game line with high bytes.
+  #
   # @param title [String] XMLData.room_title
   # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
-  # @return [Regexp, nil] a pattern matching a line that starts with the
-  #   title, or +nil+ when the title is empty or not "[...]" shaped (before
-  #   the first room title arrives), so no line is changed
+  # @return [Regexp, nil] a pattern matching the bytes of a line that
+  #   starts with the title, or +nil+ when the title is empty or not
+  #   "[...]" shaped (before the first room title arrives), so no line is
+  #   changed
   def self.room_title_pattern(title, game)
     title = title.to_s
     title = title[1..-2] if game.to_s.start_with?('DR') && title.start_with?('[[') && title.end_with?(']]')
     return nil unless title.length > 2 && title.start_with?('[') && title.end_with?(']')
 
-    /\A#{Regexp.escape(title)}/
+    /\A#{Regexp.escape(title.b)}/
   end
 
   # Adds the room numbers to a room title line, for --rnum: " - <number>"
@@ -312,17 +339,24 @@ module GameLogger
   # titles.
   #
   # The room for --exclude and --rnum is read from XMLData and the map's UID
-  # table (see {lich_room_id}), never from Room.current or Map.current, so a
-  # Lich room number needs the map loaded (by Lich or another script) with
-  # the room's UID in it. A found Lich number is kept until the room
-  # changes; while there is none, each line asks the map again, so a room
-  # is numbered and excluded from the line after the map learns its UID.
+  # table (see {lich_room_id}), never from Room.current or Map.current.
+  # When a Lich number is needed, the map is loaded once in the background
+  # (see {start_map_load}). A found Lich number is kept until the room
+  # changes; while there is none, or while that load is still running, each
+  # line asks the map again, so a room is numbered and excluded from the
+  # line after the map learns its UID.
   #
   # @note A line is checked against the room the parser holds when the
   #   logger reads the line, not when the game sent it. When the logger
   #   falls behind a room change, a room title can be left without numbers
   #   or get the next room's numbers, and lines at the edge of an excluded
   #   room can be skipped or logged on the wrong side.
+  # @note Lines read before the map has loaded are logged even in a room
+  #   excluded by Lich number (a u<uid> entry needs no map).
+  # @note When another script reloads the map, the UID table is cleared
+  #   and rebuilt one room at a time. A UID shared by several rooms can
+  #   then show just one of them, and the logger keeps that Lich number
+  #   for the rest of the room. Only the logger's own load is waited out.
   # @return [void]
   def self.main
     if defined?(get_settings)
@@ -344,9 +378,11 @@ module GameLogger
     lines = lines_per_file(@options.lines)
 
     uid_excludes, id_excludes = exclude_entries(@options.exclude)
-    track_room = show_room_numbers || !(uid_excludes.empty? && id_excludes.empty?)
+    look_up_lich_id = show_room_numbers || !id_excludes.empty?
+    track_room = look_up_lich_id || !uid_excludes.empty?
+    map_loader = (start_map_load if look_up_lich_id)
     room_count = room_uid = room_title = title_pattern = lich_id = nil
-    room_excluded = false
+    room_uid_excluded = room_id_excluded = false
 
     Thread.new {
       begin
@@ -397,20 +433,23 @@ module GameLogger
               room_count = XMLData.room_count
               room_uid = XMLData.room_id
               room_title = XMLData.room_title.dup
-              room_excluded = uid_excludes.include?("u#{room_uid}")
+              room_uid_excluded = uid_excludes.include?("u#{room_uid}")
+              room_id_excluded = false
               lich_id = nil
               title_pattern = (room_title_pattern(room_title, XMLData.game) if show_room_numbers)
             end
             # Only a found Lich id is kept for the room. Until then the map is
-            # asked again on each line: it may not be loaded yet or may learn
-            # the UID later, and lich_room_id never loads it.
-            if lich_id.nil? && !room_excluded && (show_room_numbers || !id_excludes.empty?)
+            # asked again on each line, as it may not be loaded yet or may
+            # learn the UID later. While the logger's own map load runs, a
+            # found id is asked for again too: the UID table is rebuilt one
+            # room at a time, so a UID shared by several rooms can show one.
+            if look_up_lich_id && !room_uid_excluded && (lich_id.nil? || map_loader&.alive?)
               lich_id = lich_room_id(room_uid)
-              room_excluded = !lich_id.nil? && id_excludes.include?(lich_id.to_s)
+              room_id_excluded = !lich_id.nil? && id_excludes.include?(lich_id.to_s)
             end
-            next if room_excluded
+            next if room_uid_excluded || room_id_excluded
 
-            line = number_room_title(line, lich_id, room_uid, XMLData.game) if title_pattern&.match?(line)
+            line = number_room_title(line, lich_id, room_uid, XMLData.game) if title_pattern&.match?(line.b)
           end
           unless line =~ /^<\/?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)/
             unless defined?(stamp_enable)

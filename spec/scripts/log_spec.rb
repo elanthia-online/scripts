@@ -671,7 +671,8 @@ RSpec.describe GameLogger do
       let(:room) { { game: 'GSIV', count: 1, uid: 4_216_015, title: '[Sanctum of Scales, Columns]' } }
       # UID => Lich ids, as Map.ids_from_uid answers from the map's UID table.
       let(:uid_table) { {} }
-      # Strict doubles: any call other than Map.ids_from_uid fails the example.
+      # Strict doubles: any call other than Map.ids_from_uid and Map.loaded?
+      # (the map is loaded unless an example says otherwise) fails the example.
       let(:map) { double('Map') }
       let(:room_class) { double('Room') }
 
@@ -680,6 +681,7 @@ RSpec.describe GameLogger do
         stub_const('Map', map)
         stub_const('Room', room_class)
         allow(map).to receive(:ids_from_uid) { |uid| uid_table.fetch(uid, []) }
+        allow(map).to receive(:loaded?).and_return(true)
         allow(XMLData).to receive(:game) { room[:game] }
         allow(XMLData).to receive(:room_count) { room[:count] }
         allow(XMLData).to receive(:room_id) { room[:uid] }
@@ -755,6 +757,34 @@ RSpec.describe GameLogger do
           LogSpecHarness.feed('Gabriel says, "Meet me at [Sanctum of Scales, Columns]."')
 
           expect(log_with('--rnum')).to eq(['Gabriel says, "Meet me at [Sanctum of Scales, Columns]."'])
+        end
+
+        # A UTF-8 room title with a non-ASCII letter made a UTF-8 pattern,
+        # which raised Encoding::CompatibilityError on any binary
+        # (ASCII-8BIT) line with high bytes and ended the logger. The
+        # non-ASCII data is built at runtime (Custom/AsciiOnlySource).
+        context 'when the room title has letters outside ASCII' do
+          let(:e_acute) { [0xe9].pack('U') }
+          let(:title) { "[Caf#{e_acute} Row]" }
+          let(:high_byte_line) { "some #{[0xff].pack('C')} text".b }
+
+          before { room[:title] = title }
+
+          it 'numbers a binary title line and logs other binary lines with high bytes unchanged' do
+            uid_table[4_216_015] = [228]
+            LogSpecHarness.feed(title.b, high_byte_line, 'You also see a door.')
+
+            expect(log_with('--rnum').map(&:b)).to eq(
+              ["[Caf#{e_acute} Row - 228] (u4216015)".b, high_byte_line, 'You also see a door.'.b]
+            )
+          end
+
+          it 'numbers a UTF-8 title line too' do
+            uid_table[4_216_015] = [228]
+            LogSpecHarness.feed("#{title} (4216015)")
+
+            expect(log_with('--rnum')).to eq(["[Caf#{e_acute} Row - 228] (4216015)"])
+          end
         end
 
         it 'builds the title matcher once per room, not once per line' do
@@ -856,8 +886,9 @@ RSpec.describe GameLogger do
           )
         end
 
-        # Map.ids_from_uid never loads the map: until Lich or another script
-        # loads it (or adds the UID), the table answers [] for every room.
+        # Map.ids_from_uid never loads the map: until the map is loaded (by
+        # the logger's own load, see below, or by anything else) or learns
+        # the UID, the table answers [] for every room.
         context 'when the map learns the UID while the logger is in the room' do
           before do
             answers = [[], [288]]
@@ -891,6 +922,118 @@ RSpec.describe GameLogger do
 
           expect(log_with('--exclude=u7199')).to eq(['line 1', 'line 2'])
           expect(map).not_to have_received(:ids_from_uid)
+        end
+      end
+
+      # A-1: Lich loads the map only when something asks for it (in DR its
+      # own room display does not by default), so with a Lich number to find
+      # the logger loads it once, in a thread of its own.
+      context 'when nothing has loaded the map' do
+        let(:loaders) { [] }
+
+        before do
+          allow(map).to receive(:loaded?).and_return(false)
+          allow(map).to receive(:load).and_return(true)
+          allow(GameLogger).to receive(:start_map_load).and_wrap_original do |original|
+            original.call.tap { |loader| loaders << loader }
+          end
+        end
+
+        after { loaders.compact.each { |loader| loader.join(2) } }
+
+        def wait_for_loaders
+          loaders.compact.each { |loader| expect(loader.join(2)).not_to be_nil }
+        end
+
+        { '--rnum' => ['--rnum'], 'a Lich id in --exclude' => ['--exclude=u7199,288'] }.each do |label, args|
+          it "loads the map once, in its own thread, for #{label}" do
+            LogSpecHarness.feed('line 1', { count: 2, uid: 4_216_016 }, 'line 2')
+
+            expect(log_with(*args)).to eq(['line 1', 'line 2'])
+            wait_for_loaders
+            expect(GameLogger).to have_received(:start_map_load).once
+            expect(loaders.first).to be_a(Thread)
+            expect(map).to have_received(:load).once
+          end
+        end
+
+        { 'no room options' => [], 'only u-ids in --exclude' => ['--exclude=u7199'],
+          'a bare --exclude' => ['--exclude'] }.each do |label, args|
+          it "does not load the map with #{label}" do
+            LogSpecHarness.feed('line 1')
+
+            expect(log_with(*args)).to eq(['line 1'])
+            expect(GameLogger).not_to have_received(:start_map_load)
+            expect(map).not_to have_received(:loaded?)
+            expect(map).not_to have_received(:load)
+          end
+        end
+
+        it 'does not load the map again when it is already loaded' do
+          allow(map).to receive(:loaded?).and_return(true)
+          LogSpecHarness.feed('line 1')
+
+          expect(log_with('--rnum', '--exclude=288')).to eq(['line 1'])
+          expect(loaders).to eq([nil])
+          expect(map).not_to have_received(:load)
+        end
+
+        it 'keeps reading lines while the map loads, and excludes the room once it has' do
+          gate = Thread::Queue.new
+          allow(map).to receive(:load) do
+            gate.pop
+            uid_table[4_216_015] = [288]
+            true
+          end
+          LogSpecHarness.feed('line 1', 'line 2')
+
+          expect(log_with('--exclude=288')).to eq(['line 1', 'line 2'])
+          expect(loaders.first).to be_alive
+
+          gate << :loaded
+          wait_for_loaders
+          expect(GameLogger.lich_room_id(4_216_015)).to eq(288)
+        end
+
+        # The UID table is cleared and rebuilt one room at a time, so mid-load
+        # a UID shared by two rooms can show only the first.
+        it 'asks again for a Lich id found while the load is still running' do
+          gate = Thread::Queue.new
+          allow(map).to receive(:load) do
+            gate.pop
+            true
+          end
+          answers = [[228], [228, 229]]
+          allow(map).to receive(:ids_from_uid) { answers.size > 1 ? answers.shift : answers.first }
+          LogSpecHarness.feed('[Sanctum of Scales, Columns]', '[Sanctum of Scales, Columns]')
+
+          expect(log_with('--rnum')).to eq(
+            ['[Sanctum of Scales, Columns - 228] (u4216015)', '[Sanctum of Scales, Columns] (u4216015)']
+          )
+          expect(map).to have_received(:ids_from_uid).twice
+          gate << :loaded
+        end
+
+        it 'says so when no map database can be loaded' do
+          allow(map).to receive(:load).and_return(false)
+          LogSpecHarness.feed('line 1')
+
+          expect(log_with('--exclude=288')).to eq(['line 1'])
+          wait_for_loaders
+          expect(LogSpecHarness.echoes).to include(
+            'no map database could be loaded, so Lich room numbers in --exclude and --rnum match no room; u<uid> entries still work.'
+          )
+        end
+
+        it 'says so and keeps logging when the load raises' do
+          allow(map).to receive(:load).and_raise(Errno::EACCES, 'map.json')
+          LogSpecHarness.feed('line 1')
+
+          expect(log_with('--rnum')).to eq(['line 1'])
+          wait_for_loaders
+          expect(LogSpecHarness.echoes).to include(
+            'the map failed to load (Permission denied - map.json), so Lich room numbers in --exclude and --rnum match no room; u<uid> entries still work.'
+          )
         end
       end
 
