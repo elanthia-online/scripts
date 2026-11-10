@@ -22,10 +22,13 @@
        author: elanthia-online
  contributors: Tillmen, Tysong, Xanlin
          game: gs
-      version: 1.2.5
+      version: 1.2.6
      required: Lich >= 5.14.0
 
   changelog:
+    1.2.6 (2026-11-10):
+      * when typed commands stop being logged after an error, the logger echoes the error and where it happened, and the log file gets a line saying typed commands are not logged after it
+      * a log file that cannot be closed goes to the Lich log with its path and the error, instead of a bare "Can't close file!"
     1.2.5 (2026-11-10):
       * a log run reads its options when it starts and keeps them to itself, so another log run starting at the same time (;force log) can no longer give it its --exclude, --rnum, --timestamp or --lines
     1.2.4 (2026-11-10):
@@ -408,7 +411,8 @@ module GameLogger
   # logger stops (;kill, logout, Lich exiting) and not only when it starts a
   # new file; see {write_footer}. A file whose header could not be written
   # gets no footer, and is still closed, so an error in the header never
-  # leaves the file open.
+  # leaves the file open. A close that fails goes to the Lich log with the
+  # file's path and the error, and is otherwise ignored.
   #
   # @param filename [String] the log file path; an existing file is
   #   appended to
@@ -440,8 +444,8 @@ module GameLogger
       ensure
         begin
           file.close
-        rescue
-          Lich.log "Can't close file!"
+        rescue StandardError => e
+          Lich.log "log: closing the log file #{filename} failed (#{e.class}: #{e.message})"
         end
       end
     end
@@ -468,6 +472,43 @@ module GameLogger
 
     Lich.log "log: the footer of #{file.path} was not written while the logger stopped (#{e.class}: #{e.message})"
     nil
+  end
+
+  # Starts the thread that logs typed commands: each command lich-5 hands
+  # the script's upstream buffer is pushed onto its downstream buffer as
+  # ">command" (a leading "<c>" removed), so the get loop in {main} writes
+  # it in order with the game lines. When the thread stops on an error, it
+  # says why and leaves a notice in the log file, see {upstream_stopped}.
+  # Thread#kill (;kill, logout) stops it without either.
+  #
+  # @return [Thread] the started thread
+  def self.start_upstream_logger
+    Thread.new do
+      loop { Script.current.downstream_buffer.push ">#{upstream_get.sub(/^<c>/, '')}" }
+    rescue StandardError => e
+      upstream_stopped(e)
+    end
+  end
+
+  # Says that typed commands are no longer logged because the upstream
+  # thread (see {start_upstream_logger}) stopped on +error+: echoes the
+  # error's class, message and first backtrace line with what the user can
+  # do, and pushes one comment line onto the downstream buffer, so the log
+  # file shows where the ">command" lines end. The game lines are still
+  # logged. That line goes through the get loop like a game line: it is
+  # stamped when timestamps are on, and it is not written while the
+  # logger is in an --exclude room.
+  #
+  # @param error [StandardError] the error that stopped the thread
+  # @return [void]
+  def self.upstream_stopped(error)
+    reason = "#{error.class}: #{error.message.to_s.gsub(/\s+/, ' ').strip}"
+    where = error.backtrace&.first
+    name = Script.current.name
+    echo "typed commands are no longer logged: the upstream thread stopped on #{reason}#{" at #{where}" if where}. " \
+         "Game lines are still logged; restart the logger (;kill #{name}, then ;#{name}) to log typed commands again."
+    # "--" would end the comment early.
+    Script.current.downstream_buffer.push "<!-- log: typed commands are not logged after this line; the upstream thread stopped (#{reason.gsub('--', '- -')}) -->"
   end
 
   # Writes the lines lich-5's reget returned at the top of the first log
@@ -503,9 +544,9 @@ module GameLogger
   # line; stamps lines when {timestamp_format} returns a format. The file
   # header and footer carry that format, or the date and time when there is
   # none; a file also gets its footer when the logger stops (see
-  # {with_log_file}). Typed commands are logged as ">command" lines, lines seen in
-  # --exclude rooms are skipped, and --rnum adds the room number to room
-  # titles.
+  # {with_log_file}). Typed commands are logged as ">command" lines (see
+  # {start_upstream_logger}), lines seen in --exclude rooms are skipped,
+  # and --rnum adds the room number to room titles.
   #
   # The room for --exclude and --rnum is read from XMLData and the map's UID
   # table (see {lich_room_id}), never from Room.current or Map.current.
@@ -566,15 +607,7 @@ module GameLogger
     room_count = room_uid = room_title = title_pattern = lich_id = nil
     room_uid_excluded = room_id_excluded = false
 
-    Thread.new {
-      begin
-        loop {
-          Script.current.downstream_buffer.push ">#{upstream_get.sub(/^<c>/, '')}"
-        }
-      rescue
-        echo $!
-      end
-    }
+    start_upstream_logger
 
     started = false
     # The line that opens the next file. A line read after midnight belongs

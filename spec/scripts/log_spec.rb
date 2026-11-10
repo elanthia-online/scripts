@@ -792,6 +792,104 @@ RSpec.describe GameLogger do
       end
     end
 
+    # R-21: the upstream thread's rescue echoed only the bare message and
+    # wrote nothing to the file, so a pasted log just lost its commands.
+    context 'when the upstream thread stops on an error' do
+      let(:notice) { '<!-- log: typed commands are not logged after this line; the upstream thread stopped (RuntimeError: boom) -->' }
+
+      # The first typed command is logged; the next upstream_get raises
+      # +error+.
+      def type_then_fail(error)
+        calls = 0
+        allow(GameLogger).to receive(:upstream_get) do
+          calls += 1
+          raise error if calls > 1
+
+          '<c>look'
+        end
+      end
+
+      it 'echoes the error, where it was raised and how to log typed commands again' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        error = RuntimeError.new('boom')
+        type_then_fail(error)
+
+        run_main
+
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/)).to eq(
+          [
+            "typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at #{error.backtrace.first}. " \
+            'Game lines are still logged; restart the logger (;kill log, then ;log) to log typed commands again.'
+          ]
+        )
+      end
+
+      it 'writes one line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        LogSpecHarness.feed('line 1')
+        type_then_fail(RuntimeError.new('boom'))
+
+        run_main
+
+        expect(log_lines.drop(2)).to eq(['line 1', '>look', notice, default_stamp])
+      end
+
+      it 'stamps that line like a game line when timestamps are on' do
+        use_options(OpenStruct.new(timestamp: '%H:%M'))
+        LogSpecHarness.idle_timeout = 0.5
+        type_then_fail(RuntimeError.new('boom'))
+
+        run_main
+
+        expect(log_lines.last(3)).to eq(['10:00: >look', "10:00: #{notice}", '10:00'])
+      end
+
+      it 'puts a message over several lines on one line, and breaks up "--" so the comment is not closed early' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        type_then_fail(IOError.new("closed stream\n--> see above"))
+
+        run_main
+
+        expect(log_lines[-2]).to eq('<!-- log: typed commands are not logged after this line; the upstream thread stopped (IOError: closed stream - -> see above) -->')
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on IOError: closed stream --> see above at ')
+      end
+
+      it 'does not write the line in an --exclude room' do
+        use_options(GameLogger::Opts.parse(['--exclude=u1234']))
+        LogSpecHarness.idle_timeout = 0.5
+        type_then_fail(RuntimeError.new('boom'))
+
+        run_main
+
+        expect(log_lines.drop(2)).to eq([default_stamp])
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands are no longer logged: /).size).to eq(1)
+      end
+    end
+
+    describe '.start_upstream_logger' do
+      # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
+      it 'says nothing and leaves no line when the thread is killed, as ;kill log does' do
+        waiting = Thread::Queue.new
+        allow(GameLogger).to receive(:upstream_get) do
+          waiting << true
+          sleep # waits for the next typed command until ;kill
+        end
+        thread = GameLogger.start_upstream_logger
+        Timeout.timeout(2) { waiting.pop }
+
+        thread.kill
+        thread.join(2)
+
+        expect(thread).not_to be_alive
+        expect(LogSpecHarness.echoes).to eq([])
+        expect(LogSpecHarness::DOWNSTREAM).to be_empty
+      end
+    end
+
     # R-05, R-07, R-18, R-19, R-34: --rnum and --exclude take the room from
     # XMLData and the map's UID table only (Q-13 A), never from
     # Room.current or Map.current, which can send LOCATION/PEER from the
@@ -1470,6 +1568,31 @@ RSpec.describe GameLogger do
         expect(files.first).to be_closed
         expect(log_lines).to eq([default_stamp, marker, 'a'])
         expect(Lich).not_to have_received(:log)
+      end
+    end
+
+    # R-22: a close that failed logged a bare "Can't close file!", with
+    # neither the file nor the error.
+    context 'when the file cannot be closed' do
+      it 'logs the file and the error to the Lich log and stops as it would have' do
+        use_options(OpenStruct.new)
+        allow(Lich).to receive(:log)
+        LogSpecHarness.feed('line 1')
+        allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+          original.call(*args, &block).tap do |file|
+            next unless file.is_a?(File)
+
+            allow(file).to receive(:close).and_wrap_original do |close|
+              close.call
+              raise IOError, 'device gone'
+            end
+          end
+        end
+
+        expect { run_main }.not_to raise_error
+
+        expect(log_lines.drop(2)).to eq(['line 1', default_stamp])
+        expect(Lich).to have_received(:log).with("log: closing the log file #{find_log_file} failed (IOError: device gone)")
       end
     end
 
