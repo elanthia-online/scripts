@@ -2485,6 +2485,26 @@ module LogSpecHarness::Env
         expect(File.read(file_at('2026/07/2026-07-01_08-30-00.log')).lines(chomp: true)).to eq([stamp, 'line 1', stamp])
       end
 
+      # A mode's header_stamp (Mode::TEXT has none) makes the header line
+      # when timestamps are off; the footer keeps the default stamp.
+      describe '.with_log_file with a header_stamp' do
+        let(:path) { File.join(log_dir, 'header.log') }
+        let(:header_stamp) { ->(time) { "header at #{time.strftime('%H:%M')}" } }
+
+        it 'writes the header_stamp line as the header when timestamps are off' do
+          GameLogger.with_log_file(path, nil, clock: clock, header_stamp: header_stamp) { |file| file.puts 'line 1' }
+
+          expect(File.read(path).lines(chomp: true))
+            .to eq(['header at 08:30', 'line 1', "2026-07-01 08:30:00.000 #{clock.now.strftime('%:z')}"])
+        end
+
+        it 'writes the timestamp format as the header when timestamps are on' do
+          GameLogger.with_log_file(path, '%T', clock: clock, header_stamp: header_stamp) { |file| file.puts 'line 1' }
+
+          expect(File.read(path).lines(chomp: true)).to eq(['08:30:00', 'line 1', '08:30:00'])
+        end
+      end
+
       describe '#format_line' do
         it 'returns the line as it is without a timestamp format' do
           logger = GameLogger::Logger.new(OpenStruct.new)
