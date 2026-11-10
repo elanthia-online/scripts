@@ -210,6 +210,16 @@ raise "Extracted code does not look like a single module" unless module_code.sca
 
 module_line = script_content.lines.index { |l| l.start_with?('module GameLogger') } + 1
 
+# Lich evaluates log.lic from its first line, so its magic comment
+# (frozen_string_literal) applies to every literal in the module and the
+# script body. Each extracted piece gets the same comment on a line of its
+# own, one line above where it starts, so literals are frozen here as they
+# are in Lich and backtraces still give log.lic's line numbers.
+magic_comment = script_content.lines.first[/\A#\s*frozen_string_literal:\s*\w+\s*\n/].to_s
+magic_lines = magic_comment.empty? ? 0 : 1
+module_code = magic_comment + module_code
+module_line -= magic_lines
+
 # Evaluates log.lic's `module GameLogger` body in LogSpecHarness::Env, as
 # Lich does each time the script starts: every run of log.lic in a session
 # evaluates the module again in the same namespace, while earlier runs may
@@ -226,7 +236,8 @@ LogSpecHarness.evaluate_game_logger
 # calls with no receiver (hide_me) go to ScriptHelpers; the line number
 # keeps backtraces pointing at log.lic.
 script_body_line = script_content.lines.index { |l| l.start_with?('=end') } + 2
-script_body = script_content.lines.drop(script_body_line - 1).join
+script_body = magic_comment + script_content.lines.drop(script_body_line - 1).join
+script_body_line -= magic_lines
 LogSpecHarness::Env.extend(LogSpecHarness::ScriptHelpers)
 LogSpecHarness.define_singleton_method(:run_whole_script) do
   LogSpecHarness::Env.module_eval(script_body, script_path, script_body_line)
@@ -2589,6 +2600,14 @@ module LogSpecHarness::Env
         expect(mode.extension).to eq('.log')
         expect(mode.started_text).to eq('Non-XML Logging started, currently logging to')
         expect(mode.upstream_line.call('<c>look')).to eq('>look')
+      end
+
+      # log.lic's first line is "# frozen_string_literal: true" and Lich
+      # evaluates the file from there, so the harness does too: a change
+      # that mutates a literal fails here, not only in Lich.
+      it "has log.lic's string literals frozen, as Lich evaluates the file" do
+        expect(GameLogger::Mode::TEXT.started_text).to be_frozen
+        expect(GameLogger::Logger::REGET_MARKER).to be_frozen
       end
     end
 
