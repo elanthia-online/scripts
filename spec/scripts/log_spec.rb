@@ -1848,6 +1848,42 @@ module LogSpecHarness::Env
           )
         end
 
+        # R-31: each file goes in the year and month folders of its own
+        # start, so a new day that is a new month or year opens new folders.
+        it 'puts the file of a new month and of a new year under their own year/month folders' do
+          december_last = Time.new(2026, 12, 31, 23, 59, 59)
+          new_year = Time.new(2027, 1, 1, 0, 0, 1)
+          use_options(OpenStruct.new)
+          LogSpecHarness.feed('april line', december_last, 'december line', new_year, 'january line')
+
+          run_main
+
+          expect(log_files.transform_values { |lines| lines[-2] }).to eq(
+            '2026/04/2026-04-23_10-00-05.log' => 'april line',
+            '2026/12/2026-12-31_23-59-59.log' => 'december line',
+            '2027/01/2027-01-01_00-00-01.log' => 'january line'
+          )
+        end
+
+        # An error from get (not the StopIteration that ends the loop) is
+        # not swallowed: the file gets its footer, is closed, and the error
+        # stops the logger.
+        it 'ends the file with its footer and lets an error raised while reading a line through' do
+          use_options(OpenStruct.new)
+          LogSpecHarness.feed('line 1', 'line 2')
+          reads = 0
+          allow(GameLogger).to receive(:get).and_wrap_original do |original|
+            reads += 1
+            raise IOError, 'stream closed' if reads == 2
+
+            original.call
+          end
+
+          expect { run_main }.to raise_error(IOError, 'stream closed')
+
+          expect(log_files).to eq('2026/04/2026-04-23_10-00-05.log' => [default_stamp, marker, 'line 1', default_stamp])
+        end
+
         it 'appends to an existing file of the same name when the logger starts' do
           month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
           FileUtils.mkdir_p(month)
