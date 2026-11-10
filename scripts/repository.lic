@@ -10,9 +10,11 @@
           game: any
           tags: core
       required: Lich > 5.0.1
-       version: 2.76
+       version: 2.77
 
   changelog:
+    2.77 (2026-11-09):
+      ;repository gui is a Lich WebUI window instead of GTK: browse, search, read comments and download
     2.76 (2026-10-07):
       Fix change-password saving the new password where later commands can't find it
     2.75 (2026-09-28):
@@ -884,187 +886,182 @@ module RepositoryTillmen
     end
   end
 
-  # GUI implementation
-  if defined?(Gtk)
-    class RepositoryGUI
-      class Setup < Gtk::Builder
-        CATEGORIES = {} unless defined?(CATEGORIES)
-        CATEGORIES.merge!({
-          general: {
-            repository: {
-              default: [],
-              load: proc do |store, setting|
-                store.clear
-                setting.each do |item|
-                  votes = item[7].to_i.positive? ? item[7] : ''
-                  rating = item[7].to_i.positive? ? "#{(item[6].to_f / item[7].to_f).to_s.slice(/^[0-9]+(?:\.[0-9])?/)}" : ''
-                  downloads = item[5].dup.to_i > 999 ? item[5].dup.reverse!.gsub!(/(\d{3})(?=\d)/, '\\1,').reverse! : item[5]
+  # GUI implementation: ;repository gui, a native Lich WebUI window to browse
+  # and search the script list and download a script, as the GTK window did.
+  class RepositoryGUI
+    class Setup
+      # Lich keeps this class between runs in a session; start each run clean.
+      constants(false).each { |name| remove_const(name) }
 
-                  iter = store.append
-                  iter[0] = item[0] # filename
-                  iter[1] = item[1] # game
-                  iter[2] = "#{(item[2].to_f / 1024).to_s.slice(/^[0-9]+(?:\.[0-9])?/)}k" # size_show
-                  iter[3] = item[2].to_i # size_sort
-                  iter[4] = Time.at(item[3].to_i).strftime("%Y-%m-%d") # last_updated
-                  iter[5] = item[4] # author
-                  iter[6] = downloads # DLs_show
-                  iter[7] = item[5].to_i # DLs_sort
-                  iter[8] = rating # ratings_show
-                  iter[9] = rating.to_f # ratings_sort
-                  iter[10] = votes # votes_show
-                  iter[11] = votes.to_i # votes_sort
-                  iter[12] = item[8] # tags
-                  iter[13] = item[9] # comments
-                end
-              end
-            },
-            search_entry: { default: '' },
-            download_link: { default: '' },
-            link_data: { default: '' }
-          }
-        })
+      PAGE_ID = 'repository-gui'
+      DOWNLOAD_HOLD = 10 # seconds the button stays off after a download, against double clicks
 
-        def self.get_category(key)
-          CATEGORIES.each { |category, data| return category unless data[key].nil? }
+      def self.available?
+        defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
+          defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+      end
+
+      # One script from the server list, ready to show:
+      # [filename, game, size, updated, author, downloads, rating total, votes, tags, comments]
+      def self.row(item)
+        votes = item[7].to_i
+        {
+          file: item[0].to_s, game: item[1].to_s,
+          size_k: (item[2].to_f / 1024).round(1), updated: Time.at(item[3].to_i).strftime('%Y-%m-%d'),
+          author: item[4].to_s, downloads: item[5].to_i,
+          rating: votes.positive? ? (item[6].to_f / votes).floor(1) : nil, votes: votes.positive? ? votes : nil,
+          tags: item[8].to_s, comments: item[9].to_s, search: item.map { |c| c.to_s.downcase }
+        }
+      end
+
+      # Blocks until the window is closed, as the GTK window did.
+      def initialize(repo_list)
+        @owner = Script.current
+        @all = repo_list[1..].to_a.sort_by { |item| item.first.to_s.downcase }.map { |item| Setup.row(item) }
+        @shown = @all
+        @search = ''
+        @selected = nil
+        @held_until = nil
+        @closed = Queue.new
+        run
+      end
+
+      attr_reader :shown, :search
+
+      def run
+        gui = self
+        @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: 'Repository Search',
+                                     props: { size: [1200, 650], bare: true, density: :compact, viewport: true },
+                                     on: { close: ->(_ev) { gui.closed } }) do |ui|
+          gui.render(ui)
+        end
+        Lich::API.webui_refresh(@page)
+        Lich::API.webui_start
+        unless Lich::API.webui_open(page: @page)
+          echo 'error: could not open a window for the repository browser'
+          return
+        end
+        @closed.pop
+      ensure
+        begin
+          Lich::WebUI.terminate_owner(@owner)
+        rescue StandardError
           nil
         end
+      end
 
-        def self.get_setting(key)
-          cat = get_category(key)
-          return nil if cat.nil?
+      def closed
+        @closed << :closed
+      end
 
-          CATEGORIES[cat].each { |setting, data| return data if setting == key }
-          nil
+      def close_clicked
+        @closed << :closed
+        Lich::WebUI.close(@page)
+      end
+
+      def cb(&block)
+        gui = self
+        lambda do |ev|
+          block.call(ev)
+        rescue StandardError => e
+          echo "repository gui: #{e.class}: #{e.message}"
+        ensure
+          gui.redraw
         end
+      end
 
-        def initialize(repo_list)
-          return unless defined?(Gtk) && Gtk::Version::MAJOR == 3
+      def redraw
+        Lich::API.webui_refresh(@page) if @page
+      end
 
-          super()
+      # Filter on every column, as the GTK window's search did.
+      def set_search(text)
+        @search = text.to_s
+        needle = @search.downcase
+        @shown = needle.empty? ? @all : @all.select { |r| r[:search].any? { |c| c.include?(needle) } }
+        @selected = nil unless @shown.include?(@selected)
+      end
 
-          @running = true
-          @repo_list = repo_list
+      def select(key)
+        @selected = @shown[key.to_s.delete_prefix('r').to_i]
+      end
 
-          # Remove the first element (header)
-          @data_without_header = @repo_list[1..-1]
+      def selected = @selected
 
-          # Sort the array by the first element of each subarray
-          @data_without_header = @data_without_header.sort_by { |subarray| subarray.first.downcase }
+      def link
+        return nil unless @selected
 
-          Gtk.queue do
-            add_from_string(self.class.repository_ui)
-            load_settings
+        "download #{@selected[:file]} --author=#{@selected[:author]} --game=#{@selected[:game]}"
+      end
 
-            self['main'].show_all
-            self['main'].keep_above = true
-            self['main'].set_title "Repository Search"
+      def held?
+        (@held_until && Time.now < @held_until && @held_link == link) ? true : false
+      end
 
-            connect_signals { |handler| method(handler) }
+      def download
+        cmd = link or return
+        return if held?
 
-            # Access the GtkSearchEntry widget
-            search_entry = self['search_entry']
+        @held_until = Time.now + DOWNLOAD_HOLD
+        @held_link = cmd
+        Script.start('repository', cmd, force: true)
+        Thread.new do
+          sleep DOWNLOAD_HOLD
+          redraw
+        end
+      end
 
-            # Connect signal to handle search entry text changes
-            search_entry.signal_connect('changed') do
-              search_text = search_entry.text
-              filter_data(search_text)
-            end
-
-            # Connect signal to handle search activation (e.g., pressing Enter)
-            search_entry.signal_connect('activate') do
-              search_text = search_entry.text
-              filter_data(search_text)
-            end
+      def render(ui)
+        gui = self
+        rows = @shown
+        sel = @selected
+        ui.stack(key: 'repo', gap: 6, margin: 8, fill: true) do
+          ui.columns(key: 'bar', count: 3, weights: [3, 2, 4], compact: true, row_align: :end, gap: 6) do
+            ui.text_input(slot: '0', key: 'search', label: 'Keyword Search', search: true, value: gui.search, change_mode: :input,
+                          placeholder: 'name, author, game, tags or comments',
+                          on: { change: gui.cb { |ev| gui.set_search(ev.payload[:value]) } })
+            ui.button(slot: '1', key: 'download', label: sel ? "Download #{sel[:file]}" : 'Download selected script',
+                      variant: :primary, disabled: sel.nil? || gui.held?,
+                      tooltip: gui.held? ? 'Just started; it is available again in a few seconds.' : 'Runs ;repository download for the selected script.',
+                      on: { activate: gui.cb { gui.download } })
+            ui.text(slot: '2', key: 'count', emphasis: :subtle, content: "#{rows.size} script(s)#{gui.search.empty? ? '' : " matching '#{gui.search}'"}")
           end
-
-          wait_while { @running }
-        end
-
-        def load_settings
-          Gtk.queue do
-            objects.each do |obj|
-              next unless obj.methods.include?(:builder_name)
-
-              key = obj.builder_name.to_sym
-              setting = self.class.get_setting(key)
-              next if setting.nil?
-
-              case obj
-              when Gtk::Label
-                self[key].visible = false if key == :link_data
-              when Gtk::Button
-                if key == :download_link
-                  self[key].signal_connect("clicked") do |button|
-                    link = self['link_data'].text
-                    next if link == 'label'
-
-                    # Disable briefly so a double click doesn't start a duplicate download
-                    button.sensitive = false
-                    @pending_link = link
-                    GLib::Source.remove(@download_timer) if @download_timer
-                    Script.start('repository', link, force: true)
-                    @download_timer = GLib::Timeout.add_seconds(10) do
-                      @download_timer = nil
-                      @pending_link = nil
-                      button.sensitive = true if @running
-                      false # one-shot timer
-                    end
-                  end
-                end
-              when Gtk::Entry
-                obj.text = ''
-              when Gtk::TreeView
-                store = self["#{key}_store"]
-                if store.nil?
-                  respond "** failed to find store for treeview #{key}"
-                  next
-                elsif setting[:load].nil?
-                  respond "** no :load defined #{key}"
-                  next
-                end
-
-                setting[:load].call(store, @data_without_header)
-
-                self[key].signal_connect('row-activated') do |_, path, _|
-                  iter = self["#{key}_store"].get_iter(path)
-                  self['comments'].text = iter[13]
-                  self['download_link'].label = iter[0]
-                  self['link_data'].text = "download #{iter[0]} --author=#{iter[5]} --game=#{iter[1]}"
-                  # Stay disabled if this is the script that was just downloaded
-                  self['download_link'].sensitive = self['link_data'].text != @pending_link
-                end
+          ui.split(key: 'split', orientation: :horizontal, position: 70, fill: true) do
+            idx = sel && rows.index(sel)
+            ui.table(slot: 'first', key: 'scripts', headers: true, selection: :single, fill: true, sortable: true,
+                     selected: idx ? ["r#{idx}"] : [],
+                     columns: [{ key: 'file', label: 'File Name', sortable: true, expand: true },
+                               { key: 'game', label: 'Game', sortable: true, width: 60 },
+                               { key: 'size', label: 'Size (k)', sortable: true, width: 70, align: :end },
+                               { key: 'updated', label: 'Last Updated', sortable: true, width: 100 },
+                               { key: 'author', label: 'Author', sortable: true, width: 110 },
+                               { key: 'dls', label: 'DLs', sortable: true, width: 70, align: :end },
+                               { key: 'rating', label: 'Rating', sortable: true, width: 60, align: :end },
+                               { key: 'votes', label: 'Votes', sortable: true, width: 60, align: :end },
+                               { key: 'tags', label: 'Tags', sortable: true, width: 160 }],
+                     rows: rows.each_with_index.map do |r, i|
+                       { key: "r#{i}", cells: { 'file' => r[:file], 'game' => r[:game], 'size' => r[:size_k], 'updated' => r[:updated],
+                                                'author' => r[:author], 'dls' => r[:downloads], 'rating' => r[:rating] || '',
+                                                'votes' => r[:votes] || '', 'tags' => r[:tags] } }
+                     end,
+                     on: { selection_change: gui.cb { |ev| key = Array(ev.payload[:rows]).first; gui.select(key) if key } })
+            ui.group(slot: 'second', key: 'comments-box', label: 'Comments', fill: true) do
+              ui.scroll(key: 'comments-scroll', fill: true) do
+                text = if sel.nil?
+                         'Comments from selected script (if any) will be shown here'
+                       elsif sel[:comments].strip.empty?
+                         "No comments for #{sel[:file]}."
+                       else
+                         sel[:comments]
+                       end
+                ui.text(key: 'comments', content: text, wrap: true)
               end
             end
           end
-        end
-
-        def filter_data(search_text)
-          search_text.downcase!
-          filtered_data = @data_without_header.select do |item|
-            item.any? { |column| column.to_s.downcase.include?(search_text) }
+          ui.columns(key: 'footer', count: 2, weights: [6, 1], compact: true, row_align: :center, gap: 6) do
+            ui.text(slot: '0', key: 'hint', emphasis: :subtle, content: 'Click a script to see its comments, then download it.')
+            ui.button(slot: '1', key: 'close', label: 'Close', on: { activate: ->(_ev) { gui.close_clicked } })
           end
-
-          # Reset comments box and download button
-          self['comments'].text = ''
-          self['download_link'].label = 'Download selected script'
-          self['download_link'].sensitive = true
-          self['link_data'].text = 'label'
-
-          # refresh the GtkTreeView using the load proc
-          CATEGORIES[:general][:repository][:load].call(self[:repository_store], filtered_data)
-        end
-
-        def on_close_clicked
-          self['main'].destroy
-        end
-
-        def on_destroy
-          # Already on the GTK thread; set immediately so pending download timers see it
-          @running = false
-        end
-
-        def self.repository_ui
-          '<?xml version="1.0" encoding="UTF-8"?><!-- Generated with glade 3.38.2 --><interface><requires lib="gtk+" version="3.20"/><object class="GtkListStore" id="repository_store"><columns><!-- column-name filename --><column type="gchararray"/><!-- column-name game --><column type="gchararray"/><!-- column-name size --><column type="gchararray"/><!-- column-name size_int --><column type="gint"/><!-- column-name last_updated --><column type="gchararray"/><!-- column-name author --><column type="gchararray"/><!-- column-name downloads --><column type="gchararray"/><!-- column-name downloads_int --><column type="gint"/><!-- column-name ratings --><column type="gchararray"/><!-- column-name ratings_float --><column type="gfloat"/><!-- column-name votes --><column type="gchararray"/><!-- column-name votes_int --><column type="gint"/><!-- column-name tags --><column type="gchararray"/><!-- column-name comments --><column type="gchararray"/></columns></object><object class="GtkWindow" id="main"><property name="can-focus">False</property><property name="default-width">1200</property><property name="default-height">650</property><signal name="destroy" handler="on_destroy" swapped="no"/><child><object class="GtkBox"><property name="visible">True</property><property name="can-focus">False</property><property name="orientation">vertical</property><property name="spacing">5</property><child><object class="GtkNotebook"><property name="visible">True</property><property name="can-focus">True</property><property name="hexpand">True</property><property name="vexpand">True</property><property name="show-tabs">False</property><child><object class="GtkScrolledWindow"><property name="visible">True</property><property name="can-focus">True</property><property name="shadow-type">in</property><child><object class="GtkViewport"><property name="visible">True</property><property name="can-focus">False</property><child><object class="GtkBox"><property name="visible">True</property><property name="can-focus">False</property><property name="orientation">vertical</property><child><object class="GtkFrame"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">10</property><property name="label-xalign">0</property><child><!-- n-columns=3 n-rows=3 --><object class="GtkGrid"><property name="visible">True</property><property name="can-focus">False</property><child><object class="GtkScrolledWindow"><property name="width-request">800</property><property name="height-request">500</property><property name="visible">True</property><property name="can-focus">True</property><property name="halign">start</property><property name="border-width">5</property><property name="shadow-type">in</property><child><object class="GtkTreeView" id="repository"><property name="visible">True</property><property name="can-focus">True</property><property name="model">repository_store</property><property name="enable-search">False</property><property name="search-column">0</property><property name="fixed-height-mode">True</property><property name="enable-grid-lines">both</property><property name="activate-on-single-click">True</property><child internal-child="selection"><object class="GtkTreeSelection"/></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">File Name</property><property name="sort-column-id">0</property><child><object class="GtkCellRendererText"/><attributes><attribute name="text">0</attribute></attributes></child></object></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">Game</property><property name="clickable">True</property><property name="sort-column-id">1</property><child><object class="GtkCellRendererText"><property name="xalign">0.5099999904632568</property></object><attributes><attribute name="text">1</attribute></attributes></child></object></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">Size</property><property name="clickable">True</property><property name="sort-column-id">3</property><child><object class="GtkCellRendererText"><property name="xalign">1</property></object><attributes><attribute name="text">2</attribute></attributes></child></object></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">Last Updated</property><property name="clickable">True</property><property name="sort-column-id">4</property><child><object class="GtkCellRendererText"><property name="xalign">0.5099999904632568</property></object><attributes><attribute name="text">4</attribute></attributes></child></object></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">Author</property><property name="clickable">True</property><property name="sort-column-id">5</property><child><object class="GtkCellRendererText"/><attributes><attribute name="text">5</attribute></attributes></child></object></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">DLs</property><property name="clickable">True</property><property name="sort-column-id">7</property><child><object class="GtkCellRendererText"><property name="xalign">1</property></object><attributes><attribute name="text">6</attribute></attributes></child></object></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">Rating</property><property name="clickable">True</property><property name="sort-column-id">9</property><child><object class="GtkCellRendererText"><property name="xalign">1</property></object><attributes><attribute name="text">8</attribute></attributes></child></object></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">Votes</property><property name="clickable">True</property><property name="sort-column-id">11</property><child><object class="GtkCellRendererText"><property name="xalign">1</property></object><attributes><attribute name="text">10</attribute></attributes></child></object></child><child><object class="GtkTreeViewColumn"><property name="resizable">True</property><property name="sizing">fixed</property><property name="title" translatable="yes">Tags</property><property name="clickable">True</property><property name="sort-column-id">12</property><child><object class="GtkCellRendererText"/><attributes><attribute name="text">12</attribute></attributes></child></object></child></object></child></object><packing><property name="left-attach">0</property><property name="top-attach">2</property></packing></child><child><object class="GtkScrolledWindow"><property name="visible">True</property><property name="can-focus">True</property><property name="hexpand">True</property><property name="border-width">5</property><property name="shadow-type">in</property><child><object class="GtkViewport"><property name="visible">True</property><property name="can-focus">False</property><child><object class="GtkLabel" id="comments"><property name="visible">True</property><property name="can-focus">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-top">5</property><property name="label" translatable="yes">Comments from selected script (if any) will be shown here</property><property name="wrap">True</property></object></child></object></child></object><packing><property name="left-attach">1</property><property name="top-attach">2</property></packing></child><child><!-- n-columns=3 n-rows=2 --><object class="GtkGrid"><property name="visible">True</property><property name="can-focus">False</property><child><object class="GtkSearchEntry" id="search_entry"><property name="width-request">300</property><property name="visible">True</property><property name="can-focus">True</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-top">5</property><property name="margin-bottom">10</property><property name="primary-icon-name">edit-find-symbolic</property><property name="primary-icon-activatable">False</property><property name="primary-icon-sensitive">False</property><property name="placeholder-text" translatable="yes">Keyword Search</property></object><packing><property name="left-attach">0</property><property name="top-attach">1</property><property name="width">2</property></packing></child><child><object class="GtkLabel" id="link_data"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">label</property></object><packing><property name="left-attach">2</property><property name="top-attach">1</property></packing></child><child><placeholder/></child><child><placeholder/></child><child><placeholder/></child></object><packing><property name="left-attach">0</property><property name="top-attach">0</property><property name="height">2</property></packing></child><child><object class="GtkButton" id="download_link"><property name="label" translatable="yes">Download selected script</property><property name="width-request">200</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">True</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">10</property></object><packing><property name="left-attach">1</property><property name="top-attach">1</property></packing></child><child><placeholder/></child><child><placeholder/></child><child><placeholder/></child><child><placeholder/></child></object></child><child type="label"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property></object></child></object><packing><property name="expand">False</property><property name="fill">True</property><property name="position">0</property></packing></child><child><placeholder/></child></object></child></object></child></object></child><child type="tab"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes"> Profiles </property></object><packing><property name="tab-fill">False</property><property name="reorderable">True</property></packing></child></object><packing><property name="expand">False</property><property name="fill">True</property><property name="position">0</property></packing></child><child><object class="GtkBox"><property name="visible">True</property><property name="can-focus">False</property><child><placeholder/></child><child><object class="GtkButton"><property name="label" translatable="yes">Close</property><property name="width-request">80</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">True</property><property name="halign">end</property><property name="margin-end">10</property><property name="margin-top">5</property><property name="margin-bottom">10</property><property name="hexpand">True</property><signal name="clicked" handler="on_close_clicked" swapped="no"/></object><packing><property name="expand">False</property><property name="fill">True</property><property name="position">1</property></packing></child></object><packing><property name="expand">False</property><property name="fill">True</property><property name="pack-type">end</property><property name="position">1</property></packing></child></object></child></object></interface>'
         end
       end
     end
@@ -2777,8 +2774,8 @@ module RepositoryTillmen
     end
 
     def execute_gui
-      unless defined?(Gtk)
-        echo "error: no gtk"
+      unless RepositoryGUI::Setup.available?
+        echo 'error: the repository browser needs the Lich WebUI; ;repository list and ;repository info work without it'
         exit
       end
 
