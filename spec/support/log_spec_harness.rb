@@ -40,10 +40,14 @@ module LogSpecHarness
     attr_accessor :server_buffer
     # The current run's Script.current (see new_script).
     attr_reader :script, :echoes
+    # The scripts running besides the current run, for Script.running and
+    # Script.hidden: OpenStructs with a name and hidden ([] after reset!).
+    attr_accessor :other_scripts
 
     # Puts the harness back to a fresh start for the next example: empty
     # buffers, no echoes, no settings, no server buffer, no upstream
-    # thread, and a new Script.current with no arguments.
+    # thread, no other running scripts, and a new Script.current with no
+    # arguments.
     #
     # @return [OpenStruct] the new Script.current (see {new_script})
     def reset!
@@ -56,6 +60,7 @@ module LogSpecHarness
       @hide_me_calls = 0
       @settings = OpenStruct.new
       @server_buffer = []
+      @other_scripts = []
       @script = new_script
     end
 
@@ -248,11 +253,23 @@ module LogSpecHarness
       def self.log(_msg); end
     end
 
-    # Lich's Script, for Script.current only.
+    # Lich's Script, for Script.current, Script.running and Script.hidden.
     class Script
       # @return [OpenStruct] the current run's script (see
       #   {LogSpecHarness.new_script})
       def self.current = LogSpecHarness.script
+
+      # lich-5's Script.running: the running scripts that are not hidden.
+      #
+      # @return [Array<OpenStruct>] the {LogSpecHarness.other_scripts} not
+      #   hidden (the current run has called hide_me)
+      def self.running = LogSpecHarness.other_scripts.reject(&:hidden)
+
+      # lich-5's Script.hidden: the running scripts that are hidden.
+      #
+      # @return [Array<OpenStruct>] the current run, then the
+      #   {LogSpecHarness.other_scripts} that are hidden
+      def self.hidden = [LogSpecHarness.script, *LogSpecHarness.other_scripts.select(&:hidden)]
     end
   end
 

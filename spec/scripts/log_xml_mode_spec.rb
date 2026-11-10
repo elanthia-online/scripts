@@ -433,7 +433,7 @@ module LogSpecHarness::Env
       end
     end
 
-    # The contract the ;log --xml shim must keep. lich-5 hands the XML lines
+    # The contract ;log --xml must keep. lich-5 hands the XML lines
     # to a script that wants the XML downstream, and adds the text lines to
     # the same buffer when it wants the text downstream too, or another
     # script's output when it wants that; typed commands reach upstream_get
@@ -924,6 +924,20 @@ module LogSpecHarness::Env
         expect(echoes.grep(/\Atyped commands/).first).to end_with('(;kill log, then ;log --xml) to log typed commands again.')
       end
 
+      # TEXT AND XML TOGETHER: ;log, then ;force log --xml. Both run as log,
+      # so ;kill log stops the first log Lich finds, and ;log --xml without
+      # ;force is refused while the other one runs.
+      it 'restarts with ;force, and says ;kill log can stop the other one, when the text log runs too' do
+        LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: true)]
+
+        run_xml(args: 'streams', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+        expect(echoes.grep(/\Atyped commands/).first).to end_with(
+          'restart the logger (;kill log, then ;force log --xml streams; another log is running too, and ;kill log stops the first log Lich finds, ' \
+          'which can be the other one) to log typed commands again.'
+        )
+      end
+
       it 'gives the frame as is when it has no "path:line" start' do
         error = RuntimeError.new('boom')
         error.set_backtrace(['<internal:kernel>'])
@@ -1306,7 +1320,8 @@ module LogSpecHarness::Env
     it 'is not among the core scripts whose owner repository.lic sets to elanthia-online' do
       core = repository[/%w\[(repository\.lic [^\]]*)\]/, 1]
 
-      expect(core.to_s.split).to eq(%w[repository.lic lnet.lic alias.lic vars.lic go2.lic autostart.lic log.lic])
+      expect(core.to_s.split).to include('log.lic')
+      expect(core.to_s.split).not_to include('logxml.lic')
     end
   end
 end

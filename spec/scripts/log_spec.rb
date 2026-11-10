@@ -1047,6 +1047,40 @@ module LogSpecHarness::Env
           expect(LogSpecHarness.echoes.first).to end_with('(;kill log, then ;log) to log typed commands again.')
         end
 
+        # ;log plus ;force log --xml: both run as log. ;kill log stops the
+        # first log Lich finds, and ;log without ;force is refused while the
+        # other one runs (lich-5 v5.21.0 lib/global_defs.rb:2500,
+        # lib/common/script.rb:744).
+        it 'restarts with ;force, and says ;kill log can stop the other one, when another log is running (hidden, as log hides itself)' do
+          LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: true)]
+
+          GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
+
+          expect(LogSpecHarness.echoes.first).to end_with(
+            'restart the logger (;kill log, then ;force log; another log is running too, and ;kill log stops the first log Lich finds, ' \
+            'which can be the other one) to log typed commands again.'
+          )
+        end
+
+        it 'restarts with ;force when the other log is not hidden, and when its name differs only in case' do
+          LogSpecHarness.other_scripts = [OpenStruct.new(name: 'LOG', hidden: false)]
+          allow(Script.current).to receive(:vars).and_return(['--rnum', '--rnum'])
+
+          GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
+
+          expect(LogSpecHarness.echoes.first).to include('(;kill log, then ;force log --rnum; another log is running too, ')
+        end
+
+        # A run named logxml (an install's local logxml.lic) does not block
+        # ;log, and ;kill log picks the exact name first.
+        it 'restarts without ;force when only scripts of other names run' do
+          LogSpecHarness.other_scripts = [OpenStruct.new(name: 'logxml', hidden: true), OpenStruct.new(name: 'mylog', hidden: false)]
+
+          GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
+
+          expect(LogSpecHarness.echoes.first).to end_with('(;kill log, then ;log) to log typed commands again.')
+        end
+
         # Restarting without them would log rooms the user excluded.
         it 'gives the restart with the arguments the logger was started with, under its own name' do
           use_options(OpenStruct.new)
