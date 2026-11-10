@@ -15,6 +15,12 @@ require_relative '../support/log_spec_harness'
 #
 # Nested in Env so XMLData, Script and Lich below are the ones the scripts see.
 module LogSpecHarness::Env
+  # Raised by the shim's exit in these examples (see the exit stub below).
+  # Kernel#exit raises SystemExit, which RSpec does not rescue: a shim that
+  # rejected log.lic in an example not expecting it would end the whole run
+  # there, with status 0 and "0 failures", skipping every later example.
+  class ShimExited < StandardError; end
+
   RSpec.describe 'logxml.lic' do
     let(:scripts_dir) { File.expand_path('../../scripts', __dir__) }
     let(:script_path) { File.join(scripts_dir, 'logxml.lic') }
@@ -58,6 +64,9 @@ module LogSpecHarness::Env
         paths << path
         LogSpecHarness::Env.module_eval(File.read(path), path, 1)
       end
+      # The shim's exit fails the example (ShimExited) instead of ending
+      # the run; the examples where the shim rejects log.lic expect it.
+      allow(LogSpecHarness::Env).to receive(:exit) { raise ShimExited, 'logxml.lic exited' }
     end
 
     after do
@@ -245,6 +254,17 @@ module LogSpecHarness::Env
         expect(logged_lines(args: '--roomnum').first).to eq(
           '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns] (u4216015)'
         )
+      end
+
+      # As in ;log, a bare word is an option too; 0.6.6 needed the "--".
+      %w[rnum roomnum].each do |word|
+        it "turns room numbers on for the word #{word}, without --" do
+          uid_table[uid] = [228]
+
+          expect(logged_lines(args: word).first).to eq(
+            '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015)'
+          )
+        end
       end
 
       it 'adds no Lich id when the UID maps to more than one room' do
@@ -460,6 +480,15 @@ module LogSpecHarness::Env
       run_logxml(lines: [line])
 
       expect(log_lines).to eq([default_header, line, default_footer])
+    end
+
+    # The filter is logxml 0.6.1's /^<(?:push|pop)Stream/: "^" matches after
+    # each line break in the line too, so a line holding one before a
+    # popStream is dropped whole. (Made-up line; lich-5 chomps only the end.)
+    it 'drops a line whose popStream starts after a line break in it, without streams' do
+      run_logxml(lines: ['<output>before</output>', "<output>a torch</output>\n<popStream/>", '<output>after</output>'])
+
+      expect(log_lines).to eq([default_header, '<output>before</output>', '<output>after</output>', default_footer])
     end
 
     # Lines verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml,
@@ -1033,7 +1062,7 @@ module LogSpecHarness::Env
         it "says to update log.lic, logs nothing and does not load it, for #{label}" do
           write_log_lic(version_line)
 
-          expect { run_shim }.to raise_error(SystemExit)
+          expect { run_shim }.to raise_error(ShimExited)
 
           expect(echoes).to eq([upgrade_message("#{stub_log} #{problem}")])
           expect(loaded).to eq([])
@@ -1042,7 +1071,7 @@ module LogSpecHarness::Env
       end
 
       it 'says log.lic was not found, logs nothing and loads nothing, when there is no log.lic' do
-        expect { run_shim }.to raise_error(SystemExit)
+        expect { run_shim }.to raise_error(ShimExited)
 
         expect(echoes).to eq([upgrade_message("#{stub_log} was not found")])
         expect(loaded).to eq([])
@@ -1051,7 +1080,7 @@ module LogSpecHarness::Env
       it 'says log.lic was not found when log.lic is a folder' do
         Dir.mkdir(stub_log)
 
-        expect { run_shim }.to raise_error(SystemExit)
+        expect { run_shim }.to raise_error(ShimExited)
 
         expect(echoes).to eq([upgrade_message("#{stub_log} was not found")])
         expect(loaded).to eq([])
@@ -1063,7 +1092,7 @@ module LogSpecHarness::Env
         error = Errno::EACCES.new(stub_log)
         allow(File).to receive(:binread).with(stub_log, 20_000).and_raise(error)
 
-        expect { run_shim }.to raise_error(SystemExit)
+        expect { run_shim }.to raise_error(ShimExited)
 
         expect(echoes).to eq([upgrade_message("#{stub_log} could not be read (Errno::EACCES: #{error.message})")])
         expect(loaded).to eq([])
@@ -1085,7 +1114,7 @@ module LogSpecHarness::Env
         write_log_lic('      version: 1.2.8')
         File.write(stub_log, "#{File.read(stub_log)}\n#   version: 9.9.9\n")
 
-        expect { run_shim }.to raise_error(SystemExit)
+        expect { run_shim }.to raise_error(ShimExited)
 
         expect(echoes).to eq([upgrade_message("#{stub_log} is version 1.2.8")])
       end
