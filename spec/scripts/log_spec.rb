@@ -2408,5 +2408,178 @@ module LogSpecHarness::Env
         end
       end
     end
+
+    # R-29: one run is a GameLogger::Logger, whose clock and Lich helpers
+    # (get, reget, echo, get_settings) can be handed in instead of stubbed.
+    describe 'GameLogger::Logger' do
+      let(:log_dir) { Dir.mktmpdir }
+      let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+
+      # A clock that always answers the same time.
+      let(:clock) do
+        time = Time.new(2026, 7, 1, 8, 30, 0)
+        Object.new.tap { |fake| fake.define_singleton_method(:now) { time } }
+      end
+
+      # Lich's script helpers as public methods: get answers the given lines,
+      # then raises StopIteration, which ends the run's loop.
+      let(:io_class) do
+        Class.new do
+          attr_reader :echoes, :gets
+
+          def initialize(lines, reget: nil, settings: OpenStruct.new)
+            @lines = lines.dup
+            @reget = reget
+            @settings = settings
+            @echoes = []
+            @gets = 0
+          end
+
+          def get
+            @gets += 1
+            @lines.shift || raise(StopIteration)
+          end
+
+          attr_reader :reget
+
+          def echo(msg) = @echoes << msg
+          def get_settings = @settings
+        end
+      end
+
+      before do
+        stub_const('LICH_DIR', log_dir)
+        hide_const('LOG_DIR')
+      end
+
+      after do
+        FileUtils.rm_rf(log_dir)
+      end
+
+      def file_at(relative)
+        File.join(log_dir, 'logs', 'GSIV-TestChar', relative)
+      end
+
+      it 'names, dates and stamps the file by the clock it is given, not Time.now' do
+        $login_time = Time.new(2026, 7, 1, 8, 29, 50)
+        io = io_class.new(['line 1'], reget: ["a reget line\r"],
+                                      settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
+        logger = GameLogger::Logger.new(GameLogger::Opts.parse([]), clock: clock, io: io)
+
+        Timeout.timeout(5) { logger.run }
+
+        path = file_at('2026/07/2026-07-01_08-30-00.log')
+        # The reget line has the login time ($login_time), not the clock's.
+        expect(File.read(path).lines(chomp: true)).to eq(['08:30', '08:29: a reget line', marker, '08:30: line 1', '08:30'])
+        expect(io.echoes).to eq(["Non-XML Logging started, currently logging to #{path}"])
+        expect(io.gets).to eq(2)
+      end
+
+      it 'writes no reget when the clock is 30 seconds past login' do
+        $login_time = Time.new(2026, 7, 1, 8, 29, 30)
+        io = io_class.new(['line 1'], reget: ['a reget line'])
+
+        Timeout.timeout(5) { GameLogger::Logger.new(GameLogger::Opts.parse([]), clock: clock, io: io).run }
+
+        stamp = "2026-07-01 08:30:00.000 #{clock.now.strftime('%:z')}"
+        expect(File.read(file_at('2026/07/2026-07-01_08-30-00.log')).lines(chomp: true)).to eq([stamp, 'line 1', stamp])
+      end
+
+      describe '#format_line' do
+        it 'returns the line as it is without a timestamp format' do
+          logger = GameLogger::Logger.new(OpenStruct.new)
+
+          expect(logger.format_line('You see a rat.', Time.new(2026, 7, 1, 8, 30, 0))).to eq('You see a rat.')
+        end
+
+        it "stamps the line with the given time in the run's --timestamp format" do
+          $login_time = Time.new(2026, 1, 1)
+          logger = GameLogger::Logger.new(GameLogger::Opts.parse(['--timestamp=%H:%M:%S']), clock: clock, io: io_class.new([]))
+          Timeout.timeout(5) { logger.run }
+
+          expect(logger.format_line('You see a rat.', Time.new(2026, 7, 1, 23, 59, 58))).to eq('23:59:58: You see a rat.')
+        end
+      end
+
+      describe '#skip_line?' do
+        {
+          'a pushStream line' => ['<pushStream id="inv"/>', true],
+          'a popStream line' => ['<popStream/>You see a rat.', true],
+          'a closing progressBar line' => ['</progressBar>', true],
+          'a dialogData line' => ['<dialogData id="minivitals">', true],
+          'an openDialog line' => ['<openDialog id="x">', true],
+          'a game line' => ['You see a rat.', false],
+          'a line with the tag after its start' => ['You say, "<pushStream id=inv/>"', false],
+          'an empty line' => ['', false]
+        }.each do |label, (line, skipped)|
+          it "is #{skipped} for #{label}" do
+            expect(GameLogger::Logger.new(OpenStruct.new).skip_line?(line)).to be(skipped)
+          end
+        end
+      end
+
+      describe '#reget_lines' do
+        it 'removes the "\\r" line ends and stamps nothing without a timestamp format' do
+          logger = GameLogger::Logger.new(OpenStruct.new)
+
+          expect(logger.reget_lines(["line 1\r", 'line 2'], Time.new(2026, 7, 1))).to eq(['line 1', 'line 2'])
+        end
+
+        it 'gives no lines for an empty reget (nil)' do
+          expect(GameLogger::Logger.new(OpenStruct.new).reget_lines(nil, Time.new(2026, 7, 1))).to eq([])
+        end
+      end
+
+      describe '#decorate_title' do
+        it 'returns the line itself before any room title matcher is set' do
+          line = '[Town Square]'
+
+          expect(GameLogger::Logger.new(OpenStruct.new).decorate_title(line)).to equal(line)
+        end
+      end
+
+      context 'when another run evaluates the module' do
+        it 'replaces Logger, Mode and Mode::TEXT without a constant warning' do
+          logger_class = GameLogger::Logger
+          mode_class = GameLogger::Mode
+          text_mode = GameLogger::Mode::TEXT
+
+          expect { LogSpecHarness.evaluate_game_logger }.not_to output.to_stderr
+
+          expect(GameLogger::Logger).not_to equal(logger_class)
+          expect(GameLogger::Mode).not_to equal(mode_class)
+          expect(GameLogger::Mode::TEXT).not_to equal(text_mode)
+        end
+
+        it 'leaves a run built before it with the Logger class it was built with' do
+          logger = GameLogger::Logger.new(OpenStruct.new)
+
+          LogSpecHarness.evaluate_game_logger
+
+          expect(logger).not_to be_a(GameLogger::Logger)
+          expect(logger.class::REGET_MARKER).to eq("<!-- Above contents from reget; full logging now active -->\n")
+        end
+      end
+
+      it 'is a frozen value with the text format' do
+        mode = GameLogger::Mode::TEXT
+
+        expect(mode).to be_frozen
+        expect(mode.extension).to eq('.log')
+        expect(mode.started_text).to eq('Non-XML Logging started, currently logging to')
+        expect(mode.upstream_line.call('<c>look')).to eq('>look')
+      end
+    end
+
+    describe '.start_upstream_logger with a block' do
+      it 'logs each typed command as the block formats it' do
+        LogSpecHarness.type('look')
+
+        thread = GameLogger.start_upstream_logger { |command| "typed: #{command}" }
+        thread.join(2)
+
+        expect(LogSpecHarness::DOWNSTREAM.pop(true)).to eq('typed: look')
+      end
+    end
   end
 end
