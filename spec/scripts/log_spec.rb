@@ -2365,9 +2365,12 @@ module LogSpecHarness::Env
           # an optional picture resource or popBold, then the roomName style
           # or the Saga-identity <room> block. Lines made up from that pattern.
           {
-            'the roomName style with no picture resource' => '<style id="roomName" />[Town Square]',
-            'a popBold before the roomName style'         => '<popBold/><style id="roomName" />[Town Square]',
-            'a Saga-identity <room> block'                => '<resource picture="0"/><room><name>[Town Square]</name><description>A fountain.</description></room>'
+            'the roomName style with no picture resource'   => '<style id="roomName" />[Town Square]',
+            'a popBold before the roomName style'           => '<popBold/><style id="roomName" />[Town Square]',
+            'a Saga-identity <room> block'                  => '<resource picture="0"/><room><name>[Town Square]</name><description>A fountain.</description></room>',
+            'a picture resource with a number other than 0' => '<resource picture="12"/><style id="roomName" />[Town Square]',
+            'a tab before the roomName style\'s />'         => %(<resource picture="0"/><style id="roomName"\t/>[Town Square]),
+            'two spaces before the roomName style\'s />'    => '<resource picture="0"/><style id="roomName"  />[Town Square]'
           }.each do |label, line|
             it "numbers #{label}, the u-id right after the first ]" do
               use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
@@ -2377,6 +2380,18 @@ module LogSpecHarness::Env
 
               expect(xml_lines[2..-2]).to eq([line.sub('[Town Square]', '[Town Square - 228] (u1234)')])
             end
+          end
+
+          # Lich's pattern takes the picture resource or popBold, not both,
+          # so this form (which logxml 0.6.6 numbered) is left alone too.
+          it 'numbers no title with both a picture resource and popBold before it' do
+            use_options(GameLogger::Opts.parse(['--xml', '--rnum']))
+            both_line = '<resource picture="0"/><popBold/><style id="roomName" />[Town Square]'
+            LogSpecHarness.feed(both_line)
+
+            run_main
+
+            expect(xml_lines[2..-2]).to eq([both_line])
           end
 
           # A familiar's view of its own room (Lich matches it too, with an
@@ -2918,6 +2933,21 @@ module LogSpecHarness::Env
         }.each do |label, ((line, lich_id, game), numbered)|
           it "numbers the title as XML mode does (any u-id right after the first ]) in #{label}" do
             expect(GameLogger::Logger.number_room_title(line, lich_id, 1234, game, uid_after_title: true)).to eq(numbered)
+          end
+        end
+
+        # Lich's room display shows a UID of 0 or above 4294967296 as
+        # "unknown" (lich-5 lib/games.rb); no " (u0)" is made up for it.
+        {
+          'an unknown UID of 0'    => [0, '[Town Square - 228]'],
+          'a UID above 4294967296' => [4_294_967_297, '[Town Square - 228]'],
+          'the highest known UID'  => [4_294_967_296, '[Town Square - 228] (u4294967296)'],
+          'the lowest known UID'   => [1, '[Town Square - 228] (u1)'],
+          'no UID at all (nil)'    => [nil, '[Town Square - 228]']
+        }.each do |label, (uid, numbered)|
+          it "adds a GemStone u-id only for a known UID, in both modes: #{label}" do
+            expect(GameLogger::Logger.number_room_title('[Town Square]', 228, uid, 'GSIV')).to eq(numbered)
+            expect(GameLogger::Logger.number_room_title('[Town Square]', 228, uid, 'GSIV', uid_after_title: true)).to eq(numbered)
           end
         end
 
