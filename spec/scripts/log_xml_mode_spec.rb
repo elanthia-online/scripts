@@ -925,16 +925,28 @@ module LogSpecHarness::Env
       end
 
       # TEXT AND XML TOGETHER: ;log, then ;force log --xml. Both run as log,
-      # so ;kill log stops the first log Lich finds, and ;log --xml without
-      # ;force is refused while the other one runs.
-      it 'restarts with ;force, and says ;kill log can stop the other one, when the text log runs too' do
+      # so ;kill log stops the one started first (the text log), and
+      # ;log --xml without ;force is refused while the other one runs.
+      it 'stops both and starts both again in order when the text log started first' do
+        LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: true, before: true)]
+
+        run_xml(args: 'streams', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+        expect(echoes.grep(/\Atyped commands/).first).to end_with(
+          'restart the logger (;kill log twice, one at a time, then ;log, then ;force log --xml streams; ' \
+          ';kill log stops the log started before this one first, so this stops both and starts them again in that order) ' \
+          'to log typed commands again.'
+        )
+      end
+
+      it 'restarts with one ;kill and ;force when the XML log started first' do
         LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: true)]
 
         run_xml(args: 'streams', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
 
         expect(echoes.grep(/\Atyped commands/).first).to end_with(
-          'restart the logger (;kill log, then ;force log --xml streams; another log is running too, and ;kill log stops the first log Lich finds, ' \
-          'which can be the other one) to log typed commands again.'
+          'restart the logger (;kill log, then ;force log --xml streams; another log is running too, and ;kill log stops the one started first, ' \
+          'which is this one) to log typed commands again.'
         )
       end
 

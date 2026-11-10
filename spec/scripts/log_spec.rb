@@ -1048,17 +1048,62 @@ module LogSpecHarness::Env
         end
 
         # ;log plus ;force log --xml: both run as log. ;kill log stops the
-        # first log Lich finds, and ;log without ;force is refused while the
-        # other one runs (lich-5 v5.21.0 lib/global_defs.rb:2500,
-        # lib/common/script.rb:744).
-        it 'restarts with ;force, and says ;kill log can stop the other one, when another log is running (hidden, as log hides itself)' do
+        # exact name in Lich's running list, then its hidden list, each in
+        # start order, and ;log without ;force is refused while the other
+        # one runs (lich-5 v5.21.0 lib/global_defs.rb:2500,
+        # lib/common/script.rb:744; upstream main
+        # lib/common/client_commands/builtins.rb:72-73).
+        it 'restarts with one ;kill and ;force when this logger started first (another log hidden, as log hides itself)' do
           LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: true)]
 
           GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
 
           expect(LogSpecHarness.echoes.first).to end_with(
-            'restart the logger (;kill log, then ;force log; another log is running too, and ;kill log stops the first log Lich finds, ' \
-            'which can be the other one) to log typed commands again.'
+            'restart the logger (;kill log, then ;force log; another log is running too, and ;kill log stops the one started first, ' \
+            'which is this one) to log typed commands again.'
+          )
+        end
+
+        # The documented setup: ;log, then ;force log --xml, and the XML
+        # logger's upstream dies. One ;kill log would stop the healthy text
+        # logger and leave this one running.
+        it 'stops both and starts both again, in order and each with its own arguments, when this logger started later' do
+          LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: true, before: true, vars: ['--rnum', '--rnum'])]
+          allow(Script.current).to receive(:vars).and_return(['--xml streams', '--xml', 'streams'])
+
+          GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
+
+          expect(LogSpecHarness.echoes.first).to end_with(
+            'restart the logger (;kill log twice, one at a time, then ;log --rnum, then ;force log --xml streams; ' \
+            ';kill log stops the log started before this one first, so this stops both and starts them again in that order) ' \
+            'to log typed commands again.'
+          )
+        end
+
+        # Lich searches its running (not hidden) list first, so a log that
+        # has not hidden yet is stopped first even when it started later.
+        it 'counts a log that is not hidden as stopped before this one' do
+          LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: false)]
+
+          GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
+
+          expect(LogSpecHarness.echoes.first).to include('(;kill log twice, one at a time, then ;log, then ;force log; ')
+        end
+
+        # A log still running after the kills (started after this one) means
+        # the first restart needs ;force too.
+        it 'restarts every stopped log with ;force while a later log keeps running' do
+          LogSpecHarness.other_scripts = [
+            OpenStruct.new(name: 'log', hidden: true, before: true, vars: ['--rnum']),
+            OpenStruct.new(name: 'log', hidden: true, before: true, vars: ['--xml']),
+            OpenStruct.new(name: 'log', hidden: true, vars: ['--lines=10'])
+          ]
+
+          GameLogger::Logger.upstream_stopped(RuntimeError.new('boom'))
+
+          expect(LogSpecHarness.echoes.first).to include(
+            '(;kill log 3 times, one at a time, then ;force log --rnum, then ;force log --xml, then ;force log; ' \
+            ';kill log stops the 2 logs started before this one first, so this stops all of them and starts them again in that order)'
           )
         end
 

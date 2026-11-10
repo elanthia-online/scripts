@@ -41,7 +41,9 @@ module LogSpecHarness
     # The current run's Script.current (see new_script).
     attr_reader :script, :echoes
     # The scripts running besides the current run, for Script.running and
-    # Script.hidden: OpenStructs with a name and hidden ([] after reset!).
+    # Script.hidden: OpenStructs with a name and hidden, and optionally
+    # vars and before (true when started before the current run; Lich's
+    # lists are in start order). [] after reset!.
     attr_accessor :other_scripts
 
     # Puts the harness back to a fresh start for the next example: empty
@@ -267,9 +269,13 @@ module LogSpecHarness
 
       # lich-5's Script.hidden: the running scripts that are hidden.
       #
-      # @return [Array<OpenStruct>] the current run, then the
-      #   {LogSpecHarness.other_scripts} that are hidden
-      def self.hidden = [LogSpecHarness.script, *LogSpecHarness.other_scripts.select(&:hidden)]
+      # @return [Array<OpenStruct>] in start order: the hidden
+      #   {LogSpecHarness.other_scripts} started before the current run,
+      #   the current run, then the other hidden ones
+      def self.hidden
+        hidden = LogSpecHarness.other_scripts.select(&:hidden)
+        [*hidden.select(&:before), LogSpecHarness.script, *hidden.reject(&:before)]
+      end
     end
   end
 
