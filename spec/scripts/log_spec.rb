@@ -593,6 +593,30 @@ RSpec.describe GameLogger do
       end
     end
 
+    # R-09 through main: with no options passed, main parses the script's
+    # arguments itself, and a quoted format needs the rescan of vars[0].
+    context 'when started with a quoted --timestamp and no options passed' do
+      it 'stamps the header and each line with the whole format' do
+        $reget_lines = []
+        # As autostart starts it: vars[0] the joined line, vars[1..] split on spaces.
+        allow(Script.current).to receive(:vars).and_return(
+          ['--timestamp="%b %d %T"', '--timestamp="%b', '%d', '%T"']
+        )
+        LogSpecHarness.feed('You see a door.')
+
+        run_main
+
+        expect(log_lines).to eq(
+          [
+            'Apr 23 10:00:05',
+            '<!-- Above contents from reget; full logging now active -->',
+            'Apr 23 10:00:05: You see a door.',
+            'Apr 23 10:00:05'
+          ]
+        )
+      end
+    end
+
     context 'with a --timestamp format that holds an equals sign' do
       it 'prefixes each line with the whole format' do
         $reget_lines = []
@@ -1505,12 +1529,16 @@ RSpec.describe GameLogger do
 
       # Lich runs each script on its own thread, so another run can evaluate
       # the module at any point of this one, here while it reads its settings.
+      # Script.current is per thread in lich-5, so the other run's arguments
+      # are visible only while it evaluates the module; this run's are put
+      # back after, and only state on the shared module can leak across.
       it "keeps this run's arguments when another run evaluates the module while this one starts" do
         start_script_with('--exclude=u1234', '--timestamp=%H:%M')
         LogSpecHarness.evaluate_game_logger
         another_run = lambda do
           start_script_with('--lines=5')
           LogSpecHarness.evaluate_game_logger
+          start_script_with('--exclude=u1234', '--timestamp=%H:%M')
         end
         GameLogger.define_singleton_method(:get_settings) do
           another_run.call
