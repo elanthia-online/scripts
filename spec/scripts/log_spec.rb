@@ -3317,11 +3317,12 @@ module LogSpecHarness::Env
           expect(GameLogger.compress_after_days(nil, '14')).to eq(14)
           expect(GameLogger.compress_after_days('30', 7)).to eq(30)
           expect(GameLogger.compress_after_days(nil, nil)).to be_nil
+          expect(GameLogger.compress_after_days('0', nil)).to eq(0)
+          expect(GameLogger.compress_after_days(nil, 0)).to eq(0)
           expect(LogSpecHarness.echoes).to be_empty
         end
 
         {
-          'zero' => ['0', nil, '--compress-after "0" is not a number of days'],
           'a negative number' => ['-5', nil, '--compress-after "-5" is not a number of days'],
           'a word' => ['month', nil, '--compress-after "month" is not a number of days'],
           'a bare flag' => [true, nil, '--compress-after was given without a number of days'],
@@ -3329,7 +3330,7 @@ module LogSpecHarness::Env
         }.each do |label, (option, setting, message)|
           it "turns compression off and says why for #{label}" do
             expect(GameLogger.compress_after_days(option, setting)).to be_nil
-            expect(LogSpecHarness.echoes).to eq(["#{message}; use a whole number above 0, like --compress-after=30. Old logs are not compressed."])
+            expect(LogSpecHarness.echoes).to eq(["#{message}; use a whole number, 0 or above, like --compress-after=7. Old logs are not compressed."])
           end
         end
       end
@@ -3378,12 +3379,39 @@ module LogSpecHarness::Env
           expect(File).to exist(decoy)
         end
 
-        it 'leaves a file written to within the last hour alone, whatever its name says' do
-          path = log_file('2026/10/2026-10-01_08-00-00.log', mtime: now - 60)
+        # Nisugi: age is by name, so a log copied in today (fresh mtime) but
+        # dated weeks ago is compressed; only a file dated yesterday, which
+        # a logger may still have open, keeps the one-hour guard.
+        it 'compresses an old-dated file just copied in, and skips a yesterday file written within the hour' do
+          copied = log_file('2026/10/2026-10-01_08-00-00.log', mtime: now - 60)
+          yesterday = log_file('2026/10/2026-10-31_23-00-00.log', mtime: now - 60)
 
-          expect(GameLogger::Logger.compress_old_logs(folder, cutoff, now: now)).to eq([0, 0, 0])
-          expect(File).to exist(path)
-          expect(File).not_to exist("#{path}.gz")
+          expect(GameLogger::Logger.compress_old_logs(folder, Date.new(2026, 11, 1), now: now).first).to eq(1)
+          expect(File).to exist("#{copied}.gz")
+          expect(File).to exist(yesterday)
+          expect(File).not_to exist("#{yesterday}.gz")
+        end
+
+        # --compress-after=0: every file dated before today, never today's.
+        it 'with 0 days compresses yesterday and older, never a file dated today' do
+          yesterday = log_file('2026/10/2026-10-31_08-00-00.log', mtime: now - 7200)
+          today = log_file('2026/11/2026-11-01_06-00-00.log', mtime: now - 7200)
+
+          expect(GameLogger::Logger.compress_old_logs(folder, Date.new(2026, 11, 1) - 0, now: now).first).to eq(1)
+          expect(File).to exist("#{yesterday}.gz")
+          expect(File).to exist(today)
+        end
+
+        # Nisugi's Minor, second half: a temp file whose log another sweep
+        # finished is never touched by compress_log_file again.
+        it 'removes an abandoned temp file whose log is gone, and leaves a fresh one' do
+          abandoned = log_file('2026/10/2026-10-01_08-00-00.log.gz.tmp', mtime: now - 86_400)
+          fresh = log_file('2026/10/2026-10-02_08-00-00.log.gz.tmp', mtime: now - 60)
+
+          GameLogger::Logger.compress_old_logs(folder, cutoff, now: now)
+
+          expect(File).not_to exist(abandoned)
+          expect(File).to exist(fresh)
         end
       end
 
@@ -3562,6 +3590,7 @@ module LogSpecHarness::Env
 
         it "gives the .gz the original's permissions" do
           File.chmod(0o600, path)
+          skip 'permission bits do not round-trip on this system (Windows)' unless File.stat(path).mode & 0o777 == 0o600
 
           GameLogger::Logger.compress_log_file(path, now: now)
 
@@ -3569,6 +3598,31 @@ module LogSpecHarness::Env
         end
 
         # Review finding 8: same size is not the same bytes.
+        # Nisugi's Minor: the original vanished after the temp file was made.
+        it "removes its own temp file when another sweep finished the log meanwhile" do
+          allow(LogSpecHarness::Env::Lich).to receive(:log)
+          allow(File).to receive(:open).and_call_original
+          allow(File).to receive(:open).with(path, 'rb').and_wrap_original do |original, *args, &block|
+            File.delete(path)
+            original.call(*args, &block)
+          end
+
+          expect(GameLogger::Logger.compress_log_file(path, now: now)).to be_nil
+          expect(File).not_to exist(tmp)
+          expect(LogSpecHarness::Env::Lich).not_to have_received(:log)
+        end
+
+        it "removes an abandoned temp file beside a finished .gz while finishing the log" do
+          bytes = File.binread(path)
+          Zlib::GzipWriter.open("#{path}.gz") { |gz| gz.write(bytes) }
+          File.write(tmp, 'left by a stopped sweep')
+          File.utime(now - 86_400, now - 86_400, tmp)
+
+          expect(GameLogger::Logger.compress_log_file(path, now: now)).to be_a(Array)
+          expect(File).not_to exist(tmp)
+          expect(File).not_to exist(path)
+        end
+
         it 'keeps the original when an existing .gz has the same size but other bytes' do
           allow(LogSpecHarness::Env::Lich).to receive(:log)
           bytes = File.binread(path)
@@ -3614,6 +3668,7 @@ module LogSpecHarness::Env
         before do
           stub_const('LICH_DIR', root)
           hide_const('LOG_DIR')
+          stub_const('LogSpecHarness::Env::GameLogger::Logger::DAY_SWEEP_DELAY', 0)
           $login_time = Time.new(2026, 1, 1)
         end
 
@@ -3702,6 +3757,34 @@ module LogSpecHarness::Env
           run_logger(GameLogger::Opts.parse(['--compress-after=30', 'twin', '--twin']), io_class.new(['line 1']))
 
           expect(Timeout.timeout(2) { calls.pop }.last).to eq(Date.new(2026, 10, 2))
+        end
+
+        # A new day's sweep waits, so the XML twin of --both has closed
+        # yesterday's file; the first sweep of a run does not.
+        it "waits #{120} seconds before a new day's sweep, and not before the first" do
+          stub_const('LogSpecHarness::Env::GameLogger::Logger::DAY_SWEEP_DELAY', 120)
+          slept = Queue.new
+          allow_any_instance_of(GameLogger::Logger).to receive(:sleep) { |_, seconds| slept << seconds }
+          calls = Queue.new
+          allow(GameLogger::Logger).to receive(:compress_old_logs) { |*args, **| calls << args[1]; [0, 0, 0] }
+          times = clock_time
+          io = io_class.new(['line 1', 'line 2'], on_get: ->(left) { times[0] = Time.new(2026, 11, 2, 0, 0, 5) if left == 1 })
+
+          run_logger(GameLogger::Opts.parse(['--compress-after=7']), io)
+          2.times { Timeout.timeout(2) { calls.pop } }
+
+          expect(slept.size).to eq(1)
+          expect(slept.pop).to eq(120)
+        end
+
+        it 'echoes files dated before today for 0 days' do
+          allow(GameLogger::Logger).to receive(:compress_old_logs).and_return([3, 3_000_000, 300_000])
+          io = io_class.new(['line 1'])
+
+          run_logger(GameLogger::Opts.parse(['--compress-after=0']), io)
+          sleep 0.05 until io.echoes.size >= 2
+
+          expect(io.echoes).to include('compressed 3 log files dated before today: 3 MB down to 300 KB.')
         end
 
         it 'does not sweep without the option or the setting' do
