@@ -54,6 +54,8 @@ RSpec.describe 'Ewaggle::Setup' do
         define_singleton_method(:save_profile) { saves << :saved }
         define_singleton_method(:data) { Struct.new(:settings).new({}) }
       })
+      form = Module.new { define_singleton_method(:choice_options) { |choices| choices.map { |v| { value: v, label: v } } } }
+      ns.const_set(:Lich, Module.new { const_set(:WebUI, Module.new { const_set(:SettingsForm, form) }) })
       ns.module_eval(setup_source, path)
       ns.const_get(:Setup).class_eval { define_method(:respond) { |*| nil } }
     end
@@ -65,8 +67,14 @@ RSpec.describe 'Ewaggle::Setup' do
     setup_class.new({ cast_list: [] }.merge(settings))
   end
 
+  # Stands in for SettingsForm's field renderer: emits the field definition as a component.
   def render(setup)
-    recorder_class.new.tap { |ui| setup.render(ui) }.nodes
+    field = lambda do |ui, key, **overrides|
+      definition = setup.fields.find { |f| f[:key] == key }
+      ui.public_send(definition[:type], **definition.reject { |name, _| name == :type }, **overrides, key: key.to_s)
+    end
+    save = ->(ui, **props) { ui.button(key: 'save', label: 'Save & Close', **props) }
+    recorder_class.new.tap { |ui| setup.render(ui, field, save, -> {}) }.nodes
   end
 
   def node(nodes, key)
@@ -109,12 +117,26 @@ RSpec.describe 'Ewaggle::Setup' do
     expect(settings[:not_to_cast]).not_to include('101  Spirit Warding I')
   end
 
-  it 'restores the GTK hints and commits text as it is typed, so Close cannot lose it' do
+  it 'restores the GTK hints on the text fields' do
     nodes = render(build)
 
-    expect(node(nodes, :sonic_weapon)).to include(change_mode: :input, placeholder: 'Name of sonic weapon (follow link for options)')
-    expect(node(nodes, :sonic_shield)).to include(change_mode: :input, placeholder: 'Name of sonic shield (follow link for options)')
-    expect(node(nodes, :retribution_spell)).to include(change_mode: :input, placeholder: 'Spell Number Only')
+    expect(node(nodes, :sonic_weapon)).to include(placeholder: 'Name of sonic weapon (follow link for options)')
+    expect(node(nodes, :sonic_shield)).to include(placeholder: 'Name of sonic shield (follow link for options)')
+    expect(node(nodes, :retribution_spell)).to include(placeholder: 'Spell Number Only')
+  end
+
+  it 'renders Save & Close and Cancel, and no live change handlers on fields' do
+    nodes = render(build)
+
+    expect(node(nodes, :save)).to include(label: 'Save & Close')
+    expect(node(nodes, :cancel)).to include(label: 'Cancel')
+    expect(node(nodes, :use_multicast)).not_to have_key(:on)
+  end
+
+  it 'gives spells that share a number unique row keys' do
+    setup = build({ cast_list: ['101  Spirit Warding I', '101 Spirit Warding I'] })
+
+    expect(setup.row_keys.values).to contain_exactly('spell-101', 'spell-101-2', 'spell-107', 'spell-712', 'spell-1009', 'spell-1012')
   end
 
   it 'moves spells between the lists, and ignores a drop on the list they are in' do
@@ -139,19 +161,15 @@ RSpec.describe 'Ewaggle::Setup' do
     expect(setup.status).to include('Select a spell')
   end
 
-  describe 'closing' do
-    before do
-      namespace.const_set(:Lich, Module.new)
-      namespace.const_get(:Lich).const_set(:WebUI, Module.new { define_singleton_method(:close) { |_page| nil } })
-    end
-
-    it 'saves once and does not refresh the closed page' do
+  describe 'saving' do
+    it 'coerces submitted values and takes both lists from the window' do
       setup = build
+      setup.move_spell('spell-107', :cast_list)
 
-      setup.act { setup.on_close_clicked }
+      result = setup.normalize(setup.settings.merge(use_multicast: nil, start_at: '999', sonic_weapon: ' sword ', cast_list: []))
 
-      expect(saved).to eq([:saved])
-      expect(setup.instance_variable_get(:@closed).pop(true)).to eq(:close)
+      expect(result).to include(use_multicast: false, start_at: 250, sonic_weapon: 'sword', cast_list: ['107  Spirit Shield'])
+      expect(result[:not_to_cast]).not_to include('107  Spirit Shield')
     end
 
     it 'reports an error from a callback instead of raising it into the dispatcher' do
