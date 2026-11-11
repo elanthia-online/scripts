@@ -144,7 +144,7 @@ module LogSpecHarness::Env
         # example starts the script as lich-5 does (Script#initialize): a
         # typed String, or the Array autostart.lic saves and starts it with.
         context 'when called with no args (reads Script.current.vars)' do
-          it "reads the header's autostart example whole on the autostart Array path" do
+          it "reads the help's autostart example whole on the autostart Array path" do
             # ;autostart add --global log --timestamp=\"%F %T %Z\" --rnum --exclude=288,2300,u7199 --lines=50000
             # is saved as these words; lich-5 joins them into vars[0] and keeps them as vars[1..].
             LogSpecHarness.start_script(['--timestamp="%F', '%T', '%Z"', '--rnum', '--exclude=288,2300,u7199', '--lines=50000'])
@@ -298,6 +298,59 @@ module LogSpecHarness::Env
       # failure instead of a hung suite.
       def run_main
         Timeout.timeout(5) { start_main }
+      end
+
+      # ;log help (and --help) shows the usage and logs nothing; the usage
+      # left the script's header in 1.4.0.
+      context 'when started with help' do
+        %w[help --help].each do |argument|
+          it "shows the usage for #{argument} and starts no logging" do
+            LogSpecHarness.start_script(argument)
+
+            run_main
+
+            expect(LogSpecHarness.responses.first).to eq(';log logs the game to a file.')
+            expect(Dir.glob(File.join(log_dir, '**', '*')).select { |f| File.file?(f) }).to be_empty
+            expect(LogSpecHarness.script.want_upstream).to be_falsey
+            expect(LogSpecHarness.script.want_script_output).to be_falsey
+            expect(LogSpecHarness.upstream_thread).to be_nil
+            expect(LogSpecHarness.echoes).to be_empty
+          end
+        end
+
+        it 'lists every option the logger reads' do
+          LogSpecHarness.start_script('help')
+
+          run_main
+
+          usage = LogSpecHarness.responses.join("\n")
+          %w[--xml --timestamp= --rnum --roomnum --exclude= --lines= --streams].each do |option|
+            expect(usage).to include(option)
+          end
+        end
+
+        it 'shows the name the script runs as, for an install that still has logxml.lic' do
+          LogSpecHarness.start_script('help', name: 'logxml')
+
+          run_main
+
+          expect(LogSpecHarness.responses.first).to eq(';logxml logs the game to a file.')
+          expect(LogSpecHarness.responses).to include(a_string_starting_with('  ;logxml --xml'))
+        end
+
+        it "uses Lich's command character" do
+          LogSpecHarness.start_script('help')
+          original = $lich_char
+          $lich_char = '.'
+
+          begin
+            run_main
+          ensure
+            $lich_char = original
+          end
+
+          expect(LogSpecHarness.responses.first).to eq('.log logs the game to a file.')
+        end
       end
 
       def find_log_file
@@ -3683,5 +3736,25 @@ RSpec.describe 'log.lic required Lich version' do
     skip 'log.lic does not use Data' unless source.include?('Data.define')
 
     expect(floor).to be >= Gem::Version.new('5.19.0')
+  end
+end
+
+# The header is what ;repository info and every reader see first; the usage
+# lives in ;log help (GameLogger.help_lines) since 1.4.0, so the header stays
+# short and holds no per-option syntax.
+RSpec.describe 'log.lic header' do
+  let(:header) do
+    source = File.read(File.expand_path('../../scripts/log.lic', __dir__))
+    source[/^=begin\n.*?^=end\n/m]
+  end
+
+  it 'is short and points at ;log help for the options' do
+    expect(header.lines.size).to be <= 70
+    expect(header).to include(';log help')
+    expect(header).not_to match(/^\s*SYNTAX/)
+  end
+
+  it 'keeps the indented version: line an older logxml.lic wrapper reads' do
+    expect(header).to match(/^[ \t]+version:[ \t]*\d+\.\d+\.\d+$/)
   end
 end

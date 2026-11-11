@@ -40,6 +40,8 @@ module LogSpecHarness
     attr_accessor :server_buffer
     # The current run's Script.current (see new_script).
     attr_reader :script, :echoes
+    # The lines the script responded (Lich's respond), in order.
+    attr_reader :responses
     # The scripts running besides the current run, for Script.running and
     # Script.hidden: OpenStructs with a name and hidden, and optionally
     # vars and before (true when started before the current run; Lich's
@@ -56,6 +58,7 @@ module LogSpecHarness
       DOWNSTREAM.clear
       UPSTREAM.clear
       @echoes = []
+      @responses = []
       @idle_timeout = 0
       @wait_for_upstream = false
       @upstream_thread = nil
@@ -208,6 +211,14 @@ module LogSpecHarness
       @echoes << msg.to_s
     end
 
+    # Lich's respond: keeps the line (see {responses}).
+    #
+    # @param msg [Object] the line
+    # @return [Array<String>] every line responded so far
+    def respond(msg)
+      @responses << msg.to_s
+    end
+
     # lich-5's reget with no arguments (lib/global_defs.rb:1601-1633): the
     # server buffer joined on "\n"; unless the script wants the XML
     # downstream, the stream/tag blocks are cut, every tag removed and
@@ -293,6 +304,9 @@ module LogSpecHarness
     # @param msg [Object] the message (see {LogSpecHarness.echo})
     # @return [Array<String>] every echo of the run so far
     def echo(msg) = LogSpecHarness.echo(msg)
+    # @param msg [Object] the line (see {LogSpecHarness.respond})
+    # @return [Array<String>] every line responded so far
+    def respond(msg) = LogSpecHarness.respond(msg)
     # @return [Array<String>, nil] the reget lines (see
     #   {LogSpecHarness.reget})
     def reget = LogSpecHarness.reget
