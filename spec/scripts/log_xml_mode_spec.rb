@@ -549,9 +549,21 @@ module LogSpecHarness::Env
       end
 
       it 'still ends the span at a line with a line break that closes more streams than it opens' do
+        run_xml(lines: [*inv_open, %(<pushStream id="thoughts"/>Bob: "hi"\n<popStream/><popStream/>), *inv_close])
+
+        expect(log_lines).to eq([default_header, '<popStream/>', '  a cloak', '<popStream/>', '<output>after</output>', default_footer])
+      end
+
+      it 'still ends the span at a line with a line break and a popStream but no pushStream' do
         run_xml(lines: [*inv_open, "<output>a torch</output>\n<popStream/>", *inv_close])
 
         expect(log_lines).to eq([default_header, '  a cloak', '<popStream/>', '<output>after</output>', default_footer])
+      end
+
+      it 'leaves out a line with a line break and no stream tags, as span content' do
+        run_xml(lines: [*inv_open, "  a torch\n  a rope", *inv_close])
+
+        expect(log_lines).to eq([default_header, '<output>after</output>', default_footer])
       end
 
       it 'leaves out a line with a line break that opens a left-out stream' do
