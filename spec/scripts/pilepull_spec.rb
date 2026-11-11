@@ -23,6 +23,7 @@
 
 require_relative '../spec_helper'
 require 'zlib'
+require 'stringio'
 require 'tmpdir'
 require 'fileutils'
 
@@ -1124,6 +1125,39 @@ RSpec.describe 'pilepull.lic reward tracking' do
 
         bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
         expect(bucket[:items][['rare', 'glowing orb']]).to eq(1)
+      end
+
+      it 'reads every member of a gzipped log that holds several' do
+        path = File.join(tmp_dir, '2026-03-01_15-47-17.log.gz')
+        member = lambda do |text|
+          io = StringIO.new(+'')
+          gz = Zlib::GzipWriter.new(io)
+          gz.write(text)
+          gz.finish
+          io.string
+        end
+        pull = '18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!'
+        File.binwrite(path, member.call("#{pull}\n") + member.call("#{pull}\n"))
+
+        log_scan.scan_file(path, 'Pickasso', totals)
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:items][['rare', 'glowing orb']]).to eq(2)
+      end
+
+      # A log.lic --compress-after sweep can gzip a listed .log before
+      # this scan reaches it.
+      it 'reads the .gz of a listed .log that was compressed before it was read' do
+        plain = File.join(tmp_dir, '2026-03-01_15-47-17.log')
+        Zlib::GzipWriter.open("#{plain}.gz") do |gz|
+          gz.write("18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!\n")
+        end
+
+        log_scan.scan_file(plain, 'Pickasso', totals)
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:items][['rare', 'glowing orb']]).to eq(1)
+        expect(log_scan.echoed.join).not_to match(/could not read log/)
       end
 
       it 'notes a damaged gzipped log and moves on instead of raising' do
