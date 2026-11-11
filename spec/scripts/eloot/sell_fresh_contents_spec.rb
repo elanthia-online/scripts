@@ -31,6 +31,8 @@ RSpec.describe 'ELoot sell sacks read fresh contents' do
 
   let(:commands) { [] }
   let(:sold) { [] }
+  # [commands issued so far, whether the sack still counted as full] at each free_hands
+  let(:stows) { [] }
 
   let(:game) do
     Struct.new(:sack, :in_sack, :closed, :commands, :sold) do
@@ -58,8 +60,9 @@ RSpec.describe 'ELoot sell sacks read fresh contents' do
   end
 
   let(:data) do
-    Struct.new(:settings, :look_regex, :sell_exclude_regex, :alchemy_mode, :silver_breakdown, :disk)
-          .new({ sell_loot_types: %w[skin gem], sell_appraise_types: [] }, /In the/, exclude, false, Hash.new(0), nil)
+    Struct.new(:settings, :look_regex, :sell_exclude_regex, :alchemy_mode, :silver_breakdown, :disk, :sacks_full)
+          .new({ sell_loot_types: %w[skin gem], sell_appraise_types: [] }, /In the/, exclude, false, Hash.new(0), nil,
+               { 'last cleared' => [] })
   end
 
   let(:eloot) do
@@ -84,8 +87,11 @@ RSpec.describe 'ELoot sell sacks read fresh contents' do
 
   let(:inventory) do
     game = self.game
+    data = self.data
+    stows = self.stows
     Module.new do
-      define_singleton_method(:free_hands) { |**| nil }
+      # free_hands is where a bulk sale's note gets stowed; note whether the sack still counts as full then
+      define_singleton_method(:free_hands) { |**| stows << [game.commands.length, data.sacks_full.key?(game.sack.name)] }
       define_singleton_method(:drag) { |item, *| game.drag(item) }
       define_singleton_method(:wear) { |_| nil }
     end
@@ -114,7 +120,9 @@ RSpec.describe 'ELoot sell sacks read fresh contents' do
     eloot.module_eval(extract_lic_method(source, 'fresh_contents', source_path: eloot_path))
     sell.module_eval(%w[selling_type? furrier gemshop].map do |m|
       extract_lic_method(sell_source, m, source_path: eloot_path)
-    end.push(extract_lic_method(source, 'check_bounty_furrier', source_path: eloot_path)).join("\n"))
+    end.push(*%w[check_bounty_furrier check_bounty_gems].map do |m|
+      extract_lic_method(source, m, source_path: eloot_path)
+    end).join("\n"))
   end
 
   after { $sell_ignore = [] }
@@ -193,6 +201,84 @@ RSpec.describe 'ELoot sell sacks read fresh contents' do
 
         expect(commands).to eq(["look in ##{satchel.id}"])
       end
+    end
+  end
+
+  # A sack marked full earlier in the trip (an item that "won't fit") stayed marked after
+  # the shop emptied it, so the promissory note it paid with had nowhere to go and eloot
+  # paused with "Failed to store the promissory note." Replays a reported log: a feras
+  # hammer filled a velveteen longcloak, then the jeweler bought its 21 gems for a note.
+  describe 'a sack marked full before the bulk sale' do
+    before { data.sacks_full[satchel.name] = ['2026-11-11 09:23:56', 28719, 'feras hammer(167201249)'] }
+
+    def stows_after_sale
+      sale = commands.index("sell ##{satchel.id}")
+      stows.select { |at, _| at > sale }.map(&:last)
+    end
+
+    shared_examples 'counts the sack as having room again' do
+      it 'no longer counts the sack as full when stowing what the shop paid with' do
+        run_sale
+
+        expect(stows_after_sale).not_to be_empty
+        expect(stows_after_sale).to all(be(false))
+        expect(data.sacks_full).to include('last cleared')
+      end
+    end
+
+    describe 'Sell.furrier' do
+      def run_sale = sell.furrier
+
+      include_examples 'counts the sack as having room again'
+    end
+
+    describe 'Sell.gemshop' do
+      let(:cached) { [opal] }
+      let(:in_sack) { [opal] }
+
+      before do
+        stub_const('Spell', Class.new)
+        data.settings.merge!(sell_gold_rings: false, keep_transmogs: false)
+      end
+
+      def run_sale = sell.gemshop
+
+      include_examples 'counts the sack as having room again'
+    end
+
+    describe 'Sell.check_bounty_furrier' do
+      # only the bounty skin, so the sack is sold whole
+      let(:cached) { [gland] }
+      let(:in_sack) { [gland] }
+
+      before do
+        task = Struct.new(:skin, :type) { def skin? = true }.new('kiramon poison gland', 'skin')
+        stub_const('Bounty', Module.new { define_singleton_method(:task) { task } })
+        stub_const('Region', Module.new { define_singleton_method(:furrier) { 9471 } })
+      end
+
+      def run_sale = sell.check_bounty_furrier
+
+      include_examples 'counts the sack as having room again'
+    end
+
+    describe 'Sell.check_bounty_gems' do
+      let(:cached) { [opal] }
+      let(:in_sack) { [opal] }
+
+      before do
+        task = Struct.new(:type) { def gem? = true }.new('gem')
+        stub_const('Bounty', Module.new do
+          define_singleton_method(:task) { task }
+          define_singleton_method(:requirements) { { gem: 'white opal' } }
+        end)
+        stub_const('Region', Module.new { define_singleton_method(:gemshop) { 9472 } })
+        sell.define_singleton_method(:checkbounty) { '' }
+      end
+
+      def run_sale = sell.check_bounty_gems
+
+      include_examples 'counts the sack as having room again'
     end
   end
 end
