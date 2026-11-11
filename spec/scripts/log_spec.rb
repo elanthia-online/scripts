@@ -329,13 +329,31 @@ module LogSpecHarness::Env
           end
         end
 
-        it 'shows the name the script runs as, for an install that still has logxml.lic' do
+        # A run named logxml always logs XML (Logger.mode_for), and with
+        # logxml.lic still installed, ;log and ;logxml run side by side under
+        # their own names, so its help must say that, not offer text mode.
+        it 'tells an install that still has logxml.lic what ;logxml does' do
           LogSpecHarness.start_script('help', name: 'logxml')
 
           run_main
 
-          expect(LogSpecHarness.responses.first).to eq(';logxml logs the game to a file.')
-          expect(LogSpecHarness.responses).to include(a_string_starting_with('  ;logxml --xml'))
+          usage = LogSpecHarness.responses
+          expect(usage.first).to eq(';log logs the game to a file.')
+          expect(usage).to include(a_string_matching(/\A  ;logxml\s+the same as ;log --xml/))
+          expect(usage).not_to include(a_string_matching(/\A  ;logxml\s+game text/))
+          expect(usage.join("\n")).to include(';log and ;logxml run side by side, and both can be autostarted')
+          expect(usage.join("\n")).not_to include(';force log --xml')
+        end
+
+        it 'gives a plain ;log install the ;force way to log text and XML together' do
+          LogSpecHarness.start_script('help')
+
+          run_main
+
+          usage = LogSpecHarness.responses
+          expect(usage).to include(a_string_matching(/\A  ;log\s+game text to a \.log file/))
+          expect(usage.join("\n")).to include(';log, then ;force log --xml')
+          expect(usage).not_to include(a_string_matching(/\A  ;logxml/))
         end
 
         it "uses Lich's command character" do
@@ -3748,10 +3766,19 @@ RSpec.describe 'log.lic header' do
     source[/^=begin\n.*?^=end\n/m]
   end
 
+  # Only the part above the changelog: each release adds changelog lines,
+  # and older entries move to the second comment block.
   it 'is short and points at ;log help for the options' do
-    expect(header.lines.size).to be <= 70
+    expect(header[/\A.*?^\s*changelog:/m].lines.size).to be <= 20
     expect(header).to include(';log help')
     expect(header).not_to match(/^\s*SYNTAX/)
+  end
+
+  it 'keeps only the changelog back to 1.3.0, where --xml arrived; older entries follow in a second block' do
+    expect(header).to match(/^ {4}1\.3\.0 \(/)
+    expect(header).not_to match(/^ {4}1\.2\.8 \(/)
+    rest = File.read(File.expand_path('../../scripts/log.lic', __dir__)).split(header, 2).last
+    expect(rest).to match(/\A=begin\n {4}1\.2\.8 \(.*^ {4}0\.0\.2 \(.*?^=end$/m)
   end
 
   it 'keeps the indented version: line an older logxml.lic wrapper reads' do
