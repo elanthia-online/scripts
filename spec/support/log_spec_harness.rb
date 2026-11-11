@@ -1,6 +1,10 @@
 require 'tmpdir'
 require 'fileutils'
 require 'ostruct'
+# log.lic requires these at its top level, outside the module the harness
+# evaluates.
+require 'date'
+require 'zlib'
 require 'timeout'
 require_relative 'lich_script_vars'
 
