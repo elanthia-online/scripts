@@ -46,7 +46,7 @@
       bigshot's live settings (UserVars.op) without writing a file, the same
       as ;bigshot profile load.
     - Edits are live: every change goes into the editor's copy at once, and
-      the title shows * while there are unsaved changes.
+      the footer says when there are unsaved changes.
     - The window needs Lich's WebUI (Lich 5.24 or newer with the WebUI
       stack). With --no-gui only the command-line actions work.
 
@@ -66,6 +66,16 @@
       - Close is recorded before the page closes, so it is never mistaken for
         closing the window.
       - bigshot's old boon_flee_from toggle is turned into flee ticks on load.
+      - Loading or saving a profile refreshes Notes, Current Profile, the
+        Boon Creatures "all" ticks, a creature's boon ticks and Compare's B;
+        typing in Notes after a load no longer writes the old profile's text.
+      - Creatures renders in tens of milliseconds with long flee lists (was
+        over a second); pickers and typing that change nothing shown no
+        longer redraw the window.
+      - The window's size and place are remembered by Lich; the title is
+        fixed (the footer shows the profile and unsaved changes).
+      - Clear keeps the list's sort; re-picking a creature resets its area.
+      - A second Save as while the overwrite question is open is refused.
     2.0.0 (2026-11-06)
       - Rewritten from GTK to Lich's native WebUI. No GTK anywhere.
       - The editor no longer subclasses Bigshot::Setup; the layout lives here.
@@ -1054,7 +1064,9 @@ module BSProfiles
       @cr_filters = {}      # eohunter's filters: flags, type, class, family, traits
       @cr_filter_rev = 0
       @area_index = 0
-      @roster_rev = 0
+      @list_words = {}      # parsed Hunt/Ignore/Flee lists, see list_words
+      @roster = nil
+      @roster_key = nil
       @open_sections = {}   # Details and boon flee, kept open across creatures
       @hunt_creatures = []
       @hunt_creatures_for = nil
@@ -1062,7 +1074,6 @@ module BSProfiles
       @cr_mode = @settings['hunting_room_id'].to_s.strip.empty? ? 'search' : 'hunt'
       # map
       @map_scale = nil # fitted to the window on first use
-      @window_height = WINDOW_SIZE.last
       @map_current = nil
       @map_role = 'hunting_room_id'
       @map_focus = nil
@@ -1073,7 +1084,10 @@ module BSProfiles
       @sheet_rooms = {}
       @entry_rev = Hash.new(0)
       @load_rev = 0
-      @window_width = WINDOW_SIZE.first
+      @profile_rev = 0 # bumped when the profile's name changes: Load, Save as
+      @pick_rev = 0 # bumped per creature pick, so its area picker starts over
+      @overwrite = nil # the overwrite question while it is open
+      @cmp_names = nil # the two sides of the comparison shown
       @map_dark = BSProfiles.map_dark_default
       @map_sizes = {}
       @map_route = nil
@@ -1087,8 +1101,7 @@ module BSProfiles
     def run
       editor = self
       @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: title, props: { size: WINDOW_SIZE, bare: true, density: :compact, viewport: true },
-                                   on: { close: ->(_ev) { editor.viewer_closed },
-                                         configure: ->(ev) { editor.on_configure(ev) } }) do |ui|
+                                   on: { close: ->(_ev) { editor.viewer_closed } }) do |ui|
         editor.render(ui)
       end
       register_maps
@@ -1122,15 +1135,6 @@ module BSProfiles
       @closed << :viewer
     end
 
-    # The tabs and panels fill the window by themselves, so a resize needs no
-    # re-render. The width is kept for the map's Fit button.
-    def on_configure(event)
-      width = event.payload[:width].to_i
-      @window_width = width if width > MAP_SIDE_SLACK + 100
-      height = event.payload[:height].to_i
-      @window_height = height if height > MAP_TOP_SLACK + 100
-    end
-
     # :close goes first: closing the page can report the window closed at
     # once, and in bigshot mode that would mean discard.
     def close_clicked
@@ -1138,11 +1142,10 @@ module BSProfiles
       Lich::WebUI.close(@page)
     end
 
+    # The window title is fixed when the page is made; the footer shows the
+    # profile and whether it has unsaved changes.
     def title
-      label = @profile.empty? ? 'new profile' : @profile
-      return "Big Shot: v#{$bigshot_version}#{@profile.empty? ? '' : " (#{@profile})"}" if @live
-
-      "Bigshot Profiles: #{label}#{@dirty ? ' *' : ''}"
+      @live ? "Big Shot: v#{$bigshot_version}" : 'Bigshot Profiles'
     end
 
     # Editing bigshot's live settings, from ;bigshot setup.
@@ -1161,6 +1164,16 @@ module BSProfiles
     def cb(&block)
       editor = self
       ->(ev) { editor.act { block.call(ev) } }
+    end
+
+    # For a callback that only records state the page does not show (a
+    # picker's choice, a field's draft): errors contained, no re-render.
+    def cb_quiet(&block)
+      lambda do |ev|
+        block.call(ev)
+      rescue StandardError => e
+        respond "bsprofiles: #{e.class}: #{e.message}"
+      end
     end
 
     def status(tab, msg)
@@ -1251,6 +1264,7 @@ module BSProfiles
       @profile = name
       load_settings(data)
       @load_rev += 1
+      @profile_rev += 1
       @dirty = false
       @cmp_b = name
       @cmp_rows = nil
@@ -1270,6 +1284,7 @@ module BSProfiles
       name = name.to_s.strip
       return status(:profiles, 'Please enter a name before saving the profile.') if name.empty?
       return status(:profiles, bad_name_message) unless BSProfiles.valid_name?(name)
+      return status(:profiles, 'Answer the overwrite question first.') if @overwrite && !@overwrite.resolved?
 
       if BSProfiles.exist?(name)
         confirm_overwrite(name)
@@ -1282,16 +1297,19 @@ module BSProfiles
       path = BSProfiles.save(name, snapshot)
       saved(name)
       @save_name = ''
+      @profile_rev += 1
       @cmp_b = name
       status(:profiles, "The profile has been saved to #{path}")
     end
 
+    # One question at a time: save_as refuses a second Save as while this is
+    # open, as the modal's id can be registered only once.
     def confirm_overwrite(name)
       editor = self
-      future = Lich::API.webui_modal(owner: @owner, id: 'overwrite', title: 'Profile exists',
-                                     body: "A profile named '#{name}' already exists. Overwrite it?",
-                                     buttons: [{ id: 'overwrite', label: 'Overwrite' }, { id: 'cancel', label: 'Keep existing' }],
-                                     no_viewer: :abort, cancel_button: 'cancel', default_button: 'cancel')
+      future = @overwrite = Lich::API.webui_modal(owner: @owner, id: 'overwrite', title: 'Profile exists',
+                                                  body: "A profile named '#{name}' already exists. Overwrite it?",
+                                                  buttons: [{ id: 'overwrite', label: 'Overwrite' }, { id: 'cancel', label: 'Keep existing' }],
+                                                  no_viewer: :abort, cancel_button: 'cancel', default_button: 'cancel')
       future.then do |result|
         editor.act do
           if result.button == 'overwrite'
@@ -1315,8 +1333,19 @@ module BSProfiles
       BSProfiles.load(choice) || {}
     end
 
+    # The pickers change without a re-render, so the summary names the sides
+    # that were compared, not what the pickers hold now.
     def run_compare
       @cmp_rows = BSProfiles.compare(settings_for_choice(@cmp_a), settings_for_choice(@cmp_b))
+      @cmp_names = [@cmp_a, @cmp_b]
+    end
+
+    attr_reader :cmp_names
+
+    # A control seeded from the profile's name: a new key after Load and
+    # Save as, as the browser keeps a field's own value under one key.
+    def profile_key(id)
+      @profile_rev.zero? ? id : "#{id}-p#{@profile_rev}"
     end
 
     def open_choice(choice)
@@ -1338,22 +1367,22 @@ module BSProfiles
     #             for each boon ticked, so a creature can be hunted plain and
     #             fled when it spawns with that boon)
 
-    def reset_filters
-      @lvl_min, @lvl_max = BSProfiles.default_band
-      @cr_name = ''
-      @cr_area = ''
-    end
-
     def cr_mode = @cr_mode
 
     def cr_mode=(mode)
       @cr_mode = mode == 'search' ? 'search' : 'hunt'
     end
 
-    # [[template, rooms it lives in], ...] for the roster being shown.
+    # [[template, rooms it lives in], ...] for the roster being shown. A render
+    # asks for it several times, so it is kept until what it depends on changes.
     def roster
+      key = [@cr_mode, @lvl_min, @lvl_max, @cr_area, @cr_name, @cr_filters.dup,
+             @cr_mode == 'search' ? nil : hunt_rooms.object_id]
+      return @roster if @roster_key == key
+
       base = @cr_mode == 'search' ? search_creatures.map { |t| [t, nil] } : hunt_creatures
-      base.select { |t, _| creature_passes?(t) }
+      @roster_key = key
+      @roster = base.select { |t, _| creature_passes?(t) }
     end
 
     # --- filters, as eohunter's creature search has them -----------------
@@ -1442,7 +1471,8 @@ module BSProfiles
     end
 
     def creature_key(t)
-      "c#{BSProfiles.templates.index(t)}"
+      @template_index ||= BSProfiles.templates.each_with_index.to_h.compare_by_identity
+      "c#{@template_index[t]}"
     end
 
     def template_for_key(key)
@@ -1452,20 +1482,21 @@ module BSProfiles
     def select_creature(key)
       @cr_selected = key
       @area_index = 0
+      @pick_rev += 1
     end
 
+    attr_reader :pick_rev
+
     # Back to no creature picked, on the full creature list, to choose another.
-    # The table keeps its own highlight once seeded, so a new key gives it a
-    # fresh, empty selection. Settings a Fence wrote stay as they are.
-    def clear_creature
+    # The table keeps the viewer's highlight, so it is cleared for that viewer.
+    # Settings a Fence wrote stay as they are.
+    def clear_creature(viewer = nil)
       @cr_selected = nil
       @area_index = 0
       @cr_mode = 'search'
-      @cr_clear_rev = @cr_clear_rev.to_i + 1
+      @page.set(@roster_cid, :selected, [], viewer: viewer) if @page && @roster_cid
       status(:creatures, nil)
     end
-
-    def cr_clear_rev = @cr_clear_rev.to_i
 
     # The selected creature, if it is in the roster being shown.
     def template
@@ -1483,8 +1514,20 @@ module BSProfiles
       item.sub(/\([^)]*\)\z/, '').strip
     end
 
+    # The list's words, folded for comparison, parsed once per change of the
+    # setting: the roster asks about every creature on every render.
+    def list_words(id)
+      text = @settings[id].to_s
+      cached = @list_words[id]
+      return cached.last if cached&.first == text
+
+      words = list_items(id).to_set { |i| item_word(i).downcase(:fold) }
+      @list_words[id] = [text.dup, words]
+      words
+    end
+
     def listed?(id, word)
-      list_items(id).any? { |i| item_word(i).casecmp?(word) }
+      list_words(id).include?(word.to_s.downcase(:fold))
     end
 
     def list_add(id, word)
@@ -1760,14 +1803,25 @@ module BSProfiles
       @map_scale = scale.clamp(MAP_MIN_SCALE, MAP_MAX_SCALE).round(3)
     end
 
-    # Zoom so the sheet's width fills the view.
+    # The window's size as the viewer last reported it. The host keeps and
+    # restores the window's size and place itself; until a report arrives
+    # the opening size stands in.
+    def window_size
+      geometry = @page&.window_geometry || {}
+      width = geometry[:width].to_i
+      height = geometry[:height].to_i
+      [width > MAP_SIDE_SLACK + 100 ? width : WINDOW_SIZE.first,
+       height > MAP_TOP_SLACK + 100 ? height : WINDOW_SIZE.last]
+    end
+
     # Zoom so the whole sheet fits the view, both ways.
     def map_fit
       w, h = map_size(map_current) if map_current
       return unless w.to_i.positive? && h.to_i.positive?
 
-      across = (@window_width - MAP_SIDE_SLACK).to_f / w
-      down = (@window_height - MAP_TOP_SLACK).to_f / h
+      width, height = window_size
+      across = (width - MAP_SIDE_SLACK).to_f / w
+      down = (height - MAP_TOP_SLACK).to_f / h
       map_zoom([across, down].min)
     end
 
@@ -2068,7 +2122,7 @@ module BSProfiles
                       names.map { |n| { value: n, label: n } }
             ui.select(slot: '0', key: 'profile_name', label: 'Saved profiles', options: options, value: editor.load_choice,
                       tooltip: 'Saved profiles for this character. Pick one and click Load Profile.',
-                      on: { change: editor.cb { |ev| editor.load_choice = ev.payload[:value].to_s } })
+                      on: { change: editor.cb_quiet { |ev| editor.load_choice = ev.payload[:value].to_s } })
             ui.button(slot: '1', key: 'profile_button', label: 'Load Profile',
                       tooltip: "Load the chosen profile into the editor, replacing what is here.\nUnsaved edits are lost.",
                       on: { activate: editor.cb { editor.load_profile(editor.load_choice) } })
@@ -2076,14 +2130,14 @@ module BSProfiles
                       tooltip: 'Write the current settings to the profile named below.',
                       on: { activate: editor.cb { editor.update_profile } })
           end
-          ui.text_input(key: 'profile_current', label: 'Current Profile:', value: editor.profile, read_only: true,
+          ui.text_input(key: editor.profile_key('profile_current'), label: 'Current Profile:', value: editor.profile, read_only: true,
                         tooltip: 'The profile file this window represents. Update Profile writes to it.')
         end
         ui.group(key: 'p-save', label: 'Save Profile') do
           ui.columns(key: 'p-save-row', count: 2, weights: [3, 2], compact: true, row_align: :end) do
-            ui.text_input(slot: '0', key: 'save_profile_name', label: 'New profile name', value: editor.save_name,
+            ui.text_input(slot: '0', key: editor.profile_key('save_profile_name'), label: 'New profile name', value: editor.save_name,
                           placeholder: 'name for the new profile', tooltip: 'Name for the new profile. Spaces are fine.',
-                          on: { change: editor.cb { |ev| editor.save_name = ev.payload[:value].to_s }, submit: editor.cb { editor.save_as(editor.save_name) } })
+                          on: { change: editor.cb_quiet { |ev| editor.save_name = ev.payload[:value].to_s }, submit: editor.cb { editor.save_as(editor.save_name) } })
             ui.button(slot: '1', key: 'profile_save', label: 'Save Current Settings as...',
                       tooltip: 'Write the current settings to a new profile with the name typed here.',
                       on: { activate: editor.cb { editor.save_as(editor.save_name) } })
@@ -2091,7 +2145,7 @@ module BSProfiles
         end
         ui.text(key: 'p-status', content: editor.status_text(:profiles), tone: :caution, wrap: true) unless editor.status_text(:profiles).empty?
         ui.group(key: 'p-notes', label: 'Notes') do
-          ui.textarea(key: 'notes', value: editor.settings['notes'].to_s, rows: 5, tooltip: 'Free-form notes stored with the profile.',
+          ui.textarea(key: editor.entry_key('notes'), value: editor.settings['notes'].to_s, rows: 5, tooltip: 'Free-form notes stored with the profile.',
                       on: { change: editor.cb { |ev| editor.set('notes', ev.payload[:value].to_s) } })
         end
         ui.text(key: 'p-info', wrap: true, emphasis: :subtle,
@@ -2122,7 +2176,7 @@ module BSProfiles
         ui.group(key: 'boons-all', label: 'All Boon Creatures') do
           ui.stack(key: 'boons-all-row', orientation: :horizontal, gap: 24) do
             BoonMatrix::MODES.each do |mode|
-              ui.checkbox(key: "boons_all:#{mode}", label: mode.capitalize, checked: editor.boons["boons_all:#{mode}"].active?,
+              ui.checkbox(key: editor.entry_key("boons_all:#{mode}"), label: mode.capitalize, checked: editor.boons["boons_all:#{mode}"].active?,
                           **editor.tipp("all:#{mode}_label"),
                           on: { change: editor.cb { |ev| editor.boon_changed('boons_all', mode, ev.payload[:value]) } })
             end
@@ -2173,9 +2227,10 @@ module BSProfiles
       ui.stack(key: 'compare', gap: 8, margin: 8) do
         ui.columns(key: 'cmp-row', count: 6, weights: [3, 3, 1, 2, 2, 2], compact: true, row_align: :end) do
           ui.select(slot: '0', key: 'cmp_a', label: 'A', options: choices, value: editor.cmp_a, tooltip: "Left side of the comparison.\n#{side_tip}",
-                    on: { change: editor.cb { |ev| editor.cmp_a = ev.payload[:value].to_s } })
-          ui.select(slot: '1', key: 'cmp_b', label: 'B', options: choices, value: editor.cmp_b, tooltip: "Right side of the comparison.\n#{side_tip}",
-                    on: { change: editor.cb { |ev| editor.cmp_b = ev.payload[:value].to_s } })
+                    on: { change: editor.cb_quiet { |ev| editor.cmp_a = ev.payload[:value].to_s } })
+          ui.select(slot: '1', key: editor.profile_key('cmp_b'), label: 'B', options: choices, value: editor.cmp_b,
+                    tooltip: "Right side of the comparison.\n#{side_tip}",
+                    on: { change: editor.cb_quiet { |ev| editor.cmp_b = ev.payload[:value].to_s } })
           ui.button(slot: '2', key: 'cmp_run', label: 'Compare', variant: :primary, tooltip: 'Run the comparison. Differences are shown in red.',
                     on: { activate: editor.cb { editor.run_compare } })
           ui.checkbox(slot: '3', key: 'cmp_only_diff', label: 'Only differences', checked: editor.cmp_only_diff,
@@ -2189,7 +2244,7 @@ module BSProfiles
         rows = editor.cmp_rows
         if rows
           diffs = rows.count { |r| r[3] }
-          ui.text(key: 'cmp-summary', content: "#{diffs} of #{rows.size} settings differ between '#{editor.cmp_a}' and '#{editor.cmp_b}'.")
+          ui.text(key: 'cmp-summary', content: "#{diffs} of #{rows.size} settings differ between '#{editor.cmp_names[0]}' and '#{editor.cmp_names[1]}'.")
           shown = editor.cmp_only_diff ? rows.select { |r| r[3] } : rows
           table_rows = shown.map do |key, va, vb, differs|
             row = { key: key, cells: { 'setting' => key, 'a' => BSProfiles.display_value(va), 'b' => BSProfiles.display_value(vb) } }
@@ -2249,8 +2304,9 @@ module BSProfiles
       rev = @cr_filter_rev
       weights = search ? [3, 1, 1, 3, 4] : [3, 3, 6]
       ui.columns(key: "cr-row1-#{mode}-#{rev}", count: weights.size, weights: weights, compact: true, row_align: :end, gap: 6) do
-        # Keyed by the mode, as Fence switches it and a select is seeded once.
-        ui.select(slot: '0', key: "cr_mode-#{mode}", label: 'Show', value: mode,
+        # The row is keyed by the mode, as Fence and Clear switch it and a
+        # select is seeded once.
+        ui.select(slot: '0', key: 'cr_mode', label: 'Show', value: mode,
                   options: [{ value: 'hunt', label: 'Creatures in my hunt' }, { value: 'search', label: 'Search all creatures' }],
                   tooltip: "Creatures in my hunt: what lives in the rooms outlined green on the Map tab.\nSearch: every creature, by level, name and area.",
                   on: { change: editor.cb { |ev| editor.cr_mode = ev.payload[:value].to_s } })
@@ -2323,21 +2379,18 @@ module BSProfiles
                   { key: 'ignore', label: 'Ignore', width: 58, editor: { type: :checkbox } },
                   { key: 'flee', label: 'Flee', width: 48, editor: { type: :checkbox } },
                   { key: 'boons', label: 'Flee if boon', width: 120 }]
-      ui.table(key: "cr-roster-#{cr_clear_rev}", headers: true, selection: :single, selected: selected,
-               fill: true, sortable: true,
-               tooltip: "Hunt adds the noun to Valid Targets; Ignore to \"...but don't count these\"; Flee the name to \"...and always flee from\".\n" \
-                        'Hunt and Ignore exclude each other. Creatures sharing a noun share Hunt and Ignore. Click a row for its boons and details.',
-               columns: columns, rows: rows,
-               on: { cell_edit: editor.cb { |ev|
-                 t = editor.template_for_key(ev.payload[:row])
-                 editor.roster_edit(t, ev.payload[:column].to_s, ev.payload[:value] ? true : false) if t
-               },
-                     selection_change: editor.cb { |ev| key = Array(ev.payload[:rows]).first; editor.select_creature(key) if key } })
-    end
-
-    def roster_edit(t, column, on)
-      set_role(t, column, on)
-      @roster_rev += 1
+      # Clear unselects through the table's cid, for the viewer who clicked.
+      table = ui.table(key: 'cr-roster', headers: true, selection: :single, selected: selected,
+                       fill: true, sortable: true,
+                       tooltip: "Hunt adds the noun to Valid Targets; Ignore to \"...but don't count these\"; Flee the name to \"...and always flee from\".\n" \
+                                'Hunt and Ignore exclude each other. Creatures sharing a noun share Hunt and Ignore. Click a row for its boons and details.',
+                       columns: columns, rows: rows,
+                       on: { cell_edit: editor.cb { |ev|
+                         t = editor.template_for_key(ev.payload[:row])
+                         editor.set_role(t, ev.payload[:column].to_s, ev.payload[:value] ? true : false) if t
+                       },
+                             selection_change: editor.cb { |ev| key = Array(ev.payload[:rows]).first; editor.select_creature(key) if key } })
+      @roster_cid = table.cid
     end
 
     def render_creature_detail(ui)
@@ -2352,17 +2405,18 @@ module BSProfiles
       # out here first.
       fled = boon_flees(t)
       selected = @cr_selected
+      load_rev = @load_rev
       ui.columns(key: 'cr-title-row', count: 2, weights: [5, 1], compact: true, row_align: :center, gap: 6) do
         ui.text(slot: '0', key: 'cr-title', content: "#{t.name}, level #{t.level}", emphasis: :strong, wrap: true)
         ui.button(slot: '1', key: 'cr-clear', label: 'Clear', tooltip: 'Unselect this creature',
-                  on: { activate: editor.cb { editor.clear_creature } })
+                  on: { activate: editor.cb { |ev| editor.clear_creature(ev.viewer_id) } })
       end
       # The flow: pick a creature, fence its area, then choose from what lives
       # there. Fence is the next step, so it comes first.
       unless t.areas.empty?
         if t.areas.size > 1
           options = t.areas.each_with_index.map { |a, i| { value: i.to_s, label: a[:name].to_s } }
-          ui.select(key: "area_combo-#{selected}", label: 'Area', options: options.first(512), value: @area_index.to_s,
+          ui.select(key: "area_combo-#{selected}-#{editor.pick_rev}", label: 'Area', options: options.first(512), value: @area_index.to_s,
                     on: { change: editor.cb { |ev| editor.select_area(ev.payload[:value].to_i) } })
         end
         ui.button(key: 'fence_btn', label: "Fence #{(t.areas[@area_index.to_i] || t.areas.first)[:name]}", variant: :primary,
@@ -2379,7 +2433,9 @@ module BSProfiles
                 content: "Still hunted without the boon. Adds \"<adjective> #{t.name}\" to \"...and always flee from\" for each " \
                          'adjective of the boon. A spawn with two boons is not caught, as bigshot matches whole names. ' \
                          'The Boon Creatures tab sets boons for every creature.')
-        ui.grid(key: "cr-boon-grid-#{selected}", cols: 2, gap: 2) do
+        # Keyed by the load too: the ticks are seeded once, and another
+        # profile can flee this creature for other boons.
+        ui.grid(key: "cr-boon-grid-#{selected}-l#{load_rev}", cols: 2, gap: 2) do
           BoonMatrix::GROUPS.values.flatten.sort_by { |b| BoonMatrix::LABELS.fetch(b, [b]).first }.each do |boon|
             label, note = BoonMatrix::LABELS.fetch(boon, [boon, ''])
             adjs = BoonMatrix::ADJECTIVES.fetch(boon, [])
@@ -2387,7 +2443,7 @@ module BSProfiles
 
             tip = "Shows as: #{adjs.join(', ')}#{note.to_s.empty? ? '' : ".\n#{note}"}"
             ui.checkbox(key: "cr-boon-#{boon}", label: label, checked: fled.include?(boon), tooltip: tip,
-                        on: { change: editor.cb { |ev| editor.set_boon_flee(t, boon, ev.payload[:value] ? true : false); editor.bump_roster } })
+                        on: { change: editor.cb { |ev| editor.set_boon_flee(t, boon, ev.payload[:value] ? true : false) } })
           end
         end
       end
@@ -2415,10 +2471,6 @@ module BSProfiles
       @open_sections[name] = open ? true : false
     end
 
-    def bump_roster
-      @roster_rev += 1
-    end
-
     # ---- map ----
 
     def render_map(ui)
@@ -2431,12 +2483,12 @@ module BSProfiles
           ui.text_input(slot: '1', key: 'map_find', label: 'Find', value: editor.find_text, change_mode: :input,
                         placeholder: 'room id, uNNNN, area or room title',
                         tooltip: 'Press Enter to open the map with that room or area.',
-                        on: { change: editor.cb { |ev| editor.find_text = ev.payload[:value].to_s },
+                        on: { change: editor.cb_quiet { |ev| editor.find_text = ev.payload[:value].to_s },
                               submit: editor.cb { editor.find_on_map } })
           ui.select(slot: '2', key: 'map_role', label: 'Left-click sets', value: editor.map_role,
                     options: MAP_ROLES.map { |role, label| { value: role, label: label } },
                     tooltip: "What a left-click on a room makes it. Clicking a room that already has it takes it off.\nA right-click clears every role a room has.",
-                    on: { change: editor.cb { |ev| editor.map_role = ev.payload[:value].to_s } })
+                    on: { change: editor.cb_quiet { |ev| editor.map_role = ev.payload[:value].to_s } })
         end
         ui.columns(key: 'map-tools', count: 6, weights: [1, 1, 1, 1, 1, 6], compact: true, row_align: :center, gap: 6) do
           ui.button(slot: '0', key: 'zoom_out', label: '-', tooltip: 'Zoom out. Ctrl + mouse wheel over the map also zooms.',
