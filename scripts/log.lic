@@ -13,10 +13,12 @@
        author: elanthia-online
  contributors: Tillmen, Tysong, Xanlin, LostRanger
          game: any
-      version: 1.6.1
+      version: 1.7.0
      required: Lich >= 5.19.0
 
   changelog:
+    1.7.0 (2026-11-12):
+      * New --compress-after=N option (or log_compress_after: N in DragonRealms yaml) gzips log files older than N days.
     1.6.1 (2026-11-12):
       * XML logs no longer drop an lnet chat line that arrives while inventory is listed.
     1.6.0 (2026-11-11):
@@ -86,6 +88,9 @@
 =end
 
 hide_me
+
+require 'date'
+require 'zlib'
 
 # The game logger behind ;log and ;log --xml. Each run of log.lic (and
 # of an install's local logxml.lic 0.7.x, which loads this file under the
@@ -231,6 +236,29 @@ module GameLogger
     problem = value.is_a?(String) ? "--lines=#{value} is not a valid line count" : 'lines was given without a value'
     echo "#{problem}; use a whole number above 0, like --lines=50000. Using the default of #{DEFAULT_LINES_PER_FILE} lines per file."
     DEFAULT_LINES_PER_FILE
+  end
+
+  # Turns the --compress-after option, or the log_compress_after setting
+  # when the option is not given (DragonRealms yaml), into a number of
+  # days: log files dated more than that many days before today are
+  # gzipped (see +GameLogger::Logger.compress_old_logs+). Only a whole
+  # number above 0 is a number of days; anything else (0, negative, words,
+  # a bare --compress-after) echoes once and turns compression off.
+  #
+  # @param option [String, true, nil] the parsed --compress-after option
+  # @param setting [Integer, String, nil] settings.log_compress_after
+  # @return [Integer, nil] the days, or +nil+ for no compression
+  def self.compress_after_days(option, setting)
+    value, source = option.nil? ? [setting, 'log_compress_after'] : [option, '--compress-after']
+    return nil if value.nil?
+
+    days = value if value.is_a?(Integer)
+    days = Integer(value, 10) if value.is_a?(String) && value.match?(/\A[0-9]+\z/)
+    return days if days&.positive?
+
+    problem = value == true ? "#{source} was given without a number of days" : "#{source} #{value.inspect} is not a number of days"
+    echo "#{problem}; use a whole number above 0, like --compress-after=30. Old logs are not compressed."
+    nil
   end
 
   # Whether a value can be handed to strftime as a timestamp format: only a
@@ -849,6 +877,176 @@ module GameLogger
       path
     end
 
+    # A log file name this logger writes: <YYYY-MM-DD_HH-MM-SS>, an optional
+    # rotation suffix (_01), then .log or .xml. The date in the name, not the
+    # file's modification time, decides its age (copying logs between
+    # machines resets modification times).
+    LOG_FILE_NAME = /\A(\d{4})-(\d{2})-(\d{2})_\d{2}-\d{2}-\d{2}(?:_\d+)?\.(?:log|xml)\z/
+
+    # Seconds since its last write under which a file is left alone, and
+    # after which a leftover .gz.tmp counts as abandoned: a file written to
+    # within the hour may still be in use by some logger.
+    RECENT_WRITE = 3600
+
+    # One character's log folder: <log root>/<game>-<name>, see {log_root}.
+    #
+    # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
+    # @param name [String] the character's name (XMLData.name)
+    # @return [String] the folder path
+    def self.character_log_folder(game, name)
+      File.join(log_root, "#{game}-#{name}")
+    end
+
+    # Gzips every log file in a character's month folders
+    # (<folder>/<YYYY>/<MM>/) whose name dates it before +cutoff+, one file
+    # at a time (see {compress_log_file}). Files with other names, .gz
+    # files and the folder root (the layout before log.lic 0.0.7) are left
+    # alone.
+    #
+    # @param folder [String] the character's log folder, see
+    #   {character_log_folder}
+    # @param cutoff [Date] files dated before this day are compressed
+    # @param now [Time] the time now, for {RECENT_WRITE}
+    # @return [Array(Integer, Integer, Integer)] the files compressed, their
+    #   bytes before and their bytes after
+    def self.compress_old_logs(folder, cutoff, now: Time.now)
+      count = before = after = 0
+      Dir.glob(File.join(folder, '[0-9][0-9][0-9][0-9]', '[0-9][0-9]', '*')).sort.each do |path|
+        next unless (match = File.basename(path).match(LOG_FILE_NAME))
+        next unless (Date.new(match[1].to_i, match[2].to_i, match[3].to_i) rescue nil)&.<(cutoff)
+        next unless (sizes = compress_log_file(path, now: now))
+
+        count += 1
+        before += sizes[0]
+        after += sizes[1]
+      end
+      [count, before, after]
+    end
+
+    # Gzips one log file in place, as <path>.gz, without ever losing it:
+    # the copy is written to <path>.gz.tmp (created exclusively, so a second
+    # logger compressing the same folder skips the file), flushed to disk,
+    # read back whole and checked against the original's size, then renamed
+    # to <path>.gz with the original's modification time; only then is the
+    # original deleted. A file written to within {RECENT_WRITE} is skipped.
+    # When <path>.gz already exists (an earlier sweep stopped after the
+    # rename), the original is deleted only if that .gz holds all of it.
+    # Every failure leaves the original in place, removes the temp file this
+    # call made, and goes to the Lich log with the path and the error.
+    #
+    # @param path [String] the log file
+    # @param now [Time] the time now, for {RECENT_WRITE}
+    # @return [Array(Integer, Integer), nil] the original's size and the
+    #   .gz's size when the original is gone, or +nil+ when it is still there
+    def self.compress_log_file(path, now: Time.now)
+      stat = File.stat(path)
+      return nil if now - stat.mtime < RECENT_WRITE
+
+      gz_path = "#{path}.gz"
+      return finish_compressed(path, gz_path, stat) if File.exist?(gz_path)
+
+      tmp = "#{gz_path}.tmp"
+      File.delete(tmp) if File.exist?(tmp) && now - File.mtime(tmp) > RECENT_WRITE
+      created = false
+      File.open(tmp, File::WRONLY | File::CREAT | File::EXCL | File::BINARY) do |out|
+        created = true
+        gzip = Zlib::GzipWriter.new(out, Zlib::DEFAULT_COMPRESSION)
+        gzip.mtime = stat.mtime
+        gzip.orig_name = File.basename(path)
+        File.open(path, 'rb') do |input|
+          while (chunk = input.read(65_536))
+            gzip.write(chunk)
+          end
+        end
+        gzip.finish
+        out.flush
+        out.fsync
+      end
+      unless gzip_complete?(tmp, stat.size) && File.size(path) == stat.size
+        File.delete(tmp)
+        created = false
+        Lich.log "log: left #{path} as it is: its compressed copy did not read back whole, or the file changed meanwhile"
+        return nil
+      end
+      File.rename(tmp, gz_path)
+      created = false
+      File.utime(stat.atime, stat.mtime, gz_path)
+      remove_compressed_original(path, gz_path, stat)
+    rescue Errno::EEXIST
+      nil
+    rescue SystemCallError, IOError, Zlib::Error => e
+      begin
+        File.delete(tmp) if created && File.exist?(tmp)
+      rescue SystemCallError
+        nil
+      end
+      Lich.log "log: left #{path} as it is: compressing it failed (#{e.class}: #{e.message})"
+      nil
+    end
+
+    # Deletes the original once <path>.gz holds it (see
+    # {compress_log_file}). When it cannot be deleted (on Windows, a file
+    # another program has open), both stay, and the next sweep deletes the
+    # original after checking the .gz ({finish_compressed}).
+    #
+    # @param path [String] the log file
+    # @param gz_path [String] its .gz
+    # @param stat [File::Stat] the log file's stat from before compressing
+    # @return [Array(Integer, Integer), nil] the sizes, or +nil+ when the
+    #   original is still there
+    def self.remove_compressed_original(path, gz_path, stat)
+      File.delete(path)
+      [stat.size, File.size(gz_path)]
+    rescue SystemCallError => e
+      Lich.log "log: compressed #{path} to #{gz_path}, but could not delete the original (#{e.class}: #{e.message}); the next sweep deletes it"
+      nil
+    end
+
+    # Finishes a file an earlier sweep compressed but did not delete: the
+    # original goes only when <path>.gz reads back whole at the original's
+    # size ({gzip_complete?}); otherwise both stay and the Lich log says why.
+    #
+    # @param path [String] the log file
+    # @param gz_path [String] its existing .gz
+    # @param stat [File::Stat] the log file's stat
+    # @return [Array(Integer, Integer), nil] the sizes when the original is
+    #   gone, or +nil+ when it is still there
+    def self.finish_compressed(path, gz_path, stat)
+      return remove_compressed_original(path, gz_path, stat) if gzip_complete?(gz_path, stat.size)
+
+      Lich.log "log: left #{path} as it is: #{gz_path} already exists and does not hold all of it"
+      nil
+    end
+
+    # Whether +gz_path+ is a whole gzip file holding +size+ bytes: read to
+    # the end, which also checks gzip's CRC and length trailer.
+    #
+    # @param gz_path [String] the .gz (or .gz.tmp) file
+    # @param size [Integer] the original's size in bytes
+    # @return [Boolean]
+    def self.gzip_complete?(gz_path, size)
+      total = 0
+      Zlib::GzipReader.open(gz_path) do |gzip|
+        while (chunk = gzip.read(65_536))
+          total += chunk.bytesize
+        end
+      end
+      total == size
+    rescue Zlib::Error, IOError, SystemCallError
+      false
+    end
+
+    # A byte count for the echo: "438 MB", "4.9 GB".
+    #
+    # @param bytes [Integer]
+    # @return [String]
+    def self.size_text(bytes)
+      return "#{(bytes / 1e9).round(1)} GB" if bytes >= 1e9
+      return "#{(bytes / 1e6).round} MB" if bytes >= 1e6
+
+      "#{(bytes / 1e3).round} KB"
+    end
+
     # The header or footer line of a log file: the time now in the
     # timestamp format, or in {FILE_STAMP_FORMAT} (date, time to the
     # millisecond and UTC offset) when timestamps are off.
@@ -1268,12 +1466,13 @@ module GameLogger
 
     # Reads the settings and options and sets the script's flags, in the
     # order the logger always has: get_settings, the mode's
-    # {Mode#script_flags}, then the timestamp format and the --lines count
-    # (each may echo), then the map load when a Lich number is needed. Every
-    # value goes on this run.
+    # {Mode#script_flags}, then the timestamp format, the --lines count and
+    # the --compress-after days (each may echo), then the map load when a
+    # Lich number is needed. Every value goes on this run.
     #
     # @return [void]
     def configure
+      settings = nil
       if @io.respond_to?(:get_settings, true)
         settings = @io.send(:get_settings)
         stamp_enable = settings.log_timestamp
@@ -1283,6 +1482,10 @@ module GameLogger
       @stamp_format = GameLogger.timestamp_format(@options.timestamp, stamp_enable, stamp_format)
       @show_room_numbers = @options.roomnum || @options.rnum
       @lines_per_file = GameLogger.lines_per_file(@options.lines)
+      # The XML twin of --both shares this character folder; only the text
+      # logger compresses it.
+      @compress_days = (GameLogger.compress_after_days(@options[:'compress-after'], settings&.log_compress_after) unless @options.twin)
+      @compress_date = @compressor = nil
       configure_rooms
     end
 
@@ -1314,6 +1517,7 @@ module GameLogger
       dir = self.class.log_directory(XMLData.game, XMLData.name, @clock.now)
       FileUtils.mkdir_p(dir) unless File.exist?(dir)
       date = today
+      start_compression(date) if @compress_days && date != @compress_date
       filename = self.class.log_file_path(dir, @clock.now, @mode.extension, rotated: @started)
       self.class.with_log_file(filename, @stamp_format, clock: @clock, header_stamp: @mode.header_stamp) do |file|
         start_logging(file, filename) unless @started
@@ -1414,6 +1618,38 @@ module GameLogger
       @room_uid_excluded || @room_id_excluded
     end
 
+    # Starts gzipping this character's old logs in a background thread, at
+    # most once a day: when the run opens its first file and when a new
+    # day's file opens (see {Logger.compress_old_logs}). The get loop never
+    # waits on it, so a sweep over years of logs cannot make Lich's
+    # downstream buffer drop lines. It echoes once, with the count and the
+    # space, when it compressed something; a sweep still running from the
+    # day before is left to finish.
+    #
+    # @param date [String] the day now, "%Y-%m-%d"
+    # @return [void]
+    def start_compression(date)
+      return if @compressor&.alive?
+
+      @compress_date = date
+      folder = self.class.character_log_folder(XMLData.game, XMLData.name)
+      cutoff = Date.strptime(date, '%Y-%m-%d') - @compress_days
+      days = @compress_days
+      now = @clock.now
+      io = @io
+      label = self.class.log_label
+      @compressor = Thread.new do
+        Thread.current.priority = -1
+        count, before, after = self.class.compress_old_logs(folder, cutoff, now: now)
+        if count.positive?
+          io.send(:echo, "compressed #{count} log file#{'s' unless count == 1} older than #{days} day#{'s' unless days == 1}: " \
+                         "#{self.class.size_text(before)} down to #{self.class.size_text(after)}.")
+        end
+      rescue StandardError => e
+        Lich.log "#{label}: compressing old logs stopped (#{e.class}: #{e.message})"
+      end
+    end
+
     # The day now, as the file names write it.
     #
     # @return [String] "%Y-%m-%d"
@@ -1502,6 +1738,8 @@ module GameLogger
       "  #{pad}                          Lich room number (needs the room's UID in Lich's map)",
       "  #{pad} --lines=50000            start a new file after this many lines (default 30000)",
       "  #{pad} --streams                XML mode only: keep all the stream window content (very noisy)",
+      "  #{pad} --compress-after=30      gzip log files more than this many days old (in the background,",
+      "  #{pad}                          when logging starts and each new day; .log becomes .log.gz)",
       '',
       "  Files go to Lich's log folder (lich/logs, or the one set with Lich's --logs=), under",
       '  <game>-<character>/<year>/<month>/, with a new file each day and after --lines lines.',
@@ -1509,7 +1747,8 @@ module GameLogger
       *together,
       '',
       '  DragonRealms: log_timestamp: true in your yaml turns timestamps on, in the',
-      '  log_timestamp_format format; --timestamp wins over both.',
+      '  log_timestamp_format format; --timestamp wins over both. log_compress_after: 30',
+      '  in your yaml does what --compress-after=30 does; the option wins.',
       '',
       '  A reply that comes within about 50 ms of a typed command can be logged before it.',
       '',
@@ -1541,7 +1780,7 @@ module GameLogger
   #   them
   # @return [Object, nil] the started exec script, or nil when none started
   def self.start_xml_twin(options)
-    twin_options = options.to_h.reject { |key, _| %i[both help].include?(key) }.merge(xml: true)
+    twin_options = options.to_h.reject { |key, _| %i[both help].include?(key) }.merge(xml: true, twin: true)
     twin = ExecScript.start("hide_me\n::#{name}.main(OpenStruct.new(#{twin_options.inspect}))", quiet: true, name: Logger::BOTH_XML_NAME)
     unless twin
       echo '--both: the XML log could not be started (Lich did not start a second script), so only the text log is written.'
@@ -1588,6 +1827,12 @@ module GameLogger
   # @option options [String, true, nil] :both --both, or the word both:
   #   any value logs the text here and the XML in a twin exec script (see
   #   {start_xml_twin})
+  # @option options [String, true, nil] :"compress-after" --compress-after=N:
+  #   gzip this character's log files dated more than N days ago (see
+  #   {compress_after_days}); the log_compress_after setting does the same
+  #   when the option is not given
+  # @option options [true, nil] :twin set only by {start_xml_twin} for the
+  #   XML twin of --both, which leaves compressing to its text logger
   # @option options [String, true, nil] :help the word help or --help:
   #   shows {help_lines} instead of logging (see {show_help})
   # @return [void]
