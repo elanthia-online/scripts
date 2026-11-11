@@ -3323,9 +3323,9 @@ module LogSpecHarness::Env
         end
 
         {
-          'a negative number' => ['-5', nil, '--compress-after "-5" is not a number of days'],
-          'a word' => ['month', nil, '--compress-after "month" is not a number of days'],
-          'a bare flag' => [true, nil, '--compress-after was given without a number of days'],
+          'a negative number'  => ['-5', nil, '--compress-after "-5" is not a number of days'],
+          'a word'             => ['month', nil, '--compress-after "month" is not a number of days'],
+          'a bare flag'        => [true, nil, '--compress-after was given without a number of days'],
           'a bad yaml setting' => [nil, 'x', 'log_compress_after "x" is not a number of days']
         }.each do |label, (option, setting, message)|
           it "turns compression off and says why for #{label}" do
@@ -3489,9 +3489,9 @@ module LogSpecHarness::Env
 
         it 'flushes the compressed copy to disk before renaming it' do
           synced = []
-          allow_any_instance_of(File).to receive(:fsync).and_wrap_original { |m| synced << m.receiver.path; m.call }
+          allow_any_instance_of(File).to(receive(:fsync).and_wrap_original { |m| synced << m.receiver.path; m.call })
           renamed = []
-          allow(File).to receive(:rename).and_wrap_original { |m, from, to| renamed << [synced.dup, from, to]; m.call(from, to) }
+          allow(File).to(receive(:rename).and_wrap_original { |m, from, to| renamed << [synced.dup, from, to]; m.call(from, to) })
 
           GameLogger::Logger.compress_log_file(path, now: now)
 
@@ -3841,7 +3841,7 @@ module LogSpecHarness::Env
 
         # A new day's sweep waits, so the XML twin of --both has closed
         # yesterday's file; the first sweep of a run does not.
-        it "waits #{120} seconds before a new day's sweep, and not before the first" do
+        it "waits 120 seconds before a new day's sweep, and not before the first" do
           stub_const('LogSpecHarness::Env::GameLogger::Logger::DAY_SWEEP_DELAY', 120)
           sweep_synchronously!
           slept = Queue.new
