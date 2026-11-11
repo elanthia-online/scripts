@@ -438,11 +438,13 @@ module LogSpecHarness::Env
     # the same buffer when it wants the text downstream too, or another
     # script's output when it wants that; typed commands reach upstream_get
     # only with want_upstream.
-    it 'asks for the XML downstream and typed commands, and not the text downstream or script output' do
+    # Since 1.5.0 it also asks for script output, as text mode does, so the
+    # XML log carries Lich's and other scripts' echoes (logxml.lic did not).
+    it 'asks for the XML downstream, script output and typed commands, and not the text downstream' do
       run_xml
 
       expect(xml_script.to_h.slice(:want_downstream, :want_downstream_xml, :want_script_output, :want_upstream)).to eq(
-        want_downstream: false, want_downstream_xml: true, want_script_output: false, want_upstream: true
+        want_downstream: false, want_downstream_xml: true, want_script_output: true, want_upstream: true
       )
     end
 

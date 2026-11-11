@@ -318,6 +318,14 @@ module LogSpecHarness::Env
           end
         end
 
+        it 'says both kinds of log record script output' do
+          LogSpecHarness.start_script('help')
+
+          run_main
+
+          expect(LogSpecHarness.responses).to include('  Both kinds of log also record script output (what Lich and other scripts echo).')
+        end
+
         it 'lists every option the logger reads' do
           LogSpecHarness.start_script('help')
 
@@ -2494,7 +2502,9 @@ module LogSpecHarness::Env
         # the text lines with want_downstream and other scripts' echoes with
         # want_script_output, and gives reget's raw XML only to a script that
         # already wants the XML downstream.
-        it 'wants the XML downstream and typed commands only, set before reget is called' do
+        # Since 1.5.0 XML mode also wants script output (other scripts'
+        # echoes and responds), as text mode always has.
+        it 'wants the XML downstream, script output and typed commands, set before reget is called' do
           flags_at_reget = nil
           allow(LogSpecHarness).to receive(:reget).and_wrap_original do |original|
             flags_at_reget = LogSpecHarness.script.to_h.slice(:want_downstream, :want_downstream_xml, :want_script_output, :want_upstream)
@@ -2504,7 +2514,7 @@ module LogSpecHarness::Env
 
           run_main
 
-          expect(flags_at_reget).to eq(want_downstream: false, want_downstream_xml: true, want_script_output: false, want_upstream: true)
+          expect(flags_at_reget).to eq(want_downstream: false, want_downstream_xml: true, want_script_output: true, want_upstream: true)
         end
 
         # Server lines verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml.
@@ -3350,13 +3360,13 @@ module LogSpecHarness::Env
       describe 'Mode::XML' do
         let(:mode) { GameLogger::Mode::XML }
 
-        it "is a frozen value with logxml's file extension, typed command line and flags" do
+        it "is a frozen value with logxml's file extension and typed command line, and script output too" do
           expect(mode).to be_frozen
           expect(mode.extension).to eq('.xml')
           expect(mode.started_text).to eq('XML Logging started, currently logging to')
           expect(mode.upstream_line.call('<c>look')).to eq('<!-- CLIENT --><c>look<!-- ENDCLIENT -->')
           expect(mode.script_flags).to be_frozen
-          expect(mode.script_flags).to eq(want_script_output: false, want_upstream: true, want_downstream: false, want_downstream_xml: true)
+          expect(mode.script_flags).to eq(want_script_output: true, want_upstream: true, want_downstream: false, want_downstream_xml: true)
         end
 
         # Only the hour's leading zero goes, never a zero in the date or minutes.
