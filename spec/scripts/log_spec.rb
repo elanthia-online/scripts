@@ -3537,6 +3537,18 @@ module LogSpecHarness::Env
           expect(calls).to be_empty
         end
 
+        it 'does not sweep again when a full file starts the next one the same day' do
+          calls = Queue.new
+          allow(GameLogger::Logger).to receive(:compress_old_logs) { |*args, **| calls << args[1]; [0, 0, 0] }
+
+          run_logger(GameLogger::Opts.parse(['--compress-after=30', '--lines=1']), io_class.new(['line 1', 'line 2', 'line 3']))
+          first = Timeout.timeout(2) { calls.pop }
+          sleep 0.1
+
+          expect(first).to eq(Date.new(2026, 10, 2))
+          expect(calls).to be_empty
+        end
+
         it 'does not sweep without the option or the setting' do
           allow(GameLogger::Logger).to receive(:compress_old_logs)
 
