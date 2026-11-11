@@ -3610,7 +3610,7 @@ module LogSpecHarness::Env
         it 'says nothing when another sweep holds the temp file (the exclusive create fails)' do
           allow(LogSpecHarness::Env::Lich).to receive(:log)
           allow(File).to receive(:open).and_call_original
-          allow(File).to receive(:open).with(tmp, anything).and_raise(Errno::EEXIST, tmp)
+          allow(File).to receive(:open).with(tmp, anything, anything).and_raise(Errno::EEXIST, tmp)
 
           expect(GameLogger::Logger.compress_log_file(path, now: now)).to be_nil
           expect(File).to exist(path)
@@ -3663,6 +3663,65 @@ module LogSpecHarness::Env
           GameLogger::Logger.compress_log_file(path, now: now)
 
           expect(File.stat("#{path}.gz").mode & 0o777).to eq(0o600)
+        end
+
+        # GHSA-hw37-f32h-g7vv (mrhoribu): the temp file took the umask's
+        # mode, so a log restricted to 0600 was readable by others while it
+        # was compressed, and stayed so as a .gz when the chmod was refused.
+        it 'keeps a restricted log unreadable to others while compressing it, and when its permissions cannot be set' do
+          File.chmod(0o600, path)
+          skip 'permission bits do not round-trip on this system (Windows)' unless File.stat(path).mode & 0o777 == 0o600
+          tmp = "#{path}.gz.tmp"
+          tmp_modes = []
+          allow(File).to receive(:open).and_wrap_original do |original, *args, **kw, &blk|
+            tmp_modes << (File.stat(tmp).mode & 0o777) if args.first == path && File.exist?(tmp)
+            original.call(*args, **kw, &blk)
+          end
+          allow(File).to receive(:chmod).and_raise(Errno::EPERM, path)
+          allow(LogSpecHarness::Env::Lich).to receive(:log)
+          old_umask = File.umask(0o022)
+          begin
+            GameLogger::Logger.compress_log_file(path, now: now)
+          ensure
+            File.umask(old_umask)
+          end
+
+          expect(tmp_modes).to eq([0o600])
+          expect(File.stat("#{path}.gz").mode & 0o777).to eq(0o600)
+        end
+
+        # mrhoribu: two sweepers in step; B reaches a file A has just renamed
+        # and deleted. That is not a mismatch, and is not logged as one.
+        it 'says nothing when another sweeper deletes the original while its .gz is being checked' do
+          bytes = File.binread(path)
+          Zlib::GzipWriter.open("#{path}.gz") { |gz| gz.write(bytes) }
+          allow(LogSpecHarness::Env::Lich).to receive(:log)
+          allow(File).to receive(:open).and_wrap_original do |original, *args, **kw, &blk|
+            File.delete(path) if args.first == path && args[1] == 'rb' && File.exist?(path)
+            original.call(*args, **kw, &blk)
+          end
+
+          expect(GameLogger::Logger.compress_log_file(path, now: now)).to be_nil
+          expect(LogSpecHarness::Env::Lich).not_to have_received(:log)
+          expect(gunzip("#{path}.gz")).to eq(bytes)
+        end
+
+        # mrhoribu's open question: a sweeper whose clock runs over an hour
+        # ahead takes this sweep's temp file for abandoned and leaves its own
+        # (still empty) one in its place just before the rename. The
+        # original must not be deleted for a .gz that does not read back.
+        it 'keeps the original when the renamed .gz does not read back whole' do
+          bytes = File.binread(path)
+          tmp = "#{path}.gz.tmp"
+          allow(LogSpecHarness::Env::Lich).to receive(:log)
+          allow(File).to receive(:rename).and_wrap_original do |original, from, to|
+            File.binwrite(from, '') if from == tmp
+            original.call(from, to)
+          end
+
+          expect(GameLogger::Logger.compress_log_file(path, now: now)).to be_nil
+          expect(File.binread(path)).to eq(bytes)
+          expect(LogSpecHarness::Env::Lich).to have_received(:log).with(a_string_including('did not read back whole after the rename'))
         end
 
         # Review finding 8: same size is not the same bytes.
