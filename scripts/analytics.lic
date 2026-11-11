@@ -258,6 +258,7 @@ module GS4Analytics
       [:parse_sales, true, 'record vendor sales and spending from the game text'],
       [:parse_bank, true, 'record BANK ACCOUNT and teller lines as bank balances'],
       [:track_shops, true, "record each shop, bank and locksmith stop (from the map's room tags)"],
+      [:combat, true, "record damage dealt and kills credited per creature (turns on Lich's combat tracker)"],
       [:max_hunt_minutes, nil, 'ask bigshot to rest after hunting this long. blank: no limit'],
       [:idle_warn_minutes, 8, 'alert after this long with nothing running'],
       [:idle_recover_minutes, nil, 'after this long idle, walk to profile_room_map and start rest_script. blank: off'],
@@ -434,7 +435,7 @@ module GS4Analytics
     # The schema in create_schema. Any change to it bumps this, and a file made
     # with another value is refused (see check_schema), not migrated. Kept in
     # step with KNOWN_SCHEMAS in elanthia-online/analytics.
-    SCHEMA_VERSION    = '10'
+    SCHEMA_VERSION    = '11'
     PROGRESS_COLUMNS = %i[level exp ascension_exp until_next fame deeds long_term_exp deaths_sting
                           ptp mtp atp lumnis rpa fashlonae resource_name resource_weekly resource_total
                           suffused voln_favor covert_arts_charges shadow_essence].freeze
@@ -676,6 +677,28 @@ module GS4Analytics
 
       # +at+ is when the corpse was searched, so a kill whose write waits
       # still lands on the right day
+      # CombatManager's sums: each cycle one of +firsts+ (when a changed
+      # creature was first fought) falls in is summed again from the
+      # recorder, through the block, and its rows replaced. A cycle runs to
+      # the next one's start.
+      def record_combat(who, firsts)
+        mine = db[:cycles].where(game: who.game, character: who.name)
+        spans = firsts.filter_map do |at|
+          cycle = mine.where(Sequel[:start_time] <= at.floor).reverse(:start_time).select(:cycle_id, :start_time).first or next
+          following = mine.where(Sequel[:start_time] > cycle[:start_time]).min(:start_time)
+          [cycle[:cycle_id], cycle[:start_time], following || (Time.now.to_i + 1)]
+        end
+        spans.uniq.each do |cycle_id, from, to|
+          rows = yield(from, to)
+          stats = db[:combat_stats]
+          # By time, not cycle id: a cycle too short to keep is deleted and
+          # the next starts where it did, and rows summed under it in between
+          # would be counted again under the next
+          stats.where(game: who.game, character: who.name).where(Sequel[:start_time] >= from).where(Sequel[:start_time] < to).delete
+          rows.each { |row| stats.insert(clean(row.merge(game: who.game, character: who.name, cycle_id: cycle_id, start_time: from))) }
+        end
+      end
+
       def record_kill(who, creature, profile, silver, at: Time.now.to_i, boxes: 0)
         kills = Sequel[:kill_stats]
         db[:kill_stats].insert_conflict(
@@ -1243,6 +1266,28 @@ module GS4Analytics
           Integer :covert_arts_charges
           Integer :shadow_essence
           primary_key %i[game character timestamp]
+        end
+
+        # Per cycle and creature kind, what a character did to the creatures
+        # it fought (CombatManager): how many it hit, its damage and hits, its
+        # kills (its own killing blow) and assists (it hit one someone else
+        # killed), and its damage to the ones it killed. start_time is the
+        # cycle's, so ranges need no join.
+        db.create_table?(:combat_stats) do
+          String :game, null: false
+          String :character, null: false
+          String :cycle_id, null: false
+          Integer :start_time, null: false
+          String :creature, null: false
+          String :noun
+          Integer :fought, default: 0
+          Integer :kills, default: 0
+          Integer :assists, default: 0
+          Integer :damage, default: 0
+          Integer :hits, default: 0
+          Integer :kill_damage, default: 0
+          primary_key %i[game character cycle_id creature]
+          index %i[game character start_time]
         end
 
         db.create_table?(:metadata) do
@@ -2558,6 +2603,204 @@ module GS4Analytics
   end
 
   # ==========================================================================
+  # CombatManager: damage dealt and kills credited, per creature, from Lich's
+  # own combat tracker and recorder (Lich::Gemstone::Combat). The recorder
+  # keeps every swing in a file of its own beside the character's settings;
+  # once a minute each cycle a changed creature was fought in is summed again
+  # into combat_stats, one row per creature kind: the creatures this character
+  # hit, its damage and hits on them, its kills and its assists.
+  # ==========================================================================
+  module CombatManager
+    constants(false).each { |name| remove_const(name) unless const_get(name).is_a?(Module) }
+
+    FILE_NAME = 'analytics-combat.db'
+    IDLE_SECONDS = 300    # no combat this long ends the recorder's hunt (its own default)
+    ROLLUP_SECONDS = 60   # how often the summary is brought up to date
+    # A creature already summed is summed again while it could still change:
+    # a death the room shows late, a creature come back to after a rest
+    REVISIT_SECONDS = 900
+    KEEP_DAYS = 3 # the recorder's swings are kept this long once summed
+    PRUNE_SECONDS = 6 * 3600 # and trimmed this often, a login can run for days
+    MARK_KEY = 'combat_mark'
+    # The recorder decides whose an attack is (attacks.ours) and which attack
+    # killed a creature (creatures.killed_by_attack_id, kill_credit). A hit is
+    # this character's when its attack is, or when it rode a flare of ours (a
+    # reactive flare on a creature's own attack); the kill is ours the same way.
+    OWN_HIT = '(a.ours = 1 OR EXISTS (SELECT 1 FROM flares f WHERE f.id = h.flare_id AND f.ours = 1))'
+    OUR_KILL = '(a.ours = 1 OR EXISTS (SELECT 1 FROM hits h JOIN flares f ON f.id = h.flare_id ' \
+               'WHERE h.attack_id = a.id AND h.creature_id = c.id AND f.ours = 1))'
+    # Each creature's sums, for the creatures first fought in [from, to)
+    CREATURES_SQL = <<~SQL
+      SELECT c.name, c.noun, c.killed_at,
+             (SELECT COALESCE(SUM(h.damage), 0) FROM hits h JOIN attacks a ON a.id = h.attack_id
+               WHERE h.creature_id = c.id AND #{OWN_HIT}) AS damage,
+             (SELECT COUNT(*) FROM hits h JOIN attacks a ON a.id = h.attack_id
+               WHERE h.creature_id = c.id AND h.damage > 0 AND #{OWN_HIT}) AS hits,
+             (SELECT #{OUR_KILL} FROM attacks a WHERE a.id = c.killed_by_attack_id) AS our_kill
+      FROM creatures c
+      WHERE c.exist_id IS NOT NULL AND c.first_seen >= ? AND c.first_seen < ?
+    SQL
+    # When the creatures touched since the mark were first fought
+    CHANGED_SQL = 'SELECT first_seen, MAX(COALESCE(last_seen, 0), COALESCE(killed_at, 0)) AS seen FROM creatures ' \
+                  'WHERE exist_id IS NOT NULL AND (last_seen >= ? OR killed_at >= ?)'
+
+    class << self
+      attr_reader :recorder
+
+      def start(who, cfg)
+        @who = who
+        @recorder = nil
+        @path = File.join(DATA_DIR, who.game, who.name, FILE_NAME)
+        return unless cfg[:combat]
+        return Log.info('Combat: not recorded, this Lich has no combat recorder') unless load_lich
+
+        @mark = Database.reader { |db| db[:metadata].where(key: "#{MARK_KEY}_#{who}").get(:value) }.to_f
+        # What the last run recorded and didn't sum (a crash), before it's pruned.
+        # Neither stops the recording if it fails.
+        begin
+          rollup
+          prune
+        rescue StandardError => e
+          Log.error('combat catch-up', e)
+        end
+        @pruned_at = monotonic
+        @recorder = Lich::Gemstone::Combat::Recorder.new(@path, character: who.name, idle_timeout: IDLE_SECONDS)
+        @recorder.subscribe!
+        tracker = Lich::Gemstone::Combat::Tracker
+        # Lich keeps the tracker's on/off per character: put back what was found
+        @enabled_tracker = !tracker.enabled?
+        tracker.enable! if @enabled_tracker
+        @rolled_at = monotonic
+        Log.debug("Combat: recording to #{@path}")
+      rescue StandardError, ScriptError => e
+        Log.error('combat start', e)
+        @recorder = nil
+      end
+
+      def stop
+        return unless @who
+
+        if @recorder
+          Util.safely { @recorder.close }
+          Util.safely { Lich::Gemstone::Combat::Tracker.disable! } if @enabled_tracker
+          rollup
+        end
+        @recorder = nil
+        @who = nil
+      end
+
+      # From the cycle watcher's loop: closes a hunt the idle gap has ended,
+      # and sums what changed since the last time
+      def tick
+        return unless @recorder && monotonic - @rolled_at.to_f >= ROLLUP_SECONDS
+
+        @rolled_at = monotonic
+        @recorder.check_idle!
+        rollup
+        return unless monotonic - @pruned_at.to_f >= PRUNE_SECONDS
+
+        @pruned_at = monotonic
+        prune # its own connection; the recorder's hunts being written are newer
+      rescue StandardError => e
+        Log.error('combat', e)
+      end
+
+      # Finds the creatures touched since the mark (less REVISIT_SECONDS) and
+      # queues their cycles to be summed again. The recorder's file is read
+      # through connections of its own: in WAL mode they never wait on its
+      # writes.
+      def rollup(path = @path, who = @who)
+        return unless who && File.exist?(path)
+
+        since = @mark.to_f - REVISIT_SECONDS
+        changed = recorder_rows(path, CHANGED_SQL, [since, since])
+        return if changed.empty?
+
+        @mark = [@mark.to_f, *changed.map { |row| row['seen'].to_f }].max
+        mark = @mark
+        firsts = changed.map { |row| row['first_seen'].to_f }
+        Database.async do
+          Database.record_combat(who, firsts) { |from, to| summarize(path, from, to) }
+          Database.set_metadata("#{MARK_KEY}_#{who}", mark)
+        end
+      end
+
+      # One row per creature kind fought in [from, to): only those this
+      # character hit or killed. A kill is its own killing blow; an assist, one
+      # it hit that died to someone else's.
+      def summarize(path, from, to)
+        kinds = {}
+        recorder_rows(path, CREATURES_SQL, [from, to]).each do |row|
+          damage = row['damage'].to_i
+          kill = row['our_kill'].to_i == 1
+          next unless damage.positive? || kill
+
+          kind = kinds[row['name'].to_s] ||= { creature: row['name'].to_s, noun: row['noun'], fought: 0, kills: 0, assists: 0,
+                                              damage: 0, hits: 0, kill_damage: 0 }
+          kind[:fought] += 1
+          kind[:damage] += damage
+          kind[:hits] += row['hits'].to_i
+          if kill
+            kind[:kills] += 1
+            kind[:kill_damage] += damage
+          elsif row['killed_at']
+            kind[:assists] += 1
+          end
+        end
+        kinds.values
+      end
+
+      def recorder_rows(path, sql, params)
+        require 'sqlite3'
+        db = SQLite3::Database.new(path, readonly: true)
+        db.busy_timeout = 5_000
+        db.results_as_hash = true
+        db.execute(sql, params)
+      ensure
+        db&.close
+      end
+
+      # Drops the recorder's hunts that ended KEEP_DAYS ago and were summed.
+      # Flares and resolutions hang off an attack; everything else names its hunt.
+      def prune
+        return unless File.exist?(@path)
+
+        require 'sqlite3'
+        cutoff = [Time.now.to_f - (KEEP_DAYS * 86_400), @mark.to_f - REVISIT_SECONDS].min
+        old = 'SELECT id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?'
+        db = SQLite3::Database.new(@path)
+        db.busy_timeout = 5_000
+        db.transaction do
+          %w[flares resolutions].each do |table|
+            db.execute("DELETE FROM #{table} WHERE attack_id IN (SELECT id FROM attacks WHERE session_id IN (#{old}))", [cutoff])
+          end
+          %w[hits statuses attacks creatures sessions].each do |table|
+            db.execute("DELETE FROM #{table} WHERE #{table == 'sessions' ? 'id' : 'session_id'} IN (#{old})", [cutoff])
+          end
+        end
+      rescue StandardError => e
+        Log.error('combat prune', e)
+      ensure
+        db&.close
+      end
+
+      private
+
+      def load_lich
+        return false unless defined?(LIB_DIR)
+
+        require File.join(LIB_DIR, 'gemstone', 'combat', 'recorder')
+        defined?(Lich::Gemstone::Combat::Tracker) && Lich::Gemstone::Combat::Tracker.respond_to?(:enable!) &&
+          Lich::Gemstone::Combat::Recorder.method_defined?(:check_idle!)
+      rescue LoadError
+        false
+      end
+
+      def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+  end
+
+  # ==========================================================================
   # CycleManager: turns "which scripts are running" into hunt/rest/dead/idle
   # cycles, with rest-step timing, hunt timeout, weapon check and idle recovery
   # ==========================================================================
@@ -2645,6 +2888,7 @@ module GS4Analytics
         touch_login
         roll_over_midnight
         ShopWatcher.tick
+        CombatManager.tick
         signals = read_signals
         track_rest_step if @current_state == :rest
         check_hunt_timeout
@@ -3238,6 +3482,7 @@ module GS4Analytics
         ProgressManager.start(who)
         ShopWatcher.start(who)
         CycleManager.start(who, cfg)
+        CombatManager.start(who, cfg)
         BountyManager.start(who, cfg)
         AlertManager.start(who, cfg)
         @running = true
@@ -3254,6 +3499,7 @@ module GS4Analytics
         @running = false
         AlertManager.stop
         BountyManager.stop
+        CombatManager.stop
         CycleManager.stop
         ProgressManager.stop
         ShopWatcher.stop

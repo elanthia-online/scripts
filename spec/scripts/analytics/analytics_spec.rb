@@ -169,7 +169,7 @@ RSpec.describe 'analytics.lic' do
       expect(progress['cycle']).to eq('exp_regular_start' => 900_500, 'exp_regular_end' => 900_500,
                                       'exp_asc_start' => 100_000, 'exp_asc_end' => 100_000, 'exp_total_start' => 1_000_000)
       expect(progress['cycle_fame']).to eq([nil, 5000])
-      expect(progress['schema']).to eq('10')
+      expect(progress['schema']).to eq('11')
     end
   end
 
@@ -511,12 +511,37 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'combat' do
+    subject(:combat) { result('combat') }
+
+    it "sums the hunt's creatures by kind, from this character's hits only, with kills and assists as the recorder credited them" do
+      # [in the hunt, creature, fought, kills, assists, damage, hits, damage to its kills]; the
+      # creature only another fought is left out, the three-week-old one had no cycle, and the
+      # rows summed under a dropped cycle in the hunt's time are replaced, not added to
+      expect(combat['rows']).to eq([[1, 'battle-scarred foot ninja', 1, 1, 0, 80, 2, 80], [1, 'foot ninja', 1, 0, 1, 20, 1, 0],
+                                    [1, 'foot soldier', 2, 1, 0, 37, 2, 25]])
+    end
+
+    it 'keeps the mark for the next run' do
+      expect(combat['mark']).to be(true)
+    end
+
+    it 'sums a hunt again when one of its creatures changed' do
+      expect(combat['again']).to eq([25, 2])
+    end
+
+    it "prunes only the recorder's hunts that ended long ago, with every row under them" do
+      expect(combat['kept']).to eq('sessions' => 1, 'creatures' => 5, 'attacks' => 7, 'flares' => 2, 'resolutions' => 0,
+                                   'hits' => 8, 'statuses' => 0)
+    end
+  end
+
   describe 'a database from another build' do
     subject(:guard) { result('schema_guard') }
 
     it 'is refused before anything is written into it, saying what to do' do
       expect(guard['writer'].first).to be(true)
-      expect(guard['writer'].last).to include('schema 6', 'this one uses 10', 'Rename or move it')
+      expect(guard['writer'].last).to include('schema 6', 'this one uses 11', 'Rename or move it')
       expect(guard['untouched']).to eq(%w[cycles metadata])
     end
 
@@ -530,7 +555,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'starts a fresh database in an empty file' do
-      expect(guard['empty_file']).to eq('10')
+      expect(guard['empty_file']).to eq('11')
     end
   end
 

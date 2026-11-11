@@ -1983,6 +1983,79 @@ when 'shops'
   result = { 'open' => open_visit && open_visit.transform_keys(&:to_s), 'visits' => visits.map(&:values), 'off' => off,
              'sales' => sales.map(&:values), 'raced' => raced }
 
+when 'combat'
+  # A recorder file as Lich's Combat::Recorder lays it out (the columns the
+  # summary reads), with one hunt today and one that ended three weeks ago
+  A::Database.connect!
+  path = File.join(Dir.mktmpdir('analytics-combat'), 'analytics-combat.db')
+  rec = SQLite3::Database.new(path)
+  rec.execute_batch(<<~SQL)
+    CREATE TABLE sessions (id INTEGER PRIMARY KEY, character TEXT, source TEXT, started_at REAL NOT NULL, ended_at REAL);
+    CREATE TABLE creatures (id INTEGER PRIMARY KEY, session_id INTEGER, exist_id INTEGER, noun TEXT, name TEXT, first_seen REAL,
+                            last_seen REAL, killed_at REAL, killed_by_attack_id INTEGER, kill_credit TEXT);
+    CREATE TABLE attacks (id INTEGER PRIMARY KEY, session_id INTEGER, creature_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE flares (id INTEGER PRIMARY KEY, attack_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE resolutions (id INTEGER PRIMARY KEY, attack_id INTEGER);
+    CREATE TABLE hits (id INTEGER PRIMARY KEY, attack_id INTEGER, flare_id INTEGER, session_id INTEGER, creature_id INTEGER, damage INTEGER);
+    CREATE TABLE statuses (id INTEGER PRIMARY KEY, session_id INTEGER, creature_id INTEGER);
+  SQL
+  t = NOW - 600
+  hunt = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'sewer_tunnels', {})
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', t - 60, hunt)
+  rec.execute('INSERT INTO sessions VALUES (1, ?, ?, ?, NULL), (2, ?, ?, ?, ?)',
+              [WHO.name, 'live', t, WHO.name, 'live', NOW - (21 * 86_400), NOW - (21 * 86_400) + 600])
+  # [id, exist id, name, killed by attack, credit]
+  [[1, 101, 'battle-scarred foot ninja', 1, 'crit'], # our swing killed it
+   [2, 102, 'foot ninja', 4, 'window'],              # we hit it, another player finished it
+   [3, 103, 'mutated rat', 5, 'window'],             # someone else's fight
+   [4, 104, 'foot soldier', nil, nil],               # only our shield's spikes, and it got away
+   [5, 105, 'foot soldier', 6, 'last_own_hit']].each do |id, exist, name, by, credit|
+    rec.execute('INSERT INTO creatures VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [id, exist, name.split.last, name, t + id, t + id + 30, (t + id + 30 if by), by, credit])
+  end
+  rec.execute('INSERT INTO creatures VALUES (6, 2, 201, ?, ?, ?, ?, ?, 7, ?)', ['ninja', 'foot ninja', NOW - (21 * 86_400) + 10, NOW - (21 * 86_400) + 20, NOW - (21 * 86_400) + 20, 'crit'])
+  # attacks: [id, creature, ours]; 6 is a creature's swing at us that our reactive flare (flare 1) answered
+  [[1, 1, 1], [2, 1, 1], [3, 2, 1], [4, 2, 0], [5, 3, 0], [6, nil, 0], [7, 6, 1], [8, nil, 0]].each do |id, creature, ours|
+    rec.execute('INSERT INTO attacks VALUES (?, ?, ?, ?)', [id, id == 7 ? 2 : 1, creature, ours])
+  end
+  rec.execute('INSERT INTO flares VALUES (1, 6, 1), (2, 8, 1), (3, 7, 0)')
+  rec.execute('INSERT INTO resolutions VALUES (1, 7)')
+  # hits: [attack, flare, creature, damage]
+  [[1, nil, 1, 50], [2, nil, 1, 30], [3, nil, 2, 20], [4, nil, 2, 90], [5, nil, 3, 70], [6, 1, 5, 25], [8, 2, 4, 12]].each do |attack, flare, creature, damage|
+    rec.execute('INSERT INTO hits (attack_id, flare_id, session_id, creature_id, damage) VALUES (?, ?, 1, ?, ?)', [attack, flare, creature, damage])
+  end
+  rec.execute('INSERT INTO hits (attack_id, session_id, creature_id, damage) VALUES (7, 2, 6, 40)')
+  rec.execute('INSERT INTO statuses (session_id, creature_id) VALUES (2, 6)')
+  rec.close
+  # Summed earlier under a cycle too short to keep, which the hunt then replaced
+  # from the same moment: the next pass must not count its creatures twice
+  run_sql("INSERT INTO combat_stats (game, character, cycle_id, start_time, creature, fought, damage) VALUES (?, ?, 'dropped', ?, 'foot ninja', 1, 20)",
+          *WHO, t - 60)
+  manager = A::CombatManager
+  manager.instance_variable_set(:@path, path)
+  manager.instance_variable_set(:@mark, 0.0)
+  manager.rollup(path, WHO)
+  A::Database.flush
+  summed = lambda do
+    A::Database.all('SELECT cycle_id = ? AS in_hunt, creature, fought, kills, assists, damage, hits, kill_damage FROM combat_stats ' \
+                    'ORDER BY creature', hunt).map(&:values)
+  end
+  first = summed.call
+  # A later hit on the ninja: its hunt is summed again on the next pass
+  check = SQLite3::Database.new(path)
+  check.execute('INSERT INTO hits (attack_id, session_id, creature_id, damage) VALUES (3, 1, 2, 5)')
+  check.execute('UPDATE creatures SET last_seen = ? WHERE id = 2', [t + 200])
+  check.close
+  manager.rollup(path, WHO)
+  A::Database.flush
+  again = A::Database.one("SELECT damage, hits FROM combat_stats WHERE creature = 'foot ninja'").values
+  manager.prune
+  left = SQLite3::Database.new(path)
+  kept = %w[sessions creatures attacks flares resolutions hits statuses].to_h { |table| [table, left.get_first_value("SELECT COUNT(*) FROM #{table}")] }
+  left.close
+  result = { 'rows' => first, 'mark' => A::Database.one('SELECT value FROM metadata WHERE key = ?', "combat_mark_#{WHO}")['value'].to_f.positive?,
+             'again' => again, 'kept' => kept }
+
 when 'reload'
   # Loading the body again must not warn about redefined constants
   warnings = StringIO.new
