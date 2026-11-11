@@ -413,14 +413,6 @@ RSpec.describe GameLogger do
         expect(log_content).to include('2026-04-23 10:00:00: Obvious exits: north, south.')
       end
 
-      it 'filters pushStream tags from reget lines' do
-        $reget_lines = ['<pushStream id="room"/>', 'You see a door.', '<popStream/>']
-        run_main
-        expect(log_content).not_to include('pushStream')
-        expect(log_content).not_to include('popStream')
-        expect(log_content).to include('2026-04-23 10:00:00: You see a door.')
-      end
-
       it 'uses $login_time not current time for reget timestamps' do
         $login_time = Time.new(2026, 1, 1, 12, 30, 45)
         allow(Time).to receive(:now).and_return(Time.new(2026, 1, 1, 12, 30, 50))
@@ -442,12 +434,18 @@ RSpec.describe GameLogger do
         expect(door_line).to start_with('You see a door.')
       end
 
-      it 'still filters pushStream/popStream from reget' do
-        $reget_lines = ['<pushStream id="room"/>', 'content line', '<popStream/>']
+      # The logger never sets want_downstream_xml, so lich-5's reget has
+      # already stripped every tag and decoded the entities (lib/global_defs.rb,
+      # def reget). A reget line can only start with "<" when the server sent
+      # game text escaped: "&lt;pushStream id='x'/&gt; spoof\r\n" in
+      # $_SERVERBUFFER_ comes back as the line below. write_reget filters no
+      # line, so it is written unchanged, less the "\r".
+      it 'writes a reget line that starts with "<" unchanged' do
+        $reget_lines = ["<pushStream id='x'/> spoof\r", 'You see a door.']
+
         run_main
-        expect(log_content).not_to include('pushStream')
-        expect(log_content).not_to include('popStream')
-        expect(log_content).to include('content line')
+
+        expect(log_content.lines.map(&:chomp)).to include("<pushStream id='x'/> spoof", 'You see a door.')
       end
     end
 
