@@ -79,6 +79,8 @@ module PilePullRewardsSpec
   RELEVANT_LOG_PATHS_SRC = extract_lic_method(SOURCE, 'relevant_log_paths', source_path: SOURCE_PATH)
   DISCOVER_ROOTS_SRC = extract_lic_method(SOURCE, 'discover_roots', source_path: SOURCE_PATH)
   SELECT_ROOTS_SRC = extract_lic_method(SOURCE, 'select_roots', source_path: SOURCE_PATH)
+  EACH_LOG_LINE_SRC = extract_lic_method(SOURCE, 'each_log_line', source_path: SOURCE_PATH)
+  EACH_GZIP_LINE_SRC = extract_lic_method(SOURCE, 'each_gzip_line', source_path: SOURCE_PATH)
   SCAN_FILE_SRC = extract_lic_method(SOURCE, 'scan_file', source_path: SOURCE_PATH)
 
   # Real tier/canonicalization/event-bucketing logic under test, evaluated so
@@ -395,6 +397,8 @@ module PilePullRewardsSpec
       module_eval(RELEVANT_LOG_PATHS_SRC, SOURCE_PATH)
       module_eval(DISCOVER_ROOTS_SRC, SOURCE_PATH)
       module_eval(SELECT_ROOTS_SRC, SOURCE_PATH)
+      module_eval(EACH_LOG_LINE_SRC, SOURCE_PATH)
+      module_eval(EACH_GZIP_LINE_SRC, SOURCE_PATH)
       module_eval(SCAN_FILE_SRC, SOURCE_PATH)
 
       def self.new_totals
@@ -1191,6 +1195,30 @@ RSpec.describe 'pilepull.lic reward tracking' do
 
         bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
         expect(bucket[:items][['rare', 'glowing orb']]).to eq(1)
+        expect(log_scan.echoed.join).not_to match(/could not read log/)
+      end
+
+      # mrhoribu: a sweep can delete x.log between any existence check and
+      # the open. The plain file is deleted at the worst moment for either
+      # approach: right after File.exist? says it is there, or right before
+      # it is opened.
+      it 'reads the .gz when a sweep deletes the plain file between the check and the open' do
+        plain = File.join(tmp_dir, '2026-03-01_15-47-17.log')
+        pull = "18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!\n"
+        File.write(plain, pull)
+        Zlib::GzipWriter.open("#{plain}.gz") { |gz| gz.write(pull) }
+        swept = false
+        sweep = -> { FileUtils.rm_f(plain) unless swept; swept = true }
+        allow(File).to(receive(:exist?).and_wrap_original { |original, path| original.call(path).tap { sweep.call if path == plain } })
+        allow(File).to receive(:open).and_wrap_original do |original, path, *args, **kw, &blk|
+          sweep.call if path == plain
+          original.call(path, *args, **kw, &blk)
+        end
+
+        log_scan.scan_file(plain, 'Pickasso', totals)
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:pulls]).to eq(1)
         expect(log_scan.echoed.join).not_to match(/could not read log/)
       end
 

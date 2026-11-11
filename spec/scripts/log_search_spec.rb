@@ -89,6 +89,48 @@ RSpec.describe 'log_search.lic LogSearchFiles' do
       expect(files.lines(gz).last).to eq(found)
     end
 
+    # mrhoribu: one unreadable file must not end the run before the
+    # results are saved.
+    {
+      'truncated'                => ->(gz) { gz[0, gz.bytesize / 2] },
+      'followed by zero padding' => ->(gz) { gz + ("\0" * 64) },
+      'followed by other bytes'  => ->(gz) { gz + 'junk' },
+      'empty'                    => ->(_gz) { '' }
+    }.each do |label, damage|
+      it "gives nil and the error for a damaged .gz (#{label}) instead of raising" do
+        gz = write('2024-08-01_10-00-00.log.gz', damage.call(gzip("#{found}\n" * 50)))
+        errors = []
+
+        expect(files.lines(gz) { |error| errors << error }).to be_nil
+        expect(errors.size).to eq(1)
+        expect(errors.first).to be_a(Zlib::Error)
+      end
+    end
+
+    it 'gives nil and the error for a log that is not there' do
+      errors = []
+
+      expect(files.lines(File.join(dir, '2024-08-01_10-00-00.log')) { |error| errors << error }).to be_nil
+      expect(errors.map(&:class)).to eq([Errno::ENOENT])
+    end
+
+    # A sweep can delete x.log between any existence check and the read:
+    # deleted right after File.exist? says it is there, or right before the
+    # read, whichever the code does.
+    it 'reads the .gz when a sweep deletes the plain file between the check and the read' do
+      plain = write('2024-08-01_10-00-00.log', "#{found}\n")
+      write('2024-08-01_10-00-00.log.gz', gzip("#{found}\n"))
+      swept = false
+      sweep = -> { FileUtils.rm_f(plain) unless swept; swept = true }
+      allow(File).to(receive(:exist?).and_wrap_original { |original, path| original.call(path).tap { sweep.call if path == plain } })
+      allow(File).to receive(:binread).and_wrap_original do |original, path, *args|
+        sweep.call if path == plain
+        original.call(path, *args)
+      end
+
+      expect(files.lines(plain)).to eq([found])
+    end
+
     it 'reads the .gz of a listed .log that was compressed before it was read' do
       plain = File.join(dir, '2024-08-01_10-00-00.log')
       write('2024-08-01_10-00-00.log.gz', gzip("#{found}\n"))
