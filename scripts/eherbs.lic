@@ -16,7 +16,8 @@
           requires: Lich >= 5.9.0
            version: 2.3.0
   2.3.0 (2026-11-09)
-    - ;eherbs setup is a Lich WebUI window instead of GTK; same options, Close saves as before
+    - ;eherbs setup is a Lich WebUI window instead of GTK; same options; Save & Close saves, Cancel or closing the window discards
+    - setup checks Stock to % of Capacity: blank, or a whole number from 0 to 100
     - ;eherbs settings no longer needs GTK
   2.2.1 (2026-09-14)
     - warn on stock when a Survivalist's Kit is used without a stock % set, instead of silently reporting fully stocked
@@ -523,9 +524,9 @@ module EHerbs
     UserVars.herbsack             = settings[:herb_container]
   end
 
-  # ;eherbs setup: a native Lich WebUI window with the same options as the old
-  # GTK window. Close saves (through EHerbs.load) and ;eherbs setup then
-  # writes them out; closing the window any other way discards, as before.
+  # ;eherbs setup: a Lich WebUI settings form with the same options as the old
+  # GTK window. Save & Close saves (through EHerbs.load) and ;eherbs setup then
+  # writes them out; Cancel or closing the window discards.
   # The class also backs ;eherbs settings (list), which now works without GTK.
   class Setup
     attr_accessor :settings
@@ -555,7 +556,7 @@ module EHerbs
 
     def self.available?
       defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
-        defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+        defined?(Lich::WebUI::SettingsForm) ? true : false
     end
 
     def self.get_category(key)
@@ -576,8 +577,6 @@ module EHerbs
     def initialize(settings)
       @settings = settings
       @owner = Script.current
-      @closed = Queue.new
-      @saved = false
 
       # set default values if they don't exist
       @@categories.each do |_, data|
@@ -602,114 +601,91 @@ module EHerbs
 
     def start
       setup = self
-      @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: 'EHerbs Setup',
-                                   props: { size: [700, 440], bare: true, density: :compact, viewport: true },
-                                   on: { close: ->(_ev) { setup.viewer_closed } }) do |ui|
-        setup.render(ui)
+      form = nil
+      values = @settings.merge(herb_container: @settings[:herb_container].to_s.strip, stock: @settings[:stock].to_s.strip)
+      form = Lich::WebUI::SettingsForm.new(
+        owner: @owner, id: PAGE_ID, title: 'EHerbs Setup', values: values, fields: fields,
+        props: { size: [700, 440], viewport: true },
+        normalize: ->(draft) { setup.normalize(draft) },
+        layout: ->(ui, field, save) { setup.render(ui, field, save, -> { form.close }) }
+      )
+      result = form.show.wait
+      if result
+        EHerbs.load(result)
+      else
+        respond ' EHerbs setup closed WITHOUT saving. Use the Save & Close button to save.'
       end
-      Lich::API.webui_refresh(@page)
-      Lich::API.webui_start
-      unless Lich::API.webui_open(page: @page)
-        respond ' EHerbs: could not open a window for setup. Please use the command line.'
-        return
+      result
+    end
+
+    STOCK_TIP = "When using ;eherbs stock it will fill your herb sack to a percentage of it's capacity.\n" \
+                'Primarily intended for survival kits but will work for ordinary containers.'
+    DISTILLER_TIP = 'Checks the survival kit when eherbs is used and keeps the distiller active. ' \
+                    'Survival kits were introduced at Dusk Ruin 2023 as a special herb container.'
+    SPLIT_BLOOD_TIP = "Count and stock major blood (yabathilium, Bloody Krolvin ale, Olak's Ol'style ale, green mushroom potion, " \
+                      'sassafras tea) separately from acantha. When off, all blood herbs are combined as before.'
+    CHECKS = [
+      [:buy_missing, 'Buy missing herbs'], [:deposit_coins, 'Deposit Coins'], [:use_mending, 'Use Sigil of Mending'],
+      [:skip_scars, 'Skip level 1 scars'], [:blood_toggle, 'Heal Blood Only'],
+      [:use650, 'Assume Aspect (650) Yierka'], [:use_yaba, 'Use yabathilium first'],
+      [:distiller, 'Use Distiller (survival kits only)', DISTILLER_TIP], [:use1035, 'Song of Tonis (1035)'],
+      [:use_potions, 'Try to use potions before plants'], [:split_blood, 'Separate major/minor blood', SPLIT_BLOOD_TIP]
+    ].freeze
+
+    def fields
+      checks = CHECKS.map do |key, label, tip|
+        field = { key: key, type: :checkbox, label: label, disabled: disabled?(key) }
+        field[:tooltip] = tip if tip
+        field
       end
-      @closed.pop
-      respond ' EHerbs setup closed WITHOUT saving. Use the Close button to save.' unless @saved
-    ensure
-      begin
-        Lich::WebUI.terminate_owner(@owner)
-      rescue StandardError
-        nil
+      checks + [
+        { key: :herb_container, type: :text_input },
+        { key: :stock, type: :text_input, placeholder: '0 - 100', tooltip: STOCK_TIP },
+      ]
+    end
+
+    # Trims text and accepts a blank stock or a whole number from 0 to 100.
+    def normalize(draft)
+      draft[:herb_container] = draft[:herb_container].to_s.strip
+      stock = draft[:stock].to_s.strip.delete('%')
+      unless stock.empty?
+        raise ArgumentError, 'Stock to % of Capacity must be a whole number from 0 to 100, or blank.' unless stock.match?(/\A\d+\z/) && stock.to_i <= 100
+
+        stock = stock.to_i
       end
+      draft[:stock] = stock
+      CHECKS.each { |key, _| draft[key] = draft[key] ? true : false }
+      draft
     end
 
-    def viewer_closed
-      @closed << :viewer
-    end
-
-    def close_clicked
-      EHerbs.load(@settings)
-      @saved = true
-      @closed << :close
-      Lich::WebUI.close(@page)
-    end
-
-    def act
-      yield
-    rescue StandardError => e
-      respond " EHerbs setup: #{e.class}: #{e.message}"
-    ensure
-      Lich::API.webui_refresh(@page) if @page && !@saved
-    end
-
-    def cb(&block)
-      setup = self
-      ->(ev) { setup.act { block.call(ev) } }
-    end
-
-    def set(key, value)
-      @settings[key] = value
-    end
-
-    def check(ui, key, label, tip = nil)
-      setup = self
-      extra = tip ? { tooltip: tip } : {}
-      ui.checkbox(key: key.to_s, label: label, checked: @settings[key] ? true : false, disabled: disabled?(key), **extra,
-                  on: { change: setup.cb { |ev| setup.set(key, ev.payload[:value] ? true : false) } })
-    end
-
-    def text(ui, key, placeholder = nil, tip = nil)
-      setup = self
-      extra = {}
-      extra[:placeholder] = placeholder if placeholder
-      extra[:tooltip] = tip if tip
-      ui.text_input(key: key.to_s, value: @settings[key].to_s.strip, change_mode: :input, **extra,
-                    on: { change: setup.cb { |ev| setup.set(key, ev.payload[:value].to_s.strip) } })
-    end
-
-    def render(ui)
-      setup = self
+    def render(ui, field, save, cancel)
       ui.stack(key: 'eherbs', gap: 6, margin: 8, fill: true) do
         ui.scroll(key: 'body', fill: true) do
           ui.stack(key: 'panels', gap: 8) do
             ui.group(key: 'general', label: 'General') do
               ui.columns(key: 'general-cols', count: 2, weights: [2, 3], gap: 12, row_align: :start) do
                 ui.stack(slot: '0', key: 'general-checks', gap: 4) do
-                  setup.check(ui, :buy_missing, 'Buy missing herbs')
-                  setup.check(ui, :deposit_coins, 'Deposit Coins')
-                  setup.check(ui, :use_mending, 'Use Sigil of Mending')
-                  setup.check(ui, :skip_scars, 'Skip level 1 scars')
-                  setup.check(ui, :blood_toggle, 'Heal Blood Only')
+                  %i[buy_missing deposit_coins use_mending skip_scars blood_toggle].each { |key| field.call(ui, key) }
                 end
                 ui.grid(slot: '1', key: 'general-values', cols: 2, homogeneous: false, expand_columns: [2], row_gap: 6, column_gap: 10) do
                   ui.text(key: 'l-sack', content: 'Herb Sack')
-                  setup.text(ui, :herb_container)
+                  field.call(ui, :herb_container)
                   ui.text(key: 'l-stock', content: 'Stock to % of Capacity')
-                  setup.text(ui, :stock, '0 - 100',
-                             "When using ;eherbs stock it will fill your herb sack to a percentage of it's capacity.\n" \
-                             'Primarily intended for survival kits but will work for ordinary containers.')
+                  field.call(ui, :stock)
                 end
               end
             end
             ui.group(key: 'misc', label: 'Misc') do
               ui.grid(key: 'misc-checks', cols: 3, gap: 4) do
-                setup.check(ui, :use650, 'Assume Aspect (650) Yierka')
-                setup.check(ui, :use_yaba, 'Use yabathilium first')
-                setup.check(ui, :distiller, 'Use Distiller (survival kits only)',
-                            'Checks the survival kit when eherbs is used and keeps the distiller active. ' \
-                            'Survival kits were introduced at Dusk Ruin 2023 as a special herb container.')
-                setup.check(ui, :use1035, 'Song of Tonis (1035)')
-                setup.check(ui, :use_potions, 'Try to use potions before plants')
-                setup.check(ui, :split_blood, 'Separate major/minor blood',
-                            "Count and stock major blood (yabathilium, Bloody Krolvin ale, Olak's Ol'style ale, green mushroom potion, " \
-                            'sassafras tea) separately from acantha. When off, all blood herbs are combined as before.')
+                %i[use650 use_yaba distiller use1035 use_potions split_blood].each { |key| field.call(ui, key) }
               end
             end
           end
         end
-        ui.columns(key: 'footer', count: 2, weights: [6, 1], compact: true, row_align: :center, gap: 6) do
-          ui.text(slot: '0', key: 'footer-text', emphasis: :subtle, content: 'Changes are only saved if you use the Close button.')
-          ui.button(slot: '1', key: 'close', label: 'Close', variant: :primary, on: { activate: ->(_ev) { setup.close_clicked } })
+        ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, gap: 6) do
+          ui.text(slot: '0', key: 'footer-text', emphasis: :subtle, content: 'Cancel or closing the window discards changes.')
+          ui.button(slot: '1', key: 'cancel', label: 'Cancel', on: { activate: ->(_ev) { cancel.call } })
+          save.call(ui, slot: '2', variant: :primary)
         end
       end
     end
