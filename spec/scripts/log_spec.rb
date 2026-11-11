@@ -792,6 +792,213 @@ RSpec.describe GameLogger do
       end
     end
 
+    # R-21: the upstream thread's rescue echoed only the bare message, so a
+    # pasted log just lost its commands with nothing saying where or why
+    # (in lich-5 that echo reached the file only as script output, see
+    # want_script_output; this harness does not feed echoes back to get).
+    context 'when the upstream thread stops on an error' do
+      let(:notice) { '<!-- log: typed commands are not logged after this line; the upstream thread stopped (RuntimeError: boom) -->' }
+
+      # "file:line" of where +error+ was raised, without the directory.
+      def raised_at(error)
+        location = error.backtrace_locations.first
+        "#{File.basename(location.path)}:#{location.lineno}"
+      end
+
+      # The notice line as written for an error that reads +reason+.
+      def notice_for(reason)
+        "<!-- log: typed commands are not logged after this line; the upstream thread stopped (#{reason}) -->"
+      end
+
+      # The first typed command is logged; the next upstream_get raises
+      # +error+.
+      def type_then_fail(error)
+        calls = 0
+        allow(GameLogger).to receive(:upstream_get) do
+          calls += 1
+          raise error if calls > 1
+
+          '<c>look'
+        end
+      end
+
+      it 'echoes the error, where it was raised and how to log typed commands again' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        error = RuntimeError.new('boom')
+        type_then_fail(error)
+
+        run_main
+
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/)).to eq(
+          [
+            "typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at #{raised_at(error)}. " \
+            'Game lines are still logged; restart the logger (;kill log, then ;log) to log typed commands again.'
+          ]
+        )
+        expect(raised_at(error)).to match(/\Alog_spec\.rb:\d+\z/)
+      end
+
+      # The directory (C:/Users/<name>/...) only makes the echo longer.
+      it 'gives the file and line it was raised at without the directory' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        error = RuntimeError.new('boom')
+        error.set_backtrace(["C:/Users/someone/Lich5/scripts/log.lic:487:in 'block in GameLogger.start_upstream_logger'"])
+        allow(GameLogger).to receive(:upstream_get).and_raise(error)
+
+        run_main
+
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at log.lic:487. ')
+        expect(LogSpecHarness.echoes.join).not_to include('someone')
+      end
+
+      it 'leaves out "at" when the error has no backtrace' do
+        GameLogger.upstream_stopped(RuntimeError.new('boom'))
+
+        expect(LogSpecHarness.echoes).to eq(
+          ['typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom. ' \
+           'Game lines are still logged; restart the logger (;kill log, then ;log) to log typed commands again.']
+        )
+      end
+
+      it 'gives the frame as is when it has no "path:line" start' do
+        error = RuntimeError.new('boom')
+        error.set_backtrace(['<internal:kernel>'])
+
+        expect(GameLogger.upstream_frame(error)).to eq('<internal:kernel>')
+
+        GameLogger.upstream_stopped(error)
+
+        expect(LogSpecHarness.echoes.first)
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at <internal:kernel>. ')
+      end
+
+      # Without the strip, the hint would read ";log " with a trailing space.
+      it 'gives the restart without arguments when vars[0] is only whitespace' do
+        allow(Script.current).to receive(:vars).and_return(['  '])
+
+        GameLogger.upstream_stopped(RuntimeError.new('boom'))
+
+        expect(LogSpecHarness.echoes.first).to end_with('(;kill log, then ;log) to log typed commands again.')
+      end
+
+      # Restarting without them would log rooms the user excluded.
+      it 'gives the restart with the arguments the logger was started with, under its own name' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        allow(Script.current).to receive_messages(
+          name: 'mylog',
+          vars: ['--exclude=u1234 --timestamp="%H:%M"', '--exclude=u1234', '--timestamp="%H:%M"']
+        )
+        type_then_fail(RuntimeError.new('boom'))
+
+        run_main
+
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
+          .to end_with('restart the logger (;kill mylog, then ;mylog --exclude=u1234 --timestamp="%H:%M") to log typed commands again.')
+      end
+
+      it 'writes a notice line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        LogSpecHarness.feed('line 1')
+        type_then_fail(RuntimeError.new('boom'))
+
+        run_main
+
+        expect(log_lines.drop(2)).to eq(['line 1', '>look', notice, default_stamp])
+      end
+
+      it 'stamps that line like a game line when timestamps are on' do
+        use_options(OpenStruct.new(timestamp: '%H:%M'))
+        LogSpecHarness.idle_timeout = 0.5
+        type_then_fail(RuntimeError.new('boom'))
+
+        run_main
+
+        expect(log_lines.last(3)).to eq(['10:00: >look', "10:00: #{notice}", '10:00'])
+      end
+
+      it 'puts a message over several lines on one line, and breaks up "--" so the comment is not closed early' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        type_then_fail(IOError.new("closed stream\n--> see above"))
+
+        run_main
+
+        expect(log_lines[-2]).to eq('<!-- log: typed commands are not logged after this line; the upstream thread stopped (IOError: closed stream - -> see above) -->')
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on IOError: closed stream --> see above at ')
+      end
+
+      # gsub('--', '- -') left "a - --> b" and "x- --y": the first closed the
+      # comment early, both left a "--" XML does not allow in a comment.
+      {
+        'a ---> b'          => 'a - - -> b',
+        '--- Lich: x---y'   => '- - - Lich: x- - -y',
+        'ends in a dash -'  => 'ends in a dash -',
+        'ends in dashes --' => 'ends in dashes - -'
+      }.each do |message, spaced|
+        it "spaces out every dash run in #{message.inspect} so the comment holds no \"--\"" do
+          use_options(OpenStruct.new)
+          LogSpecHarness.idle_timeout = 0.5
+          type_then_fail(IOError.new(message))
+
+          run_main
+
+          expect(log_lines[-2]).to eq(notice_for("IOError: #{spaced}"))
+          body = log_lines[-2].delete_prefix('<!--').delete_suffix('-->')
+          expect(body).not_to include('--')
+          expect(body).not_to end_with('-')
+        end
+      end
+
+      it 'drops the whitespace around the message' do
+        use_options(OpenStruct.new)
+        LogSpecHarness.idle_timeout = 0.5
+        type_then_fail(RuntimeError.new(" \tboom\n"))
+
+        run_main
+
+        expect(log_lines[-2]).to eq(notice)
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands/).first)
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at ')
+      end
+
+      it 'does not write the line in an --exclude room' do
+        use_options(GameLogger::Opts.parse(['--exclude=u1234']))
+        LogSpecHarness.idle_timeout = 0.5
+        type_then_fail(RuntimeError.new('boom'))
+
+        run_main
+
+        expect(log_lines.drop(2)).to eq([default_stamp])
+        expect(LogSpecHarness.echoes.grep(/\Atyped commands are no longer logged: /).size).to eq(1)
+      end
+    end
+
+    describe '.start_upstream_logger' do
+      # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
+      it 'says nothing and leaves no line when the thread is killed, as ;kill log does' do
+        waiting = Thread::Queue.new
+        allow(GameLogger).to receive(:upstream_get) do
+          waiting << true
+          sleep # waits for the next typed command until ;kill
+        end
+        thread = GameLogger.start_upstream_logger
+        Timeout.timeout(2) { waiting.pop }
+
+        thread.kill
+        thread.join(2)
+
+        expect(thread).not_to be_alive
+        expect(LogSpecHarness.echoes).to eq([])
+        expect(LogSpecHarness::DOWNSTREAM).to be_empty
+      end
+    end
+
     # R-05, R-07, R-18, R-19, R-34: --rnum and --exclude take the room from
     # XMLData and the map's UID table only (Q-13 A), never from
     # Room.current or Map.current, which can send LOCATION/PEER from the
@@ -1470,6 +1677,31 @@ RSpec.describe GameLogger do
         expect(files.first).to be_closed
         expect(log_lines).to eq([default_stamp, marker, 'a'])
         expect(Lich).not_to have_received(:log)
+      end
+    end
+
+    # R-22: a close that failed logged a bare "Can't close file!", with
+    # neither the file nor the error.
+    context 'when the file cannot be closed' do
+      it 'logs the file and the error to the Lich log and stops as it would have' do
+        use_options(OpenStruct.new)
+        allow(Lich).to receive(:log)
+        LogSpecHarness.feed('line 1')
+        allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+          original.call(*args, &block).tap do |file|
+            next unless file.is_a?(File)
+
+            allow(file).to receive(:close).and_wrap_original do |close|
+              close.call
+              raise IOError, 'device gone'
+            end
+          end
+        end
+
+        expect { run_main }.not_to raise_error
+
+        expect(log_lines.drop(2)).to eq(['line 1', default_stamp])
+        expect(Lich).to have_received(:log).with("log: closing the log file #{find_log_file} failed (IOError: device gone); lines are written as they come, with sync on, but the file may be missing its footer or a last write")
       end
     end
 

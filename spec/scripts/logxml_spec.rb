@@ -45,9 +45,13 @@ RSpec.describe 'logxml.lic' do
   # (+nil+ for none, as in GS). Ends when the fed lines run out; a Time
   # among +lines+ moves the clock before the next line is read.
   # +reget+ is what lich-5's reget answers: nil for an empty buffer. A
-  # block runs once the fed lines run out, just before the logger stops.
-  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'], reget: nil)
+  # block runs once the fed lines run out; then get hands out what the
+  # upstream thread pushed onto the downstream buffer (+@logxml_script+),
+  # and the logger stops. +upstream+ stands in for upstream_get; the default
+  # ends the upstream thread before it reads a command.
+  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'], reget: nil, upstream: -> { Thread.current.kill })
     script = OpenStruct.new(want_script_output: nil, vars: [vars.join(' '), *vars], downstream_buffer: [], name: 'logxml')
+    @logxml_script = script
     stub_const('Script', Class.new { define_singleton_method(:current) { script } })
     pending_lines = lines.map(&:dup) # fresh Strings, as get returns; logxml edits lines in place
     sink = echoes
@@ -57,14 +61,18 @@ RSpec.describe 'logxml.lic' do
     runner.define_singleton_method(:reget) { reget }
     on_stop = block_given? ? proc { yield } : proc {}
     time_now = clock
+    stopping = false
     runner.define_singleton_method(:get) do
       time_now[0] = pending_lines.shift while pending_lines.first.is_a?(Time)
       next pending_lines.shift unless pending_lines.empty?
 
-      on_stop.call
+      on_stop.call unless stopping
+      stopping = true
+      next script.downstream_buffer.shift unless script.downstream_buffer.empty?
+
       raise StopIteration
     end
-    runner.define_singleton_method(:upstream_get) { Thread.current.kill }
+    runner.define_singleton_method(:upstream_get) { upstream.call }
     runner.define_singleton_method(:get_settings) { settings } unless settings.nil?
     Timeout.timeout(5) { runner.instance_eval(body, script_path, body_line) }
   end
@@ -473,6 +481,169 @@ RSpec.describe 'logxml.lic' do
       expect(opened.first).to be_closed
       expect(log_lines).to eq([default_header, '<output>line 1</output>'])
       expect(lich_log).to eq([])
+    end
+  end
+
+  # R-22: a close that failed logged a bare "Can't close file!", with
+  # neither the file nor the error.
+  context 'when the file cannot be closed' do
+    it 'logs the file and the error to the Lich log and stops as it would have' do
+      lich_log = stub_lich_log
+      allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+        original.call(*args, &block).tap do |file|
+          next unless file.is_a?(File)
+
+          allow(file).to receive(:close).and_wrap_original do |close|
+            close.call
+            raise IOError, 'device gone'
+          end
+        end
+      end
+
+      expect { run_logxml(lines: ['<output>line 1</output>']) }.not_to raise_error
+
+      expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
+      expect(lich_log).to eq(["logxml: closing the log file #{log_file} failed (IOError: device gone); lines are written as they come, with sync on, but the file may be missing its footer or a last write"])
+    end
+  end
+
+  # R-21: the upstream thread's rescue echoed only the bare message and
+  # wrote nothing to the file, so a pasted log just lost its commands.
+  context 'when the upstream thread stops on an error' do
+    # The first typed command is read; the next upstream_get raises +error+.
+    def type_then_fail(error)
+      calls = 0
+      lambda do
+        calls += 1
+        raise error if calls > 1
+
+        '<c>look'
+      end
+    end
+
+    # Waits until the upstream thread has pushed the command and its notice.
+    def wait_for_upstream_stop
+      Timeout.timeout(2) { sleep 0.01 until @logxml_script.downstream_buffer.size >= 2 }
+    end
+
+    # "file:line" of where +error+ was raised, without the directory.
+    def raised_at(error)
+      location = error.backtrace_locations.first
+      "#{File.basename(location.path)}:#{location.lineno}"
+    end
+
+    # The notice line as written for an error that reads +reason+.
+    def notice_for(reason)
+      "<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (#{reason}) -->"
+    end
+
+    it 'echoes the error, where it was raised and how to log typed commands again' do
+      error = RuntimeError.new('boom')
+
+      run_logxml(lines: [], upstream: type_then_fail(error)) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/)).to eq(
+        [
+          "typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at #{raised_at(error)}. " \
+          'Game lines are still logged; restart the logger (;kill logxml, then ;logxml) to log typed commands again.'
+        ]
+      )
+      expect(raised_at(error)).to match(/\Alogxml_spec\.rb:\d+\z/)
+    end
+
+    # The directory (C:/Users/<name>/...) only makes the echo longer.
+    it 'gives the file and line it was raised at without the directory' do
+      error = RuntimeError.new('boom')
+      error.set_backtrace(["C:/Users/someone/Lich5/scripts/logxml.lic:142:in 'block in <main>'"])
+      raise_it = lambda do
+        @logxml_script.downstream_buffer << 'first'
+        raise error
+      end
+
+      run_logxml(lines: [], upstream: raise_it) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/).first)
+        .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at logxml.lic:142. ')
+      expect(echoes.join).not_to include('someone')
+    end
+
+    # Restarting without them would drop --timestamp, --rnum or streams.
+    it 'gives the restart with the arguments the logger was started with' do
+      run_logxml(vars: %w[streams --timestamp=%H:%M], lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/).first)
+        .to end_with('restart the logger (;kill logxml, then ;logxml streams --timestamp=%H:%M) to log typed commands again.')
+    end
+
+    # Without the strip, the hint would read ";logxml " with a trailing space.
+    it 'gives the restart without arguments when vars[0] is only whitespace' do
+      run_logxml(vars: ['  '], lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/).first).to end_with('(;kill logxml, then ;logxml) to log typed commands again.')
+    end
+
+    it 'gives the frame as is when it has no "path:line" start' do
+      error = RuntimeError.new('boom')
+      error.set_backtrace(['<internal:kernel>'])
+
+      run_logxml(lines: [], upstream: type_then_fail(error)) { wait_for_upstream_stop }
+
+      expect(echoes.grep(/\Atyped commands/).first)
+        .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at <internal:kernel>. ')
+    end
+
+    it 'writes a notice line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
+      run_logxml(lines: ['<output>line 1</output>'], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+      expect(log_lines).to eq(
+        [
+          default_header,
+          '<output>line 1</output>',
+          '<!-- CLIENT --><c>look<!-- ENDCLIENT -->',
+          '<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (RuntimeError: boom) -->',
+          default_footer
+        ]
+      )
+    end
+
+    it 'puts a message over several lines on one line, and breaks up "--" so the comment is not closed early' do
+      run_logxml(lines: [], upstream: type_then_fail(IOError.new("closed stream\n--> see above"))) { wait_for_upstream_stop }
+
+      expect(log_lines[-2]).to eq('<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (IOError: closed stream - -> see above) -->')
+      expect(echoes.grep(/\Atyped commands/).first)
+        .to start_with('typed commands are no longer logged: the upstream thread stopped on IOError: closed stream --> see above at ')
+    end
+
+    # gsub('--', '- -') left "a - --> b" and "x- --y": the first closed the
+    # comment early, both left a "--" XML does not allow in a comment.
+    {
+      'a ---> b'          => 'a - - -> b',
+      '--- Lich: x---y'   => '- - - Lich: x- - -y',
+      'ends in dashes --' => 'ends in dashes - -'
+    }.each do |message, spaced|
+      it "spaces out every dash run in #{message.inspect} so the comment holds no \"--\"" do
+        run_logxml(lines: [], upstream: type_then_fail(IOError.new(message))) { wait_for_upstream_stop }
+
+        expect(log_lines[-2]).to eq(notice_for("IOError: #{spaced}"))
+        body = log_lines[-2].delete_prefix('<!--').delete_suffix('-->')
+        expect(body).not_to include('--')
+        expect(body).not_to end_with('-')
+      end
+    end
+
+    it 'drops the whitespace around the message' do
+      run_logxml(lines: [], upstream: type_then_fail(RuntimeError.new(" \tboom\n"))) { wait_for_upstream_stop }
+
+      expect(log_lines[-2]).to eq(notice_for('RuntimeError: boom'))
+    end
+
+    # lich-5 stops a script by Thread#kill on its threads (script.rb kill);
+    # the default upstream stand-in ends the thread that way.
+    it 'says nothing and leaves no line when the thread is killed, as ;kill logxml does' do
+      run_logxml(lines: ['<output>line 1</output>']) { sleep 0.05 }
+
+      expect(echoes).to eq([started_echo])
+      expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
     end
   end
 
