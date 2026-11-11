@@ -144,7 +144,7 @@ module LogSpecHarness::Env
         # example starts the script as lich-5 does (Script#initialize): a
         # typed String, or the Array autostart.lic saves and starts it with.
         context 'when called with no args (reads Script.current.vars)' do
-          it "reads the header's autostart example whole on the autostart Array path" do
+          it "reads the help's autostart example whole on the autostart Array path" do
             # ;autostart add --global log --timestamp=\"%F %T %Z\" --rnum --exclude=288,2300,u7199 --lines=50000
             # is saved as these words; lich-5 joins them into vars[0] and keeps them as vars[1..].
             LogSpecHarness.start_script(['--timestamp="%F', '%T', '%Z"', '--rnum', '--exclude=288,2300,u7199', '--lines=50000'])
@@ -298,6 +298,77 @@ module LogSpecHarness::Env
       # failure instead of a hung suite.
       def run_main
         Timeout.timeout(5) { start_main }
+      end
+
+      # ;log help (and --help) shows the usage and logs nothing; the usage
+      # left the script's header in 1.4.0.
+      context 'when started with help' do
+        %w[help --help].each do |argument|
+          it "shows the usage for #{argument} and starts no logging" do
+            LogSpecHarness.start_script(argument)
+
+            run_main
+
+            expect(LogSpecHarness.responses.first).to eq(';log logs the game to a file.')
+            expect(Dir.glob(File.join(log_dir, '**', '*')).select { |f| File.file?(f) }).to be_empty
+            expect(LogSpecHarness.script.want_upstream).to be_falsey
+            expect(LogSpecHarness.script.want_script_output).to be_falsey
+            expect(LogSpecHarness.upstream_thread).to be_nil
+            expect(LogSpecHarness.echoes).to be_empty
+          end
+        end
+
+        it 'lists every option the logger reads' do
+          LogSpecHarness.start_script('help')
+
+          run_main
+
+          usage = LogSpecHarness.responses.join("\n")
+          %w[--xml --timestamp= --rnum --roomnum --exclude= --lines= --streams].each do |option|
+            expect(usage).to include(option)
+          end
+        end
+
+        # A run named logxml always logs XML (Logger.mode_for), and with
+        # logxml.lic still installed, ;log and ;logxml run side by side under
+        # their own names, so its help must say that, not offer text mode.
+        it 'tells an install that still has logxml.lic what ;logxml does' do
+          LogSpecHarness.start_script('help', name: 'logxml')
+
+          run_main
+
+          usage = LogSpecHarness.responses
+          expect(usage.first).to eq(';log logs the game to a file.')
+          expect(usage).to include(a_string_matching(/\A  ;logxml\s+the same as ;log --xml/))
+          expect(usage).not_to include(a_string_matching(/\A  ;logxml\s+game text/))
+          expect(usage.join("\n")).to include(';log and ;logxml run side by side, and both can be autostarted')
+          expect(usage.join("\n")).not_to include(';force log --xml')
+        end
+
+        it 'gives a plain ;log install the ;force way to log text and XML together' do
+          LogSpecHarness.start_script('help')
+
+          run_main
+
+          usage = LogSpecHarness.responses
+          expect(usage).to include(a_string_matching(/\A  ;log\s+game text to a \.log file/))
+          expect(usage.join("\n")).to include(';log, then ;force log --xml')
+          expect(usage).not_to include(a_string_matching(/\A  ;logxml/))
+        end
+
+        it "uses Lich's command character" do
+          LogSpecHarness.start_script('help')
+          original = $lich_char
+          $lich_char = '.'
+
+          begin
+            run_main
+          ensure
+            $lich_char = original
+          end
+
+          expect(LogSpecHarness.responses.first).to eq('.log logs the game to a file.')
+        end
       end
 
       def find_log_file
@@ -3683,5 +3754,34 @@ RSpec.describe 'log.lic required Lich version' do
     skip 'log.lic does not use Data' unless source.include?('Data.define')
 
     expect(floor).to be >= Gem::Version.new('5.19.0')
+  end
+end
+
+# The header is what ;repository info and every reader see first; the usage
+# lives in ;log help (GameLogger.help_lines) since 1.4.0, so the header stays
+# short and holds no per-option syntax.
+RSpec.describe 'log.lic header' do
+  let(:header) do
+    source = File.read(File.expand_path('../../scripts/log.lic', __dir__))
+    source[/^=begin\n.*?^=end\n/m]
+  end
+
+  # Only the part above the changelog: each release adds changelog lines,
+  # and older entries move to the second comment block.
+  it 'is short and points at ;log help for the options' do
+    expect(header[/\A.*?^\s*changelog:/m].lines.size).to be <= 20
+    expect(header).to include(';log help')
+    expect(header).not_to match(/^\s*SYNTAX/)
+  end
+
+  it 'keeps only the changelog back to 1.3.0, where --xml arrived; older entries follow in a second block' do
+    expect(header).to match(/^ {4}1\.3\.0 \(/)
+    expect(header).not_to match(/^ {4}1\.2\.8 \(/)
+    rest = File.read(File.expand_path('../../scripts/log.lic', __dir__)).split(header, 2).last
+    expect(rest).to match(/\A=begin\n {4}1\.2\.8 \(.*^ {4}0\.0\.2 \(.*?^=end$/m)
+  end
+
+  it 'keeps the indented version: line an older logxml.lic wrapper reads' do
+    expect(header).to match(/^[ \t]+version:[ \t]*\d+\.\d+\.\d+$/)
   end
 end
