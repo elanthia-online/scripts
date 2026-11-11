@@ -18,7 +18,7 @@
 
   changelog:
     1.7.0 (2026-11-12):
-      * New --compress-after=N option (or log_compress_after: N in DragonRealms yaml) gzips log files older than N days.
+      * New --compress-after=N option (or log_compress_after: N in DragonRealms yaml) gzips log files older than N days (0: all but today's).
     1.6.1 (2026-11-12):
       * XML logs no longer drop an lnet chat line that arrives while inventory is listed.
     1.6.0 (2026-11-11):
@@ -246,9 +246,12 @@ module GameLogger
   # Turns the --compress-after option, or the log_compress_after setting
   # when the option is not given (DragonRealms yaml), into a number of
   # days: log files dated more than that many days before today are
-  # gzipped (see +GameLogger::Logger.compress_old_logs+). Only a whole
-  # number above 0 is a number of days; anything else (0, negative, words,
-  # a bare --compress-after) echoes once and turns compression off.
+  # gzipped (see +GameLogger::Logger.compress_old_logs+), so 0 means every
+  # file dated before today. Today's files are never compressed: another
+  # logger (the XML twin of --both, a second ;log) may still have one open.
+  # Only a whole number, 0 or above, is a number of days; anything else
+  # (negative, words, a bare --compress-after) echoes once and turns
+  # compression off.
   #
   # @param option [String, true, nil] the parsed --compress-after option
   # @param setting [Integer, String, nil] settings.log_compress_after
@@ -259,10 +262,10 @@ module GameLogger
 
     days = value if value.is_a?(Integer)
     days = Integer(value, 10) if value.is_a?(String) && value.match?(/\A[0-9]+\z/)
-    return days if days&.positive?
+    return days if days && days >= 0
 
     problem = value == true ? "#{source} was given without a number of days" : "#{source} #{value.inspect} is not a number of days"
-    echo "#{problem}; use a whole number above 0, like --compress-after=30. Old logs are not compressed."
+    echo "#{problem}; use a whole number, 0 or above, like --compress-after=7. Old logs are not compressed."
     nil
   end
 
@@ -888,6 +891,10 @@ module GameLogger
     # machines resets modification times).
     LOG_FILE_NAME = /\A(\d{4})-(\d{2})-(\d{2})_\d{2}-\d{2}-\d{2}(?:_\d+)?\.(?:log|xml)\z/
 
+    # Seconds a new day's sweep waits before it starts (see
+    # {#start_compression}).
+    DAY_SWEEP_DELAY = 120
+
     # Seconds since its last write under which a file is left alone, and
     # after which a leftover .gz.tmp counts as abandoned: a file written to
     # within the hour may still be in use by some logger.
@@ -920,9 +927,19 @@ module GameLogger
       # the pattern.
       Dir.glob('[0-9][0-9][0-9][0-9]/[0-9][0-9]/*', base: folder).sort.each do |relative|
         path = File.join(folder, relative)
+        # A temp file whose log is gone (another sweep finished it, or it
+        # was moved away) is removed once abandoned; one beside its log is
+        # handled with the log, in compress_log_file.
+        if relative.end_with?('.gz.tmp')
+          remove_abandoned_temp(path, now) unless File.exist?(path.delete_suffix('.gz.tmp'))
+          next
+        end
         next unless (match = File.basename(path).match(LOG_FILE_NAME))
-        next unless (Date.new(match[1].to_i, match[2].to_i, match[3].to_i) rescue nil)&.<(cutoff)
-        next unless (sizes = compress_log_file(path, now: now))
+        next unless (date = (Date.new(match[1].to_i, match[2].to_i, match[3].to_i) rescue nil))&.<(cutoff)
+        # Only a file dated yesterday (or later) can still be in use; an
+        # older one is compressed even if just copied in (copying resets the
+        # modification time, not the name).
+        next unless (sizes = compress_log_file(path, now: now, recent_guard: date >= now.to_date - 1))
 
         count += 1
         before += sizes[0]
@@ -947,17 +964,20 @@ module GameLogger
     #
     # @param path [String] the log file
     # @param now [Time] the time now, for {RECENT_WRITE}
+    # @param recent_guard [Boolean] skip the file when it was written to
+    #   within {RECENT_WRITE} ({compress_old_logs} turns this off for files
+    #   dated before yesterday)
     # @return [Array(Integer, Integer), nil] the original's size and the
     #   .gz's size when the original is gone, or +nil+ when it is still there
-    def self.compress_log_file(path, now: Time.now)
+    def self.compress_log_file(path, now: Time.now, recent_guard: true)
       stat = File.stat(path)
-      return nil if now - stat.mtime < RECENT_WRITE
+      return nil if recent_guard && now - stat.mtime < RECENT_WRITE
 
       gz_path = "#{path}.gz"
+      tmp = "#{gz_path}.tmp"
+      remove_abandoned_temp(tmp, now)
       return finish_compressed(path, gz_path, stat) if File.exist?(gz_path)
 
-      tmp = "#{gz_path}.tmp"
-      File.delete(tmp) if File.exist?(tmp) && now - File.mtime(tmp) > RECENT_WRITE
       created = false
       written = nil
       File.open(tmp, File::WRONLY | File::CREAT | File::EXCL | File::BINARY) do |out|
@@ -991,16 +1011,41 @@ module GameLogger
       sync_directory(File.dirname(gz_path))
       keep_times_and_mode(gz_path, stat)
       remove_compressed_original(path, gz_path, stat)
-    rescue Errno::EEXIST, Errno::ENOENT
-      # Another sweeper is compressing this file, or has already finished it.
+    rescue Errno::EEXIST
+      # Another sweeper is compressing this file.
+      nil
+    rescue Errno::ENOENT
+      # Another sweeper finished this file meanwhile; drop this call's copy.
+      remove_own_temp(tmp, created)
       nil
     rescue SystemCallError, IOError, Zlib::Error => e
-      begin
-        File.delete(tmp) if created && File.exist?(tmp)
-      rescue SystemCallError
-        nil
-      end
+      remove_own_temp(tmp, created)
       Lich.log "log: left #{path} as it is: compressing it failed (#{e.class}: #{e.message})"
+      nil
+    end
+
+    # Deletes the temp file a {compress_log_file} call made, when it made
+    # one and it is still there.
+    #
+    # @param tmp [String, nil] the temp file
+    # @param created [Boolean] whether this call created it
+    # @return [void]
+    def self.remove_own_temp(tmp, created)
+      File.delete(tmp) if created && tmp && File.exist?(tmp)
+    rescue SystemCallError
+      nil
+    end
+
+    # Deletes a temp file left over an hour ago ({RECENT_WRITE}): a sweep
+    # that was stopped, or one whose log another sweep finished. A younger
+    # one may belong to a sweep still running and is left alone.
+    #
+    # @param tmp [String] the temp file
+    # @param now [Time] the time now
+    # @return [void]
+    def self.remove_abandoned_temp(tmp, now)
+      File.delete(tmp) if File.exist?(tmp) && now - File.mtime(tmp) > RECENT_WRITE
+    rescue SystemCallError
       nil
     end
 
@@ -1734,6 +1779,9 @@ module GameLogger
     def start_compression(date)
       return if @compressor&.alive?
 
+      # A new day's sweep waits a little, so the other loggers on this
+      # character (the XML twin of --both) have closed yesterday's files.
+      delay = @compress_date ? DAY_SWEEP_DELAY : 0
       @compress_date = date
       folder = self.class.character_log_folder(XMLData.game, XMLData.name)
       cutoff = Date.strptime(date, '%Y-%m-%d') - @compress_days
@@ -1743,9 +1791,11 @@ module GameLogger
       label = self.class.log_label
       @compressor = Thread.new do
         Thread.current.priority = -1
-        count, before, after = self.class.compress_old_logs(folder, cutoff, now: now)
+        sleep(delay) if delay.positive?
+        count, before, after = self.class.compress_old_logs(folder, cutoff, now: delay.positive? ? Time.now : now)
         if count.positive?
-          io.send(:echo, "compressed #{count} log file#{'s' unless count == 1} older than #{days} day#{'s' unless days == 1}: " \
+          age = days.zero? ? 'dated before today' : "older than #{days} day#{'s' unless days == 1}"
+          io.send(:echo, "compressed #{count} log file#{'s' unless count == 1} #{age}: " \
                          "#{self.class.size_text(before)} down to #{self.class.size_text(after)}.")
         end
       rescue StandardError => e
@@ -1841,8 +1891,8 @@ module GameLogger
       "  #{pad}                          Lich room number (needs the room's UID in Lich's map)",
       "  #{pad} --lines=50000            start a new file after this many lines (default 30000)",
       "  #{pad} --streams                XML mode only: keep all the stream window content (very noisy)",
-      "  #{pad} --compress-after=30      gzip log files more than this many days old (in the background,",
-      "  #{pad}                          when logging starts and each new day; .log becomes .log.gz)",
+      "  #{pad} --compress-after=7       gzip log files more than this many days old (0: all but today's;",
+      "  #{pad}                          in the background, when logging starts and each new day)",
       '',
       "  Files go to Lich's log folder (lich/logs, or the one set with Lich's --logs=), under",
       '  <game>-<character>/<year>/<month>/, with a new file each day and after --lines lines.',
@@ -1850,8 +1900,8 @@ module GameLogger
       *together,
       '',
       '  DragonRealms: log_timestamp: true in your yaml turns timestamps on, in the',
-      '  log_timestamp_format format; --timestamp wins over both. log_compress_after: 30',
-      '  in your yaml does what --compress-after=30 does; the option wins.',
+      '  log_timestamp_format format; --timestamp wins over both. log_compress_after: 7',
+      '  in your yaml does what --compress-after=7 does; the option wins.',
       '',
       '  A reply that comes within about 50 ms of a typed command can be logged before it.',
       '',
