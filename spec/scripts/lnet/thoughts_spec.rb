@@ -128,9 +128,14 @@ RSpec.describe 'lnet.lic' do
       end
 
       it 'shows the familiar window and preset forms the same way' do
+        lnet.options['preset'] = 'thought'
+        out = feed(%(<message type="private" from="Bob">hi</message>))
+        expect(out.first).to eq([:main_stream, %(<pushStream id="thoughts"/><preset id='thought'>[Private]-Bob:</preset> "hi"\n<popStream/>\r\n)])
+        expect(out.count { |kind, _| kind == :downstream_xml }).to eq(1)
         lnet.options['fam_window'] = true
         out = feed(%(<message type="private" from="Bob">hi</message>))
         expect(out.first).to eq([:main_stream, %(<pushStream id="familiar" ifClosedStyle="watching"/>[Private]-Bob: "hi"\n<popStream/>\r\n)])
+        expect(out.count { |kind, _| kind == :downstream_xml }).to eq(1)
       end
     end
 
