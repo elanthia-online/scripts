@@ -29,7 +29,8 @@ RSpec.describe 'ElanthiaMap::Window' do
       w.instance_variable_set(:@lock, Mutex.new)
       w.instance_variable_set(:@settings, { expanded_canvas: true, global_scale: 1.0, global_scale_enabled: false, map_scale: {}, dynamic_indicator_size: false, keep_centered: true })
       w.instance_variable_set(:@notes, {})
-      w.instance_variable_set(:@menu_revision, 0)
+      w.instance_variable_set(:@menu_revisions, Hash.new(0))
+      w.instance_variable_set(:@note_serial, 0)
       w.instance_variable_set(:@current_map, 'maps/sheet.png')
       w.instance_variable_set(:@image_sizes, { 'maps/sheet.png' => [1000, 800] })
       w.instance_variable_set(:@rooms_by_sheet, { 'sheet.png' => rooms })
@@ -189,11 +190,13 @@ RSpec.describe 'ElanthiaMap::Window' do
 
   it 'gives a menu item a new key after an outside change, because the viewer keeps its checked state' do
     window.define_singleton_method(:refresh) { nil }
-    before = window.menu_key('tags-0')
+    tag_before = window.menu_key('tags-0', :tags)
+    scale_before = window.menu_key('scale-100', :scale)
 
     window.on_tag('bank')
 
-    expect(window.menu_key('tags-0')).not_to eq(before)
+    expect(window.menu_key('tags-0', :tags)).not_to eq(tag_before)
+    expect(window.menu_key('scale-100', :scale)).to eq(scale_before)
   end
 
   it 'keeps Find open and explains when nothing matches' do
@@ -219,11 +222,43 @@ RSpec.describe 'ElanthiaMap::Window' do
     expect(window.find_status).to eq('')
   end
 
-  it 'keeps the scroller inside the window, leaving room for an open panel' do
-    window.instance_variable_set(:@char_settings, { window_height: 600 })
+  it 'opens each note with a fresh editor key, so one room\'s draft never reaches another' do
+    rooms << room(1) << room(2, tags: [])
+    rooms[1].image_coords = [100, 100, 120, 120]
+    window.define_singleton_method(:refresh) { nil }
+    window.instance_variable_set(:@notes, { '2' => 'saved b' })
+    keys = []
+    [[15, 25], [110, 110], [15, 25]].each do |click|
+      window.instance_variable_set(:@right_click, click)
+      window.on_open_note
+      keys << "note-text-#{window.note_room.id}-#{window.note_serial}"
+    end
 
-    expect(window.view_height).to eq(598)
-    window.instance_variable_set(:@panel, :find)
-    expect(window.view_height).to eq(502)
+    expect(keys.uniq.size).to eq(3)
+    window.instance_variable_set(:@right_click, [110, 110])
+    window.on_open_note
+    expect(window.note_text).to eq('saved b')
+  end
+
+  it 'caps note pins at what the composite can hold and says so once' do
+    300.times { |index| rooms << room(index) }
+    window.instance_variable_set(:@notes, (0...300).to_h { |index| [index.to_s, 'n'] })
+    list = rooms
+    namespace.const_get(:Room).define_singleton_method(:[]) { |id| list[id] }
+
+    expect(window.layers.size).to be <= 512
+    window.layers
+    expect(said).to eq(['[map notes: 300 notes on this sheet; only 255 can be drawn at once]'])
+  end
+
+  it 're-centres on the same spot after the viewer panned away' do
+    window.instance_variable_set(:@viewport, { width: 400, height: 300 })
+    window.center_on(100, 100)
+    first = window.scroll_origin_prop[:scroll_origin]
+    window.instance_variable_set(:@last_position, [0, 0])
+
+    window.center_on(100, 100)
+
+    expect(window.scroll_origin_prop[:scroll_origin]).not_to eq(first)
   end
 end

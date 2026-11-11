@@ -18,22 +18,28 @@ Tracks your current room on visual maps
 
   changelog:
     v3.0.0 (2026-11-09)
-      * Rewritten from GTK to Lich's WebUI (contract 2.52). The Borderless Window option is
-        gone: a browser app window cannot be made frameless. The window is a browser app
-        window served by Lich; the map sheet, the room circle, the tag and
-        location X markers and the note pins are drawn by the browser from
-        data (composite layers), so they stay crisp at any zoom and nothing
-        is rasterised with Cairo any more. The options menu, the Find room
-        and note editors, keep-on-top, opacity and hidden scrollbars all come
-        from the WebUI contract. Ctrl+wheel zoom keeps the middle of the view
-        still. Every setting, and the per-character
-        window size and position, is read and written under the same keys
-        as before, so nothing is lost on upgrade. All GC-anchoring, gtk_safe
-        wrapping and platform-specific window hints are gone with GTK.
-        Keep window on top and Opacity act on the OS window and are offered
-        only where Lich can reach it (Windows); elsewhere the two items are
-        not shown. Tag and location markers are capped at what one composite
-        may hold, and say so once when a selection is cut short.
+      * Rewritten from GTK to Lich's WebUI (contract 2.52). The window is a
+        browser app window served by Lich; the map sheet, the room circle, the
+        tag and location X markers and the note pins are drawn by the browser
+        from data (composite layers), so they stay crisp at any zoom and nothing
+        is rasterised with Cairo any more. The options menu, the Find room and
+        note editors and hidden scrollbars come from the WebUI contract.
+        Ctrl+wheel zoom keeps the middle of the view still. Every setting is
+        read and written under the same keys as before. All GC-anchoring,
+        gtk_safe wrapping and platform-specific window hints are gone with GTK.
+      * Keep window on top, Opacity and Borderless Window are offered wherever
+        the WebUI host reports it can apply them, and hidden elsewhere.
+      * Lich now saves the window's size and position; the first run opens where
+        the 2.x settings left it.
+      * The window fills its viewport and the browser lays it out; resizing no
+        longer redraws the map.
+      * The note editor starts from the note as saved each time it opens; a draft
+        for one room can no longer be saved onto another.
+      * Tag and location markers, and note pins, are capped at what one composite
+        may hold, and say so once when cut short.
+      * Re-centring on the room works after panning away, even to the same spot.
+      * The window title no longer shows the room number.
+      * If the window cannot open, the script says so and exits.
     v2.1.4 (2026-05-29)
       * Anchor transient dialog handlers (find + note dialogs). Their handler
         Procs and widgets were connected but never rooted on the Ruby side, so
@@ -128,61 +134,9 @@ module ElanthiaMap
     attr_accessor :current_window
   end
 
-  # Reads a sheet's pixel size from its header. Nothing else about the image
-  # is needed server-side: the browser draws it.
-  module ImageSize
-    # File signatures as bytes: the repository's style cop allows no escape
-    # that produces a non-ASCII byte, so they are packed rather than written.
-    PNG_SIGNATURE = [0x89, 0x50, 0x4E, 0x47].pack('C*').freeze
-    JPEG_SIGNATURE = [0xFF, 0xD8].pack('C*').freeze
-    # The note pin, U+1F4CC, for the same reason.
-    NOTE_PIN = [0x1F4CC].pack('U').freeze
-
-    module_function
-
-    # @param path [String]
-    # @return [Array(Integer, Integer), nil] width and height
-    def read(path)
-      header = File.binread(path, 64)
-      return nil unless header && header.bytesize >= 10
-
-      if header.start_with?(PNG_SIGNATURE)
-        header[16, 8].unpack('N2')
-      elsif header.start_with?('GIF8'.b)
-        header[6, 4].unpack('v2')
-      elsif header.start_with?(JPEG_SIGNATURE)
-        jpeg(path)
-      end
-    rescue SystemCallError, IOError
-      nil
-    end
-
-    # Walks the JPEG segments to the first start-of-frame.
-    def jpeg(path)
-      File.open(path, 'rb') do |io|
-        io.seek(2)
-        loop do
-          marker = io.read(2)
-          return nil unless marker && marker.bytesize == 2 && marker.getbyte(0) == 0xFF
-
-          type = marker.getbyte(1)
-          next if type == 0xFF
-
-          length = io.read(2)&.unpack1('n')
-          return nil unless length
-
-          if [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF].include?(type)
-            frame = io.read(5)
-            return nil unless frame && frame.bytesize == 5
-
-            height, width = frame[1, 4].unpack('n2')
-            return [width, height]
-          end
-          io.seek(length - 2, IO::SEEK_CUR)
-        end
-      end
-    end
-  end
+  # The note pin, U+1F4CC, packed: the repository's style cop allows no
+  # escape that produces a non-ASCII byte.
+  NOTE_PIN = [0x1F4CC].pack('U').freeze
 
   # Map metadata read from the mapdb's meta: tags, and the links between
   # sheets. Unchanged from the GTK version.
@@ -252,12 +206,18 @@ module ElanthiaMap
     PAGE_ID = 'map'
     OPACITY_STEPS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0].freeze
     SCALE_STEPS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0].freeze
-    PANEL_HEIGHTS = { find: 96, note: 190 }.freeze
-    # Keeps the page itself from overflowing and adding scrollbars of its own.
-    VIEW_SLACK = 2
 
     attr_reader :settings, :trouble_mode, :current_map
-    attr_accessor :follow_mode, :temp_follow_disabled
+    attr_reader :follow_mode
+    attr_accessor :temp_follow_disabled
+
+    # Set from the script thread (;map <room>); the menu's Follow check follows.
+    def follow_mode=(value)
+      @lock.synchronize do
+        @follow_mode = value
+        bump_menu(:follow)
+      end
+    end
 
     def initialize(script, map_dir)
       @script = script
@@ -279,12 +239,15 @@ module ElanthiaMap
       @find_focus = 0          # a new value moves keyboard focus to the Find box
       @note_room = nil
       @note_text = ''
+      @note_serial = 0         # part of the note editor's key: each opening seeds a fresh draft
       @image_sizes = {}
       @rooms_by_sheet = {}
+      @sheet_lists = {}        # tags and locations per sheet, for the menu
       @viewport = nil          # { width:, height: } of the scroller, in CSS px, from the browser
       @requested_scroll = nil
       @scroll_origin = nil
-      @menu_revision = 0       # part of the menu item keys; see render_menu
+      @menu_revisions = Hash.new(0) # per submenu, part of its item keys; see menu_key
+      @presentation_support = {}
       @center_target = nil
       @last_position = nil
       @last_user_scroll = nil
@@ -293,6 +256,7 @@ module ElanthiaMap
       @attached = false
       @settings_dirty = false  # a change made off the script thread, waiting for the loop to write it
       @markers_cut = nil       # the (sheet, selection) already reported as truncated
+      @notes_cut = nil         # the sheet whose notes were already reported as truncated
 
       @fix_mode = script.vars[1] =~ /fix/ ? true : false
       @trouble_mode = script.vars[1] =~ /trouble/ ? true : false
@@ -307,77 +271,55 @@ module ElanthiaMap
     # ---- lifecycle ----------------------------------------------------------
 
     # Registers the page, starts the shared WebUI service and opens the window.
+    # The service runs its own workers outside this script's thread group.
+    # @return [Boolean] whether the window opened
     def show
       window = self
       @page = Lich::WebUI.page(
-        owner: @script, id: PAGE_ID, title: title_for(nil), props: { bare: true }, on: page_events
+        owner: @script, id: PAGE_ID, title: title_for, props: { bare: true, viewport: true }, on: page_events
       ) { |builder| window.render(builder) }
 
+      Lich::WebUI.start
+      @presentation_support = begin
+        @page.presentation_support
+      rescue StandardError
+        {}
+      end
+      diag('presentation', support: @presentation_support)
       Lich::WebUI.refresh(@page)
-      start_service
 
-      diag('window.url', url: Lich::WebUI.launch_url(page: @page))
-      # Passing the geometry keeps this script's own per-character settings in
-      # charge of where the window comes back.
-      Lich::WebUI.open(page: @page, geometry: { width: @char_settings[:window_width].to_i, height: @char_settings[:window_height].to_i,
-                                                position: @char_settings[:window_position].first(2).map(&:to_i) })
+      # The host saves and restores the window's size and position. Until it
+      # has saved any, the window opens where the 2.x settings left it.
+      saved = Lich::WebUI.window_geometry_store&.read(@page)
+      geometry = saved ? nil : legacy_geometry
+      Lich::WebUI.open(page: @page, geometry: geometry) ? true : false
+    end
+
+    def legacy_geometry
+      position = Array(@char_settings[:window_position]).first(2).map(&:to_i)
+      { width: @char_settings[:window_width].to_i.clamp(100, 65_536), height: @char_settings[:window_height].to_i.clamp(100, 65_536),
+        position: position.length == 2 ? position : [0, 0] }
     end
 
     def page_events
       window = self
-      { close: ->(_event) { window.closed_by_viewer }, configure: ->(event) { window.on_configure(event) },
-      attach: ->(_event) { window.on_attach } }
+      { close: ->(_event) { window.closed_by_viewer }, attach: ->(_event) { window.on_attach } }
     end
 
-    # What the OS window should look like. No borderless: a Chrome app window
-    # draws its own title bar and cannot be made frameless, so the old menu item
-    # is gone rather than offered and ignored. The `borderless` setting key is
-    # left alone on disk.
+    # What the OS window should look like, for the requests this host supports.
     def window_presentation
-      {
-        always_on_top: @settings[:keep_above] ? true : false,
-        opacity: @settings[:opacity].to_f.clamp(0.1, 1.0)
-      }
+      result = {}
+      result[:always_on_top] = @settings[:keep_above] ? true : false if supports?(:always_on_top)
+      result[:borderless] = @settings[:borderless] ? true : false if supports?(:borderless)
+      result[:opacity] = @settings[:opacity].to_f.clamp(0.1, 1.0) if supports?(:opacity)
+      result
     end
 
-    # Starts the shared WebUI service from the default thread group.
-    #
-    # The service's accept loop inherits the group of whoever calls start,
-    # and a thread created from a script belongs to that script's group,
-    # which Lich kills when the script stops: a service started from here
-    # would lose its listener with this script and could never rebind its
-    # port. The starter is created parked and moved before it runs, so the
-    # move cannot lose the race with the start.
-    def start_service
-      service = Lich::WebUI.service
-      return if service.server.running?
-      return Lich::WebUI.start if Thread.current.group.equal?(ThreadGroup::Default)
-
-      gate = Queue.new
-      result = Queue.new
-      thread = Thread.new do
-        gate.pop
-        result << [:ok, Lich::WebUI.start]
-      rescue Exception => e # rubocop:disable Lint/RescueException
-        result << [:error, e]
-      end
-      begin
-        ThreadGroup::Default.add(thread)
-      rescue ThreadError
-        nil # an enclosed group keeps its threads; start anyway
-      end
-      gate << true
-      status, value = result.pop
-      raise value if status == :error
-
-      value
-    end
-
-    # Whether keep-on-top and opacity can reach the OS window on this host.
-    # Where they cannot, the menu leaves the two items out rather than
+    # Whether the host can apply a presentation request (keep-on-top, opacity,
+    # borderless). Where it cannot, the menu leaves the item out rather than
     # offering a toggle that persists and does nothing.
-    def presentation_available?
-      defined?(Lich::WebUI::WindowPresentation) && Lich::WebUI::WindowPresentation.available? ? true : false
+    def supports?(feature)
+      @presentation_support[feature] ? true : false
     end
 
     # The new window took focus from the game. Hand it back the first time only:
@@ -453,9 +395,6 @@ module ElanthiaMap
     def save_settings
       @lock.synchronize do
         @settings_dirty = false
-        CharSettings['window_width'] = @char_settings[:window_width]
-        CharSettings['window_height'] = @char_settings[:window_height]
-        CharSettings['window_position'] = @char_settings[:window_position]
         Settings['keep_above'] = @settings[:keep_above]
         Settings['global_scale'] = @settings[:global_scale]
         Settings['global_scale_enabled'] = @settings[:global_scale_enabled]
@@ -541,7 +480,11 @@ module ElanthiaMap
     end
 
     def sheet_size(map_path)
-      @image_sizes[map_path] ||= ImageSize.read(map_path) || [1, 1]
+      @image_sizes[map_path] ||= begin
+        Lich::WebUI::ImageSize.read(map_path)
+      rescue ArgumentError, SystemCallError
+        [1, 1]
+      end
     end
 
     # Rooms whose image is this sheet; cached per sheet, the mapdb does not
@@ -559,7 +502,7 @@ module ElanthiaMap
       end
 
       @current_map = map_path
-      @menu_revision += 1 # the scale, tag and location checks belong to the sheet
+      bump_menu(:scale, :tags, :locations) # their checks belong to the sheet
       diag('map.change', sheet: File.basename(map_path))
       true
     end
@@ -633,7 +576,6 @@ module ElanthiaMap
           center_on((coords[0] + coords[2]) / 2.0, (coords[1] + coords[3]) / 2.0) if coords && @settings[:keep_centered] && !recently_scrolled?
         end
       end
-      retitle(room)
       refresh
     end
 
@@ -663,8 +605,11 @@ module ElanthiaMap
     # Moves the scroller on the next render. The composite's scroll_origin is
     # shared by every viewer and applied only when it changes, so ordinary
     # redraws do not undo the viewer's panning. The caller refreshes, outside
-    # @lock.
+    # @lock. Asking again for the origin already sent, after the viewer panned
+    # away, would change nothing the browser compares, so that request moves
+    # by a pixel to count as new.
     def push_scroll(x, y)
+      y += y.zero? ? 1 : -1 if [x, y] == @scroll_origin && @last_position && @last_position != @scroll_origin
       @requested_scroll = [x, y]
       @scroll_origin = [x, y]
     end
@@ -675,12 +620,12 @@ module ElanthiaMap
       @lock.synchronize do
         window = self
         builder.facility(:presentation, window_presentation.merge(scrollbars: @settings[:hide_scrollbars] ? false : true))
-        # The scroller is the window's height: unbounded, it would grow to the
-        # size of the sheet and there would be nothing to scroll or centre.
-        scroll_props = { key: 'view', height: window.view_height, scrollbars: window.settings[:hide_scrollbars] ? false : true,
+        # The page is the window (viewport) and the scroller fills what an open
+        # editor panel leaves of it; the browser sizes both.
+        scroll_props = { key: 'view', fill: true, scrollbars: window.settings[:hide_scrollbars] ? false : true,
                          on: { scrolled: ->(event) { window.on_scrolled(event) } } }
-        builder.scroll(**scroll_props) do
-          if window.current_map
+        if window.current_map
+          builder.scroll(**scroll_props) do
             width, height = window.canvas_size
             builder.composite(
               key: 'map', width: width, height: height, scale: window.scale, **window.scroll_origin_prop,
@@ -691,10 +636,10 @@ module ElanthiaMap
                 region_activate: ->(event) { window.on_region_activate(event) }
               }
             )
-          else
-            builder.group(key: 'no-map-box', context_menu: 'options', height: [window.view_height - 40, 60].max, margin: 12) do
-              builder.text(key: 'no-map', emphasis: 'subtle', content: 'No map for this room. Right-click for the options menu.')
-            end
+          end
+        else
+          builder.group(key: 'no-map-box', context_menu: 'options', fill: true, padding: 12) do
+            builder.text(key: 'no-map', emphasis: 'subtle', content: 'No map for this room. Right-click for the options menu.')
           end
         end
         render_menu(builder)
@@ -704,11 +649,6 @@ module ElanthiaMap
 
     def scroll_origin_prop
       @scroll_origin ? { scroll_origin: @scroll_origin } : {}
-    end
-
-    # Height for the scroller, leaving room for an open editor panel below it.
-    def view_height
-      [@char_settings[:window_height].to_i - VIEW_SLACK - PANEL_HEIGHTS.fetch(@panel, 0) - (@panel == :find && !@find_status.to_s.empty? ? 24 : 0), 100].max
     end
 
     # The composite's layers, in the sheet's own pixels (the composite's
@@ -723,11 +663,12 @@ module ElanthiaMap
       if route
         result << { kind: 'image', x: ox, y: oy, w: width, h: height, src: "#{route}#{ERB::Util.url_encode(name)}" }
       end
-      notes = note_layers(ox, oy)
       marker = room_marker(ox, oy, s)
-      # The composite holds at most COLLECTION layers. The sheet, the notes and
-      # the room marker are always drawn; the markers get what is left, and a
-      # selection larger than that is cut short and said so once.
+      # The composite holds at most COLLECTION layers. The sheet and the room
+      # marker are always drawn, the notes (two layers each) next, and the tag
+      # and location markers get what is left; whatever is cut short is said
+      # once.
+      notes = note_layers(ox, oy, COLLECTION - result.length - (marker ? 1 : 0))
       budget = COLLECTION - result.length - notes.length - (marker ? 1 : 0)
       marked = marked_rooms(@active_tag) { |room| room.tags&.include?(@active_tag) }.map { |coords| [coords, BLUE] }
       marked.concat(marked_rooms(@active_location) { |room| room.location.to_s == @active_location }.map { |coords| [coords, GREEN] })
@@ -759,11 +700,11 @@ module ElanthiaMap
         color: tint, line_width: (2.0 / s).clamp(1.0, 8.0) }
     end
 
-    def note_layers(ox, oy)
+    def note_layers(ox, oy, budget)
       return [] if @notes.empty?
 
       name = File.basename(@current_map)
-      @notes.filter_map do |room_id, text|
+      pairs = @notes.filter_map do |room_id, text|
         room = Room[room_id.to_i]
         next unless room && room.image == name
 
@@ -776,9 +717,19 @@ module ElanthiaMap
           # the room on click (region_activate).
           { kind: 'region', key: "note-#{room.id}", x1: ox + x1, y1: oy + y1, x2: ox + x2, y2: oy + y2,
             label: text.to_s[0, SHORT], activates: true },
-          { kind: 'label', x: ox + x2 - 10, y: oy + y1 - 14, text: ImageSize::NOTE_PIN }
+          { kind: 'label', x: ox + x2 - 10, y: oy + y1 - 14, text: NOTE_PIN }
         ]
-      end.flatten
+      end
+      shown = [budget / 2, 0].max
+      report_cut_notes(pairs.length, shown) if pairs.length > shown
+      pairs.first(shown).flatten
+    end
+
+    def report_cut_notes(total, shown)
+      return if @notes_cut == @current_map
+
+      @notes_cut = @current_map
+      respond "[map notes: #{total} notes on this sheet; only #{shown} can be drawn at once]"
     end
 
     def room_marker(ox, oy, s)
@@ -802,28 +753,35 @@ module ElanthiaMap
 
     # A menu item's checked state belongs to the viewer and a re-render will not
     # change it. Anything that changes one from outside its own click bumps
-    # @menu_revision, and the new keys make the browser take the current value.
-    def menu_key(key)
-      "#{key}-r#{@menu_revision}"
+    # that submenu's revision, and only its items get new keys, which make the
+    # browser take the current value.
+    def menu_key(key, submenu)
+      "#{key}-r#{@menu_revisions[submenu]}"
+    end
+
+    # Caller holds @lock.
+    def bump_menu(*submenus)
+      submenus.each { |submenu| @menu_revisions[submenu] += 1 }
     end
 
     def render_menu(builder)
       window = self
       check = lambda do |key, label, setting|
-        builder.toggle(key: window.menu_key(key), label: label, appearance: :menu, checked: window.settings[setting] ? true : false,
+        builder.toggle(key: window.menu_key(key, :options), label: label, appearance: :menu, checked: window.settings[setting] ? true : false,
                        on: { change: ->(event) { window.on_setting_toggle(setting, event.payload[:value]) } })
       end
       builder.group(key: 'options', menu: :context) do
-        builder.toggle(key: window.menu_key('follow'), label: 'Follow', appearance: :menu, checked: window.follow_mode ? true : false,
+        builder.toggle(key: window.menu_key('follow', :follow), label: 'Follow', appearance: :menu, checked: window.follow_mode ? true : false,
                        on: { change: ->(event) { window.on_follow_toggle(event.payload[:value]) } })
         check.call('keep-centered', 'Keep Centered', :keep_centered)
         check.call('expanded-canvas', 'Expanded Canvas', :expanded_canvas)
-        check.call('keep-above', 'Keep window on top', :keep_above) if window.presentation_available?
+        check.call('keep-above', 'Keep window on top', :keep_above) if window.supports?(:always_on_top)
+        check.call('borderless', 'Borderless Window', :borderless) if window.supports?(:borderless)
         check.call('dark-mode', 'Dark Mode', :dark_mode)
         check.call('dynamic-indicator', 'Dynamic Indicator Size', :dynamic_indicator_size)
         check.call('hide-scrollbars', 'Hide Scrollbars', :hide_scrollbars)
         builder.divider(key: 'sep-1')
-        if window.presentation_available?
+        if window.supports?(:opacity)
           window.render_radio_submenu(builder, 'opacity', 'Opacity', OPACITY_STEPS, window.settings[:opacity]) do |value|
             window.on_opacity(value)
           end
@@ -849,7 +807,7 @@ module ElanthiaMap
       window = self
       builder.group(key: key, label: label, menu: :submenu) do
         values.each do |value|
-          builder.radio_option(key: window.menu_key("#{key}-#{(value * 100).to_i}"), label: "#{(value * 100).to_i}%", appearance: :menu,
+          builder.radio_option(key: window.menu_key("#{key}-#{(value * 100).to_i}", key.to_sym), label: "#{(value * 100).to_i}%", appearance: :menu,
                                group: key, checked: (current.to_f - value).abs < 0.001,
                                on: { change: ->(event) { yield(value) if event.payload[:value] } })
         end
@@ -859,31 +817,42 @@ module ElanthiaMap
     def render_scale_submenu(builder)
       window = self
       builder.group(key: 'scale', label: 'Scale', menu: :submenu) do
-        builder.toggle(key: window.menu_key('global-scale'), label: 'Global Scale', appearance: :menu,
+        builder.toggle(key: window.menu_key('global-scale', :scale), label: 'Global Scale', appearance: :menu,
                        checked: window.settings[:global_scale_enabled] ? true : false,
                        on: { change: ->(event) { window.on_setting_toggle(:global_scale_enabled, event.payload[:value]) } })
         builder.divider(key: 'scale-sep')
         current = window.scale
         SCALE_STEPS.each do |value|
-          builder.radio_option(key: window.menu_key("scale-#{(value * 100).to_i}"), label: "#{(value * 100).to_i}%", appearance: :menu,
+          builder.radio_option(key: window.menu_key("scale-#{(value * 100).to_i}", :scale), label: "#{(value * 100).to_i}%", appearance: :menu,
                                group: 'scale', checked: (current - value).abs < 0.001,
                                on: { change: ->(event) { window.on_scale(value) if event.payload[:value] } })
         end
       end
     end
 
+    # The map list, sorted once: the mapdb does not change while we run.
+    def maps_menu
+      @maps_menu ||= begin
+        categories = {}
+        uncategorized = []
+        all_maps = MapData.data.values.sort_by { |m| (m[:name] || '').downcase }
+        all_maps.each do |map_info|
+          if map_info[:categories].empty?
+            uncategorized << map_info
+          else
+            map_info[:categories].each_key { |category| (categories[category] ||= []) << map_info }
+          end
+        end
+        categories = categories.keys.sort_by(&:downcase).to_h do |category|
+          [category, categories[category].sort_by { |m| (m[:shortname] || m[:name] || '').downcase }]
+        end
+        [categories, all_maps, uncategorized]
+      end
+    end
+
     def render_maps_submenu(builder)
       window = self
-      categories = {}
-      uncategorized = []
-      all_maps = MapData.data.values.sort_by { |m| (m[:name] || '').downcase }
-      all_maps.each do |map_info|
-        if map_info[:categories].empty?
-          uncategorized << map_info
-        else
-          map_info[:categories].each_key { |category| (categories[category] ||= []) << map_info }
-        end
-      end
+      categories, all_maps, uncategorized = maps_menu
       map_items = lambda do |prefix, maps|
         maps.first(COLLECTION - 2).each_with_index do |map_info, index|
           label = (map_info[:shortname] || map_info[:name] || map_info[:filename] || 'Unknown').to_s[0, SHORT]
@@ -892,9 +861,9 @@ module ElanthiaMap
         end
       end
       builder.group(key: 'maps', label: 'Maps', menu: :submenu) do
-        categories.keys.sort_by(&:downcase).first(COLLECTION - 4).each_with_index do |category, index|
+        categories.first(COLLECTION - 4).each_with_index do |(category, maps), index|
           builder.group(key: "category-#{index}", label: category.to_s[0, SHORT], menu: :submenu) do
-            map_items.call("category-#{index}", categories[category].sort_by { |m| (m[:shortname] || m[:name] || '').downcase })
+            map_items.call("category-#{index}", maps)
           end
         end
         builder.divider(key: 'maps-sep-1')
@@ -908,17 +877,19 @@ module ElanthiaMap
 
     attr_reader :map_dir
 
+    # Tags and locations are cached per sheet, like rooms_on.
     def tags_on_sheet
       return [] unless @current_map
 
-      rooms_on(@current_map).flat_map { |room| room.tags || [] }.compact
-                            .reject { |tag| tag =~ /^(silver-cost|meta:)/ }.uniq.sort_by(&:downcase)
+      (@sheet_lists[[:tags, @current_map]] ||= rooms_on(@current_map).flat_map { |room| room.tags || [] }.compact
+                                                                      .reject { |tag| tag =~ /^(silver-cost|meta:)/ }.uniq.sort_by(&:downcase))
     end
 
     def locations_on_sheet
       return [] unless @current_map
 
-      rooms_on(@current_map).map(&:location).compact.reject { |loc| loc == false }.map(&:to_s).uniq.sort_by(&:downcase)
+      (@sheet_lists[[:locations, @current_map]] ||= rooms_on(@current_map).map(&:location).compact.reject { |loc| loc == false }
+                                                                           .map(&:to_s).uniq.sort_by(&:downcase))
     end
 
     def render_room_list_submenu(builder, key, label, clear_label, values, active)
@@ -935,7 +906,7 @@ module ElanthiaMap
           builder.button(key: "#{key}-clear", label: clear_label, on: { activate: ->(_event) { yield(nil) } })
           builder.divider(key: "#{key}-sep")
           values.first(COLLECTION - 2).each_with_index do |value, index|
-            builder.toggle(key: window.menu_key("#{key}-#{index}"), label: value.to_s[0, SHORT], appearance: :menu, checked: value == active,
+            builder.toggle(key: window.menu_key("#{key}-#{index}", key.to_sym), label: value.to_s[0, SHORT], appearance: :menu, checked: value == active,
                            on: { change: ->(event) { yield(event.payload[:value] ? value : nil) } })
           end
         end
@@ -962,7 +933,10 @@ module ElanthiaMap
         end
       when :note
         builder.group(key: 'note-panel', label: "Note: Room #{window.note_room&.id}", margin: 8) do
-          builder.textarea(key: 'note-text', value: window.note_text, rows: 5,
+          # The draft belongs to the viewer and is seeded only once per key, so
+          # each opening (room and serial) gets its own key and starts from the
+          # note as saved, never from another room's draft.
+          builder.textarea(key: "note-text-#{window.note_room&.id}-#{window.note_serial}", value: window.note_text, rows: 5,
                            on: { change: ->(event) { window.on_note_text(event.payload[:value]) } })
           builder.columns(key: 'note-buttons', count: 3, compact: true) do
             builder.button(key: 'note-save', slot: '0', label: 'Save', variant: 'primary', on: { activate: ->(_event) { window.on_note_save } })
@@ -973,20 +947,16 @@ module ElanthiaMap
       end
     end
 
-    attr_reader :find_text, :find_status, :find_focus, :note_room, :note_text
+    attr_reader :find_text, :find_status, :find_focus, :note_room, :note_text, :note_serial
 
     def refresh
       Lich::WebUI.refresh(@page) if @page
     end
 
-    def retitle(room)
-      return unless @page
-
-      @page.refresh_definition(title: title_for(room), props: { bare: true }, on: page_events)
-    end
-
-    def title_for(room)
-      room&.id ? "Map: #{Char.name} (##{room.id})" : "Map: #{Char.name}"
+    # The title is fixed when the page is registered; the page API offers no
+    # supported way to change it per room.
+    def title_for
+      "Map: #{Char.name}"
     end
 
     # ---- handlers -----------------------------------------------------------
@@ -997,7 +967,7 @@ module ElanthiaMap
     def on_setting_toggle(setting, value)
       @lock.synchronize do
         @settings[setting] = value ? true : false
-        @menu_revision += 1 if setting == :global_scale_enabled
+        bump_menu(:scale) if setting == :global_scale_enabled
       end
       settings_changed
       refresh
@@ -1042,7 +1012,7 @@ module ElanthiaMap
     def on_tag(value)
       @lock.synchronize do
         @active_tag = value
-        @menu_revision += 1
+        bump_menu(:tags) # its toggles are exclusive only here
       end
       refresh
     end
@@ -1050,7 +1020,7 @@ module ElanthiaMap
     def on_location(value)
       @lock.synchronize do
         @active_location = value
-        @menu_revision += 1
+        bump_menu(:locations)
       end
       refresh
     end
@@ -1085,6 +1055,7 @@ module ElanthiaMap
       @lock.synchronize do
         @note_room = room
         @note_text = @notes[room.id.to_s] || ''
+        @note_serial += 1
         @panel = :note
       end
       refresh
@@ -1143,28 +1114,9 @@ module ElanthiaMap
         @temp_follow_disabled = true
         @panel = nil
         @find_status = ''
-        @menu_revision += 1
+        bump_menu(:follow)
       end
       show_room(room)
-    end
-
-    # The browser reports the window's size and position as they change.
-    def on_configure(event)
-      payload = event.payload
-      width = payload[:width].to_i
-      height = payload[:height].to_i
-      position = payload[:position]
-      resized = false
-      @lock.synchronize do
-        if width > 100 && height > 100
-          resized = height != @char_settings[:window_height].to_i
-          @char_settings[:window_width] = width
-          @char_settings[:window_height] = height
-        end
-        @char_settings[:window_position] = position.first(2).map(&:to_i) if position.is_a?(Array) && position.length == 2
-      end
-      settings_changed
-      refresh if resized
     end
 
     # The scroller's live extent. Only the browser knows the viewport; the
@@ -1216,7 +1168,7 @@ module ElanthiaMap
         middle_x = (x + viewport[:width] / 2.0) / old
         middle_y = (y + viewport[:height] / 2.0) / old
         set_scale(old * (event.payload[:direction] == 'in' ? 1.1 : 0.9))
-        @menu_revision += 1
+        bump_menu(:scale)
         new = scale
         target = [[(middle_x * new - viewport[:width] / 2.0).round, 0].max, [(middle_y * new - viewport[:height] / 2.0).round, 0].max]
       end
@@ -1299,6 +1251,7 @@ module ElanthiaMap
       ]
       @fix_click = nil
       @rooms_by_sheet.clear
+      @sheet_lists.clear
       respond '[map fix: Room coordinates set.]'
       refresh
     end
@@ -1362,7 +1315,12 @@ module ElanthiaMap
     display_room = determine_display_room(script)
     window = Window.new(script, MAP_DIR)
     ElanthiaMap.current_window = window
-    window.show
+    unless window.show
+      respond '[map: the map window could not be opened (is the WebUI disabled, or the browser missing?)]'
+      window.destroy
+      ElanthiaMap.current_window = nil
+      return
+    end
 
     if display_room
       window.follow_mode = false
