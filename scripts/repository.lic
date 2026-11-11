@@ -15,6 +15,7 @@
   changelog:
     2.77 (2026-11-09):
       ;repository gui is a Lich WebUI window instead of GTK: browse, search, read comments and download
+      Keyword search filters on Enter; the table also jumps to a file name as you type in it
     2.76 (2026-10-07):
       Fix change-password saving the new password where later commands can't find it
     2.75 (2026-09-28):
@@ -898,26 +899,42 @@ module RepositoryTillmen
 
       def self.available?
         defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
-          defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+          Lich::WebUI.respond_to?(:callback_scheduler)
+      end
+
+      # The WebUI only carries valid UTF-8; server text in another or a
+      # broken encoding is converted, with bad bytes replaced.
+      def self.utf8(value)
+        text = value.to_s
+        return text if text.encoding == Encoding::UTF_8 && text.valid_encoding?
+
+        if [Encoding::UTF_8, Encoding::BINARY, Encoding::US_ASCII].include?(text.encoding)
+          text.dup.force_encoding(Encoding::UTF_8).scrub('?')
+        else
+          text.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: '?')
+        end
       end
 
       # One script from the server list, ready to show:
       # [filename, game, size, updated, author, downloads, rating total, votes, tags, comments]
-      def self.row(item)
+      # id: its place in the full list, the table row's identity across searches.
+      def self.row(item, id = 0)
         votes = item[7].to_i
+        text = item.map { |c| utf8(c) }
         {
-          file: item[0].to_s, game: item[1].to_s,
+          id: id, file: text[0], game: text[1],
           size_k: (item[2].to_f / 1024).round(1), updated: Time.at(item[3].to_i).strftime('%Y-%m-%d'),
-          author: item[4].to_s, downloads: item[5].to_i,
+          author: text[4], downloads: item[5].to_i,
           rating: votes.positive? ? (item[6].to_f / votes).floor(1) : nil, votes: votes.positive? ? votes : nil,
-          tags: item[8].to_s, comments: item[9].to_s, search: item.map { |c| c.to_s.downcase }
+          tags: text[8].to_s, comments: text[9].to_s, search: text.map(&:downcase)
         }
       end
 
       # Blocks until the window is closed, as the GTK window did.
       def initialize(repo_list)
         @owner = Script.current
-        @all = repo_list[1..].to_a.sort_by { |item| item.first.to_s.downcase }.map { |item| Setup.row(item) }
+        @all = repo_list[1..].to_a.map { |item| Setup.row(item) }.sort_by { |r| r[:file].downcase }
+        @all.each_with_index { |r, i| r[:id] = i }
         @shown = @all
         @search = ''
         @selected = nil
@@ -930,24 +947,20 @@ module RepositoryTillmen
 
       def run
         gui = self
-        @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: 'Repository Search',
-                                     props: { size: [1200, 650], bare: true, density: :compact, viewport: true },
-                                     on: { close: ->(_ev) { gui.closed } }) do |ui|
+        @page = Lich::WebUI.page(owner: @owner, id: PAGE_ID, title: 'Repository Search',
+                                 props: { size: [1200, 650], bare: true, density: :compact, viewport: true },
+                                 on: { close: ->(_ev) { gui.closed } }) do |ui|
           gui.render(ui)
         end
-        Lich::API.webui_refresh(@page)
-        Lich::API.webui_start
-        unless Lich::API.webui_open(page: @page)
+        Lich::WebUI.refresh(@page)
+        Lich::WebUI.start
+        # Owner-scoped: pending callbacks end with the window's script.
+        @scheduler = Lich::WebUI.callback_scheduler(owner: @owner)
+        unless Lich::WebUI.open(page: @page)
           echo 'error: could not open a window for the repository browser'
           return
         end
         @closed.pop
-      ensure
-        begin
-          Lich::WebUI.terminate_owner(@owner)
-        rescue StandardError
-          nil
-        end
       end
 
       def closed
@@ -971,7 +984,7 @@ module RepositoryTillmen
       end
 
       def redraw
-        Lich::API.webui_refresh(@page) if @page
+        Lich::WebUI.refresh(@page) if @page
       end
 
       # Filter on every column, as the GTK window's search did.
@@ -982,8 +995,10 @@ module RepositoryTillmen
         @selected = nil unless @shown.include?(@selected)
       end
 
+      # Rows are keyed by their place in the full list, so a key names the
+      # same script before and after a search; nil clears the selection.
       def select(key)
-        @selected = @shown[key.to_s.delete_prefix('r').to_i]
+        @selected = key && @all[key.to_s.delete_prefix('r').to_i]
       end
 
       def selected = @selected
@@ -1005,9 +1020,10 @@ module RepositoryTillmen
         @held_until = Time.now + DOWNLOAD_HOLD
         @held_link = cmd
         Script.start('repository', cmd, force: true)
-        Thread.new do
-          sleep DOWNLOAD_HOLD
-          redraw
+        gui = self
+        @scheduler.schedule(DOWNLOAD_HOLD * 1000) do
+          gui.redraw
+          false # once
         end
       end
 
@@ -1017,7 +1033,8 @@ module RepositoryTillmen
         sel = @selected
         ui.stack(key: 'repo', gap: 6, margin: 8, fill: true) do
           ui.columns(key: 'bar', count: 3, weights: [3, 2, 4], compact: true, row_align: :end, gap: 6) do
-            ui.text_input(slot: '0', key: 'search', label: 'Keyword Search', search: true, value: gui.search, change_mode: :input,
+            # Filters on Enter: a filtered re-render per keystroke is too much for the full list.
+            ui.text_input(slot: '0', key: 'search', label: 'Keyword Search (Enter)', search: true, value: gui.search,
                           placeholder: 'name, author, game, tags or comments',
                           on: { change: gui.cb { |ev| gui.set_search(ev.payload[:value]) } })
             ui.button(slot: '1', key: 'download', label: sel ? "Download #{sel[:file]}" : 'Download selected script',
@@ -1027,9 +1044,8 @@ module RepositoryTillmen
             ui.text(slot: '2', key: 'count', emphasis: :subtle, content: "#{rows.size} script(s)#{gui.search.empty? ? '' : " matching '#{gui.search}'"}")
           end
           ui.split(key: 'split', orientation: :horizontal, position: 70, fill: true) do
-            idx = sel && rows.index(sel)
             ui.table(slot: 'first', key: 'scripts', headers: true, selection: :single, fill: true, sortable: true,
-                     selected: idx ? ["r#{idx}"] : [],
+                     search_column: 'file', selected: sel ? ["r#{sel[:id]}"] : [],
                      columns: [{ key: 'file', label: 'File Name', sortable: true, expand: true },
                                { key: 'game', label: 'Game', sortable: true, width: 60 },
                                { key: 'size', label: 'Size (k)', sortable: true, width: 70, align: :end },
@@ -1039,12 +1055,12 @@ module RepositoryTillmen
                                { key: 'rating', label: 'Rating', sortable: true, width: 60, align: :end },
                                { key: 'votes', label: 'Votes', sortable: true, width: 60, align: :end },
                                { key: 'tags', label: 'Tags', sortable: true, width: 160 }],
-                     rows: rows.each_with_index.map do |r, i|
-                       { key: "r#{i}", cells: { 'file' => r[:file], 'game' => r[:game], 'size' => r[:size_k], 'updated' => r[:updated],
+                     rows: rows.map do |r|
+                       { key: "r#{r[:id]}", cells: { 'file' => r[:file], 'game' => r[:game], 'size' => r[:size_k], 'updated' => r[:updated],
                                                 'author' => r[:author], 'dls' => r[:downloads], 'rating' => r[:rating] || '',
                                                 'votes' => r[:votes] || '', 'tags' => r[:tags] } }
                      end,
-                     on: { selection_change: gui.cb { |ev| key = Array(ev.payload[:rows]).first; gui.select(key) if key } })
+                     on: { selection_change: gui.cb { |ev| gui.select(Array(ev.payload[:rows]).first) } })
             ui.group(slot: 'second', key: 'comments-box', label: 'Comments', fill: true) do
               ui.scroll(key: 'comments-scroll', fill: true) do
                 text = if sel.nil?
