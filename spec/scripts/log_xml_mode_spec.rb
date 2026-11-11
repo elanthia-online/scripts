@@ -4,34 +4,30 @@ require 'ostruct'
 require 'timeout'
 require_relative '../support/log_spec_harness'
 
-# logxml.lic is a shim: it checks that log.lic next to it is 1.3.0 or later
-# and loads it, and log.lic runs in XML mode because the script runs as
-# logxml. These examples run logxml.lic's body (everything after its =end
-# header) in the harness's Env, as Lich runs a script, with Script.current
-# named logxml. Its load of log.lic evaluates the real log.lic there too
-# (see the load stub below), so the examples run the real shim and the
-# real XML mode together, against the harness's stand-ins for Lich (see
-# spec/support/log_spec_harness.rb).
+# XML mode, as ;log --xml runs it: these examples run log.lic's body
+# (everything after its =end header, see LogSpecHarness.run_whole_script)
+# in the harness's Env, as Lich runs a script, with Script.current named
+# log and --xml first among the arguments, against the harness's stand-ins
+# for Lich (see spec/support/log_spec_harness.rb). The file was
+# logxml_spec.rb, which ran the same examples through the logxml.lic shim;
+# logxml.lic left the repository in log.lic 1.3.4 (USER-1), and a run
+# named logxml (an install's local copy of the shim loads log.lic under
+# that name) still picks XML mode, see the examples that say so.
 #
 # Nested in Env so XMLData, Script and Lich below are the ones the scripts see.
 module LogSpecHarness::Env
-  # Raised by the shim's exit in these examples (see the exit stub below).
-  # Kernel#exit raises SystemExit, which RSpec does not rescue: a shim that
-  # rejected log.lic in an example not expecting it would end the whole run
-  # there, with status 0 and "0 failures", skipping every later example.
-  class ShimExited < StandardError; end
+  # Raised by an exit from the script in these examples (see the exit stub
+  # below). Kernel#exit raises SystemExit, which RSpec does not rescue: an
+  # exit would end the whole run there, with status 0 and "0 failures",
+  # skipping every later example.
+  class ScriptExited < StandardError; end
 
-  RSpec.describe 'logxml.lic' do
+  RSpec.describe 'log.lic in XML mode (;log --xml)' do
     let(:scripts_dir) { File.expand_path('../../scripts', __dir__) }
-    let(:script_path) { File.join(scripts_dir, 'logxml.lic') }
-    let(:script_lines) { File.readlines(script_path) }
-    # First line after the =end header, 1-based, so backtraces point at logxml.lic.
-    let(:body_line) { script_lines.index { |l| l.start_with?('=end') } + 2 }
-    let(:body) { script_lines.drop(body_line - 1).join }
 
     let(:log_dir) { Dir.mktmpdir }
     let(:frozen_time) { Time.new(2026, 4, 23, 10, 0, 5) }
-    # Time.now; a Time among run_logxml's lines moves it.
+    # Time.now; a Time among run_xml's lines moves it.
     let(:clock) { [frozen_time] }
     let(:echoes) { LogSpecHarness.echoes }
     let(:default_header) { '2026-04-23 10:00am' }
@@ -40,8 +36,6 @@ module LogSpecHarness::Env
     # the 12-hour header.
     let(:default_footer) { frozen_time.strftime('%Y-%m-%d %H:%M:%S.%L %:z') }
     let(:started_echo) { "XML Logging started, currently logging to #{log_file}" }
-    # The paths logxml.lic loaded.
-    let(:loaded) { [] }
 
     around do |example|
       login_time = $login_time
@@ -57,16 +51,9 @@ module LogSpecHarness::Env
       stub_const('SCRIPT_DIR', scripts_dir)
       allow(Time).to receive(:now) { clock.first }
       $login_time = frozen_time - 3600
-      # Lich's load evaluates the file at the top level; here it is
-      # evaluated in Env, where the harness's stand-ins are.
-      paths = loaded
-      allow(LogSpecHarness::Env).to receive(:load) do |path|
-        paths << path
-        LogSpecHarness::Env.module_eval(File.read(path), path, 1)
-      end
-      # The shim's exit fails the example (ShimExited) instead of ending
-      # the run; the examples where the shim rejects log.lic expect it.
-      allow(LogSpecHarness::Env).to receive(:exit) { raise ShimExited, 'logxml.lic exited' }
+      # log.lic never exits; if it did, the example fails (ScriptExited)
+      # instead of the run ending.
+      allow(LogSpecHarness::Env).to receive(:exit) { raise ScriptExited, 'log.lic exited' }
     end
 
     after do
@@ -74,27 +61,40 @@ module LogSpecHarness::Env
     end
 
     # The Script.current of the last run.
-    def logxml_script
+    def xml_script
       LogSpecHarness.script
     end
 
-    # Runs logxml.lic once, started with +args+ (a String as typed, an Array
-    # as autostart passes its saved arguments; vars are built as lich-5 builds
-    # them, see LichScriptVars), and the given DR settings (+nil+ for none:
-    # get_settings then answers an empty OpenStruct, as lich-5's does for a
-    # GemStone character with no yaml). Ends when the fed lines run out; a
-    # Time among +lines+ moves the clock before the next line is read.
-    # +reget+ is what lich-5's reget answers: nil for an empty buffer. With
-    # +server_buffer+ (the raw lines the server sent), reget answers as
-    # lich-5's does instead, from the want_downstream_xml the script has set
-    # by then (see LogSpecHarness.reget). A block runs once the fed lines run
-    # out; then get hands out what the upstream thread pushed onto the
-    # downstream buffer, and the logger stops. +upstream+ stands in for
-    # upstream_get; the default ends the upstream thread before it reads a
-    # command. The script starts with lich-5's Script#initialize want_*
-    # defaults (lib/common/script.rb).
-    def run_logxml(args: nil, settings: nil, lines: ['<output>You see a door.</output>'], reget: nil, server_buffer: nil, upstream: -> { Thread.current.kill }, &on_stop)
-      LogSpecHarness.start_script(args, name: 'logxml')
+    # The arguments ;log --xml +args+ starts log.lic with: --xml before
+    # +args+ (a String as typed, kept as it is after "--xml ", trailing
+    # spaces too; an Array as autostart passes its saved arguments).
+    def xml_args(args)
+      case args
+      when nil then '--xml'
+      when Array then ['--xml', *args]
+      else "--xml #{args}"
+      end
+    end
+
+    # Runs log.lic once, as ;log --xml +args+ (see xml_args; vars are built
+    # as lich-5 builds them, see LichScriptVars), under the script name
+    # +name+, and the given DR settings (+nil+ for none: get_settings then
+    # answers an empty OpenStruct, as lich-5's does for a GemStone character
+    # with no yaml). With +name+ 'logxml', +args+ are passed as they are,
+    # with no --xml, as an install's local logxml.lic starts log.lic. Ends
+    # when the fed lines run out; a Time among +lines+ moves the clock
+    # before the next line is read. +reget+ is what lich-5's reget answers:
+    # nil for an empty buffer. With +server_buffer+ (the raw lines the
+    # server sent), reget answers as lich-5's does instead, from the
+    # want_downstream_xml the script has set by then (see
+    # LogSpecHarness.reget). A block runs once the fed lines run out; then
+    # get hands out what the upstream thread pushed onto the downstream
+    # buffer, and the logger stops. +upstream+ stands in for upstream_get;
+    # the default ends the upstream thread before it reads a command. The
+    # script starts with lich-5's Script#initialize want_* defaults
+    # (lib/common/script.rb).
+    def run_xml(args: nil, name: 'log', settings: nil, lines: ['<output>You see a door.</output>'], reget: nil, server_buffer: nil, upstream: -> { Thread.current.kill }, &on_stop)
+      LogSpecHarness.start_script(name == 'log' ? xml_args(args) : args, name: name)
       LogSpecHarness.settings = settings || OpenStruct.new
       if server_buffer
         LogSpecHarness.server_buffer = server_buffer
@@ -103,7 +103,7 @@ module LogSpecHarness::Env
       end
       feed_lines(lines, &on_stop)
       allow(LogSpecHarness).to receive(:upstream_get) { upstream.call }
-      run_body
+      Timeout.timeout(5) { LogSpecHarness.run_whole_script }
     end
 
     # Makes get hand out +lines+ (a Time among them moves the clock), then
@@ -125,11 +125,6 @@ module LogSpecHarness::Env
       end
     end
 
-    # Runs logxml.lic's body as Lich runs the script.
-    def run_body
-      Timeout.timeout(5) { LogSpecHarness::Env.module_eval(body, script_path, body_line) }
-    end
-
     def log_file
       Dir.glob(File.join(log_dir, '**', '*.xml')).first
     end
@@ -148,7 +143,7 @@ module LogSpecHarness::Env
     context 'when the yaml enables timestamps without a usable format' do
       { 'no format' => nil, 'an empty format' => '', 'a non-String format' => 5 }.each do |label, format|
         it "stamps with %F %T %Z and says so for #{label} (#{format.inspect})" do
-          run_logxml(settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: format))
+          run_xml(settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: format))
 
           expect(log_lines).to eq([fallback_stamp, "#{fallback_stamp}: <output>You see a door.</output>", fallback_stamp])
           expect(echoes).to eq(
@@ -161,7 +156,7 @@ module LogSpecHarness::Env
       end
 
       it 'uses a --timestamp=FMT without a message' do
-        run_logxml(args: '--timestamp=%H:%M', settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
+        run_xml(args: '--timestamp=%H:%M', settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
 
         expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
         expect(echoes).to eq([started_echo])
@@ -169,14 +164,14 @@ module LogSpecHarness::Env
     end
 
     it 'uses the yaml format when it is a format' do
-      run_logxml(settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
+      run_xml(settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
       expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
       expect(echoes).to eq([started_echo])
     end
 
     it 'stays off when the yaml turns timestamps off, whatever the format' do
-      run_logxml(settings: OpenStruct.new(log_timestamp: false, log_timestamp_format: nil))
+      run_xml(settings: OpenStruct.new(log_timestamp: false, log_timestamp_format: nil))
 
       expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
       expect(echoes).to eq([started_echo])
@@ -184,7 +179,7 @@ module LogSpecHarness::Env
 
     context 'with an empty --timestamp=' do
       it 'logs without timestamps and says the option was ignored' do
-        run_logxml(args: '--timestamp=')
+        run_xml(args: '--timestamp=')
 
         expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
         expect(echoes).to eq(
@@ -196,20 +191,20 @@ module LogSpecHarness::Env
       end
 
       it 'treats --timestamp="" in vars[0] the same way' do
-        run_logxml(args: '--timestamp=""')
+        run_xml(args: '--timestamp=""')
 
         expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
         expect(echoes.first).to start_with('timestamp was given without a format')
       end
 
       it 'keeps the yaml format when the yaml enables timestamps' do
-        run_logxml(args: '--timestamp=', settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
+        run_xml(args: '--timestamp=', settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
         expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
       end
     end
 
-    # R-05, R-19, R-34 (logxml copy): the Lich id comes only from the map's
+    # R-05, R-19, R-34 (in XML mode): the Lich id comes only from the map's
     # UID table, never from Map.current, which matches the room from the
     # logger's thread (LOCATION/PEER, a cleared buffer) and echoes
     # "no map database found" with no map.
@@ -233,7 +228,7 @@ module LogSpecHarness::Env
       end
 
       def logged_lines(args: '--rnum', line: title_line)
-        run_logxml(args: args, lines: [line, '<output>You see a door.</output>'])
+        run_xml(args: args, lines: [line, '<output>You see a door.</output>'])
         expect(log_lines.last).to eq(default_footer)
         log_lines[1..-2]
       end
@@ -349,20 +344,20 @@ module LogSpecHarness::Env
       it 'reads --rnum after another option' do
         uid_table[uid] = [228]
 
-        run_logxml(args: '--timestamp=%T --rnum', lines: [title_line])
+        run_xml(args: '--timestamp=%T --rnum', lines: [title_line])
 
         expect(log_lines).to eq(
           ['10:00:05', '10:00:05: <resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015)', '10:00:05']
         )
       end
 
-      # ;autostart add --global logxml --timestamp=\"%F %T %Z\" --rnum (the
-      # header's example) is saved as these words; lich-5 joins them into
-      # vars[0].
+      # ;autostart add --global log --xml --timestamp=\"%F %T %Z\" --rnum (the
+      # header's autostart example, with --xml) is saved as these words;
+      # lich-5 joins them into vars[0].
       it "reads the header's autostart example on the autostart Array path" do
         uid_table[uid] = [228]
 
-        run_logxml(args: ['--timestamp="%F', '%T', '%Z"', '--rnum'], lines: [title_line])
+        run_xml(args: ['--timestamp="%F', '%T', '%Z"', '--rnum'], lines: [title_line])
 
         expect(log_lines).to eq(
           [
@@ -438,15 +433,15 @@ module LogSpecHarness::Env
       end
     end
 
-    # The contract the ;log --xml shim must keep. lich-5 hands the XML lines
+    # The contract ;log --xml must keep. lich-5 hands the XML lines
     # to a script that wants the XML downstream, and adds the text lines to
     # the same buffer when it wants the text downstream too, or another
     # script's output when it wants that; typed commands reach upstream_get
     # only with want_upstream.
     it 'asks for the XML downstream and typed commands, and not the text downstream or script output' do
-      run_logxml
+      run_xml
 
-      expect(logxml_script.to_h.slice(:want_downstream, :want_downstream_xml, :want_script_output, :want_upstream)).to eq(
+      expect(xml_script.to_h.slice(:want_downstream, :want_downstream_xml, :want_script_output, :want_upstream)).to eq(
         want_downstream: false, want_downstream_xml: true, want_script_output: false, want_upstream: true
       )
     end
@@ -454,7 +449,7 @@ module LogSpecHarness::Env
     it 'keeps pushStream and popStream lines when started with streams' do
       stream_lines = ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>']
 
-      run_logxml(args: 'streams', lines: stream_lines)
+      run_xml(args: 'streams', lines: stream_lines)
 
       expect(log_lines).to eq([default_header, *stream_lines, default_footer])
     end
@@ -463,7 +458,7 @@ module LogSpecHarness::Env
     # R-06: without streams, an inventory stream is left out whole, the
     # lines inside it too (log.lic 1.3.2).
     it 'leaves out stream content when no argument is the word streams' do
-      run_logxml(args: 'nostreams', lines: ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>', '<output>after</output>'])
+      run_xml(args: 'nostreams', lines: ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>', '<output>after</output>'])
 
       expect(log_lines).to eq([default_header, '<output>after</output>', default_footer])
     end
@@ -482,7 +477,7 @@ module LogSpecHarness::Env
         'a closing dialogData tag' => '</dialogData>'
       }.each do |label, tag_line|
         it "logs #{label} with the lines around it" do
-          run_logxml(lines: ['<output>before</output>', tag_line, '<output>after</output>'])
+          run_xml(lines: ['<output>before</output>', tag_line, '<output>after</output>'])
 
           expect(log_lines).to eq([default_header, '<output>before</output>', tag_line, '<output>after</output>', default_footer])
         end
@@ -494,7 +489,7 @@ module LogSpecHarness::Env
     # out from its pushStream on (logxml 0.6.6 kept the whole line, as it
     # did not start with the tag) and the tags before it are kept.
     it 'keeps the tags before an inventory pushStream later in the line, without streams' do
-      run_logxml(lines: ["<clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:"])
+      run_xml(lines: ["<clearStream id='inv' ifClosed=''/><pushStream id='inv'/>Your worn items are:"])
 
       expect(log_lines).to eq([default_header, "<clearStream id='inv' ifClosed=''/>", default_footer])
     end
@@ -504,7 +499,7 @@ module LogSpecHarness::Env
     # a popStream ends nothing and the whole line is kept. (Made-up line;
     # lich-5 chomps only the end.)
     it 'keeps a line with a popStream after a line break in it when no stream span is open, without streams' do
-      run_logxml(lines: ['<output>before</output>', "<output>a torch</output>\n<popStream/>", '<output>after</output>'])
+      run_xml(lines: ['<output>before</output>', "<output>a torch</output>\n<popStream/>", '<output>after</output>'])
 
       expect(log_lines).to eq([default_header, '<output>before</output>', '<output>a torch</output>', '<popStream/>', '<output>after</output>', default_footer])
     end
@@ -514,7 +509,7 @@ module LogSpecHarness::Env
     it 'writes game lines as they come, leading spaces included' do
       lines = ['  1d100: 20 + Modifiers: 372 == 392', '   ... 60 points of damage!']
 
-      run_logxml(lines: lines)
+      run_xml(lines: lines)
 
       expect(log_lines).to eq([default_header, *lines, default_footer])
     end
@@ -524,7 +519,7 @@ module LogSpecHarness::Env
     # spec/fixtures/streams/gs_saga_hunt.xml, 41 in dr_saga_hunt.xml) arrive
     # as "", and stay in the log.
     it 'writes a blank game line as a blank line' do
-      run_logxml(lines: ['<output>line 1</output>', '', '<output>line 2</output>'])
+      run_xml(lines: ['<output>line 1</output>', '', '<output>line 2</output>'])
 
       expect(log_lines).to eq([default_header, '<output>line 1</output>', '', '<output>line 2</output>', default_footer])
     end
@@ -533,8 +528,8 @@ module LogSpecHarness::Env
       typed = ['<c>look']
       upstream = -> { typed.empty? ? Thread.current.kill : typed.shift }
 
-      run_logxml(args: '--timestamp=%T', upstream: upstream) do
-        Timeout.timeout(2) { sleep 0.01 while logxml_script.downstream_buffer.empty? }
+      run_xml(args: '--timestamp=%T', upstream: upstream) do
+        Timeout.timeout(2) { sleep 0.01 while xml_script.downstream_buffer.empty? }
       end
 
       expect(log_lines).to eq(
@@ -545,23 +540,28 @@ module LogSpecHarness::Env
     it 'has each line in the file while the logger waits for the next one' do
       on_disk = nil
 
-      run_logxml(lines: ['<output>line 1</output>']) { on_disk = File.read(log_file) }
+      run_xml(lines: ['<output>line 1</output>']) { on_disk = File.read(log_file) }
 
       expect(on_disk.lines(chomp: true)).to eq([default_header, '<output>line 1</output>'])
     end
 
     it 'hides itself once' do
-      run_logxml
+      run_xml
 
       expect(LogSpecHarness.hide_me_calls).to eq(1)
     end
 
-    # lich-5 gives a script started without arguments an empty vars, so
-    # vars[1..] is nil (N35 in log_spec.rb).
-    it 'logs with no options when started without arguments (vars is empty)' do
-      run_logxml(args: '')
+    # USER-1: logxml.lic left the repository in log.lic 1.3.4, but neither
+    # lich5-update nor the repository deletes a local file, so an install
+    # keeps its logxml.lic; 0.7.x loads log.lic under the name logxml, with
+    # the arguments ;logxml was started with. lich-5 gives a script started
+    # without arguments an empty vars, so vars[1..] is nil (N35 in
+    # log_spec.rb).
+    it 'logs XML with no options when run under the name logxml without arguments (vars is empty), as a local logxml.lic runs it' do
+      run_xml(args: '', name: 'logxml')
 
-      expect(logxml_script.vars).to eq([])
+      expect(xml_script.vars).to eq([])
+      expect(Dir.glob(File.join(log_dir, '**', '*.log'))).to eq([])
       expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
       expect(echoes).to eq([started_echo])
     end
@@ -570,7 +570,7 @@ module LogSpecHarness::Env
     it 'writes the header hour before 10 without a leading zero' do
       clock[0] = Time.new(2026, 4, 23, 9, 5, 0)
 
-      run_logxml
+      run_xml
 
       expect(log_lines).to eq(['2026-04-23 9:05am', '<output>You see a door.</output>', clock[0].strftime('%Y-%m-%d %H:%M:%S.%L %:z')])
     end
@@ -592,7 +592,7 @@ module LogSpecHarness::Env
           "Your <a exist=\"781927405\" noun=\"disk\">disk</a> arrives, following you dutifully.\r"
         ]
 
-        run_logxml(server_buffer: server_lines)
+        run_xml(server_buffer: server_lines)
 
         expect(log_lines.first(7)).to eq([default_header, *server_lines.map(&:chomp), marker])
       end
@@ -600,7 +600,7 @@ module LogSpecHarness::Env
       # R-14: lich-5's reget returns nil for an empty buffer; puts(nil)
       # wrote a blank line before the marker.
       it 'writes no blank line when reget returns nil' do
-        run_logxml(reget: nil)
+        run_xml(reget: nil)
 
         expect(log_lines.first(3)).to eq([default_header, marker, '<output>You see a door.</output>'])
       end
@@ -608,7 +608,7 @@ module LogSpecHarness::Env
       # The reget is written as the server sent it: the per-line stamp is for
       # lines read while logging, not for lines from before the logger started.
       it 'writes the reget without timestamps when timestamps are on' do
-        run_logxml(args: '--timestamp=%T', reget: ["<output>Before the logger.</output>\r"])
+        run_xml(args: '--timestamp=%T', reget: ["<output>Before the logger.</output>\r"])
 
         expect(log_lines).to eq(
           ['10:00:05', '<output>Before the logger.</output>', marker, '10:00:05: <output>You see a door.</output>', '10:00:05']
@@ -617,7 +617,7 @@ module LogSpecHarness::Env
 
       # R-15: reget lines keep the server's "\r" (CRLF line ends).
       it 'writes the raw reget lines without their trailing carriage return' do
-        run_logxml(reget: ["<pushStream id=\"room\"/>Room text\r", "<prompt time=\"1\">&gt;</prompt>\r"])
+        run_xml(reget: ["<pushStream id=\"room\"/>Room text\r", "<prompt time=\"1\">&gt;</prompt>\r"])
 
         expect(File.binread(log_file)).not_to include("\r")
         expect(log_lines.first(4)).to eq(
@@ -633,7 +633,7 @@ module LogSpecHarness::Env
       it 'writes the reget and the marker when the logger starts 29.9 seconds after login' do
         $login_time = frozen_time - 29.9
 
-        run_logxml(reget: ["<output>Before the logger.</output>\r"])
+        run_xml(reget: ["<output>Before the logger.</output>\r"])
 
         expect(log_lines).to eq(
           [default_header, '<output>Before the logger.</output>', marker, '<output>You see a door.</output>', default_footer]
@@ -643,7 +643,7 @@ module LogSpecHarness::Env
       it 'writes neither the reget nor the marker when the logger starts 30 seconds after login' do
         $login_time = frozen_time - 30
 
-        run_logxml(reget: ["<output>Before the logger.</output>\r"])
+        run_xml(reget: ["<output>Before the logger.</output>\r"])
 
         expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
       end
@@ -658,7 +658,7 @@ module LogSpecHarness::Env
       it 'writes the log under LOG_DIR in the <game>-<name>/<year>/<month> layout' do
         stub_const('LOG_DIR', logs_dir)
 
-        run_logxml
+        run_xml
 
         expect(Dir.glob(File.join(logs_dir, '**', '*.xml'))).to eq(
           [File.join(logs_dir, 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml')]
@@ -668,12 +668,12 @@ module LogSpecHarness::Env
     end
 
     it 'writes under LICH_DIR/logs when LOG_DIR is not defined or empty' do
-      run_logxml
+      run_xml
       expect(log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml'))
 
       FileUtils.rm_rf(File.join(log_dir, 'logs'))
       stub_const('LOG_DIR', '')
-      run_logxml
+      run_xml
       expect(log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml'))
     end
 
@@ -684,7 +684,7 @@ module LogSpecHarness::Env
       let(:next_day) { Time.new(2026, 4, 24, 0, 0, 1) }
 
       it "logs the first line after midnight in the new day's file" do
-        run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>'])
+        run_xml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>'])
 
         root = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
         next_day_footer = next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')
@@ -697,7 +697,7 @@ module LogSpecHarness::Env
       end
 
       it 'counts only written lines toward the 30000, not skipped stream lines' do
-        run_logxml(lines: ['<pushStream id="inv"/>', '<popStream/>', *Array.new(30_001) { |n| "<output>#{n + 1}</output>" }])
+        run_xml(lines: ['<pushStream id="inv"/>', '<popStream/>', *Array.new(30_001) { |n| "<output>#{n + 1}</output>" }])
 
         # R-25: the clock is frozen, so the second file gets an _01 suffix.
         month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
@@ -713,7 +713,7 @@ module LogSpecHarness::Env
       # first one came after midnight it went to the new day's file and the
       # waiting file kept only its header and footer, under the old day.
       it 'opens the file after a full one only when its first line comes, also past midnight' do
-        run_logxml(lines: [*Array.new(30_000) { |n| "<output>#{n + 1}</output>" }, next_day, '<output>next day</output>'])
+        run_xml(lines: [*Array.new(30_000) { |n| "<output>#{n + 1}</output>" }, next_day, '<output>next day</output>'])
 
         month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
         expect(Dir.children(month).sort).to eq(['2026-04-23_10-00-05.xml', '2026-04-24_00-00-01.xml'])
@@ -729,7 +729,7 @@ module LogSpecHarness::Env
         File.write(File.join(month, '2026-04-24_00-00-01.xml'), "other logger\n")
         File.write(File.join(month, '2026-04-24_00-00-01_01.xml'), "other logger\n")
 
-        run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>'])
+        run_xml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>'])
 
         expect(File.read(File.join(month, '2026-04-24_00-00-01_02.xml')).lines(chomp: true)).to eq(
           ['2026-04-24 12:00am', '<output>line 2</output>', next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')]
@@ -742,7 +742,7 @@ module LogSpecHarness::Env
         FileUtils.mkdir_p(month)
         File.write(File.join(month, '2026-04-23_10-00-05.xml'), "earlier run\n")
 
-        run_logxml
+        run_xml
 
         expect(Dir.children(month)).to eq(['2026-04-23_10-00-05.xml'])
         expect(log_lines).to eq(['earlier run', default_header, '<output>You see a door.</output>', default_footer])
@@ -752,7 +752,7 @@ module LogSpecHarness::Env
     # R-23: the footer was written only when a new file started.
     context 'when the logger stops' do
       it 'ends the file with the footer once, after the last line' do
-        run_logxml(lines: ['<output>line 1</output>'])
+        run_xml(lines: ['<output>line 1</output>'])
 
         expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
       end
@@ -764,7 +764,7 @@ module LogSpecHarness::Env
           original.call(*args, &block).tap { |file| opened << file if file.is_a?(File) }
         end
 
-        run_logxml(lines: []) do
+        run_xml(lines: []) do
           allow(opened.first).to receive(:puts).and_raise(Errno::ENOSPC)
         end
 
@@ -773,15 +773,15 @@ module LogSpecHarness::Env
         expect(opened.first).to be_closed
         expect(log_lines).to eq([default_header])
         expect(lich_log).to eq(
-          ["logxml: the footer of #{log_file} was not written while the logger stopped (Errno::ENOSPC: No space left on device)"]
+          ["log: the footer of #{log_file} was not written while the logger stopped (Errno::ENOSPC: No space left on device)"]
         )
       end
 
       # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
-      it 'writes the footer when the thread is killed, as ;kill logxml does' do
+      it 'writes the footer when the thread is killed, as ;kill log does' do
         waiting = Thread::Queue.new
         logger = Thread.new do
-          run_logxml(lines: ['<output>line 1</output>']) do
+          run_xml(lines: ['<output>line 1</output>']) do
             waiting << true
             sleep # get waits for the next line until ;kill
           end
@@ -816,7 +816,7 @@ module LogSpecHarness::Env
           end
         end
 
-        expect { run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>']) }
+        expect { run_xml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>']) }
           .to raise_error(Errno::EIO)
 
         expect(opened.size).to eq(1)
@@ -842,10 +842,10 @@ module LogSpecHarness::Env
           end
         end
 
-        expect { run_logxml(lines: ['<output>line 1</output>']) }.not_to raise_error
+        expect { run_xml(lines: ['<output>line 1</output>']) }.not_to raise_error
 
         expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
-        expect(lich_log).to eq(["logxml: closing the log file #{log_file} failed (IOError: device gone); lines are written as they come, with sync on, but the file may be missing its footer or a last write"])
+        expect(lich_log).to eq(["log: closing the log file #{log_file} failed (IOError: device gone); lines are written as they come, with sync on, but the file may be missing its footer or a last write"])
       end
     end
 
@@ -865,7 +865,7 @@ module LogSpecHarness::Env
 
       # Waits until the upstream thread has pushed the command and its notice.
       def wait_for_upstream_stop
-        Timeout.timeout(2) { sleep 0.01 until logxml_script.downstream_buffer.size >= 2 }
+        Timeout.timeout(2) { sleep 0.01 until xml_script.downstream_buffer.size >= 2 }
       end
 
       # "file:line" of where +error+ was raised, without the directory.
@@ -876,82 +876,108 @@ module LogSpecHarness::Env
 
       # The notice line as written for an error that reads +reason+.
       def notice_for(reason)
-        "<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (#{reason}) -->"
+        "<!-- log: typed commands are not logged after this line; the upstream thread stopped (#{reason}) -->"
       end
 
       it 'echoes the error, where it was raised and how to log typed commands again' do
         error = RuntimeError.new('boom')
 
-        run_logxml(lines: [], upstream: type_then_fail(error)) { wait_for_upstream_stop }
+        run_xml(lines: [], upstream: type_then_fail(error)) { wait_for_upstream_stop }
 
         expect(echoes.grep(/\Atyped commands/)).to eq(
           [
             "typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at #{raised_at(error)}. " \
-            'Game lines are still logged; restart the logger (;kill logxml, then ;logxml) to log typed commands again.'
+            'Game lines are still logged; restart the logger (;kill log, then ;log --xml) to log typed commands again.'
           ]
         )
-        expect(raised_at(error)).to match(/\Alogxml_spec\.rb:\d+\z/)
+        expect(raised_at(error)).to match(/\Alog_xml_mode_spec\.rb:\d+\z/)
       end
 
       # The directory (C:/Users/<name>/...) only makes the echo longer.
       it 'gives the file and line it was raised at without the directory' do
         error = RuntimeError.new('boom')
-        error.set_backtrace(["C:/Users/someone/Lich5/scripts/logxml.lic:142:in 'block in <main>'"])
+        error.set_backtrace(["C:/Users/someone/Lich5/scripts/log.lic:142:in 'block in <main>'"])
         raise_it = lambda do
-          logxml_script.downstream_buffer << 'first'
+          xml_script.downstream_buffer << 'first'
           raise error
         end
 
-        run_logxml(lines: [], upstream: raise_it) { wait_for_upstream_stop }
+        run_xml(lines: [], upstream: raise_it) { wait_for_upstream_stop }
 
         expect(echoes.grep(/\Atyped commands/).first)
-          .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at logxml.lic:142. ')
+          .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at log.lic:142. ')
         expect(echoes.join).not_to include('someone')
       end
 
       # Restarting without them would drop --timestamp, --rnum or streams.
       it 'gives the restart with the arguments the logger was started with' do
-        run_logxml(args: 'streams --timestamp=%H:%M', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+        run_xml(args: 'streams --timestamp=%H:%M', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
 
         expect(echoes.grep(/\Atyped commands/).first)
-          .to end_with('restart the logger (;kill logxml, then ;logxml streams --timestamp=%H:%M) to log typed commands again.')
+          .to end_with('restart the logger (;kill log, then ;log --xml streams --timestamp=%H:%M) to log typed commands again.')
       end
 
-      # Without the strip, the hint would read ";logxml " with a trailing space.
-      it 'gives the restart without arguments when vars[0] is only whitespace' do
-        run_logxml(args: '  ', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+      # Without the strip, the hint would read ";log --xml   " with trailing spaces.
+      it 'gives the restart without the spaces vars[0] ends in' do
+        run_xml(args: '  ', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
 
-        expect(echoes.grep(/\Atyped commands/).first).to end_with('(;kill logxml, then ;logxml) to log typed commands again.')
+        expect(echoes.grep(/\Atyped commands/).first).to end_with('(;kill log, then ;log --xml) to log typed commands again.')
+      end
+
+      # TEXT AND XML TOGETHER: ;log, then ;force log --xml. Both run as log,
+      # so ;kill log stops the one started first (the text log), and
+      # ;log --xml without ;force is refused while the other one runs.
+      it 'stops both and starts both again in order when the text log started first' do
+        LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: true, before: true)]
+
+        run_xml(args: 'streams', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+        expect(echoes.grep(/\Atyped commands/).first).to end_with(
+          'restart the logger (;kill log twice, one at a time, then ;log, then ;force log --xml streams; ' \
+          ';kill log stops the log started before this one first, so this stops both and starts them again in that order) ' \
+          'to log typed commands again.'
+        )
+      end
+
+      it 'restarts with one ;kill and ;force when the XML log started first' do
+        LogSpecHarness.other_scripts = [OpenStruct.new(name: 'log', hidden: true)]
+
+        run_xml(args: 'streams', lines: [], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+
+        expect(echoes.grep(/\Atyped commands/).first).to end_with(
+          'restart the logger (;kill log, then ;force log --xml streams; another log is running too, and ;kill log stops the one started first, ' \
+          'which is this one) to log typed commands again.'
+        )
       end
 
       it 'gives the frame as is when it has no "path:line" start' do
         error = RuntimeError.new('boom')
         error.set_backtrace(['<internal:kernel>'])
 
-        run_logxml(lines: [], upstream: type_then_fail(error)) { wait_for_upstream_stop }
+        run_xml(lines: [], upstream: type_then_fail(error)) { wait_for_upstream_stop }
 
         expect(echoes.grep(/\Atyped commands/).first)
           .to start_with('typed commands are no longer logged: the upstream thread stopped on RuntimeError: boom at <internal:kernel>. ')
       end
 
       it 'writes a notice line into the log file saying typed commands are not logged after it, and keeps logging game lines' do
-        run_logxml(lines: ['<output>line 1</output>'], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
+        run_xml(lines: ['<output>line 1</output>'], upstream: type_then_fail(RuntimeError.new('boom'))) { wait_for_upstream_stop }
 
         expect(log_lines).to eq(
           [
             default_header,
             '<output>line 1</output>',
             '<!-- CLIENT --><c>look<!-- ENDCLIENT -->',
-            '<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (RuntimeError: boom) -->',
+            '<!-- log: typed commands are not logged after this line; the upstream thread stopped (RuntimeError: boom) -->',
             default_footer
           ]
         )
       end
 
       it 'puts a message over several lines on one line, and breaks up "--" so the comment is not closed early' do
-        run_logxml(lines: [], upstream: type_then_fail(IOError.new("closed stream\n--> see above"))) { wait_for_upstream_stop }
+        run_xml(lines: [], upstream: type_then_fail(IOError.new("closed stream\n--> see above"))) { wait_for_upstream_stop }
 
-        expect(log_lines[-2]).to eq('<!-- logxml: typed commands are not logged after this line; the upstream thread stopped (IOError: closed stream - -> see above) -->')
+        expect(log_lines[-2]).to eq('<!-- log: typed commands are not logged after this line; the upstream thread stopped (IOError: closed stream - -> see above) -->')
         expect(echoes.grep(/\Atyped commands/).first)
           .to start_with('typed commands are no longer logged: the upstream thread stopped on IOError: closed stream --> see above at ')
       end
@@ -964,7 +990,7 @@ module LogSpecHarness::Env
         'ends in dashes --' => 'ends in dashes - -'
       }.each do |message, spaced|
         it "spaces out every dash run in #{message.inspect} so the comment holds no \"--\"" do
-          run_logxml(lines: [], upstream: type_then_fail(IOError.new(message))) { wait_for_upstream_stop }
+          run_xml(lines: [], upstream: type_then_fail(IOError.new(message))) { wait_for_upstream_stop }
 
           expect(log_lines[-2]).to eq(notice_for("IOError: #{spaced}"))
           body = log_lines[-2].delete_prefix('<!--').delete_suffix('-->')
@@ -974,15 +1000,15 @@ module LogSpecHarness::Env
       end
 
       it 'drops the whitespace around the message' do
-        run_logxml(lines: [], upstream: type_then_fail(RuntimeError.new(" \tboom\n"))) { wait_for_upstream_stop }
+        run_xml(lines: [], upstream: type_then_fail(RuntimeError.new(" \tboom\n"))) { wait_for_upstream_stop }
 
         expect(log_lines[-2]).to eq(notice_for('RuntimeError: boom'))
       end
 
       # lich-5 stops a script by Thread#kill on its threads (script.rb kill);
       # the default upstream stand-in ends the thread that way.
-      it 'says nothing and leaves no line when the thread is killed, as ;kill logxml does' do
-        run_logxml(lines: ['<output>line 1</output>']) { sleep 0.05 }
+      it 'says nothing and leaves no line when the thread is killed, as ;kill log does' do
+        run_xml(lines: ['<output>line 1</output>']) { sleep 0.05 }
 
         expect(echoes).to eq([started_echo])
         expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
@@ -1010,7 +1036,7 @@ module LogSpecHarness::Env
           end
         end
 
-        expect { run_logxml }.to raise_error(Errno::ENOSPC)
+        expect { run_xml }.to raise_error(Errno::ENOSPC)
 
         expect(opened.size).to eq(1)
         expect(opened.first).to be_closed
@@ -1019,154 +1045,15 @@ module LogSpecHarness::Env
     end
 
     it 'keeps a comma in a quoted --timestamp format' do
-      run_logxml(args: '--timestamp="%b %d, %H:%M"')
+      run_xml(args: '--timestamp="%b %d, %H:%M"')
 
       expect(log_lines).to eq(['Apr 23, 10:00', 'Apr 23, 10:00: <output>You see a door.</output>', 'Apr 23, 10:00'])
     end
 
-    # R-10, Q-02: Lich updates log.lic and logxml.lic one file at a time
-    # (lich5-update, repository), so logxml.lic can run next to an older
-    # log.lic, which would log text under ;logxml, or with no log.lic at all.
-    # log.lic starts logging as soon as it is loaded, so its version is read
-    # from its header before it is loaded.
-    describe 'checking log.lic before loading it' do
-      let(:stub_dir) { Dir.mktmpdir }
-      let(:stub_log) { File.join(stub_dir, 'log.lic') }
-
-      before do
-        stub_const('SCRIPT_DIR', stub_dir)
-        paths = loaded
-        allow(LogSpecHarness::Env).to receive(:load) { |path| paths << path }
-      end
-
-      after { FileUtils.rm_rf(stub_dir) }
-
-      # A log.lic with +version_line+ in its header, as the real header has it.
-      def write_log_lic(version_line)
-        File.write(stub_log, <<~LIC)
-          # frozen_string_literal: true
-
-          =begin
-
-            logs the game
-
-                 author: elanthia-online
-          #{version_line}
-               required: Lich >= 5.14.0
-          =end
-
-          GameLogger.main
-        LIC
-      end
-
-      def run_shim
-        LogSpecHarness.start_script('--rnum', name: 'logxml')
-        run_body
-      end
-
-      def upgrade_message(problem)
-        "logxml runs log.lic in XML mode, which needs log.lic 1.3.0 or later, but #{problem}. " \
-          'Nothing is logged: update log.lic (;lich5-update --script=log.lic), then start ;logxml again.'
-      end
-
-      {
-        'an older log.lic (1.2.8, from before XML mode)' => ['      version: 1.2.8', 'is version 1.2.8'],
-        'a log.lic one patch short of 1.3.0 (1.2.99)'    => ['      version: 1.2.99', 'is version 1.2.99'],
-        'a pre-release of 1.3.0'                         => ['      version: 1.3.0.pre', 'is version 1.3.0.pre'],
-        'a version that is not a version'                => ['      version: one', 'is version one'],
-        'a log.lic with no version line'                 => ['  (no version)', 'has no version in its header'],
-        'a version line at the start of a line'          => ['version: 1.3.0', 'has no version in its header']
-      }.each do |label, (version_line, problem)|
-        it "says to update log.lic, logs nothing and does not load it, for #{label}" do
-          write_log_lic(version_line)
-
-          expect { run_shim }.to raise_error(ShimExited)
-
-          expect(echoes).to eq([upgrade_message("#{stub_log} #{problem}")])
-          expect(loaded).to eq([])
-          expect(Dir.exist?(File.join(log_dir, 'logs'))).to be(false)
-        end
-      end
-
-      it 'says log.lic was not found, logs nothing and loads nothing, when there is no log.lic' do
-        expect { run_shim }.to raise_error(ShimExited)
-
-        expect(echoes).to eq([upgrade_message("#{stub_log} was not found")])
-        expect(loaded).to eq([])
-      end
-
-      it 'says log.lic was not found when log.lic is a folder' do
-        Dir.mkdir(stub_log)
-
-        expect { run_shim }.to raise_error(ShimExited)
-
-        expect(echoes).to eq([upgrade_message("#{stub_log} was not found")])
-        expect(loaded).to eq([])
-      end
-
-      it 'says log.lic could not be read, and why, when reading it fails' do
-        write_log_lic('      version: 1.3.0')
-        allow(File).to receive(:binread).and_call_original
-        error = Errno::EACCES.new(stub_log)
-        allow(File).to receive(:binread).with(stub_log, 20_000).and_raise(error)
-
-        expect { run_shim }.to raise_error(ShimExited)
-
-        expect(echoes).to eq([upgrade_message("#{stub_log} could not be read (Errno::EACCES: #{error.message})")])
-        expect(loaded).to eq([])
-      end
-
-      # Gem::Version compares each number: as Strings, "1.10.0" < "1.3.0".
-      ['1.3.0', '1.3.1', '1.10.0', '2.0'].each do |version|
-        it "loads log.lic #{version} once, with nothing said" do
-          write_log_lic("      version: #{version}")
-
-          run_shim
-
-          expect(loaded).to eq([stub_log])
-          expect(echoes).to eq([])
-        end
-      end
-
-      it 'reads the version in the header, not a version: line later in the file' do
-        write_log_lic('      version: 1.2.8')
-        File.write(stub_log, "#{File.read(stub_log)}\n#   version: 9.9.9\n")
-
-        expect { run_shim }.to raise_error(ShimExited)
-
-        expect(echoes).to eq([upgrade_message("#{stub_log} is version 1.2.8")])
-      end
-    end
-
-    it 'loads the log.lic next to it once, which logs XML because it runs as logxml' do
-      run_logxml(args: '--timestamp=%H:%M')
-
-      expect(loaded).to eq([File.join(scripts_dir, 'log.lic')])
-      expect(Dir.glob(File.join(log_dir, '**', '*.log'))).to eq([])
-      expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
-      expect(echoes).to eq([started_echo])
-    end
-
-    it "accepts the log.lic next to it: log.lic's header version is 1.3.0 or later" do
-      version = File.read(File.join(scripts_dir, 'log.lic'))[/^[ \t]+version:[ \t]*(\S+)/, 1]
-
-      expect(Gem::Version.new(version)).to be >= Gem::Version.new('1.3.0')
-    end
-
-    # The Lich repository holds a script whose required: Lich version is
-    # newer than the running Lich; the shim and the log.lic it loads are held
-    # or updated together only when they say the same.
-    it 'carries the same required: line as log.lic' do
-      required = ->(file) { File.readlines(File.join(scripts_dir, file)).grep(/^\s+required:/) }
-
-      expect(required.call('logxml.lic')).to eq(required.call('log.lic'))
-      expect(required.call('logxml.lic').size).to eq(1)
-    end
-
-    # Q-08: the options log.lic has and logxml 0.6.6 lacked.
-    context 'with the options it gets from log.lic' do
+    # Q-08: the options text mode has and logxml 0.6.6 lacked.
+    context 'with the options it shares with text mode' do
       it 'starts a new file after --lines written lines' do
-        run_logxml(args: '--lines=1', lines: ['<output>line 1</output>', '<output>line 2</output>'])
+        run_xml(args: '--lines=1', lines: ['<output>line 1</output>', '<output>line 2</output>'])
 
         month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
         expect(Dir.children(month).sort).to eq(['2026-04-23_10-00-05.xml', '2026-04-23_10-00-05_01.xml'])
@@ -1177,7 +1064,7 @@ module LogSpecHarness::Env
       it 'skips the lines read in an --exclude room, by its u-id' do
         allow(XMLData).to receive(:room_id).and_return(7199)
 
-        run_logxml(args: '--exclude=u7199')
+        run_xml(args: '--exclude=u7199')
 
         expect(log_lines).to eq([default_header, default_footer])
       end
@@ -1185,7 +1072,7 @@ module LogSpecHarness::Env
       it 'keeps pushStream and popStream lines with --streams' do
         stream_lines = ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>']
 
-        run_logxml(args: '--streams', lines: stream_lines)
+        run_xml(args: '--streams', lines: stream_lines)
 
         expect(log_lines).to eq([default_header, *stream_lines, default_footer])
       end
@@ -1195,14 +1082,15 @@ module LogSpecHarness::Env
         stub_const('Map', map)
         title_line = '<resource picture="0"/><style id="roomName" />[Town Square]'
 
-        run_logxml(args: '--rnumber', lines: [title_line])
+        run_xml(args: '--rnumber', lines: [title_line])
 
         expect(log_lines).to eq([default_header, title_line, default_footer])
         expect(map).not_to have_received(:ids_from_uid)
       end
     end
 
-    # R-02: the files ;logxml and ;log --xml write, against the files
+    # R-02: the files ;log --xml writes (and log.lic run under the name
+    # logxml, as an install's local logxml.lic 0.7.x runs it), against the files
     # logxml.lic 0.6.1 (the release this merge started from, kept verbatim in
     # spec/fixtures/scripts/logxml-0.6.1.lic) writes, from the same input in
     # the same harness. Every difference is a fix the ledger lists: the
@@ -1211,10 +1099,10 @@ module LogSpecHarness::Env
     # midnight in the new day's file (R-13), LOG_DIR (R-24), and, without
     # streams, the line inside the inventory stream left out (R-06).
     # There is no fixture for logxml.lic 0.6.6, the last version before
-    # ;logxml ran log.lic. The layer review replayed the lich-5 stream
-    # fixtures through 0.6.6, this shim and ;log --xml out of tree (472 runs
+    # ;logxml ran log.lic. The layer-09 review replayed the lich-5 stream
+    # fixtures through 0.6.6, the 0.7.0 shim and ;log --xml out of tree (472 runs
     # over options, the reget window and timestamp settings): files, echoes
-    # and script flags matched except where the 0.7.0 changelog says they
+    # and script flags matched except where logxml.lic 0.7.0's changelog said they
     # change (the word rnum turns room numbers on; a bare --timestamp
     # echoes that it is ignored).
     describe 'against logxml.lic 0.6.1 on the same input' do
@@ -1257,10 +1145,11 @@ module LogSpecHarness::Env
       end
 
       # Runs one logger on the same input and returns files_written: :base
-      # is logxml.lic 0.6.1, :logxml the logxml.lic shim, :log_xml log.lic
-      # started with --xml. The typed commands are read first (get waits for
-      # the upstream thread to push each one), then +lines+; a Time among
-      # them moves the clock.
+      # is logxml.lic 0.6.1, :log_xml log.lic started with --xml, and
+      # :logxml_name log.lic run under the name logxml without --xml, as an
+      # install's local logxml.lic 0.7.x runs it. The typed commands are
+      # read first (get waits for the upstream thread to push each one),
+      # then +lines+; a Time among them moves the clock.
       def run_one(which, args:, lines:, typed:, server_buffer:)
         FileUtils.rm_rf(Dir.glob(File.join(log_dir, '*')) + Dir.glob(File.join(logs_dir, '*')))
         LogSpecHarness.reset!
@@ -1285,8 +1174,7 @@ module LogSpecHarness::Env
         Timeout.timeout(5) do
           case which
           when :base then LogSpecHarness::Env.module_eval(base_lines.drop(base_body_line - 1).join, base_path, base_body_line)
-          when :logxml then run_body
-          when :log_xml then LogSpecHarness.run_whole_script
+          else LogSpecHarness.run_whole_script
           end
         end
         # The upstream thread ends on the empty buffer; wait for it, so it
@@ -1297,7 +1185,7 @@ module LogSpecHarness::Env
 
       # The three runs on the same input.
       def run_all(args: '', lines: game_lines, typed: ['<c>look'], server_buffer: server_lines)
-        %i[base logxml log_xml].to_h { |which| [which, run_one(which, args: args, lines: lines, typed: typed, server_buffer: server_buffer)] }
+        %i[base log_xml logxml_name].to_h { |which| [which, run_one(which, args: args, lines: lines, typed: typed, server_buffer: server_buffer)] }
       end
 
       # R-15: lich-5's reget leaves the server's "\r" at the end of each line;
@@ -1328,16 +1216,16 @@ module LogSpecHarness::Env
 
           expect(runs[:base].keys).to eq([xml_file])
           expect(runs[:base][xml_file]).to include("\r\n")
-          expect(runs[:logxml]).to eq(xml_file => without_inv_span_line(without_reget_cr(runs[:base][xml_file])) + footer)
-          expect(runs[:log_xml]).to eq(runs[:logxml])
+          expect(runs[:log_xml]).to eq(xml_file => without_inv_span_line(without_reget_cr(runs[:base][xml_file])) + footer)
+          expect(runs[:logxml_name]).to eq(runs[:log_xml])
         end
 
         it 'differs the same way with a quoted --timestamp, the reget unstamped in both' do
           runs = run_all(args: '--timestamp="%F %T"')
 
           expect(runs[:base][xml_file]).to start_with("2026-04-23 10:00:05\n<style")
-          expect(runs[:logxml]).to eq(xml_file => "#{without_inv_span_line(without_reget_cr(runs[:base][xml_file]))}2026-04-23 10:00:05\n")
-          expect(runs[:log_xml]).to eq(runs[:logxml])
+          expect(runs[:log_xml]).to eq(xml_file => "#{without_inv_span_line(without_reget_cr(runs[:base][xml_file]))}2026-04-23 10:00:05\n")
+          expect(runs[:logxml_name]).to eq(runs[:log_xml])
         end
 
         # R-14: lich-5's reget answers nil for an empty buffer, and puts(nil)
@@ -1346,8 +1234,8 @@ module LogSpecHarness::Env
           runs = run_all(server_buffer: [])
 
           expect(runs[:base][xml_file]).to start_with("#{default_header}\n\n#{marker}\n")
-          expect(runs[:logxml]).to eq(xml_file => without_inv_span_line(runs[:base][xml_file].sub("#{default_header}\n\n", "#{default_header}\n")) + footer)
-          expect(runs[:log_xml]).to eq(runs[:logxml])
+          expect(runs[:log_xml]).to eq(xml_file => without_inv_span_line(runs[:base][xml_file].sub("#{default_header}\n\n", "#{default_header}\n")) + footer)
+          expect(runs[:logxml_name]).to eq(runs[:log_xml])
         end
       end
 
@@ -1356,16 +1244,16 @@ module LogSpecHarness::Env
           runs = run_all
 
           expect(runs[:base][xml_file]).not_to include(marker)
-          expect(runs[:logxml]).to eq(xml_file => without_inv_span_line(runs[:base][xml_file]) + footer)
-          expect(runs[:log_xml]).to eq(runs[:logxml])
+          expect(runs[:log_xml]).to eq(xml_file => without_inv_span_line(runs[:base][xml_file]) + footer)
+          expect(runs[:logxml_name]).to eq(runs[:log_xml])
         end
 
         it 'differs only by the footer (R-23) with streams' do
           runs = run_all(args: 'streams')
 
           expect(runs[:base][xml_file]).to include('<pushStream id="inv"/>')
-          expect(runs[:logxml]).to eq(xml_file => runs[:base][xml_file] + footer)
-          expect(runs[:log_xml]).to eq(runs[:logxml])
+          expect(runs[:log_xml]).to eq(xml_file => runs[:base][xml_file] + footer)
+          expect(runs[:logxml_name]).to eq(runs[:log_xml])
         end
 
         # 0.6.1 took the Lich number from Map.current; log.lic takes it from
@@ -1379,11 +1267,11 @@ module LogSpecHarness::Env
           runs = run_all(args: '--rnum')
 
           expect(runs[:base][xml_file]).to include('<style id="roomName" />[Town Square - 228] (u1234) (1234)')
-          expect(runs[:logxml]).to eq(
+          expect(runs[:log_xml]).to eq(
             xml_file => without_inv_span_line(runs[:base][xml_file]).sub('[Town Square - 228] (u1234) (1234)', '[Town Square - 228] (1234)') + footer
           )
-          expect(runs[:logxml][xml_file]).to include('<style id="roomName" />[Town Square - 228] (1234)')
-          expect(runs[:log_xml]).to eq(runs[:logxml])
+          expect(runs[:log_xml][xml_file]).to include('<style id="roomName" />[Town Square - 228] (1234)')
+          expect(runs[:logxml_name]).to eq(runs[:log_xml])
         end
 
         # R-24: Lich's --logs= sets LOG_DIR; 0.6.1 wrote under LICH_DIR/logs.
@@ -1393,8 +1281,8 @@ module LogSpecHarness::Env
           runs = run_all
 
           expect(runs[:base].keys).to eq([xml_file])
-          expect(runs[:logxml]).to eq('LOG_DIR/GSIV-TestChar/2026/04/2026-04-23_10-00-05.xml' => without_inv_span_line(runs[:base][xml_file]) + footer)
-          expect(runs[:log_xml]).to eq(runs[:logxml])
+          expect(runs[:log_xml]).to eq('LOG_DIR/GSIV-TestChar/2026/04/2026-04-23_10-00-05.xml' => without_inv_span_line(runs[:base][xml_file]) + footer)
+          expect(runs[:logxml_name]).to eq(runs[:log_xml])
         end
 
         # R-13: 0.6.1 wrote the line before checking the date.
@@ -1409,13 +1297,43 @@ module LogSpecHarness::Env
             xml_file  => "#{default_header}\n<output>line 1</output>\n<output>line 2</output>\n#{next_day_footer}",
             next_file => "2026-04-24 12:00am\n"
           )
-          expect(runs[:logxml]).to eq(
+          expect(runs[:log_xml]).to eq(
             xml_file  => runs[:base][xml_file].sub("<output>line 2</output>\n", ''),
             next_file => "#{runs[:base][next_file]}<output>line 2</output>\n#{next_day_footer}"
           )
-          expect(runs[:log_xml]).to eq(runs[:logxml])
+          expect(runs[:logxml_name]).to eq(runs[:log_xml])
         end
       end
+    end
+  end
+
+  # USER-1 (2026-11-11): logxml.lic is no longer in the repository; ;log
+  # --xml writes the XML log. bin/repo deletes a scripts/ file removed here
+  # from the Lich repository server, and repository.lic must then stop
+  # handing it to new installs as a default updatable script and stop
+  # moving its owner to elanthia-online as a core script, as it does for
+  # log.lic.
+  RSpec.describe 'logxml.lic removed from the repository (USER-1)' do
+    let(:scripts_dir) { File.expand_path('../../scripts', __dir__) }
+    let(:repository) { File.read(File.join(scripts_dir, 'repository.lic')) }
+
+    it 'is not in the scripts folder, while log.lic is' do
+      expect(File.exist?(File.join(scripts_dir, 'logxml.lic'))).to be(false)
+      expect(File.file?(File.join(scripts_dir, 'log.lic'))).to be(true)
+    end
+
+    it 'is not among the default scripts repository.lic makes updatable, while log.lic is' do
+      defaults = repository.scan(/^\s*add_default_script\('([^']+)'/).flatten
+
+      expect(defaults).to include('log.lic')
+      expect(defaults).not_to include('logxml.lic')
+    end
+
+    it 'is not among the core scripts whose owner repository.lic sets to elanthia-online' do
+      core = repository[/%w\[(repository\.lic [^\]]*)\]/, 1]
+
+      expect(core.to_s.split).to include('log.lic')
+      expect(core.to_s.split).not_to include('logxml.lic')
     end
   end
 end

@@ -1,6 +1,6 @@
 # Script.current.vars as lich-5 v5.21.0 builds them (lib/common/script.rb,
 # Script#initialize, lines 1734-1750), for the specs that start a script
-# with arguments: log_spec.rb and logxml_spec.rb.
+# with arguments: log_spec.rb and log_xml_mode_spec.rb.
 module LichScriptVars
   # A String (typed, ;log ...) is vars[0] whole, then split on spaces with
   # quotes honoured and removed (an escaped quote stays as a quote); an

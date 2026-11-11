@@ -4,8 +4,8 @@ require 'ostruct'
 require 'timeout'
 require_relative 'lich_script_vars'
 
-# The harness log_spec.rb and logxml_spec.rb run log.lic in (logxml.lic
-# loads log.lic, see logxml_spec.rb).
+# The harness log_spec.rb and log_xml_mode_spec.rb run log.lic in
+# (log_xml_mode_spec.rb runs the whole script, see run_whole_script).
 #
 # Stand-ins for the parts of lich-5 that log.lic's `module GameLogger` uses,
 # kept off the top level: the module is evaluated inside
@@ -40,10 +40,16 @@ module LogSpecHarness
     attr_accessor :server_buffer
     # The current run's Script.current (see new_script).
     attr_reader :script, :echoes
+    # The scripts running besides the current run, for Script.running and
+    # Script.hidden: OpenStructs with a name and hidden, and optionally
+    # vars and before (true when started before the current run; Lich's
+    # lists are in start order). [] after reset!.
+    attr_accessor :other_scripts
 
     # Puts the harness back to a fresh start for the next example: empty
     # buffers, no echoes, no settings, no server buffer, no upstream
-    # thread, and a new Script.current with no arguments.
+    # thread, no other running scripts, and a new Script.current with no
+    # arguments.
     #
     # @return [OpenStruct] the new Script.current (see {new_script})
     def reset!
@@ -56,6 +62,7 @@ module LogSpecHarness
       @hide_me_calls = 0
       @settings = OpenStruct.new
       @server_buffer = []
+      @other_scripts = []
       @script = new_script
     end
 
@@ -85,7 +92,8 @@ module LogSpecHarness
     # @param args [String, Array<String>, nil] a String as typed (;log ...),
     #   an Array as autostart passes its saved arguments, nil for none
     # @param name [String] the script's name, Script.current.name ('log',
-    #   or 'logxml' for a run started as ;logxml)
+    #   or 'logxml' for a run an install's local logxml.lic starts, which
+    #   picks XML mode)
     # @return [OpenStruct] the stand-in Script, with +downstream_buffer+
     #   set to {DOWNSTREAM}
     def new_script(args = nil, name: 'log')
@@ -247,11 +255,27 @@ module LogSpecHarness
       def self.log(_msg); end
     end
 
-    # Lich's Script, for Script.current only.
+    # Lich's Script, for Script.current, Script.running and Script.hidden.
     class Script
       # @return [OpenStruct] the current run's script (see
       #   {LogSpecHarness.new_script})
       def self.current = LogSpecHarness.script
+
+      # lich-5's Script.running: the running scripts that are not hidden.
+      #
+      # @return [Array<OpenStruct>] the {LogSpecHarness.other_scripts} not
+      #   hidden (the current run has called hide_me)
+      def self.running = LogSpecHarness.other_scripts.reject(&:hidden)
+
+      # lich-5's Script.hidden: the running scripts that are hidden.
+      #
+      # @return [Array<OpenStruct>] in start order: the hidden
+      #   {LogSpecHarness.other_scripts} started before the current run,
+      #   the current run, then the other hidden ones
+      def self.hidden
+        hidden = LogSpecHarness.other_scripts.select(&:hidden)
+        [*hidden.select(&:before), LogSpecHarness.script, *hidden.reject(&:before)]
+      end
     end
   end
 
