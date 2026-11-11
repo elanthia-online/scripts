@@ -16,7 +16,9 @@
    changelog:
       1.1.0 (2026-11-09)
          ;alias setup is a Lich WebUI window instead of GTK: this character's and
-         global aliases on two tabs; edit, delete and add, then Save
+         global aliases on two tabs; edit, delete and add, then Save & Close
+         Each tab is one table with in-place editing and type-ahead by trigger,
+         so any number of aliases shows; typing no longer redraws the window
       1.0.5 (2026-06-30)
          Updated for 5.19.0 Lich to include new hook registry semantics
       1.0.4 (2025-01-31)
@@ -50,12 +52,13 @@
 
 =end
 
-# ;alias setup: a native Lich WebUI window with two tabs, this character's
-# aliases and global ones. Targets can be edited, aliases deleted and new
-# ones added. Nothing is written until Save; Cancel or closing the window
-# discards the changes. The window belongs to its own run of this script,
-# started by ;alias setup, so it outlives nothing: the alias service (the
-# upstream hook) keeps running and is told to reload after a save.
+# ;alias setup: a native Lich WebUI settings form with two tabs, this
+# character's aliases and global ones, each one table. Targets are edited in
+# place, aliases deleted and new ones added. Nothing is written until Save &
+# Close; Cancel or closing the window discards the changes. The form's
+# lifecycle is Lich's SettingsForm. The window belongs to its own run of
+# this script, started by ;alias setup: the alias service (the upstream
+# hook) keeps running and is told to reload after a save.
 class AliasSetup
   # Lich keeps this class between runs in a session; start each run clean.
   constants(false).each { |name| remove_const(name) }
@@ -63,154 +66,159 @@ class AliasSetup
   PAGE_ID = 'alias-setup'
 
   def self.available?
-    defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
-      defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+    defined?(Lich::WebUI::SettingsForm) && Lich::WebUI.respond_to?(:presentation_enabled?) &&
+      Lich::WebUI.presentation_enabled?
   end
 
-  Row = Struct.new(:trigger, :original, :target, :deleted) do
-    def changed? = deleted || target != original
+  # key: the table row identity (triggers may hold any character). added: a
+  # new alias, written on Save.
+  Row = Struct.new(:key, :trigger, :original, :target, :deleted, :added) do
+    def changed? = added || deleted || target != original
+
+    def note
+      if added then 'new, added when you save'
+      elsif deleted then 'deleted when you save'
+      elsif target != original then 'changed'
+      else ''
+      end
+    end
   end
 
-  # One tab: a table in the alias database, its rows, and aliases waiting to
-  # be added.
+  # One tab: a table in the alias database, its rows, and the selected row.
   class List
-    attr_reader :table, :label, :rows, :added
-    attr_accessor :new_trigger, :new_target, :new_rev
+    attr_reader :table, :label, :rows
+    attr_accessor :new_rev, :selected, :next_added
 
-    def initialize(db, table, label)
+    def initialize(db, table, label, n)
       @table = table
       @label = label
       @rows = []
-      db.execute("SELECT trigger,target FROM #{table};") { |r| @rows << Row.new(r[0].to_s, r[1].to_s, r[1].to_s, false) }
-      @rows.sort_by! { |r| r.trigger.downcase }
-      @added = []
-      @new_trigger = ''
-      @new_target = ''
+      db.execute("SELECT trigger,target FROM #{table};") { |r| @rows << [r[0].to_s, r[1].to_s] }
+      @rows = @rows.sort_by { |t, _| t.downcase }.each_with_index.map { |(t, v), i| Row.new("t#{n}-#{i}", t, v, v, false, false) }
       @new_rev = 0
+      @next_added = 0
+      @selected = nil
     end
 
-    def changes = @rows.count(&:changed?) + @added.size
+    def row(key) = @rows.find { |r| r.key == key }
+    def changes = @rows.count(&:changed?)
   end
 
   def initialize(db, character)
-    @owner = Script.current
     @db = db
-    @lists = [List.new(db, character, "#{Char.name}'s Aliases"), List.new(db, 'global', 'Global Aliases')]
+    @lists = [List.new(db, character, "#{Char.name}'s Aliases", 0), List.new(db, 'global', 'Global Aliases', 1)]
     @status = ''
-    @closed = Queue.new
-    @saved = false
   end
 
   attr_reader :lists, :status
 
   def changes = @lists.sum(&:changes)
 
+  # Returns whether the aliases were saved.
   def run
     setup = self
-    @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: 'Lich - Aliases',
-                                 props: { size: [800, 580], bare: true, density: :compact, viewport: true },
-                                 on: { close: ->(_ev) { setup.viewer_closed } }) do |ui|
-      setup.render(ui)
-    end
-    Lich::API.webui_refresh(@page)
-    Lich::API.webui_start
-    unless Lich::API.webui_open(page: @page)
-      respond "\n--- alias: could not open a window for setup.\n\n"
-      return false
-    end
-    @closed.pop
-    unless @saved
+    @form = Lich::WebUI::SettingsForm.new(
+      owner: Script.current, id: PAGE_ID, title: 'Lich - Aliases', values: {}, fields: [],
+      props: { size: [800, 580], viewport: true },
+      layout: ->(ui, _field, save) { setup.render(ui, save) }
+    )
+    if @form.show.wait
+      apply
+      true
+    else
       pending = changes
       respond "\n--- alias window closed#{pending.positive? ? " WITHOUT saving #{pending} change(s)" : ''}\n\n"
+      false
     end
-    @saved
   ensure
+    # This run may go on as the alias service, so release the window now
+    # rather than at script death.
     begin
-      Lich::WebUI.terminate_owner(@owner)
+      Lich::WebUI.terminate_owner(Script.current)
     rescue StandardError
       nil
     end
   end
 
-  def viewer_closed
-    @closed << :viewer
+  def refresh
+    Lich::WebUI.refresh(@form.page) if @form&.page
   end
 
-  # Run a UI callback, then re-render.
-  def act
-    yield
-  rescue StandardError => e
-    @status = "#{e.class}: #{e.message}"
-  ensure
-    Lich::API.webui_refresh(@page) if @page && !@saved
-  end
+  def edit(list, key, text)
+    row = list.row(key)
+    return if row.nil? || row.deleted
 
-  def cb(&block)
-    setup = self
-    ->(ev) { setup.act { block.call(ev) } }
-  end
-
-  def set_target(list, trigger, text)
-    row = list.rows.find { |r| r.trigger == trigger } or return
     row.target = text.to_s
+    refresh
   end
 
-  def toggle_delete(list, trigger)
-    row = list.rows.find { |r| r.trigger == trigger } or return
-    row.deleted = !row.deleted
+  # Delete or undo the selected alias; a new one is simply removed.
+  def toggle_selected(list)
+    row = list.row(list.selected)
+    if row.nil?
+      @status = 'Select an alias first.'
+    elsif row.added
+      list.rows.delete(row)
+      list.selected = nil
+      @status = ''
+    else
+      row.deleted = !row.deleted
+      @status = ''
+    end
+    refresh
   end
 
   # The trigger is case-insensitive, as the service matches it.
-  def add(list)
-    trigger = list.new_trigger.to_s.strip
-    return @status = 'Type a trigger for the new alias.' if trigger.empty?
-    return @status = "#{trigger} is already an alias here; edit it in the list." if list.rows.any? { |r| r.trigger.casecmp?(trigger) }
-    return @status = "#{trigger} is already waiting to be added." if list.added.any? { |t, _| t.casecmp?(trigger) }
-    return @status = "Type what #{trigger} should send." if list.new_target.to_s.strip.empty?
-
-    list.added << [trigger, list.new_target.to_s]
-    list.new_trigger = ''
-    list.new_target = ''
-    list.new_rev += 1
-    @status = ''
-  end
-
-  def remove_added(list, trigger)
-    list.added.reject! { |t, _| t == trigger }
+  def add(list, trigger, target)
+    trigger = trigger.to_s.strip
+    if trigger.empty?
+      @status = 'Type a trigger for the new alias.'
+    elsif (row = list.rows.find { |r| r.trigger.casecmp?(trigger) })
+      @status = row.added ? "#{trigger} is already waiting to be added." : "#{trigger} is already an alias here; edit it in the list."
+    elsif target.to_s.strip.empty?
+      @status = "Type what #{trigger} should send."
+    else
+      list.rows << Row.new("a#{@lists.index(list)}-#{list.next_added += 1}", trigger, nil, target.to_s, false, true)
+      list.new_rev += 1
+      @status = ''
+    end
+    refresh
   end
 
   # The old window's save, table by table.
-  def save
+  def apply
     count = changes
     @lists.each do |list|
       list.rows.each do |row|
-        if row.deleted
+        if row.added
+          if @db.get_first_value("SELECT target FROM #{list.table} WHERE trigger=? COLLATE NOCASE;", row.trigger.encode('UTF-8'))
+            respond "[alias: warning: new alias #{row.trigger} already exists; ignoring]"
+          else
+            @db.execute("INSERT INTO #{list.table} (trigger,target) VALUES(?,?);", [row.trigger.encode('UTF-8'), row.target.encode('UTF-8')])
+          end
+        elsif row.deleted
           @db.execute("DELETE FROM #{list.table} WHERE trigger=?", [row.trigger.encode('UTF-8')])
-        elsif row.target != row.original
+        elsif row.changed?
           @db.execute("INSERT OR REPLACE INTO #{list.table} (trigger,target) VALUES(?,?);",
                       [row.trigger.encode('UTF-8'), row.target.encode('UTF-8')])
         end
       end
-      list.added.each do |trigger, target|
-        if @db.get_first_value("SELECT target FROM #{list.table} WHERE trigger=? COLLATE NOCASE;", trigger.encode('UTF-8'))
-          respond "[alias: warning: new alias #{trigger} already exists; ignoring]"
-        else
-          @db.execute("INSERT INTO #{list.table} (trigger,target) VALUES(?,?);", [trigger.encode('UTF-8'), target.encode('UTF-8')])
-        end
-      end
     end
-    @saved = true
     respond "\n--- aliases saved#{count.positive? ? " (#{count} change(s))" : ''}\n\n"
-    Lich::WebUI.close(@page)
-    @closed << :save
   end
 
   def cancel
-    Lich::WebUI.close(@page)
-    @closed << :cancel
+    @form.close
   end
 
-  def render(ui)
+  def table_rows(list)
+    list.rows.map do |row|
+      cells = { 'trigger' => row.trigger, 'target' => row.target, 'note' => row.note }
+      row.deleted ? { key: row.key, cells: cells, cell_disabled: ['target'] } : { key: row.key, cells: cells }
+    end
+  end
+
+  def render(ui, save)
     setup = self
     lists = @lists
     ui.stack(key: 'alias', gap: 6, margin: 8, fill: true) do
@@ -227,48 +235,33 @@ class AliasSetup
                          'A target may use \\r between commands and \\? for what follows the trigger. ' \
                          'Cancel or closing the window discards changes.')
         ui.button(slot: '1', key: 'cancel', label: 'Cancel', on: { activate: ->(_ev) { setup.cancel } })
-        ui.button(slot: '2', key: 'save', label: 'Save', variant: :primary, on: { activate: ->(_ev) { setup.save } })
+        save.call(ui, slot: '2', variant: :primary)
       end
     end
   end
 
   def render_list(ui, list, n)
     setup = self
-    rows = list.rows
-    added = list.added
-    ui.scroll(key: "list#{n}", fill: true) do
-      if rows.empty? && added.empty?
-        ui.text(key: "none#{n}", content: 'No aliases here yet. Add one below.', emphasis: :subtle)
-      else
-        ui.grid(key: "rows#{n}", cols: 3, homogeneous: false, expand_columns: [2], row_gap: 4, column_gap: 10) do
-          # Keyed by position: triggers may hold any character.
-          rows.each_with_index do |row, i|
-            ui.text(key: "t#{n}-#{i}", content: row.trigger, emphasis: row.deleted ? :subtle : :normal)
-            if row.deleted
-              ui.text(key: "x#{n}-#{i}", content: '(deleted when you save)', emphasis: :subtle, tooltip: 'Undo to keep it.')
-            else
-              ui.text_input(key: "v#{n}-#{i}", value: row.target, change_mode: :input,
-                            on: { change: setup.cb { |ev| setup.set_target(list, row.trigger, ev.payload[:value]) } })
-            end
-            ui.button(key: "d#{n}-#{i}", label: row.deleted ? 'Undo' : 'Delete',
-                      on: { activate: setup.cb { setup.toggle_delete(list, row.trigger) } })
-          end
-          added.each_with_index do |(trigger, target), i|
-            ui.text(key: "at#{n}-#{i}", content: trigger, emphasis: :strong)
-            ui.text(key: "av#{n}-#{i}", content: "#{target}   (new, added when you save)", emphasis: :subtle)
-            ui.button(key: "ad#{n}-#{i}", label: 'Remove', on: { activate: setup.cb { setup.remove_added(list, trigger) } })
-          end
-        end
-      end
-    end
+    ui.table(key: "rows#{n}", headers: true, fill: true, selection: :single, sortable: true, search_column: 'trigger',
+             columns: [{ key: 'trigger', label: 'Trigger', sortable: true, resizable: true, width: 160 },
+                       { key: 'target', label: 'Sends (double-click to edit)', expand: true, editor: { type: :text } },
+                       { key: 'note', label: 'Note', width: 200 }],
+             rows: setup.table_rows(list),
+             on: { cell_edit: ->(ev) { setup.edit(list, ev.payload[:row], ev.payload[:value]) },
+                   selection_change: ->(ev) { list.selected = Array(ev.payload[:rows]).first } })
     ui.group(key: "new#{n}", label: 'New alias') do
-      ui.columns(key: "new-row#{n}-#{list.new_rev}", count: 3, weights: [2, 4, 1], compact: true, row_align: :end, gap: 6) do
-        ui.text_input(slot: '0', key: "nt#{n}", label: 'Trigger', value: list.new_trigger, change_mode: :input,
-                      on: { change: setup.cb { |ev| list.new_trigger = ev.payload[:value].to_s } })
-        ui.text_input(slot: '1', key: "nv#{n}", label: 'Sends', value: list.new_target, change_mode: :input,
-                      on: { change: setup.cb { |ev| list.new_target = ev.payload[:value].to_s },
-                            submit: setup.cb { setup.add(list) } })
-        ui.button(slot: '2', key: "na#{n}", label: 'Add', on: { activate: setup.cb { setup.add(list) } })
+      ui.columns(key: "new-row#{n}-#{list.new_rev}", count: 4, weights: [2, 4, 1, 2], compact: true, row_align: :end, gap: 6) do
+        # Read once, on Add or Enter, through a submission: typing does not
+        # call back or re-render.
+        trigger = target = nil
+        add = ->(ev) { setup.add(list, ev.submission[trigger.cid], ev.submission[target.cid]) }
+        trigger = ui.text_input(slot: '0', key: "nt#{n}", label: 'Trigger', value: '')
+        target = ui.text_input(slot: '1', key: "nv#{n}", label: 'Sends', value: '', on: { submit: add })
+        ui.submit(target, [trigger, target])
+        ui.button(slot: '2', key: "na#{n}", label: 'Add', submit: [trigger, target], on: { activate: add })
+        ui.button(slot: '3', key: "nd#{n}", label: 'Delete / Undo selected',
+                  tooltip: 'Marks the selected alias for deletion when you save, or undoes that.',
+                  on: { activate: ->(_ev) { setup.toggle_selected(list) } })
       end
     end
   end
