@@ -14,7 +14,9 @@
   changelog:
     1.3.0 (2026-11-09)
       ;vars setup is a Lich WebUI window instead of GTK: edit values, delete
-      and add variables, then Save. Cancel or closing the window discards.
+      and add variables, then Save & Close. Cancel or closing the window discards.
+      One table with in-place editing and type-ahead by name, so any number of
+      variables shows; typing no longer redraws the window.
     1.2.0 (2023-12-04)
       Allowed setting of vars to boolean values true/false
     1.1 (2023-09-07)
@@ -41,9 +43,12 @@
 
 =end
 
-# ;vars setup: a native Lich WebUI window listing every variable. Values
-# can be edited, variables deleted and new ones added. Nothing is written
-# until Save; Cancel or closing the window discards the changes.
+# ;vars setup: a native Lich WebUI settings form listing every variable in
+# one table. Values are edited in place, variables deleted and new ones
+# added. Nothing is written until Save & Close; Cancel or closing the window
+# discards the changes. The form's lifecycle (Save, Cancel, close, waiting
+# on this script's thread) is Lich's SettingsForm; this class supplies the
+# table and applies the result.
 class VarsSetup
   # Lich keeps this class between runs in a session; start each run clean.
   constants(false).each { |name| remove_const(name) }
@@ -51,184 +56,168 @@ class VarsSetup
   PAGE_ID = 'vars-setup'
 
   def self.available?
-    defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
-      defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+    defined?(Lich::WebUI::SettingsForm) && Lich::WebUI.respond_to?(:presentation_enabled?) &&
+      Lich::WebUI.presentation_enabled?
   end
 
-  Row = Struct.new(:name, :original, :value, :deleted) do
+  # key: the table row identity (names may hold any character). added: a
+  # new variable, written on Save.
+  Row = Struct.new(:key, :name, :original, :value, :deleted, :added) do
     # Only text values are edited here, as in the old window; true/false
     # and other values are shown and can be deleted, set with ;vars set.
-    def editable? = original.is_a?(String)
-    def changed? = deleted || (editable? && value != original)
+    def editable? = !deleted && (added || original.is_a?(String))
+    def changed? = added || deleted || (original.is_a?(String) && value != original)
 
     def shown
-      editable? ? value : "#{original.class}: #{original.inspect}"
+      added || original.is_a?(String) ? value : original.inspect
+    end
+
+    def note
+      if added then 'new, added when you save'
+      elsif deleted then 'deleted when you save'
+      elsif !original.is_a?(String) then "#{original.class}; change it with ;vars set"
+      elsif value != original then 'changed'
+      else ''
+      end
     end
   end
 
   def initialize
-    @owner = Script.current
-    @rows = Vars.list.to_a.sort_by { |name, _| name.to_s.downcase }
-                .map { |name, value| Row.new(name.to_s, value, value.is_a?(String) ? value.dup : value, false) }
-    @added = []          # [[name, value], ...] not yet saved
-    @new_name = ''
-    @new_value = ''
-    @new_rev = 0         # a new key clears the add boxes after Add
+    @rows = Vars.list.to_a.sort_by { |name, _| name.to_s.downcase }.each_with_index
+                .map { |(name, value), i| Row.new("v#{i}", name.to_s, value, value.is_a?(String) ? value.dup : value, false, false) }
+    @next_added = 0
+    @new_rev = 0 # a new key clears the add boxes after Add
+    @selected = nil
     @status = ''
-    @closed = Queue.new
-    @saved = false
   end
 
-  attr_reader :rows, :added, :status, :new_rev
-  attr_accessor :new_name, :new_value
+  attr_reader :rows, :status, :new_rev
 
-  def changes
-    @rows.count(&:changed?) + @added.size
-  end
+  def changes = @rows.count(&:changed?)
 
   def run
     setup = self
-    @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: "Lich - #{Char.name}'s Vars",
-                                 props: { size: [760, 560], bare: true, density: :compact, viewport: true },
-                                 on: { close: ->(_ev) { setup.viewer_closed } }) do |ui|
-      setup.render(ui)
-    end
-    Lich::API.webui_refresh(@page)
-    Lich::API.webui_start
-    unless Lich::API.webui_open(page: @page)
-      respond "\n--- vars: could not open a window for setup.\n\n"
-      return
-    end
-    @closed.pop
-    return if @saved
-
-    pending = changes
-    respond "\n--- vars window closed#{pending.positive? ? " WITHOUT saving #{pending} change(s)" : ''}\n\n"
-  ensure
-    begin
-      Lich::WebUI.terminate_owner(@owner)
-    rescue StandardError
-      nil
+    @form = Lich::WebUI::SettingsForm.new(
+      owner: Script.current, id: PAGE_ID, title: "Lich - #{Char.name}'s Vars", values: {}, fields: [],
+      props: { size: [760, 560], viewport: true },
+      layout: ->(ui, _field, save) { setup.render(ui, save) }
+    )
+    if @form.show.wait
+      apply
+    else
+      pending = changes
+      respond "\n--- vars window closed#{pending.positive? ? " WITHOUT saving #{pending} change(s)" : ''}\n\n"
     end
   end
 
-  def viewer_closed
-    @closed << :viewer
+  def refresh
+    Lich::WebUI.refresh(@form.page) if @form&.page
   end
 
-  # Run a UI callback, then re-render.
-  def act
-    yield
-  rescue StandardError => e
-    @status = "#{e.class}: #{e.message}"
-  ensure
-    Lich::API.webui_refresh(@page) if @page && !@saved
-  end
+  def row(key) = @rows.find { |r| r.key == key }
 
-  def cb(&block)
-    setup = self
-    ->(ev) { setup.act { block.call(ev) } }
-  end
+  def edit(key, text)
+    row = row(key)
+    return unless row&.editable?
 
-  def set_value(name, text)
-    row = @rows.find { |r| r.name == name } or return
     row.value = text.to_s
+    refresh
   end
 
-  def toggle_delete(name)
-    row = @rows.find { |r| r.name == name } or return
-    row.deleted = !row.deleted
+  def select(key)
+    @selected = key
   end
 
-  def add
-    name = @new_name.to_s.strip
-    return @status = 'Type a name for the new variable.' if name.empty?
-    return @status = "Variable #{name} already exists; edit it in the list." if @rows.any? { |r| r.name == name }
-    return @status = "#{name} is already waiting to be added." if @added.any? { |n, _| n == name }
-
-    @added << [name, @new_value.to_s]
-    @new_name = ''
-    @new_value = ''
-    @new_rev += 1
-    @status = ''
+  # Delete or undo the selected variable; a new one is simply removed.
+  def toggle_selected
+    row = row(@selected)
+    if row.nil?
+      @status = 'Select a variable first.'
+    elsif row.added
+      @rows.delete(row)
+      @selected = nil
+      @status = ''
+    else
+      row.deleted = !row.deleted
+      @status = ''
+    end
+    refresh
   end
 
-  def remove_added(name)
-    @added.reject! { |n, _| n == name }
+  def add(name, value)
+    name = name.to_s.strip
+    if name.empty?
+      @status = 'Type a name for the new variable.'
+    elsif (row = @rows.find { |r| r.name == name })
+      @status = row.added ? "#{name} is already waiting to be added." : "Variable #{name} already exists; edit it in the list."
+    else
+      @rows << Row.new("a#{@next_added += 1}", name, nil, value.to_s, false, true)
+      @new_rev += 1
+      @status = ''
+    end
+    refresh
   end
 
   # The old window's save: deleted variables go, edited text values change,
   # new variables are added.
-  def save
+  def apply
+    count = changes
     @rows.each do |row|
-      if row.deleted
+      if row.added
+        Vars[row.name] = row.value unless Vars.list.key?(row.name)
+      elsif row.deleted
         Vars[row.name] = nil
-      elsif row.editable? && row.value != row.original
+      elsif row.changed?
         Vars[row.name] = row.value
       end
     end
-    @added.each { |name, value| Vars[name] = value unless Vars.list.key?(name) }
-    count = changes
-    @saved = true
     respond "\n--- vars saved#{count.positive? ? " (#{count} change(s))" : ''}\n\n"
-    Lich::WebUI.close(@page)
-    @closed << :save
   end
 
   def cancel
-    Lich::WebUI.close(@page)
-    @closed << :cancel
+    @form.close
   end
 
-  def render(ui)
+  def table_rows
+    @rows.map do |row|
+      cells = { 'name' => row.name, 'value' => row.shown, 'note' => row.note }
+      row.editable? ? { key: row.key, cells: cells } : { key: row.key, cells: cells, cell_disabled: ['value'] }
+    end
+  end
+
+  def render(ui, save)
     setup = self
-    rows = @rows
-    added = @added
     ui.stack(key: 'vars', gap: 6, margin: 8, fill: true) do
-      ui.scroll(key: 'list', fill: true) do
-        if rows.empty? && added.empty?
-          ui.text(key: 'none', content: 'No variables are set. Add one below.', emphasis: :subtle)
-        else
-          ui.grid(key: 'rows', cols: 3, homogeneous: false, expand_columns: [2], row_gap: 4, column_gap: 10) do
-            # Keyed by position: variable names may hold any character.
-            rows.each_with_index do |row, i|
-              ui.text(key: "n#{i}", content: row.name, emphasis: row.deleted ? :subtle : :normal)
-              if row.editable? && !row.deleted
-                ui.text_input(key: "v#{i}", value: row.value, change_mode: :input,
-                              on: { change: setup.cb { |ev| setup.set_value(row.name, ev.payload[:value]) } })
-              else
-                ui.text(key: "s#{i}", content: row.deleted ? '(deleted when you save)' : row.shown, emphasis: :subtle,
-                        tooltip: row.deleted ? 'Undo to keep it.' : 'Not text, so it is not edited here. Change it with ;vars set NAME=VALUE.')
-              end
-              ui.button(key: "d#{i}", label: row.deleted ? 'Undo' : 'Delete',
-                        on: { activate: setup.cb { setup.toggle_delete(row.name) } })
-            end
-            added.each_with_index do |(name, value), i|
-              ui.text(key: "an#{i}", content: name, emphasis: :strong)
-              ui.text(key: "av#{i}", content: "#{value}   (new, added when you save)", emphasis: :subtle)
-              ui.button(key: "ad#{i}", label: 'Remove', on: { activate: setup.cb { setup.remove_added(name) } })
-            end
-          end
-        end
-      end
+      ui.table(key: 'rows', headers: true, fill: true, selection: :single, sortable: true, search_column: 'name',
+               columns: [{ key: 'name', label: 'Name', sortable: true, resizable: true, width: 200 },
+                         { key: 'value', label: 'Value (double-click to edit)', expand: true, editor: { type: :text } },
+                         { key: 'note', label: 'Note', width: 230 }],
+               rows: setup.table_rows,
+               on: { cell_edit: ->(ev) { setup.edit(ev.payload[:row], ev.payload[:value]) },
+                     selection_change: ->(ev) { setup.select(Array(ev.payload[:rows]).first) } })
       ui.group(key: 'new', label: 'New variable') do
-        ui.columns(key: "new-row-#{setup.new_rev}", count: 3, weights: [2, 4, 1], compact: true, row_align: :end, gap: 6) do
-          ui.text_input(slot: '0', key: 'new-name', label: 'Name', value: setup.new_name, change_mode: :input,
-                        on: { change: setup.cb { |ev| setup.new_name = ev.payload[:value].to_s } })
-          ui.text_input(slot: '1', key: 'new-value', label: 'Value', value: setup.new_value, change_mode: :input,
-                        on: { change: setup.cb { |ev| setup.new_value = ev.payload[:value].to_s },
-                              submit: setup.cb { setup.add } })
-          ui.button(slot: '2', key: 'add', label: 'Add', on: { activate: setup.cb { setup.add } })
+        ui.columns(key: "new-row-#{setup.new_rev}", count: 4, weights: [2, 4, 1, 2], compact: true, row_align: :end, gap: 6) do
+          # Read once, on Add or Enter, through a submission: typing does
+          # not call back or re-render.
+          name = value = nil
+          add = ->(ev) { setup.add(ev.submission[name.cid], ev.submission[value.cid]) }
+          name = ui.text_input(slot: '0', key: 'new-name', label: 'Name', value: '')
+          value = ui.text_input(slot: '1', key: 'new-value', label: 'Value', value: '', on: { submit: add })
+          ui.submit(value, [name, value])
+          ui.button(slot: '2', key: 'add', label: 'Add', submit: [name, value], on: { activate: add })
+          ui.button(slot: '3', key: 'delete', label: 'Delete / Undo selected',
+                    tooltip: 'Marks the selected variable for deletion when you save, or undoes that.',
+                    on: { activate: ->(_ev) { setup.toggle_selected } })
         end
       end
       ui.text(key: 'status', content: setup.status, tone: :caution, wrap: true) unless setup.status.empty?
       ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, gap: 6) do
         pending = setup.changes
-        ui.text(slot: '0', key: 'summary', emphasis: :subtle,
-                content: "#{rows.size} variable(s). #{pending.zero? ? 'No changes.' : "#{pending} unsaved change(s)."} " \
+        ui.text(slot: '0', key: 'summary', emphasis: :subtle, wrap: true,
+                content: "#{setup.rows.count { |r| !r.added }} variable(s). #{pending.zero? ? 'No changes.' : "#{pending} unsaved change(s)."} " \
                          'Cancel or closing the window discards changes.')
         ui.button(slot: '1', key: 'cancel', label: 'Cancel', on: { activate: ->(_ev) { setup.cancel } })
-        ui.button(slot: '2', key: 'save', label: 'Save', variant: :primary, on: { activate: ->(_ev) { setup.save } })
+        save.call(ui, slot: '2', variant: :primary)
       end
     end
   end
