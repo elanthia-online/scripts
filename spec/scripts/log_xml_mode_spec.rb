@@ -506,6 +506,61 @@ module LogSpecHarness::Env
       expect(log_lines).to eq([default_header, '<output>before</output>', '<output>a torch</output>', '<popStream/>', '<output>after</output>', default_footer])
     end
 
+    # lnet.lic 1.26 puts its chat line on the downstream from its own thread
+    # (Script.new_downstream_xml), so it can come between two lines of an
+    # inventory stream. It has a line break in it, which no chomped game line
+    # has, and closes the stream it opens: it is kept whole and the span
+    # stays open. Before 1.6.1 its popStream ended the span, so the chat was
+    # left out and the rest of the inventory was logged.
+    describe 'a line a script put on the downstream inside a stream span, without streams' do
+      let(:inv_open) { ["<pushStream id='inv'/>Your worn items are:", '  a pack'] }
+      let(:inv_close) { ['  a cloak', '<popStream/>', '<output>after</output>'] }
+      let(:chat) { %(<pushStream id="thoughts"/>[lnet]-Bob: "hi"\n<popStream/>) }
+
+      it 'keeps an lnet chat line whole and leaves the rest of the span out' do
+        run_xml(lines: [*inv_open, chat, *inv_close])
+
+        expect(log_lines).to eq([default_header, '<pushStream id="thoughts"/>[lnet]-Bob: "hi"', '<popStream/>', '<output>after</output>', default_footer])
+      end
+
+      it 'keeps an lnet familiar-window chat line whole' do
+        familiar = %(<pushStream id="familiar" ifClosedStyle="watching"/>[lnet]-Bob: "hi"\n<popStream/>)
+
+        run_xml(lines: [*inv_open, familiar, *inv_close])
+
+        expect(log_lines).to eq(
+          [default_header, '<pushStream id="familiar" ifClosedStyle="watching"/>[lnet]-Bob: "hi"', '<popStream/>', '<output>after</output>', default_footer]
+        )
+      end
+
+      it 'keeps two such lines in a row, the span still open after both' do
+        run_xml(lines: [*inv_open, chat, chat, *inv_close])
+
+        expect(log_lines.count('<popStream/>')).to eq(2)
+        expect(log_lines).not_to include('  a cloak')
+      end
+
+      # A game line is one line, so a closed stream on it ends the span, as
+      # lich-5's own text does.
+      it 'still ends the span at a game line that opens and closes a stream' do
+        run_xml(lines: [*inv_open, '<pushStream id="thoughts"/>Bob: "hi"<popStream/>', *inv_close])
+
+        expect(log_lines).to eq([default_header, '  a cloak', '<popStream/>', '<output>after</output>', default_footer])
+      end
+
+      it 'still ends the span at a line with a line break that closes more streams than it opens' do
+        run_xml(lines: [*inv_open, "<output>a torch</output>\n<popStream/>", *inv_close])
+
+        expect(log_lines).to eq([default_header, '  a cloak', '<popStream/>', '<output>after</output>', default_footer])
+      end
+
+      it 'leaves out a line with a line break that opens a left-out stream' do
+        run_xml(lines: [*inv_open, "<pushStream id='inv'/>a rope\n<popStream/>", *inv_close])
+
+        expect(log_lines).to eq([default_header, '  a cloak', '<popStream/>', '<output>after</output>', default_footer])
+      end
+    end
+
     # Lines verbatim from lich-5 spec/fixtures/streams/gs_saga_hunt.xml,
     # leading spaces included.
     it 'writes game lines as they come, leading spaces included' do
