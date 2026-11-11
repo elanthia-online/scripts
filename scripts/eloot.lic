@@ -23,6 +23,10 @@
     - the setup window is now a Lich WebUI page instead of GTK, and needs a Lich with WebUI
     - fix: ;eloot list and ;eloot debug no longer depend on GTK, and ;eloot debug no longer errors
     - fix: adding or deleting a list entry in setup could error when the list had no duplicates
+    - setup saves with Save & Close; Cancel or closing the window discards changes
+    - fix: setup no longer fails to open when a saved alpha rate is off its 0.1 step or a
+      saved loot stance / locksmith priority is not one of the choices
+    - fix: after Add or Delete in a setup list, the highlighted row and Delete now agree
   v2.14.2 (2026-10-25)
     - fix: after unpausing eloot when your containers were full, it no longer keeps pausing
       on every item until you restart it
@@ -797,9 +801,9 @@ module ELoot # Data
 end
 
 module ELoot # UI Setup
-  # The setting catalog, the WebUI setup window, and `;eloot list`. Everything
-  # the window shows is rendered from @settings, so changing a setting and
-  # refreshing is all a callback has to do.
+  # The setting catalog, the WebUI setup window, and `;eloot list`. The window is a
+  # Lich::WebUI::ListSettingsForm: Save & Close returns the edited settings, which
+  # are saved to the profile; Cancel or closing the window discards them.
   class Setup
     attr_reader :settings, :status
 
@@ -866,6 +870,22 @@ module ELoot # UI Setup
         ['neutral', 'Neutral'], ['guarded', 'Guarded'], ['defensive', 'Defensive']
       ].freeze
       LOCKSMITH_PRIORITIES = [['pool', 'Pool First'], ['locksmith', 'Locksmith First']].freeze
+      SELECTS = { loot_stance: STANCES, locksmith_priority: LOCKSMITH_PRIORITIES }.freeze
+
+      # Array settings shown as one checkbox per value.
+      MEMBERS = {
+        loot_types: LOOT_TYPES, sell_loot_types: SELL_TYPES, sell_container: SELL_CONTAINERS, sell_appraise_types: APPRAISE_TYPES,
+        trash_dump_types: TRASH_TYPES, gem_horde_containers: [['default', 'Default'], ['gem', 'Gem']],
+        alchemy_horde_containers: [['default', 'Default'], ['reagent', 'Reagent']]
+      }.freeze
+      # Array settings shown as an Add/Delete table.
+      LISTS = %i[loot_exclude loot_keep critter_exclude unlootable between sell_exclude sell_keep_scrolls skin_exclude
+                 gem_everything gem_list alchemy_everything alchemy_list].freeze
+      # Settings the window does not show.
+      HIDDEN = %i[gem_horde_inv alchemy_horde_inv tipping_test gem_locker alchemy_locker].freeze
+      # Checkboxes that enable or disable other controls.
+      GATES = %i[sell_locksmith_pool sell_locksmith skin_enable gem_horde gem_horde_locker gem_horde_locker_che gem_everything_list
+                 gem_only_list alchemy_horde alchemy_horde_locker alchemy_horde_locker_che alchemy_everything_list alchemy_only_list].freeze
 
       REGEX_LIST_TIP = "Enter one per line. Regular expressions are supported.\nExample: Enter (?:aquamarine|gold) wand and gold ring as separate entries."
       CREATURE_LIST_TIP = "Enter one per line. Regular expressions are supported.\nExample: Enter (?:big ugly|mongrel) kobold and Vvrael destroyer as separate entries."
@@ -1014,7 +1034,7 @@ module ELoot # UI Setup
     # True when Lich can open a WebUI window for this script.
     def self.available?
       defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
-        defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+        defined?(Lich::WebUI::ListSettingsForm)
     end
 
     def self.get_category(key)
@@ -1030,17 +1050,35 @@ module ELoot # UI Setup
       nil
     end
 
+    # ListSettingsForm keys rows by position and seeds each viewer's table
+    # selection only once, so after Add or Delete the window would keep
+    # highlighting a row the form no longer has selected (and Delete would do
+    # nothing). Clearing that viewer's selection keeps the two in step.
+    @form_class = nil
+
+    def self.form_class
+      @form_class ||= Class.new(Lich::WebUI::ListSettingsForm) do
+        private
+
+        def render_field(tree, field, refs, **overrides)
+          ref = super
+          (@tables ||= {})[field[:key]] = ref if field && @lists.key?(field[:key])
+          ref
+        end
+
+        def change_list(key, action, event)
+          super
+          table = @tables&.[](key)
+          @page.set(table.cid, :selected, [], viewer: event.viewer_id) if table
+        end
+      end
+    end
+
     def initialize(settings)
       @owner = Script.current
       @settings = settings
       @version = ELoot.get_script_version
-      @closed = Queue.new
-      @saved = false
-      @tab = 0
       @status = ''
-      @entries = Hash.new('')
-      @entry_generation = Hash.new(0)
-      @selected = {}
       validate_settings
 
       # remove settings that doesn't exist
@@ -1054,7 +1092,7 @@ module ELoot # UI Setup
         @settings[:"#{type}_only_list"] = false if @settings[:"#{type}_everything_list"]
         @settings[:"#{type}_horde_locker_che"] = false if @settings[:"#{type}_horde_locker"]
       end
-      normalize_scrolls
+      normalize_scrolls(@settings[:sell_keep_scrolls])
     end
 
     # set default values if they don't exist and correct Integer, Float and String types if saved settings are wrong class
@@ -1079,121 +1117,171 @@ module ELoot # UI Setup
       end
     end
 
-    # Options this character cannot use.
+    # Options this character cannot use. Known spells don't change while the window is open.
     def unavailable
-      conditions = {
+      @unavailable ||= {
         loot_phase: Stats.prof != 'Sorcerer',
         skin_resolve: !Spell[9704].known?,
         sigil_determination_on_fail: !Spell[9716].known?,
         skin_604: !Spell[604].known?,
         sell_shroud: !Spell[1205].known? && !Spell[1212].known?,
         sell_aspect: !Spell[650].known?
-      }
-      conditions.select { |_, off| off }.keys
+      }.select { |_, off| off }.keys
     end
 
     # ---------------------------------------------------------- lifecycle --
 
+    # Opens the window and waits. Save & Close returns the edited settings, which
+    # are saved to the profile; Cancel or closing the window discards them.
     def start
+      result = form.show.wait
+      if result
+        apply(result)
+        ELoot.msg(type: "info", text: " Setup saved.")
+      else
+        ELoot.msg(type: "info", text: " Setup closed without saving.")
+      end
+    end
+
+    # The window, ready to show. Lists are edited on copies so Cancel discards them too.
+    def form
       setup = self
-      @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: title, props: { size: [900, 820] },
-                                   on: { close: ->(_ev) { setup.viewer_closed } }) do |ui|
-        setup.render(ui)
-      end
-      Lich::API.webui_refresh(@page)
-      Lich::API.webui_start
-      unless Lich::API.webui_open(page: @page)
-        ELoot.msg(type: "error", text: " Could not open a browser window for setup.")
-        ELoot.settings_cli_notice
-        return
-      end
-      @closed.pop
-      ELoot.msg(type: "info", text: " Setup closed WITHOUT saving. Use the Close button to save changes.") unless @saved
-    ensure
-      begin
-        Lich::WebUI.terminate_owner(@owner)
-      rescue StandardError
-        nil
-      end
+      @live = form_values
+      @drafts = LISTS.to_h { |key| [key, Array(@settings[key]).dup] }
+      @form = Setup.form_class.new(owner: @owner, id: PAGE_ID, title: title, values: @live, fields: fields,
+                                   lists: LISTS.to_h { |key| [key, list_spec(key)] },
+                                   normalize: ->(draft) { setup.normalize(draft) },
+                                   layout: ->(ui, field, save) { setup.layout(ui, field, save) },
+                                   props: { size: [900, 820] })
     end
 
-    def viewer_closed
-      @closed << :viewer
-    end
+    attr_reader :drafts
 
-    def on_close_clicked
+    def apply(result)
+      @settings.merge!(result)
       validate_settings
       ELoot.save_profile
-      @saved = true
-      Lich::WebUI.close(@page)
-      @closed << :close
     end
 
     def title
       "ELoot Setup v#{@version}"
     end
 
-    # Run a UI callback: contain errors, then re-render.
-    def act
-      yield
-    rescue StandardError => e
-      respond "ELoot setup: #{e.class}: #{e.message}"
-      respond e.backtrace.first(5).join("\n") if @settings[:debug]
-    ensure
-      Lich::API.webui_refresh(@page) if @page && !@saved
+    # ------------------------------------------------------ fields and values --
+
+    def shown_keys
+      @@categories.values_at(:loot, :boxes, :sell, :skin, :hoard).flat_map(&:keys).uniq - HIDDEN
     end
 
-    def cb(&block)
-      setup = self
-      ->(ev) { setup.act { block.call(ev) } }
+    def boolean?(key)
+      [true, false].include?(Setup.get_setting(key)[:default])
     end
 
-    # ------------------------------------------------------- state changes --
-
-    def set(key, value)
-      @settings[key] = value
+    def member_key(key, value)
+      :"#{key}-#{value.tr(' ', '_')}"
     end
 
-    def set_check(key, value)
-      @settings[key] = value
-      return unless value && EXCLUSIVE.key?(key)
-
-      @settings[EXCLUSIVE[key]] = false
-      uncheck(EXCLUSIVE[key])
+    # Exclusive pairs share a group name; SettingsForm unchecks the other half.
+    def exclusive_group(key)
+      EXCLUSIVE.key?(key) ? [key, EXCLUSIVE[key]].min : nil
     end
 
-    # A viewer keeps its own checked state across renders, so turning off the
-    # other half of a pair has to be pushed to the window.
-    def uncheck(key)
-      component = @page&.last_render&.tree&.each&.find { |node| node.type == :checkbox && node.props[:key].to_s == key.to_s }
-      @page.set(component.cid, :checked, false) if component
+    def fields
+      list = shown_keys.reject { |key| LISTS.include?(key) || MEMBERS.key?(key) }.map do |key|
+        if SPINS.key?(key)
+          max, step, digits = SPINS[key]
+          { key: key, type: :number_input, min: 0, max: max, step: step, digits: digits, stepper_buttons: true, align: :start }
+        elsif SELECTS.key?(key)
+          { key: key, type: :select, options: SELECTS[key].map { |value, text| { value: value, label: text } } }
+        elsif key.to_s.end_with?('_locker_name')
+          { key: key, type: :select, editable: true, options: locker_options, placeholder: 'Select Locker Location' }
+        elsif key == :overflow_containers
+          { key: key, type: :textarea, rows: 3 }
+        elsif boolean?(key)
+          { key: key, type: :checkbox, exclusive: exclusive_group(key) }.compact
+        else
+          { key: key, type: :text_input }
+        end
+      end
+      MEMBERS.each { |key, items| items.each { |value, _| list << { key: member_key(key, value), type: :checkbox } } }
+      list
     end
 
-    def set_number(key, value)
-      max, _step, digits = SPINS.fetch(key)
-      number = digits.zero? ? value.to_i : value.to_f
-      @settings[key] = number.clamp(0, max)
+    def form_values
+      shown_keys.each_with_object({}) do |key, values|
+        if MEMBERS.key?(key)
+          MEMBERS[key].each { |value, _| values[member_key(key, value)] = Array(@settings[key]).include?(value) }
+        elsif LISTS.include?(key)
+          values[key] = Array(@settings[key]).dup
+        elsif SPINS.key?(key)
+          values[key] = spin_value(key)
+        elsif SELECTS.key?(key)
+          values[key] = select_value(key)
+        elsif boolean?(key)
+          values[key] = @settings[key] ? true : false
+        else
+          values[key] = @settings[key].to_s.strip
+        end
+      end
     end
 
-    # Display value for a spinner. The contract refuses a value outside min..max.
+    # Display value for a spinner: inside min..max and on a step, as the contract requires.
     def spin_value(key)
-      max, _step, digits = SPINS.fetch(key)
+      max, step, digits = SPINS.fetch(key)
       number = digits.zero? ? @settings[key].to_i : @settings[key].to_f
-      number.clamp(0, max)
+      ((number.clamp(0, max) / step).round * step).round(digits)
     end
 
-    def toggle_member(key, value, on)
-      list = (@settings[key] ||= [])
-      list.delete(value)
-      return unless on
-
-      list.push(value)
-      list.uniq!
-      list.sort!
+    # A saved value that isn't one of the choices shows the first choice.
+    def select_value(key)
+      value = @settings[key].to_s
+      SELECTS.fetch(key).any? { |option, _| option == value } ? value : SELECTS.fetch(key).first.first
     end
 
-    def add_entry(key)
-      text = @entries[key].to_s.strip
+    # Turns the submitted window values back into settings. A number or choice the
+    # player left as displayed keeps its saved value, even one the window had to adjust.
+    def normalize(draft)
+      result = shown_keys.to_h do |key|
+        value =
+          if MEMBERS.key?(key)
+            known = MEMBERS[key].map(&:first)
+            (Array(@settings[key]) - known + known.select { |item| draft[member_key(key, item)] }).uniq.sort
+          elsif LISTS.include?(key)
+            Array(draft[key]).dup
+          elsif SPINS.key?(key)
+            number_setting(key, draft[key])
+          elsif SELECTS.key?(key)
+            draft[key] == select_value(key) ? @settings[key] : draft[key].to_s
+          elsif boolean?(key)
+            draft[key] ? true : false
+          else
+            draft[key].to_s.strip
+          end
+        [key, value]
+      end
+      unavailable.each { |key| result[key] = false }
+      result
+    end
+
+    def number_setting(key, value)
+      raise ArgumentError, "#{key} must be a number." unless value.is_a?(Numeric)
+      return @settings[key] if value == spin_value(key)
+
+      max, _step, digits = SPINS.fetch(key)
+      (digits.zero? ? value.round : value.to_f.round(digits)).clamp(0, max)
+    end
+
+    # ------------------------------------------------------------------ lists --
+
+    def list_spec(key)
+      setup = self
+      { columns: list_columns(key), rows: proc { setup.list_rows(key) }, value: proc { setup.drafts[key].dup },
+        add: ->(text) { setup.add_entry(key, text) }, delete: ->(index) { setup.delete_entry(key, index) },
+        clear_after_add: true }
+    end
+
+    def add_entry(key, text)
+      text = text.to_s.strip
       return if text.empty?
 
       if key == :sell_keep_scrolls
@@ -1204,34 +1292,26 @@ module ELoot # UI Setup
         end
       end
 
-      list = (@settings[key] ||= [])
+      list = @drafts[key]
       list.push(text) unless list.map(&:to_s).include?(text)
-      sort_list(key)
-      @entries.delete(key)
-      @entry_generation[key] += 1 # a new input key is what clears the viewer's typed text
-      @selected.delete(key)
+      sort_list(key, list)
       @status = ''
     end
 
-    def delete_entry(key)
-      row = @selected[key]
-      return if row.nil?
-
-      @settings[key].delete_at(row.delete_prefix('row-').to_i)
-      sort_list(key)
-      @selected.delete(key)
+    def delete_entry(key, index)
+      @drafts[key].delete_at(index)
+      sort_list(key, @drafts[key])
     end
 
-    def sort_list(key)
-      return normalize_scrolls if key == :sell_keep_scrolls
+    def sort_list(key, list)
+      return normalize_scrolls(list) if key == :sell_keep_scrolls
 
-      @settings[key].uniq!
-      @settings[key].sort_by!(&:to_s)
+      list.uniq!
+      list.sort_by!(&:to_s)
     end
 
     # Numeric order, plain before vibrant. Entries without a spell number can't be used.
-    def normalize_scrolls
-      list = @settings[:sell_keep_scrolls]
+    def normalize_scrolls(list)
       return unless list.is_a?(Array)
 
       list.select! { |entry| entry.to_s.match?(/^\d+/) }
@@ -1249,41 +1329,57 @@ module ELoot # UI Setup
 
     def list_rows(key)
       if key == :sell_keep_scrolls
-        return @settings[key].each_with_index.map do |entry, index|
+        return @drafts[key].map do |entry|
           spell = Spell[entry.to_s[/^\d+/]]
-          { key: "row-#{index}", cells: { 'number' => (spell ? spell.num : entry.to_s[/^\d+/]).to_s, 'name' => (spell ? spell.name : '').to_s,
-                                          'vibrant' => entry.to_s.match?(/v/i) ? 'Vibrant' : '' } }
+          { 'number' => (spell ? spell.num : entry.to_s[/^\d+/]).to_s, 'name' => (spell ? spell.name : '').to_s,
+            'vibrant' => entry.to_s.match?(/v/i) ? 'Vibrant' : '' }
         end
       end
 
-      @settings[key].each_with_index.map { |entry, index| { key: "row-#{index}", cells: { 'entry' => entry.to_s } } }
+      @drafts[key].map { |entry| { 'entry' => entry.to_s } }
     end
 
-    def list_columns(key, title)
-      return [{ key: 'entry', label: title, expand: true }] unless key == :sell_keep_scrolls
+    def list_columns(key)
+      return [{ key: 'entry', label: 'Entry', expand: true }] unless key == :sell_keep_scrolls
 
       [{ key: 'number', label: 'Spell Number' }, { key: 'name', label: 'Spell Name', expand: true }, { key: 'vibrant', label: 'Vibrant' }]
     end
 
-    def select_row(key, row)
-      if row.nil?
-        @selected.delete(key)
-      else
-        @selected[key] = row.to_s
-      end
+    # ---------------------------------------------------------- live gating --
+
+    # Controls that enable or disable others re-render the window when changed.
+    # The draft stays in the window; @live only tracks what those rules read.
+    def gate(key)
+      return {} unless GATES.include?(key)
+
+      setup = self
+      { on: { change: ->(ev) { setup.gate_changed(key, ev.payload[:value] ? true : false) } } }
     end
 
-    def set_entry(key, text)
-      @entries[key] = text.to_s
+    def gate_changed(key, value)
+      @live[key] = value
+      if value && EXCLUSIVE.key?(key)
+        @live[EXCLUSIVE[key]] = false # SettingsForm unchecks the other half, which re-renders
+      else
+        Lich::WebUI.refresh(@form.page)
+      end
     end
 
     # ------------------------------------------------------------- render --
 
-    def render(ui)
+    def control(ui, key, **props)
+      @field.call(ui, key, **props)
+    end
+
+    attr_reader :refs
+
+    def layout(ui, field, save)
       setup = self
+      @field = field
+      @refs = {}
       ui.presentation(always_on_top: true)
       ui.stack(key: 'main', gap: 8, margin: 8) do
-        ui.tabs(key: 'tabs', names: TABS, selected: setup.tab, on: { select: ->(ev) { setup.tab = ev.payload[:index] } }) do
+        ui.tabs(key: 'tabs', names: TABS, selected: 0, on: { select: ->(_ev) {} }) do
           ui.stack(slot: TABS[0], key: 'tab-looting', gap: 8) { setup.render_looting(ui) }
           ui.stack(slot: TABS[1], key: 'tab-looting-grid', gap: 8) { setup.render_looting_grid(ui) }
           ui.stack(slot: TABS[2], key: 'tab-boxes', gap: 8) { setup.render_boxes(ui) }
@@ -1294,10 +1390,8 @@ module ELoot # UI Setup
           ui.stack(slot: TABS[7], key: 'tab-alchemy', gap: 8) { setup.render_hoard(ui, :alchemy) }
         end
       end
-      render_footer(ui)
+      render_footer(ui, save)
     end
-
-    attr_accessor :tab
 
     def render_looting(ui)
       setup = self
@@ -1320,16 +1414,15 @@ module ELoot # UI Setup
             setup.render_check(ui, :sigil_determination_on_fail, 'Sigil of Determination(?)', tip: 'Will use Sigil of Determination if you fail to loot because you are too injured.')
           end
           ui.stack(slot: '2', key: 'loot-other-right', gap: 4) do
-            setup.render_select(ui, :loot_stance, 'Loot stance(?)', STANCES, tip: 'Stance to swap to before looting. No change leaves your stance alone.')
+            setup.render_select(ui, :loot_stance, 'Loot stance(?)', tip: 'Stance to swap to before looting. No change leaves your stance alone.')
             setup.render_entry(ui, :charm_name, 'Fossil Charm Name', hint: 'Originally from Mushroom Spore Giftbox 07/29/2023')
           end
         end
       end
       ui.columns(key: 'loot-containers', count: 2, gap: 8, row_align: :stretch) do
         ui.group(slot: '0', key: 'loot-overflow', label: 'Overflow Containers') do
-          ui.textarea(key: 'overflow_containers', label: '(comma-separated)', value: setup.settings[:overflow_containers].to_s.strip, rows: 3,
-                      tooltip: 'Enter comma-separated names of your overflow containers (e.g., "rucksack, cloak, orange pack"). These containers will be used in order when the targeted STOW container is full.',
-                      on: { change: ->(ev) { setup.set(:overflow_containers, ev.payload[:value].to_s.strip) } })
+          setup.control(ui, :overflow_containers, label: '(comma-separated)',
+                                                  tooltip: 'Enter comma-separated names of your overflow containers (e.g., "rucksack, cloak, orange pack"). These containers will be used in order when the targeted STOW container is full.')
         end
         ui.group(slot: '1', key: 'loot-coins', label: 'Weightless Coin Containers') do
           setup.render_entry(ui, :coin_hand_name, 'Coin Bag / Coin Hand / Gambling Kit', hint: 'Name of item')
@@ -1353,8 +1446,8 @@ module ELoot # UI Setup
 
     def render_boxes(ui)
       setup = self
-      pool = @settings[:sell_locksmith_pool] ? true : false
-      both = pool && @settings[:sell_locksmith] ? true : false
+      pool = @live[:sell_locksmith_pool] ? true : false
+      both = pool && @live[:sell_locksmith] ? true : false
       ui.columns(key: 'boxes-top', count: 2, gap: 8, row_align: :stretch) do
         ui.stack(slot: '0', key: 'boxes-left', gap: 8) do
           ui.group(key: 'boxes-locksmith', label: 'Locksmithing') do
@@ -1370,8 +1463,8 @@ module ELoot # UI Setup
             setup.render_check(ui, :locksmith_when_gem_bounty, 'Default to using locksmith when gem bounty active')
             ui.columns(key: 'boxes-locksmith-3', count: 2, gap: 8, row_align: :start) do
               setup.render_spin(ui, :locksmith_withdraw_amount, 'Bank Withdraw Amount', slot: '0', tip: 'How much to withdraw from the bank before going to the town locksmith.')
-              setup.render_select(ui, :locksmith_priority, 'Locksmith Priority', LOCKSMITH_PRIORITIES, slot: '1', off: !both,
-                                  tip: 'Only used when both "Use locksmith pool" and "Use town locksmith" are checked. Whichever is chosen runs first; the other picks up whatever it couldn\'t take.')
+              setup.render_select(ui, :locksmith_priority, 'Locksmith Priority', slot: '1', off: !both,
+                                                                                 tip: 'Only used when both "Use locksmith pool" and "Use town locksmith" are checked. Whichever is chosen runs first; the other picks up whatever it couldn\'t take.')
             end
           end
           ui.group(key: 'boxes-standard', label: 'Standard Pool Tipping') do
@@ -1393,8 +1486,10 @@ module ELoot # UI Setup
           end
           ui.stack(slot: '1', key: 'boxes-incremental-right', gap: 8) do
             ui.text(key: 'boxes-formula', wrap: true, content: TIPPING_NOTES)
+            # Previews the values in the window, saved or not; it never saves.
+            inputs = %i[base_tip max_tip alpha_rate].map { |key| setup.refs.fetch(key) }
             ui.button(key: 'tipping_test', label: 'Test Formula Values', tooltip: 'Prints a sample distribution to the screen.', disabled: !pool, align: :start,
-                      on: { activate: setup.cb { setup.tipping_test } })
+                      submit: inputs, on: { activate: ->(ev) { setup.tipping_preview(inputs.map { |input| ev.submission[input.cid] }) } })
           end
         end
       end
@@ -1465,7 +1560,7 @@ module ELoot # UI Setup
 
     def render_skinning(ui)
       setup = self
-      off = !@settings[:skin_enable]
+      off = !@live[:skin_enable]
       ui.group(key: 'skin-settings', label: 'Settings') do
         ui.columns(key: 'skin-checks', count: 5, gap: 8) do
           setup.render_check(ui, :skin_enable, 'Enable skinning', slot: '0')
@@ -1497,9 +1592,9 @@ module ELoot # UI Setup
     def render_hoard(ui, type)
       setup = self
       labels = HOARD_LABELS.fetch(type)
-      off = !@settings[:"#{type}_horde"]
-      public_locker = @settings[:"#{type}_horde_locker"]
-      house_locker = @settings[:"#{type}_horde_locker_che"]
+      off = !@live[:"#{type}_horde"]
+      public_locker = @live[:"#{type}_horde_locker"]
+      house_locker = @live[:"#{type}_horde_locker_che"]
       ui.group(key: "#{type}-general", label: 'General Settings') do
         ui.columns(key: "#{type}-general-cols", count: 2, gap: 8, row_align: :start) do
           ui.stack(slot: '0', key: "#{type}-general-left", gap: 4) do
@@ -1510,9 +1605,7 @@ module ELoot # UI Setup
           end
           ui.stack(slot: '1', key: "#{type}-general-right", gap: 4) do
             setup.render_check(ui, :"#{type}_horde_locker", labels[:public_locker], off: off)
-            ui.select(key: "#{type}_locker_name", editable: true, options: setup.locker_options, placeholder: 'Select Locker Location',
-                      value: setup.settings[:"#{type}_locker_name"].to_s, disabled: off || !public_locker,
-                      on: { change: ->(ev) { setup.set(:"#{type}_locker_name", ev.payload[:value].to_s.strip) } })
+            setup.control(ui, :"#{type}_locker_name", disabled: off || !public_locker)
             setup.render_check(ui, :"#{type}_horde_locker_che", labels[:house_locker], off: off)
             setup.render_inline_entry(ui, :"#{type}_horde_che_rooms", 'Locations(?)', off: off || !house_locker, tip: LOCATION_TIP, hint: "Comma separated list of room #'s OUTSIDE the locker")
             setup.render_inline_entry(ui, :"#{type}_horde_che_entry", 'Entry Verb', off: off || !house_locker, hint: 'go arch or tap panel or other')
@@ -1523,7 +1616,7 @@ module ELoot # UI Setup
       ui.group(key: "#{type}-containers", label: labels[:containers_title]) do
         ui.columns(key: "#{type}-containers-cols", count: 2, weights: [2, 1], gap: 8, row_align: :center) do
           ui.stack(slot: '0', key: "#{type}-containers-left") do
-            setup.render_members(ui, :"#{type}_horde_containers", [['default', 'Default'], labels[:container_type]], off: off, columns: 2)
+            setup.render_members(ui, :"#{type}_horde_containers", MEMBERS.fetch(:"#{type}_horde_containers"), off: off, columns: 2)
           end
           setup.render_check(ui, :"#{type}_horde_use_overflow", 'Use All Overflow Containers', slot: '1', off: off)
         end
@@ -1532,26 +1625,31 @@ module ELoot # UI Setup
         ui.columns(key: "#{type}-list-tables", count: 2, gap: 8, row_align: :start) do
           ui.stack(slot: '0', key: "#{type}-list-left", gap: 4) do
             setup.render_check(ui, :"#{type}_everything_list", labels[:everything], off: off)
-            setup.render_list(ui, :"#{type}_everything", 'Exclude', off: off || !setup.settings[:"#{type}_everything_list"], hint: labels[:exclude_hint])
+            setup.render_list(ui, :"#{type}_everything", 'Exclude', off: off || !setup.live[:"#{type}_everything_list"], hint: labels[:exclude_hint])
           end
           ui.stack(slot: '1', key: "#{type}-list-right", gap: 4) do
             setup.render_check(ui, :"#{type}_only_list", labels[:only], off: off)
-            setup.render_list(ui, :"#{type}_list", 'Only these', off: off || !setup.settings[:"#{type}_only_list"], hint: labels[:include_hint])
+            setup.render_list(ui, :"#{type}_list", 'Only these', off: off || !setup.live[:"#{type}_only_list"], hint: labels[:include_hint])
           end
         end
       end
     end
 
-    def render_footer(ui)
+    attr_reader :live
+
+    def render_footer(ui, save)
       setup = self
       ui.divider(key: 'footer-div')
-      ui.columns(key: 'footer', count: 2, weights: [5, 1], compact: true, row_align: :center, margin: 6) do
+      ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, margin: 6) do
         ui.text(slot: '0', key: 'footer-text', wrap: true,
-                content: "#{setup.status.empty? ? '' : "#{setup.status}    "}To save, exit with the Close button, not the window's X.")
-        ui.button(slot: '1', key: 'close', label: 'Close', variant: :primary,
-                  tooltip: 'Save the settings to your eloot profile and close this window.',
-                  on: { activate: setup.cb { setup.on_close_clicked } })
+                content: "#{setup.status.empty? ? '' : "#{setup.status}    "}Save & Close saves your settings. Cancel or closing the window discards your changes.")
+        ui.button(slot: '1', key: 'cancel', label: 'Cancel', tooltip: 'Close this window without saving.', on: { activate: ->(_ev) { setup.cancel } })
+        save.call(ui, slot: '2', variant: :primary, tooltip: 'Save the settings to your eloot profile and close this window.')
       end
+    end
+
+    def cancel
+      @form.close
     end
 
     # --------------------------------------------------------- render parts --
@@ -1565,10 +1663,7 @@ module ELoot # UI Setup
     end
 
     def render_check(ui, key, label, slot: nil, off: false, tip: nil)
-      setup = self
-      ui.checkbox(key: key.to_s, label: label, checked: @settings[key] ? true : false, disabled: off || unavailable.include?(key),
-                  **place(slot), **tip_for(tip),
-                  on: { change: setup.cb { |ev| setup.set_check(key, ev.payload[:value] ? true : false) } })
+      control(ui, key, label: label, disabled: off || unavailable.include?(key), **place(slot), **tip_for(tip), **gate(key))
     end
 
     # Checkboxes over one array setting. items: [stored value, label]
@@ -1577,19 +1672,14 @@ module ELoot # UI Setup
       items.each_slice(columns).with_index do |group, row|
         ui.columns(key: "#{key}-#{row}", count: columns, gap: 8) do
           group.each_with_index do |(value, label), column|
-            ui.checkbox(slot: column.to_s, key: "#{key}-#{value.tr(' ', '_')}", label: label,
-                        checked: Array(setup.settings[key]).include?(value), disabled: off, **setup.tip_for(tips[value]),
-                        on: { change: setup.cb { |ev| setup.toggle_member(key, value, ev.payload[:value] ? true : false) } })
+            setup.control(ui, setup.member_key(key, value), slot: column.to_s, label: label, disabled: off, **setup.tip_for(tips[value]))
           end
         end
       end
     end
 
     def render_entry(ui, key, label, slot: nil, off: false, tip: nil, hint: nil)
-      setup = self
-      ui.text_input(key: key.to_s, label: label, value: @settings[key].to_s.strip, change_mode: :input, disabled: off,
-                    **place(slot), **tip_for(tip), **hint_for(hint),
-                    on: { change: ->(ev) { setup.set(key, ev.payload[:value].to_s.strip) } })
+      control(ui, key, label: label, disabled: off, **place(slot), **tip_for(tip), **hint_for(hint))
     end
 
     # A text box with its label beside it instead of above it.
@@ -1597,9 +1687,7 @@ module ELoot # UI Setup
       setup = self
       ui.columns(key: "#{key}-row", count: 2, weights: [1, 4], gap: 8, compact: true, row_align: :center) do
         ui.text(slot: '0', key: "#{key}-label", content: label, **setup.tip_for(tip))
-        ui.text_input(slot: '1', key: key.to_s, value: setup.settings[key].to_s.strip, change_mode: :input, disabled: off,
-                      **setup.tip_for(tip), **setup.hint_for(hint),
-                      on: { change: ->(ev) { setup.set(key, ev.payload[:value].to_s.strip) } })
+        setup.control(ui, key, slot: '1', disabled: off, **setup.tip_for(tip), **setup.hint_for(hint))
       end
     end
 
@@ -1608,46 +1696,39 @@ module ELoot # UI Setup
     end
 
     def render_spin(ui, key, label, slot: nil, off: false, tip: nil)
-      setup = self
-      max, step, digits = SPINS.fetch(key)
-      ui.number_input(key: key.to_s, label: label, value: spin_value(key), min: 0, max: max, step: step, digits: digits,
-                      stepper_buttons: true, disabled: off, align: :start, **place(slot), **tip_for(tip),
-                      on: { change: ->(ev) { setup.set_number(key, ev.payload[:value]) } })
+      @refs[key] = control(ui, key, label: label, disabled: off, **place(slot), **tip_for(tip))
     end
 
-    def render_select(ui, key, label, items, slot: nil, off: false, tip: nil)
-      setup = self
-      ui.select(key: key.to_s, label: label, value: @settings[key].to_s, disabled: off, **place(slot), **tip_for(tip),
-                options: items.map { |value, text| { value: value, label: text } },
-                on: { change: setup.cb { |ev| setup.set(key, ev.payload[:value].to_s) } })
+    def render_select(ui, key, label, slot: nil, off: false, tip: nil)
+      control(ui, key, label: label, disabled: off, **place(slot), **tip_for(tip))
     end
 
-    # An add/delete list: Add, entry box and Delete in a row, above the table.
+    # An add/delete list: entry box, Add and Delete in a row, above the table.
+    # The entry comes first because Add submits it.
     def render_list(ui, key, title, slot: nil, off: false, tip: nil, hint: 'Add an entry', height: 200)
       setup = self
-      rows = list_rows(key)
-      selected = rows.any? { |row| row[:key] == @selected[key] } ? [@selected[key]] : []
-      generation = @entry_generation[key]
       ui.group(key: "#{key}-box", label: title, **place(slot), **tip_for(tip)) do
-        ui.columns(key: "#{key}-controls", count: 3, weights: [1, 3, 1], gap: 4, compact: true, row_align: :center) do
-          ui.button(slot: '0', key: "#{key}-add", label: 'Add', disabled: off, on: { activate: setup.cb { setup.add_entry(key) } })
-          ui.text_input(slot: '1', key: "#{key}-entry-#{generation}", value: setup.entries[key].to_s, change_mode: :input, disabled: off,
-                        placeholder: hint,
-                        on: { change: ->(ev) { setup.set_entry(key, ev.payload[:value]) },
-                              submit: setup.cb { setup.add_entry(key) } })
-          ui.button(slot: '2', key: "#{key}-delete", label: 'Delete', disabled: off, on: { activate: setup.cb { setup.delete_entry(key) } })
+        ui.columns(key: "#{key}-controls", count: 3, weights: [3, 1, 1], gap: 4, compact: true, row_align: :center) do
+          setup.control(ui, :"#{key}_entry", slot: '0', placeholder: hint, disabled: off)
+          setup.control(ui, :"#{key}_add", slot: '1', label: 'Add', disabled: off)
+          setup.control(ui, :"#{key}_delete", slot: '2', label: 'Delete', disabled: off)
         end
-        ui.table(key: "#{key}-table", columns: setup.list_columns(key, title), rows: rows, headers: key == :sell_keep_scrolls,
-                 selection: :single, selected: selected, min_height: height, max_height: height, disabled: off,
-                 on: { selection_change: ->(ev) { setup.select_row(key, Array(ev.payload[:rows]).first) } })
+        setup.control(ui, key, headers: key == :sell_keep_scrolls, min_height: height, max_height: height, disabled: off)
       end
     end
 
-    attr_reader :entries
+    # --------------------------------------------------------- other output --
+
+    def tipping_preview(values)
+      base_tip, max_tip, alpha_rate = values
+      tipping_test(base_tip, max_tip, alpha_rate)
+    rescue StandardError => e
+      respond "ELoot setup: #{e.class}: #{e.message}"
+    end
 
     # --------------------------------------------------------- other output --
 
-    def tipping_test
+    def tipping_test(base_tip = @settings[:base_tip], max_tip = @settings[:max_tip], alpha_rate = @settings[:alpha_rate])
       rows = []
       rows << [{ value: "Box depositing starts at 1", colspan: 4, alignment: :center }]
       rows << :separator
@@ -1667,16 +1748,16 @@ module ELoot # UI Setup
         first_item = "#{first_half[i]}  "
         second_item = "#{second_half[i]}  "
 
-        tip_1 = first_item ? Sell.locksmith_tip(first_item, @settings[:base_tip], @settings[:max_tip], @settings[:alpha_rate]) : nil
+        tip_1 = first_item ? Sell.locksmith_tip(first_item, base_tip, max_tip, alpha_rate) : nil
         tip_1 = tip_1.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
-        tip_1 = i == 0 ? @settings[:base_tip].to_i.round(0).to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse : tip_1
+        tip_1 = i == 0 ? base_tip.to_i.round(0).to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse : tip_1
 
-        tip_2 = !second_item.strip.empty? ? Sell.locksmith_tip(second_item, @settings[:base_tip], @settings[:max_tip], @settings[:alpha_rate]) : nil
+        tip_2 = !second_item.strip.empty? ? Sell.locksmith_tip(second_item, base_tip, max_tip, alpha_rate) : nil
         tip_2 = tip_2.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
 
         rows << [first_item, tip_1, second_item, tip_2]
       end
-      alpha = @settings[:alpha_rate].to_f.round(1)
+      alpha = alpha_rate.to_f.round(1)
       table = Terminal::Table.new :title => "Incremental Tipping (alpha: #{alpha})", :rows => rows
       (0..3).each do |i|
         table.align_column(i, :right)
