@@ -699,6 +699,12 @@ module GS4Analytics
         end
       end
 
+      def record_pool(who, npc, boxes, waiting, full, town, at: Time.now.to_i)
+        db[:pool_depth].insert_conflict(:replace)
+                       .insert(clean(game: who.game, character: who.name, timestamp: at, full: full ? 1 : 0, town: town,
+                                     npc: npc, boxes: boxes, waiting: waiting))
+      end
+
       def record_kill(who, creature, profile, silver, at: Time.now.to_i, boxes: 0)
         kills = Sequel[:kill_stats]
         db[:kill_stats].insert_conflict(
@@ -1290,6 +1296,22 @@ module GS4Analytics
           index %i[game character start_time]
         end
 
+        # The locksmith pool: how many of a character's boxes it held each time
+        # it listed them (boxes, and how many were still waiting), and each box
+        # it turned away for holding all it will for the character (full = 1,
+        # no count)
+        db.create_table?(:pool_depth) do
+          String :game, null: false
+          String :character, null: false
+          Integer :timestamp, null: false
+          Integer :full, null: false, default: 0
+          String :town
+          String :npc
+          Integer :boxes
+          Integer :waiting
+          primary_key %i[game character timestamp full]
+        end
+
         db.create_table?(:metadata) do
           String :key, primary_key: true
           String :value
@@ -1621,6 +1643,12 @@ module GS4Analytics
         visit && visit.merge(town: town_of(visit[:room]))
       end
 
+      # The town a room is in, as a visit names it; nil for no room. Walks the
+      # map the first time for a room, so call it off the game-text thread.
+      def town_at(room)
+        room && town_of(room)
+      end
+
       private
 
       def shop_here
@@ -1693,6 +1721,19 @@ module GS4Analytics
     # Paid at a town's debt collector: 'The town clerk says, "Looks like 265 silvers clears up all your debts in Solhaven.'
     DEBTS_RE = /\AThe town clerk says, "Looks like ([\d,]+) silvers? clears? up all your debts\b/
     PROMPT_RE = /<prompt/
+    # The locksmith pool's list of your boxes (ASK <worker> FOR RETURN, as eloot
+    # does): 'The worker says, "Pickasso, here's the list of boxes we have for
+    # you."', then " 1.  A scratched white oak box about a minute ago for 750
+    # silvers." and "     It is waiting to be worked on." for each. Named, so
+    # another player's list in the room isn't taken for yours.
+    POOL_LIST_RE   = /\A(?:The )?(?<npc>[^,"]+?) says, "(?<name>[^,"]+), here's the list of boxes we have for you\./
+    POOL_BOX_RE    = /\A\s*\d+\.\s+.+ for [\d,]+ silvers?\.\s*\z/
+    POOL_STATUS_RE = /\A\s{3,}It (?<waiting>is waiting to be worked on)?/
+    # A box turned away, the pool holding all it will for you. The worker says
+    # it to the room, so it's yours only straight after your own offer.
+    POOL_FULL_RE   = /\A(?:The )?(?<npc>[^,"]+?) says, "Sorry, we're already holding as many boxes for you as we can\./
+    SCRIPT_NOTE_RE = /\A\[[\w\/.-]+(?::|\]>)/ # "[tsquelch3: End Squelching!]", "[eloot]>ask ..."
+    POOL_OFFER_RE  = /\AYou want a locksmith to open .+ for a tip of [\d,]+ silvers?\./
     # Your own fossil charm only: another character's ends "returning to him/her".
     # Pointed at a box, it reads "in search of silvers inside <box>.  They locate
     # a pile of 1,307 coins" (or a heap, or a stack): box silver. Rubbed, "in
@@ -1910,10 +1951,45 @@ module GS4Analytics
           read_expense(text)
         end
         read_bank(text) if Settings.current[:parse_bank]
+        read_pool(text)
         line
       rescue StandardError => e
         Log.error('silver hook', e)
         line
+      end
+
+      # How many of your boxes the locksmith pool holds: counted from its list,
+      # which ends at the first line that isn't a box or a box's status
+      def read_pool(text)
+        if @pool_list
+          if text.match?(POOL_BOX_RE)
+            @pool_list[:boxes] += 1
+            return
+          elsif (found = text.match(POOL_STATUS_RE))
+            @pool_list[:waiting] += 1 if found[:waiting]
+            return
+          elsif text.match?(SCRIPT_NOTE_RE)
+            return # another script's note, printed in the middle of the list
+          end
+          list = @pool_list
+          @pool_list = nil
+          record_pool(list[:npc], list[:boxes], list[:waiting], full: false, at: list[:at])
+        end
+        if (found = text.match(POOL_LIST_RE))
+          @pool_list = { npc: found[:npc], boxes: 0, waiting: 0, at: Time.now.to_i } if found[:name] == @who&.name
+        elsif text.match?(POOL_OFFER_RE)
+          @pool_offer_at = Time.now.to_i
+        elsif (found = text.match(POOL_FULL_RE)) && @pool_offer_at && Time.now.to_i - @pool_offer_at <= 10
+          @pool_offer_at = nil
+          record_pool(found[:npc], nil, nil, full: true)
+        end
+      end
+
+      def record_pool(npc, boxes, waiting, full:, at: Time.now.to_i)
+        who = @who
+        room = Util.safely { Room.current }
+        Database.async { Database.record_pool(who, npc, boxes, waiting, full, ShopWatcher.town_at(room), at: at) }
+        Log.debug(full ? 'Locksmith pool: full, box turned away' : "Locksmith pool: #{boxes} of your boxes")
       end
 
       # A vendor buying an item: one silver event and one item sale. A gem

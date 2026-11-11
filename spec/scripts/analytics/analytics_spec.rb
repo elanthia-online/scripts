@@ -511,6 +511,12 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'the locksmith pool' do
+    it 'counts our boxes from its list, ignoring other scripts\' notes, and a box of ours turned away for a full pool' do
+      expect(result('pool')['pool']).to eq([['worker', 3, 2, 0], ['worker', nil, nil, 1]])
+    end
+  end
+
   describe 'combat' do
     subject(:combat) { result('combat') }
 

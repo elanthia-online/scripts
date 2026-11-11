@@ -1983,6 +1983,36 @@ when 'shops'
   result = { 'open' => open_visit && open_visit.transform_keys(&:to_s), 'visits' => visits.map(&:values), 'off' => off,
              'sales' => sales.map(&:values), 'raced' => raced }
 
+when 'pool'
+  # The locksmith pool's list of our boxes, as eloot asks for it, and a box turned away
+  A::Database.connect!
+  A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  feed = ->(*lines) { lines.each { |line| DownstreamHook.run("#{line}\r\n") } }
+  feed.call('The worker says, "We don\'t have any boxes ready for you."',
+            'The worker says, "Splinter, here\'s the list of boxes we have for you."',
+            ' 1.  A scratched white oak box about a minute ago for 750 silvers.',
+            '     It is waiting to be worked on.',
+            ' 2.  A battered tanik strongbox about 20 minutes ago for 750 silvers.',
+            '[tsquelch3: End Squelching!]',
+            '     It is waiting to be worked on.',
+            '10.  An iron-bound maple chest a few days ago for 750 silvers.',
+            '     It has been opened.',
+            '<prompt time="1794300000">&gt;</prompt>',
+            # Another player's list, and another player's box turned away: not ours
+            'The worker says, "April, here\'s the list of boxes we have for you."',
+            ' 1.  A plain maple trunk about an hour ago for 750 silvers.',
+            '     It is waiting to be worked on.',
+            'The worker says, "Sorry, we\'re already holding as many boxes for you as we can."')
+  sleep 1.1 # a second apart, as the game is
+  feed.call('You want a locksmith to open a riveted white oak trunk for a tip of 750 silvers.  There is also a fee of 1,803 silvers ' \
+            'due up front, totaling 2,553 silvers.  You will need that amount on you or in a local bank.',
+            'Please GIVE WORKER 750 CONFIRM to the worker to proceed.',
+            'The worker says, "Sorry, we\'re already holding as many boxes for you as we can."')
+  sleep 0.3
+  A::Database.flush
+  result = { 'pool' => A::Database.all('SELECT npc, boxes, waiting, full FROM pool_depth ORDER BY timestamp, full').map(&:values) }
+
 when 'combat'
   # A recorder file as Lich's Combat::Recorder lays it out (the columns the
   # summary reads), with one hunt today and one that ended three weeks ago
