@@ -3686,7 +3686,7 @@ module LogSpecHarness::Env
 
           run_logger(GameLogger::Opts.parse(['--compress-after=30']), io)
           args, kw = Timeout.timeout(2) { calls.pop }
-          sleep 0.05 until io.echoes.size >= 2
+          Timeout.timeout(2) { sleep 0.05 until io.echoes.size >= 2 }
 
           expect(args).to eq([run_folder, Date.new(2026, 10, 2)])
           expect(kw).to eq(now: clock_time.first)
@@ -3782,7 +3782,7 @@ module LogSpecHarness::Env
           io = io_class.new(['line 1'])
 
           run_logger(GameLogger::Opts.parse(['--compress-after=0']), io)
-          sleep 0.05 until io.echoes.size >= 2
+          Timeout.timeout(2) { sleep 0.05 until io.echoes.size >= 2 }
 
           expect(io.echoes).to include('compressed 3 log files dated before today: 3 MB down to 300 KB.')
         end
