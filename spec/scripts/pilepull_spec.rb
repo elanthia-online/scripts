@@ -22,6 +22,7 @@
 # bug fail loudly instead of silently undercounting again.
 
 require_relative '../spec_helper'
+require 'zlib'
 require 'tmpdir'
 require 'fileutils'
 
@@ -1013,6 +1014,17 @@ RSpec.describe 'pilepull.lic reward tracking' do
 
         expect(log_scan.relevant_log_paths(tmp_dir)).to eq(in_window.sort)
       end
+
+      # log.lic 1.7.0's --compress-after gzips old logs in place.
+      it 'keeps gzipped logs too, and only the plain file when both forms exist' do
+        gz_only = File.join(tmp_dir, '2026-03-02_10-00-00.log.gz')
+        Zlib::GzipWriter.open(gz_only) { |gz| gz.write('') }
+        plain = write_log('2026-03-03_10-00-00.log', '')
+        Zlib::GzipWriter.open("#{plain}.gz") { |gz| gz.write('') }
+        Zlib::GzipWriter.open(File.join(tmp_dir, '2026-01-15_00-00-01.log.gz')) { |gz| gz.write('') }  # outside any window
+
+        expect(log_scan.relevant_log_paths(tmp_dir)).to eq([gz_only, plain].sort)
+      end
     end
 
     describe 'scan_file' do
@@ -1098,6 +1110,28 @@ RSpec.describe 'pilepull.lic reward tracking' do
         write_log('README.log', "18:58:21: You pull a glowing orb from within!\n")
 
         expect { log_scan.scan_file(File.join(tmp_dir, 'README.log'), 'Pickasso', totals) }.not_to raise_error
+        expect(totals).to be_empty
+      end
+
+      it 'reads a gzipped log (log.lic --compress-after) like a plain one, invalid bytes included' do
+        path = File.join(tmp_dir, '2026-03-01_15-47-17.log.gz')
+        Zlib::GzipWriter.open(path) do |gz|
+          gz.write("18:58:20: #{[0xFF, 0xFE].pack('C*')}garbled text\n")
+          gz.write("18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!\n")
+        end
+
+        expect { log_scan.scan_file(path, 'Pickasso', totals) }.not_to raise_error
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:items][['rare', 'glowing orb']]).to eq(1)
+      end
+
+      it 'notes a damaged gzipped log and moves on instead of raising' do
+        path = File.join(tmp_dir, '2026-03-01_15-47-17.log.gz')
+        File.binwrite(path, 'not gzip')
+
+        expect { log_scan.scan_file(path, 'Pickasso', totals) }.not_to raise_error
+        expect(log_scan.echoed.join).to match(/could not read log/)
         expect(totals).to be_empty
       end
 
