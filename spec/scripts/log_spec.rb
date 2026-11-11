@@ -10,6 +10,7 @@ module XMLData
   def self.name;       "TestChar";      end
   def self.room_id;    1234;            end
   def self.room_title; "[Town Square]"; end
+  def self.room_count = 0
 end
 
 module Lich
@@ -657,6 +658,446 @@ RSpec.describe GameLogger do
         run_main
 
         expect(log_lines.last).to eq('>look')
+      end
+    end
+
+    # R-05, R-07, R-18, R-19, R-34: --rnum and --exclude take the room from
+    # XMLData and the map's UID table only (Q-13 A), never from
+    # Room.current or Map.current, which can send LOCATION/PEER from the
+    # logger and rescan the whole map on every line.
+    describe 'room lookups for --rnum and --exclude' do
+      # The parser's room as the logger sees it when it reads a line. A Hash
+      # fed between lines moves the parser to another room (see the get stub).
+      let(:room) { { game: 'GSIV', count: 1, uid: 4_216_015, title: '[Sanctum of Scales, Columns]' } }
+      # UID => Lich ids, as Map.ids_from_uid answers from the map's UID table.
+      let(:uid_table) { {} }
+      # Strict doubles: any call other than Map.ids_from_uid and Map.loaded?
+      # (the map is loaded unless an example says otherwise) fails the example.
+      let(:map) { double('Map') }
+      let(:room_class) { double('Room') }
+
+      before do
+        $reget_lines = []
+        stub_const('Map', map)
+        stub_const('Room', room_class)
+        allow(map).to receive(:ids_from_uid) { |uid| uid_table.fetch(uid, []) }
+        allow(map).to receive(:loaded?).and_return(true)
+        allow(XMLData).to receive(:game) { room[:game] }
+        allow(XMLData).to receive(:room_count) { room[:count] }
+        allow(XMLData).to receive(:room_id) { room[:uid] }
+        allow(XMLData).to receive(:room_title) { room[:title] }
+        allow(GameLogger).to receive(:get) do
+          item = LogSpecHarness.get
+          while item.is_a?(Hash)
+            room.merge!(item)
+            item = LogSpecHarness.get
+          end
+          item
+        end
+      end
+
+      # Runs the logger with these arguments and returns the logged game
+      # lines (the header and the reget marker dropped).
+      def log_with(*args)
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(args))
+        run_main
+        log_lines.drop(2)
+      end
+
+      context 'with --rnum in GemStone' do
+        it 'adds the Lich id from the UID table and the u-id to the room title only' do
+          uid_table[4_216_015] = [228]
+          LogSpecHarness.feed('[Sanctum of Scales, Columns]', 'You also see a door.')
+
+          expect(log_with('--rnum')).to eq(
+            ['[Sanctum of Scales, Columns - 228] (u4216015)', 'You also see a door.']
+          )
+        end
+
+        it 'keeps the game-shown (4216015) instead of adding a second u-id' do
+          uid_table[4_216_015] = [228]
+          LogSpecHarness.feed('[Sanctum of Scales, Columns] (4216015)')
+
+          expect(log_with('--rnum')).to eq(['[Sanctum of Scales, Columns - 228] (4216015)'])
+        end
+
+        it "writes no ' - ]' when the UID is not in the map, only the u-id" do
+          LogSpecHarness.feed('[Sanctum of Scales, Columns]', '[Sanctum of Scales, Columns] (4216015)')
+
+          expect(log_with('--rnum')).to eq(
+            ['[Sanctum of Scales, Columns] (u4216015)', '[Sanctum of Scales, Columns] (4216015)']
+          )
+        end
+
+        it 'adds no Lich id when the UID maps to more than one room' do
+          uid_table[4_216_015] = [228, 229]
+          LogSpecHarness.feed('[Sanctum of Scales, Columns]')
+
+          expect(log_with('--rnum')).to eq(['[Sanctum of Scales, Columns] (u4216015)'])
+        end
+
+        it 'leaves every line alone while the parser has no room title yet' do
+          room[:title] = ''
+          LogSpecHarness.feed('[Gabriel] says, "hi [there]"', 'You also see a door.')
+
+          expect(log_with('--rnum')).to eq(['[Gabriel] says, "hi [there]"', 'You also see a door.'])
+        end
+
+        # GS main_subtitle builds "[" + subtitle[3..-1] + "]", so a " - "
+        # subtitle leaves the title as "[]".
+        it 'leaves every line alone when the room title is an empty []' do
+          room[:title] = '[]'
+          LogSpecHarness.feed('[] says nothing', 'You also see a door.')
+
+          expect(log_with('--rnum')).to eq(['[] says nothing', 'You also see a door.'])
+        end
+
+        it 'leaves a line that shows the room title after its start' do
+          uid_table[4_216_015] = [228]
+          LogSpecHarness.feed('Gabriel says, "Meet me at [Sanctum of Scales, Columns]."')
+
+          expect(log_with('--rnum')).to eq(['Gabriel says, "Meet me at [Sanctum of Scales, Columns]."'])
+        end
+
+        # A UTF-8 room title with a non-ASCII letter made a UTF-8 pattern,
+        # which raised Encoding::CompatibilityError on any binary
+        # (ASCII-8BIT) line with high bytes and ended the logger. The
+        # non-ASCII data is built at runtime (Custom/AsciiOnlySource).
+        context 'when the room title has letters outside ASCII' do
+          let(:e_acute) { [0xe9].pack('U') }
+          let(:title) { "[Caf#{e_acute} Row]" }
+          let(:high_byte_line) { "some #{[0xff].pack('C')} text".b }
+
+          before { room[:title] = title }
+
+          it 'numbers a binary title line and logs other binary lines with high bytes unchanged' do
+            uid_table[4_216_015] = [228]
+            LogSpecHarness.feed(title.b, high_byte_line, 'You also see a door.')
+
+            expect(log_with('--rnum').map(&:b)).to eq(
+              ["[Caf#{e_acute} Row - 228] (u4216015)".b, high_byte_line, 'You also see a door.'.b]
+            )
+          end
+
+          it 'numbers a UTF-8 title line too' do
+            uid_table[4_216_015] = [228]
+            LogSpecHarness.feed("#{title} (4216015)")
+
+            expect(log_with('--rnum')).to eq(["[Caf#{e_acute} Row - 228] (4216015)"])
+          end
+        end
+
+        it 'builds the title matcher once per room, not once per line' do
+          allow(GameLogger).to receive(:room_title_pattern).and_call_original
+          LogSpecHarness.feed(
+            '[Sanctum of Scales, Columns]', 'line 1', 'line 2',
+            { count: 2, uid: 4_216_016, title: '[Sanctum of Scales, Pool]' },
+            '[Sanctum of Scales, Pool]', 'line 3'
+          )
+
+          expect(log_with('--rnum')).to eq(
+            [
+              '[Sanctum of Scales, Columns] (u4216015)', 'line 1', 'line 2',
+              '[Sanctum of Scales, Pool] (u4216016)', 'line 3'
+            ]
+          )
+          expect(GameLogger).to have_received(:room_title_pattern).twice
+        end
+      end
+
+      context 'with --rnum in DragonRealms' do
+        # lich-5 wraps the subtitle's bracketed title in one more pair of
+        # brackets, so XMLData.room_title is [[...]] while the game line
+        # shows [...] (proofs/verify/dr_rnum.out).
+        before do
+          room.merge!(game: 'DR', uid: 230_008, title: "[[Bosque Deriel, Hermit's Shacks]]")
+        end
+
+        it 'adds the Lich id to the room title line and no u-id' do
+          uid_table[230_008] = [12_345]
+          LogSpecHarness.feed("[Bosque Deriel, Hermit's Shacks] (230008)", 'Obvious paths: north.')
+
+          expect(log_with('--rnum')).to eq(
+            ["[Bosque Deriel, Hermit's Shacks - 12345] (230008)", 'Obvious paths: north.']
+          )
+        end
+
+        it 'adds the Lich id when the game does not show the room id' do
+          uid_table[230_008] = [12_345]
+          LogSpecHarness.feed("[Bosque Deriel, Hermit's Shacks]")
+
+          expect(log_with('--roomnum')).to eq(["[Bosque Deriel, Hermit's Shacks - 12345]"])
+        end
+
+        it 'leaves the title alone when the UID is not in the map' do
+          LogSpecHarness.feed("[Bosque Deriel, Hermit's Shacks] (230008)")
+
+          expect(log_with('--rnum')).to eq(["[Bosque Deriel, Hermit's Shacks] (230008)"])
+        end
+      end
+
+      context 'when looking up the room' do
+        it 'never calls Room.current or Map.current and asks the UID table once per room' do
+          uid_table.merge!(4_216_015 => [228], 4_216_016 => [229])
+          LogSpecHarness.feed(
+            '[Sanctum of Scales, Columns]', 'line 1', 'line 2',
+            { count: 2, uid: 4_216_016, title: '[Sanctum of Scales, Pool]' },
+            '[Sanctum of Scales, Pool]', 'line 3',
+            { count: 3, uid: 4_216_015, title: '[Sanctum of Scales, Columns]' },
+            'line 4'
+          )
+          expect(room_class).not_to receive(:current)
+          expect(map).not_to receive(:current)
+
+          lines = log_with('--rnum', '--exclude=999')
+
+          expect(lines).to eq(
+            [
+              '[Sanctum of Scales, Columns - 228] (u4216015)', 'line 1', 'line 2',
+              '[Sanctum of Scales, Pool - 229] (u4216016)', 'line 3', 'line 4'
+            ]
+          )
+          expect(map).to have_received(:ids_from_uid).with(4_216_015).twice
+          expect(map).to have_received(:ids_from_uid).with(4_216_016).once
+        end
+
+        it 'looks the room up again when the UID changes within one room count' do
+          uid_table.merge!(4_216_015 => [228], 4_216_016 => [229])
+          LogSpecHarness.feed(
+            '[Sanctum of Scales, Columns]',
+            { uid: 4_216_016 },
+            '[Sanctum of Scales, Columns]'
+          )
+
+          expect(log_with('--rnum')).to eq(
+            ['[Sanctum of Scales, Columns - 228] (u4216015)', '[Sanctum of Scales, Columns - 229] (u4216016)']
+          )
+        end
+
+        it 'rebuilds the title matcher when the title changes within one room count' do
+          LogSpecHarness.feed(
+            '[Sanctum of Scales, Columns]',
+            { title: '[Sanctum of Scales, Pool]' },
+            '[Sanctum of Scales, Pool]'
+          )
+
+          expect(log_with('--rnum')).to eq(
+            ['[Sanctum of Scales, Columns] (u4216015)', '[Sanctum of Scales, Pool] (u4216015)']
+          )
+        end
+
+        # Map.ids_from_uid never loads the map: until the map is loaded (by
+        # the logger's own load, see below, or by anything else) or learns
+        # the UID, the table answers [] for every room.
+        context 'when the map learns the UID while the logger is in the room' do
+          before do
+            answers = [[], [288]]
+            allow(map).to receive(:ids_from_uid) { answers.size > 1 ? answers.shift : answers.first }
+          end
+
+          it 'starts skipping an excluded room once the map has its UID' do
+            LogSpecHarness.feed('first line at login', 'second line', 'third line')
+
+            expect(log_with('--exclude=288')).to eq(['first line at login'])
+          end
+
+          it 'numbers the room title once the map has its UID' do
+            LogSpecHarness.feed('[Sanctum of Scales, Columns]', '[Sanctum of Scales, Columns]')
+
+            expect(log_with('--rnum')).to eq(
+              ['[Sanctum of Scales, Columns] (u4216015)', '[Sanctum of Scales, Columns - 288] (u4216015)']
+            )
+          end
+
+          it 'stops asking the map once it has answered with the Lich id' do
+            LogSpecHarness.feed('line 1', 'line 2', 'line 3', 'line 4')
+
+            expect(log_with('--rnum')).to eq(['line 1', 'line 2', 'line 3', 'line 4'])
+            expect(map).to have_received(:ids_from_uid).twice
+          end
+        end
+
+        it 'does not look up the Lich id when only u-ids are excluded and --rnum is off' do
+          LogSpecHarness.feed('line 1', { count: 2, uid: 4_216_016 }, 'line 2')
+
+          expect(log_with('--exclude=u7199')).to eq(['line 1', 'line 2'])
+          expect(map).not_to have_received(:ids_from_uid)
+        end
+      end
+
+      # A-1: Lich loads the map only when something asks for it (in DR its
+      # own room display does not by default), so with a Lich number to find
+      # the logger loads it once, in a thread of its own.
+      context 'when nothing has loaded the map' do
+        let(:loaders) { [] }
+
+        before do
+          allow(map).to receive(:loaded?).and_return(false)
+          allow(map).to receive(:load).and_return(true)
+          allow(GameLogger).to receive(:start_map_load).and_wrap_original do |original|
+            original.call.tap { |loader| loaders << loader }
+          end
+        end
+
+        after { loaders.compact.each { |loader| loader.join(2) } }
+
+        def wait_for_loaders
+          loaders.compact.each { |loader| expect(loader.join(2)).not_to be_nil }
+        end
+
+        { '--rnum' => ['--rnum'], 'a Lich id in --exclude' => ['--exclude=u7199,288'] }.each do |label, args|
+          it "loads the map once, in its own thread, for #{label}" do
+            LogSpecHarness.feed('line 1', { count: 2, uid: 4_216_016 }, 'line 2')
+
+            expect(log_with(*args)).to eq(['line 1', 'line 2'])
+            wait_for_loaders
+            expect(GameLogger).to have_received(:start_map_load).once
+            expect(loaders.first).to be_a(Thread)
+            expect(map).to have_received(:load).once
+          end
+        end
+
+        { 'no room options' => [], 'only u-ids in --exclude' => ['--exclude=u7199'],
+          'a bare --exclude' => ['--exclude'] }.each do |label, args|
+          it "does not load the map with #{label}" do
+            LogSpecHarness.feed('line 1')
+
+            expect(log_with(*args)).to eq(['line 1'])
+            expect(GameLogger).not_to have_received(:start_map_load)
+            expect(map).not_to have_received(:loaded?)
+            expect(map).not_to have_received(:load)
+          end
+        end
+
+        it 'does not load the map again when it is already loaded' do
+          allow(map).to receive(:loaded?).and_return(true)
+          LogSpecHarness.feed('line 1')
+
+          expect(log_with('--rnum', '--exclude=288')).to eq(['line 1'])
+          expect(loaders).to eq([nil])
+          expect(map).not_to have_received(:load)
+        end
+
+        it 'keeps reading lines while the map loads, and excludes the room once it has' do
+          gate = Thread::Queue.new
+          allow(map).to receive(:load) do
+            gate.pop
+            uid_table[4_216_015] = [288]
+            true
+          end
+          LogSpecHarness.feed('line 1', 'line 2')
+
+          expect(log_with('--exclude=288')).to eq(['line 1', 'line 2'])
+          expect(loaders.first).to be_alive
+
+          gate << :loaded
+          wait_for_loaders
+          expect(GameLogger.lich_room_id(4_216_015)).to eq(288)
+        end
+
+        # The UID table is cleared and rebuilt one room at a time, so mid-load
+        # a UID shared by two rooms can show only the first.
+        it 'asks again for a Lich id found while the load is still running' do
+          gate = Thread::Queue.new
+          allow(map).to receive(:load) do
+            gate.pop
+            true
+          end
+          answers = [[228], [228, 229]]
+          allow(map).to receive(:ids_from_uid) { answers.size > 1 ? answers.shift : answers.first }
+          LogSpecHarness.feed('[Sanctum of Scales, Columns]', '[Sanctum of Scales, Columns]')
+
+          expect(log_with('--rnum')).to eq(
+            ['[Sanctum of Scales, Columns - 228] (u4216015)', '[Sanctum of Scales, Columns] (u4216015)']
+          )
+          expect(map).to have_received(:ids_from_uid).twice
+          gate << :loaded
+        end
+
+        it 'says so when no map database can be loaded' do
+          allow(map).to receive(:load).and_return(false)
+          LogSpecHarness.feed('line 1')
+
+          expect(log_with('--exclude=288')).to eq(['line 1'])
+          wait_for_loaders
+          expect(LogSpecHarness.echoes).to include(
+            'no map database could be loaded, so Lich room numbers in --exclude and --rnum match no room; u<uid> entries still work.'
+          )
+        end
+
+        it 'says so and keeps logging when the load raises' do
+          allow(map).to receive(:load).and_raise(Errno::EACCES, 'map.json')
+          LogSpecHarness.feed('line 1')
+
+          expect(log_with('--rnum')).to eq(['line 1'])
+          wait_for_loaders
+          expect(LogSpecHarness.echoes).to include(
+            'the map failed to load (Permission denied - map.json), so Lich room numbers in --exclude and --rnum match no room; u<uid> entries still work.'
+          )
+        end
+      end
+
+      context 'with --exclude' do
+        it 'skips lines in a room excluded by u-id and logs the rest' do
+          LogSpecHarness.feed('in the columns', { count: 2, uid: 4_216_016 }, 'in the pool')
+
+          expect(log_with('--exclude=u4216015')).to eq(['in the pool'])
+        end
+
+        it 'skips lines in a room whose UID maps to an excluded Lich id' do
+          uid_table.merge!(4_216_015 => [288], 4_216_016 => [300])
+          LogSpecHarness.feed('in the columns', { count: 2, uid: 4_216_016 }, 'in the pool')
+
+          expect(log_with('--exclude=288,2300')).to eq(['in the pool'])
+        end
+
+        it 'checks u-id entries first, without asking the UID table, when they match' do
+          LogSpecHarness.feed('in the columns', 'still in the columns')
+
+          expect(log_with('--exclude=u4216015,288')).to eq([])
+          expect(map).not_to have_received(:ids_from_uid)
+        end
+
+        it 'logs a room whose UID is not in the map even when Lich ids are excluded' do
+          LogSpecHarness.feed('in an unmapped room')
+
+          expect(log_with('--exclude=288')).to eq(['in an unmapped room'])
+        end
+
+        it 'logs a room whose UID maps to more than one Lich id' do
+          uid_table[4_216_015] = [288, 289]
+          LogSpecHarness.feed('in a multi-id room')
+
+          expect(log_with('--exclude=288')).to eq(['in a multi-id room'])
+        end
+
+        it 'ignores an empty entry (--exclude=,288) instead of excluding every unmapped room' do
+          uid_table[4_216_016] = [288]
+          LogSpecHarness.feed('in an unmapped room', { count: 2, uid: 4_216_016 }, 'in room 288')
+
+          expect(log_with('--exclude=,288')).to eq(['in an unmapped room'])
+        end
+
+        it 'does not treat an empty entry as a Lich id to look up (--exclude=,u7199)' do
+          LogSpecHarness.feed('line 1')
+
+          expect(log_with('--exclude=,u7199')).to eq(['line 1'])
+          expect(map).not_to have_received(:ids_from_uid)
+        end
+
+        it 'excludes nothing for a bare --exclude' do
+          LogSpecHarness.feed('line 1')
+
+          expect(log_with('--exclude')).to eq(['line 1'])
+          expect(map).not_to have_received(:ids_from_uid)
+        end
+
+        it 'also skips commands typed in an excluded room' do
+          LogSpecHarness.idle_timeout = 0.5
+          LogSpecHarness.type('look')
+
+          expect(log_with('--exclude=u4216015')).to eq([])
+        end
       end
     end
 

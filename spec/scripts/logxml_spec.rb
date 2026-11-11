@@ -7,7 +7,7 @@ require 'timeout'
 # real body (everything after the =end header) on a fresh object whose
 # singleton methods stand in for the Lich script helpers. Nothing is defined
 # at the top level, so other spec files keep their own helpers.
-RSpec.describe 'logxml.lic timestamp settings' do
+RSpec.describe 'logxml.lic' do
   let(:script_path) { File.expand_path('../../scripts/logxml.lic', __dir__) }
   let(:script_lines) { File.readlines(script_path) }
   # First line after the =end header, 1-based, so backtraces point at logxml.lic.
@@ -40,7 +40,7 @@ RSpec.describe 'logxml.lic timestamp settings' do
   def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'])
     script = OpenStruct.new(want_script_output: nil, vars: [vars.join(' '), *vars], downstream_buffer: [], name: 'logxml')
     stub_const('Script', Class.new { define_singleton_method(:current) { script } })
-    pending_lines = lines.dup
+    pending_lines = lines.map(&:dup) # fresh Strings, as get returns; logxml edits lines in place
     sink = echoes
     runner = Object.new
     runner.define_singleton_method(:hide_me) { nil }
@@ -121,6 +121,132 @@ RSpec.describe 'logxml.lic timestamp settings' do
       run_logxml(vars: ['--timestamp='], settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
       expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>'])
+    end
+  end
+
+  # R-05, R-19, R-34 (logxml copy): the Lich id comes only from the map's
+  # UID table, never from Map.current, which matches the room from the
+  # logger's thread (LOCATION/PEER, a cleared buffer) and echoes
+  # "no map database found" with no map.
+  context 'with --rnum' do
+    let(:game) { 'GSIV' }
+    let(:uid) { 4_216_015 }
+    let(:uid_table) { {} }
+    # Strict double: any call other than Map.ids_from_uid and Map.loaded?
+    # (the map is loaded unless an example says otherwise) fails the example.
+    let(:map) { double('Map') }
+    let(:title_line) { '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns]' }
+
+    before do
+      room_game = game
+      room_uid = uid
+      stub_const('XMLData', Module.new do
+        define_singleton_method(:game) { room_game }
+        define_singleton_method(:name) { 'TestChar' }
+        define_singleton_method(:room_id) { room_uid }
+      end)
+      stub_const('Map', map)
+      allow(map).to receive(:ids_from_uid) { |n| uid_table.fetch(n, []) }
+      allow(map).to receive(:loaded?).and_return(true)
+    end
+
+    def logged_lines(vars: ['--rnum'])
+      run_logxml(vars: vars, lines: [title_line, '<output>You see a door.</output>'])
+      log_lines.drop(1)
+    end
+
+    it 'adds the Lich id from the UID table and the u-id to the GS room title' do
+      uid_table[uid] = [228]
+
+      expect(logged_lines).to eq(
+        [
+          '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 228] (u4216015)',
+          '<output>You see a door.</output>'
+        ]
+      )
+      expect(map).to have_received(:ids_from_uid).once
+    end
+
+    it "writes no ' - ]' in GS when the UID is not in the map, only the u-id" do
+      expect(logged_lines(vars: ['--roomnum']).first).to eq(
+        '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns] (u4216015)'
+      )
+    end
+
+    it 'adds no Lich id when the UID maps to more than one room' do
+      uid_table[uid] = [228, 229]
+
+      expect(logged_lines.first).to eq(
+        '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns] (u4216015)'
+      )
+    end
+
+    it 'does not look the room up without --rnum' do
+      expect(logged_lines(vars: []).first).to eq(title_line)
+      expect(map).not_to have_received(:ids_from_uid)
+    end
+
+    # A-1: Lich loads the map only when something asks for it (in DR its
+    # own room display does not by default), so --rnum loads it once, in a
+    # thread of its own, off the get loop.
+    context 'when nothing has loaded the map' do
+      let(:load_results) { Thread::Queue.new }
+      let(:load_result) { true }
+
+      before do
+        allow(map).to receive(:loaded?).and_return(false)
+        allow(map).to receive(:load) do
+          load_results << load_result
+          load_result
+        end
+      end
+
+      it 'loads the map once and still logs every line' do
+        expect(logged_lines.size).to eq(2)
+        expect(load_results.pop(timeout: 2)).to be(true)
+        expect(map).to have_received(:load).once
+      end
+
+      context 'when no map database can be loaded' do
+        let(:load_result) { false }
+
+        it 'says so' do
+          logged_lines
+          expect(load_results.pop(timeout: 2)).to be(false)
+          Timeout.timeout(2) { sleep 0.01 until echoes.any? { |e| e.start_with?('no map database') } }
+          expect(echoes).to include('no map database could be loaded, so --rnum adds no Lich room numbers.')
+        end
+      end
+
+      it 'does not load the map without --rnum' do
+        logged_lines(vars: [])
+        expect(map).not_to have_received(:loaded?)
+        expect(map).not_to have_received(:load)
+      end
+    end
+
+    it 'does not load the map when it is already loaded' do
+      allow(map).to receive(:load)
+      logged_lines
+      expect(map).to have_received(:loaded?).once
+      expect(map).not_to have_received(:load)
+    end
+
+    context 'in DragonRealms' do
+      let(:game) { 'DR' }
+      let(:uid) { 230_008 }
+
+      it 'adds the Lich id and no u-id' do
+        uid_table[uid] = [12_345]
+
+        expect(logged_lines.first).to eq(
+          '<resource picture="0"/><style id="roomName" />[Sanctum of Scales, Columns - 12345]'
+        )
+      end
+
+      it 'leaves the title alone when the UID is not in the map' do
+        expect(logged_lines.first).to eq(title_line)
+      end
     end
   end
 
