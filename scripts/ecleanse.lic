@@ -10,8 +10,8 @@
 
   Improvements:
   v2.4.0  (2026-11-09)
-    - ;ecleanse setup is now a Lich WebUI window instead of GTK, with the same options; Close saves, closing the window discards, as before
-    - the stun maneuver options (Stance1, Stance2, Flee, Hide) still allow only one at a time
+    - ;ecleanse setup is now a Lich WebUI window instead of GTK, with the same options; Save & Close saves, Cancel or closing the window discards
+    - the stun maneuver options (Stance1, Stance2, Flee, Hide) still allow only one at a time; ticking one now unticks the others in the window
     - fix: ;ecleanse list stopped with an error after the settings
   v2.3.7  (2026-11-06)
     - finding a different lost weapon no longer ends the search for the one just disarmed
@@ -282,10 +282,10 @@ end
 
 # UI Setup
 module Ecleanse
-  # ;ecleanse setup: a native Lich WebUI window with the same options as the
-  # old GTK window. Close writes the settings file if anything changed;
-  # closing the window any other way discards, as before. The class also
-  # backs ;ecleanse list, which works without the WebUI.
+  # ;ecleanse setup: a Lich WebUI settings form with the same options as the
+  # old GTK window. Save & Close writes the settings file if anything changed;
+  # Cancel or closing the window discards. The class also backs
+  # ;ecleanse list, which works without the WebUI.
   class Setup
     attr_accessor :settings
 
@@ -358,7 +358,7 @@ module Ecleanse
 
     def self.available?
       defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
-        defined?(Lich::API) && Lich::API.respond_to?(:webui_page) ? true : false
+        defined?(Lich::WebUI::SettingsForm) ? true : false
     end
 
     def self.get_category(key)
@@ -377,8 +377,6 @@ module Ecleanse
     def initialize(settings)
       @settings = settings
       @owner = Script.current
-      @closed = Queue.new
-      @saved = false
 
       # Capture starting settings
       @original_settings = Marshal.load(Marshal.dump(settings))
@@ -436,102 +434,71 @@ module Ecleanse
     def start
       unavailable.each_key { |key| @settings[key] = false }
       setup = self
-      @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: "Ecleanse Setup v#{@version}",
-                                   props: { size: [800, 500], bare: true, density: :compact, viewport: true },
-                                   on: { close: ->(_ev) { setup.viewer_closed } }) do |ui|
-        setup.render(ui)
-      end
-      Lich::API.webui_refresh(@page)
-      Lich::API.webui_start
-      unless Lich::API.webui_open(page: @page)
-        respond ' Ecleanse: could not open a window for setup. Please use the command line.'
-        return
-      end
-      @closed.pop
-      unless @saved
+      form = nil
+      form = Lich::WebUI::SettingsForm.new(
+        owner: @owner, id: PAGE_ID, title: "Ecleanse Setup v#{@version}", values: @settings, fields: fields,
+        props: { size: [800, 500], viewport: true },
+        normalize: ->(draft) { setup.normalize(draft) },
+        layout: ->(ui, field, save) { setup.render(ui, field, save, -> { form.close }) }
+      )
+      result = form.show.wait
+      if result.nil?
         respond
         Lich::Messaging.msg('plain', " Ecleanse UI closed WITHOUT saving any changes")
-        Lich::Messaging.msg('plain', " Be sure to use the close button to save changes")
+        Lich::Messaging.msg('plain', " Use the Save & Close button to save changes")
         respond
-      end
-    ensure
-      begin
-        Lich::WebUI.terminate_owner(@owner)
-      rescue StandardError
-        nil
-      end
-    end
-
-    def viewer_closed
-      @closed << :viewer
-    end
-
-    def close_clicked
-      if @original_settings == @settings
+      elsif result == @original_settings
         respond
         Lich::Messaging.msg('plain', " Nothing to save. No changes were made.")
         respond
       else
         filename = File.join(DATA_DIR, XMLData.game, Char.name, 'ecleanse.yaml')
-        File.write(filename, @settings.to_yaml)
+        File.write(filename, result.to_yaml)
         respond
         Lich::Messaging.msg('plain', " Settings saved to file: #{filename}.")
         respond
       end
-      @saved = true
-      @closed << :close
-      Lich::WebUI.close(@page)
+      result
     end
 
-    def act
-      yield
-    rescue StandardError => e
-      respond " Ecleanse setup: #{e.class}: #{e.message}"
-    ensure
-      Lich::API.webui_refresh(@page) if @page && !@saved
+    # One form field per checkbox and text box; stun maneuvers are exclusive.
+    def fields
+      checks = (MISC_COLUMNS + STUN_COLUMNS + DISARMED_COLUMNS).flatten(1).map do |key, label, tip|
+        field = { key: key, type: :checkbox, label: label, disabled: disabled?(key) }
+        field[:tooltip] = tip if tip
+        field[:exclusive] = :stun if STUN_EXCLUSIVE.include?(key)
+        field
+      end
+      checks + [
+        { key: :stop_scripts, type: :text_input, placeholder: 'list of scripts to pause eg - bigshot, eloot, go2' },
+        { key: :safe_room, type: :text_input, placeholder: 'room number or name',
+          tooltip: 'If left empty will run to nearest town or sanctuary.' },
+      ]
     end
 
-    def cb(&block)
-      setup = self
-      ->(ev) { setup.act { block.call(ev) } }
-    end
-
-    def set(key, value)
-      @settings[key] = value
-      return unless value && STUN_EXCLUSIVE.include?(key)
-
-      (STUN_EXCLUSIVE - [key]).each { |other| @settings[other] = false }
-    end
-
-    def check(ui, key, label, tip = nil)
-      setup = self
-      extra = tip ? { tooltip: tip } : {}
-      ui.checkbox(key: key.to_s, label: label, checked: @settings[key] ? true : false, disabled: disabled?(key), **extra,
-                  on: { change: setup.cb { |ev| setup.set(key, ev.payload[:value] ? true : false) } })
-    end
-
-    def text(ui, key, placeholder = nil, tip = nil)
-      setup = self
-      extra = {}
-      extra[:placeholder] = placeholder if placeholder
-      extra[:tooltip] = tip if tip
-      ui.text_input(key: key.to_s, value: @settings[key].to_s.strip, change_mode: :input, **extra,
-                    on: { change: setup.cb { |ev| setup.set(key, ev.payload[:value].to_s.strip) } })
+    # Strips text, keeps unusable options off and at most one stun maneuver on.
+    def normalize(draft)
+      %i[stop_scripts safe_room].each { |key| draft[key] = draft[key].to_s.strip }
+      (MISC_COLUMNS + STUN_COLUMNS + DISARMED_COLUMNS).flatten(1).each do |key, _|
+        draft[key] = draft[key] && !disabled?(key) ? true : false
+      end
+      first = STUN_EXCLUSIVE.find { |key| draft[key] }
+      (STUN_EXCLUSIVE - [first]).each { |key| draft[key] = false }
+      draft
     end
 
     # A group of checkbox columns; +columns+ is a list of [key, label, tip] lists.
-    def check_columns(ui, key, columns)
-      setup = self
+    def check_columns(ui, field, key, columns)
       ui.columns(key: key, count: columns.size, gap: 12, row_align: :start) do
         columns.each_with_index do |items, i|
           ui.stack(slot: i.to_s, key: "#{key}-#{i}", gap: 4) do
-            items.each { |k, label, tip| setup.check(ui, k, label, tip) }
+            items.each { |k, _| field.call(ui, k) }
           end
         end
       end
     end
 
-    def render(ui)
+    def render(ui, field, save, cancel)
       setup = self
       ui.stack(key: 'ecleanse', gap: 6, margin: 8, fill: true) do
         ui.scroll(key: 'body', fill: true) do
@@ -539,29 +506,30 @@ module Ecleanse
             ui.group(key: 'scripts', label: 'Scripts') do
               ui.grid(key: 'scripts-row', cols: 2, homogeneous: false, expand_columns: [2], column_gap: 10) do
                 ui.text(key: 'l-stop', content: 'Scripts to Pause')
-                setup.text(ui, :stop_scripts, 'list of scripts to pause eg - bigshot, eloot, go2')
+                field.call(ui, :stop_scripts)
               end
             end
             ui.group(key: 'misc', label: 'Misc') do
               ui.stack(key: 'misc-body', gap: 6) do
-                setup.check_columns(ui, 'misc-cols', MISC_COLUMNS)
+                setup.check_columns(ui, field, 'misc-cols', MISC_COLUMNS)
                 ui.grid(key: 'safe-row', cols: 2, homogeneous: false, expand_columns: [2], column_gap: 10) do
                   ui.text(key: 'l-safe', content: 'Itchy Curse Safe Room')
-                  setup.text(ui, :safe_room, 'room number or name', 'If left empty will run to nearest town or sanctuary.')
+                  field.call(ui, :safe_room)
                 end
               end
             end
             ui.group(key: 'stun', label: 'Stun Recovery') do
-              setup.check_columns(ui, 'stun-cols', STUN_COLUMNS)
+              setup.check_columns(ui, field, 'stun-cols', STUN_COLUMNS)
             end
             ui.group(key: 'disarmed', label: 'Cast in Room when Disarmed') do
-              setup.check_columns(ui, 'disarmed-cols', DISARMED_COLUMNS)
+              setup.check_columns(ui, field, 'disarmed-cols', DISARMED_COLUMNS)
             end
           end
         end
-        ui.columns(key: 'footer', count: 2, weights: [6, 1], compact: true, row_align: :center, gap: 6) do
-          ui.text(slot: '0', key: 'footer-text', emphasis: :subtle, content: 'Changes are only saved if you use the Close button.')
-          ui.button(slot: '1', key: 'close', label: 'Close', variant: :primary, on: { activate: ->(_ev) { setup.close_clicked } })
+        ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, gap: 6) do
+          ui.text(slot: '0', key: 'footer-text', emphasis: :subtle, content: 'Cancel or closing the window discards changes.')
+          ui.button(slot: '1', key: 'cancel', label: 'Cancel', on: { activate: ->(_ev) { cancel.call } })
+          save.call(ui, slot: '2', variant: :primary)
         end
       end
     end
