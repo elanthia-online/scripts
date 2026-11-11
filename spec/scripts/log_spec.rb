@@ -3362,6 +3362,74 @@ module LogSpecHarness::Env
           expect(Dir.glob(File.join(folder, '**', '*.tmp'))).to be_empty
         end
 
+        # Nisugi round 2 / mrhoribu: an idle logger keeps yesterday's file
+        # open until a game line comes. A second sweeping logger in the same
+        # Lich process must skip it: on Linux and macOS File.delete succeeds
+        # on an open file, and the lines written after the sweep were lost.
+        context 'with a file a logger in this process holds open' do
+          let(:idle) { log_file('2026/10/2026-10-31_22-00-00.log', mtime: Time.new(2026, 10, 31, 22, 30, 0)) }
+          let(:today) { Date.new(2026, 11, 1) }
+
+          it 'leaves it alone, so the lines written after the sweep are kept, and compresses it once closed' do
+            path = idle
+            GameLogger::Logger.with_log_file(path, nil) do |file|
+              file.puts 'before the sweep'
+              File.utime(Time.new(2026, 10, 31, 22, 30, 0), Time.new(2026, 10, 31, 22, 30, 0), path)
+
+              expect(GameLogger::Logger.compress_old_logs(folder, today, now: now).first).to eq(0)
+              expect(File).not_to exist("#{path}.gz")
+              file.puts 'after the sweep'
+            end
+            File.utime(Time.new(2026, 10, 31, 22, 30, 0), Time.new(2026, 10, 31, 22, 30, 0), path)
+
+            expect(GameLogger::Logger.compress_old_logs(folder, today, now: now).first).to eq(1)
+            expect(gunzip("#{path}.gz")).to include("before the sweep\n", "after the sweep\n")
+          end
+
+          it 'still compresses the other old files in the folder' do
+            other = log_file('2026/10/2026-10-30_08-00-00.log')
+            path = idle
+
+            GameLogger::Logger.with_log_file(path, nil) do
+              File.utime(Time.new(2026, 10, 31, 22, 30, 0), Time.new(2026, 10, 31, 22, 30, 0), path)
+
+              expect(GameLogger::Logger.compress_old_logs(folder, today, now: now).first).to eq(1)
+            end
+            expect(File).to exist("#{other}.gz")
+            expect(File).to exist(path)
+          end
+
+          it 'skips it while any one of two loggers still holds it' do
+            path = idle
+            key = GameLogger.open_log_path(path)
+            begin
+              GameLogger::Logger.with_log_file(path, nil) { nil }
+
+              expect(GameLogger.log_path_open?(path)).to be(true)
+            ensure
+              GameLogger.close_log_path(key)
+            end
+            expect(GameLogger.log_path_open?(path)).to be(false)
+          end
+
+          it 'stops counting it as open when the block raises, and when the file cannot be opened' do
+            path = idle
+            expect { GameLogger::Logger.with_log_file(path, nil) { raise IOError, 'disk gone' } }.to raise_error(IOError)
+            expect(GameLogger.log_path_open?(path)).to be(false)
+
+            missing = File.join(root, 'no such folder', 'x.log')
+            expect { GameLogger::Logger.with_log_file(missing, nil) { nil } }.to raise_error(SystemCallError)
+            expect(GameLogger.log_path_open?(missing)).to be(false)
+          end
+
+          it 'matches the path the sweep builds to the one the logger opened, however it is written' do
+            path = idle
+            GameLogger::Logger.with_log_file(File.join(folder, '2026', '10', '.', File.basename(path)), nil) do
+              expect(GameLogger.log_path_open?(path)).to be(true)
+            end
+          end
+        end
+
         # Review finding 2: LOG_DIR may hold glob characters.
         it 'finds the logs under a folder whose name has glob characters' do
           odd = File.join(root, 'logs[1] {a}', 'GSIV-TestChar')
@@ -3679,6 +3747,17 @@ module LogSpecHarness::Env
           Timeout.timeout(5) { GameLogger::Logger.new(options, clock: clock, io: io).run }
         end
 
+        # Waits for each sweep thread before the run reads its next line. A
+        # sweep still running when the day changes is left to finish (see
+        # the example for that), so an example that needs the next day's
+        # sweep must not let the first one still be alive then.
+        def sweep_synchronously!
+          allow_any_instance_of(GameLogger::Logger).to receive(:start_compression).and_wrap_original do |original, *args|
+            original.call(*args)
+            original.receiver.instance_variable_get(:@compressor)&.join
+          end
+        end
+
         it 'sweeps the character folder in the background when it starts, with the cutoff N days before today' do
           calls = Queue.new
           allow(GameLogger::Logger).to receive(:compress_old_logs) { |*args, **kw| calls << [args, kw]; [2, 2_000_000, 180_000] }
@@ -3703,6 +3782,7 @@ module LogSpecHarness::Env
         end
 
         it 'sweeps again when a new day starts, and not more than once a day' do
+          sweep_synchronously!
           calls = Queue.new
           allow(GameLogger::Logger).to receive(:compress_old_logs) { |*args, **| calls << args[1]; [0, 0, 0] }
           # The second line is read after midnight; the third the same day.
@@ -3763,6 +3843,7 @@ module LogSpecHarness::Env
         # yesterday's file; the first sweep of a run does not.
         it "waits #{120} seconds before a new day's sweep, and not before the first" do
           stub_const('LogSpecHarness::Env::GameLogger::Logger::DAY_SWEEP_DELAY', 120)
+          sweep_synchronously!
           slept = Queue.new
           allow_any_instance_of(GameLogger::Logger).to receive(:sleep) { |_, seconds| slept << seconds }
           calls = Queue.new

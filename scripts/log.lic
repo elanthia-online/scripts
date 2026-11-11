@@ -132,6 +132,46 @@ module GameLogger
   # argument a player types parses to it.
   TWIN_KEY = :'xml twin of --both' unless defined?(TWIN_KEY)
 
+  # Log files open in this Lich process, by path ({open_log_path}), with how
+  # many loggers hold each: every logger for a character runs in this one
+  # process (the --both twin and an install's local logxml.lic too), so a
+  # sweep skips exactly the files in use ({log_path_open?}). Kept on the
+  # module, which each run evaluates again, so all runs share one table.
+  OPEN_LOG_PATHS = Hash.new(0) unless defined?(OPEN_LOG_PATHS)
+
+  # Guards {OPEN_LOG_PATHS}: loggers and their sweep threads use it at once.
+  OPEN_LOG_PATHS_LOCK = Mutex.new unless defined?(OPEN_LOG_PATHS_LOCK)
+
+  # Records that a logger is about to open +path+, until {close_log_path}.
+  #
+  # @param path [String] the log file's path
+  # @return [String] the path as recorded (expanded)
+  def self.open_log_path(path)
+    key = File.expand_path(path)
+    OPEN_LOG_PATHS_LOCK.synchronize { OPEN_LOG_PATHS[key] += 1 }
+    key
+  end
+
+  # Records that a logger closed +key+ (as {open_log_path} returned it).
+  #
+  # @param key [String] the recorded path
+  # @return [void]
+  def self.close_log_path(key)
+    OPEN_LOG_PATHS_LOCK.synchronize do
+      OPEN_LOG_PATHS[key] -= 1
+      OPEN_LOG_PATHS.delete(key) unless OPEN_LOG_PATHS[key].positive?
+    end
+  end
+
+  # Whether some logger in this Lich process has +path+ open.
+  #
+  # @param path [String] a log file's path
+  # @return [Boolean]
+  def self.log_path_open?(path)
+    key = File.expand_path(path)
+    OPEN_LOG_PATHS_LOCK.synchronize { OPEN_LOG_PATHS.key?(key) }
+  end
+
   # The script's argument parser: turns ;log's arguments into one option
   # per name, an argument starting with {FLAG_PREFIX} as a flag
   # ({parse_flag}) and any other word as a +true+ option
@@ -895,9 +935,12 @@ module GameLogger
     # {#start_compression}).
     DAY_SWEEP_DELAY = 120
 
-    # Seconds since its last write under which a file is left alone, and
-    # after which a leftover .gz.tmp counts as abandoned: a file written to
-    # within the hour may still be in use by some logger.
+    # Seconds since its last write under which a file dated yesterday is
+    # left alone, and after which a leftover .gz.tmp counts as abandoned. A
+    # file a logger in this Lich process holds open is skipped whatever its
+    # age ({GameLogger.log_path_open?}); this guard is the backstop for a
+    # logger that does not record its files, such as a logxml.lic older
+    # than 0.7.
     RECENT_WRITE = 3600
 
     # One character's log folder: <log root>/<game>-<name>, see {log_root}.
@@ -912,8 +955,9 @@ module GameLogger
     # Gzips every log file in a character's month folders
     # (<folder>/<YYYY>/<MM>/) whose name dates it before +cutoff+, one file
     # at a time (see {compress_log_file}). Files with other names, .gz
-    # files and the folder root (the layout before log.lic 0.0.7) are left
-    # alone.
+    # files, the folder root (the layout before log.lic 0.0.7) and any file
+    # a logger in this Lich process holds open ({GameLogger.log_path_open?})
+    # are left alone.
     #
     # @param folder [String] the character's log folder, see
     #   {character_log_folder}
@@ -936,6 +980,10 @@ module GameLogger
         end
         next unless (match = File.basename(path).match(LOG_FILE_NAME))
         next unless (date = (Date.new(match[1].to_i, match[2].to_i, match[3].to_i) rescue nil))&.<(cutoff)
+        # A file a logger in this process holds open is never compressed: an
+        # idle logger keeps yesterday's file open until a game line comes,
+        # and on Linux and macOS deleting it would lose its later lines.
+        next if GameLogger.log_path_open?(path)
         # Only a file dated yesterday (or later) can still be in use; an
         # older one is compressed even if just copied in (copying resets the
         # modification time, not the name).
@@ -1239,7 +1287,14 @@ module GameLogger
     #   first. Errors raised by the block pass through after the footer and
     #   close.
     def self.with_log_file(filename, stamp_format, clock: Time, header_stamp: nil)
-      file = File.open(filename, 'a')
+      # Recorded before the open, so no sweep starts on it in between.
+      open_key = GameLogger.open_log_path(filename)
+      begin
+        file = File.open(filename, 'a')
+      rescue StandardError
+        GameLogger.close_log_path(open_key)
+        raise
+      end
       header_written = false
       finished = false
       begin
@@ -1257,6 +1312,8 @@ module GameLogger
             file.close
           rescue StandardError => e
             Lich.log "#{log_label}: closing the log file #{filename} failed (#{e.class}: #{e.message}); lines are written as they come, with sync on, but the file may be missing its footer or a last write"
+          ensure
+            GameLogger.close_log_path(open_key)
           end
         end
       end
