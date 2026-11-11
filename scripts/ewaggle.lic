@@ -15,6 +15,7 @@
   2.2.0 (2026-11-07)
     - setup window rewritten from GTK to Lich's native WebUI (no GTK needed)
     - spells move between the lists by drag and drop, double-click, or the two buttons
+    - Save & Close saves; Cancel or closing the window discards
   2.1.7 (2026-10-21)
     - bugfix for mana bread with custom food not being eaten or dropped
   2.1.6 (2026-06-16)
@@ -205,7 +206,8 @@ module Ewaggle
   # Native WebUI setup window. Replaces the Gtk::Builder window: the layout is
   # authored with the Lich WebUI tree builder, the two spell lists are tables
   # that share a transfer group (drag a row across, or double-click it), and
-  # the Close button writes the profile exactly as the GTK window did.
+  # Save & Close writes the profile exactly as the GTK window's Close did;
+  # Cancel or closing the window discards. Built on Lich::WebUI::SettingsForm.
   class Setup
     attr_accessor :settings
 
@@ -262,7 +264,7 @@ module Ewaggle
     # True when Lich can open a WebUI window for this script.
     def self.available?
       defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
-        defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+        defined?(Lich::WebUI::SettingsForm) ? true : false
     end
 
     def self.get_category(key)
@@ -282,8 +284,6 @@ module Ewaggle
       @owner = Script.current
       @settings = settings
       @script_name = Script.current.name.capitalize
-      @closed = Queue.new
-      @saved = false
       @selected = { not_to_cast: nil, cast_list: nil }
       @status = ''
 
@@ -355,58 +355,93 @@ module Ewaggle
 
     # ---------------------------------------------------------- lifecycle --
 
+    # Shows the settings form. Save & Close writes the profile; Cancel or
+    # closing the window discards (;ewaggle setup reloads the profile after).
     def start
       setup = self
-      @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: title, props: { size: [760, 820] },
-                                   on: { close: ->(_ev) { setup.viewer_closed } }) do |ui|
-        setup.render(ui)
+      values = @settings.dup
+      SPINS.each { |key, (min, max)| values[key] = values[key].to_i.clamp(min, max) }
+      values[:sonic_armor] = '' unless SONIC_ARMOR.include?(values[:sonic_armor].to_s)
+      @form = Lich::WebUI::SettingsForm.new(
+        owner: @owner, id: PAGE_ID, title: title, values: values, fields: fields,
+        props: { size: [760, 820], bare: false, density: :normal },
+        normalize: ->(draft) { setup.normalize(draft) },
+        layout: ->(ui, field, save) { setup.render(ui, field, save, -> { setup.cancel }) }
+      )
+      result = @form.show.wait
+      if result
+        Ewaggle.data.settings = result
+        Ewaggle.save_profile
+      else
+        respond
+        Lich::Messaging.msg('plain', " #{@script_name} UI closed WITHOUT saving any changes")
+        Lich::Messaging.msg('plain', " Use the Save & Close button to save changes")
+        respond
       end
-      Lich::API.webui_refresh(@page)
-      Lich::API.webui_start
-      unless Lich::API.webui_open(page: @page)
-        Lich::Messaging.msg('plain', " #{@script_name}: could not open a browser window for setup.")
-        return
-      end
-      @closed.pop
-      return if @saved
-
-      respond
-      Lich::Messaging.msg('plain', " #{@script_name} UI closed WITHOUT saving any changes")
-      Lich::Messaging.msg('plain', " Be sure to use the close button to save changes")
-      respond
-    ensure
-      begin
-        Lich::WebUI.terminate_owner(@owner)
-      rescue StandardError
-        nil
-      end
+      result
     end
 
-    def viewer_closed
-      @closed << :viewer
-    end
-
-    def on_close_clicked
-      Ewaggle.data.settings[:cast_list] = @settings[:cast_list].dup
-      Ewaggle.data.settings[:not_to_cast] = @settings[:not_to_cast].dup
-      Ewaggle.save_profile
-      @saved = true
-      Lich::WebUI.close(@page)
-      @closed << :close
+    def cancel
+      @form&.close
     end
 
     def title
       "Ewaggle Setup v#{@version}"
     end
 
-    # Run a UI callback: contain errors, then re-render.
+    CHECKS = {
+      use_multicast: 'Multicast', skip_short_spells: 'Skip Short Spells on Others', bail_no_mana: 'Bail on No More Resources',
+      use_203: 'Use Mana Bread (203)', use_515: 'Use Rapid Fire (515)', use_wracking: 'Sign of Wracking',
+      wander_to_wrack: 'Wander to Wrack', use_power: 'Sigil of Power', use_concentration: 'Sigil of Concentration',
+      use_mana: 'Symbol of Mana', skip_not_sharing: 'Skip characters not sharing spell info'
+    }.freeze
+    SPIN_TIPS = {
+      start_at: 'Stackable spells with less time remaining than this are cast.',
+      stop_at: 'Stackable spells are cast until they have this much time remaining.',
+      refreshable_min: 'Spells above this time will NOT be cast',
+      armor_min: 'Armor buffs above this time will NOT be cast',
+      reserve_mana: 'Mana to keep in reserve. Casting stops at this amount.'
+    }.freeze
+
+    # Form fields. Options the character cannot use are left out of the layout,
+    # so they keep the forced-off value set in #initialize.
+    def fields
+      checks = CHECKS.map { |key, label| { key: key, type: :checkbox, label: label } }
+      spins = SPINS.map do |key, (min, max)|
+        { key: key, type: :number_input, min: min, max: max, step: 1, stepper_buttons: true, digits: 0, tooltip: SPIN_TIPS.fetch(key) }
+      end
+      armor = [{ value: '', label: '(none)' }] + Lich::WebUI::SettingsForm.choice_options(SONIC_ARMOR)
+      checks + spins + [
+        { key: :sonic_weapon, type: :text_input, placeholder: 'Name of sonic weapon (follow link for options)',
+          tooltip: 'Notable exceptions: Katana, Naginata, Claidhmore, and Missile Weapons.' },
+        { key: :sonic_shield, type: :text_input, placeholder: 'Name of sonic shield (follow link for options)' },
+        { key: :sonic_armor, type: :select, options: armor },
+        { key: :retribution_spell, type: :text_input, placeholder: 'Spell Number Only',
+          tooltip: 'Spell number to cast with Cloak of Shadows (712). See gswiki.play.net/Cloak_of_Shadows_(712).' },
+      ]
+    end
+
+    # Coerces submitted values to the types the profile has always held and
+    # takes both spell lists from this window's current state.
+    def normalize(draft)
+      CHECKS.each_key { |key| draft[key] = draft[key] ? true : false }
+      SPINS.each { |key, (min, max)| draft[key] = draft[key].to_i.clamp(min, max) }
+      %i[sonic_weapon sonic_shield retribution_spell].each { |key| draft[key] = draft[key].to_s.strip }
+      draft[:sonic_armor] = draft[:sonic_armor].to_s
+      draft[:cast_list] = @settings[:cast_list].dup
+      draft[:not_to_cast] = @settings[:not_to_cast].dup
+      draft
+    end
+
+    # Re-renders after a list move or a button press; field edits and row
+    # selection never refresh the page.
     def act
       yield
     rescue StandardError => e
       respond "#{@script_name} setup: #{e.class}: #{e.message}"
       respond e.backtrace.first(5).join("\n") if @settings[:debug]
     ensure
-      Lich::API.webui_refresh(@page) if @page && !@saved
+      Lich::WebUI.refresh(@form.page) if @form&.page
     end
 
     def cb(&block)
@@ -414,14 +449,17 @@ module Ewaggle
       ->(ev) { setup.act { block.call(ev) } }
     end
 
-    def set(key, value)
-      @settings[key] = value
-    end
-
     # ---------------------------------------------------------- spell lists --
 
-    def self.spell_key(text)
-      "spell-#{text.to_s[/^\d+/]}"
+    # Row keys for every spell in either list: the spell number, plus a suffix
+    # when two entries share a number, so keys are unique across both tables.
+    def row_keys
+      used = Hash.new(0)
+      (@settings[:not_to_cast] + @settings[:cast_list]).uniq.sort_by { |text| [text[/^\d+/].to_i, text] }.to_h do |text|
+        base = "spell-#{text.to_s[/^\d+/] || 'x'}"
+        used[base] += 1
+        [text, used[base] == 1 ? base : "#{base}-#{used[base]}"]
+      end
     end
 
     def self.sort_spells(list)
@@ -436,16 +474,18 @@ module Ewaggle
     # holds it. A drop onto the list it already lives in is a no-op.
     def move_spell(row, dest)
       src = other_list(dest)
-      text = @settings[src].find { |entry| Setup.spell_key(entry) == row }
+      keys = row_keys
+      text = @settings[src].find { |entry| keys[entry] == row }
       return unless text
 
       @settings[src].delete(text)
       @settings[dest] << text unless @settings[dest].include?(text)
       @settings[dest] = Setup.sort_spells(@settings[dest])
-      @selected = { not_to_cast: nil, cast_list: nil }
+      @selected[src] = nil
       @status = "#{text.strip} moved to #{LISTS[dest]}"
     end
 
+    # Each button moves the row selected in its own source list.
     def move_selected(dest)
       row = @selected[other_list(dest)]
       return @status = "Select a spell in #{LISTS[other_list(dest)]} first" unless row
@@ -453,18 +493,24 @@ module Ewaggle
       move_spell(row, dest)
     end
 
+    # Remembers the row selected in one list. The browser already shows it, so
+    # this neither refreshes nor touches the other list's selection.
+    def select_row(key, row)
+      @selected[key] = row.nil? ? nil : row.to_s
+    end
+
     # ------------------------------------------------------------- render --
 
-    def render(ui)
+    def render(ui, field, save, cancel)
       setup = self
       ui.stack(key: 'main', gap: 8, margin: 8) do
         setup.render_lists(ui)
-        setup.render_stackable(ui)
-        setup.render_options(ui)
-        setup.render_nonstackable(ui)
-        setup.render_misc(ui)
+        setup.render_stackable(ui, field)
+        setup.render_options(ui, field)
+        setup.render_nonstackable(ui, field)
+        setup.render_misc(ui, field)
       end
-      render_footer(ui)
+      render_footer(ui, save, cancel)
     end
 
     def render_lists(ui)
@@ -473,8 +519,9 @@ module Ewaggle
         ui.text(key: 'lists-hint', wrap: true,
                 content: 'Drag a spell between the lists, or double-click it. The buttons move the selected spell.')
         ui.columns(key: 'lists-cols', count: 2, gap: 8, row_align: :start) do
+          keys = setup.row_keys
           LISTS.each_with_index do |(key, label), i|
-            setup.render_spell_table(ui, key, label, i.to_s)
+            setup.render_spell_table(ui, key, label, i.to_s, keys)
           end
         end
         ui.columns(key: 'lists-buttons', count: 2, gap: 8) do
@@ -488,9 +535,9 @@ module Ewaggle
       end
     end
 
-    def render_spell_table(ui, key, label, slot)
+    def render_spell_table(ui, key, label, slot, keys)
       setup = self
-      rows = Setup.sort_spells(@settings[key]).map { |text| { key: Setup.spell_key(text), cells: { 'spell' => text.strip } } }
+      rows = Setup.sort_spells(@settings[key].uniq).map { |text| { key: keys.fetch(text), cells: { 'spell' => text.strip } } }
       selected = rows.any? { |r| r[:key] == @selected[key] } ? [@selected[key]] : []
       ui.table(slot: slot, key: "list-#{key}", columns: [{ key: 'spell', label: label, expand: true }], rows: rows,
                headers: true, selection: :single, selected: selected, activation: :double, max_height: 260,
@@ -499,58 +546,42 @@ module Ewaggle
                on: {
                  row_drop: setup.cb { |ev| setup.move_spell(ev.payload[:row].to_s, key) },
                  row_activate: setup.cb { |ev| setup.move_spell(ev.payload[:row].to_s, setup.other_list(key)) },
-                 selection_change: setup.cb { |ev| setup.select_row(key, Array(ev.payload[:rows]).first) }
+                 selection_change: ->(ev) { setup.select_row(key, Array(ev.payload[:rows]).first) }
                })
     end
 
-    def select_row(key, row)
-      @selected[key] = row.nil? ? nil : row.to_s
-      @selected[other_list(key)] = nil if row
-    end
-
-    def render_stackable(ui)
+    def render_stackable(ui, field)
       setup = self
       ui.group(key: 'stackable', label: 'Stackable Spells') do
         ui.columns(key: 'stackable-cols', count: 2, gap: 8) do
-          setup.render_spin(ui, :start_at, 'Start Casting Below:', '0',
-                            'Stackable spells with less time remaining than this are cast.')
-          setup.render_spin(ui, :stop_at, 'Stop Casting at:', '1',
-                            'Stackable spells are cast until they have this much time remaining.')
+          setup.render_spin(ui, field, :start_at, 'Start Casting Below:', '0')
+          setup.render_spin(ui, field, :stop_at, 'Stop Casting at:', '1')
         end
       end
     end
 
-    def render_options(ui)
+    def render_options(ui, field)
       setup = self
       off = disabled
+      shown = ->(key) { field.call(ui, key) unless off.include?(key) }
       ui.group(key: 'options', label: 'Options') do
         ui.columns(key: 'options-cols', count: 2, gap: 8) do
           ui.stack(slot: '0', key: 'options-left', gap: 4) do
-            setup.render_check(ui, :use_multicast, 'Multicast')
-            setup.render_check(ui, :skip_short_spells, 'Skip Short Spells on Others')
-            setup.render_check(ui, :bail_no_mana, 'Bail on No More Resources')
-            setup.render_check(ui, :use_203, 'Use Mana Bread (203)') unless off.include?(:use_203)
-            setup.render_check(ui, :use_515, 'Use Rapid Fire (515)') unless off.include?(:use_515)
+            %i[use_multicast skip_short_spells bail_no_mana use_203 use_515].each(&shown)
           end
           ui.stack(slot: '1', key: 'options-right', gap: 4) do
             case Society.membership
-            when 'Council of Light'
-              setup.render_check(ui, :use_wracking, 'Sign of Wracking') unless off.include?(:use_wracking)
-              setup.render_check(ui, :wander_to_wrack, 'Wander to Wrack') unless off.include?(:wander_to_wrack)
-            when 'Guardians of Sunfist'
-              setup.render_check(ui, :use_power, 'Sigil of Power') unless off.include?(:use_power)
-              setup.render_check(ui, :use_concentration, 'Sigil of Concentration') unless off.include?(:use_concentration)
-            when 'Order of Voln'
-              setup.render_check(ui, :use_mana, 'Symbol of Mana') unless off.include?(:use_mana)
+            when 'Council of Light' then %i[use_wracking wander_to_wrack].each(&shown)
+            when 'Guardians of Sunfist' then %i[use_power use_concentration].each(&shown)
+            when 'Order of Voln' then shown.call(:use_mana)
             end
           end
         end
-        setup.render_sonic(ui)
+        setup.render_sonic(ui, field)
       end
     end
 
-    def render_sonic(ui)
-      setup = self
+    def render_sonic(ui, field)
       weapon = Spell[1012].known?
       shield = Spell[1009].known?
       armor = Spell[1014].known?
@@ -559,82 +590,62 @@ module Ewaggle
       ui.stack(key: 'sonic', gap: 4) do
         if weapon
           ui.markdown(key: 'sonic_weapon_label', content: 'Sonic Weapon: ([gswiki.play.net/Weapon](https://gswiki.play.net/Weapon))')
-          ui.text_input(key: 'sonic_weapon', value: setup.settings[:sonic_weapon].to_s, change_mode: :input, placeholder: 'Name of sonic weapon (follow link for options)',
-                        tooltip: 'Notable exceptions: Katana, Naginata, Claidhmore, and Missile Weapons.',
-                        on: { change: ->(ev) { setup.set(:sonic_weapon, ev.payload[:value].to_s.strip) } })
+          field.call(ui, :sonic_weapon)
         end
         if shield
           ui.markdown(key: 'sonic_shield_label',
                       content: 'Sonic Shield: ([gswiki.play.net/Sonic Shield Song](https://gswiki.play.net/Sonic_Shield_Song_(1009)))')
-          ui.text_input(key: 'sonic_shield', value: setup.settings[:sonic_shield].to_s, change_mode: :input, placeholder: 'Name of sonic shield (follow link for options)',
-                        on: { change: ->(ev) { setup.set(:sonic_shield, ev.payload[:value].to_s.strip) } })
+          field.call(ui, :sonic_shield)
         end
         if armor
           ui.markdown(key: 'sonic_armor_label',
                       content: 'Sonic Armor: ([gswiki.play.net/Sonic Armor](https://gswiki.play.net/Sonic_Armor_(1014)))')
-          options = [{ value: '', label: '(none)' }] + SONIC_ARMOR.map { |name| { value: name, label: name } }
-          current = setup.settings[:sonic_armor].to_s
-          current = '' unless SONIC_ARMOR.include?(current)
-          ui.select(key: 'sonic_armor', options: options, value: current,
-                    on: { change: setup.cb { |ev| setup.set(:sonic_armor, ev.payload[:value].to_s) } })
+          field.call(ui, :sonic_armor)
         end
       end
     end
 
-    def render_nonstackable(ui)
+    def render_nonstackable(ui, field)
       setup = self
       ui.group(key: 'nonstackable', label: 'Non-Stackable Spells') do
         ui.columns(key: 'nonstackable-cols', count: 2, gap: 8) do
-          setup.render_spin(ui, :refreshable_min, 'Minimum Time(?):', '0', 'Spells above this time will NOT be cast')
-          setup.render_spin(ui, :armor_min, 'Armor Buffs(?):', '1', 'Armor buffs above this time will NOT be cast')
+          setup.render_spin(ui, field, :refreshable_min, 'Minimum Time(?):', '0')
+          setup.render_spin(ui, field, :armor_min, 'Armor Buffs(?):', '1')
         end
       end
     end
 
-    def render_misc(ui)
+    def render_misc(ui, field)
       setup = self
       ui.group(key: 'misc', label: 'Misc') do
-        setup.render_check(ui, :skip_not_sharing, 'Skip characters not sharing spell info')
+        field.call(ui, :skip_not_sharing)
         ui.columns(key: 'misc-cols', count: 2, gap: 8) do
-          setup.render_spin(ui, :reserve_mana, 'Reserve Mana:', '0', 'Mana to keep in reserve. Casting stops at this amount.')
+          setup.render_spin(ui, field, :reserve_mana, 'Reserve Mana:', '0')
           unless setup.disabled.include?(:retribution_spell)
             ui.columns(slot: '1', key: 'retribution-row', count: 2, weights: [2, 3], compact: true, row_align: :center) do
               ui.text(slot: '0', key: 'retribution_label', content: 'Retribution Spell:')
-              ui.text_input(slot: '1', key: 'retribution_spell', value: setup.settings[:retribution_spell].to_s, change_mode: :input, placeholder: 'Spell Number Only',
-                            tooltip: 'Spell number to cast with Cloak of Shadows (712). See gswiki.play.net/Cloak_of_Shadows_(712).',
-                            on: { change: ->(ev) { setup.set(:retribution_spell, ev.payload[:value].to_s.strip) } })
+              field.call(ui, :retribution_spell, slot: '1')
             end
           end
         end
       end
     end
 
-    def render_footer(ui)
+    def render_footer(ui, save, cancel)
       setup = self
       ui.divider(key: 'footer-div')
-      ui.columns(key: 'footer', count: 2, weights: [5, 1], compact: true, row_align: :center, margin: 6) do
+      ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, margin: 6) do
         ui.text(slot: '0', key: 'footer-text', wrap: true,
-                content: "#{setup.status.empty? ? '' : "#{setup.status}    "}To save, exit with the Close button, not the window's X.")
-        ui.button(slot: '1', key: 'close', label: 'Close', variant: :primary,
-                  tooltip: 'Save the settings to your ewaggle profile and close this window.',
-                  on: { activate: setup.cb { setup.on_close_clicked } })
+                content: "#{setup.status.empty? ? '' : "#{setup.status}    "}Cancel or closing the window discards changes.")
+        ui.button(slot: '1', key: 'cancel', label: 'Cancel', on: { activate: ->(_ev) { cancel.call } })
+        save.call(ui, slot: '2', variant: :primary, tooltip: 'Save the settings to your ewaggle profile and close this window.')
       end
     end
 
-    def render_check(ui, key, label)
-      setup = self
-      ui.checkbox(key: key.to_s, label: label, checked: @settings[key] ? true : false,
-                  on: { change: setup.cb { |ev| setup.set(key, ev.payload[:value] ? true : false) } })
-    end
-
-    def render_spin(ui, key, label, slot, tip)
-      setup = self
-      min, max = SPINS.fetch(key)
+    def render_spin(ui, field, key, label, slot)
       ui.columns(slot: slot, key: "#{key}-row", count: 2, weights: [2, 3], compact: true, row_align: :center) do
-        ui.text(slot: '0', key: "#{key}-label", content: label, tooltip: tip)
-        ui.number_input(slot: '1', key: key.to_s, value: setup.settings[key].to_i.clamp(min, max), min: min, max: max, step: 1,
-                        stepper_buttons: true, digits: 0, tooltip: tip,
-                        on: { change: setup.cb { |ev| setup.set(key, ev.payload[:value].to_i.clamp(min, max)) } })
+        ui.text(slot: '0', key: "#{key}-label", content: label, tooltip: SPIN_TIPS.fetch(key))
+        field.call(ui, key, slot: '1')
       end
     end
 
