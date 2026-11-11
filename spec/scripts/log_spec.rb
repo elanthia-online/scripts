@@ -2744,3 +2744,20 @@ module LogSpecHarness::Env
     end
   end
 end
+
+# Lich refuses to start a script whose `required: Lich` floor is above the
+# running Lich, and repository.lic checks the same line before it installs
+# an update (CommentParser.check_lich_requirement). Data.define and
+# Data#with are Ruby 3.2, while Lich 5.14.0 to 5.18.x accept Ruby 2.6
+# (lib/version.rb REQUIRED_RUBY); 5.19.0 is the first Lich that requires
+# Ruby 4.0. So a log.lic that uses Data must not let an older Lich load it.
+RSpec.describe 'log.lic required Lich version' do
+  let(:source) { File.read(File.expand_path('../../scripts/log.lic', __dir__)) }
+  let(:floor) { Gem::Version.new(source[/^[ \t]+required:[ \t]*Lich[ \t]*>=?[ \t]*([\d.]+)/, 1]) }
+
+  it 'is Lich 5.19.0 or later while the script uses Ruby 3.2 Data' do
+    skip 'log.lic does not use Data' unless source.include?('Data.define')
+
+    expect(floor).to be >= Gem::Version.new('5.19.0')
+  end
+end
