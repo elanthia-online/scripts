@@ -16,10 +16,15 @@
        author: elanthia-online
  contributors: Tillmen, Tysong, Xanlin
          game: gs
-      version: 1.2.1
+      version: 1.2.2
      required: Lich > 5.0.1
 
   changelog:
+    1.2.2 (2026-11-10):
+      * --timestamp keeps commas and "=" in the format; a --timestamp with no format echoes and is ignored instead of crashing
+      * log_timestamp on with no usable log_timestamp_format echoes and uses "%F %T %Z" instead of crashing
+      * --lines accepts 50,000 and 50_000; an invalid value echoes a message and uses 30000
+      * an argument "--" with no option name echoes and is ignored instead of crashing
     1.2.1 (2026-09-25):
       * Expand regex match for various XML that may come across due to script output
     1.2.0 (2026-04-23):
@@ -68,24 +73,76 @@ unless (Gem::Version.new(RUBY_VERSION) > Gem::Version.new('2.0.0')) || $SAFE == 
 end
 
 module GameLogger
+  # Lines written to one log file before a new file is started, when
+  # --lines is not given or is not a valid count.
+  DEFAULT_LINES_PER_FILE ||= 30_000
+
+  # Timestamp format used when the settings turn timestamps on but give no
+  # usable log_timestamp_format (the DR base.yaml default).
+  DEFAULT_TIMESTAMP_FORMAT ||= '%F %T %Z'
+
+  # A --lines value: plain digits, or groups of three digits after the first
+  # group, split by "," or "_" (50000, 50,000, 50_000, 1,000,000).
+  LINE_COUNT_PATTERN ||= /\A(?:[0-9]+|[0-9]{1,3}(?:[,_][0-9]{3})+)\z/
+
   module Opts
     FLAG_PREFIX ||= "--"
+    # Flags whose value is a comma-separated list. Every other flag keeps its
+    # value whole, so a --timestamp format may contain commas.
+    LIST_FLAGS ||= %i[exclude].freeze
 
+    # Records a positional word as a +true+ option. A word never replaces a
+    # value already given for the same name (the word +timestamp+ after
+    # --timestamp=FMT keeps FMT).
+    #
+    # @param h [Hash{Symbol => Object}] options parsed so far; updated in place
+    # @param c [String] the positional word, e.g. "streams"
+    # @return [Object] the value now stored under the word's name
     def self.parse_command(h, c)
-      h[c.to_sym] = true
+      h[c.to_sym] ||= true
     end
 
+    # Records one --name[=value] flag. The value is everything after the
+    # first "="; only {LIST_FLAGS} are split on commas (a single item stays
+    # a String). A bare flag is +true+ and never replaces a value already
+    # given for the same name; a valued flag replaces any earlier value, so
+    # the last --timestamp=FMT wins. A flag with no name (+--+ or +--=x+)
+    # echoes and is ignored.
+    #
+    # @param h [Hash{Symbol => Object}] options parsed so far; updated in place
+    # @param f [String] the flag as typed, e.g. "--timestamp=%b %d, %Y %T"
+    # @return [String, Array<String>, true, nil] the value now stored for the
+    #   flag, or +nil+ when the flag has no name and is ignored
     def self.parse_flag(h, f)
-      (name, val) = f[2..-1].split("=")
+      (name, val) = f[2..-1].split("=", 2)
+      if name.nil? || name.empty?
+        echo "#{f} has no option name, so it is ignored."
+        return nil
+      end
+
+      key = name.to_sym
       if val.nil?
-        h[name.to_sym] = true
-      else
+        h[key] ||= true
+      elsif LIST_FLAGS.include?(key)
         val = val.split(",")
 
-        h[name.to_sym] = val.size == 1 ? val.first : val
+        h[key] = val.size == 1 ? val.first : val
+      else
+        h[key] = val
       end
     end
 
+    # Parses the script's arguments into options. Arguments starting with
+    # +--+ go through {parse_flag}; any other word goes through
+    # {parse_command}. With no +args+, reads Script.current.vars: when
+    # vars[0] holds a double quote, it is re-split so a quoted value
+    # (--timestamp="%F %T %Z") stays one argument, which matters for
+    # autostart, whose saved arguments reach vars[1..] split on spaces.
+    #
+    # @param args [Array<String>, nil] arguments to parse; +nil+ reads
+    #   Script.current.vars
+    # @return [OpenStruct] one member per option name; an option not given
+    #   reads as +nil+
     def self.parse(args = nil)
       case args
       when nil
@@ -117,7 +174,71 @@ module GameLogger
     end
   end
 
+  # Turns the --lines option into a line count. Accepts whole numbers above
+  # 0 written as plain digits or in groups of three digits split by "," or
+  # "_" (50000, 50,000, 50_000); see {LINE_COUNT_PATTERN}. Anything else (0,
+  # negative, words, misplaced separators like 50,00, a bare --lines or the
+  # word lines) echoes one message and falls back to
+  # {DEFAULT_LINES_PER_FILE}, so a bad value can neither crash the logger
+  # nor make it rotate files without reading lines.
+  #
+  # @param value [String, true, nil] the parsed --lines option (+true+ for a
+  #   bare --lines or the word lines, +nil+ when not given)
+  # @return [Integer] lines per log file, always above 0
+  def self.lines_per_file(value)
+    return DEFAULT_LINES_PER_FILE if value.nil?
+
+    count = Integer(value.delete(',_'), 10) if value.is_a?(String) && value.match?(LINE_COUNT_PATTERN)
+    return count if count&.positive?
+
+    problem = value.is_a?(String) ? "--lines=#{value} is not a valid line count" : 'lines was given without a value'
+    echo "#{problem}; use a whole number above 0, like --lines=50000. Using the default of #{DEFAULT_LINES_PER_FILE} lines per file."
+    DEFAULT_LINES_PER_FILE
+  end
+
+  # Whether a value can be handed to strftime as a timestamp format: only a
+  # non-empty String is.
+  #
+  # @param value [Object] a --timestamp option or a log_timestamp_format setting
+  # @return [Boolean]
+  def self.timestamp_format?(value)
+    value.is_a?(String) && !value.empty?
+  end
+
+  # Picks the timestamp format from the --timestamp option and the profile
+  # settings, checking both the same way ({timestamp_format?}) so strftime
+  # never sees anything but a format. A --timestamp=FMT wins. A --timestamp
+  # with no format (bare flag, the word timestamp, or --timestamp=) echoes
+  # once and is ignored. Settings that turn timestamps on without a usable
+  # log_timestamp_format echo once and use {DEFAULT_TIMESTAMP_FORMAT}.
+  #
+  # @param option [String, true, nil] the parsed --timestamp option
+  # @param enabled [Object] settings.log_timestamp; truthy turns timestamps on
+  #   (+nil+ when there are no settings)
+  # @param format [Object] settings.log_timestamp_format
+  # @return [String, nil] the format to stamp with, or +nil+ for no timestamps
+  def self.timestamp_format(option, enabled, format)
+    return option if timestamp_format?(option)
+
+    echo 'timestamp was given without a format, so it is ignored; to add timestamps use --timestamp="%F %T %Z".' unless option.nil?
+    return nil unless enabled
+    return format if timestamp_format?(format)
+
+    echo "log_timestamp is on in your settings, but log_timestamp_format #{format.inspect} is not a format; using #{DEFAULT_TIMESTAMP_FORMAT.inspect}."
+    DEFAULT_TIMESTAMP_FORMAT
+  end
+
   @options = Opts.parse
+
+  # Runs the logger until the script is killed: starts a new log file on
+  # each new day and after the --lines count (see {lines_per_file}),
+  # stamping lines when {timestamp_format} returns a format. The file
+  # header and footer carry that format, or the date and time when there is
+  # none. Typed commands are logged as ">command" lines, lines seen in
+  # --exclude rooms are skipped, and --rnum adds the room number to room
+  # titles.
+  #
+  # @return [void]
   def self.main
     if defined?(get_settings)
       settings = get_settings
@@ -127,17 +248,15 @@ module GameLogger
     Script.current.want_script_output = true
     Script.current.want_upstream = true
 
-    if @options.timestamp
-      stamp_format = @options.timestamp
-      stamp_enable = true
-    end
+    stamp_format = timestamp_format(@options.timestamp, stamp_enable, stamp_format)
+    stamp_enable = !stamp_format.nil?
 
     show_room_numbers = false
     if @options.roomnum || @options.rnum
       show_room_numbers = @options.roomnum || @options.rnum
     end
 
-    lines = (@options.lines || 30_000).to_i
+    lines = lines_per_file(@options.lines)
 
     Thread.new {
       begin
