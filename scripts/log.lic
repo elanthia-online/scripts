@@ -1,6 +1,9 @@
 =begin
 
-  logs the game to lich\logs\<game code>-<char name>\<date>-<number>.log
+  logs the game to <Lich log folder>\<game code>-<char name>\<year>\<month>\<date>_<time>.log
+  (the Lich log folder is LOG_DIR, set by Lich's --logs= option, or lich\logs;
+  a file started by a new day or a full file whose name is already taken ends in _01, _02, ... before .log;
+  a restarted logger appends to a file of the same name)
   starts a new file after 30,000 lines (somewhere around 1mb)
 
   SYNTAX:  ;log
@@ -19,10 +22,19 @@
        author: elanthia-online
  contributors: Tillmen, Tysong, Xanlin
          game: gs
-      version: 1.2.3
+      version: 1.2.4
      required: Lich >= 5.14.0
 
   changelog:
+    1.2.4 (2026-11-10):
+      * the reget lines at the top of the log no longer end in a stray carriage return, and an empty reget writes nothing
+      * logs go to Lich's log folder (LOG_DIR, set by Lich's --logs= option), or LICH_DIR/logs when it is not set
+      * a log file now also gets its footer when the logger is stopped (;kill, logout, Lich exiting), not only when a new file starts; a footer that cannot be written then goes to the Lich log
+      * a log file whose header cannot be written is closed instead of being left open
+      * the new day's file starts with the first line read after midnight, which went into yesterday's file; a line in an --exclude room also starts it, and is still not logged
+      * only lines written to the file count toward --lines, so excluded and filtered lines no longer make header-and-footer-only files
+      * a file started by a new day or a full file whose name is taken (for example, a whole file within one second) gets an _01, _02, ... suffix (sorting after the first file) instead of being appended to it; the first file of a run still appends to a file of the same name
+      * after a full file, the next file is opened when its first line comes, so no file is left without lines when that line comes after midnight or the logger stops first
     1.2.3 (2026-11-10):
       * --rnum and --exclude find the Lich room number in the map's UID table, never by matching the room from the logger (no LOCATION/PEER sent, no lost lines)
       * with --rnum or a Lich room number in --exclude, the logger loads the map once in the background when nothing has loaded it yet (in DragonRealms, Lich's own room display does not load it by default); until the map has the room's UID, each line asks again, so the room is numbered and excluded from then on
@@ -328,13 +340,170 @@ module GameLogger
     line
   end
 
+  # The folder that holds every character's log folders: Lich's LOG_DIR,
+  # which Lich's --logs= option sets (and which pilepull.lic reads these
+  # logs from), or LICH_DIR/logs when LOG_DIR is not defined or empty.
+  #
+  # @return [String] the logs folder
+  def self.log_root
+    root = (LOG_DIR if defined?(LOG_DIR)).to_s
+    root.empty? ? File.join(LICH_DIR, 'logs') : root
+  end
+
+  # The folder for one character's logs in one month:
+  # <log root>/<game>-<name>/<YYYY>/<MM>, see {log_root}.
+  #
+  # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
+  # @param name [String] the character's name (XMLData.name)
+  # @param time [Time] the time the log file is started
+  # @return [String] the folder path (not created here)
+  def self.log_directory(game, name, time)
+    File.join(log_root, "#{game}-#{name}", time.strftime('%Y'), time.strftime('%m'))
+  end
+
+  # The path for a new log file: <dir>/<YYYY-MM-DD_HH-MM-SS><extension>.
+  # The first file of a run keeps that name even when the file exists (it
+  # is appended to, as a restarted logger always has). A file started by
+  # rotation never reuses an existing name: when a whole file filled within
+  # one second (a tiny --lines during a burst), or another logger wrote
+  # that name, "_01", "_02", ... is added before the extension. That
+  # suffix sorts after the first file's name and, up to _99, in order, so a
+  # month folder listed by name keeps the files in the order written.
+  #
+  # @param dir [String] the folder, see {log_directory}
+  # @param time [Time] the time the file is started
+  # @param extension [String] the file extension with its dot, e.g. ".log"
+  # @param rotated [Boolean] true for a file started by rotation (a new day
+  #   or the --lines count), false for the first file of a run
+  # @return [String] the file path
+  def self.log_file_path(dir, time, extension, rotated:)
+    stem = File.join(dir, time.strftime('%Y-%m-%d_%H-%M-%S'))
+    path = "#{stem}#{extension}"
+    return path unless rotated
+
+    suffix = 0
+    path = "#{stem}_#{format('%02d', suffix += 1)}#{extension}" while File.exist?(path)
+    path
+  end
+
+  # The header or footer line of a log file: the time now in the
+  # timestamp format, or as "%Y-%m-%d %H:%M:%S.%L %:z" (date, time to the
+  # millisecond and UTC offset) when timestamps are off. That default is
+  # written here rather than as a constant: Lich keeps this module for the
+  # whole session, and a guarded constant would keep the first loaded value
+  # when a newer log.lic is started.
+  #
+  # @param stamp_format [String, nil] the strftime format, or +nil+ for no
+  #   timestamps
+  # @return [String] the line, without a line end
+  def self.file_stamp(stamp_format)
+    Time.now.strftime(stamp_format || '%Y-%m-%d %H:%M:%S.%L %:z')
+  end
+
+  # Opens a log file for appending, writes its header line, runs the block
+  # with it, then writes its footer line and closes it. The footer is
+  # written exactly once, from an ensure, so a file gets one also when the
+  # logger stops (;kill, logout, Lich exiting) and not only when it starts a
+  # new file; see {write_footer}. A file whose header could not be written
+  # gets no footer, and is still closed, so an error in the header never
+  # leaves the file open.
+  #
+  # @param filename [String] the log file path; an existing file is
+  #   appended to
+  # @param stamp_format [String, nil] the strftime format for the header and
+  #   footer, or +nil+ for the default, see {file_stamp}
+  # @yield [file] writes the file's lines
+  # @yieldparam file [File] the open log file, with sync on
+  # @yieldreturn [void]
+  # @return [void]
+  # @raise [SystemCallError, IOError] when the file cannot be opened, its
+  #   header cannot be written, or the block returns (the file is full or
+  #   the day changed) and the footer cannot be written; the file is closed
+  #   first. Errors raised by the block pass through after the footer and
+  #   close.
+  def self.with_log_file(filename, stamp_format)
+    file = File.open(filename, 'a')
+    header_written = false
+    finished = false
+    begin
+      file.sync = true
+      file.puts file_stamp(stamp_format)
+      header_written = true
+      yield file
+      finished = true
+    ensure
+      begin
+        # Not finished: an error or Thread#kill (;kill) is stopping the logger.
+        write_footer(file, stamp_format, stopping: !finished) if header_written
+      ensure
+        begin
+          file.close
+        rescue
+          Lich.log "Can't close file!"
+        end
+      end
+    end
+  end
+
+  # Writes a log file's footer line. It runs each time a file is closed:
+  # when a new file starts (a new day or the --lines count), where a failed
+  # write raises, and when the logger stops, where a failed write (disk
+  # full, a closed file) goes to the Lich log and is otherwise ignored, so
+  # it does not replace the reason the logger stopped.
+  #
+  # @param file [File] the open log file
+  # @param stamp_format [String, nil] the strftime format, or +nil+ for
+  #   the default, see {file_stamp}
+  # @param stopping [Boolean] true when the logger is stopping (an error or
+  #   ;kill), false when the file is closed for the next one
+  # @return [void]
+  # @raise [IOError, SystemCallError] when the write fails and +stopping+ is
+  #   false
+  def self.write_footer(file, stamp_format, stopping:)
+    file.puts file_stamp(stamp_format)
+  rescue IOError, SystemCallError => e
+    raise unless stopping
+
+    Lich.log "log: the footer of #{file.path} was not written while the logger stopped (#{e.class}: #{e.message})"
+    nil
+  end
+
+  # Writes the lines lich-5's reget returned at the top of the first log
+  # file, as the text log shows them: the stream, progress bar and dialog
+  # tag lines are left out, the server's "\r" line end is removed
+  # ($_SERVERBUFFER_ keeps CRLF and reget splits on "\n"), and with
+  # timestamps on each line is stamped with $login_time.
+  #
+  # @param file [File] the open log file
+  # @param lines [Array<String>, nil] reget's answer; +nil+ (an empty
+  #   buffer) writes nothing
+  # @param stamp_format [String, nil] the strftime format, or +nil+ for no
+  #   timestamps
+  # @return [void]
+  def self.write_reget(file, lines, stamp_format)
+    Array(lines).each do |line|
+      next if line =~ /^<\/?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)/
+
+      line = line.chomp
+      if stamp_format
+        file.puts "#{$login_time.strftime(stamp_format)}: #{line}"
+      else
+        file.puts line
+      end
+    end
+  end
+
   @options = Opts.parse
 
   # Runs the logger until the script is killed: starts a new log file on
-  # each new day and after the --lines count (see {lines_per_file}),
-  # stamping lines when {timestamp_format} returns a format. The file
+  # each new day, with the first line read after midnight (excluded or
+  # not), and after the --lines count of written lines (see
+  # {lines_per_file}; excluded and filtered lines do not count), when the
+  # next line is read, so the next file is named and dated by its first
+  # line; stamps lines when {timestamp_format} returns a format. The file
   # header and footer carry that format, or the date and time when there is
-  # none. Typed commands are logged as ">command" lines, lines seen in
+  # none; a file also gets its footer when the logger stops (see
+  # {with_log_file}). Typed commands are logged as ">command" lines, lines seen in
   # --exclude rooms are skipped, and --rnum adds the room number to room
   # titles.
   #
@@ -395,38 +564,41 @@ module GameLogger
     }
 
     started = false
+    # The line that opens the next file. A line read after midnight belongs
+    # to the new day's file: it is kept here while the old file is closed.
+    # After a full file, the next line is read before the next file is
+    # opened, so its name and date are those of its first line: a file
+    # opened at once would wait with no line, and when that line came after
+    # midnight it would go to the new day's file, leaving an old-day file
+    # with only its header and footer.
+    carried_line = nil
     loop {
-      dir = File.join(LICH_DIR, 'logs', "#{XMLData.game}-#{XMLData.name}", Time.now.strftime("%Y"), Time.now.strftime("%m"))
+      carried_line = get if started && carried_line.nil?
+      dir = log_directory(XMLData.game, XMLData.name, Time.now)
       FileUtils.mkdir_p(dir) unless File.exist?(dir)
       thisdate = Time.now.strftime("%Y-%m-%d")
-      filename = File.join(dir, "#{Time.now.strftime("%Y-%m-%d_%H-%M-%S")}.log")
-      file = File.open(filename, 'a')
-      file.sync = true
-      if stamp_enable
-        file.puts "#{Time.now.strftime(stamp_format)}\n"
-      else
-        file.puts "#{Time.now.strftime("%Y-%m-%d %H:%M:%S.%L %:z")}\n"
-      end
-      unless started
-        if (Time.now - $login_time) < 30
-          reget.each do |line|
-            next if line =~ /^<\/?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)/
-
-            if stamp_enable
-              file.puts "#{$login_time.strftime(stamp_format)}: #{line}"
-            else
-              file.puts line
-            end
+      filename = log_file_path(dir, Time.now, '.log', rotated: started)
+      with_log_file(filename, stamp_format) do |file|
+        unless started
+          if (Time.now - $login_time) < 30
+            write_reget(file, reget, stamp_format)
+            file.puts "<!-- Above contents from reget; full logging now active -->\n"
           end
-          file.puts "<!-- Above contents from reget; full logging now active -->\n"
-        end
 
-        echo "Non-XML Logging started, currently logging to #{filename}"
-        started = true
-      end
-      begin
-        lines.times {
-          line = get
+          echo "Non-XML Logging started, currently logging to #{filename}"
+          started = true
+        end
+        # Only lines written to the file count toward --lines.
+        written = 0
+        while written < lines
+          line = carried_line || get
+          carried_line = nil
+          # The date is checked before anything else, on every line read,
+          # excluded or not, so the first line of a new day starts its file.
+          if Time.now.strftime("%Y-%m-%d") != thisdate
+            carried_line = line
+            break
+          end
           if track_room
             # Work the room out again only when the parser has moved on.
             unless XMLData.room_count == room_count && XMLData.room_id == room_uid && XMLData.room_title == room_title
@@ -451,29 +623,18 @@ module GameLogger
 
             line = number_room_title(line, lich_id, room_uid, XMLData.game) if title_pattern&.match?(line.b)
           end
-          unless line =~ /^<\/?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)/
-            unless defined?(stamp_enable)
-              file.puts line
+          next if line =~ /^<\/?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)/
+
+          unless defined?(stamp_enable)
+            file.puts line
+          else
+            if stamp_enable
+              file.puts "#{Time.now.strftime(stamp_format)}: #{line}"
             else
-              if stamp_enable
-                file.puts "#{Time.now.strftime(stamp_format)}: #{line}"
-              else
-                file.puts line
-              end
+              file.puts line
             end
           end
-          break if Time.now.strftime("%Y-%m-%d") != thisdate
-        }
-        if stamp_enable
-          file.puts "#{Time.now.strftime(stamp_format)}\n"
-        else
-          file.puts "#{Time.now.strftime("%Y-%m-%d %H:%M:%S.%L %:z")}\n"
-        end
-      ensure
-        begin
-          file.close
-        rescue
-          Lich.log "Can't close file!"
+          written += 1
         end
       end
     }

@@ -16,18 +16,24 @@ RSpec.describe 'logxml.lic' do
 
   let(:log_dir) { Dir.mktmpdir }
   let(:frozen_time) { Time.new(2026, 4, 23, 10, 0, 5) }
+  # Time.now; a Time among run_logxml's lines moves it.
+  let(:clock) { [frozen_time] }
   let(:echoes) { [] }
   let(:default_header) { '2026-04-23 10:00am' }
   let(:fallback_stamp) { frozen_time.strftime('%F %T %Z') }
+  # The footer when timestamps are off: 24-hour with milliseconds, unlike
+  # the 12-hour header.
+  let(:default_footer) { frozen_time.strftime('%Y-%m-%d %H:%M:%S.%L %:z') }
   let(:started_echo) { "XML Logging started, currently logging to #{log_file}" }
 
   before do
     stub_const('LICH_DIR', log_dir)
+    hide_const('LOG_DIR') # unless an example sets it, as Lich's --logs= does
     stub_const('XMLData', Module.new do
       def self.game = 'GSIV'
       def self.name = 'TestChar'
     end)
-    allow(Time).to receive(:now).and_return(frozen_time)
+    allow(Time).to receive(:now) { clock.first }
     $login_time = frozen_time - 3600
   end
 
@@ -36,8 +42,11 @@ RSpec.describe 'logxml.lic' do
   end
 
   # Runs logxml.lic once with +vars+ as typed and the given DR settings
-  # (+nil+ for none, as in GS). Ends when the fed lines run out.
-  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'])
+  # (+nil+ for none, as in GS). Ends when the fed lines run out; a Time
+  # among +lines+ moves the clock before the next line is read.
+  # +reget+ is what lich-5's reget answers: nil for an empty buffer. A
+  # block runs once the fed lines run out, just before the logger stops.
+  def run_logxml(vars: [], settings: nil, lines: ['<output>You see a door.</output>'], reget: nil)
     script = OpenStruct.new(want_script_output: nil, vars: [vars.join(' '), *vars], downstream_buffer: [], name: 'logxml')
     stub_const('Script', Class.new { define_singleton_method(:current) { script } })
     pending_lines = lines.map(&:dup) # fresh Strings, as get returns; logxml edits lines in place
@@ -45,8 +54,16 @@ RSpec.describe 'logxml.lic' do
     runner = Object.new
     runner.define_singleton_method(:hide_me) { nil }
     runner.define_singleton_method(:echo) { |msg| sink << msg.to_s }
-    runner.define_singleton_method(:reget) { [] }
-    runner.define_singleton_method(:get) { pending_lines.shift || raise(StopIteration) }
+    runner.define_singleton_method(:reget) { reget }
+    on_stop = block_given? ? proc { yield } : proc {}
+    time_now = clock
+    runner.define_singleton_method(:get) do
+      time_now[0] = pending_lines.shift while pending_lines.first.is_a?(Time)
+      next pending_lines.shift unless pending_lines.empty?
+
+      on_stop.call
+      raise StopIteration
+    end
     runner.define_singleton_method(:upstream_get) { Thread.current.kill }
     runner.define_singleton_method(:get_settings) { settings } unless settings.nil?
     Timeout.timeout(5) { runner.instance_eval(body, script_path, body_line) }
@@ -54,6 +71,13 @@ RSpec.describe 'logxml.lic' do
 
   def log_file
     Dir.glob(File.join(log_dir, '**', '*.xml')).first
+  end
+
+  # Stands in for Lich.log; returns the Array its messages are added to.
+  def stub_lich_log
+    [].tap do |logged|
+      stub_const('Lich', Module.new { define_singleton_method(:log) { |msg| logged << msg } })
+    end
   end
 
   def log_lines
@@ -65,7 +89,7 @@ RSpec.describe 'logxml.lic' do
       it "stamps with %F %T %Z and says so for #{label} (#{format.inspect})" do
         run_logxml(settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: format))
 
-        expect(log_lines).to eq([fallback_stamp, "#{fallback_stamp}: <output>You see a door.</output>"])
+        expect(log_lines).to eq([fallback_stamp, "#{fallback_stamp}: <output>You see a door.</output>", fallback_stamp])
         expect(echoes).to eq(
           [
             "log_timestamp is on in your settings, but log_timestamp_format #{format.inspect} is not a format; using \"%F %T %Z\".",
@@ -78,7 +102,7 @@ RSpec.describe 'logxml.lic' do
     it 'uses a --timestamp=FMT without a message' do
       run_logxml(vars: ['--timestamp=%H:%M'], settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
 
-      expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>'])
+      expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
       expect(echoes).to eq([started_echo])
     end
   end
@@ -86,14 +110,14 @@ RSpec.describe 'logxml.lic' do
   it 'uses the yaml format when it is a format' do
     run_logxml(settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
-    expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>'])
+    expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
     expect(echoes).to eq([started_echo])
   end
 
   it 'stays off when the yaml turns timestamps off, whatever the format' do
     run_logxml(settings: OpenStruct.new(log_timestamp: false, log_timestamp_format: nil))
 
-    expect(log_lines).to eq([default_header, '<output>You see a door.</output>'])
+    expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
     expect(echoes).to eq([started_echo])
   end
 
@@ -101,7 +125,7 @@ RSpec.describe 'logxml.lic' do
     it 'logs without timestamps and says the option was ignored' do
       run_logxml(vars: ['--timestamp='])
 
-      expect(log_lines).to eq([default_header, '<output>You see a door.</output>'])
+      expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
       expect(echoes).to eq(
         [
           'timestamp was given without a format, so it is ignored; to add timestamps use --timestamp="%F %T %Z".',
@@ -113,14 +137,14 @@ RSpec.describe 'logxml.lic' do
     it 'treats --timestamp="" in vars[0] the same way' do
       run_logxml(vars: ['--timestamp=""'])
 
-      expect(log_lines).to eq([default_header, '<output>You see a door.</output>'])
+      expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
       expect(echoes.first).to start_with('timestamp was given without a format')
     end
 
     it 'keeps the yaml format when the yaml enables timestamps' do
       run_logxml(vars: ['--timestamp='], settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
-      expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>'])
+      expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
     end
   end
 
@@ -152,7 +176,8 @@ RSpec.describe 'logxml.lic' do
 
     def logged_lines(vars: ['--rnum'])
       run_logxml(vars: vars, lines: [title_line, '<output>You see a door.</output>'])
-      log_lines.drop(1)
+      expect(log_lines.last).to eq(default_footer)
+      log_lines[1..-2]
     end
 
     it 'adds the Lich id from the UID table and the u-id to the GS room title' do
@@ -250,9 +275,239 @@ RSpec.describe 'logxml.lic' do
     end
   end
 
+  context 'when started within 30 seconds of login' do
+    let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+
+    before { $login_time = frozen_time - 5 }
+
+    # R-14: lich-5's reget returns nil for an empty buffer; puts(nil)
+    # wrote a blank line before the marker.
+    it 'writes no blank line when reget returns nil' do
+      run_logxml(reget: nil)
+
+      expect(log_lines.first(3)).to eq([default_header, marker, '<output>You see a door.</output>'])
+    end
+
+    # R-15: reget lines keep the server's "\r" (CRLF line ends).
+    it 'writes the raw reget lines without their trailing carriage return' do
+      run_logxml(reget: ["<pushStream id=\"room\"/>Room text\r", "<prompt time=\"1\">&gt;</prompt>\r"])
+
+      expect(File.binread(log_file)).not_to include("\r")
+      expect(log_lines.first(4)).to eq(
+        [default_header, '<pushStream id="room"/>Room text', '<prompt time="1">&gt;</prompt>', marker]
+      )
+    end
+  end
+
+  # R-24: Lich's --logs= sets LOG_DIR; pilepull.lic reads the logs there.
+  context 'with Lich started with --logs=' do
+    let(:logs_dir) { Dir.mktmpdir }
+
+    after { FileUtils.rm_rf(logs_dir) }
+
+    it 'writes the log under LOG_DIR in the <game>-<name>/<year>/<month> layout' do
+      stub_const('LOG_DIR', logs_dir)
+
+      run_logxml
+
+      expect(Dir.glob(File.join(logs_dir, '**', '*.xml'))).to eq(
+        [File.join(logs_dir, 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml')]
+      )
+      expect(log_file).to be_nil
+    end
+  end
+
+  it 'writes under LICH_DIR/logs when LOG_DIR is not defined or empty' do
+    run_logxml
+    expect(log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml'))
+
+    FileUtils.rm_rf(File.join(log_dir, 'logs'))
+    stub_const('LOG_DIR', '')
+    run_logxml
+    expect(log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.xml'))
+  end
+
+  # R-13: the line was written before the date check, so the first line
+  # after midnight went into yesterday's file; skipped lines used up the
+  # 30000-line budget.
+  context 'when starting a new file' do
+    let(:next_day) { Time.new(2026, 4, 24, 0, 0, 1) }
+
+    it "logs the first line after midnight in the new day's file" do
+      run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>'])
+
+      root = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      next_day_footer = next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')
+      expect(File.read(File.join(root, '2026-04-23_10-00-05.xml')).lines(chomp: true)).to eq(
+        [default_header, '<output>line 1</output>', next_day_footer]
+      )
+      expect(File.read(File.join(root, '2026-04-24_00-00-01.xml')).lines(chomp: true)).to eq(
+        ['2026-04-24 12:00am', '<output>line 2</output>', next_day_footer]
+      )
+    end
+
+    it 'counts only written lines toward the 30000, not skipped stream lines' do
+      run_logxml(lines: ['<pushStream id="inv"/>', '<popStream/>', *Array.new(30_001) { |n| "<output>#{n + 1}</output>" }])
+
+      # R-25: the clock is frozen, so the second file gets an _01 suffix.
+      month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      first = File.read(File.join(month, '2026-04-23_10-00-05.xml')).lines(chomp: true)
+      expect(first.size).to eq(30_002)
+      expect(first.last(2)).to eq(['<output>30000</output>', default_footer])
+      expect(File.read(File.join(month, '2026-04-23_10-00-05_01.xml')).lines(chomp: true)).to eq(
+        [default_header, '<output>30001</output>', default_footer]
+      )
+    end
+
+    # A file opened at once after a full one waited for a line; when the
+    # first one came after midnight it went to the new day's file and the
+    # waiting file kept only its header and footer, under the old day.
+    it 'opens the file after a full one only when its first line comes, also past midnight' do
+      run_logxml(lines: [*Array.new(30_000) { |n| "<output>#{n + 1}</output>" }, next_day, '<output>next day</output>'])
+
+      month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      expect(Dir.children(month).sort).to eq(['2026-04-23_10-00-05.xml', '2026-04-24_00-00-01.xml'])
+      expect(File.read(File.join(month, '2026-04-23_10-00-05.xml')).lines(chomp: true).last).to eq(default_footer)
+      expect(File.read(File.join(month, '2026-04-24_00-00-01.xml')).lines(chomp: true)).to eq(
+        ['2026-04-24 12:00am', '<output>next day</output>', next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')]
+      )
+    end
+
+    it 'gives a new file _02 when the time-stamped name and its _01 both exist' do
+      month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      FileUtils.mkdir_p(month)
+      File.write(File.join(month, '2026-04-24_00-00-01.xml'), "other logger\n")
+      File.write(File.join(month, '2026-04-24_00-00-01_01.xml'), "other logger\n")
+
+      run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>'])
+
+      expect(File.read(File.join(month, '2026-04-24_00-00-01_02.xml')).lines(chomp: true)).to eq(
+        ['2026-04-24 12:00am', '<output>line 2</output>', next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')]
+      )
+      expect(File.read(File.join(month, '2026-04-24_00-00-01_01.xml'))).to eq("other logger\n")
+    end
+
+    it 'appends to an existing file of the same name when it starts' do
+      month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+      FileUtils.mkdir_p(month)
+      File.write(File.join(month, '2026-04-23_10-00-05.xml'), "earlier run\n")
+
+      run_logxml
+
+      expect(Dir.children(month)).to eq(['2026-04-23_10-00-05.xml'])
+      expect(log_lines).to eq(['earlier run', default_header, '<output>You see a door.</output>', default_footer])
+    end
+  end
+
+  # R-23: the footer was written only when a new file started.
+  context 'when the logger stops' do
+    it 'ends the file with the footer once, after the last line' do
+      run_logxml(lines: ['<output>line 1</output>'])
+
+      expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
+    end
+
+    it 'closes the file, logs the failed footer and lets the reason through when the footer cannot be written' do
+      lich_log = stub_lich_log
+      opened = []
+      allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+        original.call(*args, &block).tap { |file| opened << file if file.is_a?(File) }
+      end
+
+      run_logxml(lines: []) do
+        allow(opened.first).to receive(:puts).and_raise(Errno::ENOSPC)
+      end
+
+      expect(opened.size).to eq(1)
+      expect(opened.first).to have_received(:puts).once # the footer was tried
+      expect(opened.first).to be_closed
+      expect(log_lines).to eq([default_header])
+      expect(lich_log).to eq(
+        ["logxml: the footer of #{log_file} was not written while the logger stopped (Errno::ENOSPC: No space left on device)"]
+      )
+    end
+
+    # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
+    it 'writes the footer when the thread is killed, as ;kill logxml does' do
+      waiting = Thread::Queue.new
+      logger = Thread.new do
+        run_logxml(lines: ['<output>line 1</output>']) do
+          waiting << true
+          sleep # get waits for the next line until ;kill
+        end
+      end
+      Timeout.timeout(2) { waiting.pop }
+
+      logger.kill
+      logger.join(2)
+
+      expect(logger).not_to be_alive
+      expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
+    end
+
+    # A footer that fails when a file is closed for the next one is not part
+    # of stopping: it raises, as the plain puts before 0.6.4 did.
+    it "closes the file and raises when the footer cannot be written as the new day's file starts" do
+      lich_log = stub_lich_log
+      next_day = Time.new(2026, 4, 24, 0, 0, 1)
+      next_day_footer = next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z')
+      opened = []
+      allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+        original.call(*args, &block).tap do |file|
+          next unless file.is_a?(File)
+
+          # Only the first file's footer, stamped at the new day, fails.
+          allow(file).to receive(:puts).and_wrap_original do |puts, *lines|
+            raise Errno::EIO if opened.first.equal?(file) && lines.first.to_s.chomp == next_day_footer
+
+            puts.call(*lines)
+          end
+          opened << file
+        end
+      end
+
+      expect { run_logxml(lines: ['<output>line 1</output>', next_day, '<output>line 2</output>']) }
+        .to raise_error(Errno::EIO)
+
+      expect(opened.size).to eq(1)
+      expect(opened.first).to be_closed
+      expect(log_lines).to eq([default_header, '<output>line 1</output>'])
+      expect(lich_log).to eq([])
+    end
+  end
+
+  # R-22: the header was written before the begin/ensure that closes the file.
+  context 'when the header cannot be written' do
+    it 'closes the file without a footer and raises the error' do
+      opened = []
+      header_failed = false
+      allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+        original.call(*args, &block).tap do |file|
+          next unless file.is_a?(File)
+
+          # Only the first write (the header) fails, so a footer would land.
+          allow(file).to receive(:puts).and_wrap_original do |puts, *lines|
+            unless header_failed
+              header_failed = true
+              raise Errno::ENOSPC
+            end
+            puts.call(*lines)
+          end
+          opened << file
+        end
+      end
+
+      expect { run_logxml }.to raise_error(Errno::ENOSPC)
+
+      expect(opened.size).to eq(1)
+      expect(opened.first).to be_closed
+      expect(File.read(log_file)).to eq('')
+    end
+  end
+
   it 'keeps a comma in a quoted --timestamp format' do
     run_logxml(vars: ['--timestamp="%b %d, %H:%M"'])
 
-    expect(log_lines).to eq(['Apr 23, 10:00', 'Apr 23, 10:00: <output>You see a door.</output>'])
+    expect(log_lines).to eq(['Apr 23, 10:00', 'Apr 23, 10:00: <output>You see a door.</output>', 'Apr 23, 10:00'])
   end
 end

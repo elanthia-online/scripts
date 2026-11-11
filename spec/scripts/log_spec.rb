@@ -83,9 +83,11 @@ end
 def hide_me; end
 def echo(msg) = LogSpecHarness.echo(msg)
 
+# lich-5's reget (global_defs.rb) answers nil, never [], when the buffer
+# holds nothing, so an empty $reget_lines reads as nil here too.
 $reget_lines = []
 def reget
-  $reget_lines
+  $reget_lines.nil? || $reget_lines.empty? ? nil : $reget_lines
 end
 
 def get = LogSpecHarness.get
@@ -352,8 +354,14 @@ RSpec.describe GameLogger do
 
     before do
       stub_const('LICH_DIR', log_dir)
+      # Lich's LOG_DIR (lib/constants.rb) is hidden unless an example sets
+      # it, so files land under LICH_DIR/logs whatever the suite loaded.
+      hide_const('LOG_DIR')
       allow(Time).to receive(:now).and_return(frozen_time)
       $login_time = Time.new(2026, 4, 23, 10, 0, 0)
+      # Examples that set reget lines would otherwise leave them for the
+      # next example, whose file would start with them in random order.
+      $reget_lines = []
     end
 
     after do
@@ -451,6 +459,43 @@ RSpec.describe GameLogger do
       expect(log_content).to include('<!-- Above contents from reget; full logging now active -->')
     end
 
+    # R-24: Lich's --logs= sets LOG_DIR (lich.rbw), and pilepull.lic reads
+    # these session logs from LOG_DIR.
+    context 'with Lich started with --logs=' do
+      let(:logs_dir) { Dir.mktmpdir }
+
+      after { FileUtils.rm_rf(logs_dir) }
+
+      it 'writes the log under LOG_DIR in the <game>-<name>/<year>/<month> layout' do
+        stub_const('LOG_DIR', logs_dir)
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+        run_main
+
+        expect(Dir.glob(File.join(logs_dir, '**', '*.log'))).to eq(
+          [File.join(logs_dir, 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.log')]
+        )
+        expect(Dir.glob(File.join(log_dir, '**', '*.log'))).to eq([])
+      end
+    end
+
+    it 'writes under LICH_DIR/logs when LOG_DIR is not defined' do
+      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+      run_main
+
+      expect(find_log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.log'))
+    end
+
+    it 'writes under LICH_DIR/logs when LOG_DIR is empty' do
+      stub_const('LOG_DIR', '')
+      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+      run_main
+
+      expect(find_log_file).to eq(File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04', '2026-04-23_10-00-05.log'))
+    end
+
     it 'creates log directory with game and character name' do
       $reget_lines = []
       GameLogger.instance_variable_set(:@options, OpenStruct.new)
@@ -464,6 +509,43 @@ RSpec.describe GameLogger do
       run_main
       expect(log_content).to include('<!-- Above contents from reget; full logging now active -->')
       expect(log_content.lines.count { |l| l.include?('2026-04-23 10:00:00:') }).to eq(0)
+    end
+
+    # R-14: lich-5's reget returns nil when the buffer is empty. log.lic
+    # only survived that in game through Lich's NilClass patch.
+    it 'writes only the marker when reget returns nil (empty buffer)' do
+      $reget_lines = nil
+      GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+      run_main
+
+      expect(File.read(find_log_file).lines(chomp: true).first(2)).to eq(
+        [frozen_time.strftime("%Y-%m-%d %H:%M:%S.%L %:z"), '<!-- Above contents from reget; full logging now active -->']
+      )
+    end
+
+    # R-15: $_SERVERBUFFER_ keeps the server's CRLF line ends and reget
+    # splits on "\n", so each reget line ends in "\r".
+    context 'when the reget lines end in a carriage return' do
+      it 'writes them without it, timestamps off' do
+        $reget_lines = ["You see a door.\r", "Obvious exits: north.\r"]
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+
+        run_main
+
+        expect(File.binread(find_log_file)).not_to include("\r")
+        expect(log_content.lines(chomp: true)[1, 2]).to eq(['You see a door.', 'Obvious exits: north.'])
+      end
+
+      it 'writes them without it, timestamps on' do
+        $reget_lines = ["You see a door.\r"]
+        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%F %T'))
+
+        run_main
+
+        expect(File.binread(find_log_file)).not_to include("\r")
+        expect(log_content.lines(chomp: true)[1]).to eq('2026-04-23 10:00:00: You see a door.')
+      end
     end
 
     def log_lines
@@ -485,7 +567,8 @@ RSpec.describe GameLogger do
           [
             'Apr 23, 2026 10:00:05',
             '<!-- Above contents from reget; full logging now active -->',
-            'Apr 23, 2026 10:00:05: You see a door.'
+            'Apr 23, 2026 10:00:05: You see a door.',
+            'Apr 23, 2026 10:00:05'
           ]
         )
       end
@@ -499,7 +582,7 @@ RSpec.describe GameLogger do
 
         run_main
 
-        expect(log_lines.last).to eq('10=00: You see a door.')
+        expect(log_lines.last(2)).to eq(['10=00: You see a door.', '10=00'])
       end
     end
 
@@ -528,7 +611,8 @@ RSpec.describe GameLogger do
             [
               default_stamp,
               '<!-- Above contents from reget; full logging now active -->',
-              'You see a door.'
+              'You see a door.',
+              default_stamp
             ]
           )
           expect(LogSpecHarness.echoes).to eq(
@@ -545,7 +629,7 @@ RSpec.describe GameLogger do
         run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
         expect(log_lines).to eq(
-          ['10:00', '<!-- Above contents from reget; full logging now active -->', '10:00: You see a door.']
+          ['10:00', '<!-- Above contents from reget; full logging now active -->', '10:00: You see a door.', '10:00']
         )
         expect(LogSpecHarness.echoes.first).to eq(no_format_echo)
       end
@@ -564,7 +648,7 @@ RSpec.describe GameLogger do
 
           stamp = frozen_time.strftime('%F %T %Z')
           expect(log_lines).to eq(
-            [stamp, '<!-- Above contents from reget; full logging now active -->', "#{stamp}: You see a door."]
+            [stamp, '<!-- Above contents from reget; full logging now active -->', "#{stamp}: You see a door.", stamp]
           )
           expect(LogSpecHarness.echoes).to eq(
             [
@@ -582,7 +666,7 @@ RSpec.describe GameLogger do
 
         run_main_with_settings(OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
 
-        expect(log_lines.last).to eq('10:00: You see a door.')
+        expect(log_lines.last(2)).to eq(['10:00: You see a door.', '10:00'])
         expect(LogSpecHarness.echoes.size).to eq(1)
       end
 
@@ -593,7 +677,7 @@ RSpec.describe GameLogger do
 
         run_main_with_settings(OpenStruct.new(log_timestamp: false, log_timestamp_format: nil))
 
-        expect(log_lines.last).to eq('You see a door.')
+        expect(log_lines.last(2)).to eq(['You see a door.', default_stamp])
         expect(LogSpecHarness.echoes.size).to eq(1)
       end
     end
@@ -609,7 +693,7 @@ RSpec.describe GameLogger do
           run_main
 
           expect(log_lines).to eq(
-            [default_stamp, '<!-- Above contents from reget; full logging now active -->', 'line 1', 'line 2']
+            [default_stamp, '<!-- Above contents from reget; full logging now active -->', 'line 1', 'line 2', default_stamp]
           )
           expect(LogSpecHarness.echoes.first).to start_with("--lines=#{given} is not a valid line count")
         end
@@ -623,7 +707,7 @@ RSpec.describe GameLogger do
 
           run_main
 
-          expect(log_lines.last).to eq('line 1')
+          expect(log_lines.last(2)).to eq(['line 1', default_stamp])
           expect(LogSpecHarness.echoes.first).to start_with('lines was given without a value;')
         end
       end
@@ -637,14 +721,18 @@ RSpec.describe GameLogger do
 
         run_main
 
-        # The clock is frozen, so the second file has the same name and the
-        # rollover shows up as footer + header lines in one file.
-        expect(log_lines[1001]).to eq('line 1000')
-        expect(log_lines[1002]).to eq(default_stamp)
-        expect(log_lines[1003]).to eq(default_stamp)
-        expect(log_lines[1004]).to eq('line 1001')
-        expect(log_lines.size).to eq(1005)
-        expect(LogSpecHarness.echoes).to eq(["Non-XML Logging started, currently logging to #{find_log_file}"])
+        # R-25: the clock is frozen, so the second file starts within the
+        # same second and gets an _01 suffix instead of being appended to the
+        # first one.
+        month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+        first = File.read(File.join(month, '2026-04-23_10-00-05.log')).lines(chomp: true)
+        second = File.read(File.join(month, '2026-04-23_10-00-05_01.log')).lines(chomp: true)
+        expect(first.size).to eq(1003)
+        expect(first.last(2)).to eq(['line 1000', default_stamp])
+        expect(second).to eq([default_stamp, 'line 1001', default_stamp])
+        expect(LogSpecHarness.echoes).to eq(
+          ["Non-XML Logging started, currently logging to #{File.join(month, '2026-04-23_10-00-05.log')}"]
+        )
       end
     end
 
@@ -657,7 +745,7 @@ RSpec.describe GameLogger do
 
         run_main
 
-        expect(log_lines.last).to eq('>look')
+        expect(log_lines.last(2)).to eq(['>look', default_stamp])
       end
     end
 
@@ -697,11 +785,13 @@ RSpec.describe GameLogger do
       end
 
       # Runs the logger with these arguments and returns the logged game
-      # lines (the header and the reget marker dropped).
+      # lines (the header, the reget marker and the footer dropped; the
+      # footer is checked here, as every file ends with one).
       def log_with(*args)
         GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(args))
         run_main
-        log_lines.drop(2)
+        expect(log_lines.last).to eq(default_stamp)
+        log_lines[2..-2]
       end
 
       context 'with --rnum in GemStone' do
@@ -1098,6 +1188,330 @@ RSpec.describe GameLogger do
 
           expect(log_with('--exclude=u4216015')).to eq([])
         end
+      end
+    end
+
+    # R-13: the line was written before the date check, so the first line
+    # after midnight went into yesterday's file; an --exclude `next`
+    # skipped the date check; excluded lines used up the --lines budget.
+    describe 'starting a new file' do
+      let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+      let(:next_day) { Time.new(2026, 4, 24, 0, 0, 1) }
+      let(:next_day_stamp) { next_day.strftime('%Y-%m-%d %H:%M:%S.%L %:z') }
+      # The parser's room as the logger sees it when it reads a line.
+      let(:room) { { count: 1, uid: 1234 } }
+
+      # A Time fed between lines moves the clock; a Hash moves the parser to
+      # another room.
+      before do
+        clock = frozen_time
+        allow(Time).to receive(:now) { clock }
+        allow(XMLData).to receive(:room_count) { room[:count] }
+        allow(XMLData).to receive(:room_id) { room[:uid] }
+        allow(GameLogger).to receive(:get) do
+          item = LogSpecHarness.get
+          until item.is_a?(String)
+            item.is_a?(Time) ? clock = item : room.merge!(item)
+            item = LogSpecHarness.get
+          end
+          item
+        end
+      end
+
+      # Every log file's lines, by path relative to the character folder.
+      def log_files
+        root = File.join(log_dir, 'logs', 'GSIV-TestChar')
+        Dir.glob(File.join(root, '**', '*.log')).to_h do |path|
+          [path.delete_prefix("#{root}/"), File.read(path).lines(chomp: true)]
+        end
+      end
+
+      it "logs the first line after midnight in the new day's file" do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        LogSpecHarness.feed('line 1', next_day, 'line 2')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log' => [default_stamp, marker, 'line 1', next_day_stamp],
+          '2026/04/2026-04-24_00-00-01.log' => [next_day_stamp, 'line 2', next_day_stamp]
+        )
+      end
+
+      it 'starts the new file on the first line after midnight even in an excluded room' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--exclude=u7199']))
+        LogSpecHarness.feed('line 1', { count: 2, uid: 7199 }, next_day, 'excluded line')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log' => [default_stamp, marker, 'line 1', next_day_stamp],
+          '2026/04/2026-04-24_00-00-01.log' => [next_day_stamp, next_day_stamp]
+        )
+      end
+
+      it "logs the first line after leaving an excluded room past midnight in the new day's file" do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--exclude=u7199']))
+        LogSpecHarness.feed(
+          'line 1', { count: 2, uid: 7199 }, 'excluded 1', next_day, 'excluded 2', { count: 3, uid: 1234 }, 'line 2'
+        )
+
+        run_main
+
+        expect(log_files['2026/04/2026-04-24_00-00-01.log']).to eq([next_day_stamp, 'line 2', next_day_stamp])
+        expect(log_files['2026/04/2026-04-23_10-00-05.log']).to eq([default_stamp, marker, 'line 1', next_day_stamp])
+      end
+
+      # The clock stays at 10:00:05, so the second file gets an _01 suffix.
+      it 'counts only written lines toward --lines, not lines in an excluded room' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=2', '--exclude=u7199']))
+        LogSpecHarness.feed('a', { count: 2, uid: 7199 }, 'x1', 'x2', 'x3', { count: 3, uid: 1234 }, 'b', 'c')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log'    => [default_stamp, marker, 'a', 'b', default_stamp],
+          '2026/04/2026-04-23_10-00-05_01.log' => [default_stamp, 'c', default_stamp]
+        )
+      end
+
+      it 'counts only written lines toward --lines, not filtered stream lines' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=2']))
+        LogSpecHarness.feed('a', '<pushStream id="inv"/>', '<popStream/>', 'b', 'c')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log'    => [default_stamp, marker, 'a', 'b', default_stamp],
+          '2026/04/2026-04-23_10-00-05_01.log' => [default_stamp, 'c', default_stamp]
+        )
+      end
+
+      # R-25: a rotation within one second appended to the same file.
+      it 'gives each file started within the same second its own _NN name' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        LogSpecHarness.feed('a', 'b', 'c')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log'    => [default_stamp, marker, 'a', default_stamp],
+          '2026/04/2026-04-23_10-00-05_01.log' => [default_stamp, 'b', default_stamp],
+          # no _03: the file after a full one opens only when its first
+          # line comes, and here the logger stops first
+          '2026/04/2026-04-23_10-00-05_02.log' => [default_stamp, 'c', default_stamp]
+        )
+      end
+
+      # A file opened at once after a --lines rotation waited for a line; when
+      # the first one came after midnight it went to the new day's file and
+      # the waiting file kept only its header and footer, under the old day.
+      it 'opens the file after a --lines rotation only when its first line comes, also past midnight' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        LogSpecHarness.feed('a', next_day, 'b')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log' => [default_stamp, marker, 'a', default_stamp],
+          '2026/04/2026-04-24_00-00-01.log' => [next_day_stamp, 'b', next_day_stamp]
+        )
+      end
+
+      it 'appends to an existing file of the same name when the logger starts' do
+        month = File.join(log_dir, 'logs', 'GSIV-TestChar', '2026', '04')
+        FileUtils.mkdir_p(month)
+        File.write(File.join(month, '2026-04-23_10-00-05.log'), "earlier run\n")
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        LogSpecHarness.feed('a')
+
+        run_main
+
+        expect(log_files).to eq(
+          '2026/04/2026-04-23_10-00-05.log' => ['earlier run', default_stamp, marker, 'a', default_stamp]
+        )
+      end
+    end
+
+    # R-23: the footer was written only when a new file started, so a file
+    # closed by ;kill, logout or Lich exiting (most files) had none.
+    context 'when the logger stops' do
+      let(:marker) { '<!-- Above contents from reget; full logging now active -->' }
+
+      # Records every File the logger opens.
+      def opened_files
+        @opened_files ||= [].tap do |opened|
+          allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+            original.call(*args, &block).tap { |file| opened << file if file.is_a?(File) }
+          end
+        end
+      end
+
+      it 'ends the file with the footer once, after the last line' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        LogSpecHarness.feed('line 1')
+
+        run_main
+
+        expect(log_lines).to eq([default_stamp, marker, 'line 1', default_stamp])
+      end
+
+      it 'stamps the footer with the --timestamp format' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new(timestamp: '%H:%M'))
+        LogSpecHarness.feed('line 1')
+
+        run_main
+
+        expect(log_lines).to eq(['10:00', marker, '10:00: line 1', '10:00'])
+      end
+
+      # lich-5 stops a script by Thread#kill on its threads (script.rb kill).
+      it 'writes the footer when the thread is killed, as ;kill log does' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        LogSpecHarness.idle_timeout = 5
+        LogSpecHarness.feed('line 1')
+        logger = Thread.new { GameLogger.main }
+        Timeout.timeout(2) { sleep 0.01 until find_log_file && File.read(find_log_file).include?("line 1\n") }
+
+        logger.kill
+        logger.join(2)
+
+        expect(log_lines).to eq([default_stamp, marker, 'line 1', default_stamp])
+      end
+
+      it 'closes the file, logs the failed footer and lets the reason through when the footer cannot be written' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        allow(Lich).to receive(:log)
+        files = opened_files
+        allow(GameLogger).to receive(:get) do
+          allow(files.first).to receive(:puts).and_raise(Errno::ENOSPC)
+          raise StopIteration
+        end
+
+        expect { run_main }.not_to raise_error
+
+        expect(files.size).to eq(1)
+        expect(files.first).to be_closed
+        expect(log_lines).to eq([default_stamp, marker])
+        expect(Lich).to have_received(:log).with(
+          "log: the footer of #{find_log_file} was not written while the logger stopped (Errno::ENOSPC: No space left on device)"
+        )
+      end
+
+      # A footer that fails when a full file is closed for the next one is
+      # not part of stopping: it raises, as the plain puts before 1.2.4 did,
+      # instead of being dropped while the logger moves on.
+      it 'closes the file and raises when the footer of a full file cannot be written' do
+        GameLogger.instance_variable_set(:@options, GameLogger::Opts.parse(['--lines=1']))
+        allow(Lich).to receive(:log)
+        files = opened_files
+        LogSpecHarness.feed('a', 'b')
+        # The first write after "a" on the first file is its footer.
+        a_written = false
+        allow(GameLogger).to receive(:get).and_wrap_original do |original|
+          original.call.tap do |line|
+            next unless line == 'a'
+
+            allow(files.first).to receive(:puts).and_wrap_original do |puts, *args|
+              raise Errno::EIO if a_written
+
+              a_written = true
+              puts.call(*args)
+            end
+          end
+        end
+
+        expect { run_main }.to raise_error(Errno::EIO)
+
+        expect(files.size).to eq(1)
+        expect(files.first).to be_closed
+        expect(log_lines).to eq([default_stamp, marker, 'a'])
+        expect(Lich).not_to have_received(:log)
+      end
+    end
+
+    # R-22: the header was written before the begin/ensure that closes the
+    # file, so an error there left the File open.
+    context 'when the header cannot be written' do
+      it 'closes the file without a footer and raises the error' do
+        GameLogger.instance_variable_set(:@options, OpenStruct.new)
+        opened = []
+        header_failed = false
+        allow(File).to receive(:open).and_wrap_original do |original, *args, &block|
+          original.call(*args, &block).tap do |file|
+            next unless file.is_a?(File)
+
+            # Only the first write (the header) fails, so a footer would land.
+            allow(file).to receive(:puts).and_wrap_original do |puts, *lines|
+              unless header_failed
+                header_failed = true
+                raise Errno::ENOSPC
+              end
+              puts.call(*lines)
+            end
+            opened << file
+          end
+        end
+
+        expect { run_main }.to raise_error(Errno::ENOSPC)
+
+        expect(opened.size).to eq(1)
+        expect(opened.first).to be_closed
+        expect(File.read(find_log_file)).to eq('')
+      end
+    end
+
+    describe '.log_file_path' do
+      let(:time) { Time.new(2026, 4, 23, 10, 0, 5) }
+
+      it 'names the first file of a run by the time, even when that file exists' do
+        File.write(File.join(log_dir, '2026-04-23_10-00-05.log'), '')
+
+        expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: false))
+          .to eq(File.join(log_dir, '2026-04-23_10-00-05.log'))
+      end
+
+      it 'names a rotated file by the time when no file has that name' do
+        expect(GameLogger.log_file_path(log_dir, time, '.xml', rotated: true))
+          .to eq(File.join(log_dir, '2026-04-23_10-00-05.xml'))
+      end
+
+      it 'adds _01 to a rotated file whose name exists, and _02 when that exists too' do
+        File.write(File.join(log_dir, '2026-04-23_10-00-05.log'), '')
+        expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+          .to eq(File.join(log_dir, '2026-04-23_10-00-05_01.log'))
+
+        File.write(File.join(log_dir, '2026-04-23_10-00-05_01.log'), '')
+        expect(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+          .to eq(File.join(log_dir, '2026-04-23_10-00-05_02.log'))
+      end
+
+      it 'gives rotated names that sort by name in the order written, after the first file and before the next second' do
+        names = ['2026-04-23_10-00-05.log']
+        11.times do
+          FileUtils.touch(File.join(log_dir, names.last))
+          names << File.basename(GameLogger.log_file_path(log_dir, time, '.log', rotated: true))
+        end
+        names << '2026-04-23_10-00-06.log'
+
+        expect(names.sort).to eq(names)
+      end
+    end
+
+    describe '.write_footer' do
+      let(:closed_file) { File.open(File.join(log_dir, 'closed.log'), 'a').tap(&:close) }
+
+      it 'logs and ignores a write error while the logger stops' do
+        allow(Lich).to receive(:log)
+
+        expect(GameLogger.write_footer(closed_file, nil, stopping: true)).to be_nil
+        expect(Lich).to have_received(:log).with(
+          "log: the footer of #{closed_file.path} was not written while the logger stopped (IOError: closed stream)"
+        )
+      end
+
+      it 'raises a write error when the logger is not stopping' do
+        expect { GameLogger.write_footer(closed_file, nil, stopping: false) }.to raise_error(IOError)
       end
     end
 
