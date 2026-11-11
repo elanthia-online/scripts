@@ -122,7 +122,7 @@ RSpec.describe 'Ewaggle::Setup' do
 
     expect(node(nodes, :sonic_weapon)).to include(placeholder: 'Name of sonic weapon (follow link for options)')
     expect(node(nodes, :sonic_shield)).to include(placeholder: 'Name of sonic shield (follow link for options)')
-    expect(node(nodes, :retribution_spell)).to include(placeholder: 'Spell Number Only')
+    expect(node(nodes, :retribution_spell)).to include(placeholder: 'Spell #')
   end
 
   it 'renders Save & Close and Cancel, and no live change handlers on fields' do
