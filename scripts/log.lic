@@ -127,6 +127,11 @@ module GameLogger
   # group, split by "," or "_" (50000, 50,000, 50_000, 1,000,000).
   LINE_COUNT_PATTERN = /\A(?:[0-9]+|[0-9]{1,3}(?:[,_][0-9]{3})+)\z/ unless defined?(LINE_COUNT_PATTERN)
 
+  # The option {start_xml_twin} sets on the XML twin of --both, which
+  # leaves compressing old logs to its text logger. It has spaces, so no
+  # argument a player types parses to it.
+  TWIN_KEY = :'xml twin of --both' unless defined?(TWIN_KEY)
+
   # The script's argument parser: turns ;log's arguments into one option
   # per name, an argument starting with {FLAG_PREFIX} as a flag
   # ({parse_flag}) and any other word as a +true+ option
@@ -911,7 +916,10 @@ module GameLogger
     #   bytes before and their bytes after
     def self.compress_old_logs(folder, cutoff, now: Time.now)
       count = before = after = 0
-      Dir.glob(File.join(folder, '[0-9][0-9][0-9][0-9]', '[0-9][0-9]', '*')).sort.each do |path|
+      # base: keeps glob characters in LOG_DIR ([, {, \\ on Windows) out of
+      # the pattern.
+      Dir.glob('[0-9][0-9][0-9][0-9]/[0-9][0-9]/*', base: folder).sort.each do |relative|
+        path = File.join(folder, relative)
         next unless (match = File.basename(path).match(LOG_FILE_NAME))
         next unless (Date.new(match[1].to_i, match[2].to_i, match[3].to_i) rescue nil)&.<(cutoff)
         next unless (sizes = compress_log_file(path, now: now))
@@ -927,12 +935,15 @@ module GameLogger
     # the copy is written to <path>.gz.tmp (created exclusively, so a second
     # logger compressing the same folder skips the file), flushed to disk,
     # read back whole and checked against the original's size, then renamed
-    # to <path>.gz with the original's modification time; only then is the
-    # original deleted. A file written to within {RECENT_WRITE} is skipped.
-    # When <path>.gz already exists (an earlier sweep stopped after the
-    # rename), the original is deleted only if that .gz holds all of it.
-    # Every failure leaves the original in place, removes the temp file this
-    # call made, and goes to the Lich log with the path and the error.
+    # to <path>.gz, but only while that temp file is still the one this call
+    # wrote, and given the original's modification time and permissions;
+    # only then is the original deleted. A file written to within
+    # {RECENT_WRITE} is skipped. When <path>.gz already exists (an earlier
+    # sweep stopped after the rename), the original is deleted only if that
+    # .gz holds exactly its bytes ({finish_compressed}). A file another
+    # sweeper finished meanwhile is left to it. Every failure leaves the
+    # original in place, removes the temp file this call made, and goes to
+    # the Lich log with the path and the error.
     #
     # @param path [String] the log file
     # @param now [Time] the time now, for {RECENT_WRITE}
@@ -948,6 +959,7 @@ module GameLogger
       tmp = "#{gz_path}.tmp"
       File.delete(tmp) if File.exist?(tmp) && now - File.mtime(tmp) > RECENT_WRITE
       created = false
+      written = nil
       File.open(tmp, File::WRONLY | File::CREAT | File::EXCL | File::BINARY) do |out|
         created = true
         gzip = Zlib::GzipWriter.new(out, Zlib::DEFAULT_COMPRESSION)
@@ -961,6 +973,7 @@ module GameLogger
         gzip.finish
         out.flush
         out.fsync
+        written = out.stat
       end
       unless gzip_complete?(tmp, stat.size) && File.size(path) == stat.size
         File.delete(tmp)
@@ -968,11 +981,18 @@ module GameLogger
         Lich.log "log: left #{path} as it is: its compressed copy did not read back whole, or the file changed meanwhile"
         return nil
       end
+      unless same_file?(File.stat(tmp), written)
+        created = false
+        Lich.log "log: left #{path} as it is: another sweep replaced its compressed copy before it was renamed"
+        return nil
+      end
       File.rename(tmp, gz_path)
       created = false
-      File.utime(stat.atime, stat.mtime, gz_path)
+      sync_directory(File.dirname(gz_path))
+      keep_times_and_mode(gz_path, stat)
       remove_compressed_original(path, gz_path, stat)
-    rescue Errno::EEXIST
+    rescue Errno::EEXIST, Errno::ENOENT
+      # Another sweeper is compressing this file, or has already finished it.
       nil
     rescue SystemCallError, IOError, Zlib::Error => e
       begin
@@ -984,10 +1004,50 @@ module GameLogger
       nil
     end
 
+    # Whether two stats are of the same file: size and modification time,
+    # and the inode where the system has one (Windows reports 0).
+    #
+    # @param now [File::Stat] the file's stat now
+    # @param written [File::Stat, nil] its stat right after it was written
+    # @return [Boolean]
+    def self.same_file?(now, written)
+      return false if written.nil?
+      return false unless now.size == written.size && now.mtime == written.mtime
+
+      now.ino.zero? || written.ino.zero? || now.ino == written.ino
+    end
+
+    # Flushes a rename in +dir+ to disk where the system allows it (not on
+    # Windows, where a folder cannot be opened), so a crash right after
+    # cannot keep the original's deletion and lose the .gz's rename.
+    #
+    # @param dir [String] the folder
+    # @return [void]
+    def self.sync_directory(dir)
+      File.open(dir, &:fsync)
+    rescue SystemCallError, IOError
+      nil
+    end
+
+    # Gives the .gz the original's modification time and permissions. Both
+    # are best effort: some network mounts refuse them, and the .gz is
+    # whole either way.
+    #
+    # @param gz_path [String] the .gz
+    # @param stat [File::Stat] the original's stat
+    # @return [void]
+    def self.keep_times_and_mode(gz_path, stat)
+      File.utime(stat.atime, stat.mtime, gz_path)
+      File.chmod(stat.mode & 0o777, gz_path)
+    rescue SystemCallError => e
+      Lich.log "log: compressed #{gz_path}, but could not give it the original's time or permissions (#{e.class}: #{e.message})"
+    end
+
     # Deletes the original once <path>.gz holds it (see
     # {compress_log_file}). When it cannot be deleted (on Windows, a file
     # another program has open), both stay, and the next sweep deletes the
-    # original after checking the .gz ({finish_compressed}).
+    # original after checking the .gz ({finish_compressed}). An original
+    # another sweeper already deleted counts as done.
     #
     # @param path [String] the log file
     # @param gz_path [String] its .gz
@@ -995,7 +1055,11 @@ module GameLogger
     # @return [Array(Integer, Integer), nil] the sizes, or +nil+ when the
     #   original is still there
     def self.remove_compressed_original(path, gz_path, stat)
-      File.delete(path)
+      begin
+        File.delete(path)
+      rescue Errno::ENOENT
+        nil
+      end
       [stat.size, File.size(gz_path)]
     rescue SystemCallError => e
       Lich.log "log: compressed #{path} to #{gz_path}, but could not delete the original (#{e.class}: #{e.message}); the next sweep deletes it"
@@ -1003,8 +1067,10 @@ module GameLogger
     end
 
     # Finishes a file an earlier sweep compressed but did not delete: the
-    # original goes only when <path>.gz reads back whole at the original's
-    # size ({gzip_complete?}); otherwise both stay and the Lich log says why.
+    # original goes only when <path>.gz holds exactly its bytes (same size
+    # and CRC-32, see {gzip_matches?}), after the .gz is given the
+    # original's time and permissions; otherwise both stay and the Lich log
+    # says why.
     #
     # @param path [String] the log file
     # @param gz_path [String] its existing .gz
@@ -1012,10 +1078,12 @@ module GameLogger
     # @return [Array(Integer, Integer), nil] the sizes when the original is
     #   gone, or +nil+ when it is still there
     def self.finish_compressed(path, gz_path, stat)
-      return remove_compressed_original(path, gz_path, stat) if gzip_complete?(gz_path, stat.size)
-
-      Lich.log "log: left #{path} as it is: #{gz_path} already exists and does not hold all of it"
-      nil
+      unless gzip_matches?(gz_path, path)
+        Lich.log "log: left #{path} as it is: #{gz_path} already exists and does not hold exactly its contents"
+        return nil
+      end
+      keep_times_and_mode(gz_path, stat)
+      remove_compressed_original(path, gz_path, stat)
     end
 
     # Whether +gz_path+ is a whole gzip file holding +size+ bytes: read to
@@ -1025,15 +1093,50 @@ module GameLogger
     # @param size [Integer] the original's size in bytes
     # @return [Boolean]
     def self.gzip_complete?(gz_path, size)
-      total = 0
-      Zlib::GzipReader.open(gz_path) do |gzip|
-        while (chunk = gzip.read(65_536))
-          total += chunk.bytesize
+      gzip_digest(gz_path)&.last == size
+    end
+
+    # Whether +gz_path+ holds exactly the bytes of +path+: the same size
+    # and CRC-32 after reading both to the end.
+    #
+    # @param gz_path [String] the .gz
+    # @param path [String] the original
+    # @return [Boolean]
+    def self.gzip_matches?(gz_path, path)
+      digest = gzip_digest(gz_path)
+      return false if digest.nil?
+
+      crc = 0
+      size = 0
+      File.open(path, 'rb') do |input|
+        while (chunk = input.read(65_536))
+          crc = Zlib.crc32(chunk, crc)
+          size += chunk.bytesize
         end
       end
-      total == size
-    rescue Zlib::Error, IOError, SystemCallError
+      digest == [crc, size]
+    rescue SystemCallError, IOError
       false
+    end
+
+    # The CRC-32 and byte count of everything +gz_path+ decompresses to, or
+    # +nil+ when it is not a whole gzip file (gzip's own CRC and length
+    # trailer are checked on the way).
+    #
+    # @param gz_path [String] the .gz (or .gz.tmp) file
+    # @return [Array(Integer, Integer), nil] [crc, size]
+    def self.gzip_digest(gz_path)
+      crc = 0
+      size = 0
+      Zlib::GzipReader.open(gz_path) do |gzip|
+        while (chunk = gzip.read(65_536))
+          crc = Zlib.crc32(chunk, crc)
+          size += chunk.bytesize
+        end
+      end
+      [crc, size]
+    rescue Zlib::Error, IOError, SystemCallError
+      nil
     end
 
     # A byte count for the echo: "438 MB", "4.9 GB".
@@ -1484,7 +1587,7 @@ module GameLogger
       @lines_per_file = GameLogger.lines_per_file(@options.lines)
       # The XML twin of --both shares this character folder; only the text
       # logger compresses it.
-      @compress_days = (GameLogger.compress_after_days(@options[:'compress-after'], settings&.log_compress_after) unless @options.twin)
+      @compress_days = (GameLogger.compress_after_days(@options[:'compress-after'], settings&.log_compress_after) unless @options[GameLogger::TWIN_KEY])
       @compress_date = @compressor = nil
       configure_rooms
     end
@@ -1780,7 +1883,7 @@ module GameLogger
   #   them
   # @return [Object, nil] the started exec script, or nil when none started
   def self.start_xml_twin(options)
-    twin_options = options.to_h.reject { |key, _| %i[both help].include?(key) }.merge(xml: true, twin: true)
+    twin_options = options.to_h.reject { |key, _| %i[both help].include?(key) }.merge(xml: true, TWIN_KEY => true)
     twin = ExecScript.start("hide_me\n::#{name}.main(OpenStruct.new(#{twin_options.inspect}))", quiet: true, name: Logger::BOTH_XML_NAME)
     unless twin
       echo '--both: the XML log could not be started (Lich did not start a second script), so only the text log is written.'
@@ -1831,8 +1934,8 @@ module GameLogger
   #   gzip this character's log files dated more than N days ago (see
   #   {compress_after_days}); the log_compress_after setting does the same
   #   when the option is not given
-  # @option options [true, nil] :twin set only by {start_xml_twin} for the
-  #   XML twin of --both, which leaves compressing to its text logger
+  # @option options [true, nil] :"xml twin of --both" ({TWIN_KEY}) set
+  #   only by {start_xml_twin}, which leaves compressing to the text logger
   # @option options [String, true, nil] :help the word help or --help:
   #   shows {help_lines} instead of logging (see {show_help})
   # @return [void]
