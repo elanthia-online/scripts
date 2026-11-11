@@ -42,6 +42,12 @@ module LogSpecHarness
     attr_reader :script, :echoes
     # The lines the script responded (Lich's respond), in order.
     attr_reader :responses
+    # Each ExecScript.start call: [code, options] (see Env::ExecScript).
+    attr_reader :exec_starts
+    # What ExecScript.start answers: the started exec script (an
+    # OpenStruct with a name), or false/nil when Lich refused it, or an
+    # exception to raise.
+    attr_accessor :exec_result
     # The scripts running besides the current run, for Script.running and
     # Script.hidden: OpenStructs with a name and hidden, and optionally
     # vars and before (true when started before the current run; Lich's
@@ -66,6 +72,8 @@ module LogSpecHarness
       @settings = OpenStruct.new
       @server_buffer = []
       @other_scripts = []
+      @exec_starts = []
+      @exec_result = OpenStruct.new(name: 'logxml1')
       @script = new_script
     end
 
@@ -107,7 +115,8 @@ module LogSpecHarness
         want_downstream_xml: false,
         want_script_output: false,
         want_upstream: false,
-        downstream_buffer: DOWNSTREAM
+        downstream_buffer: DOWNSTREAM,
+        die_with: []
       )
     end
 
@@ -243,6 +252,22 @@ module LogSpecHarness
   # The namespace log.lic's module is evaluated in, holding the constants
   # it reads by bare name.
   module Env
+    # Lich's ExecScript, for ExecScript.start only: keeps each call (see
+    # {LogSpecHarness.exec_starts}) and answers {LogSpecHarness.exec_result}.
+    class ExecScript
+      # @param code [String] the code the exec script would run
+      # @param options [Hash] the start options (:quiet, :name)
+      # @return [Object] {LogSpecHarness.exec_result}
+      # @raise [StandardError] when exec_result is an exception
+      def self.start(code, options = {})
+        LogSpecHarness.exec_starts << [code, options]
+        result = LogSpecHarness.exec_result
+        raise result if result.is_a?(Exception)
+
+        result
+      end
+    end
+
     # Lich's XMLData, with one fixed GemStone character and room.
     module XMLData
       # @return [String] the game code, "GSIV"

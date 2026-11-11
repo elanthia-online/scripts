@@ -300,6 +300,83 @@ module LogSpecHarness::Env
         Timeout.timeout(5) { start_main }
       end
 
+      # ;log --both writes the text log and the XML log at once. One Lich
+      # script gets a single downstream buffer (the XML and the text lines
+      # would arrive mixed), so this run logs the text and starts an exec
+      # script (Lich's ExecScript, named logxml1 and up) that logs the XML,
+      # each from its own buffer, and takes it down with it (die_with).
+      context 'when started with --both' do
+        %w[--both both].each do |argument|
+          it "logs the text itself and starts one XML twin for #{argument}" do
+            LogSpecHarness.start_script(argument)
+
+            run_main
+
+            expect(LogSpecHarness.exec_starts.size).to eq(1)
+            code, options = LogSpecHarness.exec_starts.first
+            expect(options).to eq(quiet: true, name: 'logxml')
+            expect(code).to include('hide_me')
+            expect(LogSpecHarness.script.die_with).to eq(['logxml1'])
+            expect(LogSpecHarness.script.want_downstream).to be(true)
+            expect(LogSpecHarness.script.want_downstream_xml).to be(false)
+            expect(Dir.glob(File.join(log_dir, '**', '*.log')).size).to eq(1)
+            expect(Dir.glob(File.join(log_dir, '**', '*.xml'))).to be_empty
+          end
+        end
+
+        it 'logs text even when --xml is given too' do
+          LogSpecHarness.start_script('--both --xml')
+
+          run_main
+
+          expect(LogSpecHarness.script.want_downstream_xml).to be(false)
+          expect(LogSpecHarness.exec_starts.size).to eq(1)
+        end
+
+        # The twin's code is run here as Lich runs an exec script: as its own
+        # script, with Script.current the exec script, evaluated where log.lic
+        # put GameLogger.
+        it "starts a twin that logs XML with this run's options, streams included" do
+          LogSpecHarness.start_script('--both --streams --timestamp=%H:%M')
+          run_main
+          code, = LogSpecHarness.exec_starts.first
+          hides_before = LogSpecHarness.hide_me_calls
+          LogSpecHarness.start_script('', name: 'logxml1')
+          LogSpecHarness.feed('<pushStream id="inv"/><output>In the pack: a torch.</output><popStream/>')
+
+          Timeout.timeout(5) { LogSpecHarness::Env.module_eval(code) }
+
+          expect(LogSpecHarness.script.want_downstream_xml).to be(true)
+          expect(LogSpecHarness.script.want_script_output).to be(true)
+          expect(LogSpecHarness.hide_me_calls).to eq(hides_before + 1)
+          xml = Dir.glob(File.join(log_dir, '**', '*.xml'))
+          expect(xml.size).to eq(1)
+          expect(File.read(xml.first)).to include('10:00: <pushStream id="inv"/><output>In the pack: a torch.</output><popStream/>')
+          expect(LogSpecHarness.exec_starts.size).to eq(1)
+        end
+
+        it 'says so and logs only text when Lich does not start the XML twin' do
+          LogSpecHarness.exec_result = false
+          LogSpecHarness.start_script('--both')
+
+          run_main
+
+          expect(LogSpecHarness.echoes).to include(a_string_starting_with('--both: the XML log could not be started'))
+          expect(LogSpecHarness.script.die_with).to eq([])
+          expect(Dir.glob(File.join(log_dir, '**', '*.log')).size).to eq(1)
+        end
+
+        it 'says why and logs only text when starting the XML twin raises' do
+          LogSpecHarness.exec_result = RuntimeError.new('no exec')
+          LogSpecHarness.start_script('--both')
+
+          run_main
+
+          expect(LogSpecHarness.echoes).to include(a_string_matching(/\A--both: the XML log could not be started \(RuntimeError: no exec\)/))
+          expect(Dir.glob(File.join(log_dir, '**', '*.log')).size).to eq(1)
+        end
+      end
+
       # ;log help (and --help) shows the usage and logs nothing; the usage
       # left the script's header in 1.4.0.
       context 'when started with help' do
@@ -332,7 +409,7 @@ module LogSpecHarness::Env
           run_main
 
           usage = LogSpecHarness.responses.join("\n")
-          %w[--xml --timestamp= --rnum --roomnum --exclude= --lines= --streams].each do |option|
+          %w[--xml --both --timestamp= --rnum --roomnum --exclude= --lines= --streams].each do |option|
             expect(usage).to include(option)
           end
         end
@@ -349,18 +426,19 @@ module LogSpecHarness::Env
           expect(usage.first).to eq(';log logs the game to a file.')
           expect(usage).to include(a_string_matching(/\A  ;logxml\s+the same as ;log --xml/))
           expect(usage).not_to include(a_string_matching(/\A  ;logxml\s+game text/))
-          expect(usage.join("\n")).to include(';log and ;logxml run side by side, and both can be autostarted')
+          expect(usage.join("\n")).to include(';log --both, or ;log and ;logxml side by side (both can be autostarted)')
           expect(usage.join("\n")).not_to include(';force log --xml')
         end
 
-        it 'gives a plain ;log install the ;force way to log text and XML together' do
+        it 'gives a plain ;log install --both to log text and XML together' do
           LogSpecHarness.start_script('help')
 
           run_main
 
           usage = LogSpecHarness.responses
           expect(usage).to include(a_string_matching(/\A  ;log\s+game text to a \.log file/))
-          expect(usage.join("\n")).to include(';log, then ;force log --xml')
+          expect(usage.join("\n")).to include(';log --both writes both files, and ;kill log stops both')
+          expect(usage.join("\n")).to include(';kill logxml1 stops on its own')
           expect(usage).not_to include(a_string_matching(/\A  ;logxml/))
         end
 
@@ -1297,6 +1375,22 @@ module LogSpecHarness::Env
 
           expect(log_lines.drop(2)).to eq([default_stamp])
           expect(LogSpecHarness.echoes.grep(/\Atyped commands are no longer logged: /).size).to eq(1)
+        end
+      end
+
+      # The XML twin of --both is an exec script its text logger started, so
+      # its restart goes through that logger.
+      describe '.restart_hint for the XML twin of --both' do
+        it 'restarts the text logger with --both' do
+          twin = OpenStruct.new(name: 'logxml1', vars: [])
+
+          expect(GameLogger::Logger.restart_hint(twin)).to eq(';kill log, then start ;log --both again (this XML log is its --both twin)')
+        end
+
+        it 'still treats a run named logxml, with no number, as a logxml.lic run' do
+          run = OpenStruct.new(name: 'logxml', vars: ['--rnum', '--rnum'])
+
+          expect(GameLogger::Logger.restart_hint(run)).to eq(';kill logxml, then ;logxml --rnum')
         end
       end
 
