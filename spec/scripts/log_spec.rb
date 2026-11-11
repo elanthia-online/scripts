@@ -1239,6 +1239,46 @@ module LogSpecHarness::Env
           expect(LogSpecHarness.echoes).to eq([])
           expect(LogSpecHarness::DOWNSTREAM).to be_empty
         end
+
+        # lich-5 5.22+ (lib/common/script_execution_guard.rb) can stop a
+        # script through an execution guard, which raises Interrupted in its
+        # threads instead of killing them. That is a stop, not a failure.
+        context 'when an execution guard stops the script' do
+          let(:interrupted) { Class.new(StandardError) }
+
+          before { stub_const('Lich::Common::ScriptExecutionGuard::Interrupted', interrupted) }
+
+          it 'says nothing and leaves no line, as for ;kill log' do
+            allow(GameLogger::Logger).to receive(:upstream_get).and_raise(interrupted, 'Script execution interrupted: stop')
+
+            thread = GameLogger::Logger.start_upstream_logger
+            thread.join(2)
+
+            expect(thread).not_to be_alive
+            expect(LogSpecHarness.echoes).to eq([])
+            expect(LogSpecHarness::DOWNSTREAM).to be_empty
+          end
+
+          it 'still reports any other error' do
+            allow(GameLogger::Logger).to receive(:upstream_get).and_raise(RuntimeError, 'boom')
+
+            GameLogger::Logger.start_upstream_logger.join(2)
+
+            expect(LogSpecHarness.echoes.grep(/\Atyped commands are no longer logged/).size).to eq(1)
+            expect(LogSpecHarness::DOWNSTREAM.size).to eq(1)
+          end
+        end
+
+        # Before lich-5 5.22 there is no execution guard: any error is
+        # reported, and the missing constant raises nothing.
+        it 'reports an error when lich-5 has no execution guard' do
+          hide_const('Lich::Common::ScriptExecutionGuard') if defined?(::Lich::Common::ScriptExecutionGuard)
+          allow(GameLogger::Logger).to receive(:upstream_get).and_raise(RuntimeError, 'boom')
+
+          GameLogger::Logger.start_upstream_logger.join(2)
+
+          expect(LogSpecHarness.echoes.grep(/\Atyped commands are no longer logged/).size).to eq(1)
+        end
       end
 
       # R-05, R-07, R-18, R-19, R-34: --rnum and --exclude take the room from
