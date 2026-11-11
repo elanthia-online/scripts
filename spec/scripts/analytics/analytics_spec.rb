@@ -833,6 +833,10 @@ RSpec.describe 'analytics.lic' do
       expect(edges['startup']).to eq(['idle', 'idle', true])
     end
 
+    it 'closes the last login\'s open cycles when it last saw them, or at the next cycle' do
+      expect(edges['reopened']).to eq([240, 100])
+    end
+
     it 'marks the hunt that ended in a death, keeping why it stopped' do
       expect(edges['death']['hunt_reason']).to eq('died (wounded.)')
     end

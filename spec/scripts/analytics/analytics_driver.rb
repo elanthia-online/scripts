@@ -1140,8 +1140,19 @@ when 'cycle_edges'
   cfg = A::Settings.load(WHO)
   manager = A::CycleManager
   $running = []
+  # Left open by the last login: its connection dropped 8 minutes ago, mid-hunt
+  # (the login was last seen then), and an older rest a crash left behind
+  A::Database.record_login(WHO, NOW - 7200, NOW - 7200)
+  A::Database.touch_login(WHO, NOW - 7200, NOW - 480)
+  dropped = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', {})
+  older = A::Database.start_cycle(WHO, :rest, 'rest', 'splinter_crags', {})
+  after = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', {})
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 720, dropped)
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 3000, older)
+  run_sql('UPDATE cycles SET start_time = ?, end_time = ? WHERE cycle_id = ?', NOW - 2900, NOW - 1000, after)
   manager.start(WHO, cfg)
   A::Database.flush
+  result['reopened'] = [dropped, older].map { |id| A::Database.one('SELECT end_time - start_time AS s FROM cycles WHERE cycle_id = ?', id)['s'] }
   first = A::Database.one('SELECT cycle_type, start_time FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)
   result['startup'] = [manager.current_state.to_s, first['cycle_type'], (first['start_time'].to_i - Time.now.to_i).abs <= 2]
   manager.instance_variable_set(:@running, false)
