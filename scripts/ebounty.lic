@@ -18,6 +18,9 @@
     - the setup window is now a Lich WebUI page instead of GTK, and needs a Lich with WebUI
     - fix: ;ebounty no longer fails to load when GTK is missing, and ;ebounty list no longer needs it
     - fix: adding or deleting an exclusion in setup could error when the list had no duplicates
+    - setup saves with Save & Close; Cancel or closing the window discards changes
+    - fix: setup no longer fails to open when a saved wander wait is off its 0.1 step
+    - fix: after Add or Delete in an exclusion list, the highlighted row and Delete now agree
   v1.12.6 (2026-10-19)
     - fix: no longer closes containers you left open when the script exits
     - fix: no longer tries to open containers that are already open
@@ -1175,12 +1178,11 @@ module EBounty
     end
   end
 
-  # The setting catalog, the WebUI setup window, and `;ebounty list`. Everything
-  # the window shows is rendered from @settings, so changing a setting and
-  # refreshing is all a callback has to do.
+  # The setting catalog, the WebUI setup window, and `;ebounty list`. The window is a
+  # Lich::WebUI::ListSettingsForm: Save & Close returns the edited settings, which
+  # are saved to the profile; Cancel or closing the window discards them.
   class Setup
-    attr_reader :settings, :status, :entries
-    attr_accessor :tab
+    attr_reader :settings
 
     # Lich keeps this class between runs in a session. Drop the old constants so an
     # updated script never renders with the ones from the version that ran first.
@@ -1199,13 +1201,9 @@ module EBounty
       wander_wait: [100, 0.1, 1]
     }.freeze
 
-    # Turning the key on turns these off.
+    # Checkboxes in one group: turning one on turns the others off.
     REST_CHOICES = %i[bigshot_rest custom_rest rest_random table_rest use_script].freeze
-    EXCLUSIVE = {
-      exp_pause: [:keep_hunting],
-      keep_hunting: [:exp_pause],
-      **REST_CHOICES.to_h { |key| [key, REST_CHOICES - [key]] }
-    }.freeze
+    EXCLUSIVE = { exp_pause: :hunting, keep_hunting: :hunting, **REST_CHOICES.to_h { |key| [key, :resting] } }.freeze
 
     BOUNTY_TYPES = [
       ['boss_culling', 'Boss Creature'], ['culling', 'Culling'], ['escort', 'Escort'], ['foraging', 'Foraging'], ['gem_collecting', 'Gem Collecting'],
@@ -1241,6 +1239,21 @@ module EBounty
     ].freeze
 
     EXCLUSION_TIP = "Exclusions should be entered one line at a time. Regular expressions are supported."
+
+    # Array settings shown as one checkbox per value.
+    MEMBERS = {
+      bounty_types: BOUNTY_TYPES,
+      escort_types: ESCORT_TOWNS.product(ESCORT_TOWNS).reject { |(from, _), (to, _)| from == to }.map { |(from, _), (to, _)| ["#{from}_to_#{to}"] },
+      forage_options: FORAGE_OPTIONS.flatten(1),
+      heirloom_options: HEIRLOOM_OPTIONS.flatten(1) + [['use_right', 'Flag right hand (?)']]
+    }.freeze
+    # Array settings shown as an Add/Delete table.
+    LISTS = %i[creature_exclude herb_exclude gem_exclude location_exclude].freeze
+    # Profile dropdowns and the name setting each one also fills.
+    PROFILES = { default_profile: :default_name, bandits_profile: :profile_name_bandits,
+                 **('a'..'j').to_h { |letter| [:"profile_#{letter}", :"profile_name_#{letter}"] } }.freeze
+    # Settings the window does not show.
+    HIDDEN = ([:only_required_creatures] + PROFILES.values).freeze
 
     @@categories = {
       general: {
@@ -1422,7 +1435,7 @@ module EBounty
     # True when Lich can open a WebUI window for this script.
     def self.available?
       defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
-        defined?(Lich::API) && Lich::API.respond_to?(:webui_page)
+        defined?(Lich::WebUI::ListSettingsForm)
     end
 
     def self.get_category(key)
@@ -1438,17 +1451,34 @@ module EBounty
       nil
     end
 
+    # ListSettingsForm keys rows by position and seeds each viewer's table
+    # selection only once, so after Add or Delete the window would keep
+    # highlighting a row the form no longer has selected (and Delete would do
+    # nothing). Clearing that viewer's selection keeps the two in step.
+    @form_class = nil
+
+    def self.form_class
+      @form_class ||= Class.new(Lich::WebUI::ListSettingsForm) do
+        private
+
+        def render_field(tree, field, refs, **overrides)
+          ref = super
+          (@tables ||= {})[field[:key]] = ref if field && @lists.key?(field[:key])
+          ref
+        end
+
+        def change_list(key, action, event)
+          super
+          table = @tables&.[](key)
+          @page.set(table.cid, :selected, [], viewer: event.viewer_id) if table
+        end
+      end
+    end
+
     def initialize(settings)
       @owner = Script.current
       @script_ver = EBounty.get_script_version
       @settings = settings
-      @closed = Queue.new
-      @saved = false
-      @tab = 0
-      @status = ''
-      @entries = Hash.new('')
-      @entry_generation = Hash.new(0)
-      @selected = {}
 
       # set default values if they don't exist
       @@categories.each do |_, data|
@@ -1461,148 +1491,138 @@ module EBounty
 
     # ---------------------------------------------------------- lifecycle --
 
+    # Opens the window and waits. Save & Close returns the edited settings, which
+    # are saved to the profile; Cancel or closing the window discards them.
     def start
+      result = form.show.wait
+      if result
+        apply(result)
+        EBounty.msg("info", " Setup saved.")
+      else
+        EBounty.msg("info", " Setup closed without saving.")
+      end
+    end
+
+    # The window, ready to show. Lists are edited on copies so Cancel discards them too.
+    def form
       setup = self
-      @page = Lich::API.webui_page(owner: @owner, id: PAGE_ID, title: title, props: { size: [900, 820] },
-                                   on: { close: ->(_ev) { setup.viewer_closed } }) do |ui|
-        setup.render(ui)
-      end
-      Lich::API.webui_refresh(@page)
-      Lich::API.webui_start
-      unless Lich::API.webui_open(page: @page)
-        EBounty.msg("error", " Could not open a browser window for setup.")
-        EBounty.settings_cli_notice
-        return
-      end
-      @closed.pop
-      EBounty.msg("info", " Setup closed WITHOUT saving. Use the Close button to save changes.") unless @saved
-    ensure
-      begin
-        Lich::WebUI.terminate_owner(@owner)
-      rescue StandardError
-        nil
-      end
+      @live = form_values
+      @drafts = LISTS.to_h { |key| [key, Array(@settings[key]).dup] }
+      @refs = {}
+      @form = Setup.form_class.new(owner: @owner, id: PAGE_ID, title: title, values: @live, fields: fields,
+                                   lists: LISTS.to_h { |key| [key, list_spec(key)] },
+                                   normalize: ->(draft) { setup.normalize(draft) },
+                                   layout: ->(ui, field, save) { setup.layout(ui, field, save) },
+                                   props: { size: [900, 820] })
     end
 
-    def viewer_closed
-      @closed << :viewer
-    end
+    attr_reader :drafts, :live
 
-    def on_close_clicked
+    def apply(result)
+      @settings.merge!(result)
       EBounty.save_profile(@settings)
-      @saved = true
-      Lich::WebUI.close(@page)
-      @closed << :close
     end
 
     def title
       "EBounty Setup v#{@script_ver}"
     end
 
-    # Run a UI callback: contain errors, then re-render.
-    def act
-      yield
-    rescue StandardError => e
-      respond "EBounty setup: #{e.class}: #{e.message}"
-      respond e.backtrace.first(5).join("\n") if @settings[:debug]
-    ensure
-      Lich::API.webui_refresh(@page) if @page && !@saved
+    # ------------------------------------------------------ fields and values --
+
+    def shown_keys
+      @@categories[:general].keys - HIDDEN
     end
 
-    def cb(&block)
-      setup = self
-      ->(ev) { setup.act { block.call(ev) } }
+    def boolean?(key)
+      [true, false].include?(Setup.get_setting(key)[:default])
     end
 
-    # ------------------------------------------------------- state changes --
-
-    def set(key, value)
-      @settings[key] = value
+    def member_key(key, value)
+      :"#{key}-#{value}"
     end
 
-    def set_check(key, value)
-      @settings[key] = value
-      others = value ? EXCLUSIVE.fetch(key, []) : []
-      others += [:new_bounty_on_exit] if key == :once_and_done && !value
-      others.each do |other|
-        @settings[other] = false
-        uncheck(other)
+    def fields
+      list = shown_keys.reject { |key| LISTS.include?(key) || MEMBERS.key?(key) }.map do |key|
+        if SPINS.key?(key)
+          max, step, digits = SPINS[key]
+          { key: key, type: :number_input, min: 0, max: max, step: step, digits: digits, stepper_buttons: true, align: :start }
+        elsif key == :boost_type
+          { key: key, type: :select, options: BOOST_TYPES.map { |type| { value: type, label: type } } }
+        elsif PROFILES.key?(key)
+          { key: key, type: :select, editable: true, options: profile_options }
+        elsif boolean?(key)
+          { key: key, type: :checkbox, exclusive: EXCLUSIVE[key] }.compact
+        else
+          { key: key, type: :text_input }
+        end
+      end
+      MEMBERS.each { |key, items| items.each { |value, _| list << { key: member_key(key, value), type: :checkbox } } }
+      list
+    end
+
+    def form_values
+      shown_keys.each_with_object({}) do |key, values|
+        if MEMBERS.key?(key)
+          MEMBERS[key].each { |value, _| values[member_key(key, value)] = Array(@settings[key]).include?(value) }
+        elsif LISTS.include?(key)
+          values[key] = Array(@settings[key]).dup
+        elsif SPINS.key?(key)
+          values[key] = spin_value(key)
+        elsif key == :boost_type
+          values[key] = boost_value
+        elsif boolean?(key)
+          values[key] = @settings[key] ? true : false
+        else
+          values[key] = @settings[key].to_s
+        end
       end
     end
 
-    # A viewer keeps its own checked state across renders, so turning off another
-    # option has to be pushed to the window.
-    def uncheck(key)
-      component = @page&.last_render&.tree&.each&.find { |node| node.type == :checkbox && node.props[:key].to_s == key.to_s }
-      @page.set(component.cid, :checked, false) if component
-    end
-
-    def set_number(key, value)
-      max, _step, digits = SPINS.fetch(key)
-      number = digits.zero? ? value.to_i : value.to_f
-      @settings[key] = number.clamp(0, max)
-    end
-
-    # Display value for a spinner. The contract refuses a value outside min..max.
+    # Display value for a spinner: inside min..max and on a step, as the contract requires.
     def spin_value(key)
-      max, _step, digits = SPINS.fetch(key)
+      max, step, digits = SPINS.fetch(key)
       number = digits.zero? ? @settings[key].to_i : @settings[key].to_f
-      number.clamp(0, max)
+      ((number.clamp(0, max) / step).round * step).round(digits)
     end
 
-    def toggle_member(key, value, on)
-      list = (@settings[key] ||= [])
-      list.delete(value)
-      return unless on
-
-      list.push(value)
-      list.uniq!
-      list.sort!
+    # A blank or unknown boost choice shows Any.
+    def boost_value
+      BOOST_TYPES.include?(@settings[:boost_type]) ? @settings[:boost_type] : 'Any'
     end
 
-    def add_entry(key)
-      text = @entries[key].to_s.strip
-      return if text.empty?
-
-      list = (@settings[key] ||= [])
-      list.push(text) unless list.map(&:to_s).include?(text)
-      sort_list(key)
-      @entries.delete(key)
-      @entry_generation[key] += 1 # a new input key is what clears the viewer's typed text
-      @selected.delete(key)
-    end
-
-    def delete_entry(key)
-      row = @selected[key]
-      return if row.nil?
-
-      @settings[key].delete_at(row.delete_prefix('row-').to_i)
-      sort_list(key)
-      @selected.delete(key)
-    end
-
-    def sort_list(key)
-      @settings[key].uniq!
-      @settings[key].sort_by!(&:to_s)
-    end
-
-    def select_row(key, row)
-      if row.nil?
-        @selected.delete(key)
-      else
-        @selected[key] = row.to_s
+    # Turns the submitted window values back into settings. A number or choice the
+    # player left as displayed keeps its saved value, even one the window had to adjust.
+    def normalize(draft)
+      result = shown_keys.to_h do |key|
+        value =
+          if MEMBERS.key?(key)
+            known = MEMBERS[key].map(&:first)
+            (Array(@settings[key]) - known + known.select { |item| draft[member_key(key, item)] }).uniq.sort
+          elsif LISTS.include?(key)
+            Array(draft[key]).dup
+          elsif SPINS.key?(key)
+            number_setting(key, draft[key])
+          elsif key == :boost_type
+            draft[key] == boost_value ? @settings[key] : draft[key].to_s
+          elsif boolean?(key)
+            draft[key] ? true : false
+          else
+            draft[key].to_s.strip
+          end
+        [key, value]
       end
+      result[:new_bounty_on_exit] = false unless result[:once_and_done]
+      # The dropdown and its name setting have always held the same name.
+      PROFILES.each { |profile, name| result[name] = result[profile] unless result[profile] == @settings[profile].to_s.strip }
+      result
     end
 
-    def set_entry(key, text)
-      @entries[key] = text.to_s
-    end
+    def number_setting(key, value)
+      raise ArgumentError, "#{key} must be a number." unless value.is_a?(Numeric)
+      return @settings[key] if value == spin_value(key)
 
-    # The dropdown and its text box have always been separate settings holding
-    # the same name, and both are still saved.
-    def set_profile(profile_key, name_key, value)
-      @settings[profile_key] = value.to_s.strip
-      @settings[name_key] = value.to_s.strip
+      max, _step, digits = SPINS.fetch(key)
+      (digits.zero? ? value.round : value.to_f.round(digits)).clamp(0, max)
     end
 
     def profile_options
@@ -1621,13 +1641,60 @@ module EBounty
       spell.nil? || Spell[spell].known?
     end
 
+    # ------------------------------------------------------------------ lists --
+
+    def list_spec(key)
+      setup = self
+      { columns: [{ key: 'entry', label: 'Entry', expand: true }],
+        rows: proc { setup.drafts[key].map { |entry| { 'entry' => entry.to_s } } }, value: proc { setup.drafts[key].dup },
+        add: ->(text) { setup.add_entry(key, text) }, delete: ->(index) { setup.delete_entry(key, index) },
+        clear_after_add: true }
+    end
+
+    def add_entry(key, text)
+      text = text.to_s.strip
+      return if text.empty?
+
+      list = @drafts[key]
+      list.push(text) unless list.map(&:to_s).include?(text)
+      sort_list(list)
+    end
+
+    def delete_entry(key, index)
+      @drafts[key].delete_at(index)
+      sort_list(@drafts[key])
+    end
+
+    def sort_list(list)
+      list.uniq!
+      list.sort_by!(&:to_s)
+    end
+
+    # ---------------------------------------------------------- live gating --
+
+    # Run one bounty and quit enables Get new bounty before quitting; turning it
+    # off clears that box too. Nothing else in this window depends on another control.
+    def once_and_done_changed(value, viewer)
+      @live[:once_and_done] = value
+      if value
+        Lich::WebUI.refresh(@form.page)
+      else
+        @form.page.set(@refs.fetch(:new_bounty_on_exit).cid, :checked, false, viewer: viewer) # re-renders
+      end
+    end
+
     # ------------------------------------------------------------- render --
 
-    def render(ui)
+    def control(ui, key, **props)
+      @refs[key] = @field.call(ui, key, **props)
+    end
+
+    def layout(ui, field, save)
       setup = self
+      @field = field
       ui.presentation(always_on_top: true)
       ui.stack(key: 'main', gap: 8, margin: 8) do
-        ui.tabs(key: 'tabs', names: TABS, selected: setup.tab, on: { select: ->(ev) { setup.tab = ev.payload[:index] } }) do
+        ui.tabs(key: 'tabs', names: TABS, selected: 0, on: { select: ->(_ev) {} }) do
           ui.stack(slot: 'General', key: 'tab-general', gap: 8) { setup.render_general(ui) }
           ui.stack(slot: 'Resting', key: 'tab-resting', gap: 8) { setup.render_resting(ui) }
           ui.stack(slot: 'Foraging', key: 'tab-foraging', gap: 8) { setup.render_foraging(ui) }
@@ -1638,7 +1705,7 @@ module EBounty
           ui.stack(slot: 'Profiles', key: 'tab-profiles', gap: 8) { setup.render_profiles(ui) }
         end
       end
-      render_footer(ui)
+      render_footer(ui, save)
     end
 
     def render_general(ui)
@@ -1656,17 +1723,16 @@ module EBounty
           end
           ui.stack(slot: '1', key: 'general-misc-middle', gap: 4) do
             setup.render_check(ui, :skip_healing, 'Skip healing')
-            setup.render_check(ui, :once_and_done, 'Run one bounty and quit')
-            setup.render_check(ui, :new_bounty_on_exit, 'Get new bounty before quitting (?)', off: !setup.settings[:once_and_done],
+            setup.render_check(ui, :once_and_done, 'Run one bounty and quit',
+                               on: { change: ->(ev) { setup.once_and_done_changed(ev.payload[:value] ? true : false, ev.viewer_id) } })
+            setup.render_check(ui, :new_bounty_on_exit, 'Get new bounty before quitting (?)', off: !setup.live[:once_and_done],
                                                                                               tip: 'When Run one bounty and quit is enabled, grab the next task before leaving.')
             setup.render_check(ui, :remove_heirloom, 'Remove if heirloom is missing', tip: 'Remove bounty if heirloom item is missing')
           end
           ui.stack(slot: '2', key: 'general-misc-right', gap: 4) do
             setup.render_check(ui, :use_vouchers, 'Use vouchers')
             setup.render_check(ui, :use_boosts, 'Use bounty boosts')
-            ui.select(key: 'boost_type', tooltip: 'Bounty choice when boost is active', value: BOOST_TYPES.include?(setup.settings[:boost_type]) ? setup.settings[:boost_type] : 'Any',
-                      options: BOOST_TYPES.map { |type| { value: type, label: type } },
-                      on: { change: setup.cb { |ev| setup.set(:boost_type, ev.payload[:value].to_s) } })
+            setup.control(ui, :boost_type, tooltip: 'Bounty choice when boost is active')
             setup.render_check(ui, :ranger_track, 'Ranger Track (?)', off: Stats.prof !~ /ranger/i, tip: 'Track bounty target on cooldown')
           end
         end
@@ -1748,9 +1814,7 @@ module EBounty
       setup = self
       ui.group(key: 'heirloom-options', label: 'Search Options') do
         setup.render_option_columns(ui, :heirloom_options, HEIRLOOM_OPTIONS, weights: [1, 1, 1, 1])
-        ui.checkbox(key: 'heirloom_options-use_right', label: 'Flag right hand (?)', tooltip: 'Heirloom will default to right hand instead of laying on the ground.',
-                    checked: Array(setup.settings[:heirloom_options]).include?('use_right'),
-                    on: { change: setup.cb { |ev| setup.toggle_member(:heirloom_options, 'use_right', ev.payload[:value] ? true : false) } })
+        setup.control(ui, :'heirloom_options-use_right', label: 'Flag right hand (?)', tooltip: 'Heirloom will default to right hand instead of laying on the ground.')
       end
       render_command_group(ui, 'heirloom-pre', 'Pre-Heirloom Searching', [[:heirloom_prep_commands, 'Pre-Searching Commands:'], [:heirloom_prep_scripts, 'Active Searching Scripts:']])
       render_command_group(ui, 'heirloom-post', 'Post-Heirloom Searching', [[:heirloom_post_commands, 'Post-Searching Commands:'], [:heirloom_post_scripts, 'Post-Searching Scripts:']])
@@ -1792,10 +1856,7 @@ module EBounty
               if from == to
                 ui.text(slot: (column + 1).to_s, key: "escort-same-#{from}", content: '--')
               else
-                value = "#{from}_to_#{to}"
-                ui.checkbox(slot: (column + 1).to_s, key: "escort_types-#{value}", label: '', tooltip: "#{from_label} to #{to_label}",
-                            checked: Array(setup.settings[:escort_types]).include?(value),
-                            on: { change: setup.cb { |ev| setup.toggle_member(:escort_types, value, ev.payload[:value] ? true : false) } })
+                setup.control(ui, setup.member_key(:escort_types, "#{from}_to_#{to}"), slot: (column + 1).to_s, label: '', tooltip: "#{from_label} to #{to_label}")
               end
             end
           end
@@ -1825,23 +1886,26 @@ module EBounty
           ui.text(slot: '1', key: 'profiles-profile', content: 'Associated Profile', emphasis: :strong)
           ui.text(slot: '2', key: 'profiles-kill', content: 'Only Kill Bounty Creatures', emphasis: :strong, wrap: true)
         end
-        setup.render_profile_row(ui, 'default', 'Gem/Default Profile', :default_profile, :default_name, nil)
-        setup.render_profile_row(ui, 'bandits', 'Bandits Profile', :bandits_profile, :profile_name_bandits, :kill_bandits)
+        setup.render_profile_row(ui, 'default', 'Gem/Default Profile', :default_profile, nil)
+        setup.render_profile_row(ui, 'bandits', 'Bandits Profile', :bandits_profile, :kill_bandits)
         ('a'..'j').each do |letter|
-          setup.render_profile_row(ui, letter, nil, :"profile_#{letter}", :"profile_name_#{letter}", :"kill_#{letter}", names: :"names_#{letter}")
+          setup.render_profile_row(ui, letter, nil, :"profile_#{letter}", :"kill_#{letter}", names: :"names_#{letter}")
         end
       end
     end
 
-    def render_footer(ui)
+    def render_footer(ui, save)
       setup = self
       ui.divider(key: 'footer-div')
-      ui.columns(key: 'footer', count: 2, weights: [5, 1], compact: true, row_align: :center, margin: 6) do
-        ui.text(slot: '0', key: 'footer-text', wrap: true, content: "To save, exit with the Close button, not the window's X.")
-        ui.button(slot: '1', key: 'close', label: 'Close', variant: :primary,
-                  tooltip: 'Save the settings to your ebounty profile and close this window.',
-                  on: { activate: setup.cb { setup.on_close_clicked } })
+      ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, margin: 6) do
+        ui.text(slot: '0', key: 'footer-text', wrap: true, content: 'Save & Close saves your settings. Cancel or closing the window discards your changes.')
+        ui.button(slot: '1', key: 'cancel', label: 'Cancel', tooltip: 'Close this window without saving.', on: { activate: ->(_ev) { setup.cancel } })
+        save.call(ui, slot: '2', variant: :primary, tooltip: 'Save the settings to your ebounty profile and close this window.')
       end
+    end
+
+    def cancel
+      @form.close
     end
 
     # --------------------------------------------------------- render parts --
@@ -1858,11 +1922,8 @@ module EBounty
       hint ? { placeholder: hint } : {}
     end
 
-    def render_check(ui, key, label, slot: nil, off: false, tip: nil)
-      setup = self
-      ui.checkbox(key: key.to_s, label: label, checked: @settings[key] ? true : false, disabled: off,
-                  **place(slot), **tip_for(tip),
-                  on: { change: setup.cb { |ev| setup.set_check(key, ev.payload[:value] ? true : false) } })
+    def render_check(ui, key, label, slot: nil, off: false, tip: nil, on: nil)
+      control(ui, key, label: label, disabled: off, **place(slot), **tip_for(tip), **(on ? { on: on } : {}))
     end
 
     # Checkboxes over one array setting. items: [stored value, label]
@@ -1871,9 +1932,7 @@ module EBounty
       items.each_slice(columns).with_index do |group, row|
         ui.columns(key: "#{key}-#{row}", count: columns, gap: 8) do
           group.each_with_index do |(value, label), column|
-            ui.checkbox(slot: column.to_s, key: "#{key}-#{value}", label: label,
-                        checked: Array(setup.settings[key]).include?(value),
-                        on: { change: setup.cb { |ev| setup.toggle_member(key, value, ev.payload[:value] ? true : false) } })
+            setup.control(ui, setup.member_key(key, value), slot: column.to_s, label: label)
           end
         end
       end
@@ -1886,9 +1945,7 @@ module EBounty
         columns.each_with_index do |items, column|
           ui.stack(slot: column.to_s, key: "#{key}-col-#{column}", gap: 4) do
             items.each do |value, label, spell|
-              ui.checkbox(key: "#{key}-#{value}", label: label, checked: Array(setup.settings[key]).include?(value),
-                          disabled: !setup.option_known?(key, value, spell),
-                          on: { change: setup.cb { |ev| setup.toggle_member(key, value, ev.payload[:value] ? true : false) } })
+              setup.control(ui, setup.member_key(key, value), label: label, disabled: !setup.option_known?(key, value, spell))
             end
           end
         end
@@ -1903,10 +1960,7 @@ module EBounty
     end
 
     def render_entry(ui, key, slot: nil, off: false, tip: nil, hint: nil)
-      setup = self
-      ui.text_input(key: key.to_s, value: @settings[key].to_s, change_mode: :input, disabled: off,
-                    **place(slot), **tip_for(tip), **hint_for(hint),
-                    on: { change: ->(ev) { setup.set(key, ev.payload[:value].to_s.strip) } })
+      control(ui, key, disabled: off, **place(slot), **tip_for(tip), **hint_for(hint))
     end
 
     # A text box with its label beside it instead of above it.
@@ -1919,34 +1973,24 @@ module EBounty
     end
 
     def render_spin(ui, key, label, slot: nil, tip: nil)
-      setup = self
-      max, step, digits = SPINS.fetch(key)
-      ui.number_input(key: key.to_s, label: label, value: spin_value(key), min: 0, max: max, step: step, digits: digits,
-                      stepper_buttons: true, align: :start, **place(slot), **tip_for(tip),
-                      on: { change: ->(ev) { setup.set_number(key, ev.payload[:value]) } })
+      control(ui, key, label: label, **place(slot), **tip_for(tip))
     end
 
-    # An add/delete list: Add, entry box and Delete in a row, above the table.
+    # An add/delete list: entry box, Add and Delete in a row, above the table.
+    # The entry comes first because Add submits it.
     def render_list(ui, key, title, slot: nil, hint: nil)
       setup = self
-      rows = @settings[key].each_with_index.map { |entry, index| { key: "row-#{index}", cells: { 'entry' => entry.to_s } } }
-      selected = rows.any? { |row| row[:key] == @selected[key] } ? [@selected[key]] : []
-      generation = @entry_generation[key]
       ui.group(key: "#{key}-box", label: title, tooltip: EXCLUSION_TIP, **place(slot)) do
-        ui.columns(key: "#{key}-controls", count: 3, weights: [1, 3, 1], gap: 4, compact: true, row_align: :center) do
-          ui.button(slot: '0', key: "#{key}-add", label: 'Add', on: { activate: setup.cb { setup.add_entry(key) } })
-          ui.text_input(slot: '1', key: "#{key}-entry-#{generation}", value: setup.entries[key].to_s, change_mode: :input, **setup.hint_for(hint),
-                        on: { change: ->(ev) { setup.set_entry(key, ev.payload[:value]) },
-                              submit: setup.cb { setup.add_entry(key) } })
-          ui.button(slot: '2', key: "#{key}-delete", label: 'Delete', on: { activate: setup.cb { setup.delete_entry(key) } })
+        ui.columns(key: "#{key}-controls", count: 3, weights: [3, 1, 1], gap: 4, compact: true, row_align: :center) do
+          setup.control(ui, :"#{key}_entry", slot: '0', **setup.hint_for(hint))
+          setup.control(ui, :"#{key}_add", slot: '1', label: 'Add')
+          setup.control(ui, :"#{key}_delete", slot: '2', label: 'Delete')
         end
-        ui.table(key: "#{key}-table", columns: [{ key: 'entry', label: title, expand: true }], rows: rows, headers: false,
-                 selection: :single, selected: selected, min_height: 220, max_height: 220,
-                 on: { selection_change: ->(ev) { setup.select_row(key, Array(ev.payload[:rows]).first) } })
+        setup.control(ui, key, headers: false, min_height: 220, max_height: 220)
       end
     end
 
-    def render_profile_row(ui, id, label, profile_key, name_key, kill_key, names: nil)
+    def render_profile_row(ui, id, label, profile_key, kill_key, names: nil)
       setup = self
       ui.columns(key: "profile-row-#{id}", count: 3, weights: [3, 6, 2], gap: 8, compact: true, row_align: :center) do
         if names
@@ -1954,8 +1998,7 @@ module EBounty
         else
           ui.text(slot: '0', key: "profile-label-#{id}", content: label)
         end
-        ui.select(slot: '1', key: profile_key.to_s, editable: true, options: setup.profile_options, value: setup.settings[profile_key].to_s,
-                  on: { change: ->(ev) { setup.set_profile(profile_key, name_key, ev.payload[:value]) } })
+        setup.control(ui, profile_key, slot: '1')
         if kill_key
           setup.render_check(ui, kill_key, '', slot: '2', tip: 'Only Kill Bounty Creatures')
         else

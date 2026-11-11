@@ -4,9 +4,9 @@ require_relative '../spec_helper'
 require 'tmpdir'
 require 'fileutils'
 
-# The setup window is a native WebUI page rendered from the settings hash. These run the
-# real EBounty::Setup class against stubs and a recording builder that, like the real one,
-# evaluates child blocks with the builder as self.
+# The setup window is a Lich::WebUI::ListSettingsForm. These run the real EBounty::Setup
+# class against stubs: a stand-in form class that records its options, and a recording
+# builder that, like the real one, evaluates child blocks with the builder as self.
 RSpec.describe 'EBounty::Setup' do
   let(:path) { find_lic_source('ebounty.lic', from: __dir__) }
   let(:source) { File.read(path, encoding: 'UTF-8') }
@@ -32,11 +32,23 @@ RSpec.describe 'EBounty::Setup' do
     end
   end
 
+  let(:form_stub) do
+    Class.new do
+      attr_reader :options
+
+      def initialize(**options)
+        @options = options
+      end
+
+      def page = @page ||= Struct.new(:sets) { def set(*args, **kw) = sets << [args, kw] }.new([])
+    end
+  end
+
   let(:known_spells) { [] }
   let(:prof) { 'Warrior' }
   let(:blessings) { 0 }
   let(:saved) { [] }
-  let(:pushed) { [] }
+  let(:refreshed) { [] }
   let(:game) { 'GSIV' }
 
   let(:namespace) do
@@ -44,7 +56,9 @@ RSpec.describe 'EBounty::Setup' do
     profession = prof
     ranks = blessings
     saves = saved
+    refreshes = refreshed
     game_name = game
+    stub = form_stub
     spell = Struct.new(:num, :known) { def known? = known }
     Module.new.tap do |ns|
       ns.const_set(:Spell, Module.new { define_singleton_method(:[]) { |n| spell.new(n.to_i, spells.include?(n.to_i)) } })
@@ -58,6 +72,9 @@ RSpec.describe 'EBounty::Setup' do
         define_singleton_method(:save_profile) { |settings| saves << settings }
         define_singleton_method(:msg) { |*| nil }
       })
+      webui = Module.new { define_singleton_method(:refresh) { |page| refreshes << page } }
+      webui.const_set(:ListSettingsForm, stub)
+      ns.const_set(:Lich, Module.new).const_set(:WebUI, webui)
       ns.module_eval(setup_source, path)
       ns.const_get(:Setup).class_eval { define_method(:respond) { |*| nil } }
     end
@@ -69,8 +86,18 @@ RSpec.describe 'EBounty::Setup' do
     setup_class.new(settings)
   end
 
+  # Renders the window's layout (one form per setup, as in a session); fields are
+  # recorded with their key, overrides and initial value.
   def render(setup)
-    recorder_class.new.tap { |ui| setup.render(ui) }.nodes
+    options = (@forms ||= {}.compare_by_identity)[setup] ||= setup.form.options
+    ref = Struct.new(:cid)
+    ui = recorder_class.new
+    field = lambda do |_parent, key, **props|
+      ui.nodes << props.merge(type: :field, key: key.to_s, value: options[:values][key])
+      ref.new("cid-#{key}")
+    end
+    options[:layout].call(ui, field, ->(_parent, **props) { ui.nodes << props.merge(type: :save, key: 'save') })
+    ui.nodes
   end
 
   def node(nodes, key)
@@ -121,27 +148,44 @@ RSpec.describe 'EBounty::Setup' do
     end
   end
 
-  describe 'rendering' do
-    it 'has a control for every setting' do
-      nodes = render(build)
-      general = setup_class.class_variable_get(:@@categories)[:general].keys
-      member_lists = %i[bounty_types escort_types forage_options heirloom_options]
-      tables = %i[creature_exclude herb_exclude gem_exclude location_exclude]
-      paired_names = %i[default_name profile_name_bandits] + ('a'..'j').map { |letter| :"profile_name_#{letter}" }
+  describe 'the form' do
+    let(:setup) { build }
+    let(:options) { setup.form.options }
 
-      (general - member_lists - tables - paired_names - [:only_required_creatures]).each { |key| expect(node(nodes, key)).not_to be_nil, "no control for #{key}" }
-      tables.each { |key| expect(node(nodes, "#{key}-table")).not_to be_nil, "no table for #{key}" }
-      member_lists.each { |key| expect(nodes.any? { |n| n[:key].to_s.start_with?("#{key}-") }).to be(true), "no boxes for #{key}" }
+    it 'declares a field for every setting the window shows, and renders each of them' do
+      general = setup_class.class_variable_get(:@@categories)[:general].keys
+      hidden = %i[default_name profile_name_bandits only_required_creatures] + ('a'..'j').map { |letter| :"profile_name_#{letter}" }
+      keys = options[:fields].map { |field| field[:key] }
+      lists = options[:lists].keys
+
+      expect(lists).to match_array(%i[creature_exclude herb_exclude gem_exclude location_exclude])
+      (general - hidden - lists - setup_class::MEMBERS.keys).each { |key| expect(keys).to include(key), "no field for #{key}" }
+      expect(keys.uniq).to eq(keys)
+
+      rendered = render(setup).select { |n| n[:type] == :field }.map { |n| n[:key] }
+      declared = keys.map(&:to_s) + lists.flat_map { |key| [key, "#{key}_entry", "#{key}_add", "#{key}_delete"].map(&:to_s) }
+      expect(rendered).to match_array(declared)
     end
 
     it 'offers every escort route, with none from a town to itself' do
-      keys = render(build).map { |n| n[:key].to_s }.grep(/\Aescort_types-/)
+      keys = options[:fields].map { |field| field[:key].to_s }.grep(/\Aescort_types-/)
 
       expect(keys.size).to eq(30)
       expect(keys.grep(/-(\w+)_to_\1\z/)).to be_empty
       expect(keys).to include('escort_types-landing_to_vaalor')
     end
 
+    it 'makes the resting choices one exclusive group and rest/keep hunting another' do
+      groups = options[:fields].to_h { |field| [field[:key], field[:exclusive]] }
+
+      expect(groups.values_at(:table_rest, :bigshot_rest, :custom_rest, :rest_random, :use_script).uniq.size).to eq(1)
+      expect(groups[:exp_pause]).to eq(groups[:keep_hunting])
+      expect(groups[:exp_pause]).not_to eq(groups[:table_rest])
+      expect(groups[:join_player]).to be_nil
+    end
+  end
+
+  describe 'rendering' do
     it 'disables with disabled:, because sensitive: means a confidential value' do
       expect(render(build).select { |n| n.key?(:sensitive) }).to be_empty
     end
@@ -150,8 +194,8 @@ RSpec.describe 'EBounty::Setup' do
       setup = build({ forage_options: ['use_140'] })
       nodes = render(setup)
 
-      expect(node(nodes, 'forage_options-use_140')).to include(disabled: true, checked: true)
-      expect(setup.settings[:forage_options]).to eq(['use_140'])
+      expect(node(nodes, 'forage_options-use_140')).to include(disabled: true, value: true)
+      expect(setup.normalize(setup.form_values)[:forage_options]).to eq(['use_140'])
     end
 
     context 'with the spell known' do
@@ -193,23 +237,23 @@ RSpec.describe 'EBounty::Setup' do
       end
     end
 
-    it 'shows Any for a blank boost choice, without changing the setting' do
-      setup = build
-
-      expect(node(render(setup), :boost_type)[:value]).to eq('Any')
-      expect(setup.settings[:boost_type]).to eq('')
+    it 'shows Any for a blank boost choice' do
+      expect(build.form_values[:boost_type]).to eq('Any')
     end
 
     it 'shows a saved spinner as a whole number, as GTK saved them as floats' do
-      expect(node(render(build({ culling_max: 12.0 })), :culling_max)[:value]).to eq(12)
+      expect(build({ culling_max: 12.0 }).form_values[:culling_max]).to eq(12)
     end
 
-    it 'commits text as it is typed, so Close cannot lose it' do
-      expect(node(render(build), :death_script)).to include(change_mode: :input)
+    it 'shows a spinner on its step' do
+      expect([0.2, 0.3]).to include(build({ wander_wait: 0.25 }).form_values[:wander_wait])
     end
 
     it 'keeps a profile name that has no file' do
-      expect(node(render(build({ profile_a: 'Custom' })), :profile_a)).to include(value: 'Custom', editable: true)
+      setup = build({ profile_a: 'Custom' })
+
+      expect(setup.form_values[:profile_a]).to eq('Custom')
+      expect(setup.form.options[:fields].find { |field| field[:key] == :profile_a }).to include(editable: true)
     end
 
     it 'lists only yaml files as profiles, and survives a missing folder' do
@@ -226,119 +270,97 @@ RSpec.describe 'EBounty::Setup' do
         $data_dir = nil
       end
     end
-  end
-
-  describe 'changes' do
-    def with_page(setup, *keys)
-      pushes = pushed
-      components = keys.map { |key| Struct.new(:type, :props, :cid).new(:checkbox, { key: key.to_s }, "cid-#{key}") }
-      tree = Object.new.tap { |t| t.define_singleton_method(:each) { components } }
-      result = Struct.new(:tree).new(tree)
-      page = Object.new
-      page.define_singleton_method(:last_render) { result }
-      page.define_singleton_method(:set) { |*args| pushes << args }
-      setup.instance_variable_set(:@page, page)
-    end
-
-    it 'keeps only one resting choice on, in the window too' do
-      setup = build({ table_rest: true, custom_rest: true })
-      with_page(setup, :table_rest, :custom_rest, :rest_random, :use_script)
-
-      setup.set_check(:bigshot_rest, true)
-
-      expect(setup.settings).to include(bigshot_rest: true, table_rest: false, custom_rest: false, rest_random: false, use_script: false)
-      expect(pushed).to include(['cid-table_rest', :checked, false], ['cid-custom_rest', :checked, false])
-    end
-
-    it 'does not touch the others when a resting choice is turned off' do
-      setup = build({ table_rest: true, bigshot_rest: true })
-
-      setup.set_check(:bigshot_rest, false)
-
-      expect(setup.settings[:table_rest]).to be(true)
-    end
-
-    it 'treats rest when mind full and keep hunting as a pair' do
-      setup = build({ exp_pause: true })
-
-      setup.set_check(:keep_hunting, true)
-
-      expect(setup.settings).to include(keep_hunting: true, exp_pause: false)
-    end
 
     it 'clears and disables a new bounty on exit when run one bounty is turned off' do
       setup = build({ once_and_done: true, new_bounty_on_exit: true })
-      with_page(setup, :new_bounty_on_exit)
-      expect(node(render(setup), :new_bounty_on_exit)[:disabled]).to be(false)
+      nodes = render(setup)
+      expect(node(nodes, :new_bounty_on_exit)[:disabled]).to be(false)
 
-      setup.set_check(:once_and_done, false)
+      node(nodes, :once_and_done)[:on][:change].call(Struct.new(:payload, :viewer_id).new({ value: false }, 'v1'))
 
-      expect(setup.settings[:new_bounty_on_exit]).to be(false)
-      expect(pushed).to eq([['cid-new_bounty_on_exit', :checked, false]])
       expect(node(render(setup), :new_bounty_on_exit)[:disabled]).to be(true)
     end
 
-    it 'saves a profile choice to both of its settings' do
-      setup = build
+    it 'pushes the cleared box to the viewer that turned run one bounty off' do
+      setup = build({ once_and_done: true, new_bounty_on_exit: true })
+      form = setup.form
+      ui = recorder_class.new
+      form.options[:layout].call(ui, ->(_p, key, **) { Struct.new(:cid).new("cid-#{key}") }, ->(*, **) {})
 
-      setup.set_profile(:profile_a, :profile_name_a, ' trolls ')
-
-      expect(setup.settings).to include(profile_a: 'trolls', profile_name_a: 'trolls')
+      setup.once_and_done_changed(false, 'v1')
+      expect(form.page.sets).to eq([[['cid-new_bounty_on_exit', :checked, false], { viewer: 'v1' }]])
+      setup.once_and_done_changed(true, 'v1')
+      expect(refreshed).to eq([form.page])
     end
 
-    it 'clamps and types spinner values' do
-      setup = build
+    it 'has Cancel and Save & Close, and says what each does' do
+      nodes = render(build)
 
-      setup.set_number(:gem_max, 500)
-      setup.set_number(:wander_wait, 1.5)
-
-      expect(setup.settings).to include(gem_max: 100, wander_wait: 1.5)
-    end
-
-    it 'keeps member lists unique and sorted' do
-      setup = build({ bounty_types: %w[skinning culling] })
-
-      setup.toggle_member(:bounty_types, 'rescue', true)
-      expect(setup.settings[:bounty_types]).to eq(%w[culling rescue skinning])
-      setup.toggle_member(:bounty_types, 'culling', false)
-      expect(setup.settings[:bounty_types]).to eq(%w[rescue skinning])
-    end
-
-    it 'adds and deletes exclusions, when the list had no duplicates (old code raised here)' do
-      setup = build({ gem_exclude: ['zircon'] })
-
-      setup.set_entry(:gem_exclude, '  (?:blue|red) gem ')
-      setup.add_entry(:gem_exclude)
-      setup.set_entry(:gem_exclude, 'zircon')
-      setup.add_entry(:gem_exclude)
-      expect(setup.settings[:gem_exclude]).to eq(['(?:blue|red) gem', 'zircon'])
-      expect(node(render(setup), 'gem_exclude-entry-2')).not_to be_nil
-
-      setup.delete_entry(:gem_exclude)
-      expect(setup.settings[:gem_exclude].size).to eq(2)
-      setup.select_row(:gem_exclude, 'row-0')
-      setup.delete_entry(:gem_exclude)
-      expect(setup.settings[:gem_exclude]).to eq(['zircon'])
+      expect(node(nodes, :cancel)[:label]).to eq('Cancel')
+      expect(node(nodes, :save)).to include(variant: :primary)
+      expect(node(nodes, 'footer-text')[:content]).to include('Save & Close saves', 'Cancel or closing the window discards')
     end
   end
 
-  describe 'closing' do
-    before do
-      namespace.const_set(:Lich, Module.new)
-      namespace.const_get(:Lich).const_set(:WebUI, Module.new { define_singleton_method(:close) { |_page| nil } })
+  describe 'saving' do
+    let(:setup) { build({ wander_wait: 0.25, bounty_types: %w[skinning custom], profile_a: 'trolls', profile_name_a: 'trolls' }) }
+    let(:draft) { setup.form_values }
+
+    it 'returns the settings, keeping values the window had to adjust when left alone' do
+      result = setup.normalize(draft)
+
+      expect(result).to include(wander_wait: 0.25, boost_type: '', bounty_types: %w[custom skinning])
+      expect(result).not_to have_key(:profile_name_a)
     end
 
-    it 'saves once and does not refresh the closed page' do
-      setup = build
+    it 'takes edits, merging member checkboxes and keeping values the window does not offer' do
+      result = setup.normalize(draft.merge('bounty_types-rescue': true, 'bounty_types-skinning': false, gem_max: 50, wander_wait: 1.5, death_script: ' rip '))
 
-      setup.act { setup.on_close_clicked }
+      expect(result).to include(bounty_types: %w[custom rescue], gem_max: 50, wander_wait: 1.5, death_script: 'rip')
+    end
 
+    it 'saves a changed profile choice to both of its settings' do
+      expect(setup.normalize(draft.merge(profile_a: ' kobolds '))).to include(profile_a: 'kobolds', profile_name_a: 'kobolds')
+    end
+
+    it 'never saves a new bounty on exit without run one bounty' do
+      expect(setup.normalize(draft.merge(once_and_done: false, new_bounty_on_exit: true))[:new_bounty_on_exit]).to be(false)
+    end
+
+    it 'refuses a missing number with a message' do
+      expect { setup.normalize(draft.merge(gem_max: nil)) }.to raise_error(ArgumentError, /gem_max/)
+    end
+
+    it 'saves on Save & Close and not on Cancel' do
+      result = nil
+      form = Struct.new(:result) do
+        def show = self
+        def wait = result
+      end
+      setup.define_singleton_method(:form) { form.new(result) }
+
+      setup.start
+      expect(saved).to be_empty
+      result = { gem_max: 7 }
+      setup.start
       expect(saved.size).to eq(1)
-      expect(setup.instance_variable_get(:@closed).pop(true)).to eq(:close)
+      expect(setup.settings[:gem_max]).to eq(7)
     end
+  end
 
-    it 'reports an error from a callback instead of raising it into the dispatcher' do
-      expect { build.act { raise 'boom' } }.not_to raise_error
+  describe 'exclusion lists' do
+    it 'edits a copy, kept unique and sorted' do
+      settings = { gem_exclude: ['zircon'] }
+      spec = build(settings).form.options[:lists][:gem_exclude]
+
+      spec[:add].call('  (?:blue|red) gem ')
+      spec[:add].call('zircon')
+      expect(spec[:value].call).to eq(['(?:blue|red) gem', 'zircon'])
+      expect(spec[:rows].call).to eq([{ 'entry' => '(?:blue|red) gem' }, { 'entry' => 'zircon' }])
+      spec[:delete].call(0)
+      expect(spec[:value].call).to eq(['zircon'])
+      expect(settings[:gem_exclude]).to eq(['zircon'])
+      expect(spec).to include(clear_after_add: true)
     end
   end
 end
