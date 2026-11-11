@@ -109,10 +109,20 @@ RSpec.describe 'lnet.lic' do
         expect(out.map(&:first)).to eq(%i[detached downstream_xml downstream])
       end
 
-      it 'writes nothing extra when there is no detachable client support' do
+      it 'writes only to detached clients when no front end is attached' do
+        $_CLIENT_ = nil
+        out = feed(%(<message type="channel" from="GSIV:Bob" channel="General">hi</message>))
+        expect(out).to eq([
+                            [:detached, shown],
+                            [:downstream_xml, %(<pushStream id="thoughts"/>[General]-GSIV:Bob: "hi"\n<popStream/>\n)],
+                            [:downstream, %([General]-GSIV:Bob: "hi")]
+                          ])
+      end
+
+      it 'keeps _respond on Lich older than 5.20.0 (no detachable_clients_respond)' do
         lnet::Thoughts.singleton_class.send(:remove_method, :detachable_clients_respond)
         out = feed(%(<message type="channel" from="GSIV:Bob" channel="General">hi</message>))
-        expect(out.map(&:first)).to eq(%i[main_stream downstream_xml downstream])
+        expect(out.map(&:first)).to eq(%i[_respond downstream_xml downstream])
       ensure
         lnet::Thoughts.define_singleton_method(:detachable_clients_respond) { |_line| nil }
       end
