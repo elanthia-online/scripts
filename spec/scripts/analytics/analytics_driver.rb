@@ -975,12 +975,27 @@ when 'close_writes'
   end
   count = ->(tag) { db.db[:silver_events].where(source_category: tag).count }
   # close drains the queue after closing it (#write_remaining); a hook still
-  # running then (removed, but mid-line) queues a write: it is written in place
-  db.instance_variable_get(:@queue).close
-  db.async { event.call('late') }
-  result['late'] = count.call('late')
+  # running then (removed, but mid-line) queues a write: it is written in
+  # place. Driven through close itself: Lich has killed the writer, close
+  # runs a leftover, and the hook's write comes while it does.
+  writer = db.instance_variable_get(:@writer)
+  writer.kill
+  writer.join
+  running = Queue.new
+  # (it writes after the hook's, so the two don't wait on each other's lock)
+  db.instance_variable_get(:@queue) << lambda {
+    running << true
+    sleep 0.3
+    event.call('leftover')
+  }
+  late = Thread.new do
+    running.pop
+    db.async { event.call('late') }
+  end
   db.close
+  late.join
   db.connect!
+  result['late'] = count.call('late')
   # Lich holds a ;kill back until COMMIT returns, so it lands after the
   # commit and before the queue is shifted: the job must not run again in close
   # ;kill comes from another thread (a thread can't defer killing itself)
