@@ -914,8 +914,10 @@ RSpec.describe 'analytics.lic' do
       expect(edges['reopened']).to eq([240, 100])
     end
 
-    it "marks a cycle a crash left open as 'crashed' unless it has a reason" do
-      expect(edges['crash_closed']).to eq(%w[bounty crashed])
+    it "marks a cycle a crash left open as 'crashed' unless it has a reason, with the next cycle's readings when it ends there" do
+      # the hunt ends when its login was last seen, so its end readings are unknown
+      expect(edges['crash_closed']).to eq([['bounty', nil, nil, nil, nil, nil, nil],
+                                           ['crashed', 5000, 4900, 100, 40, 70, 12.5]])
     end
 
     it 'marks the hunt that ended in a death, keeping why it stopped' do

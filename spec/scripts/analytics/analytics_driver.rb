@@ -1246,7 +1246,8 @@ when 'cycle_edges'
   A::Database.touch_login(WHO, NOW - 7200, NOW - 480)
   dropped = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', {})
   older = A::Database.start_cycle(WHO, :rest, 'rest', 'splinter_crags', {})
-  after = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', {})
+  after = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags',
+                                  { exp_total: 5000, exp_regular: 4900, exp_asc: 100, exp_field: 40, fame: 70, encumbrance: 12.5 })
   run_sql("UPDATE cycles SET rest_reason = 'bounty' WHERE cycle_id = ?", dropped)
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 720, dropped)
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 3000, older)
@@ -1254,8 +1255,9 @@ when 'cycle_edges'
   manager.start(WHO, cfg)
   A::Database.flush
   result['reopened'] = [dropped, older].map { |id| A::Database.one('SELECT end_time - start_time AS s FROM cycles WHERE cycle_id = ?', id)['s'] }
-  # marked as crashed unless it has a reason
-  result['crash_closed'] = [dropped, older].map { |id| A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', id)['rest_reason'] }
+  # marked as crashed unless it has a reason; ended where the next cycle began, it takes that one's readings
+  ends = 'rest_reason, exp_total_end, exp_regular_end, exp_asc_end, exp_field_end, fame_end, encumbrance_end'
+  result['crash_closed'] = [dropped, older].map { |id| A::Database.one("SELECT #{ends} FROM cycles WHERE cycle_id = ?", id).values }
   first = A::Database.one('SELECT cycle_type, start_time FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)
   result['startup'] = [manager.current_state.to_s, first['cycle_type'], (first['start_time'].to_i - Time.now.to_i).abs <= 2]
   manager.instance_variable_set(:@running, false)

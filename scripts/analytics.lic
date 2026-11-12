@@ -543,6 +543,10 @@ module GS4Analytics
 
     # Cycles shorter than this are state flapping, not real hunts or rests
     MIN_CYCLE_SECONDS = 10
+    # The readings end_cycle takes at a cycle's end, by the column each comes
+    # from at a cycle's start (close_cycle takes them from the next cycle)
+    END_READINGS = { exp_total_end: :exp_total_start, exp_regular_end: :exp_regular_start, exp_asc_end: :exp_asc_start,
+                     exp_field_end: :exp_field_start, fame_end: :fame_start, encumbrance_end: :encumbrance_start }.freeze
     # Tries at switching a fresh file to WAL, 50 ms apart (Database.wal_mode)
     WAL_TRIES = 50
     # The schema in create_schema. Any change to it bumps this, and a file made
@@ -787,11 +791,15 @@ module GS4Analytics
       end
 
       # Ends a cycle that a crash left open, marked 'crashed' unless it has a
-      # reason already (a rest keeps why it started)
-      def close_cycle(cycle_id, start_time, finish)
-        db[:cycles].where(cycle_id: cycle_id)
-                   .update(end_time: finish, duration_seconds: finish - start_time.to_i,
-                           rest_reason: Sequel.function(:coalesce, Sequel.function(:nullif, :rest_reason, ''), 'crashed'))
+      # reason already (a rest keeps why it started). +after+ is the id of
+      # the cycle that started at +finish+, when that's where it ends: its
+      # starting readings are this one's end, so its experience still counts.
+      def close_cycle(cycle_id, start_time, finish, after: nil)
+        values = { end_time: finish, duration_seconds: finish - start_time.to_i,
+                   rest_reason: Sequel.function(:coalesce, Sequel.function(:nullif, :rest_reason, ''), 'crashed') }
+        reading = after && db[:cycles].where(cycle_id: after).select(*END_READINGS.values).first
+        END_READINGS.each { |col, from| values[col] = reading[from] } if reading
+        db[:cycles].where(cycle_id: cycle_id).update(values)
       end
 
       def record_rest_steps(who, cycle_id, rest_start, steps)
@@ -3402,13 +3410,15 @@ module GS4Analytics
                              'AND end_time IS NULL', *@who)
         stale.each do |cycle|
           start = cycle['start_time'].to_i
-          following = Database.one('SELECT MIN(start_time) AS t FROM cycles WHERE game = ? AND character = ? ' \
-                                   'AND start_time > ?', *@who, start)['t']
+          next_row = Database.one('SELECT cycle_id, start_time FROM cycles WHERE game = ? AND character = ? ' \
+                                  'AND start_time > ? ORDER BY start_time LIMIT 1', *@who, start)
+          following = next_row&.[]('start_time')
           seen = Database.one('SELECT last_seen AS t FROM logins WHERE game = ? AND character = ? ' \
                               'AND started_at <= ? ORDER BY started_at DESC LIMIT 1', *@who, start)&.[]('t')
           finish = [following, seen].compact.map(&:to_i).min || start
           finish = start if finish < start
-          Database.async { Database.close_cycle(cycle['cycle_id'], start, finish) }
+          after = next_row['cycle_id'] if following && finish == following.to_i
+          Database.async { Database.close_cycle(cycle['cycle_id'], start, finish, after: after) }
         end
         Log.info("Closed #{stale.size} stale open cycle(s)") if stale.any?
       end
