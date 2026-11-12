@@ -1991,8 +1991,11 @@ when 'pool'
   feed = ->(*lines) { lines.each { |line| DownstreamHook.run("#{line}\r\n") } }
   feed.call('The worker says, "We don\'t have any boxes ready for you."',
             'The worker says, "Splinter, here\'s the list of boxes we have for you."',
+            '',
+            '<output class="mono"/>',
             ' 1.  A scratched white oak box about a minute ago for 750 silvers.',
             '     It is waiting to be worked on.',
+            '',
             ' 2.  A battered tanik strongbox about 20 minutes ago for 750 silvers.',
             '[tsquelch3: End Squelching!]',
             '     It is waiting to be worked on.',
