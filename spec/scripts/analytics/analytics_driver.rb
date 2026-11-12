@@ -1247,12 +1247,15 @@ when 'cycle_edges'
   dropped = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', {})
   older = A::Database.start_cycle(WHO, :rest, 'rest', 'splinter_crags', {})
   after = A::Database.start_cycle(WHO, :hunt, 'bigshot', 'splinter_crags', {})
+  run_sql("UPDATE cycles SET rest_reason = 'bounty' WHERE cycle_id = ?", dropped)
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 720, dropped)
   run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', NOW - 3000, older)
   run_sql('UPDATE cycles SET start_time = ?, end_time = ? WHERE cycle_id = ?', NOW - 2900, NOW - 1000, after)
   manager.start(WHO, cfg)
   A::Database.flush
   result['reopened'] = [dropped, older].map { |id| A::Database.one('SELECT end_time - start_time AS s FROM cycles WHERE cycle_id = ?', id)['s'] }
+  # marked as crashed unless it has a reason
+  result['crash_closed'] = [dropped, older].map { |id| A::Database.one('SELECT rest_reason FROM cycles WHERE cycle_id = ?', id)['rest_reason'] }
   first = A::Database.one('SELECT cycle_type, start_time FROM cycles WHERE cycle_id = ?', manager.current_cycle_id)
   result['startup'] = [manager.current_state.to_s, first['cycle_type'], (first['start_time'].to_i - Time.now.to_i).abs <= 2]
   manager.instance_variable_set(:@running, false)
