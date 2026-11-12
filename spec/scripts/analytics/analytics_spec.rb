@@ -445,7 +445,7 @@ RSpec.describe 'analytics.lic' do
   describe "other players' words" do
     subject(:overheard) { result('overheard') }
 
-    it 'records none of what is said, whispered or thought as this character\'s silver, kills or bank' do
+    it 'records none of what is said, whispered, thought or sent over the Voln channel as this character\'s silver, kills or bank' do
       expect(overheard['kills']).to eq([])
       expect(overheard['bank']).to eq([['bank_account', 100]])
       expect(overheard['bounties']).to eq([])

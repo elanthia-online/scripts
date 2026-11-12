@@ -1809,6 +1809,16 @@ when 'overheard'
             '<prompt time="2">&gt;</prompt>',
             # thoughts as plain text
             '[General]-GSIV:Penny: "You gather the remaining 7 coins from inside your box."',
+            # the Order of Voln's channel, in the shape Lich parses: one
+            # member's words reach every member in the realm
+            '<pushStream id="voln"/>[Voln - <a exist="-9" noun="Penny">Penny</a>] "You deposit 1 silver into your account.  ' \
+            'The teller says, \"This brings your total to 1,999,999,999 silvers."',
+            '<popStream/>',
+            '<pushStream id="voln"/>[Voln - <a exist="-9" noun="Penny">Penny</a>] "You gather the remaining 11 coins from inside your box."',
+            '<popStream/>',
+            # thoughts as one element, the form Lich's markup also reads, closed
+            # by its own end tag
+            '<stream id="thoughts">Penny: "You gather the remaining 9 coins from inside your box."</stream>',
             # a line with a byte that isn't UTF-8: read without it, and the hooks go on
             "You gather the remaining 33 coins from inside your box.\xFF".dup.force_encoding('UTF-8'),
             # this character's own: the NPCs' lines, in the main window
