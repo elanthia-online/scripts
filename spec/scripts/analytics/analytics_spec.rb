@@ -881,6 +881,26 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'a cycle too short to keep between two of the same kind' do
+    subject(:flap) { result('flap') }
+
+    it 'carries on the rest before it, rather than starting a second one' do
+      expect(flap['rest']).to eq('resumed' => true, 'open' => true, 'flap_dropped' => true)
+    end
+
+    it 'keeps the rest steps from before the flap' do
+      expect(flap['steps']).to eq([['eloot', 100.0], ['travel', 50.0]])
+    end
+
+    it 'carries on a hunt, from when it started and without the reason it stopped for' do
+      expect(flap['hunt']).to eq('resumed' => true, 'open' => true, 'reason' => nil, 'started' => true)
+    end
+
+    it 'leaves one row for each' do
+      expect(flap['cycles']).to eq([['hunt', 1, nil], ['rest', 1, 'wall of thorns poison.']])
+    end
+  end
+
   describe 'bank deposits and withdrawals' do
     subject(:moves) { result('bank_moves') }
 

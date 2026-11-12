@@ -651,6 +651,13 @@ module GS4Analytics
         db[:cycles].where(cycle_id: cycle_id).update(rest_reason: Util.norm(reason))
       end
 
+      # An ended cycle carried on (CycleManager.resume_cycle): open again
+      def reopen_cycle(cycle_id, keep_reason: true)
+        values = { end_time: nil, duration_seconds: nil }
+        values[:rest_reason] = nil unless keep_reason
+        db[:cycles].where(cycle_id: cycle_id).update(values)
+      end
+
       # Ends a cycle that a crash left open
       def close_cycle(cycle_id, start_time, finish)
         db[:cycles].where(cycle_id: cycle_id).update(end_time: finish, duration_seconds: finish - start_time.to_i)
@@ -2918,6 +2925,7 @@ module GS4Analytics
         @rest_cycle = nil
         @cycle_reason = nil
         @last_hunt = nil
+        @ended = nil
         @idle = { since: nil, warned: false, recovering: false }
         @weapon = { polls: 0, retries: 0 }
         @day = Date.today.to_s
@@ -3098,6 +3106,7 @@ module GS4Analytics
         @after_death = false
         end_current_cycle
         @carry_from = nil # the new day starts at midnight
+        @ended = nil
         @day = today
         link_silver
         start_new_cycle(@current_state)
@@ -3106,6 +3115,8 @@ module GS4Analytics
       # The id and every value are taken now and the write is queued, so a
       # database held by another session delays the row instead of losing it
       def start_new_cycle(type)
+        return resume_cycle(type) if resumes?(type)
+
         trigger = Array(@cfg[SCRIPT_KEYS[type]]).find { |name| running?(name) } || type.to_s
         row = [@who, type, trigger, profile, Vitals.read]
         id = Database.new_id
@@ -3123,6 +3134,36 @@ module GS4Analytics
         Log.debug("Started #{type} cycle")
       rescue StandardError => e
         Log.error('start cycle', e)
+      end
+
+      # A cycle too short to keep, between two of the same kind, was a flap:
+      # bigshot starting and at once going back to rest (still poisoned, still
+      # encumbered). The cycle before it goes on, rather than a second one starting.
+      def resumes?(type)
+        @carry_from && @ended && @ended[:type] == type && @carry_from - @ended[:at] <= 2
+      end
+
+      def resume_cycle(type)
+        cycle = @ended
+        @ended = nil
+        @carry_from = nil
+        id = cycle[:id]
+        # Queued after the short cycle's delete. A hunt goes on, so the reason it
+        # ended with is taken off; a rest keeps the one it started with.
+        Database.async { Database.reopen_cycle(id, keep_reason: type != :hunt) }
+        @current_cycle_id = id
+        @cycle_started_at = cycle[:started_at]
+        @cycle_reason = type == :hunt ? nil : cycle[:reason]
+        if type == :hunt
+          @hunt_start_time = cycle[:hunt_start] || cycle[:started_at]
+          @last_hunt = nil
+        elsif type == :rest
+          @rest_steps = Hash.new(0.0).merge(cycle[:steps] || {})
+          @rest_cycle = id
+          @rest_tick = monotonic
+        end
+        link_silver
+        Log.debug("Resumed the #{type} cycle")
       end
 
       def start_rest(cycle_id)
@@ -3155,9 +3196,15 @@ module GS4Analytics
         reason = @current_state == :hunt ? rest_reason : ''
         at = Time.now.to_i
         # Database.end_cycle drops a cycle this short; the next one takes its time
-        @carry_from = @cycle_started_at if @cycle_started_at && at - @cycle_started_at < Database::MIN_CYCLE_SECONDS
+        short = @cycle_started_at && at - @cycle_started_at < Database::MIN_CYCLE_SECONDS
+        @carry_from = @cycle_started_at if short
         steps = @rest_cycle == id && !@rest_steps.empty? ? @rest_steps.dup : nil
         @rest_cycle = nil if @rest_cycle == id
+        # Kept so a flap (see resume_cycle) can carry it on
+        unless short
+          @ended = { id: id, type: @current_state, at: at, started_at: @cycle_started_at, reason: @cycle_reason,
+                     hunt_start: @hunt_start_time, steps: steps }
+        end
         if @current_state == :hunt && !@carry_from
           @last_hunt = { id: id, reason: reason.empty? ? @cycle_reason.to_s : reason, at: at }
         end

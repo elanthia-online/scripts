@@ -1198,6 +1198,54 @@ when 'cycle_edges'
     'after_death' => reason_of.call(recovery), 'midnight' => reason_of.call(cut), 'after_midnight' => reason_of.call(manager.current_cycle_id)
   }
 
+when 'flap'
+  # Bigshot starts and goes straight back to resting (still poisoned): the
+  # hunt is too short to keep, and the rest before it goes on
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::CycleManager
+  $running = []
+  manager.start(WHO, cfg)
+  manager.instance_variable_set(:@running, false)
+  manager.instance_variable_get(:@thread).join(2)
+  backdate = lambda do |ago|
+    A::Database.flush
+    run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', Time.now.to_i - ago, manager.current_cycle_id)
+    manager.instance_variable_set(:@cycle_started_at, Time.now.to_i - ago)
+  end
+  $rest_reason = 'wall of thorns poison.'
+  manager.send(:transition_to, :rest)
+  rest = manager.current_cycle_id
+  backdate.call(300)
+  manager.instance_variable_get(:@rest_steps)['eloot'] += 100.0
+  manager.send(:transition_to, :hunt) # a second or two of bigshot...
+  flap = manager.current_cycle_id
+  manager.send(:transition_to, :rest) # ...and back to resting
+  manager.instance_variable_get(:@rest_steps)['travel'] += 50.0
+  A::Database.flush
+  open_rest = A::Database.one('SELECT end_time FROM cycles WHERE cycle_id = ?', rest)
+  result['rest'] = { 'resumed' => manager.current_cycle_id == rest, 'open' => open_rest['end_time'].nil?,
+                     'flap_dropped' => A::Database.all('SELECT 1 FROM cycles WHERE cycle_id = ?', flap).empty? }
+  # The same for a hunt cut by a flap of rest: it goes on, without the reason it stopped for
+  $rest_reason = ''
+  manager.send(:transition_to, :hunt)
+  hunt = manager.current_cycle_id
+  backdate.call(600)
+  started = manager.hunt_start_time
+  $rest_reason = 'encumbered.'
+  manager.send(:transition_to, :rest)
+  $rest_reason = ''
+  manager.send(:transition_to, :hunt)
+  A::Database.flush
+  open_hunt = A::Database.one('SELECT end_time, rest_reason FROM cycles WHERE cycle_id = ?', hunt)
+  result['hunt'] = { 'resumed' => manager.current_cycle_id == hunt, 'open' => open_hunt['end_time'].nil?,
+                     'reason' => open_hunt['rest_reason'], 'started' => manager.hunt_start_time == started }
+  manager.send(:end_current_cycle)
+  A::Database.flush
+  result['cycles'] = A::Database.all('SELECT cycle_type, end_time - start_time >= 300 AS long, rest_reason FROM cycles ' \
+                                     "WHERE cycle_type != 'idle' ORDER BY start_time").map(&:values)
+  result['steps'] = A::Database.all('SELECT step, seconds FROM rest_steps WHERE cycle_id = ? ORDER BY step', rest).map(&:values)
+
 when 'bigshot_status'
   # Bigshot's own status marks a rest, but only while the script is running
   A::Database.connect!
