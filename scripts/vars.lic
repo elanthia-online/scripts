@@ -8,10 +8,15 @@
    maintained by: Elanthia-Online
    game: Gemstone
    tags: core
-   required: Lich > 5.0.1
-   version: 1.2.0
+   required: Lich > 5.0.1 (setup window: Lich with the WebUI)
+   version: 1.3.0
 
   changelog:
+    1.3.0 (2026-11-09)
+      ;vars setup is a Lich WebUI window instead of GTK: edit values, delete
+      and add variables, then Save & Close. Cancel or closing the window discards.
+      One table with in-place editing and type-ahead by name, so any number of
+      variables shows; typing no longer redraws the window.
     1.2.0 (2023-12-04)
       Allowed setting of vars to boolean values true/false
     1.1 (2023-09-07)
@@ -37,6 +42,186 @@
       don't use Vars.send
 
 =end
+
+# ;vars setup: a native Lich WebUI settings form listing every variable in
+# one table. Values are edited in place, variables deleted and new ones
+# added. Nothing is written until Save & Close; Cancel or closing the window
+# discards the changes. The form's lifecycle (Save, Cancel, close, waiting
+# on this script's thread) is Lich's SettingsForm; this class supplies the
+# table and applies the result.
+class VarsSetup
+  # Lich keeps this class between runs in a session; start each run clean.
+  constants(false).each { |name| remove_const(name) }
+
+  PAGE_ID = 'vars-setup'
+
+  def self.available?
+    defined?(Lich::WebUI::SettingsForm) && Lich::WebUI.respond_to?(:presentation_enabled?) &&
+      Lich::WebUI.presentation_enabled?
+  end
+
+  # key: the table row identity (names may hold any character). added: a
+  # new variable, written on Save.
+  Row = Struct.new(:key, :name, :original, :value, :deleted, :added) do
+    # Only text values are edited here, as in the old window; true/false
+    # and other values are shown and can be deleted, set with ;vars set.
+    def editable? = !deleted && (added || original.is_a?(String))
+    def changed? = added || deleted || (original.is_a?(String) && value != original)
+
+    def shown
+      added || original.is_a?(String) ? value : original.inspect
+    end
+
+    def note
+      if added then 'new, added when you save'
+      elsif deleted then 'deleted when you save'
+      elsif !original.is_a?(String) then "#{original.class}; change it with ;vars set"
+      elsif value != original then 'changed'
+      else ''
+      end
+    end
+  end
+
+  def initialize
+    @rows = Vars.list.to_a.sort_by { |name, _| name.to_s.downcase }.each_with_index
+                .map { |(name, value), i| Row.new("v#{i}", name.to_s, value, value.is_a?(String) ? value.dup : value, false, false) }
+    @next_added = 0
+    @new_rev = 0 # a new key clears the add boxes after Add
+    @selected = nil
+    @status = ''
+  end
+
+  attr_reader :rows, :status, :new_rev
+
+  def changes = @rows.count(&:changed?)
+
+  def run
+    setup = self
+    @form = Lich::WebUI::SettingsForm.new(
+      owner: Script.current, id: PAGE_ID, title: "Lich - #{Char.name}'s Vars", values: {}, fields: [],
+      props: { size: [760, 560], viewport: true },
+      layout: ->(ui, _field, save) { setup.render(ui, save) }
+    )
+    if @form.show.wait
+      apply
+    else
+      pending = changes
+      respond "\n--- vars window closed#{pending.positive? ? " WITHOUT saving #{pending} change(s)" : ''}\n\n"
+    end
+  end
+
+  def refresh
+    Lich::WebUI.refresh(@form.page) if @form&.page
+  end
+
+  def row(key) = @rows.find { |r| r.key == key }
+
+  def edit(key, text)
+    row = row(key)
+    return unless row&.editable?
+
+    row.value = text.to_s
+    refresh
+  end
+
+  def select(key)
+    @selected = key
+  end
+
+  # Delete or undo the selected variable; a new one is simply removed.
+  def toggle_selected
+    row = row(@selected)
+    if row.nil?
+      @status = 'Select a variable first.'
+    elsif row.added
+      @rows.delete(row)
+      @selected = nil
+      @status = ''
+    else
+      row.deleted = !row.deleted
+      @status = ''
+    end
+    refresh
+  end
+
+  def add(name, value)
+    name = name.to_s.strip
+    if name.empty?
+      @status = 'Type a name for the new variable.'
+    elsif (row = @rows.find { |r| r.name == name })
+      @status = row.added ? "#{name} is already waiting to be added." : "Variable #{name} already exists; edit it in the list."
+    else
+      @rows << Row.new("a#{@next_added += 1}", name, nil, value.to_s, false, true)
+      @new_rev += 1
+      @status = ''
+    end
+    refresh
+  end
+
+  # The old window's save: deleted variables go, edited text values change,
+  # new variables are added.
+  def apply
+    count = changes
+    @rows.each do |row|
+      if row.added
+        Vars[row.name] = row.value unless Vars.list.key?(row.name)
+      elsif row.deleted
+        Vars[row.name] = nil
+      elsif row.changed?
+        Vars[row.name] = row.value
+      end
+    end
+    respond "\n--- vars saved#{count.positive? ? " (#{count} change(s))" : ''}\n\n"
+  end
+
+  def cancel
+    @form.close
+  end
+
+  def table_rows
+    @rows.map do |row|
+      cells = { 'name' => row.name, 'value' => row.shown, 'note' => row.note }
+      row.editable? ? { key: row.key, cells: cells } : { key: row.key, cells: cells, cell_disabled: ['value'] }
+    end
+  end
+
+  def render(ui, save)
+    setup = self
+    ui.stack(key: 'vars', gap: 6, margin: 8, fill: true) do
+      ui.table(key: 'rows', headers: true, fill: true, selection: :single, sortable: true, search_column: 'name',
+               columns: [{ key: 'name', label: 'Name', sortable: true, resizable: true, width: 200 },
+                         { key: 'value', label: 'Value (double-click to edit)', expand: true, editor: { type: :text } },
+                         { key: 'note', label: 'Note', width: 230 }],
+               rows: setup.table_rows,
+               on: { cell_edit: ->(ev) { setup.edit(ev.payload[:row], ev.payload[:value]) },
+                     selection_change: ->(ev) { setup.select(Array(ev.payload[:rows]).first) } })
+      ui.group(key: 'new', label: 'New variable') do
+        ui.columns(key: "new-row-#{setup.new_rev}", count: 4, weights: [2, 4, 1, 2], compact: true, row_align: :end, gap: 6) do
+          # Read once, on Add or Enter, through a submission: typing does
+          # not call back or re-render.
+          name = value = nil
+          add = ->(ev) { setup.add(ev.submission[name.cid], ev.submission[value.cid]) }
+          name = ui.text_input(slot: '0', key: 'new-name', placeholder: 'Name', value: '')
+          value = ui.text_input(slot: '1', key: 'new-value', placeholder: 'Value', value: '', on: { submit: add })
+          ui.submit(value, [name, value])
+          ui.button(slot: '2', key: 'add', label: 'Add', submit: [name, value], on: { activate: add })
+          ui.button(slot: '3', key: 'delete', label: 'Delete / Undo selected',
+                    tooltip: 'Marks the selected variable for deletion when you save, or undoes that.',
+                    on: { activate: ->(_ev) { setup.toggle_selected } })
+        end
+      end
+      ui.text(key: 'status', content: setup.status, tone: :caution, wrap: true) unless setup.status.empty?
+      ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, gap: 6) do
+        pending = setup.changes
+        ui.text(slot: '0', key: 'summary', emphasis: :subtle, wrap: true,
+                content: "#{setup.rows.count { |r| !r.added }} variable(s). #{pending.zero? ? 'No changes.' : "#{pending} unsaved change(s)."} " \
+                         'Cancel or closing the window discards changes.')
+        ui.button(slot: '1', key: 'cancel', label: 'Cancel', on: { activate: ->(_ev) { setup.cancel } })
+        save.call(ui, slot: '2', variant: :primary)
+      end
+    end
+  end
+end
 
 if (script.vars[1] == 'set') and (script.vars[0] =~ /^set\s+([^\s]+)\s*=\s*(.+)/)
   name = $1
@@ -73,150 +258,15 @@ elsif script.vars[1] == 'list'
     output.concat "\n"
     respond output
   end
-elsif defined?(Gtk) and (script.vars[1] == 'setup')
-  window = nil
-  done = false
-  Gtk.queue {
-    vars = Vars.list.to_a.sort { |a, b| a[0].to_s <=> b[0].to_s }
-    textboxes = Array.new
-    table = Gtk::Table.new((vars.length + 1), 3)
-    vars.each_index { |i|
-      label = Gtk::Label.new(vars[i][0].to_s)
-      box = Gtk::Box.new(:horizontal)
-      box.pack_end(label, :expand => false, :fill => false, :padding => 0)
-      table.attach(box, 0, 1, i, (i + 1), Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 3, 3)
-      textbox = Gtk::Entry.new
-      if vars[i][1].class == String
-        textbox.text = vars[i][1]
-      else
-        textbox.text = "#{vars[i][1].class}: #{vars[i][1].inspect}"
-        textbox.editable = false
-      end
-      table.attach(textbox, 1, 2, i, (i + 1), (Gtk::AttachOptions::EXPAND | Gtk::AttachOptions::FILL), Gtk::AttachOptions::FILL, 3, 3)
-      textboxes[i] = textbox
-      delete_button = Gtk::Button.new(:label => "Delete Entry")
-      table.attach(delete_button, 2, 3, i, (i + 1), Gtk::AttachOptions::SHRINK, Gtk::AttachOptions::FILL, 3, 3)
-      delete_button.signal_connect('clicked') {
-        report_errors {
-          label.sensitive = false
-          textbox.sensitive = false
-          delete_button.sensitive = false
-          textboxes[i] = nil
-        }
-      }
-    }
-    new_vars = Array.new
-    sw = nil
-    add_new_row = proc {
-      i = new_vars.length
-      table.n_rows = table.n_rows + 1
-      label = Gtk::Entry.new
-      label.text = "(new var name)"
-      table.attach(label, 0, 1, (table.n_rows - 1), table.n_rows, Gtk::AttachOptions::FILL, Gtk::AttachOptions::FILL, 3, 3)
-      textbox = Gtk::Entry.new
-      textbox.text = "(new var value)"
-      textbox.sensitive = false
-      table.attach(textbox, 1, 2, (table.n_rows - 1), table.n_rows, (Gtk::AttachOptions::EXPAND | Gtk::AttachOptions::FILL), Gtk::AttachOptions::FILL, 3, 3)
-      new_vars[i] = [label, textbox]
-      delete_button = Gtk::Button.new(:label => "Delete Entry")
-      delete_button.sensitive = false
-      table.attach(delete_button, 2, 3, (table.n_rows - 1), table.n_rows, Gtk::AttachOptions::SHRINK, Gtk::AttachOptions::FILL, 3, 3)
-      label.show
-      textbox.show
-      delete_button.show
-      label.signal_connect('focus-in-event') {
-        report_errors {
-          if label.text == "(new var name)"
-            label.text = ''
-          end
-          unless textbox.sensitive?
-            textbox.sensitive = true
-            delete_button.sensitive = true
-            add_new_row.call
-            Thread.new {
-              sleep 0.05
-              inc = (sw.vadjustment.upper - sw.vadjustment.value - sw.vadjustment.page_size) / 10.0
-              10.times { sw.vadjustment.value = sw.vadjustment.value + inc; sleep 0.02 }
-              sw.vadjustment.value = (sw.vadjustment.upper - sw.vadjustment.page_size)
-            }
-          end
-        }
-      }
-      textbox.signal_connect('focus-in-event') {
-        report_errors {
-          if textbox.text == "(new var value)"
-            textbox.text = ''
-          end
-        }
-      }
-      delete_button.signal_connect('clicked') {
-        report_errors {
-          label.sensitive = false
-          textbox.sensitive = false
-          delete_button.sensitive = false
-          new_vars[i][1] = nil
-        }
-      }
-    }
-    add_new_row.call
-    vp = Gtk::Viewport.new(nil, nil)
-    vp.add(table)
-    sw = Gtk::ScrolledWindow.new
-    sw.set_policy(:automatic, :always)
-    sw.add(vp)
-    window = Gtk::Window.new
-    window.title = "Lich - #{Char.name}'s Vars"
-    window.set_icon(@default_icon)
-    window.add(sw)
-    window.signal_connect('delete_event') {
-      report_errors {
-        modified = new_vars.any? { |v| (v[1] != nil) and v[1].sensitive? }
-        unless modified
-          vars.each_index { |i| if textboxes[i].nil? or ((vars[i][1].class == String) and (vars[i][1] != textboxes[i].text)); modified = true; break; end }
-        end
-        if modified
-          dialog = Gtk::MessageDialog.new(:parent => nil, :flags =>
-               :modal, :type => :question, :buttons => :yes_no, :message => "Save changes?")
-          dialog.title = "Lich - #{Char.name}'s Vars"
-          dialog.set_icon(@default_icon)
-          response = dialog.run
-          dialog.destroy
-          if response == Gtk::ResponseType::YES
-            vars.each_index { |i|
-              if textboxes[i].nil?
-                Vars[vars[i][0]] = nil
-              elsif (vars[i][1].class == String) and (vars[i][1] != textboxes[i].text)
-                Vars[vars[i][0]] = textboxes[i].text
-              end
-            }
-            new_vars.each { |var|
-              if (var[1] != nil) and var[1].sensitive?
-                if var[0].text.empty?
-                  echo "warning: ignoring new variable with no name"
-                elsif Vars.list.keys.include?(var[0].text)
-                  echo "warning: new variable #{var[0].text} already exists; ignoring"
-                else
-                  Vars[var[0].text] = var[1].text
-                end
-              end
-            }
-          end
-        end
-        done = true
-      }
-    }
-    window.set_default_size((Gdk::Screen.default.width / 2), (Gdk::Screen.default.height / 3))
-    window.set_window_position(:center)
-    window.show_all
-  }
-  begin
-    wait_until { done }
-  ensure
-    Gtk.queue { window.destroy }
+elsif script.vars[1] == 'setup'
+  if VarsSetup.available?
+    VarsSetup.new.run
+  else
+    respond "\n--- vars setup needs the Lich WebUI. Use ;vars set NAME=VALUE, ;vars delete NAME and ;vars list instead.\n\n"
   end
 else
   output = "\n"
-  output.concat "   #{$clean_lich_char}#{script.name} setup              open a window to edit variables\n" if defined?(Gtk)
+  output.concat "   #{$clean_lich_char}#{script.name} setup              open a window to edit variables\n" if VarsSetup.available?
   output.concat "   #{$clean_lich_char}#{script.name} set NAME=VALUE     add or change a variable\n"
   output.concat "   #{$clean_lich_char}#{script.name} delete NAME        delete a variable\n"
   output.concat "   #{$clean_lich_char}#{script.name} list               show current variables\n"
