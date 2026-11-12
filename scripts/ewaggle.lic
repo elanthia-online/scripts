@@ -8,10 +8,14 @@
           game: gs
           tags: magic, utility, spell
       required: Lich >= 5.9.0
-       version: 2.1.7
+       version: 2.2.0
 
   Version Control:
     Major_change.feature_addition.bugfix
+  2.2.0 (2026-11-07)
+    - setup window rewritten from GTK to Lich's native WebUI (no GTK needed)
+    - spells move between the lists by drag and drop, double-click, or the two buttons
+    - Save & Close saves; Cancel or closing the window discards
   2.1.7 (2026-10-21)
     - bugfix for mana bread with custom food not being eaten or dropped
   2.1.6 (2026-06-16)
@@ -198,439 +202,432 @@ module Ewaggle
 end
 
 # Setup
-if defined?(Gtk)
-  module Ewaggle
-    class Setup < Gtk::Builder
-      attr_accessor :settings
+module Ewaggle
+  # Native WebUI setup window. Replaces the Gtk::Builder window: the layout is
+  # authored with the Lich WebUI tree builder, the two spell lists are tables
+  # that share a transfer group (drag a row across, or double-click it), and
+  # Save & Close writes the profile exactly as the GTK window's Close did;
+  # Cancel or closing the window discards. Built on Lich::WebUI::SettingsForm.
+  class Setup
+    attr_accessor :settings
 
-      @@categories = {
-        general: {
-          not_to_cast: {
-            default: [],
-            load: proc do |store, setting|
-              store.clear
-              setting.each do |text|
-                iter = store.append
-                iter[0] = text.to_s
-              end
-            end
-          },
-          cast_list: {
-            default: [],
-            load: proc do |store, setting|
-              store.clear
-              setting.each do |text|
-                iter = store.append
-                iter[0] = text.to_s
-              end
-            end
-          },
-          start_at: { default: 180 },
-          stop_at: { default: 180 },
-          refreshable_min: { default: 15 },
-          armor_min: { default: 15 },
-          use_multicast: { default: true },
-          use_wracking: { default: false },
-          wander_to_wrack: { default: false },
-          use_power: { default: false },
-          use_mana: { default: false },
-          use_concentration: { default: false },
-          skip_not_sharing: { default: false },
-          skip_short_spells: { default: false },
-          bail_no_mana: { default: false },
-          reserve_mana: { default: 0 },
-          retribution_spell: { default: "" },
-          use_203: { default: false },
-          use_515: { default: false },
-          sonic_weapon: { default: "" },
-          sonic_shield: { default: "" },
-          sonic_armor: { default: "" },
-        },
-        internal: {
-          debug: { default: false },
-        },
+    # Lich keeps this class between runs in a session. Drop the old constants so an
+    # updated script never renders with the ones from the version that ran first.
+    constants(false).each { |name| remove_const(name) }
+
+    PAGE_ID = 'ewaggle-setup'
+    TRANSFER_GROUP = 'ewaggle-spells'
+    LISTS = { not_to_cast: 'Spells Not to Cast', cast_list: 'Spells to cast' }.freeze
+    SPINS = {
+      start_at: [0, 250],
+      stop_at: [0, 250],
+      refreshable_min: [0, 250],
+      armor_min: [0, 410],
+      reserve_mana: [0, 1000]
+    }.freeze
+    SONIC_ARMOR = [
+      'Robes', 'Light Leather', 'Full Leather', 'Reinforced Leather', 'Double Leather', 'Leather Breastplate',
+      'Cuirbouilli Leather', 'Studded Leather', 'Brigandine Armor', 'Chain mail', 'Double Chain', 'Augmented Chain',
+      'Chain Hauberk', 'Metal Breastplate', 'Augmented Plate', 'Half Plate', 'Full Plate'
+    ].freeze
+
+    @@categories = {
+      general: {
+        not_to_cast: { default: [] },
+        cast_list: { default: [] },
+        start_at: { default: 180 },
+        stop_at: { default: 180 },
+        refreshable_min: { default: 15 },
+        armor_min: { default: 15 },
+        use_multicast: { default: true },
+        use_wracking: { default: false },
+        wander_to_wrack: { default: false },
+        use_power: { default: false },
+        use_mana: { default: false },
+        use_concentration: { default: false },
+        skip_not_sharing: { default: false },
+        skip_short_spells: { default: false },
+        bail_no_mana: { default: false },
+        reserve_mana: { default: 0 },
+        retribution_spell: { default: "" },
+        use_203: { default: false },
+        use_515: { default: false },
+        sonic_weapon: { default: "" },
+        sonic_shield: { default: "" },
+        sonic_armor: { default: "" },
+      },
+      internal: {
+        debug: { default: false },
+      },
+    }
+
+    # True when Lich can open a WebUI window for this script.
+    def self.available?
+      defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled? &&
+        defined?(Lich::WebUI::SettingsForm) ? true : false
+    end
+
+    def self.get_category(key)
+      @@categories.each { |category, data| return category unless data[key].nil? }
+      nil
+    end
+
+    def self.get_setting(key)
+      cat = Setup.get_category(key)
+      return nil if cat.nil?
+
+      @@categories[cat].each { |setting, data| return data if setting == key }
+      nil
+    end
+
+    def initialize(settings)
+      @owner = Script.current
+      @settings = settings
+      @script_name = Script.current.name.capitalize
+      @selected = { not_to_cast: nil, cast_list: nil }
+      @status = ''
+
+      # Not_to_cast list needs reset if using CLI.
+      reset_no_cast
+
+      @version = Ewaggle.get_script_version
+
+      # set default values if they don't exist
+      @@categories.each do |_key, data|
+        data.each { |key, value| @settings[key] = value[:default] if @settings[key].nil? }
+      end
+
+      # remove settings that don't exist
+      @settings.delete_if { |key, _| next Setup.get_category(key).nil? }
+
+      # disable options and set them to false if the character can't do them
+      disabled.each { |key| @settings[key] = key == :retribution_spell ? "" : false }
+    end
+
+    # Options the character cannot use. They are hidden and forced off, as the
+    # GTK window did.
+    def disabled
+      conditions = {
+        retribution_spell: !Spell[712].known?,
+        use_wracking: !(Society.membership == 'Council of Light' && Society.rank >= 18),
+        wander_to_wrack: !(Society.membership == 'Council of Light' && Society.rank >= 18),
+        use_power: !(Society.membership == 'Guardians of Sunfist' && Society.rank >= 18),
+        use_concentration: !(Society.membership == 'Guardians of Sunfist' && Society.rank >= 14),
+        use_mana: !(Society.membership == 'Order of Voln' && Society.rank >= 13),
+        use_203: !Spell[203].known?,
+        use_515: !Spell[515].known?
+      }
+      conditions.select { |_, off| off }.keys
+    end
+
+    def reset_no_cast
+      @settings[:not_to_cast] = []
+
+      # Remove spells from casting list character doesn't know
+      @settings[:cast_list].reject! do |entry|
+        number = entry[/^\d+/].to_i # Extract leading digits and convert to integer
+        if entry =~ /armor/i && entry !~ /sonic|mage/i
+          !Armor.known?(entry.gsub(/^\d+\s*/, ''))
+        else
+          !Spell[number].known?
+        end
+      end
+
+      gtk_spells = []
+      Spell.list.each { |spell| gtk_spells.push(spell) if (spell.known? && spell.time_per > 0 && spell.num.to_s =~ /(?:[1-4][0-9]|50|0[1-9])$/) }
+      gtk_spells.push(Spell[511]) if Spell[511].known?
+      gtk_spells.sort_by!(&:num)
+
+      # Rebuild the not to cast list
+      gtk_spells.each do |spell|
+        next if @settings[:cast_list].include?("#{spell.num}  #{spell.name}")
+        @settings[:not_to_cast] << "#{spell.num}  #{spell.name}"
+      end
+
+      Ewaggle.armor_spells.each { |name, number|
+        next unless Armor.known?(name)
+        next if @settings[:cast_list].any? { |word| word =~ /armor/i }
+        @settings[:not_to_cast] << "#{number} #{name}"
       }
 
-      def start
-        @drag_key = nil
-        @running = true
-        Gtk.queue do
-          self['main'].show_all
+      @settings[:not_to_cast].uniq!
+    end
 
-          # selectively hide things based on class/knowledge
-          # Sorcerer and 712
-          self['retribution_label'].visible = false unless Spell[712].known?
-          self['retribution_spell'].visible = false unless Spell[712].known?
+    # ---------------------------------------------------------- lifecycle --
 
-          # Bard and Sonic Gear
-          self['sonic_weapon_label'].visible = false unless Spell[1012].known?
-          self['sonic_weapon'].visible = false unless Spell[1012].known?
-          self['sonic_shield_label'].visible = false unless Spell[1009].known?
-          self['sonic_shield'].visible = false unless Spell[1009].known?
-          self['sonic_armor_label'].visible = false unless Spell[1014].known?
-          self['sonic_armor'].visible = false unless Spell[1014].known?
-
-          # Society Options
-          self['options_grid'].children.each do |widget|
-            next if widget.builder_name =~ /use_multicast|skip_short_spells|bail_no_mana/
-            if widget.is_a?(Gtk::CheckButton)
-              self['options_grid'].remove(widget)
-            end
-          end
-
-          # Check column 1
-          row = 3
-          if Spell[203].known?
-            self['options_grid'].attach(self['use_203'], 0, row, 1, 1)
-            row += 1
-          end
-
-          if Spell[515].known?
-            self['options_grid'].attach(self['use_515'], 0, row, 1, 1)
-          end
-
-          # Check Column #2
-          if Society.member == 'Council of Light'
-            self['options_grid'].attach(self['use_wracking'], 1, 0, 1, 1)
-            self['options_grid'].attach(self['wander_to_wrack'], 1, 1, 1, 1)
-          elsif Society.member == 'Guardians of Sunfist'
-            self['options_grid'].attach(self['use_power'], 1, 0, 1, 1)
-            self['options_grid'].attach(self['use_concentration'], 1, 1, 1, 1)
-          elsif Society.member == 'Order of Voln'
-            self['options_grid'].attach(self['use_mana'], 1, 0, 1, 1)
-          end
-        end
-        wait_while { @running }
-      end
-
-      def self.get_category(key)
-        @@categories.each { |category, data| return category unless data[key].nil? }
-        nil
-      end
-
-      def self.get_setting(key)
-        cat = Setup.get_category(key)
-        return nil if cat.nil?
-
-        @@categories[cat].each { |setting, data| return data if setting == key }
-        nil
-      end
-
-      def initialize(settings)
-        super()
-        @original = settings.dup
-        @silent_exit = false
-        @settings = settings
-        @script_name = Script.current.name.capitalize
-
-        # Not_to_cast list needs reset if using CLI.
-        reset_no_cast
-
-        # Get script version
-        version = Ewaggle.get_script_version
-
-        # set default values if they don't exist
-        @@categories.each do |_key, data|
-          data.each { |key, value| @settings[key] = value[:default] if @settings[key].nil? }
-        end
-
-        # remove settings that don't exist
-        @settings.delete_if { |key, _| next Setup.get_category(key).nil? }
-
-        # use a GTK Builder to setup all the basics of the window then expand on that base
-        return unless defined?(Gtk) && Gtk::Version::MAJOR == 3
-
-        Gtk.queue do
-          # add_from_file("#{$data_dir}ewaggle.ui")
-          add_from_string(Setup.ewaggle_ui)
-          load_settings
-
-          self['main'].keep_above = true
-          self['main'].set_title "Ewaggle Setup v#{version}"
-          # connect signals after settings are loaded to a bunch of handlers don't trigger
-          connect_signals { |handler| method(handler) }
-        end
-      end
-
-      def reset_no_cast
-        @settings[:not_to_cast] = []
-
-        # Remove spells from casting list character doesn't know
-        @settings[:cast_list].reject! do |entry|
-          number = entry[/^\d+/].to_i # Extract leading digits and convert to integer
-          if entry =~ /armor/i && entry !~ /sonic|mage/i
-            !Armor.known?(entry.gsub(/^\d+\s*/, ''))
-          else
-            !Spell[number].known?
-          end
-        end
-
-        gtk_spells = []
-        Spell.list.each { |spell| gtk_spells.push(spell) if (spell.known? && spell.time_per > 0 && spell.num.to_s =~ /(?:[1-4][0-9]|50|0[1-9])$/) }
-        gtk_spells.push(Spell[511]) if Spell[511].known?
-        gtk_spells.sort_by!(&:num)
-
-        # Rebuild the not to cast list
-        gtk_spells.each do |spell|
-          next if @settings[:cast_list].include?("#{spell.num}  #{spell.name}")
-          @settings[:not_to_cast] << "#{spell.num}  #{spell.name}"
-        end
-
-        Ewaggle.armor_spells.each { |name, number|
-          next unless Armor.known?(name)
-          next if @settings[:cast_list].any? { |word| word =~ /armor/i }
-          @settings[:not_to_cast] << "#{number} #{name}"
-        }
-
-        @settings[:not_to_cast].uniq!
-      end
-
-      def on_close_clicked
-        # Need to update the spells
-        Ewaggle.data.settings[:cast_list] = []
-        self["cast_list_store"].each do |_model, _path, iter|
-          Ewaggle.data.settings[:cast_list] << iter[0]
-        end
-
-        Ewaggle.data.settings[:not_to_cast] = []
-        self["not_to_cast_store"].each do |_model, _path, iter|
-          Ewaggle.data.settings[:not_to_cast] << iter[0]
-        end
-
+    # Shows the settings form. Save & Close writes the profile; Cancel or
+    # closing the window discards (;ewaggle setup reloads the profile after).
+    def start
+      setup = self
+      values = @settings.dup
+      SPINS.each { |key, (min, max)| values[key] = values[key].to_i.clamp(min, max) }
+      values[:sonic_armor] = '' unless SONIC_ARMOR.include?(values[:sonic_armor].to_s)
+      @form = Lich::WebUI::SettingsForm.new(
+        owner: @owner, id: PAGE_ID, title: title, values: values, fields: fields,
+        props: { size: [760, 700], bare: true, density: :compact, viewport: true },
+        normalize: ->(draft) { setup.normalize(draft) },
+        layout: ->(ui, field, save) { setup.render(ui, field, save, -> { setup.cancel }) }
+      )
+      result = @form.show.wait
+      if result
+        Ewaggle.data.settings = result
         Ewaggle.save_profile
-
-        @silent_exit = true
-        self['main'].destroy
+      else
+        respond
+        Lich::Messaging.msg('plain', " #{@script_name} UI closed WITHOUT saving any changes")
+        Lich::Messaging.msg('plain', " Use the Save & Close button to save changes")
+        respond
       end
+      result
+    end
 
-      def on_destroy
-        Gtk.queue {
-          unless @silent_exit
-            respond
-            Lich::Messaging.msg('plain', " #{@script_name} UI closed WITHOUT saving any changes")
-            Lich::Messaging.msg('plain', " Be sure to use the close button to save changes")
-            respond
-          end
-          @running = false
-        }
+    def cancel
+      @form&.close
+    end
+
+    def title
+      "Ewaggle Setup v#{@version}"
+    end
+
+    CHECKS = {
+      use_multicast: 'Multicast', skip_short_spells: 'Skip Short Spells on Others', bail_no_mana: 'Bail on No More Resources',
+      use_203: 'Use Mana Bread (203)', use_515: 'Use Rapid Fire (515)', use_wracking: 'Sign of Wracking',
+      wander_to_wrack: 'Wander to Wrack', use_power: 'Sigil of Power', use_concentration: 'Sigil of Concentration',
+      use_mana: 'Symbol of Mana', skip_not_sharing: 'Skip characters not sharing spell info'
+    }.freeze
+    # From ;ewaggle help.
+    CHECK_TIPS = {
+      use_multicast: 'Use multicast where a spell allows it.',
+      skip_short_spells: "Don't cast spells with a short duration on others.",
+      bail_no_mana: 'Stop casting when you run out of mana or other resources.',
+      use_203: 'Cast and eat mana bread (203) when you know it.',
+      use_515: 'Cast Rapid Fire (515) when you know it.',
+      use_wracking: 'Use Sign of Wracking when out of mana.',
+      wander_to_wrack: 'Wander up to 20 rooms to find an empty room to wrack in, then return.',
+      use_power: 'Use Sigil of Power when out of mana.',
+      use_concentration: 'Use Sigil of Concentration when out of mana.',
+      use_mana: 'Use Symbol of Mana when out of mana.',
+      skip_not_sharing: 'Skip characters who are not sharing their spell information.'
+    }.freeze
+    SPIN_TIPS = {
+      start_at: 'Stackable spells with less time remaining than this are cast.',
+      stop_at: 'Stackable spells are cast until they have this much time remaining.',
+      refreshable_min: 'Spells above this time will NOT be cast',
+      armor_min: 'Armor buffs above this time will NOT be cast',
+      reserve_mana: 'Mana to keep in reserve. Casting stops at this amount.'
+    }.freeze
+
+    # Form fields. Options the character cannot use are left out of the layout,
+    # so they keep the forced-off value set in #initialize.
+    def fields
+      checks = CHECKS.map { |key, label| { key: key, type: :checkbox, label: label, tooltip: CHECK_TIPS.fetch(key) } }
+      spins = SPINS.map do |key, (min, max)|
+        { key: key, type: :number_input, min: min, max: max, step: 1, stepper_buttons: false, digits: 0, tooltip: SPIN_TIPS.fetch(key) }
       end
+      armor = [{ value: '', label: '(none)' }] + Lich::WebUI::SettingsForm.choice_options(SONIC_ARMOR)
+      checks + spins + [
+        { key: :sonic_weapon, type: :text_input, placeholder: 'Name of sonic weapon (follow link for options)',
+          tooltip: 'Notable exceptions: Katana, Naginata, Claidhmore, and Missile Weapons.' },
+        { key: :sonic_shield, type: :text_input, placeholder: 'Name of sonic shield (follow link for options)' },
+        { key: :sonic_armor, type: :select, options: armor },
+        { key: :retribution_spell, type: :text_input, placeholder: 'Spell #',
+          tooltip: 'Spell number to cast with Cloak of Shadows (712). See gswiki.play.net/Cloak_of_Shadows_(712).' },
+      ]
+    end
 
-      # iterate all objects and for any that match a setting name directly we set the default
-      def load_settings
-        Gtk.queue do
-          objects.each do |obj|
-            next unless obj.methods.include?(:builder_name)
+    # Coerces submitted values to the types the profile has always held and
+    # takes both spell lists from this window's current state.
+    def normalize(draft)
+      CHECKS.each_key { |key| draft[key] = draft[key] ? true : false }
+      SPINS.each { |key, (min, max)| draft[key] = draft[key].to_i.clamp(min, max) }
+      %i[sonic_weapon sonic_shield retribution_spell].each { |key| draft[key] = draft[key].to_s.strip }
+      draft[:sonic_armor] = draft[:sonic_armor].to_s
+      draft[:cast_list] = @settings[:cast_list].dup
+      draft[:not_to_cast] = @settings[:not_to_cast].dup
+      draft
+    end
 
-            key = obj.builder_name.to_sym
-            builder_name = obj.builder_name.to_s
-            next if (setting = Setup.get_setting(key)).nil?
+    # Re-renders after a list move or a button press; field edits and row
+    # selection never refresh the page.
+    def act
+      yield
+    rescue StandardError => e
+      respond "#{@script_name} setup: #{e.class}: #{e.message}"
+      respond e.backtrace.first(5).join("\n") if @settings[:debug]
+    ensure
+      Lich::WebUI.refresh(@form.page) if @form&.page
+    end
 
-            conditions = {
-              "retribution_spell" => !Spell[712].known?,
-              "use_wracking"      => !(Society.member == 'Council of Light' && Society.rank >= 18),
-              "wander_to_wrack"   => !(Society.member == 'Council of Light' && Society.rank >= 18),
-              "use_power"         => !(Society.member == 'Guardians of Sunfist' && Society.rank >= 18),
-              "use_concentration" => !(Society.member == 'Guardians of Sunfist' && Society.rank >= 14),
-              "use_mana"          => !(Society.member == 'Order of Voln' && Society.rank >= 13),
-              "use_203"           => !Spell[203].known?,
-              "use_515"           => !Spell[515].known?
-            }
+    def cb(&block)
+      setup = self
+      ->(ev) { setup.act { block.call(ev) } }
+    end
 
-            # disable options and set them to false if the character can't do them
-            if conditions[builder_name]
-              obj.set_sensitive(false)
-              @settings[key] = builder_name == "retribution_spell" ? "" : false
-            end
+    # ---------------------------------------------------------- spell lists --
 
-            if obj.class == Gtk::CheckButton
-              obj.active = @settings[key]
-              obj.signal_connect('toggled') do
-                @settings[key] = obj.active?
-              end
-            elsif obj.class == Gtk::Entry
-              obj.text = @settings[key].strip
-              obj.signal_connect('changed') do
-                @settings[key] = obj.text.strip
-              end
-            elsif obj.class == Gtk::SpinButton
-              obj.adjustment.value = @settings[key]
-              obj.signal_connect("value-changed") do
-                @settings[key] = obj.value.to_i
-                obj.update
-              end
-            elsif obj.class == Gtk::ComboBoxText
-              obj.set_active_id(@settings[key].to_s)
-              obj.signal_connect('changed') do
-                @settings[key] = obj.active_id
-              end
-            elsif obj.class == Gtk::TreeView
-              if (store = self["#{key}_store"]).nil?
-                respond "** failed to find store for treeview #{key}"
-                next
-              elsif setting[:load].nil?
-                respond "** no :load defined #{key}"
-                next
-              end
-
-              @settings[key].sort_by! { |str| str.to_i }
-
-              setting[:load].call(store, @settings[key])
-
-              # Add Drag & Drop Support
-              enable_drag_and_drop(obj, key)
-            end
-          end
-        end
-      end
-
-      def enable_drag_and_drop(tree_view, key)
-        tree_view.enable_model_drag_source(Gdk::ModifierType::BUTTON1_MASK, [Gtk::TargetEntry.new("STRING", Gtk::TargetFlags::SAME_APP, 0)], Gdk::DragAction::MOVE)
-
-        tree_view.enable_model_drag_dest([Gtk::TargetEntry.new("STRING", Gtk::TargetFlags::SAME_APP, 0)], Gdk::DragAction::MOVE)
-
-        tree_view.signal_connect("drag-data-get") do |widget, _drag_context, data, _info, _time|
-          iter = widget.selection.selected
-          next if iter.nil?
-
-          @drag_key = key
-          spell_name = iter[0].strip # Get the full string value (ID + Name)
-
-          data.set(Gdk::Selection::TYPE_STRING, spell_name.to_s)
-        end
-
-        tree_view.signal_connect("drag-data-received") do |_widget, drag_context, _x, _y, data, _info, _time|
-          dropped_spell = data.text.strip # Ensure there are no extra spaces
-
-          next if dropped_spell.nil? || dropped_spell.empty?
-
-          # Ensure the correct key is being used
-          src_key = key == :not_to_cast ? "cast_list" : "not_to_cast"
-          dst_key = key == :not_to_cast ? "not_to_cast" : "cast_list"
-
-          # Get the actual stores for source and destination
-          src_store = self["#{src_key}_store"]
-          dst_store = self["#{dst_key}_store"]
-
-          if @drag_key.to_s == dst_key.to_s
-            dst_iter = dst_store.append
-            dst_iter.set_value(0, dropped_spell)
-          else
-            # Remove the dropped spell from source store
-            found = false
-            src_store.each do |_model, _path, iter|
-              spell_id_name = iter[0].strip # Get the full ID + Name
-
-              if spell_id_name.eql?(dropped_spell)
-                src_store.remove(iter)
-                found = true
-                break
-              end
-            end
-
-            # Add the dropped spell to destination store
-            if found
-              dst_iter = dst_store.append
-              dst_iter.set_value(0, dropped_spell)
-            end
-          end
-
-          # Confirm drag is done
-          drag_context.finish(:success => true, :delete => false, :time => Gdk::CURRENT_TIME)
-
-          # Clear selection after the drag event
-          self[src_key].selection.unselect_all
-          self[dst_key].selection.unselect_all
-
-          # Sort both source and destination stores
-          src_store.set_sort_column_id(0, Gtk::SortType::ASCENDING)
-          dst_store.set_sort_column_id(0, Gtk::SortType::ASCENDING)
-        end
-
-        # Handle double-click to move item
-        tree_view.signal_connect("row-activated") do |widget, path, _column|
-          model = widget.model
-          iter = model.get_iter(path)
-          next if iter.nil?
-
-          spell_name = iter[0].strip
-          move_spell_between_lists(spell_name, key)
-
-          widget.selection.unselect_all
-        end
-      end
-
-      def move_spell_between_lists(spell_name, key)
-        # Determine source and destination lists
-        src_key = key == :not_to_cast ? "not_to_cast_store" : "cast_list_store"
-        dst_key = key == :not_to_cast ? "cast_list_store" : "not_to_cast_store"
-
-        src_store = self[src_key]
-        dst_store = self[dst_key]
-
-        # Remove from source store
-        found = false
-        src_store.each do |_model, _path, iter|
-          if iter[0].strip == spell_name
-            src_store.remove(iter)
-            found = true
-            break
-          end
-        end
-
-        # Add to destination store
-        if found
-          dst_iter = dst_store.append
-          dst_iter.set_value(0, spell_name)
-        end
-
-        # Sort after event
-        src_store.set_sort_column_id(0, Gtk::SortType::ASCENDING)
-        dst_store.set_sort_column_id(0, Gtk::SortType::ASCENDING)
-      end
-
-      def self.ewaggle_ui
-        '<?xml version="1.0" encoding="UTF-8"?><!-- Generated with glade 3.38.2 --><interface><requires lib="gtk+" version="3.20"/><object class="GtkAdjustment" id="armor_adjustment"><property name="upper">410</property><property name="step-increment">1</property><property name="page-increment">10</property></object><object class="GtkListStore" id="cast_list_store"><columns><!-- column-name gchararray1 --><column type="gchararray"/>
-        </columns></object><object class="GtkAdjustment" id="dont_cast_adjustment"><property name="upper">250</property><property name="step-increment">1</property><property name="page-increment">10</property></object><object class="GtkAdjustment" id="minimum_adjustment"><property name="upper">250</property><property name="step-increment">1</property><property name="page-increment">10</property></object><object class="GtkListStore" id="not_to_cast_store"><columns><!-- column-name gchararray1 --><column type="gchararray"/>
-        </columns></object><object class="GtkAdjustment" id="reserve_adjustment"><property name="upper">1000</property><property name="step-increment">1</property><property name="page-increment">10</property></object><object class="GtkAdjustment" id="start_casting_adjustment"><property name="upper">250</property><property name="step-increment">1</property><property name="page-increment">10</property></object><object class="GtkAdjustment" id="stop_casting_adjustment"><property name="upper">250</property><property name="step-increment">1</property><property name="page-increment">10</property>
-        </object><object class="GtkWindow" id="main"><property name="width-request">730</property><property name="height-request">800</property><property name="can-focus">False</property><property name="title" translatable="yes">Ewaggle Setup</property><signal name="destroy" handler="on_destroy" swapped="no"/><child><object class="GtkBox"><property name="visible">True</property><property name="can-focus">False</property><property name="orientation">vertical</property><property name="spacing">5</property><child><object class="GtkNotebook"><property name="visible">True</property><property name="can-focus">True</property><property name="hexpand">True</property><property name="vexpand">True</property><child><object class="GtkScrolledWindow"><property name="visible">True</property><property name="can-focus">True</property><property name="shadow-type">in</property><child><object class="GtkViewport"><property name="visible">True</property><property name="can-focus">False</property><child><object class="GtkBox"><property name="visible">True</property><property name="can-focus">False</property><property name="orientation">vertical</property><child><object class="GtkFrame"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">10</property><property name="label-xalign">0</property><property name="shadow-type">none</property><child><!-- n-columns=2 n-rows=5 --><object class="GtkGrid"><property name="visible">True</property><property name="can-focus">False</property><property name="column-homogeneous">True</property><child><object class="GtkScrolledWindow"><property name="height-request">250</property><property name="visible">True</property><property name="can-focus">True</property><property name="hexpand">True</property><property name="border-width">5</property><property name="shadow-type">in</property><child><object class="GtkViewport"><property name="visible">True</property><property name="can-focus">False</property><child><object class="GtkTreeView" id="cast_list"><property name="visible">True</property><property name="can-focus">True</property><property name="vexpand">False</property><property name="model">cast_list_store</property><property name="headers-visible">False</property><property name="search-column">0</property><property name="fixed-height-mode">True</property><child internal-child="selection"><object class="GtkTreeSelection"/>
-        </child><child><object class="GtkTreeViewColumn"><property name="sizing">fixed</property><property name="title" translatable="yes">Exclusion</property><child><object class="GtkCellRendererText"/><attributes><attribute name="text">0</attribute></attributes></child></object></child></object></child></object></child></object><packing><property name="left-attach">1</property><property name="top-attach">1</property></packing></child><child><object class="GtkScrolledWindow"><property name="height-request">250</property><property name="visible">True</property><property name="can-focus">True</property><property name="hexpand">True</property><property name="border-width">5</property><property name="shadow-type">in</property><child><object class="GtkViewport"><property name="visible">True</property><property name="can-focus">False</property><child><object class="GtkTreeView" id="not_to_cast"><property name="visible">True</property><property name="can-focus">True</property><property name="vexpand">False</property><property name="model">not_to_cast_store</property><property name="headers-visible">False</property><property name="search-column">0</property><property name="fixed-height-mode">True</property><child internal-child="selection"><object class="GtkTreeSelection"/>
-        </child><child><object class="GtkTreeViewColumn"><property name="sizing">fixed</property><property name="title" translatable="yes">Exclusion</property><child><object class="GtkCellRendererText"/><attributes><attribute name="text">0</attribute></attributes></child></object></child></object></child></object></child></object><packing><property name="left-attach">0</property><property name="top-attach">1</property></packing></child><child><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">Spells Not to Cast</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">0</property></packing></child><child><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">Spells to cast</property></object><packing><property name="left-attach">1</property><property name="top-attach">0</property></packing></child><child><object class="GtkFrame"><property name="width-request">280</property><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">5</property><property name="label-xalign">0</property><child><!-- n-columns=2 n-rows=2 --><object class="GtkGrid"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">5</property><child><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="halign">end</property><property name="margin-start">15</property><property name="margin-bottom">10</property><property name="label" translatable="yes">Start Casting Below:</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">0</property></packing></child><child><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="halign">end</property><property name="margin-bottom">10</property><property name="label" translatable="yes">Stop Casting at:</property></object><packing><property name="left-attach">0</property><property name="top-attach">1</property></packing></child><child><object class="GtkSpinButton" id="start_at"><property name="width-request">132</property><property name="visible">True</property><property name="can-focus">True</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">10</property><property name="text" translatable="yes">0</property><property name="adjustment">start_casting_adjustment</property>
-        </object><packing><property name="left-attach">1</property><property name="top-attach">0</property></packing></child><child><object class="GtkSpinButton" id="stop_at"><property name="width-request">132</property><property name="visible">True</property><property name="can-focus">True</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">10</property><property name="text" translatable="yes">0</property><property name="adjustment">stop_casting_adjustment</property>
-        </object><packing><property name="left-attach">1</property><property name="top-attach">1</property></packing></child></object></child><child type="label"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">Stackable Spells</property></object></child></object><packing><property name="left-attach">0</property><property name="top-attach">2</property></packing></child><child><object class="GtkFrame"><property name="width-request">220</property><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">5</property><property name="label-xalign">0</property><child><!-- n-columns=2 n-rows=11 --><object class="GtkGrid" id="options_grid"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">5</property><child><object class="GtkCheckButton" id="use_multicast"><property name="label" translatable="yes">Multicast</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-top">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">0</property></packing></child><child><object class="GtkCheckButton" id="use_wracking"><property name="label" translatable="yes">Sign of Wracking</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">1</property><property name="top-attach">0</property></packing></child><child><object class="GtkCheckButton" id="wander_to_wrack"><property name="label" translatable="yes">Wander to Wrack</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">1</property><property name="top-attach">1</property></packing></child><child><object class="GtkCheckButton" id="use_power"><property name="label" translatable="yes">Sigil of Power</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">1</property><property name="top-attach">2</property></packing></child><child><object class="GtkCheckButton" id="use_concentration"><property name="label" translatable="yes">Sigil of Concentration</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">1</property><property name="top-attach">3</property></packing></child><child><object class="GtkCheckButton" id="use_mana"><property name="label" translatable="yes">Symbol of Mana</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">1</property><property name="top-attach">4</property></packing></child><child><object class="GtkCheckButton" id="skip_short_spells"><property name="label" translatable="yes">Skip Short Spells on Others</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">1</property></packing></child><child><object class="GtkCheckButton" id="bail_no_mana"><property name="label" translatable="yes">Bail on No More Resources</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">2</property></packing></child><child><object class="GtkCheckButton" id="use_203"><property name="label" translatable="yes">Use Mana Bread (203)</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">3</property></packing></child><child><object class="GtkCheckButton" id="use_515"><property name="label" translatable="yes">Use Rapid Fire (515)</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">5</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">4</property></packing></child><child><object class="GtkLabel" id="sonic_weapon_label"><property name="visible">True</property><property name="can-focus">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-top">20</property><property name="label" translatable="yes">Sonic Weapon: (&lt;a href="https://gswiki.play.net/Weapon"&gt;gswiki.play.net/Weapon&lt;/a&gt;)</property><property name="use-markup">True</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">5</property><property name="width">2</property></packing></child><child><object class="GtkEntry" id="sonic_weapon"><property name="visible">True</property><property name="can-focus">True</property><property name="tooltip-text" translatable="yes">Notable exceptions: Katana, Naginata, Claidhmore, and Missile Weapons.</property><property name="margin-start">10</property><property name="margin-end">20</property><property name="margin-top">5</property><property name="margin-bottom">5</property><property name="placeholder-text" translatable="yes">Name of sonic weapon (follow link for options)</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">6</property><property name="width">2</property></packing></child><child><object class="GtkLabel" id="sonic_shield_label"><property name="visible">True</property><property name="can-focus">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-top">10</property><property name="label" translatable="yes">Sonic Shield: (&lt;a href="https://gswiki.play.net/Sonic_Shield_Song_(1009)"&gt;gswiki.play.net/Sonic Shield Song&lt;/a&gt;)</property><property name="use-markup">True</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">7</property><property name="width">2</property></packing></child><child><object class="GtkEntry" id="sonic_shield"><property name="visible">True</property><property name="can-focus">True</property><property name="margin-start">10</property><property name="margin-end">20</property><property name="margin-top">5</property><property name="margin-bottom">5</property><property name="placeholder-text" translatable="yes">Name of sonic weapon (follow link for options)</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">8</property><property name="width">2</property></packing></child><child><object class="GtkLabel" id="sonic_armor_label"><property name="visible">True</property><property name="can-focus">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-top">10</property><property name="label" translatable="yes">Sonic Armor:  (&lt;a href="https://gswiki.play.net/Sonic_Armor_(1014)"&gt;https://gswiki.play.net/Sonic Armor&lt;/a&gt;)</property><property name="use-markup">True</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">9</property><property name="width">2</property></packing></child><child><object class="GtkComboBoxText" id="sonic_armor"><property name="width-request">200</property><property name="visible">True</property><property name="can-focus">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-top">5</property><property name="margin-bottom">10</property><property name="has-entry">True</property><items><item id="Robes" translatable="yes">Robes (1)</item><item id="Light Leather" translatable="yes">Light Leather (5)</item><item id="Full Leather" translatable="yes">Full Leather (6)</item><item id="Reinforced Leather" translatable="yes">Reinforced Leather (7)</item><item id="Double Leather" translatable="yes">Double Leather (8)</item><item id="Leather Breastplate" translatable="yes">Leather Breastplate (9)</item><item id="Cuirbouilli Leather" translatable="yes">Cuirbouilli Leather (10)</item><item id="Studded Leather" translatable="yes">Studded Leather (11)</item><item id="Brigandine Armor" translatable="yes">Brigandine Armor (12)</item><item id="Chain mail" translatable="yes">Chain Mail (13)</item><item id="Double Chain" translatable="yes">Double Chain (14)</item><item id="Augmented Chain" translatable="yes">Augmented Chain (15)</item><item id="Chain Hauberk" translatable="yes">Chain Hauberk (16)</item><item id="Metal Breastplate" translatable="yes">Metal Breastplate (17)</item><item id="Augmented Plate" translatable="yes">Augmented Plate (18)</item><item id="Half Plate" translatable="yes">Half Plate (19)</item><item id="Full Plate" translatable="yes">Full Plate (20)</item>
-        </items><child internal-child="entry"><object class="GtkEntry"><property name="can-focus">True</property></object></child></object><packing><property name="left-attach">0</property><property name="top-attach">10</property><property name="width">2</property></packing></child></object></child><child type="label"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">Options</property></object></child></object><packing><property name="left-attach">1</property><property name="top-attach">2</property><property name="height">3</property>
-        </packing></child><child><object class="GtkFrame"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">5</property><property name="label-xalign">0</property><child><!-- n-columns=2 n-rows=2 --><object class="GtkGrid"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">5</property><child><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="tooltip-text" translatable="yes">Spells above this time will NOT be cast</property><property name="halign">end</property><property name="margin-start">20</property><property name="margin-bottom">10</property><property name="label" translatable="yes">Minimum Time(?): </property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">0</property></packing></child><child><object class="GtkSpinButton" id="refreshable_min"><property name="width-request">132</property><property name="visible">True</property><property name="can-focus">True</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">10</property><property name="text" translatable="yes">0</property><property name="adjustment">minimum_adjustment</property>
-        </object><packing><property name="left-attach">1</property><property name="top-attach">0</property></packing></child><child><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="tooltip-text" translatable="yes">Armor buffs above this time will NOT be cast</property><property name="halign">end</property><property name="margin-bottom">5</property><property name="label" translatable="yes">Armor Buffs(?): </property></object><packing><property name="left-attach">0</property><property name="top-attach">1</property>
-        </packing></child><child><object class="GtkSpinButton" id="armor_min"><property name="width-request">132</property><property name="visible">True</property><property name="can-focus">True</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">5</property><property name="adjustment">armor_adjustment</property></object><packing><property name="left-attach">1</property><property name="top-attach">1</property></packing></child></object>
-        </child><child type="label"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">Non-Stackable Spells</property></object></child></object><packing><property name="left-attach">0</property><property name="top-attach">3</property></packing></child><child><object class="GtkFrame"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">5</property><property name="label-xalign">0</property><child><!-- n-columns=2 n-rows=3 --><object class="GtkGrid"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">5</property><child><object class="GtkLabel" id="retribution_label"><property name="visible">True</property><property name="can-focus">False</property><property name="halign">end</property><property name="margin-bottom">5</property><property name="label" translatable="yes">Retribution Spell:</property>
-        </object><packing><property name="left-attach">0</property><property name="top-attach">2</property></packing></child><child><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="halign">end</property><property name="margin-start">40</property><property name="margin-bottom">10</property><property name="label" translatable="yes">Reserve Mana:</property></object><packing><property name="left-attach">0</property><property name="top-attach">1</property>
-        </packing></child><child><object class="GtkSpinButton" id="reserve_mana"><property name="width-request">132</property><property name="visible">True</property><property name="can-focus">True</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">10</property><property name="text" translatable="yes">0</property><property name="adjustment">reserve_adjustment</property></object><packing><property name="left-attach">1</property><property name="top-attach">1</property>
-        </packing></child><child><object class="GtkEntry" id="retribution_spell"><property name="visible">True</property><property name="can-focus">True</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">5</property><property name="width-chars">19</property><property name="placeholder-text" translatable="yes">Spell Number Only</property></object><packing><property name="left-attach">1</property><property name="top-attach">2</property>
-        </packing></child><child><object class="GtkCheckButton" id="skip_not_sharing"><property name="label" translatable="yes">Skip characters not sharing spell info</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="margin-start">40</property><property name="margin-bottom">10</property><property name="draw-indicator">True</property></object><packing><property name="left-attach">0</property><property name="top-attach">0</property><property name="width">2</property>
-        </packing></child></object></child><child type="label"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">Misc</property></object></child></object><packing><property name="left-attach">0</property><property name="top-attach">4</property></packing></child></object></child><child type="label"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property></object>
-        </child></object><packing><property name="expand">False</property><property name="fill">True</property><property name="position">0</property></packing></child></object></child></object></child></object></child><child type="tab"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">General</property></object><packing><property name="tab-fill">False</property></packing></child></object><packing><property name="expand">False</property><property name="fill">True</property><property name="position">0</property>
-        </packing></child><child><object class="GtkBox"><property name="visible">True</property><property name="can-focus">False</property><child><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="margin-start">10</property><property name="margin-top">5</property><property name="margin-bottom">10</property><property name="label" translatable="yes">To save properly, exit with the close button and not the X window --&gt;</property><attributes><attribute name="style" value="italic"/>
-        </attributes></object><packing><property name="expand">False</property><property name="fill">True</property><property name="position">0</property></packing></child><child><object class="GtkButton"><property name="label" translatable="yes">Close</property><property name="width-request">80</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">True</property><property name="halign">end</property><property name="margin-end">10</property><property name="margin-top">5</property><property name="margin-bottom">10</property><property name="hexpand">True</property><signal name="clicked" handler="on_close_clicked" swapped="no"/>
-        </object><packing><property name="expand">False</property><property name="fill">True</property><property name="position">1</property></packing></child></object><packing><property name="expand">False</property><property name="fill">True</property><property name="pack-type">end</property><property name="position">1</property></packing></child></object></child></object></interface>'
+    # Row keys for every spell in either list: the spell number, plus a suffix
+    # when two entries share a number, so keys are unique across both tables.
+    def row_keys
+      used = Hash.new(0)
+      (@settings[:not_to_cast] + @settings[:cast_list]).uniq.sort_by { |text| [text[/^\d+/].to_i, text] }.to_h do |text|
+        base = "spell-#{text.to_s[/^\d+/] || 'x'}"
+        used[base] += 1
+        [text, used[base] == 1 ? base : "#{base}-#{used[base]}"]
       end
     end
+
+    def self.sort_spells(list)
+      list.sort_by { |text| [text[/^\d+/].to_i, text] }
+    end
+
+    def other_list(key)
+      key == :not_to_cast ? :cast_list : :not_to_cast
+    end
+
+    # Move the spell with row key +row+ into list +dest+, from whichever list
+    # holds it. A drop onto the list it already lives in is a no-op.
+    def move_spell(row, dest)
+      src = other_list(dest)
+      keys = row_keys
+      text = @settings[src].find { |entry| keys[entry] == row }
+      return unless text
+
+      @settings[src].delete(text)
+      @settings[dest] << text unless @settings[dest].include?(text)
+      @settings[dest] = Setup.sort_spells(@settings[dest])
+      @selected[src] = nil
+      @status = "#{text.strip} moved to #{LISTS[dest]}"
+    end
+
+    # Each button moves the row selected in its own source list.
+    def move_selected(dest)
+      row = @selected[other_list(dest)]
+      return @status = "Select a spell in #{LISTS[other_list(dest)]} first" unless row
+
+      move_spell(row, dest)
+    end
+
+    # Remembers the row selected in one list. The browser already shows it, so
+    # this neither refreshes nor touches the other list's selection.
+    def select_row(key, row)
+      @selected[key] = row.nil? ? nil : row.to_s
+    end
+
+    # ------------------------------------------------------------- render --
+
+    # The spell lists fill the window side by side with the move buttons
+    # between them; casting numbers and options sit in two short panels below.
+    def render(ui, field, save, cancel)
+      setup = self
+      ui.stack(key: 'ewaggle', gap: 6, margin: 8, fill: true) do
+        ui.text(key: 'lists-hint', emphasis: :subtle, wrap: true,
+                content: 'Drag a spell between the lists or double-click it. The buttons move the selected spell.')
+        setup.render_lists(ui)
+        ui.columns(key: 'settings', count: 2, weights: [2, 3], gap: 8, row_align: :start) do
+          setup.render_casting(ui, field, '0')
+          setup.render_options(ui, field, '1')
+        end
+        setup.render_sonic(ui, field)
+        setup.render_footer(ui, save, cancel)
+      end
+    end
+
+    def render_lists(ui)
+      setup = self
+      keys = row_keys
+      ui.split(key: 'lists', orientation: :horizontal, position: 50, fill: true) do
+        ui.stack(slot: 'first', key: 'list-left', gap: 4, fill: true) do
+          setup.render_spell_table(ui, :not_to_cast, keys)
+          ui.button(key: 'to-cast', label: 'Cast selected  >>',
+                    tooltip: 'Move the spell selected under Spells Not to Cast into Spells to cast.',
+                    on: { activate: setup.cb { setup.move_selected(:cast_list) } })
+        end
+        ui.stack(slot: 'second', key: 'list-right', gap: 4, fill: true) do
+          setup.render_spell_table(ui, :cast_list, keys)
+          ui.button(key: 'to-not-cast', label: '<<  Do not cast selected',
+                    tooltip: 'Move the spell selected under Spells to cast into Spells Not to Cast.',
+                    on: { activate: setup.cb { setup.move_selected(:not_to_cast) } })
+        end
+      end
+    end
+
+    def render_spell_table(ui, key, keys)
+      setup = self
+      rows = Setup.sort_spells(@settings[key].uniq).map { |text| { key: keys.fetch(text), cells: { 'spell' => text.strip } } }
+      selected = rows.any? { |r| r[:key] == @selected[key] } ? [@selected[key]] : []
+      ui.table(key: "list-#{key}", columns: [{ key: 'spell', label: LISTS.fetch(key) }], rows: rows,
+               headers: true, selection: :single, selected: selected, activation: :double, fill: true,
+               transfer_group: TRANSFER_GROUP, search_column: 'spell',
+               tooltip: "#{rows.size} spells. Drag a row to the other list or double-click it to move it.",
+               on: {
+                 row_drop: setup.cb { |ev| setup.move_spell(ev.payload[:row].to_s, key) },
+                 row_activate: setup.cb { |ev| setup.move_spell(ev.payload[:row].to_s, setup.other_list(key)) },
+                 selection_change: ->(ev) { setup.select_row(key, Array(ev.payload[:rows]).first) }
+               })
+    end
+
+    CASTING = { start_at: 'Cast below', stop_at: 'Stop at', refreshable_min: 'Minimum time',
+                armor_min: 'Armor buffs', reserve_mana: 'Reserve mana' }.freeze
+
+    # Label and number side by side; the tooltips explain each.
+    def render_casting(ui, field, slot)
+      setup = self
+      ui.group(slot: slot, key: 'casting', label: 'Casting') do
+        ui.grid(key: 'casting-grid', cols: 4, homogeneous: false, row_gap: 4, column_gap: 8) do
+          CASTING.each do |key, label|
+            ui.text(key: "#{key}-label", content: label, tooltip: SPIN_TIPS.fetch(key))
+            field.call(ui, key, width: 70)
+          end
+          unless setup.disabled.include?(:retribution_spell)
+            ui.text(key: 'retribution_label', content: 'Retribution spell')
+            field.call(ui, :retribution_spell, width: 70)
+          end
+        end
+      end
+    end
+
+    def render_options(ui, field, slot)
+      off = disabled
+      shown = %i[use_multicast skip_short_spells bail_no_mana skip_not_sharing use_203 use_515
+                 use_wracking wander_to_wrack use_power use_concentration use_mana].reject { |key| off.include?(key) }
+      half = (shown.size + 1) / 2
+      ui.group(slot: slot, key: 'options', label: 'Options') do
+        ui.columns(key: 'options-cols', count: 2, gap: 8, row_align: :start) do
+          [shown.first(half), shown.drop(half)].each_with_index do |keys, i|
+            ui.stack(slot: i.to_s, key: "options-#{i}", gap: 4) { keys.each { |key| field.call(ui, key) } }
+          end
+        end
+      end
+    end
+
+    # Bards only: one row per sonic spell the character knows.
+    def render_sonic(ui, field)
+      sonic = [[1012, :sonic_weapon, 'Sonic weapon', 'https://gswiki.play.net/Weapon'],
+               [1009, :sonic_shield, 'Sonic shield', 'https://gswiki.play.net/Sonic_Shield_Song_(1009)'],
+               [1014, :sonic_armor, 'Sonic armor', 'https://gswiki.play.net/Sonic_Armor_(1014)']].select { |num, *| Spell[num].known? }
+      return if sonic.empty?
+
+      ui.group(key: 'sonic', label: 'Sonic') do
+        ui.grid(key: 'sonic-grid', cols: 2, homogeneous: false, expand_columns: [2], row_gap: 4, column_gap: 8) do
+          sonic.each do |_num, key, label, url|
+            ui.markdown(key: "#{key}_label", content: "[#{label}](#{url})")
+            field.call(ui, key)
+          end
+        end
+      end
+    end
+
+    def render_footer(ui, save, cancel)
+      setup = self
+      ui.columns(key: 'footer', count: 3, weights: [5, 1, 1], compact: true, row_align: :center, gap: 6) do
+        ui.text(slot: '0', key: 'footer-text', wrap: true, emphasis: :subtle,
+                content: "#{setup.status.empty? ? '' : "#{setup.status}    "}Cancel or closing the window discards changes.")
+        ui.button(slot: '1', key: 'cancel', label: 'Cancel', on: { activate: ->(_ev) { cancel.call } })
+        save.call(ui, slot: '2', variant: :primary, tooltip: 'Save the settings to your ewaggle profile and close this window.')
+      end
+    end
+
+    attr_reader :status
   end
 end
 
@@ -1769,12 +1766,12 @@ module Ewaggle
   when /^load$/i
     Ewaggle.load(Ewaggle.load_profile())
   when /^setup$/i
-    if defined?(Gtk)
+    if Ewaggle::Setup.available?
       Ewaggle::Setup.new(Ewaggle.data.settings).start
       Ewaggle.load(Ewaggle.load_profile)
     else
       respond
-      Lich::Messaging.msg('plain', 'GTK bindings are not installed or failed to load.')
+      Lich::Messaging.msg('plain', 'The setup window needs the Lich WebUI (a Lich build with WebUI, started without --no-gui).')
       Lich::Messaging.msg('plain', "For command-line setup, see #{$clean_lich_char}#{Script.current.name} help")
       respond
     end
