@@ -452,8 +452,8 @@ RSpec.describe 'analytics.lic' do
       expect(overheard['offers']).to eq([])
     end
 
-    it "still reads the NPCs' lines in the main window, after a stream that never closed" do
-      expect(overheard['silver']).to eq([['box', nil, 75], ['expense', 'locksmith pool', 750]])
+    it "still reads the NPCs' lines in the main window, after a stream that never closed and a line with a bad byte" do
+      expect(overheard['silver']).to eq([['box', nil, 33], ['box', nil, 75], ['expense', 'locksmith pool', 750]])
     end
   end
 

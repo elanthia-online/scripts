@@ -658,7 +658,7 @@ when 'cli'
   passed = ['look', ';other thing', ';analytics'].map { |line| UpstreamHook.run(line) }
   result = {
     'report' => report.include?('Summary'), 'status' => status.include?('Database:'),
-    'stats' => stats.include?('cycles:'), 'help' => help.include?('Usage'),
+    'stats' => stats.include?('cycles:') && stats.include?('combat_stats:') && stats.include?('pool_depth:'), 'help' => help.include?('Usage'),
     'help_paths' => [help.include?("Settings: #{File.join(DATA_DIR, 'analytics.yaml')} (every character)") &&
       help.include?("#{File.join(DATA_DIR, 'GS3', 'Splinter', 'analytics.yaml')} (this character's overrides)"),
                      help.include?("Database: #{File.join(DATA_DIR, 'analytics.db')}"), help.include?('<Lich data>')],
@@ -1807,6 +1807,10 @@ when 'overheard'
             # a stream that never pops (a lost line): the next prompt ends it
             '<pushStream id="thoughts"/><preset id="thought">[General]-GSIV:Penny: </preset>"You gather the remaining 5 coins from inside your box."',
             '<prompt time="2">&gt;</prompt>',
+            # thoughts as plain text
+            '[General]-GSIV:Penny: "You gather the remaining 7 coins from inside your box."',
+            # a line with a byte that isn't UTF-8: read without it, and the hooks go on
+            "You gather the remaining 33 coins from inside your box.\xFF".dup.force_encoding('UTF-8'),
             # this character's own: the NPCs' lines, in the main window
             'You gather the remaining 75 coins from inside your box.',
             'Jahck takes your chest and says, "Your tip of 500 silvers has been recorded, and the 250 silver fee has been collected."')
