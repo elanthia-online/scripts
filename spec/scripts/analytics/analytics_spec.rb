@@ -522,6 +522,10 @@ RSpec.describe 'analytics.lic' do
       expect(auto['elsewhere']).to eq([false, true])
     end
 
+    it 'says the dashboard is already fed, not to change ports, when another session took the port first' do
+      expect(auto['raced']).to eq([false, true, true])
+    end
+
     it 'says the port is in use when something else holds it, and finds nothing on a free port' do
       expect(auto['taken']).to eq([false, true])
       expect(auto['nobody']).to be(false)

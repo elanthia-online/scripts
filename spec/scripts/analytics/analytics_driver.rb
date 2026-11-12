@@ -634,6 +634,10 @@ when 'autostart'
   OUT.clear
   cli.send(:autostart_dashboard, port)
   elsewhere = [A::Dashboard.running?, OUT.any? { |l| l.include?('already fed by another session') }]
+  # the other session took the port between this one's check and its start
+  OUT.clear
+  cli.send(:start_dashboard, port, false)
+  raced = [A::Dashboard.running?, OUT.any? { |l| l.include?('already fed by another session') }, OUT.none? { |l| l.include?('Try ;') }]
   server.close
   thread.kill
   # something else holds the port: said, not taken for analytics.lic
@@ -643,7 +647,7 @@ when 'autostart'
   taken = [A::Dashboard.running?, OUT.any? { |l| l.include?("Port #{port} is already in use") }]
   server.close
   thread.kill
-  result = { 'default' => default, 'fresh' => fresh, 'again' => again, 'elsewhere' => elsewhere, 'taken' => taken,
+  result = { 'default' => default, 'fresh' => fresh, 'again' => again, 'elsewhere' => elsewhere, 'raced' => raced, 'taken' => taken,
              'nobody' => A::Dashboard.answering?(port, wait: 0.5) }
 
 when 'cli'
