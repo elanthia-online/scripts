@@ -227,6 +227,12 @@ RSpec.describe 'analytics.lic' do
     it "reports an unreadable character file once and uses the global settings" do
       expect(settings['broken']).to eq(['shared_rest', 7, true])
     end
+
+    it 'uses the default for a value of the wrong kind, and says which, so it cannot stop what reads it' do
+      # alerts.no_kill_minutes falls back to the global file's 7, the rest to the defaults; '30' and '9090' are numbers
+      expect(settings['typed']).to eq([8, 30, true, nil, 7, 9090])
+      expect(settings['typed_reported']).to eq(%w[idle_warn_minutes parse_bank weapon_loadout alerts.no_kill_minutes])
+    end
   end
 
   describe 'CycleManager bigshot status' do
@@ -893,6 +899,43 @@ RSpec.describe 'analytics.lic' do
 
     it 'gives the rest after a death, and a hunt cut at midnight, a reason' do
       expect(edges['death'].values_at('after_death', 'midnight', 'after_midnight')).to eq(['after death', 'midnight', nil])
+    end
+  end
+
+  describe 'idle recovery' do
+    it 'walks and then starts the rest script without holding up the cycle watcher' do
+      expect(result('idle_recovery')).to eq('returned_at_once' => true, 'calls' => [%w[run go2 1234], %w[start myrest]],
+                                            'reason' => 'idle recovery')
+    end
+  end
+
+  describe 'the weapon check' do
+    subject(:weapons) { result('weapon_check') }
+
+    it 'stows only the hands it was given, and never drops what will not stow' do
+      # right: the gem is stowed (no room: it stays); the left, not set, is left alone; nothing is dropped
+      expect(weapons['sent']).to eq(['stow #11'])
+      expect(weapons.values_at('armed', 'log')).to eq([false, 1])
+    end
+  end
+
+  describe 'midnight' do
+    it 'keeps a death going across it as one death' do
+      expect(result('midnight_dead')).to eq('dead_cycles' => 1, 'report_deaths' => 1)
+    end
+
+    it 'carries a rest on into the new day for its reason, without sending its alert again' do
+      # one row a day, both for the item limit; one alert
+      expect(result('midnight_rest')).to eq('item_alerts' => 1, 'item_rests' => 2)
+    end
+  end
+
+  describe 'max_hunt_minutes' do
+    subject(:timeout) { result('timeout_flap') }
+
+    it 'asks for a rest once, and not again when the hunt resumes after a rest too short to keep' do
+      expect(timeout.values_at('first', 'repeat_without_flap', 'after_flap')).to eq([['release'], 1, ['release']])
+      expect(timeout['hunt_start_age']).to be < 5
     end
   end
 

@@ -266,6 +266,10 @@ when 'settings'
   inherited = A::Settings.load(WHO)
   File.write(file, "rest_script: [unclosed\n")
   broken = A::Settings.load(WHO)
+  # Values of the wrong kind: the defaults instead, each reported; a number written as text is read
+  File.write(file, "idle_warn_minutes: 8m\nmax_hunt_minutes: '30'\nparse_bank: maybe\nweapon_loadout: scepter\n" \
+                   "alerts:\n  no_kill_minutes: ten\ndashboard:\n  port: '9090'\n")
+  typed = A::Settings.load(WHO)
   result = {
     'path' => file.delete_prefix("#{DATA_DIR}/"), 'global_path' => global.delete_prefix("#{DATA_DIR}/"), 'written' => written,
     'default_hunt' => defaults[:hunt_script], 'default_rest' => defaults[:rest_script],
@@ -276,7 +280,10 @@ when 'settings'
     'custom' => [custom[:rest_script], custom[:alerts][:no_kill_minutes], custom[:alerts][:silver_drop_pct],
                  custom[:alerts][:death], custom[:profile_room_map], custom[:hunt_script]],
     'inherited_rest' => inherited[:rest_script],
-    'broken' => [broken[:rest_script], broken[:alerts][:no_kill_minutes], OUT.any? { |line| line.include?('ERROR (settings') }]
+    'broken' => [broken[:rest_script], broken[:alerts][:no_kill_minutes], OUT.any? { |line| line.include?('ERROR (settings') }],
+    'typed' => [typed[:idle_warn_minutes], typed[:max_hunt_minutes], typed[:parse_bank], typed[:weapon_loadout],
+                typed[:alerts][:no_kill_minutes], typed[:dashboard][:port]],
+    'typed_reported' => OUT.grep(/Setting \S+: .* isn't/).map { |line| line[/Setting (\S+):/, 1] }
   }
 
 when 'database'
@@ -1245,6 +1252,111 @@ when 'flap'
   result['cycles'] = A::Database.all('SELECT cycle_type, end_time - start_time >= 300 AS long, rest_reason FROM cycles ' \
                                      "WHERE cycle_type != 'idle' ORDER BY start_time").map(&:values)
   result['steps'] = A::Database.all('SELECT step, seconds FROM rest_steps WHERE cycle_id = ? ORDER BY step', rest).map(&:values)
+
+when 'timeout_flap'
+  # max_hunt_minutes asks for a rest (RELEASE) once; bigshot rests a few seconds and
+  # hunts on, and the resumed hunt mustn't ask again at once
+  A::Database.connect!
+  cfg = A::Settings.load(WHO).merge(max_hunt_minutes: 30)
+  manager = A::CycleManager
+  $running = []
+  fputs = []
+  manager.define_singleton_method(:fput) { |cmd| fputs << cmd }
+  manager.start(WHO, cfg)
+  manager.instance_variable_set(:@running, false)
+  manager.instance_variable_get(:@thread).join(2)
+  manager.send(:transition_to, :hunt)
+  A::Database.flush
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', Time.now.to_i - 1900, manager.current_cycle_id)
+  manager.instance_variable_set(:@cycle_started_at, Time.now.to_i - 1900)
+  manager.instance_variable_set(:@hunt_start_time, Time.now.to_i - 1900)
+  manager.send(:check_hunt_timeout) # 31+ minutes: asks for a rest once
+  first = fputs.dup
+  manager.send(:check_hunt_timeout)
+  once = fputs.size
+  $rest_reason = 'hunt timeout'
+  manager.send(:transition_to, :rest) # bigshot rests a few seconds (nothing to do)...
+  $rest_reason = ''
+  manager.send(:transition_to, :hunt) # ...and the hunt resumes
+  manager.send(:check_hunt_timeout)
+  result = { 'first' => first, 'repeat_without_flap' => once, 'after_flap' => fputs, 'hunt_start_age' => Time.now.to_i - manager.hunt_start_time.to_i }
+when 'midnight_dead'
+  # Dead across midnight: one death, not two
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::CycleManager
+  $running = []
+  manager.start(WHO, cfg)
+  manager.instance_variable_set(:@running, false)
+  manager.instance_variable_get(:@thread).join(2)
+  manager.send(:transition_to, :dead)
+  A::Database.flush
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', Time.now.to_i - 600, manager.current_cycle_id)
+  manager.instance_variable_set(:@cycle_started_at, Time.now.to_i - 600)
+  manager.instance_variable_set(:@day, (Date.today - 1).to_s)
+  manager.send(:roll_over_midnight)
+  A::Database.flush
+  result['dead_cycles'] = A::Database.one("SELECT COUNT(*) AS n FROM cycles WHERE cycle_type = 'dead'")['n']
+  result['report_deaths'] = A::Report.figures(A::Database.db, WHO, 0)['deaths']
+when 'midnight_rest'
+  # A rest for the item limit across midnight: its alert isn't sent again
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::CycleManager
+  $running = []
+  manager.start(WHO, cfg)
+  manager.instance_variable_set(:@running, false)
+  manager.instance_variable_get(:@thread).join(2)
+  $rest_reason = 'Too many items.'
+  manager.send(:transition_to, :rest)
+  A::Database.flush
+  run_sql('UPDATE cycles SET start_time = ? WHERE cycle_id = ?', Time.now.to_i - 600, manager.current_cycle_id)
+  manager.instance_variable_set(:@cycle_started_at, Time.now.to_i - 600)
+  manager.instance_variable_set(:@day, (Date.today - 1).to_s)
+  manager.send(:roll_over_midnight)
+  A::Database.flush
+  result['item_alerts'] = OUT.grep(/ITEM LIMIT/).size
+  result['item_rests'] = A::Database.one("SELECT COUNT(*) AS n FROM cycles WHERE cycle_type='rest' AND rest_reason LIKE '%item%'")['n']
+when 'weapon_check'
+  # weapon_loadout with only a right hand set: a box in the left stays there,
+  # and a gem in the right that won't stow (a full container) isn't dropped
+  A::Database.connect!
+  A::Settings.load(WHO)
+  hand = Struct.new(:id, :noun, :name)
+  gameobj = Module.new do
+    def self.right_hand = $hands[:right]
+    def self.left_hand = $hands[:left]
+  end
+  Object.const_set(:GameObj, gameobj) unless defined?(GameObj)
+  $hands = { right: hand.new('11', 'gem', 'blue gem'), left: hand.new('12', 'box', 'iron box') }
+  sent = []
+  manager = A::CycleManager
+  manager.define_singleton_method(:fput) { |cmd| sent << cmd }
+  manager.define_singleton_method(:dothistimeout) { |cmd, *| sent << cmd; 'There is no room for that.' }
+  manager.define_singleton_method(:checkright) { $hands[:right]&.noun }
+  manager.define_singleton_method(:checkleft) { $hands[:left]&.noun }
+  armed = manager.send(:rearm, { right: 'scepter', get_right: 'get my scepter' })
+  result = { 'sent' => sent, 'armed' => armed, 'log' => OUT.grep(/stays in your hand/).size }
+
+when 'idle_recovery'
+  # idle_recover_minutes: the walk (go2, which Script.run waits for) and then
+  # the rest script, while the cycle watcher goes on ticking
+  A::Database.connect!
+  cfg = A::Settings.load(WHO).merge(rest_script: 'myrest', profile_room_map: { 'crags' => 1234 })
+  calls = Queue.new
+  Script.define_singleton_method(:run) { |*args| sleep 0.6; calls << ['run', *args] }
+  Script.define_singleton_method(:start) { |*args| calls << ['start', *args] }
+  manager = A::CycleManager
+  manager.instance_variable_set(:@cfg, cfg)
+  manager.instance_variable_set(:@who, WHO)
+  manager.define_singleton_method(:profile) { 'crags' }
+  began = Time.now
+  manager.send(:recover_from_idle, 900)
+  returned_after = Time.now - began
+  sleep 1
+  seen = []
+  seen << calls.pop until calls.empty?
+  result = { 'returned_at_once' => returned_after < 0.3, 'calls' => seen, 'reason' => $rest_reason }
 
 when 'bigshot_status'
   # Bigshot's own status marks a rest, but only while the script is running

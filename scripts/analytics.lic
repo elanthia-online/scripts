@@ -30,7 +30,7 @@
 
   Have your rest script type EXPERIENCE and RESOURCE once a rest: fame, deeds,
   Death's Sting, training points and your profession's resource are read
-  from that output (the script never sends a command itself).
+  from that output (the script never sends those commands itself).
 =end
 
 require 'date'
@@ -62,6 +62,8 @@ module GS4Analytics
   # the taskmaster) speak in the main window without a preset, so they read.
   # One per hook: each keeps its own place in the streams.
   class Overheard
+    constants(false).each { |name| remove_const(name) }
+
     STREAMS   = %w[speech thoughts whispers familiar death logons atmospherics talk ooc].freeze
     PRESET_RE = /<preset id=["'](?:speech|whisper|thought)["']/
     # A prompt ends one too: the game never prompts inside a stream, so a pop
@@ -334,6 +336,8 @@ module GS4Analytics
     DEFAULTS = SPEC.to_h { |spec| [spec[0], group.call(spec) ? spec[1].to_h { |k, v, _| [k, v] }.freeze : spec[1]] }.freeze
     GROUPS = SPEC.select { |spec| group.call(spec) }.map(&:first).freeze
     COMMENT_AT = 40 # the column comments start at, where the setting is shorter
+    NUMBERS = %i[max_hunt_minutes idle_recover_minutes].freeze # numbers with no default
+    MAPS = %i[profile_room_map rest_steps weapon_loadout].freeze
 
     @current = DEFAULTS
 
@@ -355,7 +359,7 @@ module GS4Analytics
         file = path(who)
         write(global_path, global_text) unless File.exist?(global_path)
         write(file, character_text(who)) unless File.exist?(file)
-        @current = finish(overlay(overlay(DEFAULTS, read(global_path)), read(file)))
+        @current = finish(overlay(overlay(DEFAULTS, checked(read(global_path))), checked(read(file))))
         Log.verbose = @current[:verbose] ? true : false
         @current
       rescue StandardError => e
@@ -407,6 +411,36 @@ module GS4Analytics
         cfg[:rest_steps] = stringify(cfg[:rest_steps])
         cfg[:profile_room_map] = stringify(cfg[:profile_room_map])
         cfg
+      end
+
+      # A value of the wrong kind in a file ("8m" for a number of minutes, a
+      # word for true/false, text for a map) is reported and left out, so the
+      # one before it is used (the global file's, or the default) and it can't
+      # stop what reads it. A number written as text ("30") is read.
+      def checked(over, defaults = DEFAULTS, prefix = '')
+        return over unless over.is_a?(Hash)
+
+        over.to_h do |key, value|
+          default = defaults[key]
+          next [key, checked(value, default, "#{key}.")] if defaults.equal?(DEFAULTS) && GROUPS.include?(key)
+          next [key, value] if value.nil? || value == false || !defaults.key?(key)
+
+          kind = if default.is_a?(Numeric) || NUMBERS.include?(key) then 'a number'
+                 elsif [true, false].include?(default) then 'true or false'
+                 elsif MAPS.include?(key) then 'a map ({ key: value })'
+                 end
+          fixed = case kind
+                  when 'a number'
+                    if value.is_a?(Numeric) then value
+                    elsif value.is_a?(String) && value.strip.match?(/\A\d+(?:\.\d+)?\z/) then value.strip.to_f.then { |n| n == n.to_i ? n.to_i : n }
+                    end
+                  when 'true or false' then value if value == true
+                  when 'a map ({ key: value })' then value if value.is_a?(Hash)
+                  else value
+                  end
+          Log.info("Setting #{prefix}#{key}: #{value.inspect} isn't #{kind}, so it's left out. See #{CLI::GUIDE}#settings") if fixed.nil?
+          [key, fixed]
+        end
       end
 
       def stringify(hash)
@@ -2887,10 +2921,18 @@ module GS4Analytics
         kinds.values
       end
 
+      # The recorder writes its file from another thread of this Lich. SQLite's
+      # own busy timeout waits holding Ruby's lock, which stops the game text
+      # for up to its 5 seconds; Lich's busy handler waits in Ruby instead.
+      def recorder_db(path, **opts)
+        db = SQLite3::Database.new(path, **opts)
+        db.busy_timeout = 5_000
+        defined?(Lich::SQLiteBusyWait) ? Lich::SQLiteBusyWait.install(db, 5_000) : db
+      end
+
       def recorder_rows(path, sql, params)
         require 'sqlite3'
-        db = SQLite3::Database.new(path, readonly: true)
-        db.busy_timeout = 5_000
+        db = recorder_db(path, readonly: true)
         db.results_as_hash = true
         db.execute(sql, params)
       ensure
@@ -2905,8 +2947,7 @@ module GS4Analytics
         require 'sqlite3'
         cutoff = [Time.now.to_f - (KEEP_DAYS * 86_400), @mark.to_f - REVISIT_SECONDS].min
         old = 'SELECT id FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?'
-        db = SQLite3::Database.new(@path)
-        db.busy_timeout = 5_000
+        db = recorder_db(@path)
         db.transaction do
           %w[flares resolutions].each do |table|
             db.execute("DELETE FROM #{table} WHERE attack_id IN (SELECT id FROM attacks WHERE session_id IN (#{old}))", [cutoff])
@@ -2994,6 +3035,7 @@ module GS4Analytics
       def stop
         @running = false
         @thread&.join(2)
+        @recovery&.kill
         end_current_cycle
       end
 
@@ -3029,11 +3071,19 @@ module GS4Analytics
         CombatManager.tick
         signals = read_signals
         track_rest_step if @current_state == :rest
-        check_hunt_timeout
-        check_weapons if @current_state == :hunt && @cfg[:weapon_loadout]
-        check_idle(signals.values.any?)
+        # The checks a setting turns on can't stop the cycles being tracked:
+        # one that fails is reported once and the state still moves
+        optional('hunt timeout') { check_hunt_timeout }
+        optional('weapon check') { check_weapons } if @current_state == :hunt && @cfg[:weapon_loadout]
+        optional('idle check') { check_idle(signals.values.any?) }
         update_state(signals)
         name_trigger if @unnamed
+      end
+
+      def optional(what)
+        yield
+      rescue StandardError => e
+        Log.error(what, e) # once each
       end
 
       # The cycle's script, once one of those set for its type is running
@@ -3152,20 +3202,27 @@ module GS4Analytics
         return if today == @day
 
         Log.info("Midnight rollover: #{@day} -> #{today}")
+        @day = today
+        # A death goes on across midnight as one: split, it would count as two
+        return if @current_state == :dead
+
         # A hunt still going is cut here, with no reason of its own yet: say why it ended
         note_reason(@current_cycle_id, 'midnight') if @current_state == :hunt && @current_cycle_id && rest_reason.empty?
         @after_death = false
+        # A rest goes on into the new day for the reason it started with, which
+        # isn't news: its alert (the item limit) isn't sent again
+        carried = @current_state == :rest ? @cycle_reason : nil
         end_current_cycle
         @carry_from = nil # the new day starts at midnight
         @ended = nil
-        @day = today
         link_silver
-        start_new_cycle(@current_state)
+        start_new_cycle(@current_state, reason: carried)
       end
 
       # The id and every value are taken now and the write is queued, so a
       # database held by another session delays the row instead of losing it
-      def start_new_cycle(type)
+      # reason: a rest carried on over midnight, which keeps the one it had
+      def start_new_cycle(type, reason: nil)
         return resume_cycle(type) if resumes?(type)
 
         trigger = Array(@cfg[SCRIPT_KEYS[type]]).find { |name| running?(name) } || type.to_s
@@ -3180,7 +3237,12 @@ module GS4Analytics
         @current_cycle_id = id
         @cycle_started_at = at
         @cycle_reason = nil
-        start_rest(id) if type == :rest
+        if type == :rest && reason
+          start_rest(id, alert: false)
+          note_reason(id, reason)
+        elsif type == :rest
+          start_rest(id)
+        end
         link_silver
         Log.debug("Started #{type} cycle")
       rescue StandardError => e
@@ -3206,7 +3268,9 @@ module GS4Analytics
         @cycle_started_at = cycle[:started_at]
         @cycle_reason = type == :hunt ? nil : cycle[:reason]
         if type == :hunt
-          @hunt_start_time = cycle[:hunt_start] || cycle[:started_at]
+          # A hunt that had timed out (its start cleared when it asked for the
+          # rest) counts again from now, so the next tick doesn't ask again
+          @hunt_start_time = cycle[:hunt_start] || Time.now.to_i
           @last_hunt = nil
         elsif type == :rest
           @rest_steps = Hash.new(0.0).merge(cycle[:steps] || {})
@@ -3217,10 +3281,12 @@ module GS4Analytics
         Log.debug("Resumed the #{type} cycle")
       end
 
-      def start_rest(cycle_id)
+      def start_rest(cycle_id, alert: true)
         @rest_steps = Hash.new(0.0)
         @rest_cycle = cycle_id
         @rest_tick = monotonic
+        return unless alert
+
         # Normally bigshot's $rest_reason; if it's blank (rest script started
         # by hand, or bigshot already cleared it) use the hunt that just ended
         # After a death, bigshot's reason is the one from before it: the hunt that
@@ -3359,14 +3425,19 @@ module GS4Analytics
         end
       end
 
+      # On a thread of its own: Script.run waits for the walk, and this watcher
+      # must keep ticking meanwhile (states, logins, midnight, the rollups)
       def recover_from_idle(idle_for)
         Notifier.alert('IDLE RECOVERY', "#{@who.name} idle for #{idle_for / 60} minutes, starting a rest")
         room = recovery_room
-        Script.run('go2', room.to_s) if room
-        $rest_reason = 'idle recovery' if rest_reason.empty?
-        # Start without waiting: Script.run would hold this thread for the
-        # whole rest, so the rest would never be recorded as a cycle
-        Script.start(Array(@cfg[:rest_script]).first)
+        rest = Array(@cfg[:rest_script]).first
+        @recovery = Thread.new do
+          Script.run('go2', room.to_s) if room
+          $rest_reason = 'idle recovery' if rest_reason.empty?
+          Script.start(rest) # runs on by itself; the watcher sees the rest begin
+        rescue StandardError => e
+          Log.error('idle recovery', e)
+        end
       rescue StandardError => e
         Log.error('idle recovery', e)
       end
@@ -3418,7 +3489,8 @@ module GS4Analytics
         waitcastrt?
         waitrt?
         stow_unexpected(GameObj.right_hand, loadout[:right])
-        stow_unexpected(GameObj.left_hand, loadout[:left])
+        # With no left set, whatever is in the left hand is yours to keep there
+        stow_unexpected(GameObj.left_hand, loadout[:left]) if loadout[:left]
         if loadout[:gird]
           fput 'gird'
           waitrt?
@@ -3431,12 +3503,14 @@ module GS4Analytics
         armed?(loadout)
       end
 
-      # Stows what is in a hand unless it's the wanted noun; drops it if there is no room
+      # Stows what is in a hand unless it's the wanted noun. Never drops it: an
+      # item that won't go away stays in the hand, and the check fails into its
+      # alert and rest rather than leave a box or a gem on a hunting ground
       def stow_unexpected(item, wanted)
         return if item.nil? || item.id.nil? || item.noun == wanted
 
         result = dothistimeout("stow ##{item.id}", 4, /put|don't seem|can't|no room/i)
-        fput "drop ##{item.id}" if result.to_s.match?(/don't seem|can't|no room/i)
+        Log.info("Weapon check: couldn't stow the #{item.name}, so it stays in your hand") if result.to_s.match?(/don't seem|can't|no room/i)
         waitrt?
       end
 
@@ -3654,6 +3728,9 @@ module GS4Analytics
         now = Time.now.to_i
         Database.async { Database.record_login(who, login, now) }
         @who = who
+        # Set first, so a manager that fails to start is stopped with the rest
+        # (the combat tracker turned off again, the recorder closed)
+        @running = true
         SilverManager.start(who)
         SilverManager.take_baseline
         ProgressManager.start(who)
@@ -3662,8 +3739,10 @@ module GS4Analytics
         CombatManager.start(who, cfg)
         BountyManager.start(who, cfg)
         AlertManager.start(who, cfg)
-        @running = true
         Log.info("Collecting for #{who.name} (#{who.game})")
+      rescue StandardError
+        stop
+        raise
       end
 
       def running?
@@ -4660,6 +4739,8 @@ module GS4Analytics
         who = identity
         cfg = Settings.load(who)
         Collector.start(who, cfg)
+        unknown = args.select { |arg| arg.start_with?('-') && !arg.match?(/\A--(?:dashboard(?:=\d+)?|lan)\z/) }
+        Log.info("Unknown option #{unknown.join(', ')}: collecting without it. ;#{Script.current.name} help lists the commands.") if unknown.any?
         flag = args.find { |arg| arg.match?(/\A--dashboard(=\d+)?\z/) }
         if flag
           start_dashboard(flag[/\d+/]&.to_i || cfg[:dashboard][:port], args.include?('--lan') || cfg[:dashboard][:lan])
@@ -4675,14 +4756,19 @@ module GS4Analytics
       def install_hook
         pattern = /\A(?:<c>)?#{$lich_char_regex}#{Regexp.escape(Script.current.name)}\s+(\S.*)\z/i
         UpstreamHook.add(HOOK, proc { |line|
-          words = line.match(pattern)&.[](1)&.split
-          next line unless words
+          begin
+            words = line.match(pattern)&.[](1)&.split
+            next line unless words
 
-          words = dashboard_words(words) || words
-          next line unless COMMANDS.include?(words.first.downcase)
+            words = dashboard_words(words) || words
+            next line unless COMMANDS.include?(words.first.downcase)
 
-          @commands << words
-          nil
+            @commands << words
+            nil
+          rescue StandardError => e
+            Log.error('command hook', e) # Lich would drop a hook that raises
+            line
+          end
         })
       end
 
