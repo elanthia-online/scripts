@@ -233,6 +233,11 @@ RSpec.describe 'analytics.lic' do
       expect(settings['typed']).to eq([8, 30, true, nil, 7, 9090])
       expect(settings['typed_reported']).to eq(%w[idle_warn_minutes parse_bank weapon_loadout alerts.no_kill_minutes])
     end
+
+    it 'leaves out a group given one value (alerts: false), says so, and keeps its settings' do
+      # no_kill_minutes is the global file's 7; the port the default
+      expect(settings['grouped']).to eq([7, 8080, %w[alerts dashboard]])
+    end
   end
 
   describe 'CycleManager bigshot status' do
@@ -1080,6 +1085,10 @@ RSpec.describe 'analytics.lic' do
 
     it 'still answers a request with a large cookie header' do
       expect(api['split_headers']['long_cookie']).to eq('200')
+    end
+
+    it "says when a port can't be listened on, and carries on" do
+      expect(api['bad_port']).to eq([false, true])
     end
 
     it 'refuses lan with an explanation and serves this computer only, printing the hosted URL' do

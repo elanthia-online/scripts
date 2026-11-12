@@ -270,6 +270,13 @@ when 'settings'
   File.write(file, "idle_warn_minutes: 8m\nmax_hunt_minutes: '30'\nparse_bank: maybe\nweapon_loadout: scepter\n" \
                    "alerts:\n  no_kill_minutes: ten\ndashboard:\n  port: '9090'\n")
   typed = A::Settings.load(WHO)
+  typed_said = OUT.grep(/Setting \S+: .* isn't/).map { |line| line[/Setting (\S+):/, 1] }
+  broken_said = OUT.any? { |line| line.include?('ERROR (settings') }
+  # A group given one value (alerts: false): left out and said, so the groups still read
+  OUT.clear
+  File.write(file, "alerts: false\ndashboard: 8080\n")
+  grouped = A::Settings.load(WHO)
+  grouped_said = OUT.grep(/Setting \S+: .* isn't its settings/).map { |line| line[/Setting (\S+):/, 1] }
   result = {
     'path' => file.delete_prefix("#{DATA_DIR}/"), 'global_path' => global.delete_prefix("#{DATA_DIR}/"), 'written' => written,
     'default_hunt' => defaults[:hunt_script], 'default_rest' => defaults[:rest_script],
@@ -280,11 +287,12 @@ when 'settings'
     'custom' => [custom[:rest_script], custom[:alerts][:no_kill_minutes], custom[:alerts][:silver_drop_pct],
                  custom[:alerts][:death], custom[:profile_room_map], custom[:hunt_script]],
     'inherited_rest' => inherited[:rest_script],
-    'broken' => [broken[:rest_script], broken[:alerts][:no_kill_minutes], OUT.any? { |line| line.include?('ERROR (settings') }],
+    'broken' => [broken[:rest_script], broken[:alerts][:no_kill_minutes], broken_said],
     'typed' => [typed[:idle_warn_minutes], typed[:max_hunt_minutes], typed[:parse_bank], typed[:weapon_loadout],
                 typed[:alerts][:no_kill_minutes], typed[:dashboard][:port]],
-    'typed_reported' => OUT.grep(/Setting \S+: .* isn't/).map { |line| line[/Setting (\S+):/, 1] }
+    'typed_reported' => typed_said
   }
+  result['grouped'] = [grouped[:alerts][:no_kill_minutes], grouped[:dashboard][:port], grouped_said]
 
 when 'database'
   A::Database.connect!
@@ -583,6 +591,14 @@ when 'dashboard'
   result['lan'] = [OUT.any? { |line| line.include?('lan is no longer supported') }, A::Dashboard.instance_variable_get(:@server).addr[3],
                    OUT.any? { |line| line.include?("https://analytics.elanthia.online/?live=#{port}") }]
   A::Dashboard.stop
+  # a port that can't be listened on is said, and the script goes on
+  OUT.clear
+  result['bad_port'] = begin
+    A::CLI.send(:start_dashboard, 99_999, false)
+    [A::Dashboard.running?, OUT.any? { |line| line.include?("can't listen on port 99999") }]
+  rescue StandardError => e
+    e.class.name
+  end
   result['stopped'] = [!A::Dashboard.running?, A::Dashboard.instance_variable_get(:@api_conn).nil?]
 
 when 'autostart'
