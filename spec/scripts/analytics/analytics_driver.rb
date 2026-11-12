@@ -229,6 +229,79 @@ end
 result = {}
 
 case scenario
+when 'fresh_file'
+  require 'sqlite3'
+  # Two characters starting on a fresh file at the same moment, as two Lich
+  # processes (forked here): both open it, every round
+  rounds = 15
+  opened = (1..rounds).sum do |round|
+    path = File.join(DATA_DIR, "fresh-#{round}.db")
+    go = "#{path}.go"
+    kids = Array.new(2) do |kid|
+      fork do
+        sleep 0.001 until File.exist?(go)
+        outcome = begin
+          A::Database.connect!(path)
+          A::Database.close
+          'opened'
+        rescue StandardError => e
+          "#{e.class}: #{e.message}"
+        end
+        File.write("#{path}.#{kid}", outcome)
+        exit!(0)
+      end
+    end
+    sleep 0.3
+    FileUtils.touch(go)
+    kids.each { |pid| Process.wait(pid) }
+    Array.new(2) { |kid| File.read("#{path}.#{kid}") }.count('opened')
+  end
+  # Another session part way through making the schema: this one waits its
+  # turn, then finds the schema made, rather than failing part way through
+  # (another process: the sqlite3 gem's own lock wait holds this one still)
+  path = File.join(DATA_DIR, 'midway.db')
+  other = fork do
+    db = SQLite3::Database.new(path)
+    db.execute('PRAGMA journal_mode=WAL')
+    db.execute('BEGIN IMMEDIATE')
+    db.execute('CREATE TABLE early (x)')
+    FileUtils.touch("#{path}.held")
+    sleep 0.4
+    db.execute('COMMIT')
+    exit!(0)
+  end
+  sleep 0.001 until File.exist?("#{path}.held")
+  midway = begin
+    A::Database.connect!(path)
+    A::Database.one("SELECT value FROM metadata WHERE key = 'schema_version'")['value'] == A::Database::SCHEMA_VERSION.to_s
+  rescue StandardError => e
+    "#{e.class}: #{e.message}"
+  end
+  Process.wait(other)
+  # SQLite giving SQLITE_BUSY at the WAL switch: tried again, then opened
+  path = File.join(DATA_DIR, 'busy-wal.db')
+  conn = A::Database.send(:open_database, path)
+  busy = 3
+  conn.define_singleton_method(:run) do |sql, *rest|
+    if sql.include?('journal_mode') && (busy -= 1) >= 0
+      begin
+        raise SQLite3::BusyException, 'database is locked'
+      rescue SQLite3::BusyException
+        raise Sequel::DatabaseError, 'SQLite3::BusyException: database is locked' # its cause, as Sequel wraps it
+      end
+    end
+
+    super(sql, *rest)
+  end
+  A::Database.singleton_class.send(:define_method, :open_database) { |_path| conn }
+  retried = begin
+    A::Database.connect!(path)
+    [true, busy.negative?]
+  rescue StandardError => e
+    "#{e.class}: #{e.message}"
+  end
+  result = { 'opened' => [opened, rounds * 2], 'midway' => midway, 'retried' => retried }
+
 when 'util'
   result = {
     'fmt'           => [A::Util.fmt(1_234_567), A::Util.fmt(-1234), A::Util.fmt(12)],

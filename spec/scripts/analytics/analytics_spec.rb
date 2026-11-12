@@ -506,6 +506,22 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'two characters starting on a fresh file' do
+    subject(:fresh) { result('fresh_file') }
+
+    it 'opens it in both, every time' do
+      expect(fresh['opened'].first).to eq(fresh['opened'].last)
+    end
+
+    it 'waits for a session part way through making the schema, then finds it made' do
+      expect(fresh['midway']).to be(true)
+    end
+
+    it 'tries the switch to WAL again when SQLite says it is busy' do
+      expect(fresh['retried']).to eq([true, true])
+    end
+  end
+
   describe 'dashboard.autostart' do
     subject(:auto) { result('autostart') }
 
