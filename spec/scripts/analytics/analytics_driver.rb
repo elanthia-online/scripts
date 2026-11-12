@@ -1669,6 +1669,50 @@ when 'spending'
   }
   A::SilverManager.stop
 
+when 'overheard'
+  # Other players' words, as the stream marks them (the 2026-11-12 logs):
+  # room speech in its own stream and then with its preset, a whisper, and a
+  # thought over ESP. None of it is this character's; the NPCs' lines are.
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  A::SilverManager.start(WHO)
+  A::BountyManager.start(WHO, cfg)
+  feed = ->(*lines) { lines.each { |line| DownstreamHook.run(line) } }
+  said = "<preset id='speech'>Penny says</preset>, \"%s\""
+  spoken = lambda do |text|
+    ["<pushStream id=\"speech\"/>#{format(said, text)}", '<popStream/>', format(said, text)]
+  end
+  feed.call('You currently have the following amounts on deposit:', '      Bank A: 100', '      Total: 100')
+  sleep 0.3
+  feed.call(*spoken.call('You gather the remaining 9,999,999 coins from inside your box.'),
+            *spoken.call('You search the kobold.'), '<prompt time="1">&gt;</prompt>',
+            *spoken.call('You deposit 1 silver into your account.  The teller says, "This brings your total to 1,000,000,000 silvers.'),
+            *spoken.call('You have earned 1 bounty point, 1 experience point, and 88,888,888 silver.'),
+            "<preset id=\"whisper\">Penny whispers</preset>, \"The Bob takes your gem, looks at it and hands you 4,444,444 silvers for it.\"",
+            '<pushStream id="thoughts"/><preset id="thought">[General]-GSIV:Penny: </preset>"Jahck takes your box and says, ' \
+            '\"Your tip of 1 silver has been recorded, and the 3,333,333 silvers fee has been collected"',
+            '<popStream/>',
+            # a stream that never pops (a lost line): the next prompt ends it
+            '<pushStream id="thoughts"/><preset id="thought">[General]-GSIV:Penny: </preset>"You gather the remaining 5 coins from inside your box."',
+            '<prompt time="2">&gt;</prompt>',
+            # this character's own: the NPCs' lines, in the main window
+            'You gather the remaining 75 coins from inside your box.',
+            'Jahck takes your chest and says, "Your tip of 500 silvers has been recorded, and the 250 silver fee has been collected."')
+  sleep 0.3
+  feed.call('<pushStream id="thoughts"/><preset id="thought">[General]-GSIV:Penny: </preset>"The taskmaster told you:  ' \
+            '\"It appears they have a bandit problem.\""', '<popStream/>')
+  sleep 1.2
+  A::Database.flush
+  result = {
+    'silver' => A::Database.all('SELECT source_category, vendor_type, amount FROM silver_events ORDER BY rowid').map(&:values),
+    'kills' => A::Database.all('SELECT creature FROM kill_stats').map(&:values),
+    'bank' => A::Database.all("SELECT snapshot_type, balance FROM bank_snapshots WHERE bank_name = '__total__' ORDER BY rowid").map(&:values),
+    'bounties' => A::Database.all('SELECT status FROM bounties').map(&:values),
+    'offers' => A::Database.all('SELECT assignment FROM bounty_offers').map(&:values)
+  }
+  A::BountyManager.stop
+  A::SilverManager.stop
+
 when 'money_reports'
   # The silver, kills and cycle reports, the death alert and backups
   A::Database.connect!

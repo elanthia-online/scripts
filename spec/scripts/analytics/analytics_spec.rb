@@ -436,6 +436,21 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe "other players' words" do
+    subject(:overheard) { result('overheard') }
+
+    it 'records none of what is said, whispered or thought as this character\'s silver, kills or bank' do
+      expect(overheard['kills']).to eq([])
+      expect(overheard['bank']).to eq([['bank_account', 100]])
+      expect(overheard['bounties']).to eq([])
+      expect(overheard['offers']).to eq([])
+    end
+
+    it "still reads the NPCs' lines in the main window, after a stream that never closed" do
+      expect(overheard['silver']).to eq([['box', nil, 75], ['expense', 'locksmith pool', 750]])
+    end
+  end
+
   describe 'silver, kills and deaths reports, death alert and backups' do
     subject(:money) { result('money_reports') }
 
