@@ -73,6 +73,10 @@ RSpec.describe 'analytics.lic' do
       expect(shops['visits'].map(&:last).compact.uniq).to eq(["Wehnimer's Landing", 'Solhaven'])
     end
 
+    it 'names an outpost with no town room close by after its own location' do
+      expect(shops['outpost']).to eq("Khazar's Hold")
+    end
+
     it 'files a sale under the shop it happened in, and whoever spoke as the name' do
       expect(shops['sales']).to match_array([['gemshop', 'jeweler', 5000], ['consignment', 'pawnbroker', 400],
                                              ['gemshop', 'jeweler', 2269]])

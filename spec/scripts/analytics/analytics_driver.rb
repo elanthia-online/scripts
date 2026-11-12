@@ -2243,22 +2243,29 @@ when 'progress'
 when 'shops'
   A::Database.connect!
   cfg = A::Settings.load(WHO)
-  # find_nearest_by_tag('town'): the town room each shop is nearest (Lich walks the map)
-  shop_room = Struct.new(:id, :tags, :location, :title, :town_room) do
-    def find_nearest_by_tag(tag) = tag == 'town' ? town_room : nil
+  # dijkstra(town rooms, static_only: true): the seconds to the town room each
+  # shop is nearest by the map's fixed paths (Lich walks the map). A walk that
+  # also takes paths depending on the session (an urchin guide) finds the
+  # other town nearer, so a room's town would hang on who walked it first.
+  shop_room = Struct.new(:id, :tags, :location, :title, :town_room, :seconds) do
+    def dijkstra(_towns, static_only: false)
+      [{}, static_only ? { town_room => seconds } : { 3 - town_room => 1 }]
+    end
   end
   ROOMS = {
-    10 => shop_room.new(10, ['town square'], "Wehnimer's Landing", '[Town Square]', 1),
-    20 => shop_room.new(20, ['gemshop', 'urchin guide gemshop'], "Wehnimer's Landing", '[Gems]', 1),
-    30 => shop_room.new(30, ['locksmith', 'locksmith pool'], 'the lowlands of Marshtown', '[Pool]', 2),
-    40 => shop_room.new(40, ['consignment'], 'Solhaven', '[Consignment]', 2),
-    50 => shop_room.new(50, ['locksmith pool'], 'Solhaven', '[Garret]', 2), # the priestess, in a room tagged for the pool
-    1  => shop_room.new(1, ['town'], "the town of Wehnimer's Landing", '[Town Square Central]', 1),
-    2  => shop_room.new(2, ['town'], 'the free port of Solhaven', '[Solhaven, North Market]', 2)
+    10 => shop_room.new(10, ['town square'], "Wehnimer's Landing", '[Town Square]', 1, 2),
+    20 => shop_room.new(20, ['gemshop', 'urchin guide gemshop'], "Wehnimer's Landing", '[Gems]', 1, 3),
+    30 => shop_room.new(30, ['locksmith', 'locksmith pool'], 'the lowlands of Marshtown', '[Pool]', 2, 2.6),
+    40 => shop_room.new(40, ['consignment'], 'Solhaven', '[Consignment]', 2, 1),
+    50 => shop_room.new(50, ['locksmith pool'], 'Solhaven', '[Garret]', 2, 1), # the priestess, in a room tagged for the pool
+    60 => shop_room.new(60, ['bank'], "Khazar's Hold", '[Bank]', 2, 182.6), # an outpost, three minutes from a town room
+    1  => shop_room.new(1, ['town'], "the town of Wehnimer's Landing", '[Town Square Central]', 1, 0),
+    2  => shop_room.new(2, ['town'], 'the free port of Solhaven', '[Solhaven, North Market]', 2, 0)
   }.freeze
   Object.const_set(:Room, Class.new do
     def self.current = ROOMS[$room_id]
     def self.[](id) = ROOMS[id]
+    def self.rooms_by_tag(tag) = ROOMS.values.select { |room| room.tags.include?(tag) }.map(&:id)
   end) unless defined?(Room)
   W = A::ShopWatcher
   A::SilverManager.start(WHO)
@@ -2312,7 +2319,7 @@ when 'shops'
   visits = A::Database.all('SELECT vendor, duration_seconds, silver, spent, room_id, town FROM vendor_visits ORDER BY start_time')
   sales = A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY timestamp, amount")
   result = { 'open' => open_visit && open_visit.transform_keys(&:to_s), 'visits' => visits.map(&:values), 'off' => off,
-             'sales' => sales.map(&:values), 'raced' => raced }
+             'sales' => sales.map(&:values), 'raced' => raced, 'outpost' => W.town_at(ROOMS[60]) }
 
 when 'pool'
   # The locksmith pool's list of our boxes, as eloot asks for it, and a box turned away
