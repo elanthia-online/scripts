@@ -44,7 +44,7 @@ RSpec.describe 'ELoot::Sell.handle_ingot' do
     mod = Module.new
     mod.define_singleton_method(:go2) { |place| recorder << [:go2, place] }
     mod.define_singleton_method(:silver_check) { silver[0] }
-    mod.define_singleton_method(:silver_deposit) { recorder << [:silver_deposit, ledger['Gemshop']] }
+    mod.define_singleton_method(:silver_deposit) { |**kw| recorder << [:silver_deposit, ledger['Gemshop']] && recorder << [:deposit_opts, kw] }
     mod.define_singleton_method(:in_hand?) { |item| hands.any? { |h| h.id == item.id } }
     mod.define_singleton_method(:data) { data }
     mod.define_singleton_method(:set_selling_containers) { |type:| recorder << [:set_selling_containers, type] && sacks }
@@ -128,6 +128,12 @@ RSpec.describe 'ELoot::Sell.handle_ingot' do
     expect(calls).to include([:silver_deposit, 4 * 2_245])
     expect(order.index(:silver_deposit)).to be > order.rindex(:sell_item)
     expect(order.index(:silver_deposit)).to be < calls.index([:go2, 4242])
+  end
+
+  it 'banks without reaching for the coin hand, which would free the box hand' do
+    harness.handle_ingot(stuck)
+
+    expect(calls).to include([:deposit_opts, { keep_hands: true }])
   end
 
   context 'when the dealer refuses a stored ingot' do
