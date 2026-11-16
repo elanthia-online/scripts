@@ -590,6 +590,11 @@ RSpec.describe 'analytics.lic' do
       expect(combat['rows'].find { |row| row[1] == 'mouser' }.values_at(2, 3, 4)).to eq([3, 2, 1])
     end
 
+    it "sums a recorder file without those columns as the recorder credited it, rather than not at all" do
+      # one credited kill, and a death credited to no one, which stays an assist
+      expect(combat['legacy']).to eq([['mouser', 2, 1, 1, 35]])
+    end
+
     it 'keeps the mark for the next run' do
       expect(combat['mark']).to be(true)
     end

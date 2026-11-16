@@ -2444,8 +2444,24 @@ when 'combat'
   left = SQLite3::Database.new(path)
   kept = %w[sessions creatures attacks flares resolutions hits statuses].to_h { |table| [table, left.get_first_value("SELECT COUNT(*) FROM #{table}")] }
   left.close
+  # A file from before the recorder stored who an attack belongs to beyond ours:
+  # summed as the recorder credited it, without the uncredited-kill rule
+  old_path = File.join(Dir.mktmpdir('analytics-combat-old'), 'analytics-combat.db')
+  old = SQLite3::Database.new(old_path)
+  old.execute_batch(<<~SQL)
+    CREATE TABLE creatures (id INTEGER PRIMARY KEY, session_id INTEGER, exist_id INTEGER, noun TEXT, name TEXT, first_seen REAL,
+                            last_seen REAL, killed_at REAL, killed_by_attack_id INTEGER, kill_credit TEXT);
+    CREATE TABLE attacks (id INTEGER PRIMARY KEY, session_id INTEGER, creature_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE flares (id INTEGER PRIMARY KEY, attack_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE hits (id INTEGER PRIMARY KEY, attack_id INTEGER, flare_id INTEGER, session_id INTEGER, creature_id INTEGER, damage INTEGER);
+    INSERT INTO creatures VALUES (1, 1, 301, 'mouser', 'mouser', 10, 40, 40, 1, 'crit'), (2, 1, 302, 'mouser', 'mouser', 20, 50, 50, NULL, NULL);
+    INSERT INTO attacks VALUES (1, 1, 1, 1), (2, 1, 2, 1);
+    INSERT INTO hits (attack_id, session_id, creature_id, damage) VALUES (1, 1, 1, 30), (2, 1, 2, 5);
+  SQL
+  old.close
+  legacy = manager.summarize(old_path, 0, 100).map { |row| row.values_at(:creature, :fought, :kills, :assists, :damage) }
   result = { 'rows' => first, 'mark' => A::Database.one('SELECT value FROM metadata WHERE key = ?', "combat_mark_#{WHO}")['value'].to_f.positive?,
-             'again' => again, 'kept' => kept }
+             'again' => again, 'kept' => kept, 'legacy' => legacy }
 
 when 'reload'
   # Loading the body again must not warn about redefined constants
