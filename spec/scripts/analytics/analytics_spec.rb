@@ -73,8 +73,8 @@ RSpec.describe 'analytics.lic' do
       expect(shops['visits'].map(&:last).compact.uniq).to eq(["Wehnimer's Landing", 'Solhaven'])
     end
 
-    it 'names an outpost with no town room close by after its own location' do
-      expect(shops['outpost']).to eq("Khazar's Hold")
+    it 'names an outpost with no town room close by after its own location, without its "the hamlet of"' do
+      expect(shops['outpost']).to eq(["Khazar's Hold", 'Ravelin'])
     end
 
     it 'files a sale under the shop it happened in, and whoever spoke as the name' do

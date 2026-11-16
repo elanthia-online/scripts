@@ -2348,6 +2348,7 @@ when 'shops'
     40 => shop_room.new(40, ['consignment'], 'Solhaven', '[Consignment]', 2, 1),
     50 => shop_room.new(50, ['locksmith pool'], 'Solhaven', '[Garret]', 2, 1), # the priestess, in a room tagged for the pool
     60 => shop_room.new(60, ['bank'], "Khazar's Hold", '[Bank]', 2, 182.6), # an outpost, three minutes from a town room
+    70 => shop_room.new(70, ['bank'], 'the hamlet of Ravelin', '[Ravelin Bank, Teller]', 2, 75), # past a gate the walk can't take
     1  => shop_room.new(1, ['town'], "the town of Wehnimer's Landing", '[Town Square Central]', 1, 0),
     2  => shop_room.new(2, ['town'], 'the free port of Solhaven', '[Solhaven, North Market]', 2, 0)
   }.freeze
@@ -2408,7 +2409,7 @@ when 'shops'
   visits = A::Database.all('SELECT vendor, duration_seconds, silver, spent, room_id, town FROM vendor_visits ORDER BY start_time')
   sales = A::Database.all("SELECT vendor_type, vendor_name, amount FROM silver_events WHERE source_category = 'sale' ORDER BY timestamp, amount")
   result = { 'open' => open_visit && open_visit.transform_keys(&:to_s), 'visits' => visits.map(&:values), 'off' => off,
-             'sales' => sales.map(&:values), 'raced' => raced, 'outpost' => W.town_at(ROOMS[60]) }
+             'sales' => sales.map(&:values), 'raced' => raced, 'outpost' => [W.town_at(ROOMS[60]), W.town_at(ROOMS[70])] }
 
 when 'pool'
   # The locksmith pool's list of our boxes, as eloot asks for it, and a box turned away
