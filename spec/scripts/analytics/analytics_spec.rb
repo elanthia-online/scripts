@@ -172,7 +172,7 @@ RSpec.describe 'analytics.lic' do
     end
 
     it 'puts EXPERIENCE and RESOURCE typed together on one row, though their output ends a second apart' do
-      expect(progress['paired']).to eq([{ 'fame' => 8100, 'resource_weekly' => 13_000 }])
+      expect(progress['paired']).to eq([{ 'fame' => 8100, 'resource_weekly' => 13_000, 'exp' => 900_500 }])
     end
 
     it 'keeps regular and ascension experience apart on cycles, and gives them fame only from a fresh reading' do

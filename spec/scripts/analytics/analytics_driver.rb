@@ -2216,9 +2216,11 @@ when 'progress'
   sleep 4.1
   experience.call(fame: '8,100', sting: 'Light', lte: 62, deeds: 14)
   sleep 1.1
+  $exp = 904_000 # the bar moved by the time RESOURCE ended: the row keeps what EXPERIENCE showed
   ['<output class="mono"/>', 'Health: 300/300     Mana: 80/80     Stamina: 120/120     Spirit: 10/10',
    'Devotion: 13,000/50,000 (Weekly)           68,000/200,000 (Total)', '<prompt time="2">&gt;</prompt>'].each { |line| DownstreamHook.run(line) }
   P.check(now: t + 4300)
+  $exp = 900_500
   P.stop(now: t + 5000) # and a last row
   # EXPERIENCE and RESOURCE typed together: two readings in one second, one row with both
   A::Database.flush
@@ -2247,7 +2249,7 @@ when 'progress'
     'gone' => [eased, rows.count { |r| r['deaths_sting'] == 'None' }], 'cycle_fame' => [stale[:fame], fresh[:fame]],
     'gone_row' => sting.call('None')&.slice('fame', 'deeds', 'long_term_exp'),
     'cycle' => cycle, 'schema' => A::Database.metadata('schema_version'), 'together' => together,
-    'paired' => rows.select { |r| r['fame'] == 8100 }.map { |r| r.slice('fame', 'resource_weekly') }
+    'paired' => rows.select { |r| r['fame'] == 8100 }.map { |r| r.slice('fame', 'resource_weekly', 'exp') }
   }
 
 when 'shops'
