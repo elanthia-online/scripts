@@ -390,8 +390,9 @@ RSpec.describe 'analytics.lic' do
     end
 
     it "counts a fossil charm's box coins as box silver, and coins on the ground only when no corpse just had them" do
-      expect(towns['kills']).to eq([['infernal death knight', 322], ['tatterdemalion ghast', 513]])
-      expect(towns['coins']).to eq([['floor', nil, 322], ['floor', nil, 111], ['box', 'charm', 1307]])
+      # a crumbled corpse's coins once; an ordinary corpse's silver went to the purse, so its size on the floor is floor
+      expect(towns['kills']).to eq([['hill troll', 700], ['infernal death knight', 322], ['tatterdemalion ghast', 513]])
+      expect(towns['coins']).to eq([['floor', nil, 322], ['floor', nil, 111], ['floor', nil, 700], ['box', 'charm', 1307]])
     end
 
     it 'moves the total for a teller that states no balance, and by the notes line that does' do
@@ -769,8 +770,8 @@ RSpec.describe 'analytics.lic' do
 
     it 'records each kill, ended by the prompt, the next search or stopping, with its silver' do
       expect(collector['kills']).to eq(
-        [['flesh monstrosity', 531, 'GS3', 'Splinter'], ['halfling cannibal', 1234, 'GS3', 'Splinter'], ['shambling lurk', 0, 'GS3', 'Splinter'],
-         ['veiled sentinel', 345, 'GS3', 'Splinter']]
+        [['cave troll', 612, 'GS3', 'Splinter'], ['flesh monstrosity', 531, 'GS3', 'Splinter'], ['halfling cannibal', 1234, 'GS3', 'Splinter'],
+         ['hill troll', 77, 'GS3', 'Splinter'], ['shambling lurk', 0, 'GS3', 'Splinter'], ['veiled sentinel', 345, 'GS3', 'Splinter']]
       )
     end
 
@@ -783,7 +784,9 @@ RSpec.describe 'analytics.lic' do
     end
 
     it "doesn't count a melted corpse's gathered coins again as floor silver" do
-      expect(collector['floor']).to eq([242, 531, 1234])
+      # and a crumbled corpse's coins picked up with GET COINS after the prompt aren't counted again;
+      # an ordinary corpse's 77, then a pile of 77, is floor silver
+      expect(collector['floor']).to eq([77, 242, 531, 1234])
     end
 
     it 'records a vendor visit and the price per item' do

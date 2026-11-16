@@ -502,6 +502,18 @@ when 'collector'
   DownstreamHook.run('You gather the remaining 531 <a exist="5" noun="coins">coins</a>.')
   DownstreamHook.run('You gather the remaining 242 <a exist="6" noun="coins">coins</a>.')
   DownstreamHook.run('<prompt time="1793074672">&gt;</prompt>')
+  # One that crumbles and isn't gathered: its coins are on the ground, and GET
+  # COINS after the prompt picks them up. The corpse's silver, counted once.
+  DownstreamHook.run('You search the cave troll.')
+  DownstreamHook.run('He had 612 silvers on him.')
+  DownstreamHook.run('A cave troll crumbles into a pile of dust.')
+  DownstreamHook.run('<prompt time="1793074672">&gt;</prompt>')
+  DownstreamHook.run('You gather the remaining 612 coins.')
+  # An ordinary corpse's silver goes to the purse: a pile the same size is floor silver
+  DownstreamHook.run('You search the hill troll.')
+  DownstreamHook.run('He had 77 silvers on him.')
+  DownstreamHook.run('<prompt time="1793074672">&gt;</prompt>')
+  DownstreamHook.run('You gather the remaining 77 coins.')
   # A selling script reporting its own visits (only heard with track_shops off)
   A::Settings.instance_variable_set(:@current, cfg.merge(track_shops: false))
   A::SilverManager.record_vendor_visit('gemshop', NOW - 100, NOW - 50, 12_345)
@@ -1181,8 +1193,12 @@ when 'other_towns'
     # A fossil charm: a box's coins are box silver. Coins on the ground are a
     # crumbled corpse's, already counted with its kill (this one or an earlier
     # one), or else floor silver. Another character's charm isn't ours.
-    'You search the infernal death knight.', 'She had 322 silvers on her.', '<prompt time="1793074672">&gt;</prompt>',
-    'You search the tatterdemalion ghast.', 'He had 513 silvers on him.', '<prompt time="1793074672">&gt;</prompt>',
+    'You search the infernal death knight.', 'She had 322 silvers on her.',
+    'The infernal death knight crumbles into a pile of dust.', '<prompt time="1793074672">&gt;</prompt>',
+    'You search the tatterdemalion ghast.', 'He had 513 silvers on him.',
+    'The tatterdemalion ghast fades into transparency, his remnants rapidly dissolving into the air.', '<prompt time="1793074672">&gt;</prompt>',
+    # an ordinary corpse: its 700 went to the purse, so the charm's 700 on the floor is floor silver
+    'You search the hill troll.', 'He had 700 silvers on him.', '<prompt time="1793074672">&gt;</prompt>',
     'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers.  They locate a ' \
     'stack of 322 coins on the ground, reclaiming them and returning to you.  The winged armored bugs retreat back inside the charm.',
     'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers.  They locate some ' \
@@ -1191,6 +1207,8 @@ when 'other_towns'
     'stack of 322 coins on the ground, reclaiming them and returning to you.  The winged armored bugs retreat back inside the charm.',
     'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers.  They locate a ' \
     'pile of 111 coins on the floor, reclaiming them and returning to you.  The winged armored bugs retreat back inside the charm.',
+    'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers.  They locate a ' \
+    'pile of 700 coins on the floor, reclaiming them and returning to you.  The winged armored bugs retreat back inside the charm.',
     'You summon a swarm of winged armored bugs from your shell fossil charm, which takes off in search of silvers inside a badly ' \
     'damaged silver box.  They locate a heap of 1,307 coins, reclaiming them and returning to you.  The winged armored bugs retreat.',
     'Raphael summons a swarm of winged armored bugs from his shell fossil charm, which takes off in search of silvers.  They locate ' \
