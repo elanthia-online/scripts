@@ -144,6 +144,12 @@ RSpec.describe 'analytics.lic' do
       expect(progress['eased']).to eq('deaths_sting' => 'Light', 'fame' => 7800)
     end
 
+    it "gives a reading's row the experience shown when it was taken, not when the row is written" do
+      # EXPERIENCE: the block's own figures; RESOURCE shows none, so the bar as its block ended
+      expect(progress['shown']).to eq([{ 'exp' => 900_500, 'ascension_exp' => 100_000 },
+                                       { 'exp' => 902_000, 'ascension_exp' => 100_000 }])
+    end
+
     it 'reads RESOURCE output into a row of its own, only from the block itself' do
       expect(progress['resource_check']).to be(true)
       expect(progress['resource']).to eq('resource_name' => 'Devotion', 'resource_weekly' => 12_345, 'resource_total' => 67_890,

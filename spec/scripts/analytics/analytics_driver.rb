@@ -81,7 +81,7 @@ end
 module Experience
   def self.txp = 1_000_000
   def self.exp = $exp || 900_000
-  def self.axp = 100_000
+  def self.axp = $axp || 100_000
   def self.until_next = 1500
   def self.deeds = 12
   def self.lte = 59
@@ -2174,7 +2174,12 @@ when 'progress'
   # EXPERIENCE typed right after a death: the total is the same, only the sting moved,
   # so infomon's time for the total doesn't move. The reading is read from the text.
   experience.call(fame: '7,777', sting: 'Sharp', lte: 61, deeds: 13)
+  # The bar moves on before the row is written: the row keeps what the block showed
+  $exp = 901_000
+  $axp = 100_400
   read = P.check(now: t + 410) # a new reading: at once
+  $exp = 900_500
+  $axp = nil
   # Another player's words, then the real training-point line
   DownstreamHook.run('Bob says, "PTPs/MTPs: 999/888 ATPs: 777"')
   DownstreamHook.run(%(Bob says, "      Total Exp: 1 Death's Sting: Harsh"))
@@ -2182,11 +2187,15 @@ when 'progress'
   DownstreamHook.run('<output class="mono"/>       PTPs/MTPs: 36/0                        ATPs: 6')
   tps = P.check(now: t + 420)
   sleep 4.1 # more than PAIR_SECONDS (in whole seconds) after the EXPERIENCE: a RESOURCE of its own
-  # RESOURCE output, as the game sends it, ended by the prompt
+  # RESOURCE output, as the game sends it, ended by the prompt; it shows no
+  # experience, so its row takes the bar as it stood when the block ended
+  $exp = 902_000
   ['<output class="mono"/>', 'Health: 280/<pushBold/>300<popBold/>     Mana: 40/80     Stamina: 120/120     Spirit: 10/10',
    'Devotion: 12,345/50,000 (Weekly)           67,890/200,000 (Total)', 'Suffused Devotion: 4,321', 'Voln Favor: 98,765',
    'Bob says, "Voln Favor: 1"', '<prompt time="1">&gt;</prompt>'].each { |line| DownstreamHook.run(line) }
+  $exp = 903_000
   resource = P.check(now: t + 450)
+  $exp = 900_500
   same = P.check(now: t + 500)         # nothing changed
   beat = P.check(now: t + 4100)        # the hourly heartbeat
   sleep 4.1 # apart from the RESOURCE before it
@@ -2230,6 +2239,7 @@ when 'progress'
                                                               'covert_arts_charges', 'fame', 'deaths_sting'),
     'first' => rows.first&.slice('level', 'exp', 'ascension_exp', 'until_next', 'fame', 'deeds', 'long_term_exp', 'deaths_sting', 'ptp', 'lumnis'),
     'reading' => sting.call('Sharp')&.slice('deaths_sting', 'fame', 'deeds', 'long_term_exp'),
+    'shown' => [sting.call('Sharp')&.slice('exp', 'ascension_exp'), rows.find { |r| r['resource_name'] }&.slice('exp', 'ascension_exp')],
     'reading_at_its_time' => sting.call('Sharp') && sting.call('Sharp')['timestamp'] < t + 30,
     'eased' => sting.call('Light')&.slice('deaths_sting', 'fame'),
     'heartbeat' => at.call(4100)&.slice('exp', 'deaths_sting', 'fame'),
