@@ -684,6 +684,25 @@ when 'dashboard'
   rescue StandardError => e
     e.class.name
   end
+  # nor a fraction (dashboard.port: 8080.5), which TCPServer would refuse with a TypeError
+  OUT.clear
+  result['fraction_port'] = begin
+    A::CLI.send(:start_dashboard, 8080.5, false)
+    [A::Dashboard.running?, OUT.any? { |line| line.include?("can't listen on port 8080.5") }]
+  rescue StandardError => e
+    e.class.name
+  end
+  # a port in range the computer won't let Lich listen on (below 1024 on some systems)
+  OUT.clear
+  TCPServer.define_singleton_method(:new) { |*| raise Errno::EACCES, 'bind(2) for "127.0.0.1" port 80' }
+  result['refused_port'] = begin
+    A::CLI.send(:start_dashboard, 80, false)
+    [A::Dashboard.running?, OUT.any? { |line| line.include?("can't listen on port 80 (") }]
+  rescue StandardError => e
+    e.class.name
+  ensure
+    TCPServer.singleton_class.send(:remove_method, :new)
+  end
   result['stopped'] = [!A::Dashboard.running?, A::Dashboard.instance_variable_get(:@api_conn).nil?]
 
 when 'autostart'

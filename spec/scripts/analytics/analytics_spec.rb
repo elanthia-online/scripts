@@ -1171,7 +1171,8 @@ RSpec.describe 'analytics.lic' do
     end
 
     it "says when a port can't be listened on, and carries on" do
-      expect(api['bad_port']).to eq([false, true])
+      # out of range, a fraction, and one the computer refuses
+      expect(api.values_at('bad_port', 'fraction_port', 'refused_port')).to all(eq([false, true]))
     end
 
     it 'refuses lan with an explanation and serves this computer only, printing the hosted URL' do
