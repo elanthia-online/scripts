@@ -581,7 +581,8 @@ RSpec.describe 'analytics.lic' do
       # creature only another fought is left out, the three-week-old one had no cycle, and the
       # rows summed under a dropped cycle in the hunt's time are replaced, not added to
       expect(combat['rows']).to eq([[1, 'battle-scarred foot ninja', 1, 1, 0, 80, 2, 80], [1, 'foot ninja', 1, 0, 1, 20, 1, 0],
-                                    [1, 'foot soldier', 2, 1, 0, 37, 2, 25], [1, 'mouser', 3, 2, 1, 25, 2, 15]])
+                                    [1, 'foot soldier', 2, 1, 0, 37, 2, 25], [1, 'mouser', 3, 2, 1, 25, 2, 15],
+                                    [1, 'sewer rat', 3, 1, 2, 10, 2, 0]])
     end
 
     it 'counts a kill the recorder credited to no one, or to a bleed, as ours when only this character attacked it' do
@@ -590,9 +591,11 @@ RSpec.describe 'analytics.lic' do
       expect(combat['rows'].find { |row| row[1] == 'mouser' }.values_at(2, 3, 4)).to eq([3, 2, 1])
     end
 
-    it "sums a recorder file without those columns as the recorder credited it, rather than not at all" do
-      # one credited kill, and a death credited to no one, which stays an assist
-      expect(combat['legacy']).to eq([['mouser', 2, 1, 1, 35]])
+    it 'gives no one the kill when anything else could have made it' do
+      # sewer rats: a groupmate's tremors or an orphan's damage during its life leaves an assist;
+      # another player's tick on one we never wounded isn't ours at all; an orphan after it died,
+      # and our own spell on a target the recorder couldn't place, don't block our kill
+      expect(combat['rows'].find { |row| row[1] == 'sewer rat' }.values_at(2, 3, 4)).to eq([3, 1, 2])
     end
 
     it 'keeps the mark for the next run' do
@@ -604,8 +607,8 @@ RSpec.describe 'analytics.lic' do
     end
 
     it "prunes only the recorder's hunts that ended long ago, with every row under them" do
-      expect(combat['kept']).to eq('sessions' => 1, 'creatures' => 8, 'attacks' => 13, 'flares' => 2, 'resolutions' => 0,
-                                   'hits' => 12, 'statuses' => 0)
+      expect(combat['kept']).to eq('sessions' => 1, 'creatures' => 12, 'attacks' => 22, 'flares' => 2, 'resolutions' => 0,
+                                   'hits' => 18, 'statuses' => 0)
     end
   end
 

@@ -2892,14 +2892,20 @@ module GS4Analytics
     OUR_KILL = '(a.ours = 1 OR EXISTS (SELECT 1 FROM hits h JOIN flares f ON f.id = h.flare_id ' \
                'WHERE h.attack_id = a.id AND h.creature_id = c.id AND f.ours = 1))'
     # The recorder credits no one with two kinds of kill: one whose death fell
-    # in a bleed's tick (an effect with no owning cast, unowned), and one it
-    # recorded no damage for (tremors, a cold snap). Either is ours when this
-    # character attacked it and no one else did.
-    OTHERS_ATTACKED = 'EXISTS (SELECT 1 FROM attacks o WHERE o.creature_id = c.id AND o.ours = 0 AND o.inbound = 0 ' \
-                      'AND o.unowned = 0 AND o.orphan = 0)'
-    # The columns that needs, in every file a Lich since attacks.ours writes;
-    # a file without them is summed without it
-    CREDIT_COLUMNS = %w[ours inbound unowned orphan].freeze
+    # in a tick (an effect with no owning cast, unowned: a bleed, but also a
+    # nearby player's curse or poison), and one it recorded no damage for
+    # (tremors, a cold snap). Either is ours when this character attacked it,
+    # dealt damage to it for a tick's kill, and nothing else could have:
+    # another player's attack on it; another player's spell with no target
+    # (an area spell such as tremors) during its life; or damage the recorder
+    # couldn't attribute (an orphan: a spell it has no definition for, which
+    # may be ours or a groupmate's) during its life. Those last two aren't
+    # tied to this creature, so they lean toward giving the kill to no one.
+    OTHERS_ATTACKED = 'EXISTS (SELECT 1 FROM attacks o WHERE o.ours = 0 AND o.inbound = 0 AND (' \
+                      '(o.creature_id = c.id AND o.unowned = 0 AND o.orphan = 0) OR ' \
+                      '(o.creature_id IS NULL AND o.session_id = c.session_id ' \
+                      'AND o.occurred_at BETWEEN c.first_seen AND c.killed_at AND (o.foreign_caster = 1 OR ' \
+                      '(o.orphan = 1 AND EXISTS (SELECT 1 FROM hits oh WHERE oh.attack_id = o.id AND oh.damage > 0))))))'
     # Each creature's sums, for the creatures first fought in [from, to)
     CREATURES_SQL = <<~SQL
       SELECT c.name, c.noun, c.killed_at,
@@ -2907,14 +2913,13 @@ module GS4Analytics
                WHERE h.creature_id = c.id AND #{OWN_HIT}) AS damage,
              (SELECT COUNT(*) FROM hits h JOIN attacks a ON a.id = h.attack_id
                WHERE h.creature_id = c.id AND h.damage > 0 AND #{OWN_HIT}) AS hits,
-             (SELECT #{OUR_KILL} FROM attacks a WHERE a.id = c.killed_by_attack_id) AS our_kill
-             %<credit>s
+             (SELECT #{OUR_KILL} FROM attacks a WHERE a.id = c.killed_by_attack_id) AS our_kill,
+             (SELECT a.unowned FROM attacks a WHERE a.id = c.killed_by_attack_id) AS tick_kill,
+             EXISTS (SELECT 1 FROM attacks a WHERE a.creature_id = c.id AND a.ours = 1) AS we_attacked,
+             #{OTHERS_ATTACKED} AS others
       FROM creatures c
       WHERE c.exist_id IS NOT NULL AND c.first_seen >= ? AND c.first_seen < ?
     SQL
-    UNCREDITED_SQL = ", (SELECT a.unowned FROM attacks a WHERE a.id = c.killed_by_attack_id) AS tick_kill,\n" \
-                     "EXISTS (SELECT 1 FROM attacks a WHERE a.creature_id = c.id AND a.ours = 1) AS we_attacked,\n" \
-                     "#{OTHERS_ATTACKED} AS others".freeze
     # When the creatures touched since the mark were first fought
     CHANGED_SQL = 'SELECT first_seen, MAX(COALESCE(last_seen, 0), COALESCE(killed_at, 0)) AS seen FROM creatures ' \
                   'WHERE exist_id IS NOT NULL AND (last_seen >= ? OR killed_at >= ?)'
@@ -3005,8 +3010,7 @@ module GS4Analytics
       # it hit that died to someone else's.
       def summarize(path, from, to)
         kinds = {}
-        sql = format(CREATURES_SQL, credit: credit_columns?(path) ? UNCREDITED_SQL : '')
-        recorder_rows(path, sql, [from, to]).each do |row|
+        recorder_rows(path, CREATURES_SQL, [from, to]).each do |row|
           damage = row['damage'].to_i
           kill = row['our_kill'].to_i == 1 || uncredited_kill?(row)
           next unless damage.positive? || kill
@@ -3026,17 +3030,12 @@ module GS4Analytics
         kinds.values
       end
 
-      def credit_columns?(path)
-        (@credit_columns ||= {}).fetch(path) do
-          have = recorder_rows(path, 'SELECT name FROM pragma_table_info(?)', ['attacks']).map { |row| row['name'] }
-          @credit_columns[path] = (CREDIT_COLUMNS - have).empty?
-        end
-      end
-
-      # A death the recorder credited to no one's attack, or to a bleed's tick,
-      # on a creature only this character attacked (see OTHERS_ATTACKED)
+      # A death the recorder credited to no one's attack, or to a tick on a
+      # creature this character wounded, when nothing else could have killed
+      # it (see OTHERS_ATTACKED)
       def uncredited_kill?(row)
-        return false unless row['killed_at'] && (row['our_kill'].nil? || row['tick_kill'].to_i == 1)
+        return false unless row['killed_at']
+        return false unless row['our_kill'].nil? || (row['tick_kill'].to_i == 1 && row['damage'].to_i.positive?)
 
         row['we_attacked'].to_i == 1 && row['others'].to_i.zero?
       end

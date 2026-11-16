@@ -2377,7 +2377,8 @@ when 'combat'
     CREATE TABLE creatures (id INTEGER PRIMARY KEY, session_id INTEGER, exist_id INTEGER, noun TEXT, name TEXT, first_seen REAL,
                             last_seen REAL, killed_at REAL, killed_by_attack_id INTEGER, kill_credit TEXT);
     CREATE TABLE attacks (id INTEGER PRIMARY KEY, session_id INTEGER, creature_id INTEGER, ours INTEGER NOT NULL DEFAULT 0,
-                          inbound INTEGER NOT NULL DEFAULT 0, unowned INTEGER NOT NULL DEFAULT 0, orphan INTEGER NOT NULL DEFAULT 0);
+                          inbound INTEGER NOT NULL DEFAULT 0, unowned INTEGER NOT NULL DEFAULT 0, orphan INTEGER NOT NULL DEFAULT 0,
+                          foreign_caster INTEGER NOT NULL DEFAULT 0, occurred_at REAL);
     CREATE TABLE flares (id INTEGER PRIMARY KEY, attack_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE resolutions (id INTEGER PRIMARY KEY, attack_id INTEGER);
     CREATE TABLE hits (id INTEGER PRIMARY KEY, attack_id INTEGER, flare_id INTEGER, session_id INTEGER, creature_id INTEGER, damage INTEGER);
@@ -2396,23 +2397,39 @@ when 'combat'
    [5, 105, 'foot soldier', 6, 'last_own_hit'],
    [7, 107, 'mouser', 9, 'window'],                  # bled out from our wound: the recorder credits the bleed's tick
    [8, 108, 'mouser', nil, nil],                     # died to our tremors, which the recorder saw do no damage
-   [9, 109, 'mouser', 12, 'window']].each do |id, exist, name, by, credit| # bled out, but another player hit it too
+   [9, 109, 'mouser', 12, 'window'], # bled out, but another player hit it too
+   [10, 110, 'sewer rat', nil, nil],  # we hit it; it died to unrecorded damage while a groupmate's tremors shook the room
+   [11, 111, 'sewer rat', 17, 'window'], # we missed; it died in a tick: another player's curse, not our bleed
+   [12, 112, 'sewer rat', nil, nil],  # we hit it; damage no one could be named for fell during its life
+   [13, 113, 'sewer rat', nil, nil]].each do |id, exist, name, by, credit| # ours: the orphan came after it died
+    killed = by || [8, 10, 12, 13].include?(id)
+    # the rats each live alone, a minute apart: the rule's no-target attacks are any in a creature's life
+    seen = id >= 10 ? t + 200 + ((id - 10) * 60) : t + id
     rec.execute('INSERT INTO creatures VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [id, exist, name.split.last, name, t + id, t + id + 30, (t + id + 30 if by || id == 8), by, credit])
+                [id, exist, name.split.last, name, seen, seen + 30, (seen + 30 if killed), by, credit])
   end
   rec.execute('INSERT INTO creatures VALUES (6, 2, 201, ?, ?, ?, ?, ?, 7, ?)', ['ninja', 'foot ninja', NOW - (21 * 86_400) + 10, NOW - (21 * 86_400) + 20, NOW - (21 * 86_400) + 20, 'crit'])
   # attacks: [id, creature, ours]; 6 is a creature's swing at us that our reactive flare (flare 1) answered
-  # 9 and 12 are bleed ticks (unowned); 14 is another player's
+  # 9, 12 and 17 are ticks (unowned); 14 is another player's
   [[1, 1, 1], [2, 1, 1], [3, 2, 1], [4, 2, 0], [5, 3, 0], [6, nil, 0], [7, 6, 1], [8, nil, 0],
-   [9, 7, 0], [10, 7, 1], [11, 8, 1], [12, 9, 0], [13, 9, 1], [14, 9, 0]].each do |id, creature, ours|
+   [9, 7, 0], [10, 7, 1], [11, 8, 1], [12, 9, 0], [13, 9, 1], [14, 9, 0],
+   [15, 10, 1], [17, 11, 0], [18, 11, 1], [19, 12, 1], [21, 13, 1]].each do |id, creature, ours|
     rec.execute('INSERT INTO attacks (id, session_id, creature_id, ours, inbound, unowned) VALUES (?, ?, ?, ?, ?, ?)',
-                [id, id == 7 ? 2 : 1, creature, ours, id == 6 ? 1 : 0, [9, 12].include?(id) ? 1 : 0])
+                [id, id == 7 ? 2 : 1, creature, ours, id == 6 ? 1 : 0, [9, 12, 17].include?(id) ? 1 : 0])
+  end
+  # No target: [id, when, orphan, another player's cast]. 16, a groupmate's tremors in rat 10's life;
+  # 20, an orphan in rat 12's; 22, an orphan after rat 13 died; 23, our own spell the recorder put on
+  # a target it couldn't place (not ours, not an orphan, not another player's), in rat 13's life
+  [[16, t + 205, 0, 1], [20, t + 325, 1, 0], [22, t + 415, 1, 0], [23, t + 385, 0, 0]].each do |id, at, orphan, foreign|
+    rec.execute('INSERT INTO attacks (id, session_id, creature_id, ours, orphan, foreign_caster, occurred_at) VALUES (?, 1, NULL, 0, ?, ?, ?)',
+                [id, orphan, foreign, at])
   end
   rec.execute('INSERT INTO flares VALUES (1, 6, 1), (2, 8, 1), (3, 7, 0)')
   rec.execute('INSERT INTO resolutions VALUES (1, 7)')
   # hits: [attack, flare, creature, damage]
   [[1, nil, 1, 50], [2, nil, 1, 30], [3, nil, 2, 20], [4, nil, 2, 90], [5, nil, 3, 70], [6, 1, 5, 25], [8, 2, 4, 12],
-   [10, nil, 7, 15], [11, nil, 8, 0], [13, nil, 9, 10], [14, nil, 9, 40]].each do |attack, flare, creature, damage|
+   [10, nil, 7, 15], [11, nil, 8, 0], [13, nil, 9, 10], [14, nil, 9, 40], [15, nil, 10, 5], [18, nil, 11, 0],
+   [19, nil, 12, 5], [20, nil, nil, 30], [22, nil, nil, 30], [23, nil, nil, 30]].each do |attack, flare, creature, damage|
     rec.execute('INSERT INTO hits (attack_id, flare_id, session_id, creature_id, damage) VALUES (?, ?, 1, ?, ?)', [attack, flare, creature, damage])
   end
   rec.execute('INSERT INTO hits (attack_id, session_id, creature_id, damage) VALUES (7, 2, 6, 40)')
@@ -2444,24 +2461,8 @@ when 'combat'
   left = SQLite3::Database.new(path)
   kept = %w[sessions creatures attacks flares resolutions hits statuses].to_h { |table| [table, left.get_first_value("SELECT COUNT(*) FROM #{table}")] }
   left.close
-  # A file from before the recorder stored who an attack belongs to beyond ours:
-  # summed as the recorder credited it, without the uncredited-kill rule
-  old_path = File.join(Dir.mktmpdir('analytics-combat-old'), 'analytics-combat.db')
-  old = SQLite3::Database.new(old_path)
-  old.execute_batch(<<~SQL)
-    CREATE TABLE creatures (id INTEGER PRIMARY KEY, session_id INTEGER, exist_id INTEGER, noun TEXT, name TEXT, first_seen REAL,
-                            last_seen REAL, killed_at REAL, killed_by_attack_id INTEGER, kill_credit TEXT);
-    CREATE TABLE attacks (id INTEGER PRIMARY KEY, session_id INTEGER, creature_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE flares (id INTEGER PRIMARY KEY, attack_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE hits (id INTEGER PRIMARY KEY, attack_id INTEGER, flare_id INTEGER, session_id INTEGER, creature_id INTEGER, damage INTEGER);
-    INSERT INTO creatures VALUES (1, 1, 301, 'mouser', 'mouser', 10, 40, 40, 1, 'crit'), (2, 1, 302, 'mouser', 'mouser', 20, 50, 50, NULL, NULL);
-    INSERT INTO attacks VALUES (1, 1, 1, 1), (2, 1, 2, 1);
-    INSERT INTO hits (attack_id, session_id, creature_id, damage) VALUES (1, 1, 1, 30), (2, 1, 2, 5);
-  SQL
-  old.close
-  legacy = manager.summarize(old_path, 0, 100).map { |row| row.values_at(:creature, :fought, :kills, :assists, :damage) }
   result = { 'rows' => first, 'mark' => A::Database.one('SELECT value FROM metadata WHERE key = ?', "combat_mark_#{WHO}")['value'].to_f.positive?,
-             'again' => again, 'kept' => kept, 'legacy' => legacy }
+             'again' => again, 'kept' => kept }
 
 when 'reload'
   # Loading the body again must not warn about redefined constants
