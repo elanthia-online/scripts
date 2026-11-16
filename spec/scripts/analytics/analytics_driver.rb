@@ -2008,6 +2008,12 @@ when 'overheard'
             # thoughts as one element, the form Lich's markup also reads, closed
             # by its own end tag
             '<stream id="thoughts">Penny: "You gather the remaining 9 coins from inside your box."</stream>',
+            # a thought over several lines, with the Spells window's element (a stream this
+            # character reads, the shape of Lich's GS login fixture) arriving inside it
+            '<pushStream id="thoughts"/><preset id="thought">[General]-GSIV:Penny: </preset>"Listen to this...',
+            '<stream id="Spells"><a exist="1" noun="spell">Spirit Warding I</a></stream>',
+            'You gather the remaining 9,999,998 coins from inside your box."',
+            '<popStream/>',
             # a line with a byte that isn't UTF-8: read without it, and the hooks go on
             "You gather the remaining 33 coins from inside your box.\xFF".dup.force_encoding('UTF-8'),
             # this character's own: the NPCs' lines, in the main window
