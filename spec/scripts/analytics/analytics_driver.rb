@@ -79,7 +79,7 @@ module Char
 end
 
 module Experience
-  def self.txp = 1_000_000
+  def self.txp = $txp || 1_000_000
   def self.exp = $exp || 900_000
   def self.axp = $axp || 100_000
   def self.until_next = 1500
@@ -1266,6 +1266,34 @@ when 'teller_listing'
   settle.call
   result['after_snapshot'] = total.call
   A::SilverManager.stop
+
+when 'crash_restart'
+  # Lich went down mid-cycle and this is the next start: the cycle it was in is
+  # its login's last, with nothing after it. One character per case.
+  A::Database.connect!
+  manager = A::CycleManager
+  close = lambda do |name, seen_ago:, reason: nil, start_exp: nil, type: :hunt|
+    who = A::Who.new('GS3', name)
+    A::Database.record_login(who, NOW - 7200, NOW - 7200)
+    A::Database.touch_login(who, NOW - 7200, NOW - seen_ago)
+    id = A::Database.start_cycle(who, type, 'bigshot', 'splinter_crags', start_exp ? { exp_total: start_exp } : {})
+    run_sql('UPDATE cycles SET start_time = ?, rest_reason = ? WHERE cycle_id = ?', NOW - seen_ago - 600, reason, id)
+    manager.instance_variable_set(:@who, who)
+    manager.send(:close_stale_cycles)
+    A::Database.flush
+    A::Database.one('SELECT rest_reason, exp_total_end, exp_regular_end, exp_asc_end, exp_field_end, fame_end, encumbrance_end ' \
+                    'FROM cycles WHERE cycle_id = ?', id).values
+  end
+  result = {
+    'recent' => close.call('Leonardo', seen_ago: 300, start_exp: 990_000),
+    'past_the_hour' => close.call('Raphael', seen_ago: 3700, start_exp: 990_000),
+    'below_start' => close.call('Bebop', seen_ago: 300, start_exp: 1_200_000),
+    'rest' => close.call('April', seen_ago: 300, reason: 'wounded.', type: :rest),
+    'stopped' => close.call('Casey', seen_ago: 300, reason: 'hunt stopped')
+  }
+  $txp = 0 # the game hasn't sent experience yet
+  result['no_game_yet'] = close.call('Karai', seen_ago: 300) # its start wasn't read either
+  $txp = nil
 
 when 'cycle_edges'
   # The collector's first moments, and a hunt that ends in a death

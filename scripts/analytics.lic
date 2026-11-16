@@ -543,6 +543,16 @@ module GS4Analytics
 
     # Cycles shorter than this are state flapping, not real hunts or rests
     MIN_CYCLE_SECONDS = 10
+    # A crash this recent: the readings at the next start are the crashed
+    # cycle's end. A paid account absorbs 15 exp per 10 minutes logged out
+    # (FLAG OFFLINEEXP, on by default), so up to 90 land on it
+    STALE_READING_SECONDS = 3600
+    # What a cycle a crash left open is marked: 'crashed', or with the reason it
+    # already had (a rest bigshot started: 'crashed (wounded)'). A hunt stopped
+    # by hand is no crash, and a crash is marked once.
+    CRASH_REASON = Sequel.lit("CASE WHEN NULLIF(rest_reason, '') IS NULL THEN 'crashed' " \
+                              "WHEN rest_reason = 'hunt stopped' OR rest_reason LIKE 'crashed%' THEN rest_reason " \
+                              "ELSE 'crashed (' || rest_reason || ')' END")
     # The readings end_cycle takes at a cycle's end, by the column each comes
     # from at a cycle's start (close_cycle takes them from the next cycle)
     END_READINGS = { exp_total_end: :exp_total_start, exp_regular_end: :exp_regular_start, exp_asc_end: :exp_asc_start,
@@ -790,14 +800,19 @@ module GS4Analytics
         db[:cycles].where(cycle_id: cycle_id).update(values)
       end
 
-      # Ends a cycle that a crash left open, marked 'crashed' unless it has a
-      # reason already (a rest keeps why it started). +after+ is the id of
-      # the cycle that started at +finish+, when that's where it ends: its
-      # starting readings are this one's end, so its experience still counts.
-      def close_cycle(cycle_id, start_time, finish, after: nil)
-        values = { end_time: finish, duration_seconds: finish - start_time.to_i,
-                   rest_reason: Sequel.function(:coalesce, Sequel.function(:nullif, :rest_reason, ''), 'crashed') }
+      # Ends a cycle that a crash left open, marked as CRASH_REASON says.
+      # +after+ is the id of the cycle that started at +finish+, when that's
+      # where it ends: its starting readings are this one's end, so its
+      # experience still counts. Otherwise +now+ (readings taken at the next
+      # start, by the start columns' names) ends it, when they're no less
+      # than its own start's.
+      def close_cycle(cycle_id, start_time, finish, after: nil, now: nil)
+        values = { end_time: finish, duration_seconds: finish - start_time.to_i, rest_reason: CRASH_REASON }
         reading = after && db[:cycles].where(cycle_id: after).select(*END_READINGS.values).first
+        if reading.nil? && now
+          started = db[:cycles].where(cycle_id: cycle_id).get(:exp_total_start)
+          reading = now if started.nil? || now[:exp_total_start].to_i >= started.to_i
+        end
         END_READINGS.each { |col, from| values[col] = reading[from] } if reading
         db[:cycles].where(cycle_id: cycle_id).update(values)
       end
@@ -3478,6 +3493,7 @@ module GS4Analytics
       def close_stale_cycles
         stale = Database.all('SELECT cycle_id, start_time FROM cycles WHERE game = ? AND character = ? ' \
                              'AND end_time IS NULL', *@who)
+        current = nil
         stale.each do |cycle|
           start = cycle['start_time'].to_i
           next_row = Database.one('SELECT cycle_id, start_time FROM cycles WHERE game = ? AND character = ? ' \
@@ -3488,9 +3504,21 @@ module GS4Analytics
           finish = [following, seen].compact.map(&:to_i).min || start
           finish = start if finish < start
           after = next_row['cycle_id'] if following && finish == following.to_i
-          Database.async { Database.close_cycle(cycle['cycle_id'], start, finish, after: after) }
+          # The cycle the crash was in, its login's last: what the game shows
+          # now is its end, if the crash was recent and the game has shown it
+          now = (current ||= restart_readings) if !following && seen && Time.now.to_i - finish <= Database::STALE_READING_SECONDS
+          Database.async { Database.close_cycle(cycle['cycle_id'], start, finish, after: after, now: now) }
         end
         Log.info("Closed #{stale.size} stale open cycle(s)") if stale.any?
+      end
+
+      # The readings as a cycle's start would take them, or nil while the game
+      # hasn't sent any experience yet (just after a start)
+      def restart_readings
+        vitals = Vitals.read
+        return nil unless vitals[:exp_total].to_i.positive?
+
+        Database::END_READINGS.values.to_h { |from| [from, vitals[from.to_s.delete_suffix('_start').to_sym]] }
       end
 
       def check_hunt_timeout

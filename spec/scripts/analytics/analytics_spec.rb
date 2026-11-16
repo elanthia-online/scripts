@@ -930,6 +930,24 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'a crash, then the next start' do
+    subject(:crash) { result('crash_restart') }
+
+    it 'ends the cycle Lich went down in with the readings at the next start, when that was within the hour' do
+      # fame is only from a fresh EXPERIENCE reading, so none
+      expect(crash['recent']).to eq(['crashed', 1_000_000, 900_000, 100_000, 400, nil, 12.5])
+    end
+
+    it 'leaves its end unknown when the crash was longer ago, the game has shown nothing yet, or the reading is below its start' do
+      expect(crash.values_at('past_the_hour', 'no_game_yet', 'below_start')).to all(eq(['crashed', nil, nil, nil, nil, nil, nil]))
+    end
+
+    it 'marks a rest with its reason kept, so it still counts as a crash, and leaves a hunt stopped by hand alone' do
+      expect(crash['rest'].first).to eq('crashed (wounded.)')
+      expect(crash['stopped'].first).to eq('hunt stopped')
+    end
+  end
+
   describe 'cycle edges' do
     subject(:edges) { result('cycle_edges') }
 
@@ -941,9 +959,9 @@ RSpec.describe 'analytics.lic' do
       expect(edges['reopened']).to eq([240, 100])
     end
 
-    it "marks a cycle a crash left open as 'crashed' unless it has a reason, with the next cycle's readings when it ends there" do
-      # the hunt ends when its login was last seen, so its end readings are unknown
-      expect(edges['crash_closed']).to eq([['bounty', nil, nil, nil, nil, nil, nil],
+    it "marks a cycle a crash left open as crashed, keeping a reason it had, with the next cycle's readings when it ends there" do
+      # the hunt was its login's last, seen 8 minutes ago: it ends with the readings at this start
+      expect(edges['crash_closed']).to eq([['crashed (bounty)', 1_000_000, 900_000, 100_000, 400, nil, 12.5],
                                            ['crashed', 5000, 4900, 100, 40, 70, 12.5]])
     end
 
