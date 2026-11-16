@@ -1145,8 +1145,13 @@ RSpec.describe 'analytics.lic' do
       expect(api['redirect']).to eq(['302', api['expected_location'], api['custom_location']])
     end
 
-    it 'sends no-store, nosniff, a CSP with no page allowances, and cross-origin resource policy' do
-      expect(api['headers']).to eq(['nosniff', 'no-store', "default-src 'none'; frame-ancestors 'none'", 'cross-origin'])
+    it 'sends no-store, nosniff, a CSP with no page allowances, and same-origin resource policy' do
+      expect(api['headers']).to eq(['nosniff', 'no-store', "default-src 'none'; frame-ancestors 'none'", 'same-origin'])
+    end
+
+    it "refuses another site's no-cors load of the API, and nothing else" do
+      expect(api['fetch_site']).to eq('no_cors_db' => '403', 'no_cors_meta' => '403', 'site_fetch' => '200', 'curl' => '200',
+                                      'typed' => '200', 'linked_root' => '302', 'two' => '400')
     end
 
     it 'answers only GET for known paths' do

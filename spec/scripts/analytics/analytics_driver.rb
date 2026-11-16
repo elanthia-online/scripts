@@ -663,6 +663,17 @@ when 'dashboard'
     'too_many'          => raw_status.call(['Host: localhost'] + Array.new(150) { |i| "X-#{i}: 1" }),
     'long_request_line' => raw_status.call(['Host: localhost'], "/api/meta?x=#{'a' * 5000}")
   }
+  # Another site's no-cors load (an image, a no-cors fetch) is refused before the database is built;
+  # the site's own CORS fetch, curl and a typed address are not, and a link to / still redirects
+  result['fetch_site'] = {
+    'no_cors_db'  => raw_status.call(['Host: 127.0.0.1', 'Sec-Fetch-Site: cross-site', 'Sec-Fetch-Mode: no-cors'], '/api/db'),
+    'no_cors_meta' => raw_status.call(['Host: 127.0.0.1', 'Sec-Fetch-Site: cross-site'], '/api/meta'),
+    'site_fetch'  => raw_status.call(['Host: 127.0.0.1', 'Sec-Fetch-Site: cross-site', "Origin: #{site}"], '/api/meta'),
+    'curl'        => raw_status.call(['Host: 127.0.0.1'], '/api/meta'),
+    'typed'       => raw_status.call(['Host: 127.0.0.1', 'Sec-Fetch-Site: none'], '/api/meta'),
+    'linked_root' => raw_status.call(['Host: 127.0.0.1', 'Sec-Fetch-Site: cross-site'], '/'),
+    'two'         => raw_status.call(['Host: 127.0.0.1', 'Sec-Fetch-Site: none', 'Sec-Fetch-Site: cross-site'], '/api/meta')
+  }
   # An unexpected error answers 500, still readable by the site (CORS), so it isn't taken for a script that's not running
   A::Dashboard.singleton_class.send(:alias_method, :real_meta, :meta)
   A::Dashboard.define_singleton_method(:meta) { raise 'boom' }
