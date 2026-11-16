@@ -930,6 +930,18 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'progress readings close together' do
+    subject(:pairs) { result('progress_pairs') }
+
+    it 'records a sting that faded in the same second as the EXPERIENCE that showed it as gone' do
+      expect(pairs['faded'].first).to eq('None')
+    end
+
+    it "keeps an EXPERIENCE's experience when its RESOURCE arrives after the minute's check" do
+      expect(pairs['split']).to eq(['None', 900_500, 13_000])
+    end
+  end
+
   describe 'a crash, then the next start' do
     subject(:crash) { result('crash_restart') }
 

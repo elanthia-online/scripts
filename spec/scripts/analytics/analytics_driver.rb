@@ -2298,6 +2298,37 @@ when 'progress'
     'paired' => rows.select { |r| r['fame'] == 8100 }.map { |r| r.slice('fame', 'resource_weekly', 'exp') }
   }
 
+when 'progress_pairs'
+  # Readings close together: a sting that fades in the second EXPERIENCE showed
+  # it, and the minute's check falling between an EXPERIENCE and its RESOURCE
+  A::Database.connect!
+  P = A::ProgressManager
+  experience = lambda do |fame:, sting:|
+    ['<output class="mono"/>', '', "          Level: 100                         Fame: #{fame}",
+     '     Experience: 900,500             Field Exp: 400/800', '  Ascension Exp: 100,000          Recent Deaths: 1',
+     "      Total Exp: 1,000,500         Death's Sting: #{sting}", '  Long-Term Exp: 61                  Deeds: 13',
+     '     Exp to next TP: 1,500'].each { |line| DownstreamHook.run(line) }
+  end
+  $exp = 900_500
+  P.start(WHO)
+  sleep 0.3
+  sleep(1.05 - (Time.now.to_f % 1)) # both in one second
+  experience.call(fame: '9,000', sting: 'Light')
+  DownstreamHook.run('You feel the sting of a recent death slowly fade away.')
+  P.check(now: Time.now.to_i + 10)
+  sleep 4.1
+  experience.call(fame: '9,100', sting: 'None')
+  P.check(now: Time.now.to_i + 20) # the check, before RESOURCE's output
+  $exp = 906_000                   # a pulse in between
+  ['<output class="mono"/>', 'Health: 300/300     Mana: 80/80     Stamina: 120/120     Spirit: 10/10',
+   'Devotion: 13,000/50,000 (Weekly)           68,000/200,000 (Total)', '<prompt time="3">&gt;</prompt>'].each { |line| DownstreamHook.run(line) }
+  P.check(now: Time.now.to_i + 30)
+  P.stop(now: Time.now.to_i + 40) # its last row at a time of its own
+  A::Database.flush
+  row = ->(fame) { A::Database.one('SELECT deaths_sting, exp, resource_weekly FROM progress WHERE fame = ?', fame)&.values }
+  result = { 'faded' => row.call(9000), 'split' => row.call(9100) }
+  $exp = nil
+
 when 'shops'
   A::Database.connect!
   cfg = A::Settings.load(WHO)

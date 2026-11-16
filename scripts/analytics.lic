@@ -1536,10 +1536,6 @@ module GS4Analytics
     STING_RE = /\A\s+Total Exp: [\d,]+\s+Death's Sting: (\w+)\s*\z/
     LTE_RE   = /\A\s+Long-Term Exp: ([\d,]+)\s+Deeds: (\d+)\s*\z/
     END_RE   = /\A\s+Exp (?:until lvl|to next TP): -?[\d,]+/
-    # The experience the block shows, for its own row: the progress bar Lich
-    # reads has moved on by the time the row is written (up to CHECK_EVERY)
-    SHOWN_EXP_RE = /\A\s+Experience: ([\d,]+)\s+Field Exp:/
-    SHOWN_ASC_RE = /\A\s+Ascension Exp: ([\d,]+)\s+Recent Deaths:/
     # RESOURCE output, the same way: from its Health/Mana line to the prompt
     RES_START_RE = %r{\AHealth: \d+/\d+\s+Mana: \d+/\d+\s+Stamina: }
     RESOURCE_RE  = %r{\A(Essence|Necrotic Energy|Lore Knowledge|Motes of Tranquility|Devotion|Nature's Grace|Grit|Luck Inspiration|Guile|Vitality): ([\d,]+)/50,000 \(Weekly\)\s+([\d,]+)/200,000 \(Total\)\s*\z}
@@ -1563,6 +1559,8 @@ module GS4Analytics
     # old reading is never stamped as current.
     READINGS = %i[fame deeds long_term_exp deaths_sting resource_name resource_weekly resource_total
                   suffused voln_favor covert_arts_charges shadow_essence].freeze
+    # What a RESOURCE reading paired with an EXPERIENCE leaves to it
+    EXPERIENCE_STATE = %i[level exp ascension_exp until_next].freeze
 
     class << self
       # When the last EXPERIENCE reading passed (Vitals uses it for fame on cycles)
@@ -1612,16 +1610,21 @@ module GS4Analytics
         unread = READINGS.to_h { |key| [key, nil] }
         readings = []
         readings << @readings.pop until @readings.empty?
-        # EXPERIENCE and RESOURCE typed together share a second: one row, and
-        # the experience EXPERIENCE showed wins over the bar RESOURCE took
+        # Readings in one second are one row: each value as the later reading
+        # left it (a sting that faded after the EXPERIENCE that showed it), and
+        # the game's state as EXPERIENCE's moment had it
         readings = readings.group_by { |reading| reading[:at] }.map do |_, same|
-          same.sort_by { |reading| reading.key?(:fame) ? 1 : 0 }
-              .reduce { |row, reading| row.merge(reading) { |key, a, b| key == :state ? a.merge(b) : b } }
+          same.reduce do |row, reading|
+            row.merge(reading) { |key, a, b| key == :state && !reading.key?(:fame) ? b.merge(a) : b }
+          end
         end
         who = @who
         readings.each_with_index do |reading, i|
           # what the game showed when the reading was taken, not what it shows now
           row = values.merge(reading[:state] || {}, unread, reading.slice(*READINGS))
+          # A RESOURCE paired with an EXPERIENCE the minute's check already
+          # wrote: that row's experience stands (the upsert keeps what's left out)
+          row = row.except(*EXPERIENCE_STATE) if reading[:paired] && !reading.key?(:fame)
           if @tp && i == readings.size - 1 # the training points shown with the last of them
             row = row.merge(@tp)
             @tp = nil
@@ -1678,7 +1681,8 @@ module GS4Analytics
       def stamp(kind)
         now = Time.now.to_i
         last = @stamped
-        if last && last[:kind] != kind && now - last[:at] <= PAIR_SECONDS
+        @paired = last && last[:kind] != kind && now - last[:at] <= PAIR_SECONDS
+        if @paired
           @stamped = nil
           return last[:at]
         end
@@ -1691,7 +1695,8 @@ module GS4Analytics
         if text.match?(RES_START_RE)
           @resource = {}
         elsif line.include?('<prompt')
-          @readings << @resource.merge(at: stamp(:resource), state: read) unless @resource.empty?
+          at = stamp(:resource)
+          @readings << @resource.merge(at: at, state: read, paired: @paired) unless @resource.empty?
           @resource = nil
         elsif (found = text.match(RESOURCE_RE))
           @resource.merge!(resource_name: found[1], resource_weekly: digits(found[2]), resource_total: digits(found[3]))
@@ -1710,7 +1715,6 @@ module GS4Analytics
       # Runs on the game-text thread: only remembers what it read
       def on_line(line)
         return line unless line.include?('PTPs/MTPs') || line.include?('Fame: ') || line.include?('Death') ||
-                           line.include?('Experience: ') || line.include?('Ascension Exp: ') ||
                            line.include?('Deeds: ') || line.include?('Exp ') || line.include?('sting of a recent death') ||
                            line.include?('Health: ') || (@resource && (line.include?(': ') || line.include?('<prompt')))
 
@@ -1721,10 +1725,6 @@ module GS4Analytics
           @tp = { ptp: digits(found[1]), mtp: digits(found[2]), atp: found[3] && digits(found[3]) }.compact
         elsif (found = text.match(FAME_RE))
           @block = { fame: digits(found[1]) }
-        elsif @block && (found = text.match(SHOWN_EXP_RE))
-          @block[:shown] = (@block[:shown] || {}).merge(exp: digits(found[1]))
-        elsif @block && (found = text.match(SHOWN_ASC_RE))
-          @block[:shown] = (@block[:shown] || {}).merge(ascension_exp: digits(found[1]))
         elsif @block && (found = text.match(STING_RE))
           @block[:deaths_sting] = found[1]
         elsif @block && (found = text.match(LTE_RE))
@@ -1732,8 +1732,10 @@ module GS4Analytics
           @block[:deeds] = found[2].to_i
         elsif @block && text.match?(END_RE)
           at = stamp(:experience)
-          shown = @block.delete(:shown) || {}
-          @readings << @block.merge(at: at, state: read.merge(shown))
+          # The progress bar as the block ends: on two characters' three days of
+          # EXPERIENCE it matched the block's own figures every time, and unlike
+          # the text no other player's words can reach it
+          @readings << @block.merge(at: at, state: read)
           @read_at = at
           @block = nil
         elsif text.strip.match?(STING_GONE_RE)
