@@ -2376,7 +2376,8 @@ when 'combat'
     CREATE TABLE sessions (id INTEGER PRIMARY KEY, character TEXT, source TEXT, started_at REAL NOT NULL, ended_at REAL);
     CREATE TABLE creatures (id INTEGER PRIMARY KEY, session_id INTEGER, exist_id INTEGER, noun TEXT, name TEXT, first_seen REAL,
                             last_seen REAL, killed_at REAL, killed_by_attack_id INTEGER, kill_credit TEXT);
-    CREATE TABLE attacks (id INTEGER PRIMARY KEY, session_id INTEGER, creature_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE attacks (id INTEGER PRIMARY KEY, session_id INTEGER, creature_id INTEGER, ours INTEGER NOT NULL DEFAULT 0,
+                          inbound INTEGER NOT NULL DEFAULT 0, unowned INTEGER NOT NULL DEFAULT 0, orphan INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE flares (id INTEGER PRIMARY KEY, attack_id INTEGER, ours INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE resolutions (id INTEGER PRIMARY KEY, attack_id INTEGER);
     CREATE TABLE hits (id INTEGER PRIMARY KEY, attack_id INTEGER, flare_id INTEGER, session_id INTEGER, creature_id INTEGER, damage INTEGER);
@@ -2392,19 +2393,26 @@ when 'combat'
    [2, 102, 'foot ninja', 4, 'window'],              # we hit it, another player finished it
    [3, 103, 'mutated rat', 5, 'window'],             # someone else's fight
    [4, 104, 'foot soldier', nil, nil],               # only our shield's spikes, and it got away
-   [5, 105, 'foot soldier', 6, 'last_own_hit']].each do |id, exist, name, by, credit|
+   [5, 105, 'foot soldier', 6, 'last_own_hit'],
+   [7, 107, 'mouser', 9, 'window'],                  # bled out from our wound: the recorder credits the bleed's tick
+   [8, 108, 'mouser', nil, nil],                     # died to our tremors, which the recorder saw do no damage
+   [9, 109, 'mouser', 12, 'window']].each do |id, exist, name, by, credit| # bled out, but another player hit it too
     rec.execute('INSERT INTO creatures VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [id, exist, name.split.last, name, t + id, t + id + 30, (t + id + 30 if by), by, credit])
+                [id, exist, name.split.last, name, t + id, t + id + 30, (t + id + 30 if by || id == 8), by, credit])
   end
   rec.execute('INSERT INTO creatures VALUES (6, 2, 201, ?, ?, ?, ?, ?, 7, ?)', ['ninja', 'foot ninja', NOW - (21 * 86_400) + 10, NOW - (21 * 86_400) + 20, NOW - (21 * 86_400) + 20, 'crit'])
   # attacks: [id, creature, ours]; 6 is a creature's swing at us that our reactive flare (flare 1) answered
-  [[1, 1, 1], [2, 1, 1], [3, 2, 1], [4, 2, 0], [5, 3, 0], [6, nil, 0], [7, 6, 1], [8, nil, 0]].each do |id, creature, ours|
-    rec.execute('INSERT INTO attacks VALUES (?, ?, ?, ?)', [id, id == 7 ? 2 : 1, creature, ours])
+  # 9 and 12 are bleed ticks (unowned); 14 is another player's
+  [[1, 1, 1], [2, 1, 1], [3, 2, 1], [4, 2, 0], [5, 3, 0], [6, nil, 0], [7, 6, 1], [8, nil, 0],
+   [9, 7, 0], [10, 7, 1], [11, 8, 1], [12, 9, 0], [13, 9, 1], [14, 9, 0]].each do |id, creature, ours|
+    rec.execute('INSERT INTO attacks (id, session_id, creature_id, ours, inbound, unowned) VALUES (?, ?, ?, ?, ?, ?)',
+                [id, id == 7 ? 2 : 1, creature, ours, id == 6 ? 1 : 0, [9, 12].include?(id) ? 1 : 0])
   end
   rec.execute('INSERT INTO flares VALUES (1, 6, 1), (2, 8, 1), (3, 7, 0)')
   rec.execute('INSERT INTO resolutions VALUES (1, 7)')
   # hits: [attack, flare, creature, damage]
-  [[1, nil, 1, 50], [2, nil, 1, 30], [3, nil, 2, 20], [4, nil, 2, 90], [5, nil, 3, 70], [6, 1, 5, 25], [8, 2, 4, 12]].each do |attack, flare, creature, damage|
+  [[1, nil, 1, 50], [2, nil, 1, 30], [3, nil, 2, 20], [4, nil, 2, 90], [5, nil, 3, 70], [6, 1, 5, 25], [8, 2, 4, 12],
+   [10, nil, 7, 15], [11, nil, 8, 0], [13, nil, 9, 10], [14, nil, 9, 40]].each do |attack, flare, creature, damage|
     rec.execute('INSERT INTO hits (attack_id, flare_id, session_id, creature_id, damage) VALUES (?, ?, 1, ?, ?)', [attack, flare, creature, damage])
   end
   rec.execute('INSERT INTO hits (attack_id, session_id, creature_id, damage) VALUES (7, 2, 6, 40)')

@@ -581,7 +581,13 @@ RSpec.describe 'analytics.lic' do
       # creature only another fought is left out, the three-week-old one had no cycle, and the
       # rows summed under a dropped cycle in the hunt's time are replaced, not added to
       expect(combat['rows']).to eq([[1, 'battle-scarred foot ninja', 1, 1, 0, 80, 2, 80], [1, 'foot ninja', 1, 0, 1, 20, 1, 0],
-                                    [1, 'foot soldier', 2, 1, 0, 37, 2, 25]])
+                                    [1, 'foot soldier', 2, 1, 0, 37, 2, 25], [1, 'mouser', 3, 2, 1, 25, 2, 15]])
+    end
+
+    it 'counts a kill the recorder credited to no one, or to a bleed, as ours when only this character attacked it' do
+      # mousers: bled out from our wound, and died to tremors that showed no damage, are kills;
+      # the one another player hit too is an assist
+      expect(combat['rows'].find { |row| row[1] == 'mouser' }.values_at(2, 3, 4)).to eq([3, 2, 1])
     end
 
     it 'keeps the mark for the next run' do
@@ -593,8 +599,8 @@ RSpec.describe 'analytics.lic' do
     end
 
     it "prunes only the recorder's hunts that ended long ago, with every row under them" do
-      expect(combat['kept']).to eq('sessions' => 1, 'creatures' => 5, 'attacks' => 7, 'flares' => 2, 'resolutions' => 0,
-                                   'hits' => 8, 'statuses' => 0)
+      expect(combat['kept']).to eq('sessions' => 1, 'creatures' => 8, 'attacks' => 13, 'flares' => 2, 'resolutions' => 0,
+                                   'hits' => 12, 'statuses' => 0)
     end
   end
 
