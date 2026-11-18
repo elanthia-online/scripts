@@ -2514,3 +2514,263 @@ RSpec.describe 'bigshot split_xx command parsing' do
     expect(bs.split_xx('incant 903, kill (x2)')).to eq(['incant 903', 'kill', 'kill'])
   end
 end
+
+# Room-claim handling while hunting. When bigshot lands in a room it doesn't
+# own (fear or another forced move, or the claim otherwise lapsing),
+# attack_break refuses to attack ("No Claim"). do_hunt and bs_wander must not
+# keep handing it a target there, or bigshot spins in place without moving,
+# without attacking, and without ever sleeping.
+module BigshotClaimSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  DO_HUNT_SRC = extract(/^  def do_hunt\(\).*?^  end$/m, 'do_hunt')
+  BS_WANDER_SRC = extract(/^  def bs_wander\(new_room: true\).*?^  end$/m, 'bs_wander')
+
+  # Raised by stubs to stop do_hunt/bs_wander's endless loops once a spec
+  # has seen what it needs.
+  class Stop < StandardError; end
+
+  class Harness
+    module Lich
+      module Gemstone
+        module Group
+          def self.broken?
+            false
+          end
+        end
+      end
+    end
+
+    module Stats
+      def self.prof
+        'Rogue'
+      end
+    end
+
+    Followers = Struct.new(:events) do
+      def add_event(event)
+        events << event
+      end
+
+      def all_present?
+        true
+      end
+
+      def looting_done
+        true
+      end
+
+      def roundtime?
+        false
+      end
+    end
+
+    Inbounds = Struct.new(:valid?)
+
+    attr_accessor :claim, :disks_clear, :npcs, :on_sleep, :attacks, :moves, :wander_calls, :attack_limit
+
+    def initialize
+      @claim = true
+      @disks_clear = true
+      @npcs = []
+      @attacks = []
+      @moves = 0
+      @wander_calls = []
+      @attack_limit = 3
+      @followers = Followers.new([])
+      @event_stack = []
+      @inbounds = Inbounds.new(true)
+      @WANDER_WAIT = 0
+      @FINAL_LOOT = false
+      @DELAY_LOOT = false
+      @TRACKING_CREATURE = []
+    end
+
+    def bigclaim?(check_disks: true)
+      return false unless @claim
+
+      !check_disks || @disks_clear
+    end
+
+    def sleep(*)
+      @on_sleep&.call
+    end
+
+    def sort_npcs
+      @npcs
+    end
+
+    def valid_target?(*)
+      true
+    end
+
+    def find_target(*)
+      @npcs.first
+    end
+
+    def attack(target)
+      @attacks << target
+      raise Stop, 'attacked repeatedly without leaving the room' if @attacks.size >= @attack_limit
+    end
+
+    def bs_move
+      @moves += 1
+      raise Stop, 'moved'
+    end
+
+    def debug_msg(*); end
+    def message(*); end
+    def start_watch; end
+    def reset_variables(*); end
+    def prepare_for_movement(*); end
+    def check_for_deaders_prone; end
+    def cast_signs(*); end
+    def wait_rt; end
+    def wait_while; end
+    def escape_rooms; end
+    def groupcheck; end
+    def single_stop; end
+    def cmd_hide(*); end
+    def bandit_track; end
+
+    def should_rest?
+      false
+    end
+
+    def should_flee?(*)
+      false
+    end
+
+    def no_players_hunt
+      true
+    end
+
+    def priority(*)
+      true
+    end
+
+    def time_between(*)
+      false
+    end
+
+    def group_member_stunned?
+      false
+    end
+
+    def solo?
+      true
+    end
+
+    def leading?
+      true
+    end
+
+    def hidden
+      false
+    end
+
+    class_eval(BS_WANDER_SRC)
+    alias_method :real_bs_wander, :bs_wander
+    class_eval(DO_HUNT_SRC)
+  end
+end
+
+RSpec.describe 'bigshot room claim while hunting' do
+  let(:bs) { BigshotClaimSpec::Harness.new }
+  let(:conjurer) { Struct.new(:id, :name).new(1, 'gaudy phantasmic conjurer') }
+
+  before do
+    $bigshot_quick = false
+    $bigshot_bandits = false
+    $bigshot_sneaky_hunt = false
+    $bigshot_flee = false
+    $wander_rooms = []
+  end
+
+  # Returns what bs_wander handed back, or :moved if it went to move on.
+  def wander(**)
+    bs.real_bs_wander(**)
+  rescue BigshotClaimSpec::Stop
+    :moved
+  end
+
+  describe 'bs_wander' do
+    it 'returns a creature in a room it owns' do
+      bs.npcs = [conjurer]
+      expect(wander).to eq(conjurer)
+      expect(wander(new_room: false)).to eq(conjurer)
+    end
+
+    it 'moves on instead of returning a creature found after being pulled into an occupied room during the wait' do
+      # Empty, owned room on arrival; fear drags us next door mid-wait.
+      bs.on_sleep = lambda do
+        bs.claim = false
+        bs.npcs = [conjurer]
+      end
+      expect(wander).to eq(:moved)
+    end
+
+    it 'moves on instead of returning a creature found by the bandit rescan after being pulled into an occupied room' do
+      $bigshot_bandits = true
+      bs.on_sleep = lambda do
+        bs.claim = false
+        bs.npcs = [conjurer]
+      end
+      expect(wander).to eq(:moved)
+    end
+
+    it 'moves on instead of returning a creature in a room it does not own, even straight after a fight' do
+      bs.claim = false
+      bs.npcs = [conjurer]
+      expect(wander(new_room: false)).to eq(:moved)
+    end
+
+    it 'still ignores other players\' disks in the room it was just hunting' do
+      bs.disks_clear = false
+      bs.npcs = [conjurer]
+      expect(wander(new_room: false)).to eq(conjurer)
+      expect(wander).to eq(:moved)
+    end
+  end
+
+  describe 'do_hunt' do
+    # bs_wander is stubbed: hands back the conjurer on the initial call, then
+    # records the follow-up call and stops.
+    before do
+      calls = bs.wander_calls
+      target = conjurer
+      bs.define_singleton_method(:bs_wander) do |new_room: true|
+        calls << new_room
+        raise BigshotClaimSpec::Stop, 'wandered' if calls.size > 1
+
+        target
+      end
+    end
+
+    def hunt
+      bs.do_hunt
+    rescue BigshotClaimSpec::Stop => e
+      e.message
+    end
+
+    it 'attacks the creature in a room it owns' do
+      bs.npcs = [conjurer]
+      bs.attack_limit = 1
+      expect(hunt).to eq('attacked repeatedly without leaving the room')
+      expect(bs.attacks).to eq([conjurer])
+    end
+
+    it 'leaves to wander instead of re-attacking when the room is not its claim' do
+      bs.claim = false
+      bs.npcs = [conjurer]
+      expect(hunt).to eq('wandered')
+      expect(bs.attacks).to be_empty
+      expect(bs.wander_calls).to eq([true, false])
+    end
+  end
+end
