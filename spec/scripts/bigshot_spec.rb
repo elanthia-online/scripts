@@ -2636,6 +2636,7 @@ module BigshotClaimSpec
     def groupcheck; end
     def single_stop; end
     def cmd_hide(*); end
+    def bandit_track; end
 
     def should_rest?
       false
@@ -2707,6 +2708,15 @@ RSpec.describe 'bigshot room claim while hunting' do
 
     it 'moves on instead of returning a creature found after being pulled into an occupied room during the wait' do
       # Empty, owned room on arrival; fear drags us next door mid-wait.
+      bs.on_sleep = lambda do
+        bs.claim = false
+        bs.npcs = [conjurer]
+      end
+      expect(wander).to eq(:moved)
+    end
+
+    it 'moves on instead of returning a creature found by the bandit rescan after being pulled into an occupied room' do
+      $bigshot_bandits = true
       bs.on_sleep = lambda do
         bs.claim = false
         bs.npcs = [conjurer]
