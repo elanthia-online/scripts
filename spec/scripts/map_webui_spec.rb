@@ -30,7 +30,7 @@ RSpec.describe 'ElanthiaMap::Window' do
       w.instance_variable_set(:@settings, { expanded_canvas: true, global_scale: 1.0, global_scale_enabled: false, map_scale: {}, dynamic_indicator_size: false, keep_centered: true })
       w.instance_variable_set(:@notes, {})
       w.instance_variable_set(:@menu_revisions, Hash.new(0))
-      w.instance_variable_set(:@note_serial, 0)
+      w.instance_variable_set(:@note_revision, 0)
       w.instance_variable_set(:@current_map, 'maps/sheet.png')
       w.instance_variable_set(:@image_sizes, { 'maps/sheet.png' => [1000, 800] })
       w.instance_variable_set(:@rooms_by_sheet, { 'sheet.png' => rooms })
@@ -231,7 +231,7 @@ RSpec.describe 'ElanthiaMap::Window' do
     [[15, 25], [110, 110], [15, 25]].each do |click|
       window.instance_variable_set(:@right_click, click)
       window.on_open_note
-      keys << "note-text-#{window.note_room.id}-#{window.note_serial}"
+      keys << "note-text-#{window.note_revision}"
     end
 
     expect(keys.uniq.size).to eq(3)
@@ -248,7 +248,7 @@ RSpec.describe 'ElanthiaMap::Window' do
 
     expect(window.layers.size).to be <= 512
     window.layers
-    expect(said).to eq(['[map notes: 300 notes on this sheet; only 255 can be drawn at once]'])
+    expect(said).to eq(['[map: 300 notes on this sheet; only 255 can be drawn at once]'])
   end
 
   it 're-centres on the same spot after the viewer panned away' do
