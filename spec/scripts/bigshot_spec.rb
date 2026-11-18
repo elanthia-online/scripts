@@ -2413,3 +2413,104 @@ RSpec.describe 'bigshot cmd_wand' do
     expect(bs.sent).to be_empty
   end
 end
+
+# split_xx parses the hunting command settings: comma-separated commands,
+# each optionally repeated with (xN)/(xx) and split on " and ". The result
+# feeds command_check, whose modifier regex is anchored on ")$", so any
+# whitespace left on a command hides its modifiers and the command always
+# runs.
+module BigshotSplitXxSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  CLEAN_VALUE_SRC = extract_from_source(SOURCE, /^  def clean_value\(clean, value\).*?^  end$/m,
+                                        label: 'clean_value', source_path: SOURCE_PATH)
+  MODIFIER_REGEX_SRC = extract_from_source(SOURCE, /^    @COMMAND_MODIFIER_REGEX = .*$/,
+                                           label: '@COMMAND_MODIFIER_REGEX', source_path: SOURCE_PATH)
+
+  class Harness
+    eval(CLEAN_VALUE_SRC)
+
+    attr_reader :COMMAND_MODIFIER_REGEX
+
+    def initialize
+      instance_eval(MODIFIER_REGEX_SRC)
+    end
+
+    def split_xx(value)
+      clean_value('split_xx', value)
+    end
+  end
+end
+
+RSpec.describe 'bigshot split_xx command parsing' do
+  let(:bs) { BigshotSplitXxSpec::Harness.new }
+  let(:modifier_regex) { bs.COMMAND_MODIFIER_REGEX }
+
+  def commands(result)
+    result.flat_map { |c| Array(c) }
+  end
+
+  it 'leaves no surrounding whitespace on any command' do
+    [
+      'incant 214 (m20 webbed frozen) (x2)',
+      'incant 214 (m20 webbed frozen) (xx)',
+      'incant 214 (m20) , incant 903',
+      'incant 903 (x5) , kill',
+      'stance def and 1615 target, kill (x5)',
+      'a (m1) and b (m2) (x2)',
+      'a (m1)  and b (m2)',
+      'a (m1) and  b (m2)'
+    ].each do |value|
+      commands(bs.split_xx(value)).each do |c|
+        expect(c).to eq(c.strip), "#{value.inspect} produced #{c.inspect}"
+      end
+    end
+  end
+
+  it 'keeps modifiers visible on a repeated command' do
+    result = bs.split_xx('incant 214 (m20 webbed frozen) (x2)')
+    expect(result).to eq(['incant 214 (m20 webbed frozen)'] * 2)
+    expect(result.first.match(modifier_regex)[1]).to eq('m20 webbed frozen')
+  end
+
+  it 'repeats (xx) five times with modifiers visible' do
+    result = bs.split_xx('incant 214 (m20 webbed frozen) (xx)')
+    expect(result).to eq(['incant 214 (m20 webbed frozen)'] * 5)
+    expect(result.first).to match(modifier_regex)
+  end
+
+  it 'keeps modifiers visible when a space comes before the comma' do
+    result = bs.split_xx('incant 214 (m20) , incant 903')
+    expect(result).to eq(['incant 214 (m20)', 'incant 903'])
+    expect(result.first).to match(modifier_regex)
+  end
+
+  it 'keeps the repeat when a space comes before the comma' do
+    expect(bs.split_xx('incant 903 (x5) , kill')).to eq(['incant 903'] * 5 + ['kill'])
+  end
+
+  it 'keeps an and-command as an array and repeats the next command' do
+    expect(bs.split_xx('stance def and 1615 target, kill (x5)'))
+      .to eq([['stance def', '1615 target']] + ['kill'] * 5)
+  end
+
+  it 'keeps modifiers visible on each part of a repeated and-command' do
+    result = bs.split_xx('a (m1) and b (m2) (x2)')
+    expect(result).to eq([['a (m1)', 'b (m2)']] * 2)
+    result.first.each { |part| expect(part).to match(modifier_regex) }
+  end
+
+  it 'splits on and surrounded by extra spaces' do
+    expect(bs.split_xx('a (m1)  and b (m2)')).to eq([['a (m1)', 'b (m2)']])
+    expect(bs.split_xx('force 1615 (m20) and  kill')).to eq([['force 1615 (m20)', 'kill']])
+  end
+
+  it 'does not split words that contain and' do
+    expect(bs.split_xx('wave band, throw sand')).to eq(['wave band', 'throw sand'])
+  end
+
+  it 'strips the space before a repeat on a command with no modifiers' do
+    expect(bs.split_xx('incant 903, kill (x2)')).to eq(['incant 903', 'kill', 'kill'])
+  end
+end

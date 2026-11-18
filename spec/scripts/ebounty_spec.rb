@@ -2,6 +2,11 @@
 # close-at-exit list when LOOK IN said it was closed and OPEN didn't say it
 # was already open. Replies are taken from a player's logs, including a stray
 # game line arriving where the OPEN reply was expected.
+#
+# Also covers find_herb_stow_list: a forage bounty names a mushroom by its
+# short name ("golden mushroom") while the foraged item carries the full name
+# ("golden hook mushroom"), so the short name must map to the full one or the
+# foraged count stays at 0.
 
 require_relative '../spec_helper'
 
@@ -9,6 +14,7 @@ module EBountySpec
   SOURCE_PATH = find_lic_source('ebounty.lic', from: __dir__)
   SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
   METHOD_SRC = extract_lic_method(SOURCE, 'open_container', source_path: SOURCE_PATH)
+  HERB_METHOD_SRC = extract_lic_method(SOURCE, 'find_herb_stow_list', source_path: SOURCE_PATH)
 end
 
 Object.send(:remove_const, :EBounty) if defined?(EBounty)
@@ -18,8 +24,14 @@ module EBounty
     def self.containers = @containers ||= {}
   end
 
+  # Nested for the same reason: find_herb_stow_list resolves StowList here.
+  module StowList
+    def self.stow_list = @stow_list ||= {}
+  end
+
   Data = Struct.new(:close_containers)
   Container = Struct.new(:id, :name, :noun, :contents)
+  Item = Struct.new(:name)
 
   class << self
     attr_accessor :replies, :sent
@@ -34,6 +46,7 @@ module EBounty
   end
 
   module_eval(EBountySpec::METHOD_SRC)
+  module_eval(EBountySpec::HERB_METHOD_SRC)
 end
 
 RSpec.describe 'EBounty.open_container' do
@@ -89,5 +102,43 @@ RSpec.describe 'EBounty.open_container' do
     case_obj.contents = []
     run(look: [])
     expect(EBounty.sent).to be_empty
+  end
+end
+
+RSpec.describe 'EBounty.find_herb_stow_list' do
+  def stow(*names)
+    EBounty::StowList.stow_list[:default] = EBounty::Container.new('1', 'boarhide pack', 'pack', names.map { |n| EBounty::Item.new(n) })
+  end
+
+  after { EBounty::StowList.stow_list.clear }
+
+  {
+    'white mushroom'    => 'white hook mushroom',
+    'trafel mushroom'   => 'black trafel mushroom',
+    'withered mushroom' => 'withered black mushroom',
+    'soft mushroom'     => 'soft white mushroom',
+    'red mushroom'      => 'red trafel mushroom',
+    'black mushroom'    => 'black hook mushroom',
+    'golden mushroom'   => 'golden hook mushroom',
+  }.each do |bounty_name, item_name|
+    it "counts #{item_name} for a #{bounty_name} bounty" do
+      stow(item_name, item_name, 'some acantha leaf')
+      expect(EBounty.find_herb_stow_list(bounty_name).map(&:name)).to eq([item_name, item_name])
+    end
+  end
+
+  it 'maps the bounty name regardless of case' do
+    stow('golden hook mushroom')
+    expect(EBounty.find_herb_stow_list('Golden Mushroom').length).to eq(1)
+  end
+
+  it 'does not count other hook mushrooms for a golden mushroom bounty' do
+    stow('white hook mushroom', 'black hook mushroom')
+    expect(EBounty.find_herb_stow_list('golden mushroom')).to be_empty
+  end
+
+  it 'still matches a full golden hook mushroom name directly' do
+    stow('golden hook mushroom')
+    expect(EBounty.find_herb_stow_list('golden hook mushroom').length).to eq(1)
   end
 end
