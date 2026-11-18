@@ -22,6 +22,8 @@
 # bug fail loudly instead of silently undercounting again.
 
 require_relative '../spec_helper'
+require 'zlib'
+require 'stringio'
 require 'tmpdir'
 require 'fileutils'
 
@@ -77,6 +79,8 @@ module PilePullRewardsSpec
   RELEVANT_LOG_PATHS_SRC = extract_lic_method(SOURCE, 'relevant_log_paths', source_path: SOURCE_PATH)
   DISCOVER_ROOTS_SRC = extract_lic_method(SOURCE, 'discover_roots', source_path: SOURCE_PATH)
   SELECT_ROOTS_SRC = extract_lic_method(SOURCE, 'select_roots', source_path: SOURCE_PATH)
+  EACH_LOG_LINE_SRC = extract_lic_method(SOURCE, 'each_log_line', source_path: SOURCE_PATH)
+  EACH_GZIP_LINE_SRC = extract_lic_method(SOURCE, 'each_gzip_line', source_path: SOURCE_PATH)
   SCAN_FILE_SRC = extract_lic_method(SOURCE, 'scan_file', source_path: SOURCE_PATH)
 
   # Real tier/canonicalization/event-bucketing logic under test, evaluated so
@@ -393,6 +397,8 @@ module PilePullRewardsSpec
       module_eval(RELEVANT_LOG_PATHS_SRC, SOURCE_PATH)
       module_eval(DISCOVER_ROOTS_SRC, SOURCE_PATH)
       module_eval(SELECT_ROOTS_SRC, SOURCE_PATH)
+      module_eval(EACH_LOG_LINE_SRC, SOURCE_PATH)
+      module_eval(EACH_GZIP_LINE_SRC, SOURCE_PATH)
       module_eval(SCAN_FILE_SRC, SOURCE_PATH)
 
       def self.new_totals
@@ -1013,6 +1019,29 @@ RSpec.describe 'pilepull.lic reward tracking' do
 
         expect(log_scan.relevant_log_paths(tmp_dir)).to eq(in_window.sort)
       end
+
+      # log.lic 1.7.0's --compress-after gzips old logs in place.
+      it 'keeps gzipped logs too, and only the plain file when both forms exist' do
+        gz_only = File.join(tmp_dir, '2026-03-02_10-00-00.log.gz')
+        Zlib::GzipWriter.open(gz_only) { |gz| gz.write('') }
+        plain = write_log('2026-03-03_10-00-00.log', '')
+        Zlib::GzipWriter.open("#{plain}.gz") { |gz| gz.write('') }
+        Zlib::GzipWriter.open(File.join(tmp_dir, '2026-01-15_00-00-01.log.gz')) { |gz| gz.write('') } # outside any window
+
+        expect(log_scan.relevant_log_paths(tmp_dir)).to eq([gz_only, plain].sort)
+      end
+
+      # A sweep can delete x.log right after the listing found x.log and
+      # x.log.gz; the choice must not depend on a later existence check.
+      it 'keeps only the plain file when a sweep deletes it right after the listing' do
+        plain = write_log('2026-03-03_10-00-00.log', '')
+        Zlib::GzipWriter.open("#{plain}.gz") { |gz| gz.write('') }
+        allow(Dir).to receive(:glob).and_wrap_original do |original, *args|
+          original.call(*args).tap { File.delete(plain) if File.exist?(plain) }
+        end
+
+        expect(log_scan.relevant_log_paths(tmp_dir)).to eq([plain])
+      end
     end
 
     describe 'scan_file' do
@@ -1098,6 +1127,107 @@ RSpec.describe 'pilepull.lic reward tracking' do
         write_log('README.log', "18:58:21: You pull a glowing orb from within!\n")
 
         expect { log_scan.scan_file(File.join(tmp_dir, 'README.log'), 'Pickasso', totals) }.not_to raise_error
+        expect(totals).to be_empty
+      end
+
+      it 'reads a gzipped log (log.lic --compress-after) like a plain one, invalid bytes included' do
+        path = File.join(tmp_dir, '2026-03-01_15-47-17.log.gz')
+        Zlib::GzipWriter.open(path) do |gz|
+          gz.write("18:58:20: #{[0xFF, 0xFE].pack('C*')}garbled text\n")
+          gz.write("18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!\n")
+        end
+
+        expect { log_scan.scan_file(path, 'Pickasso', totals) }.not_to raise_error
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:items][['rare', 'glowing orb']]).to eq(1)
+      end
+
+      it 'reads every member of a gzipped log that holds several' do
+        path = File.join(tmp_dir, '2026-03-01_15-47-17.log.gz')
+        member = lambda do |text|
+          io = StringIO.new(+'')
+          gz = Zlib::GzipWriter.new(io)
+          gz.write(text)
+          gz.finish
+          io.string
+        end
+        pull = '18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!'
+        File.binwrite(path, member.call("#{pull}\n") + member.call("#{pull}\n"))
+
+        log_scan.scan_file(path, 'Pickasso', totals)
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:items][['rare', 'glowing orb']]).to eq(2)
+      end
+
+      # GzipReader#unused is nil when its read buffer ended exactly at the
+      # first member's end: a level-0 member of 2048 bytes does that.
+      it 'reads a second member that starts on a 2048-byte boundary' do
+        path = File.join(tmp_dir, '2026-03-01_15-47-17.log.gz')
+        member = lambda do |text, level|
+          io = StringIO.new(+'')
+          gz = Zlib::GzipWriter.new(io, level)
+          gz.write(text)
+          gz.finish
+          io.string
+        end
+        first = member.call("#{'A' * 2024}\n", Zlib::NO_COMPRESSION)
+        expect(first.bytesize).to eq(2048)
+        pull = '18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!'
+        File.binwrite(path, first + member.call("#{pull}\n", Zlib::DEFAULT_COMPRESSION))
+
+        log_scan.scan_file(path, 'Pickasso', totals)
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:items][['rare', 'glowing orb']]).to eq(1)
+      end
+
+      # A log.lic --compress-after sweep can gzip a listed .log before
+      # this scan reaches it.
+      it 'reads the .gz of a listed .log that was compressed before it was read' do
+        plain = File.join(tmp_dir, '2026-03-01_15-47-17.log')
+        Zlib::GzipWriter.open("#{plain}.gz") do |gz|
+          gz.write("18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!\n")
+        end
+
+        log_scan.scan_file(plain, 'Pickasso', totals)
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:items][['rare', 'glowing orb']]).to eq(1)
+        expect(log_scan.echoed.join).not_to match(/could not read log/)
+      end
+
+      # mrhoribu: a sweep can delete x.log between any existence check and
+      # the open. The plain file is deleted at the worst moment for either
+      # approach: right after File.exist? says it is there, or right before
+      # it is opened.
+      it 'reads the .gz when a sweep deletes the plain file between the check and the open' do
+        plain = File.join(tmp_dir, '2026-03-01_15-47-17.log')
+        pull = "18:58:21: You hand over 1,000,000 silver and search through a pile of mania prizes.  You pull a glowing orb from within!\n"
+        File.write(plain, pull)
+        Zlib::GzipWriter.open("#{plain}.gz") { |gz| gz.write(pull) }
+        swept = false
+        sweep = -> { FileUtils.rm_f(plain) unless swept; swept = true }
+        allow(File).to(receive(:exist?).and_wrap_original { |original, path| original.call(path).tap { sweep.call if path == plain } })
+        allow(File).to receive(:open).and_wrap_original do |original, path, *args, **kw, &blk|
+          sweep.call if path == plain
+          original.call(path, *args, **kw, &blk)
+        end
+
+        log_scan.scan_file(plain, 'Pickasso', totals)
+
+        bucket = totals[['Pickasso', log_scan_rewards.event_key_for(2026, 3)]]
+        expect(bucket[:pulls]).to eq(1)
+        expect(log_scan.echoed.join).not_to match(/could not read log/)
+      end
+
+      it 'notes a damaged gzipped log and moves on instead of raising' do
+        path = File.join(tmp_dir, '2026-03-01_15-47-17.log.gz')
+        File.binwrite(path, 'not gzip')
+
+        expect { log_scan.scan_file(path, 'Pickasso', totals) }.not_to raise_error
+        expect(log_scan.echoed.join).to match(/could not read log/)
         expect(totals).to be_empty
       end
 
