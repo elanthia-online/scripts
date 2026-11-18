@@ -42,10 +42,14 @@
        requirements:
         - sequel gem
         - terminal-table gem
-           version: 1.3.4
+           version: 1.3.5
 
   Improvements:
   Major_change.feature_addition.bugfix
+  v1.3.5 (2026-11-12)
+    - ";pilepull logs" also reads log files that log.lic's --compress-after
+      has gzipped (.log.gz), and counts a log only once if both forms exist,
+      also while log.lic is compressing it, and never drops it then.
   v1.3.4 (2026-09-10)
     - Fix ";pilepull logs" crashing ("invalid byte sequence in UTF-8") on
       a log file containing a stray non-UTF-8 byte.
@@ -105,6 +109,7 @@ unless failed_to_load.empty?
 end
 
 require 'date'
+require 'zlib'
 
 module PilePull
   @prize_pile = nil
@@ -588,7 +593,14 @@ module PilePull
 
       # @return [Array<String>] this root's log files whose filename date falls in a Duskruin window, sorted
       def self.relevant_log_paths(root)
-        Dir.glob(File.join(root, '**', '*.log')).sort.select do |path|
+        # log.lic 1.7.0's --compress-after gzips old logs in place
+        # (x.log -> x.log.gz). While a sweep finishes, or when Windows kept
+        # it from deleting the original, both exist: one path per log is
+        # chosen from the listing alone, the plain file when it was listed,
+        # so a sweep that deletes it right after the listing cannot get
+        # both kept. scan_file reads the .gz if the plain file is gone.
+        paths = Dir.glob(File.join(root, '**', '*.{log,log.gz}')).group_by { |path| path.delete_suffix('.gz') }
+        paths.map { |stem, forms| forms.include?(stem) ? stem : forms.first }.sort.select do |path|
           match = File.basename(path).match(FILENAME_DATE)
           match && in_duskruin_window?(match[2].to_i, match[3].to_i)
         end
@@ -651,6 +663,48 @@ module PilePull
         totals
       end
 
+      # Yields each line of a log file. A .log.gz (log.lic --compress-after)
+      # is read through gzip, every member as zcat does, as UTF-8 like
+      # File.foreach, so the scrub in scan_file works the same. A .log that
+      # a log.lic sweep gzipped and deleted after it was listed is read from
+      # its .gz: the plain file is opened first and the .gz tried only when
+      # that open finds it gone (log.lic renames the .gz into place before
+      # deleting the original), so no check can go stale before the open.
+      def self.each_log_line(path, &block)
+        return each_gzip_line(path, &block) if path.end_with?('.gz')
+
+        begin
+          file = File.open(path)
+        rescue Errno::ENOENT => e
+          begin
+            return each_gzip_line("#{path}.gz", &block)
+          rescue Errno::ENOENT
+            raise e
+          end
+        end
+        begin
+          file.each_line(&block)
+        ensure
+          file.close
+        end
+      end
+
+      # Yields each line of every gzip member in +path+.
+      def self.each_gzip_line(path)
+        File.open(path, 'rb') do |io|
+          loop do
+            gzip = Zlib::GzipReader.new(io, external_encoding: Encoding::UTF_8)
+            gzip.each_line { |line| yield line }
+            rest = gzip.unused
+            gzip.finish
+            # unused is nil when the reader's buffer ended exactly at the
+            # member's end, so the file's end decides.
+            io.pos -= rest.bytesize if rest
+            break if io.eof?
+          end
+        end
+      end
+
       def self.scan_file(path, character, totals)
         basename = File.basename(path)
         match = basename.match(FILENAME_DATE)
@@ -660,7 +714,7 @@ module PilePull
         end
         year, month = match[1].to_i, match[2].to_i
 
-        File.foreach(path) do |line|
+        each_log_line(path) do |line|
           # Real session logs occasionally contain a byte sequence that
           # isn't valid UTF-8 (a stray control byte from a rough
           # disconnect, a client-side encoding hiccup, etc.) -- String#match
@@ -695,7 +749,7 @@ module PilePull
           bucket[:pulls] += 1
           bucket[:items][[tier, item_name]] += 1
         end
-      rescue Errno::ENOENT, Errno::EACCES => e
+      rescue Errno::ENOENT, Errno::EACCES, Zlib::Error => e
         echo("Note: could not read log #{path}: #{e.message}")
       end
 

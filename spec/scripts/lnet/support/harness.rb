@@ -5,7 +5,6 @@ require 'rexml/document'
 require 'socket'
 require 'timeout'
 require 'ostruct'
-require 'set'
 require_relative '../../../spec_helper'
 
 # Shared harness for the lnet.lic specs.
@@ -190,6 +189,17 @@ module LnetSpec
     def puts(line) = OUTPUT << [:client, line]
   end
 
+  # A game client as Lich 5.20.0 and later have it (SynchronizedSocket):
+  # records main-stream writes, and can be marked as gone away.
+  class MainStreamClient
+    attr_writer :alive
+
+    def initialize = @alive = true
+    def alive? = @alive
+    def puts(line) = OUTPUT << [:client, line]
+    def puts_main_stream(line) = OUTPUT << [:main_stream, line]
+  end
+
   # Records what the script writes; can be told to fail, or to write slowly
   # one character at a time so unsynchronised writers would interleave.
   class FakeServer
@@ -228,7 +238,6 @@ module LnetSpec
     def closed? = @closed
     def close = @closed = true
   end
-
 
   # A stream listener that records the events it is given.
   class EventLog

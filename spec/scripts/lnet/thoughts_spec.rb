@@ -77,6 +77,68 @@ RSpec.describe 'lnet.lic' do
       end
     end
 
+    context 'on Lich 5.20.0 or later (puts_main_stream)' do
+      before do
+        $frontend = 'stormfront'
+        $_CLIENT_ = LnetSpec::MainStreamClient.new
+        lnet::Thoughts.define_singleton_method(:detachable_clients_respond) { |line| LnetSpec::OUTPUT << [:detached, line] }
+      end
+
+      after { lnet::Thoughts.singleton_class.send(:remove_method, :detachable_clients_respond) }
+
+      let(:shown) { %(<pushStream id="thoughts"/>[General]-GSIV:Bob: "hi"\n<popStream/>\r\n) }
+
+      it 'shows the line on the client and detached clients, not as script output' do
+        out = feed(%(<message type="channel" from="GSIV:Bob" channel="General">hi</message>))
+        expect(out).to eq([
+                            [:main_stream, shown],
+                            [:detached, shown],
+                            [:downstream_xml, %(<pushStream id="thoughts"/>[General]-GSIV:Bob: "hi"\n<popStream/>\n)],
+                            [:downstream, %([General]-GSIV:Bob: "hi")]
+                          ])
+      end
+
+      it 'gives scripts the line as game XML exactly once' do
+        out = feed(%(<message type="channel" from="GSIV:Bob" channel="General">hi</message>))
+        expect(out.count { |kind, _| %i[_respond respond downstream_xml].include?(kind) }).to eq(1)
+      end
+
+      it 'skips a client that has gone away and still reaches detached clients' do
+        $_CLIENT_.alive = false
+        out = feed(%(<message type="channel" from="GSIV:Bob" channel="General">hi</message>))
+        expect(out.map(&:first)).to eq(%i[detached downstream_xml downstream])
+      end
+
+      it 'writes only to detached clients when no front end is attached' do
+        $_CLIENT_ = nil
+        out = feed(%(<message type="channel" from="GSIV:Bob" channel="General">hi</message>))
+        expect(out).to eq([
+                            [:detached, shown],
+                            [:downstream_xml, %(<pushStream id="thoughts"/>[General]-GSIV:Bob: "hi"\n<popStream/>\n)],
+                            [:downstream, %([General]-GSIV:Bob: "hi")]
+                          ])
+      end
+
+      it 'keeps _respond on Lich older than 5.20.0 (no detachable_clients_respond)' do
+        lnet::Thoughts.singleton_class.send(:remove_method, :detachable_clients_respond)
+        out = feed(%(<message type="channel" from="GSIV:Bob" channel="General">hi</message>))
+        expect(out.map(&:first)).to eq(%i[_respond downstream_xml downstream])
+      ensure
+        lnet::Thoughts.define_singleton_method(:detachable_clients_respond) { |_line| nil }
+      end
+
+      it 'shows the familiar window and preset forms the same way' do
+        lnet.options['preset'] = 'thought'
+        out = feed(%(<message type="private" from="Bob">hi</message>))
+        expect(out.first).to eq([:main_stream, %(<pushStream id="thoughts"/><preset id='thought'>[Private]-Bob:</preset> "hi"\n<popStream/>\r\n)])
+        expect(out.count { |kind, _| kind == :downstream_xml }).to eq(1)
+        lnet.options['fam_window'] = true
+        out = feed(%(<message type="private" from="Bob">hi</message>))
+        expect(out.first).to eq([:main_stream, %(<pushStream id="familiar" ifClosedStyle="watching"/>[Private]-Bob: "hi"\n<popStream/>\r\n)])
+        expect(out.count { |kind, _| kind == :downstream_xml }).to eq(1)
+      end
+    end
+
     context 'on Wizard or Avalon' do
       before { $frontend = 'wizard' }
 

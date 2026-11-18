@@ -1,25 +1,60 @@
+# frozen_string_literal: true
+
 =begin
 
-  logs the game to lich\logs\<game code>-<char name>\<date>-<number>.log
-  starts a new file after 30,000 lines (somewhere around 1mb)
+  Logs the game to a file, in GemStone and DragonRealms: the game text to a .log
+  file, with --xml the raw XML the game sends to a .xml file, or with --both both.
 
-  SYNTAX:  ;log
-           ;log --timestamp="%F %T %Z"          - optional timestamps
-           ;log --rnum                          - optional show Lich ID on room titles
-           ;log --exclude=u7199,288,2300        - optional rooms to exclude logging, supports UIDs via u#
-           ;log --lines=50000                   - optional change default(30000) lines to capture before new file started
-  EXAMPLE AUTOSTART:
-           ;autostart add --global log --timestamp=\"%F %T %Z\" --rnum --exclude=288,2300,u7199 --lines=50000
+  ;log help shows every option.
 
-           log format based on https://apidock.com/ruby/DateTime/strftime
+  Logs go to Lich's log folder (lich/logs, or the one set with Lich's --logs=),
+  under <game>-<character>/<year>/<month>/.
 
        author: elanthia-online
- contributors: Tillmen, Tysong, Xanlin
-         game: gs
-      version: 1.2.1
-     required: Lich > 5.0.1
+ contributors: Tillmen, Tysong, Xanlin, LostRanger
+         game: any
+      version: 1.7.0
+     required: Lich >= 5.19.0
 
   changelog:
+    1.7.0 (2026-11-12):
+      * New --compress-after=N option (or log_compress_after: N in DragonRealms yaml) gzips log files older than N days (0: all but today's).
+    1.6.1 (2026-11-12):
+      * XML logs no longer drop an lnet chat line that arrives while inventory is listed.
+    1.6.0 (2026-11-11):
+      * New --both option writes the text log and the XML log at once, from one ;log.
+    1.5.0 (2026-11-11):
+      * XML logs now also record script output (what other scripts echo), as text logs always have.
+    1.4.0 (2026-11-11):
+      * ;log help now lists the options, and this header is much shorter.
+    1.3.5 (2026-11-11):
+      * No false warning about typed commands when Lich stops the logger itself.
+    1.3.4 (2026-11-11):
+      * logxml.lic is retired: use ;log --xml (an existing logxml.lic keeps working).
+    1.3.3 (2026-11-10):
+      * Documentation update; logs are unchanged.
+    1.3.2 (2026-11-10):
+      * XML logs keep prompts and speech that used to be dropped with stream lines.
+    1.3.1 (2026-11-10):
+      * Room numbers (--rnum) work in XML logs as they do in text logs, including DragonRealms.
+    1.3.0 (2026-11-10):
+      * New --xml option logs the raw XML, as logxml.lic did, with every option available.
+=end
+=begin
+    1.2.8 (2026-11-10):
+      * Internal cleanup; now needs Lich 5.19.0 or later.
+    1.2.7 (2026-11-10):
+      * Internal cleanup; logs are unchanged.
+    1.2.6 (2026-11-10):
+      * The logger now says why when it stops logging typed commands or cannot close a file.
+    1.2.5 (2026-11-10):
+      * Two loggers running at once no longer mix up each other's options.
+    1.2.4 (2026-11-10):
+      * New files start cleanly at midnight, every file gets its closing time line, and Lich's --logs= folder is used.
+    1.2.3 (2026-11-10):
+      * --rnum and --exclude no longer send commands to the game or slow it down, and --rnum works in DragonRealms.
+    1.2.2 (2026-11-10):
+      * --timestamp and --lines no longer crash on commas, odd values or a missing value.
     1.2.1 (2026-09-25):
       * Expand regex match for various XML that may come across due to script output
     1.2.0 (2026-04-23):
@@ -32,8 +67,6 @@
       * Add --exclude=288,u7199 support to exclude logging in rooms designated.
       * Add --lines=50000 to change default 30k lines captured before starting new log file
       * Convert to module GameLogger
-=end
-=begin
     0.0.8 (2024-09-10):
       * Add --rnum support
     0.0.7 (2023-03-31):
@@ -56,36 +89,157 @@
 
 hide_me
 
-unless defined?(Script.current.want_script_output)
-  echo 'Your version of Lich is too old for this script.'
-  exit
-end
+require 'date'
+require 'zlib'
 
-unless (Gem::Version.new(RUBY_VERSION) > Gem::Version.new('2.0.0')) || $SAFE == 0
-  echo "This script must be trusted to be allowed to write to log files."
-  echo "You can trust it with the following command: #{$lich_char}trust #{script.name}"
-  exit
-end
-
+# The game logger behind ;log and ;log --xml. Each run of log.lic (and
+# of an install's local logxml.lic 0.7.x, which loads this file under the
+# name logxml; logxml.lic left the repository in 1.3.4) evaluates this
+# module again and then calls {GameLogger.main}, which reads the run's
+# options ({Opts.parse}) and runs one +GameLogger::Logger+ in the mode they
+# and the script's name pick: text mode, the game text Lich hands scripts,
+# to a ".log" file; or XML mode, the raw XML the game sends, to a ".xml"
+# file. The header at the top of log.lic describes both modes, every
+# option and where the files go, for players.
+#
+# What is left on the module is what a run uses only while it starts: the
+# option parser ({Opts}), the checks that turn the --lines and --timestamp
+# options into values ({lines_per_file}, {timestamp_format}), the --exclude
+# split ({exclude_entries}) and the background map load
+# ({start_map_load}). Everything a run uses while it logs is on its own
+# +GameLogger::Logger+ class and its +GameLogger::Mode+ value, which each
+# evaluation builds new (see +GameLogger::Mode+).
+#
+# @note No other script calls this module. spec/scripts/log_spec.rb and
+#   spec/scripts/log_xml_mode_spec.rb evaluate it (see
+#   spec/support/log_spec_harness.rb) and call {Opts.parse},
+#   {GameLogger.main} and the +GameLogger::Logger+ methods.
 module GameLogger
-  module Opts
-    FLAG_PREFIX ||= "--"
+  # Lines written to one log file before a new file is started, when
+  # --lines is not given or is not a valid count.
+  DEFAULT_LINES_PER_FILE = 30_000 unless defined?(DEFAULT_LINES_PER_FILE)
 
+  # Timestamp format used when the settings turn timestamps on but give no
+  # usable log_timestamp_format (the DR base.yaml default).
+  DEFAULT_TIMESTAMP_FORMAT = '%F %T %Z' unless defined?(DEFAULT_TIMESTAMP_FORMAT)
+
+  # A --lines value: plain digits, or groups of three digits after the first
+  # group, split by "," or "_" (50000, 50,000, 50_000, 1,000,000).
+  LINE_COUNT_PATTERN = /\A(?:[0-9]+|[0-9]{1,3}(?:[,_][0-9]{3})+)\z/ unless defined?(LINE_COUNT_PATTERN)
+
+  # The option {start_xml_twin} sets on the XML twin of --both, which
+  # leaves compressing old logs to its text logger. It has spaces, so no
+  # argument a player types parses to it.
+  TWIN_KEY = :'xml twin of --both' unless defined?(TWIN_KEY)
+
+  # Log files open in this Lich process, by path ({open_log_path}), with how
+  # many loggers hold each: every logger for a character runs in this one
+  # process (the --both twin and an install's local logxml.lic too), so a
+  # sweep skips exactly the files in use ({log_path_open?}). Kept on the
+  # module, which each run evaluates again, so all runs share one table.
+  OPEN_LOG_PATHS = Hash.new(0) unless defined?(OPEN_LOG_PATHS)
+
+  # Guards {OPEN_LOG_PATHS}: loggers and their sweep threads use it at once.
+  OPEN_LOG_PATHS_LOCK = Mutex.new unless defined?(OPEN_LOG_PATHS_LOCK)
+
+  # Records that a logger is about to open +path+, until {close_log_path}.
+  #
+  # @param path [String] the log file's path
+  # @return [String] the path as recorded (expanded)
+  def self.open_log_path(path)
+    key = File.expand_path(path)
+    OPEN_LOG_PATHS_LOCK.synchronize { OPEN_LOG_PATHS[key] += 1 }
+    key
+  end
+
+  # Records that a logger closed +key+ (as {open_log_path} returned it).
+  #
+  # @param key [String] the recorded path
+  # @return [void]
+  def self.close_log_path(key)
+    OPEN_LOG_PATHS_LOCK.synchronize do
+      OPEN_LOG_PATHS[key] -= 1
+      OPEN_LOG_PATHS.delete(key) unless OPEN_LOG_PATHS[key].positive?
+    end
+  end
+
+  # Whether some logger in this Lich process has +path+ open.
+  #
+  # @param path [String] a log file's path
+  # @return [Boolean]
+  def self.log_path_open?(path)
+    key = File.expand_path(path)
+    OPEN_LOG_PATHS_LOCK.synchronize { OPEN_LOG_PATHS.key?(key) }
+  end
+
+  # The script's argument parser: turns ;log's arguments into one option
+  # per name, an argument starting with {FLAG_PREFIX} as a flag
+  # ({parse_flag}) and any other word as a +true+ option
+  # ({parse_command}). It only reads the arguments; what each option does
+  # is decided where it is used (`GameLogger::Logger.mode_for` and the
+  # run's configure step).
+  module Opts
+    # What starts a flag argument (--rnum, --lines=50000); any other
+    # argument is a positional word.
+    FLAG_PREFIX = '--' unless defined?(FLAG_PREFIX)
+
+    # Flags whose value is a comma-separated list. Every other flag keeps its
+    # value whole, so a --timestamp format may contain commas.
+    LIST_FLAGS = %i[exclude].freeze unless defined?(LIST_FLAGS)
+
+    # Records a positional word as a +true+ option. A word never replaces a
+    # value already given for the same name (the word +timestamp+ after
+    # --timestamp=FMT keeps FMT).
+    #
+    # @param h [Hash{Symbol => Object}] options parsed so far; updated in place
+    # @param c [String] the positional word, e.g. "streams"
+    # @return [String, Array<String>, true] the value now stored under the
+    #   word's name: +true+, or the value a flag of that name gave earlier
     def self.parse_command(h, c)
-      h[c.to_sym] = true
+      h[c.to_sym] ||= true
     end
 
+    # Records one --name[=value] flag. The value is everything after the
+    # first "="; only {LIST_FLAGS} are split on commas (a single item stays
+    # a String). A bare flag is +true+ and never replaces a value already
+    # given for the same name; a valued flag replaces any earlier value, so
+    # the last --timestamp=FMT wins. A flag with no name (+--+ or +--=x+)
+    # echoes and is ignored.
+    #
+    # @param h [Hash{Symbol => Object}] options parsed so far; updated in place
+    # @param f [String] the flag as typed, e.g. "--timestamp=%b %d, %Y %T"
+    # @return [String, Array<String>, true, nil] the value now stored for the
+    #   flag, or +nil+ when the flag has no name and is ignored
     def self.parse_flag(h, f)
-      (name, val) = f[2..-1].split("=")
+      (name, val) = f[2..-1].split("=", 2)
+      if name.nil? || name.empty?
+        echo "#{f} has no option name, so it is ignored."
+        return nil
+      end
+
+      key = name.to_sym
       if val.nil?
-        h[name.to_sym] = true
-      else
+        h[key] ||= true
+      elsif LIST_FLAGS.include?(key)
         val = val.split(",")
 
-        h[name.to_sym] = val.size == 1 ? val.first : val
+        h[key] = val.size == 1 ? val.first : val
+      else
+        h[key] = val
       end
     end
 
+    # Parses the script's arguments into options. Arguments starting with
+    # +--+ go through {parse_flag}; any other word goes through
+    # {parse_command}. With no +args+, reads Script.current.vars: when
+    # vars[0] holds a double quote, it is re-split so a quoted value
+    # (--timestamp="%F %T %Z") stays one argument, which matters for
+    # autostart, whose saved arguments reach vars[1..] split on spaces.
+    #
+    # @param args [Array<String>, nil] arguments to parse; +nil+ reads
+    #   Script.current.vars
+    # @return [OpenStruct] one member per option name; an option not given
+    #   reads as +nil+
     def self.parse(args = nil)
       case args
       when nil
@@ -105,116 +259,1816 @@ module GameLogger
         opts
       end)
     end
+  end
 
-    def self.as_list(key)
-      val = to_h.fetch(key.to_sym, [])
-      val = [val] if val.is_a?(String)
-      return val
-    end
+  # Turns the --lines option into a line count. Accepts whole numbers above
+  # 0 written as plain digits or in groups of three digits split by "," or
+  # "_" (50000, 50,000, 50_000); see {LINE_COUNT_PATTERN}. Anything else (0,
+  # negative, words, misplaced separators like 50,00, a bare --lines or the
+  # word lines) echoes one message and falls back to
+  # {DEFAULT_LINES_PER_FILE}, so a bad value can neither crash the logger
+  # nor make it rotate files without reading lines.
+  #
+  # @param value [String, true, nil] the parsed --lines option (`true` for a
+  #   bare --lines or the word lines, +nil+ when not given)
+  # @return [Integer] lines per log file, always above 0
+  def self.lines_per_file(value)
+    return DEFAULT_LINES_PER_FILE if value.nil?
 
-    def self.method_missing(method, *args)
-      parse.send(method, *args)
+    count = Integer(value.delete(',_'), 10) if value.is_a?(String) && value.match?(LINE_COUNT_PATTERN)
+    return count if count&.positive?
+
+    problem = value.is_a?(String) ? "--lines=#{value} is not a valid line count" : 'lines was given without a value'
+    echo "#{problem}; use a whole number above 0, like --lines=50000. Using the default of #{DEFAULT_LINES_PER_FILE} lines per file."
+    DEFAULT_LINES_PER_FILE
+  end
+
+  # Turns the --compress-after option, or the log_compress_after setting
+  # when the option is not given (DragonRealms yaml), into a number of
+  # days: log files dated more than that many days before today are
+  # gzipped (see +GameLogger::Logger.compress_old_logs+), so 0 means every
+  # file dated before today. Today's files are never compressed: another
+  # logger (the XML twin of --both, a second ;log) may still have one open.
+  # Only a whole number, 0 or above, is a number of days; anything else
+  # (negative, words, a bare --compress-after) echoes once and turns
+  # compression off.
+  #
+  # @param option [String, true, nil] the parsed --compress-after option
+  # @param setting [Integer, String, nil] settings.log_compress_after
+  # @return [Integer, nil] the days, or +nil+ for no compression
+  def self.compress_after_days(option, setting)
+    value, source = option.nil? ? [setting, 'log_compress_after'] : [option, '--compress-after']
+    return nil if value.nil?
+
+    days = value if value.is_a?(Integer)
+    days = Integer(value, 10) if value.is_a?(String) && value.match?(/\A[0-9]+\z/)
+    return days if days && days >= 0
+
+    problem = value == true ? "#{source} was given without a number of days" : "#{source} #{value.inspect} is not a number of days"
+    echo "#{problem}; use a whole number, 0 or above, like --compress-after=7. Old logs are not compressed."
+    nil
+  end
+
+  # Whether a value can be handed to strftime as a timestamp format: only a
+  # non-empty String is.
+  #
+  # @param value [Object] a --timestamp option or a log_timestamp_format setting
+  # @return [Boolean]
+  def self.timestamp_format?(value)
+    value.is_a?(String) && !value.empty?
+  end
+
+  # Picks the timestamp format from the --timestamp option and the profile
+  # settings, checking both the same way ({timestamp_format?}) so strftime
+  # never sees anything but a format. A --timestamp=FMT wins. A --timestamp
+  # with no format (bare flag, the word timestamp, or --timestamp=) echoes
+  # once and is ignored. Settings that turn timestamps on without a usable
+  # log_timestamp_format echo once and use {DEFAULT_TIMESTAMP_FORMAT}.
+  #
+  # @param option [String, true, nil] the parsed --timestamp option
+  # @param enabled [Object] settings.log_timestamp; truthy turns timestamps on
+  #   (`nil` when there are no settings)
+  # @param format [Object] settings.log_timestamp_format
+  # @return [String, nil] the format to stamp with, or +nil+ for no timestamps
+  def self.timestamp_format(option, enabled, format)
+    return option if timestamp_format?(option)
+
+    echo 'timestamp was given without a format, so it is ignored; to add timestamps use --timestamp="%F %T %Z".' unless option.nil?
+    return nil unless enabled
+    return format if timestamp_format?(format)
+
+    echo "log_timestamp is on in your settings, but log_timestamp_format #{format.inspect} is not a format; using #{DEFAULT_TIMESTAMP_FORMAT.inspect}."
+    DEFAULT_TIMESTAMP_FORMAT
+  end
+
+  # Starts loading the map in a background thread when nothing has loaded
+  # it yet, so a Lich room number in --exclude or --rnum can be found. Lich
+  # loads the map only when something asks for it, and in DragonRealms its
+  # own room display does not by default. The load sends no game command,
+  # but it can take seconds, so it runs off the logger's get loop: a logger
+  # waiting on it during a login burst would let the script's 400-line
+  # downstream buffer (lich-5 lib/common/script.rb) drop lines.
+  #
+  # @return [Thread, nil] the loading thread, or +nil+ when the map was
+  #   already loaded and nothing was started
+  def self.start_map_load
+    return nil if Map.loaded?
+
+    Thread.new do
+      echo "no map database could be loaded, so Lich room numbers in --exclude and --rnum match no room; u<uid> entries still work." unless Map.load
+    rescue StandardError => e
+      echo "the map failed to load (#{e.message}), so Lich room numbers in --exclude and --rnum match no room; u<uid> entries still work."
     end
   end
 
-  @options = Opts.parse
-  def self.main
-    if defined?(get_settings)
-      settings = get_settings
-      stamp_enable = settings.log_timestamp
-      stamp_format = settings.log_timestamp_format
-    end
-    Script.current.want_script_output = true
-    Script.current.want_upstream = true
+  # Splits the --exclude option into game UID entries ("u7199") and Lich
+  # room number entries ("288"). Empty entries (--exclude=,288) and a bare
+  # --exclude (`true`) exclude nothing.
+  #
+  # @param option [String, Array<String>, true, nil] the parsed --exclude
+  #   option
+  # @return [Array(Array<String>, Array<String>)] the "u" UID entries, then
+  #   the Lich room number entries
+  def self.exclude_entries(option)
+    Array(option).grep(String).reject(&:empty?).partition { |entry| entry.start_with?('u') }
+  end
 
-    if @options.timestamp
-      stamp_format = @options.timestamp
-      stamp_enable = true
-    end
+  # The throwaway module this evaluation builds Mode and Logger in (as
+  # fresh::Mode and fresh::Logger) before each is set on GameLogger, once
+  # it is whole (see {Mode}). It is made first, so XML mode's line filter
+  # can name the {Logger::StreamSpanFilter} of the Logger built with it.
+  fresh = Module.new
 
-    show_room_numbers = false
-    if @options.roomnum || @options.rnum
-      show_room_numbers = @options.roomnum || @options.rnum
-    end
+  # What one log format decides, as one frozen value. The logging loop
+  # ({Logger}) is written once; everything that differs between output
+  # formats is a field here, so a format is a value handed to the loop, not
+  # a branch in it. There are two formats: text mode ({Mode::TEXT}) and XML
+  # mode ({Mode::XML}, and {Mode::XML_STREAMS} for its streams option);
+  # {Logger.mode_for} picks one for a run.
+  #
+  # The proc fields keep no state. {#line_filter} runs once per run and
+  # builds the run's line filter, which runs on every line the run reads
+  # and may keep state across lines (XML mode's follows stream spans);
+  # {#room_title} runs in the logger's get loop, only while --rnum is on,
+  # on the lines outside an excluded room, so it stays cheap. Both modes
+  # number a room title line with the one decorator,
+  # {Logger.number_room_title}; {#uid_after_title} is the one thing they
+  # tell it.
+  #
+  # Mode, {Mode::TEXT} and {Logger} are built new, not reopened, each time
+  # Lich evaluates this module (once per log run in a session), and then
+  # put in place of the last ones, with no constant warning. A run started
+  # after log.lic was updated in the session gets the new definitions, and
+  # a run already logging keeps the Mode value and the Logger class it
+  # started with, and with the class its file, room and typed-command
+  # helpers. A guarded `Mode ||=` would keep the first version's class for
+  # the whole session, and a newer log.lic that adds a field would fail to
+  # start. Each is built in the throwaway +fresh+ module, and the
+  # constants are set only once each definition is whole, so a
+  # run starting in another thread meanwhile (;force log racing a start)
+  # gets the old definitions or the new ones, never a missing one.
+  #
+  # @!attribute [r] extension
+  #   @return [String] the log file extension with its dot, e.g. ".log"
+  # @!attribute [r] header_stamp
+  #   @return [Proc, nil] makes the header line when timestamps are off:
+  #     called with the Time, returns the line. +nil+ writes the same stamp
+  #     as the footer (see {Logger.file_stamp}). With timestamps on,
+  #     the header uses the timestamp format whatever this is.
+  # @!attribute [r] upstream_line
+  #   @return [Proc] called with one typed command as upstream_get returns
+  #     it; returns the line logged for it
+  # @!attribute [r] script_flags
+  #   @return [Hash{Symbol => Boolean}] the Script.current flags the run
+  #     sets when it starts, in this order; +want_upstream: true+ sets
+  #     Script.current.want_upstream = true. A flag not listed keeps
+  #     lich-5's default.
+  # @!attribute [r] line_filter
+  #   @return [Proc] builds a run's line filter, once per run (see
+  #     {Logger#initialize}): called with no arguments, it returns an object
+  #     whose +call+ takes each game line the run reads, in order, and
+  #     returns the text written for it: the line itself, the part of it
+  #     the filter keeps, or +nil+ when nothing of it is written (it then
+  #     does not count toward --lines). Each run gets a filter of its own,
+  #     as one may keep state from line to line.
+  # @!attribute [r] reget_line
+  #   @return [Proc] called with one line of reget's answer, the timestamp
+  #     format (`nil` for none) and the login Time ($login_time); returns
+  #     the line written at the top of the first file
+  # @!attribute [r] room_title
+  #   @return [Proc] called with a game line and the current room's title
+  #     matcher ({Logger.room_title_pattern}; +nil+ when --rnum is off
+  #     or before the first room title); truthy when the line is the room's
+  #     title line, which --rnum numbers
+  # @!attribute [r] uid_after_title
+  #   @return [Boolean] where {Logger.number_room_title} puts the GemStone
+  #     " (u<uid>)" on a room title line: +true+ right after the title's
+  #     first "]", where logxml.lic 0.6.6 put it on GemStone title lines;
+  #     +false+ at the end of the line, where log.lic has always put it.
+  # @!attribute [r] started_text
+  #   @return [String] the echo once logging has started, before the log
+  #     file's path (a space between them)
+  fresh::Mode = Data.define(:extension, :header_stamp, :upstream_line, :script_flags, :line_filter, :reget_line,
+                            :room_title, :uid_after_title, :started_text)
+  mode = fresh::Mode
 
-    lines = (@options.lines || 30_000).to_i
+  # Text mode, log.lic's format (Mode::TEXT, described where it is set).
+  text = mode.new(
+    extension: '.log',
+    header_stamp: nil,
+    upstream_line: ->(command) { ">#{command.sub(/^<c>/, '')}" },
+    script_flags: { want_script_output: true, want_upstream: true }.freeze,
+    line_filter: -> { ->(line) { line unless line =~ %r{^</?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)} } },
+    reget_line: lambda do |line, stamp_format, login_time|
+      line = line.chomp
+      stamp_format ? "#{login_time.strftime(stamp_format)}: #{line}" : line
+    end,
+    room_title: ->(line, title_pattern) { title_pattern&.match?(line.b) },
+    uid_after_title: false,
+    started_text: 'Non-XML Logging started, currently logging to'
+  )
+  # Mode::TEXT, Mode::XML and Mode::XML_STREAMS, and the three Logger
+  # constants after the class, are set with const_set: YARD registers no
+  # constant set that way (nor one assigned on a local, mode::TEXT = ...),
+  # so each is documented in a @!parse block. YARD files the Mode and
+  # Logger built in +fresh+ under the path fresh::Mode and fresh::Logger,
+  # so the blocks open those paths, and the constants appear on the class
+  # pages with the rest of each class.
+  #
+  # @!parse
+  #   class fresh::Mode
+  #     # Text mode, log.lic's format: the game text as lich-5 hands it to a
+  #     # script (downstream text, lich-5's default, left on), Lich's echoes too
+  #     # (want_script_output), and typed commands (want_upstream) as ">command"
+  #     # with a leading "<c>" removed. Files end in ".log". A line that starts
+  #     # with a stream, dialog or progress bar tag (script output can carry
+  #     # them) is not written. Reget lines lose their "\r" ($_SERVERBUFFER_
+  #     # keeps CRLF and reget splits on "\n") and get the $login_time stamp when
+  #     # timestamps are on. They are not filtered: this mode never sets
+  #     # want_downstream_xml, so reget has already removed every XML tag, and a
+  #     # "<" left in a line is game text the server sent escaped as "&lt;"
+  #     # (lich-5 lib/global_defs.rb, def reget). The room title line is the
+  #     # one that starts with XMLData.room_title (see
+  #     # {Logger.room_title_pattern}); its GemStone u-id goes at the end of the
+  #     # line.
+  #     TEXT = text
+  #   end
+  mode.const_set(:TEXT, text)
 
-    Thread.new {
-      begin
-        loop {
-          Script.current.downstream_buffer.push ">#{upstream_get.sub(/^<c>/, '')}"
-        }
-      rescue
-        echo $!
+  # XML mode, the format logxml.lic wrote (Mode::XML, described where it
+  # is set).
+  xml = mode.new(
+    extension: '.xml',
+    header_stamp: ->(time) { time.strftime('%Y-%m-%d %I:%M%P').sub(/0([0-9]+:)/, '\1') },
+    upstream_line: ->(command) { "<!-- CLIENT -->#{command}<!-- ENDCLIENT -->" },
+    script_flags: { want_script_output: true, want_upstream: true, want_downstream: false, want_downstream_xml: true }.freeze,
+    line_filter: -> { fresh::Logger::StreamSpanFilter.new },
+    reget_line: ->(line, _stamp_format, _login_time) { line.chomp },
+    room_title: ->(line, _title_pattern) { line.match?(%r{\A(?:<resource picture="\d+"/>|<popBold/>)?(?:<style id="roomName"\s+/>|<room>)}) },
+    uid_after_title: true,
+    started_text: 'XML Logging started, currently logging to'
+  )
+  # @!parse
+  #   class fresh::Mode
+  #     # XML mode, the format logxml.lic wrote (selected by --xml, or by a
+  #     # run named logxml, see {Logger.mode_for}): the XML lich-5 hands a
+  #     # script that wants the XML downstream and not the text downstream,
+  #     # Lich's and other scripts' echoes (want_script_output, as text mode;
+  #     # logxml.lic left them out), and typed commands as
+  #     # "<!-- CLIENT -->command<!-- ENDCLIENT -->"
+  #     # (a leading "<c>" kept). Files end in ".xml", and with timestamps off the
+  #     # header is the date and a 12-hour time with the hour's leading zero
+  #     # dropped ("2026-04-23 9:05am"); the footer is the same as text mode's.
+  #     # The stream content lich-5 keeps out of the main-window text it hands
+  #     # scripts is left out of each line, and every other byte of the line is
+  #     # kept; a line left blank is not written (see {Logger::StreamSpanFilter}).
+  #     # The flags are set before reget is called, so reget answers the raw XML
+  #     # the server sent; its lines are written as they come, unstamped and
+  #     # unfiltered, less their "\r".
+  #     #
+  #     # --rnum numbers the room title line in the forms lich-5 numbers for its
+  #     # own room display (lib/games.rb, process_room_information): at the start
+  #     # of the line, an optional picture resource or popBold, then the roomName
+  #     # style or a Saga-identity <room> block, such as
+  #     # '<resource picture="0"/><style id="roomName" />[Title] (uid)' and
+  #     # '<resource picture="0"/><room><name>[Title] (uid)</name>...'. Lich also
+  #     # numbers those forms after a familiar pushStream, the familiar's view of
+  #     # its own room, which is not the character's room, so this mode does not.
+  #     # The form must start the String (\A, not ^): the numbers go at the first
+  #     # "]", so a title after a line break in it is not numbered. The numbers
+  #     # are {Logger.number_room_title}'s, as in text mode, with the GemStone
+  #     # u-id right after the first "]", where logxml.lic 0.6.6 put it. The
+  #     # test logxml 0.6.6 and log.lic 1.3.0 used (a line starting with the
+  #     # picture resource and naming roomName anywhere after it) also numbered a
+  #     # line with the picture resource and then popBold before the style; Lich's
+  #     # pattern does not, so neither does this one. None of lich-5's
+  #     # spec/fixtures/streams lines has that form.
+  #     XML = xml
+  #   end
+  mode.const_set(:XML, xml)
+
+  # @!parse
+  #   class fresh::Mode
+  #     # XML mode started with the word streams or --streams: every line is
+  #     # written as it comes, stream content too.
+  #     XML_STREAMS = XML.with(line_filter: -> { ->(line) { line } })
+  #   end
+  mode.const_set(:XML_STREAMS, mode::XML.with(line_filter: -> { ->(line) { line } }))
+
+  # One log run, in one {Mode}: all its state (options, settings, the room
+  # it is in, the file it writes, its line filter) is in this object, never
+  # on the module.
+  # {GameLogger.main} builds one per run of the script and runs it.
+  #
+  # The logic that decides what a line becomes ({#line_text},
+  # {#decorate_title}, {#format_line}, {#reget_lines}) is in small methods
+  # that read their arguments, the run's settings, its current room and
+  # XMLData.game; {#line_text} also goes through the run's line filter,
+  # which in XML mode carries from one line to the next whether a stream
+  # span is open (see {StreamSpanFilter}). Every time the run uses comes
+  # from the +clock+ given to {#initialize}, and the game lines, reget, the start echo and the
+  # settings come from its +io+, so a spec can feed a run lines and a time
+  # without stubbing Time. The rest still goes through Lich: the echoes
+  # from {GameLogger.timestamp_format}, {GameLogger.lines_per_file},
+  # {GameLogger.start_map_load} and {Logger.upstream_stopped}; the typed
+  # commands ({Logger.start_upstream_logger}); and $login_time, XMLData,
+  # Script.current and Map.
+  #
+  # The helpers a run calls while it logs (the file, room and
+  # typed-command methods below) are this class's own methods, called on
+  # the run's class, so a later evaluation of log.lic, whatever its version,
+  # cannot change them under a run already logging. The module methods a
+  # run calls only while it starts ({GameLogger.timestamp_format},
+  # {GameLogger.lines_per_file}, {GameLogger.exclude_entries},
+  # {GameLogger.start_map_load}) stay on the module.
+  #
+  # The class is defined in the throwaway module +fresh+, after {Mode}
+  # (whose XML line filter is this class's {StreamSpanFilter}), and set as
+  # Logger below, once it is whole (see {Mode}); the name it is set to is
+  # its name.
+  class fresh::Logger
+    # The line written after the reget lines at the top of the first file.
+    REGET_MARKER = "<!-- Above contents from reget; full logging now active -->\n"
+
+    # A run started less than this many seconds after login ($login_time)
+    # writes reget's lines at the top of its first file.
+    REGET_WINDOW = 30
+
+    # XML mode's line filter ({Mode::XML}'s {Mode#line_filter}; one per
+    # run): leaves out of each line the stream content lich-5 keeps out of
+    # the main-window text it hands scripts, and keeps every other byte, so
+    # the XML log holds what the main window shows, its markup included.
+    # lich-5 builds that text with strip_xml (lib/common/markup.rb
+    # SUPPRESSED_STREAMS and SPELLS_STREAM on lich-5 main,
+    # lib/global_defs.rb strip_xml_simple at v5.21.0; the same patterns in
+    # both). This filter models that span rule, tracked per line, and
+    # leaves out:
+    # - a span from a pushStream of the spellfront, inv, bounty, society,
+    #   reserve, speech or talk stream to the next popStream, whatever stream
+    #   that names, followed across lines;
+    # - a <stream id="Spells"> element, within one line.
+    #
+    # It is a model, not an exact copy: lich-5 joins lines only while the
+    # line's pushStreams outnumber its popStreams, so on a line that closes
+    # one stream and then opens a left-out one ("<popStream id='combat'/>
+    # <pushStream id='inv'/>...") lich-5 does not join, finds no popStream
+    # after the push and shows the rest of that line and the lines after it,
+    # while this filter leaves them out up to the next popStream. No line in
+    # lich-5's stream fixtures has that form. The reserve id is in lich-5's
+    # list from 5.19.0; on Lich 5.14.0 to 5.18.x Lich shows the reserve
+    # stream, which this filter leaves out all the same.
+    # Every other stream (combat, assess, percWindow, group, whispers,
+    # atmospherics, familiar, room, experience, loot, ...) is main-window
+    # text to lich-5 and is kept, its pushStream and popStream tags too. So
+    # are prompts and the other tags lich-5 strips from its text but which
+    # are not stream content.
+    #
+    # A line whose text is all kept is returned as it is, a blank one too; a
+    # line that loses stream content and has nothing but whitespace left is
+    # not written, as lich-5's strip drops a blank line. The two lines the
+    # logger itself puts on the downstream buffer ({OWN_LINE}: a typed
+    # command, which starts "<!-- CLIENT -->", and the upstream thread's
+    # notice, "<!-- <name>: typed commands are not logged after this line; ")
+    # are kept as they are, inside a span too, and are not read for stream
+    # tags: a typed "<pushStream id='inv'/>" opens no span and a typed
+    # "<popStream/>" closes none. Any other line, one that starts with
+    # "<!-- " too, is a game line and is filtered like the rest.
+    #
+    # A line with a line break in it, which lich-5 never hands a script for a
+    # game line (Script.new_downstream_xml chomps each one, and each is one
+    # line the game sent), is one a script put on the downstream: lnet's chat
+    # line, "<pushStream id=\"thoughts\"/>Bob: \"hi\"\n<popStream/>", is one.
+    # When such a line comes inside a span, opens no left-out stream and
+    # closes every stream it opens, it is kept whole and the span stays open:
+    # the script wrote it to the client between two game lines, so it is not
+    # span content, and its popStream closes its own stream, not the span.
+    #
+    # @note A stream that is opened and never closed leaves out every line
+    #   after it until a popStream (of any stream) comes, as lich-5's own
+    #   text does. In lich-5's stream fixtures every such stream is closed
+    #   within 38 lines.
+    # @note The span starts on the line the logger reads, so a run started
+    #   inside one keeps its last lines and the popStream; the reget is
+    #   written as it is and does not move the filter.
+    class StreamSpanFilter
+      # A pushStream that opens a span (lich-5's SUPPRESSED_STREAMS start).
+      SPAN_START = %r{<pushStream id=["'](?:spellfront|inv|bounty|society|reserve|speech|talk)["'][^>]*/>}
+
+      # A popStream, of any stream, which ends an open span.
+      SPAN_END = /<popStream[^>]*>/
+
+      # A Spells stream element (lich-5's SPELLS_STREAM).
+      SPELLS = %r{<stream id="Spells">.*?</stream>}m
+
+      # The start of any pushStream and of any popStream, counted to tell
+      # whether a line closes every stream it opens.
+      PUSH = '<pushStream'
+      POP = '<popStream'
+
+      # What is left of a line that is not written: nothing, or only
+      # whitespace (lich-5's strip_simple drops such a line too).
+      BLANK = /\A\s*\z/
+
+      # How a line the logger itself put on the downstream buffer starts:
+      # the {Mode::XML} upstream_line of a typed command, or the notice
+      # {Logger.upstream_stopped} pushes (its name part is {Logger.log_label}).
+      OWN_LINE = /\A<!-- (?:CLIENT -->|\S+: typed commands are not logged after this line; )/
+
+      # The start every {OWN_LINE} shares, tested first so that most game
+      # lines skip the regex.
+      OWN_LINE_START = '<!-- '
+
+      # A filter outside any span.
+      #
+      # @return [StreamSpanFilter]
+      def initialize
+        @in_span = false
       end
-    }
 
-    started = false
-    loop {
-      dir = File.join(LICH_DIR, 'logs', "#{XMLData.game}-#{XMLData.name}", Time.now.strftime("%Y"), Time.now.strftime("%m"))
-      FileUtils.mkdir_p(dir) unless File.exist?(dir)
-      thisdate = Time.now.strftime("%Y-%m-%d")
-      filename = File.join(dir, "#{Time.now.strftime("%Y-%m-%d_%H-%M-%S")}.log")
-      file = File.open(filename, 'a')
-      file.sync = true
-      if stamp_enable
-        file.puts "#{Time.now.strftime(stamp_format)}\n"
-      else
-        file.puts "#{Time.now.strftime("%Y-%m-%d %H:%M:%S.%L %:z")}\n"
+      # The text written for one game line, the lines given in the order the
+      # run reads them; moves the filter into or out of a span.
+      #
+      # @param line [String] a game line as get returns it
+      # @return [String, nil] +line+ itself when nothing of it is left out;
+      #   the rest of it, as a binary String, when stream content is left
+      #   out; +nil+ when that leaves nothing or only whitespace
+      def call(line)
+        return line if line.start_with?(OWN_LINE_START) && line.b.match?(OWN_LINE)
+        return line unless @in_span || line.include?(PUSH) || line.include?('<stream id="Spells">')
+        return line if @in_span && own_stream_line?(line.b)
+
+        began_in_span = @in_span
+        text = outside_spans(line.b).gsub(SPELLS, '')
+        # An empty line inside a span is span content too.
+        return line unless began_in_span || text.bytesize < line.bytesize
+
+        # As Lich's strip does, a line left blank (empty, or only spaces) is not written.
+        text.match?(BLANK) ? nil : text
       end
-      unless started
-        if (Time.now - $login_time) < 30
-          reget.each do |line|
-            next if line =~ /^<\/?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)/
 
-            if stamp_enable
-              file.puts "#{$login_time.strftime(stamp_format)}: #{line}"
-            else
-              file.puts line
-            end
+      private
+
+      # Whether +bytes+ is a line a script put on the downstream with a stream
+      # of its own: it has a line break in it (no game line has), opens no
+      # left-out stream, and has as many popStreams as pushStreams, at least
+      # one.
+      #
+      # @param bytes [String] a binary line
+      # @return [Boolean]
+      def own_stream_line?(bytes)
+        return false unless bytes.include?("\n") && !bytes.match?(SPAN_START)
+
+        pushes = bytes.scan(PUSH).size
+        pushes.positive? && pushes == bytes.scan(POP).size
+      end
+
+      # The parts of +bytes+ outside the spans, from the span state the last
+      # line left; leaves the state where this line ends.
+      #
+      # @param bytes [String] a binary game line
+      # @return [String] the parts outside spans, joined
+      def outside_spans(bytes)
+        kept = String.new(encoding: Encoding::BINARY)
+        position = 0
+        loop do
+          if @in_span
+            close = SPAN_END.match(bytes, position)
+            break unless close
+
+            @in_span = false
+            position = close.end(0)
+          else
+            open = SPAN_START.match(bytes, position)
+            kept << bytes.byteslice(position, (open ? open.begin(0) : bytes.bytesize) - position)
+            break unless open
+
+            @in_span = true
+            position = open.end(0)
           end
-          file.puts "<!-- Above contents from reget; full logging now active -->\n"
         end
-
-        echo "Non-XML Logging started, currently logging to #{filename}"
-        started = true
+        kept
       end
-      begin
-        lines.times {
-          line = get
-          if @options.exclude
-            next if Array(@options.exclude).include?(Room.current.id.to_s) || Array(@options.exclude).include?("u#{XMLData.room_id}")
-          end
-          if show_room_numbers && line =~ /^#{Regexp.escape(XMLData.room_title)}/
-            line.sub!(']') { " - #{Map.current.id}]" }
-            line += " (u#{XMLData.room_id})" if XMLData.game =~ /^GS/ && line !~ /\(#{XMLData.room_id}\)/
-          end
-          unless line =~ /^<\/?(?:(?:push|pop)Stream|progressBar|dialogData|(?:open|close)Dialog)/
-            unless defined?(stamp_enable)
-              file.puts line
-            else
-              if stamp_enable
-                file.puts "#{Time.now.strftime(stamp_format)}: #{line}"
-              else
-                file.puts line
-              end
-            end
-          end
-          break if Time.now.strftime("%Y-%m-%d") != thisdate
-        }
-        if stamp_enable
-          file.puts "#{Time.now.strftime(stamp_format)}\n"
-        else
-          file.puts "#{Time.now.strftime("%Y-%m-%d %H:%M:%S.%L %:z")}\n"
+    end
+
+    # The header and footer stamp when timestamps are off: the date, the
+    # time to the millisecond and the UTC offset. A constant of this class
+    # is safe from the session: each evaluation of log.lic builds a new
+    # class, while a guarded constant on the module would keep the first
+    # loaded value for the session.
+    FILE_STAMP_FORMAT = '%Y-%m-%d %H:%M:%S.%L %:z'
+
+    # The script name that selects XML mode, kept for installs that still
+    # have logxml.lic: it left the repository in log.lic 1.3.4, but neither
+    # lich5-update nor the repository deletes a local script, and
+    # logxml.lic 0.7.x loads this file, so a run started as ;logxml runs
+    # under this name (see {mode_for}).
+    XML_SCRIPT_NAME = 'logxml'
+
+    # The name Lich gives the exec script --both starts for the XML log
+    # ({GameLogger.start_xml_twin}), before its number (logxml1, logxml2,
+    # ...). It differs from a local logxml.lic run's name, logxml, by that
+    # number.
+    BOTH_XML_NAME = 'logxml'
+
+    # Picks the {Mode} for a run: XML mode when the options hold --xml (or
+    # the word xml) or the script runs as {XML_SCRIPT_NAME}, with every line
+    # kept ({XML_STREAMS_MODE}) when they also hold the word streams or
+    # --streams, and text mode ({DEFAULT_MODE}) otherwise; text mode ignores
+    # streams. The modes are this class's own, built with it, so a run never
+    # gets a Mode from another evaluation of log.lic.
+    #
+    # @param options [OpenStruct] the run's options, as {Opts.parse} returns
+    #   them; reads +xml+ and +streams+
+    # @param script_name [String, nil] the name the script was started as
+    #   (Script.current.name), e.g. "log", or "logxml" for an install's
+    #   local logxml.lic 0.7.x
+    # @return [Mode] {DEFAULT_MODE}, {XML_MODE} or {XML_STREAMS_MODE}
+    def self.mode_for(options, script_name)
+      return DEFAULT_MODE if options.both
+      return DEFAULT_MODE unless options.xml || script_name == XML_SCRIPT_NAME
+
+      options.streams ? XML_STREAMS_MODE : XML_MODE
+    end
+
+    # The name the running script was started as ("log", or "logxml" for
+    # XML mode run by an install's local logxml.lic 0.7.x), which starts
+    # the logger's own lines in the log file and in the Lich log, so they
+    # name the logger to look at.
+    #
+    # @return [String] Script.current.name, or "log" when there is no
+    #   current script
+    def self.log_label
+      Script.current&.name || 'log'
+    end
+
+    # Looks up the Lich room number for a game room UID in the map's UID
+    # table. Map.ids_from_uid is a plain hash lookup: unlike Room.current and
+    # Map.current it never matches the room by text, so it cannot send
+    # LOCATION or PEER from the logger (which would clear the logger's own
+    # buffer) and costs the same in rooms the map cannot place. It never
+    # loads the map either (see {GameLogger.start_map_load}): until the map
+    # is loaded, or learns the UID, every room has no Lich number here.
+    #
+    # @param uid [Integer] the game's room UID (XMLData.room_id)
+    # @return [Integer, nil] the one Lich room number mapped to +uid+, or
+    #   +nil+ when the UID maps to no room or to more than one
+    def self.lich_room_id(uid)
+      ids = Map.ids_from_uid(uid)
+      ids.first if ids.size == 1
+    end
+
+    # Builds the matcher for the current room's title line, for --rnum. In
+    # DragonRealms lich-5 wraps the bracketed title from the room subtitle in
+    # one more pair of brackets (XMLData.room_title is "[[Title]]" while the
+    # game line reads "[Title] (230008)"), so one pair is removed first.
+    #
+    # The pattern is built from the title's bytes, so match it against
+    # +line.b+: a UTF-8 pattern with letters outside ASCII raises
+    # Encoding::CompatibilityError on a binary game line with high bytes.
+    #
+    # @param title [String] XMLData.room_title
+    # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
+    # @return [Regexp, nil] a pattern matching the bytes of a line that
+    #   starts with the title, or +nil+ when the title is empty or not
+    #   "[...]" shaped (before the first room title arrives), so no line is
+    #   changed
+    def self.room_title_pattern(title, game)
+      title = title.to_s
+      title = title[1..-2] if game.to_s.start_with?('DR') && title.start_with?('[[') && title.end_with?(']]')
+      return nil unless title.length > 2 && title.start_with?('[') && title.end_with?(']')
+
+      /\A#{Regexp.escape(title.b)}/
+    end
+
+    # Adds the room numbers to a room title line, for --rnum, in either
+    # mode: " - <number>" inside the first "]" when the room has a Lich
+    # number, and in GemStone " (u<uid>)" unless the line already shows
+    # "] (<uid>)" (the game can send its room id after the title, as in
+    # "[Sanctum of Scales, Columns] (4216015)", and a second one would say
+    # the same twice). The u-id goes at the end of the line, or right after
+    # the first "]" with +uid_after_title+ (XML mode, where logxml.lic
+    # 0.6.6 put it). A room with no Lich number keeps its
+    # title as the game sent it (apart from the GemStone UID). DragonRealms
+    # titles never get a u-id, and neither does a room whose UID is unknown:
+    # 0, or above 4294967296, which Lich's own room display shows as
+    # "unknown" (lich-5 lib/games.rb).
+    #
+    # A line that shows another UID ("] (<number>)", read as Lich's own
+    # room display reads it, lich-5 lib/games.rb modify_room_display) is
+    # another room's title and is returned as it is. The logger reads
+    # XMLData when it handles a line, not when the line came in, so after
+    # quick moves the parser can already be a room ahead of the line, and
+    # its numbers would be the next room's.
+    #
+    # @param line [String] a game line whose first "]" closes the room title
+    # @param lich_id [Integer, nil] the room's Lich number, see {lich_room_id}
+    # @param uid [Integer, nil] the game's room UID (XMLData.room_id)
+    # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
+    # @param uid_after_title [Boolean] true puts the u-id right after the
+    #   first "]", false (the default, text mode) at the end of the line; see
+    #   {Mode#uid_after_title}
+    # @return [String] a new String with the numbers added, or +line+ itself
+    #   when there is nothing to add or the line shows another room's UID
+    def self.number_room_title(line, lich_id, uid, game, uid_after_title: false)
+      shown_uid = line.b[/\] \((\d+)\)/, 1]
+      return line if shown_uid && shown_uid.to_i != uid.to_i
+
+      line = line.sub(']') { " - #{lich_id}]" } if lich_id
+      return line unless shown_uid.nil? && game.to_s.start_with?('GS') && uid.to_i.between?(1, 4_294_967_296)
+
+      uid_after_title ? line.sub(']') { "] (u#{uid})" } : "#{line} (u#{uid})"
+    end
+
+    # The folder that holds every character's log folders: Lich's LOG_DIR,
+    # which Lich's --logs= option sets (and which pilepull.lic reads these
+    # logs from), or LICH_DIR/logs when LOG_DIR is not defined or empty.
+    #
+    # @return [String] the logs folder
+    def self.log_root
+      root = (LOG_DIR if defined?(LOG_DIR)).to_s
+      root.empty? ? File.join(LICH_DIR, 'logs') : root
+    end
+
+    # The folder for one character's logs in one month:
+    # <log root>/<game>-<name>/<YYYY>/<MM>, see {log_root}.
+    #
+    # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
+    # @param name [String] the character's name (XMLData.name)
+    # @param time [Time] the time the log file is started
+    # @return [String] the folder path (not created here)
+    def self.log_directory(game, name, time)
+      File.join(log_root, "#{game}-#{name}", time.strftime('%Y'), time.strftime('%m'))
+    end
+
+    # The path for a new log file: <dir>/<YYYY-MM-DD_HH-MM-SS><extension>.
+    # The first file of a run keeps that name even when the file exists (it
+    # is appended to, as a restarted logger always has). A file started by
+    # rotation never reuses an existing name: when a whole file filled within
+    # one second (a tiny --lines during a burst), or another logger wrote
+    # that name, "_01", "_02", ... is added before the extension. That
+    # suffix sorts after the first file's name and, up to _99, in order, so a
+    # month folder listed by name keeps the files in the order written.
+    #
+    # @param dir [String] the folder, see {log_directory}
+    # @param time [Time] the time the file is started
+    # @param extension [String] the file extension with its dot, e.g. ".log"
+    # @param rotated [Boolean] true for a file started by rotation (a new day
+    #   or the --lines count), false for the first file of a run
+    # @return [String] the file path
+    def self.log_file_path(dir, time, extension, rotated:)
+      stem = File.join(dir, time.strftime('%Y-%m-%d_%H-%M-%S'))
+      path = "#{stem}#{extension}"
+      return path unless rotated
+
+      suffix = 0
+      path = "#{stem}_#{format('%02d', suffix += 1)}#{extension}" while File.exist?(path)
+      path
+    end
+
+    # A log file name this logger writes: <YYYY-MM-DD_HH-MM-SS>, an optional
+    # rotation suffix (_01), then .log or .xml. The date in the name, not the
+    # file's modification time, decides its age (copying logs between
+    # machines resets modification times).
+    LOG_FILE_NAME = /\A(\d{4})-(\d{2})-(\d{2})_\d{2}-\d{2}-\d{2}(?:_\d+)?\.(?:log|xml)\z/
+
+    # Seconds a new day's sweep waits before it starts (see
+    # {#start_compression}).
+    DAY_SWEEP_DELAY = 120
+
+    # Seconds since its last write under which a file dated yesterday is
+    # left alone, and after which a leftover .gz.tmp counts as abandoned. A
+    # file a logger in this Lich process holds open is skipped whatever its
+    # age ({GameLogger.log_path_open?}); this guard is the backstop for a
+    # logger that does not record its files, such as a logxml.lic older
+    # than 0.7.
+    RECENT_WRITE = 3600
+
+    # One character's log folder: <log root>/<game>-<name>, see {log_root}.
+    #
+    # @param game [String] XMLData.game, e.g. "GSIV" or "DR"
+    # @param name [String] the character's name (XMLData.name)
+    # @return [String] the folder path
+    def self.character_log_folder(game, name)
+      File.join(log_root, "#{game}-#{name}")
+    end
+
+    # Gzips every log file in a character's month folders
+    # (<folder>/<YYYY>/<MM>/) whose name dates it before +cutoff+, one file
+    # at a time (see {compress_log_file}). Files with other names, .gz
+    # files, the folder root (the layout before log.lic 0.0.7) and any file
+    # a logger in this Lich process holds open ({GameLogger.log_path_open?})
+    # are left alone.
+    #
+    # @param folder [String] the character's log folder, see
+    #   {character_log_folder}
+    # @param cutoff [Date] files dated before this day are compressed
+    # @param now [Time] the time now, for {RECENT_WRITE}
+    # @return [Array(Integer, Integer, Integer)] the files compressed, their
+    #   bytes before and their bytes after
+    def self.compress_old_logs(folder, cutoff, now: Time.now)
+      count = before = after = 0
+      # base: keeps glob characters in LOG_DIR ([, {, \\ on Windows) out of
+      # the pattern.
+      Dir.glob('[0-9][0-9][0-9][0-9]/[0-9][0-9]/*', base: folder).sort.each do |relative|
+        path = File.join(folder, relative)
+        # A temp file whose log is gone (another sweep finished it, or it
+        # was moved away) is removed once abandoned; one beside its log is
+        # handled with the log, in compress_log_file.
+        if relative.end_with?('.gz.tmp')
+          remove_abandoned_temp(path, now) unless File.exist?(path.delete_suffix('.gz.tmp'))
+          next
         end
+        next unless (match = File.basename(path).match(LOG_FILE_NAME))
+        next unless (date = (Date.new(match[1].to_i, match[2].to_i, match[3].to_i) rescue nil))&.<(cutoff)
+        # A file a logger in this process holds open is never compressed: an
+        # idle logger keeps yesterday's file open until a game line comes,
+        # and on Linux and macOS deleting it would lose its later lines.
+        next if GameLogger.log_path_open?(path)
+        # Only a file dated yesterday (or later) can still be in use; an
+        # older one is compressed even if just copied in (copying resets the
+        # modification time, not the name).
+        next unless (sizes = compress_log_file(path, now: now, recent_guard: date >= now.to_date - 1))
+
+        count += 1
+        before += sizes[0]
+        after += sizes[1]
+      end
+      [count, before, after]
+    end
+
+    # Gzips one log file in place, as <path>.gz, without ever losing it:
+    # the copy is written to <path>.gz.tmp (created exclusively, so a second
+    # logger compressing the same folder skips the file), flushed to disk,
+    # read back whole and checked against the original's size, then renamed
+    # to <path>.gz, but only while that temp file is still the one this call
+    # wrote, and given the original's modification time and permissions;
+    # only then is the original deleted. A file written to within
+    # {RECENT_WRITE} is skipped. When <path>.gz already exists (an earlier
+    # sweep stopped after the rename), the original is deleted only if that
+    # .gz holds exactly its bytes ({finish_compressed}). A file another
+    # sweeper finished meanwhile is left to it. Every failure leaves the
+    # original in place, removes the temp file this call made, and goes to
+    # the Lich log with the path and the error.
+    #
+    # @param path [String] the log file
+    # @param now [Time] the time now, for {RECENT_WRITE}
+    # @param recent_guard [Boolean] skip the file when it was written to
+    #   within {RECENT_WRITE} ({compress_old_logs} turns this off for files
+    #   dated before yesterday)
+    # @return [Array(Integer, Integer), nil] the original's size and the
+    #   .gz's size when the original is gone, or +nil+ when it is still there
+    def self.compress_log_file(path, now: Time.now, recent_guard: true)
+      stat = File.stat(path)
+      return nil if recent_guard && now - stat.mtime < RECENT_WRITE
+
+      gz_path = "#{path}.gz"
+      tmp = "#{gz_path}.tmp"
+      remove_abandoned_temp(tmp, now)
+      return finish_compressed(path, gz_path, stat) if File.exist?(gz_path)
+
+      created = false
+      written = nil
+      # 0600: readable by nobody else while it is written, and still so if
+      # the original's permissions cannot be given to the .gz later.
+      File.open(tmp, File::WRONLY | File::CREAT | File::EXCL | File::BINARY, 0o600) do |out|
+        created = true
+        gzip = Zlib::GzipWriter.new(out, Zlib::DEFAULT_COMPRESSION)
+        gzip.mtime = stat.mtime
+        gzip.orig_name = File.basename(path)
+        File.open(path, 'rb') do |input|
+          while (chunk = input.read(65_536))
+            gzip.write(chunk)
+          end
+        end
+        gzip.finish
+        out.flush
+        out.fsync
+        written = out.stat
+      end
+      unless gzip_complete?(tmp, stat.size) && File.size(path) == stat.size
+        File.delete(tmp)
+        created = false
+        Lich.log "log: left #{path} as it is: its compressed copy did not read back whole, or the file changed meanwhile"
+        return nil
+      end
+      unless same_file?(File.stat(tmp), written)
+        created = false
+        Lich.log "log: left #{path} as it is: another sweep replaced its compressed copy before it was renamed"
+        return nil
+      end
+      File.rename(tmp, gz_path)
+      created = false
+      sync_directory(File.dirname(gz_path))
+      # Read back once more under its final name before the original goes:
+      # a sweeper whose clock runs over an hour ahead can take this temp
+      # file for abandoned and leave its own in its place just before the
+      # rename.
+      unless gzip_complete?(gz_path, stat.size)
+        Lich.log "log: left #{path} as it is: #{gz_path} did not read back whole after the rename"
+        return nil
+      end
+      keep_times_and_mode(gz_path, stat)
+      remove_compressed_original(path, gz_path, stat)
+    rescue Errno::EEXIST
+      # Another sweeper is compressing this file.
+      nil
+    rescue Errno::ENOENT
+      # Another sweeper finished this file meanwhile; drop this call's copy.
+      remove_own_temp(tmp, created)
+      nil
+    rescue SystemCallError, IOError, Zlib::Error => e
+      remove_own_temp(tmp, created)
+      Lich.log "log: left #{path} as it is: compressing it failed (#{e.class}: #{e.message})"
+      nil
+    end
+
+    # Deletes the temp file a {compress_log_file} call made, when it made
+    # one and it is still there.
+    #
+    # @param tmp [String, nil] the temp file
+    # @param created [Boolean] whether this call created it
+    # @return [void]
+    def self.remove_own_temp(tmp, created)
+      File.delete(tmp) if created && tmp && File.exist?(tmp)
+    rescue SystemCallError
+      nil
+    end
+
+    # Deletes a temp file left over an hour ago ({RECENT_WRITE}): a sweep
+    # that was stopped, or one whose log another sweep finished. A younger
+    # one may belong to a sweep still running and is left alone.
+    #
+    # @param tmp [String] the temp file
+    # @param now [Time] the time now
+    # @return [void]
+    def self.remove_abandoned_temp(tmp, now)
+      File.delete(tmp) if File.exist?(tmp) && now - File.mtime(tmp) > RECENT_WRITE
+    rescue SystemCallError
+      nil
+    end
+
+    # Whether two stats are of the same file: size and modification time,
+    # and the inode where the system has one (Windows reports 0).
+    #
+    # @param now [File::Stat] the file's stat now
+    # @param written [File::Stat, nil] its stat right after it was written
+    # @return [Boolean]
+    def self.same_file?(now, written)
+      return false if written.nil?
+      return false unless now.size == written.size && now.mtime == written.mtime
+
+      now.ino.zero? || written.ino.zero? || now.ino == written.ino
+    end
+
+    # Flushes a rename in +dir+ to disk where the system allows it (not on
+    # Windows, where a folder cannot be opened), so a crash right after
+    # cannot keep the original's deletion and lose the .gz's rename.
+    #
+    # @param dir [String] the folder
+    # @return [void]
+    def self.sync_directory(dir)
+      File.open(dir, &:fsync)
+    rescue SystemCallError, IOError
+      nil
+    end
+
+    # Gives the .gz the original's modification time and permissions. Both
+    # are best effort: some network mounts refuse them, and the .gz is
+    # whole either way.
+    #
+    # @param gz_path [String] the .gz
+    # @param stat [File::Stat] the original's stat
+    # @return [void]
+    def self.keep_times_and_mode(gz_path, stat)
+      File.utime(stat.atime, stat.mtime, gz_path)
+      File.chmod(stat.mode & 0o777, gz_path)
+    rescue SystemCallError => e
+      Lich.log "log: compressed #{gz_path}, but could not give it the original's time or permissions (#{e.class}: #{e.message})"
+    end
+
+    # Deletes the original once <path>.gz holds it (see
+    # {compress_log_file}). When it cannot be deleted (on Windows, a file
+    # another program has open), both stay, and the next sweep deletes the
+    # original after checking the .gz ({finish_compressed}). An original
+    # another sweeper already deleted counts as done.
+    #
+    # @param path [String] the log file
+    # @param gz_path [String] its .gz
+    # @param stat [File::Stat] the log file's stat from before compressing
+    # @return [Array(Integer, Integer), nil] the sizes, or +nil+ when the
+    #   original is still there
+    def self.remove_compressed_original(path, gz_path, stat)
+      begin
+        File.delete(path)
+      rescue Errno::ENOENT
+        nil
+      end
+      [stat.size, File.size(gz_path)]
+    rescue SystemCallError => e
+      Lich.log "log: compressed #{path} to #{gz_path}, but could not delete the original (#{e.class}: #{e.message}); the next sweep deletes it"
+      nil
+    end
+
+    # Finishes a file an earlier sweep compressed but did not delete: the
+    # original goes only when <path>.gz holds exactly its bytes (same size
+    # and CRC-32, see {gzip_matches?}), after the .gz is given the
+    # original's time and permissions; otherwise both stay and the Lich log
+    # says why.
+    #
+    # @param path [String] the log file
+    # @param gz_path [String] its existing .gz
+    # @param stat [File::Stat] the log file's stat
+    # @return [Array(Integer, Integer), nil] the sizes when the original is
+    #   gone, or +nil+ when it is still there
+    def self.finish_compressed(path, gz_path, stat)
+      unless gzip_matches?(gz_path, path)
+        Lich.log "log: left #{path} as it is: #{gz_path} already exists and does not hold exactly its contents"
+        return nil
+      end
+      keep_times_and_mode(gz_path, stat)
+      remove_compressed_original(path, gz_path, stat)
+    end
+
+    # Whether +gz_path+ is a whole gzip file holding +size+ bytes: read to
+    # the end, which also checks gzip's CRC and length trailer.
+    #
+    # @param gz_path [String] the .gz (or .gz.tmp) file
+    # @param size [Integer] the original's size in bytes
+    # @return [Boolean]
+    def self.gzip_complete?(gz_path, size)
+      gzip_digest(gz_path)&.last == size
+    end
+
+    # Whether +gz_path+ holds exactly the bytes of +path+: the same size
+    # and CRC-32 after reading both to the end.
+    #
+    # @param gz_path [String] the .gz
+    # @param path [String] the original
+    # @return [Boolean]
+    # @raise [Errno::ENOENT] when the original is gone
+    def self.gzip_matches?(gz_path, path)
+      digest = gzip_digest(gz_path)
+      return false if digest.nil?
+
+      crc = 0
+      size = 0
+      File.open(path, 'rb') do |input|
+        while (chunk = input.read(65_536))
+          crc = Zlib.crc32(chunk, crc)
+          size += chunk.bytesize
+        end
+      end
+      digest == [crc, size]
+    rescue Errno::ENOENT
+      # The original is gone: another sweeper finished it (see
+      # compress_log_file), which is not a mismatch.
+      raise
+    rescue SystemCallError, IOError
+      false
+    end
+
+    # The CRC-32 and byte count of everything +gz_path+ decompresses to, or
+    # +nil+ when it is not a whole gzip file (gzip's own CRC and length
+    # trailer are checked on the way).
+    #
+    # @param gz_path [String] the .gz (or .gz.tmp) file
+    # @return [Array(Integer, Integer), nil] [crc, size]
+    def self.gzip_digest(gz_path)
+      crc = 0
+      size = 0
+      Zlib::GzipReader.open(gz_path) do |gzip|
+        while (chunk = gzip.read(65_536))
+          crc = Zlib.crc32(chunk, crc)
+          size += chunk.bytesize
+        end
+      end
+      [crc, size]
+    rescue Zlib::Error, IOError, SystemCallError
+      nil
+    end
+
+    # A byte count for the echo: "438 MB", "4.9 GB".
+    #
+    # @param bytes [Integer]
+    # @return [String]
+    def self.size_text(bytes)
+      return "#{(bytes / 1e9).round(1)} GB" if bytes >= 1e9
+      return "#{(bytes / 1e6).round} MB" if bytes >= 1e6
+
+      "#{(bytes / 1e3).round} KB"
+    end
+
+    # The header or footer line of a log file: the time now in the
+    # timestamp format, or in {FILE_STAMP_FORMAT} (date, time to the
+    # millisecond and UTC offset) when timestamps are off.
+    #
+    # @param stamp_format [String, nil] the strftime format, or +nil+ for no
+    #   timestamps
+    # @param clock [#now] where the time comes from; Time by default (a spec
+    #   can pass a fixed clock)
+    # @return [String] the line, without a line end
+    def self.file_stamp(stamp_format, clock: Time)
+      clock.now.strftime(stamp_format || FILE_STAMP_FORMAT)
+    end
+
+    # Opens a log file for appending, writes its header line, runs the block
+    # with it, then writes its footer line and closes it. The footer is
+    # written exactly once, from an ensure, so a file gets one also when the
+    # logger stops (;kill, logout, Lich exiting) and not only when it starts a
+    # new file; see {write_footer}. A file whose header could not be written
+    # gets no footer, and is still closed, so an error in the header never
+    # leaves the file open. A close that fails goes to the Lich log with the
+    # file's path and the error, and is otherwise ignored. Lines are written
+    # as they come (sync is on), but a close that fails can still mean a
+    # missing footer or a write error the system reported late.
+    #
+    # @param filename [String] the log file path; an existing file is
+    #   appended to
+    # @param stamp_format [String, nil] the strftime format for the header and
+    #   footer, or +nil+ for the default, see {file_stamp}
+    # @param clock [#now] where the header and footer times come from; Time
+    #   by default
+    # @param header_stamp [Proc, nil] used for the header line instead of
+    #   {file_stamp}'s default when +stamp_format+ is +nil+: called with the
+    #   time, returns the line (see {Mode#header_stamp}); +nil+ uses the
+    #   default, as the footer always does
+    # @yield [file] writes the file's lines
+    # @yieldparam file [File] the open log file, with sync on
+    # @yieldreturn [void]
+    # @return [void]
+    # @raise [SystemCallError, IOError] when the file cannot be opened, its
+    #   header cannot be written, or the block returns (the file is full or
+    #   the day changed) and the footer cannot be written; the file is closed
+    #   first. Errors raised by the block pass through after the footer and
+    #   close.
+    def self.with_log_file(filename, stamp_format, clock: Time, header_stamp: nil)
+      # Recorded before the open, so no sweep starts on it in between.
+      open_key = GameLogger.open_log_path(filename)
+      begin
+        file = File.open(filename, 'a')
+      rescue StandardError
+        GameLogger.close_log_path(open_key)
+        raise
+      end
+      header_written = false
+      finished = false
+      begin
+        file.sync = true
+        file.puts(stamp_format.nil? && header_stamp ? header_stamp.call(clock.now) : file_stamp(stamp_format, clock: clock))
+        header_written = true
+        yield file
+        finished = true
       ensure
         begin
-          file.close
-        rescue
-          Lich.log "Can't close file!"
+          # Not finished: an error or Thread#kill (;kill) is stopping the logger.
+          write_footer(file, stamp_format, stopping: !finished, clock: clock) if header_written
+        ensure
+          begin
+            file.close
+          rescue StandardError => e
+            Lich.log "#{log_label}: closing the log file #{filename} failed (#{e.class}: #{e.message}); lines are written as they come, with sync on, but the file may be missing its footer or a last write"
+          ensure
+            GameLogger.close_log_path(open_key)
+          end
         end
       end
-    }
+    end
+
+    # Writes a log file's footer line. It runs each time a file is closed:
+    # when a new file starts (a new day or the --lines count), where a failed
+    # write raises, and when the logger stops, where a failed write (disk
+    # full, a closed file) goes to the Lich log and is otherwise ignored, so
+    # it does not replace the reason the logger stopped.
+    #
+    # @param file [File] the open log file
+    # @param stamp_format [String, nil] the strftime format, or +nil+ for
+    #   the default, see {file_stamp}
+    # @param stopping [Boolean] true when the logger is stopping (an error or
+    #   ;kill), false when the file is closed for the next one
+    # @param clock [#now] where the footer time comes from; Time by default
+    # @return [void]
+    # @raise [IOError, SystemCallError] when the write fails and +stopping+ is
+    #   false
+    def self.write_footer(file, stamp_format, stopping:, clock: Time)
+      file.puts file_stamp(stamp_format, clock: clock)
+    rescue IOError, SystemCallError => e
+      raise unless stopping
+
+      Lich.log "#{log_label}: the footer of #{file.path} was not written while the logger stopped (#{e.class}: #{e.message})"
+      nil
+    end
+
+    # Starts the thread that logs typed commands: each command lich-5 hands
+    # the script's upstream buffer is pushed onto its downstream buffer as
+    # the block formats it, by default as ">command" (a leading "<c>"
+    # removed, the {Mode#upstream_line} of {DEFAULT_MODE}), so the get loop
+    # in {#run} writes it in order with the game lines. The format comes
+    # as a block, not an argument, so a wrapper that calls +super+ with no
+    # arguments passes it on. When the thread stops on an error, it
+    # says why and leaves a notice in the log file, see {upstream_stopped}.
+    # Thread#kill (;kill, logout) stops it without either, as does an
+    # execution-guard stop (see {guard_stop?}), and so does a
+    # StopIteration from upstream_get or the push: Kernel#loop rescues that
+    # one itself and ends the loop. lich-5's upstream_get does not raise it.
+    #
+    # @note A reply the game sends within about 50 ms of a typed command
+    #   can be logged before the command's line. lich-5 hands this thread
+    #   the command by polling the upstream buffer every 50 ms
+    #   (Script#upstream_gets, lib/common/script.rb), while the get loop
+    #   wakes at once for a game line (Script#gets, a blocking wait_shift),
+    #   so a fast reply can reach the downstream buffer first. The longer
+    #   the round trip to the game, the rarer it is. ;log help says so
+    #   too; a fix belongs in lich-5.
+    # @yield [command] formats one typed command for the log; with no
+    #   block, {DEFAULT_MODE}'s {Mode#upstream_line} is used
+    # @yieldparam command [String] the command as upstream_get returns it
+    # @yieldreturn [String] the line to log
+    # @return [Thread] the started thread
+    def self.start_upstream_logger(&format_command)
+      format_command ||= DEFAULT_MODE.upstream_line
+      Thread.new do
+        loop { Script.current.downstream_buffer.push format_command.call(upstream_get) }
+      rescue StandardError => e
+        upstream_stopped(e) unless guard_stop?(e)
+      end
+    end
+
+    # Whether +error+ is lich-5's execution-guard stop
+    # (Lich::Common::ScriptExecutionGuard::Interrupted, lich-5 5.22 and
+    # later), which a guarded script's threads get instead of Thread#kill.
+    # It ends the upstream thread as quietly as ;kill does: no echo, no
+    # notice line. Before 5.22 the class does not exist and nothing is a
+    # guard stop.
+    #
+    # @param error [StandardError] the error that stopped the upstream thread
+    # @return [Boolean]
+    def self.guard_stop?(error)
+      return false unless defined?(::Lich::Common::ScriptExecutionGuard::Interrupted)
+
+      error.is_a?(::Lich::Common::ScriptExecutionGuard::Interrupted)
+    end
+
+    # Says that typed commands are no longer logged because the upstream
+    # thread (see {start_upstream_logger}) stopped on +error+: echoes the
+    # error's class and message, the file and line it was raised at (no
+    # directory, see {upstream_frame}) and how to restart the logger with the
+    # arguments it was started with, and pushes one comment line onto the
+    # downstream buffer, so the log file shows where the typed command lines
+    # end. The comment starts with the name the logger runs as (see
+    # {log_label}). The game lines are still logged. That line goes through
+    # the get loop like a game line: it is stamped when timestamps are on,
+    # and it is not written while the logger is in an --exclude room.
+    #
+    # Both modes set want_script_output, so in lich-5 the echo reaches the
+    # downstream buffer too and is logged just before the notice line.
+    #
+    # @param error [StandardError] the error that stopped the thread
+    # @return [void]
+    def self.upstream_stopped(error)
+      reason = "#{error.class}: #{error.message.to_s.gsub(/\s+/, ' ').strip}"
+      where = upstream_frame(error)
+      script = Script.current
+      echo "typed commands are no longer logged: the upstream thread stopped on #{reason}#{" at #{where}" if where}. " \
+           "Game lines are still logged; restart the logger (#{restart_hint(script)}) to log typed commands again."
+      # A "-" before another "-" is spaced out: "--" would end the comment
+      # early, and is not allowed inside an XML comment. The ")" after the
+      # reason keeps a last "-" off the closing "-->".
+      script.downstream_buffer.push "<!-- #{log_label}: typed commands are not logged after this line; the upstream thread stopped (#{reason.gsub(/-(?=-)/, '- ')}) -->"
+    end
+
+    # How to restart +script+ with the arguments it was started with:
+    # ";kill log, then ;log --xml". When another script of the same name
+    # runs too (;log plus ;force log --xml, see {help_lines}), Lich refuses a start without ;force while either runs, so
+    # every restart uses ;force. Lich's ;kill log stops the first script
+    # named exactly log in its running list, then its hidden list, both in
+    # start order (both loggers call hide_me): the log started first. So
+    # for the logger started first the hint is one ;kill and one ;force;
+    # for a later one, ;kill log stops the earlier logs before this one, so
+    # the hint stops them all and starts them again in the same order, each
+    # with the arguments it was started with. The XML twin of --both
+    # (named {BOTH_XML_NAME} and a number) is started by its text logger,
+    # so its hint restarts that one with --both.
+    #
+    # @param script [Script] the running logger (Script.current)
+    # @return [String] the restart commands, without parentheses
+    def self.restart_hint(script)
+      name = script.name.to_s
+      return ';kill log, then start ;log --both again (this XML log is its --both twin)' if name.match?(/\A#{BOTH_XML_NAME}\d+\z/)
+
+      peers = same_name_scripts(script)
+      return ";kill #{name}, then #{start_command(name, script, force: false)}" if peers.empty?
+
+      order = kill_order(name)
+      killed = order.include?(script) ? order[0..order.index { |other| other.equal?(script) }] : [script]
+      if killed.size == 1
+        return ";kill #{name}, then #{start_command(name, script, force: true)}; " \
+               "another #{name} is running too, and ;kill #{name} stops the one started first, which is this one"
+      end
+
+      # The first restart needs ;force only when a script of that name is
+      # still running after the kills.
+      force_first = peers.any? { |other| killed.none? { |gone| gone.equal?(other) } }
+      starts = killed.each_with_index.map { |other, index| start_command(name, other, force: force_first || index.positive?) }
+      times = killed.size == 2 ? 'twice' : "#{killed.size} times"
+      earlier = killed.size == 2 ? "the #{name} started before this one" : "the #{killed.size - 1} #{name}s started before this one"
+      ";kill #{name} #{times}, one at a time, then #{starts.join(', then ')}; " \
+        ";kill #{name} stops #{earlier} first, so this stops #{killed.size == 2 ? 'both' : 'all of them'} and starts them again in that order"
+    end
+
+    # The start command for +script+ under +name+, with the arguments it
+    # was started with: ";log --rnum", or ";force log --rnum" with +force+.
+    #
+    # @param name [String] the name the loggers run as
+    # @param script [Script] the logger to start again
+    # @param force [Boolean] whether the start needs ;force
+    # @return [String]
+    def self.start_command(name, script, force:)
+      args = script.vars&.first.to_s.strip
+      [";#{'force ' if force}#{name}", args].reject(&:empty?).join(' ')
+    end
+
+    # The scripts named exactly +name+ in the order Lich's ;kill +name+
+    # stops them, one per ;kill: the running list, then the hidden list,
+    # each in start order (lich-5 lib/common/client_commands/builtins.rb).
+    #
+    # @param name [String] the name the loggers run as
+    # @return [Array<Script>]
+    def self.kill_order(name)
+      (Script.running + Script.hidden).select { |other| other.name.to_s == name }.uniq(&:object_id)
+    end
+
+    # The scripts other than +script+ that run under its name (as Lich's
+    # start refuses a duplicate: any case), hidden or not; both loggers
+    # call hide_me.
+    #
+    # @param script [Script] the running logger (Script.current)
+    # @return [Array<Script>]
+    def self.same_name_scripts(script)
+      (Script.running + Script.hidden).select { |other| !other.equal?(script) && other.name.to_s.casecmp?(script.name.to_s) }
+    end
+
+    # The file name and line +error+ was raised at, from its first backtrace
+    # frame without the directory, which keeps the echo short. (The log file
+    # still shows the full log path, in the "currently logging to" echo.)
+    #
+    # @param error [StandardError] the error the upstream thread stopped on
+    # @return [String, nil] "file:line", the frame as is when it has no
+    #   "path:line" start, or nil when the error has no backtrace
+    def self.upstream_frame(error)
+      frame = error.backtrace&.first
+      return nil if frame.nil?
+
+      match = frame.match(/\A(.+?):(\d+)/)
+      match ? "#{File.basename(match[1])}:#{match[2]}" : frame
+    end
+
+    # Sets up a run; nothing is read, set or started until {#run}.
+    #
+    # @param options [OpenStruct] the run's options, as {Opts.parse} returns
+    #   them; the run reads these (`:xml` and `:streams` are read by
+    #   {Logger.mode_for}, which {GameLogger.main} uses to pick +mode+; this
+    #   method does not read them):
+    # @option options [String, true, nil] :timestamp --timestamp=FMT, the
+    #   strftime format for line stamps (see {GameLogger.timestamp_format})
+    # @option options [String, true, nil] :rnum --rnum, or the word rnum:
+    #   any value numbers room titles
+    # @option options [String, true, nil] :roomnum --roomnum, the same as
+    #   +:rnum+
+    # @option options [String, Array<String>, true, nil] :exclude
+    #   --exclude=u7199,288, the rooms whose lines are not written (see
+    #   {GameLogger.exclude_entries})
+    # @option options [String, true, nil] :lines --lines=N, the lines
+    #   written per file (see {GameLogger.lines_per_file})
+    # @param mode [Mode] the log format; by default {DEFAULT_MODE}, the
+    #   {Mode::TEXT} built with this class
+    # @param clock [#now] where every time the run uses comes from (file
+    #   names and folders, the new-day check, line stamps, the reget window,
+    #   the header and footer); Time by default
+    # @param io [Object] answers Lich's script helpers +get+ (every game
+    #   line), +reget+, +echo+ (the start echo only) and, when it has one,
+    #   +get_settings+. They are called with send, as Lich defines them as
+    #   private top-level methods. GameLogger by default, which reaches
+    #   them in Lich (and which the spec harness gives stand-ins). The
+    #   other echoes still go to Lich's echo, and typed commands do not
+    #   come through +io+: {Logger.start_upstream_logger} reads
+    #   Lich's upstream_get and pushes each command into
+    #   Script.current.downstream_buffer, which Lich's get reads, so with
+    #   an +io+ whose +get+ reads elsewhere typed commands are not logged.
+    def initialize(options, mode: DEFAULT_MODE, clock: Time, io: GameLogger)
+      @options = options
+      @mode = mode
+      @clock = clock
+      @io = io
+      @line_filter = mode.line_filter.call
+    end
+
+    # Runs the logger until the script is killed: starts a new log file on
+    # each new day, with the first line read after midnight (excluded or
+    # not), and after the --lines count of written lines (see
+    # {GameLogger.lines_per_file}; excluded and filtered lines do not
+    # count), when the next line is read, so the next file is named and
+    # dated by its first line; stamps lines when
+    # {GameLogger.timestamp_format} returns a format. The file header and
+    # footer carry that format, or the date and time when there is none; a
+    # file also gets its footer when the logger stops (see
+    # {Logger.with_log_file}). Typed commands are logged as the mode's
+    # {Mode#upstream_line} makes them (see
+    # {Logger.start_upstream_logger}), lines seen in --exclude rooms
+    # are skipped, and --rnum adds the room number to room titles.
+    #
+    # The room for --exclude and --rnum is read from XMLData and the map's
+    # UID table (see {Logger.lich_room_id}), never from Room.current or
+    # Map.current. When a Lich number is needed, the map is loaded once in
+    # the background (see {GameLogger.start_map_load}). A found Lich number
+    # is kept until the room changes; while there is none, or while that
+    # load is still running, each line asks the map again, so a room is
+    # numbered and excluded from the line after the map learns its UID.
+    #
+    # @note A line is checked against the room the parser holds when the
+    #   logger reads the line, not when the game sent it. When the logger
+    #   falls behind a room change, a room title can be left without numbers
+    #   or get the next room's numbers, and lines at the edge of an excluded
+    #   room can be skipped or logged on the wrong side.
+    # @note Lines read before the map has loaded are logged even in a room
+    #   excluded by Lich number (a u<uid> entry needs no map).
+    # @note When another script reloads the map, the UID table is cleared
+    #   and rebuilt one room at a time. A UID shared by several rooms can
+    #   then show just one of them, and the logger keeps that Lich number
+    #   for the rest of the room. Only the logger's own load is waited out.
+    # @note Lich evaluates `module GameLogger` again for every run in the
+    #   session (;force log). That replaces +Logger+ and {Mode} (see
+    #   {Mode}), and a run already logging keeps its own class, with the
+    #   file, room and typed-command helpers it calls while it logs (such as
+    #   {Logger.log_file_path} and {Logger.with_log_file}). What it reads
+    #   only while it starts is still shared: the module methods each later
+    #   run redefines ({GameLogger.timestamp_format},
+    #   {GameLogger.lines_per_file}, {GameLogger.exclude_entries},
+    #   {GameLogger.start_map_load}, {Opts}) and the module constants set
+    #   only when not yet defined ({GameLogger::DEFAULT_LINES_PER_FILE},
+    #   {GameLogger::DEFAULT_TIMESTAMP_FORMAT},
+    #   {GameLogger::LINE_COUNT_PATTERN}, {Opts::FLAG_PREFIX},
+    #   {Opts::LIST_FLAGS}), which keep the first run's values for the
+    #   session.
+    # @note A reply that comes within about 50 ms of a typed command can be
+    #   logged before the command's line; see {Logger.start_upstream_logger}.
+    # @return [void]
+    # @raise [SystemCallError, IOError] when the month's log folder cannot
+    #   be created, a log file cannot be opened, or a write to it fails (the
+    #   file is closed first; see {Logger.with_log_file})
+    def run
+      configure
+      self.class.start_upstream_logger(&@mode.upstream_line)
+      @started = false
+      # The line that opens the next file. A line read after midnight belongs
+      # to the new day's file: it is kept here while the old file is closed.
+      # After a full file, the next line is read before the next file is
+      # opened, so its name and date are those of its first line: a file
+      # opened at once would wait with no line, and when that line came after
+      # midnight it would go to the new day's file, leaving an old-day file
+      # with only its header and footer.
+      @carried_line = nil
+      loop { log_next_file }
+    end
+
+    # The text written for a game line, by the run's line filter (built
+    # from the mode's {Mode#line_filter} with the run): text mode drops a
+    # line that starts with a stream, dialog or progress bar tag; XML mode
+    # leaves out stream content and keeps the rest ({StreamSpanFilter}),
+    # and with streams keeps every line. Room exclusion is checked
+    # separately. XML mode's filter follows stream spans from line to line,
+    # so the run gives it every line it reads, in order, those in an
+    # excluded room too.
+    #
+    # @param line [String] a game line as get returns it
+    # @return [String, nil] the text to write (`line` itself when the filter
+    #   keeps all of it), or +nil+ when nothing of the line is written
+    def line_text(line)
+      @line_filter.call(line)
+    end
+
+    # Adds the room numbers to +line+ when --rnum is on and the mode says it
+    # is the current room's title line ({Mode#room_title}), with
+    # {Logger.number_room_title}, the decorator both modes share, placing
+    # the GemStone u-id where the mode's {Mode#uid_after_title} says. With
+    # --rnum off no line is numbered, also when --exclude tracks the room.
+    #
+    # @param line [String] a game line
+    # @return [String] the line with the room numbers added, or +line+
+    #   itself when it is not the title line (or --rnum is off)
+    def decorate_title(line)
+      return line unless @show_room_numbers && @mode.room_title.call(line, @title_pattern)
+
+      self.class.number_room_title(line, @lich_id, @room_uid, XMLData.game, uid_after_title: @mode.uid_after_title)
+    end
+
+    # The text written to the file for one line: "<time>: <line>" in the
+    # run's timestamp format, or the line as it is when timestamps are off.
+    #
+    # @param line [String] the line to write
+    # @param time [Time] the time to stamp it with
+    # @return [String] the text, without a line end
+    def format_line(line, time)
+      @stamp_format ? "#{time.strftime(@stamp_format)}: #{line}" : line
+    end
+
+    # reget's answer as the lines written at the top of the first file,
+    # each formatted by the mode's {Mode#reget_line}.
+    #
+    # @param lines [Array<String>, nil] reget's answer; +nil+ (an empty
+    #   buffer) gives no lines
+    # @param login_time [Time] when the character logged in ($login_time)
+    # @return [Array<String>] the lines to write, without line ends
+    def reget_lines(lines, login_time)
+      Array(lines).map { |line| @mode.reget_line.call(line, @stamp_format, login_time) }
+    end
+
+    private
+
+    # Reads the settings and options and sets the script's flags, in the
+    # order the logger always has: get_settings, the mode's
+    # {Mode#script_flags}, then the timestamp format, the --lines count and
+    # the --compress-after days (each may echo), then the map load when a
+    # Lich number is needed. Every value goes on this run.
+    #
+    # @return [void]
+    def configure
+      settings = nil
+      if @io.respond_to?(:get_settings, true)
+        settings = @io.send(:get_settings)
+        stamp_enable = settings.log_timestamp
+        stamp_format = settings.log_timestamp_format
+      end
+      @mode.script_flags.each { |flag, value| Script.current.public_send(:"#{flag}=", value) }
+      @stamp_format = GameLogger.timestamp_format(@options.timestamp, stamp_enable, stamp_format)
+      @show_room_numbers = @options.roomnum || @options.rnum
+      @lines_per_file = GameLogger.lines_per_file(@options.lines)
+      # The XML twin of --both shares this character folder; only the text
+      # logger compresses it.
+      @compress_days = (GameLogger.compress_after_days(@options[:'compress-after'], settings&.log_compress_after) unless @options[GameLogger::TWIN_KEY])
+      @compress_date = @compressor = nil
+      configure_rooms
+    end
+
+    # Works out which room lookups the run needs from --exclude and --rnum,
+    # starts the map load when a Lich number is needed, and clears the
+    # room state, so the first line works the room out.
+    #
+    # @return [void]
+    def configure_rooms
+      @uid_excludes, @id_excludes = GameLogger.exclude_entries(@options.exclude)
+      @look_up_lich_id = @show_room_numbers || !@id_excludes.empty?
+      @track_room = @look_up_lich_id || !@uid_excludes.empty?
+      @map_loader = (GameLogger.start_map_load if @look_up_lich_id)
+      @room_count = @room_uid = @room_title = @title_pattern = @lich_id = nil
+      @room_uid_excluded = @room_id_excluded = false
+    end
+
+    # Opens the next log file (in the month's folder, created when
+    # missing), writes the reget and the start echo when it is the run's
+    # first file, and fills it with lines until it is full or the day
+    # changes. The first file of a run takes its name from the time it
+    # starts; every later one is opened when its first line has been read.
+    #
+    # @return [void]
+    # @raise [SystemCallError, IOError] when the month's folder cannot be
+    #   created, and as {Logger.with_log_file} raises
+    def log_next_file
+      @carried_line = read_line if @started && @carried_line.nil?
+      dir = self.class.log_directory(XMLData.game, XMLData.name, @clock.now)
+      FileUtils.mkdir_p(dir) unless File.exist?(dir)
+      date = today
+      start_compression(date) if @compress_days && date != @compress_date
+      filename = self.class.log_file_path(dir, @clock.now, @mode.extension, rotated: @started)
+      self.class.with_log_file(filename, @stamp_format, clock: @clock, header_stamp: @mode.header_stamp) do |file|
+        start_logging(file, filename) unless @started
+        fill_file(file, date)
+      end
+    end
+
+    # Writes reget's lines and the reget marker at the top of the run's
+    # first file when the run started within {REGET_WINDOW} seconds of
+    # login, then echoes where the log goes.
+    #
+    # @param file [File] the run's first log file
+    # @param filename [String] its path, for the echo
+    # @return [void]
+    def start_logging(file, filename)
+      if (@clock.now - $login_time) < REGET_WINDOW
+        reget_lines(@io.send(:reget), $login_time).each { |line| file.puts line }
+        file.puts REGET_MARKER
+      end
+
+      @io.send(:echo, "#{@mode.started_text} #{filename}")
+      @started = true
+    end
+
+    # Writes lines to +file+ until --lines lines are written, or until a
+    # line is read on a day other than +date+; that line is kept for the
+    # next file. Lines in an excluded room and lines the mode drops are read
+    # and not written, and do not count.
+    #
+    # @param file [File] the open log file
+    # @param date [String] the file's day, "%Y-%m-%d"
+    # @return [void]
+    def fill_file(file, date)
+      written = 0
+      while written < @lines_per_file
+        line = @carried_line || read_line
+        @carried_line = nil
+        # The date is checked before anything else, on every line read,
+        # excluded or not, so the first line of a new day starts its file.
+        if today != date
+          @carried_line = line
+          break
+        end
+        excluded = false
+        if @track_room
+          refresh_room
+          refresh_lich_id
+          excluded = room_excluded?
+          line = decorate_title(line) unless excluded
+        end
+        # Excluded lines go through the filter too, which may follow a span.
+        line = line_text(line)
+        next if excluded || line.nil?
+
+        file.puts format_line(line, @clock.now)
+        written += 1
+      end
+    end
+
+    # Works the room out again when the parser has moved on (room count,
+    # UID or title changed): whether its UID is excluded and, for --rnum,
+    # its title matcher. The Lich number is cleared, for
+    # {#refresh_lich_id} to find.
+    #
+    # @return [void]
+    def refresh_room
+      return if XMLData.room_count == @room_count && XMLData.room_id == @room_uid && XMLData.room_title == @room_title
+
+      @room_count = XMLData.room_count
+      @room_uid = XMLData.room_id
+      @room_title = XMLData.room_title.dup
+      @room_uid_excluded = @uid_excludes.include?("u#{@room_uid}")
+      @room_id_excluded = false
+      @lich_id = nil
+      @title_pattern = (self.class.room_title_pattern(@room_title, XMLData.game) if @show_room_numbers)
+    end
+
+    # Looks the room's Lich number up and checks it against the --exclude
+    # Lich numbers, when one is needed and the room's UID is not already
+    # excluded. Only a found number is kept for the room. Until then the map
+    # is asked again on each line, as it may not be loaded yet or may learn
+    # the UID later. While the logger's own map load runs, a found number is
+    # asked for again too: the UID table is rebuilt one room at a time, so a
+    # UID shared by several rooms can show one.
+    #
+    # @return [void]
+    def refresh_lich_id
+      return unless @look_up_lich_id && !@room_uid_excluded && (@lich_id.nil? || @map_loader&.alive?)
+
+      @lich_id = self.class.lich_room_id(@room_uid)
+      @room_id_excluded = !@lich_id.nil? && @id_excludes.include?(@lich_id.to_s)
+    end
+
+    # Whether the current room is excluded, by its UID or its Lich number.
+    #
+    # @return [Boolean]
+    def room_excluded?
+      @room_uid_excluded || @room_id_excluded
+    end
+
+    # Starts gzipping this character's old logs in a background thread, at
+    # most once a day: when the run opens its first file and when a new
+    # day's file opens (see {Logger.compress_old_logs}). The get loop never
+    # waits on it, so a sweep over years of logs cannot make Lich's
+    # downstream buffer drop lines. It echoes once, with the count and the
+    # space, when it compressed something; a sweep still running from the
+    # day before is left to finish.
+    #
+    # @param date [String] the day now, "%Y-%m-%d"
+    # @return [void]
+    def start_compression(date)
+      return if @compressor&.alive?
+
+      # A new day's sweep waits a little, so the other loggers on this
+      # character (the XML twin of --both) have closed yesterday's files.
+      delay = @compress_date ? DAY_SWEEP_DELAY : 0
+      @compress_date = date
+      folder = self.class.character_log_folder(XMLData.game, XMLData.name)
+      cutoff = Date.strptime(date, '%Y-%m-%d') - @compress_days
+      days = @compress_days
+      now = @clock.now
+      io = @io
+      label = self.class.log_label
+      @compressor = Thread.new do
+        Thread.current.priority = -1
+        sleep(delay) if delay.positive?
+        count, before, after = self.class.compress_old_logs(folder, cutoff, now: delay.positive? ? Time.now : now)
+        if count.positive?
+          age = days.zero? ? 'dated before today' : "older than #{days} day#{'s' unless days == 1}"
+          io.send(:echo, "compressed #{count} log file#{'s' unless count == 1} #{age}: " \
+                         "#{self.class.size_text(before)} down to #{self.class.size_text(after)}.")
+        end
+      rescue StandardError => e
+        Lich.log "#{label}: compressing old logs stopped (#{e.class}: #{e.message})"
+      end
+    end
+
+    # The day now, as the file names write it.
+    #
+    # @return [String] "%Y-%m-%d"
+    def today
+      @clock.now.strftime('%Y-%m-%d')
+    end
+
+    # The next game line, from Lich's get (blocks until there is one).
+    #
+    # @return [String]
+    def read_line
+      @io.send(:get)
+    end
+  end
+
+  # The Logger's own Modes, set with const_set; the parse block below
+  # documents them (see the note before Mode::TEXT is set).
+  fresh::Logger.const_set(:DEFAULT_MODE, mode::TEXT)
+  fresh::Logger.const_set(:XML_MODE, mode::XML)
+  fresh::Logger.const_set(:XML_STREAMS_MODE, mode::XML_STREAMS)
+
+  # @!parse
+  #   class fresh::Logger
+  #     # The {Mode} built with this Logger ({Mode::TEXT}), for a run built
+  #     # with no mode and for typed commands started with no format. It is
+  #     # the class's own, so a run never gets a Mode from another evaluation.
+  #     DEFAULT_MODE = Mode::TEXT
+  #
+  #     # XML mode built with this Logger ({Mode::XML}), see {Logger.mode_for}.
+  #     XML_MODE = Mode::XML
+  #
+  #     # XML mode keeping every line ({Mode::XML_STREAMS}), built with this
+  #     # Logger, see {Logger.mode_for}.
+  #     XML_STREAMS_MODE = Mode::XML_STREAMS
+  #   end
+
+  # Puts this evaluation's Mode and Logger in place of the last ones. Each
+  # name is set once, to a whole definition, so it always reads as the old
+  # or the new one. Setting a constant again warns unless $VERBOSE is nil,
+  # so it is nil for the two assignments only.
+  begin
+    verbose = $VERBOSE
+    $VERBOSE = nil
+    const_set(:Mode, mode)
+    const_set(:Logger, fresh::Logger)
+  ensure
+    $VERBOSE = verbose
+  end
+
+  # The usage text ;log help shows, one String per line: the commands, every
+  # option, where the files go, how to log text and XML together, the
+  # DragonRealms yaml timestamp settings and an autostart example, with
+  # Lich's command character. Run as logxml (an install that still has
+  # logxml.lic, see {Logger.mode_for}), it also says ;logxml is ;log --xml,
+  # and that ;log and ;logxml run side by side under their own names.
+  #
+  # @param name [String] the name the script runs as, e.g. "log"
+  # @param char [String] Lich's command character, e.g. ";"
+  # @return [Array<String>] the help lines, ready to respond one by one
+  def self.help_lines(name, char)
+    cmd = "#{char}log"
+    pad = ' ' * cmd.length
+    xml_name = name == Logger::XML_SCRIPT_NAME
+    together =
+      if xml_name
+        ["  Text and XML together: #{cmd} --both, or #{cmd} and #{char}#{name} side by side (both can be autostarted)."]
+      else
+        ["  Text and XML together: #{cmd} --both writes both files, and #{char}kill log stops both",
+         "  (the XML half runs as #{char}#{Logger::BOTH_XML_NAME}1, which #{char}kill #{Logger::BOTH_XML_NAME}1 stops on its own)."]
+      end
+    [
+      "#{cmd} logs the game to a file.",
+      '',
+      "  #{cmd}                          game text to a .log file",
+      "  #{cmd} --xml                    the raw XML the game sends, to a .xml file",
+      "  #{cmd} --both                   both of those at once, as two files",
+      ("  #{char}#{name}                       the same as #{cmd} --xml (this install still has #{name}.lic)" if xml_name),
+      "  #{cmd} help                     this help",
+      '',
+      '  Both kinds of log also record script output (what Lich and other scripts echo).',
+      '',
+      '  Options (text and XML mode alike, unless noted):',
+      "  #{pad} --timestamp=\"%F %T %Z\"   start each line with the time, in this strftime format",
+      "  #{pad} --rnum                   add the Lich room number to room titles (or --roomnum)",
+      "  #{pad} --exclude=u7199,288      skip lines in these rooms: u<uid> for a game room UID, or a",
+      "  #{pad}                          Lich room number (needs the room's UID in Lich's map)",
+      "  #{pad} --lines=50000            start a new file after this many lines (default 30000)",
+      "  #{pad} --streams                XML mode only: keep all the stream window content (very noisy)",
+      "  #{pad} --compress-after=7       gzip log files more than this many days old (0: all but today's;",
+      "  #{pad}                          in the background, when logging starts and each new day)",
+      '',
+      "  Files go to Lich's log folder (lich/logs, or the one set with Lich's --logs=), under",
+      '  <game>-<character>/<year>/<month>/, with a new file each day and after --lines lines.',
+      '',
+      *together,
+      '',
+      '  DragonRealms: log_timestamp: true in your yaml turns timestamps on, in the',
+      '  log_timestamp_format format; --timestamp wins over both. log_compress_after: 7',
+      '  in your yaml does what --compress-after=7 does; the option wins.',
+      '',
+      '  A reply that comes within about 50 ms of a typed command can be logged before it.',
+      '',
+      "  Autostart example: #{char}autostart add --global log --timestamp=\"%F %T %Z\" --rnum"
+    ].compact
+  end
+
+  # Shows {help_lines} in the game window, for ;log help (or --help), and
+  # starts no logging: no file, no want flags, no typed-command thread.
+  #
+  # @param name [String] the name the script runs as (Script.current.name)
+  # @return [void]
+  def self.show_help(name = Script.current.name)
+    char = $lich_char.to_s.empty? ? ';' : $lich_char
+    help_lines(name, char).each { |line| respond(line) }
+    nil
+  end
+
+  # Starts the XML half of --both: an exec script (Lich's ExecScript, named
+  # logxml1 and up, quiet and hidden) that runs {main} in XML mode with this
+  # run's options (less --both and help), while this run logs the text. One
+  # Lich script gets one downstream buffer, where the text and XML lines
+  # would arrive mixed, so each log needs a script of its own. This run's
+  # die_with takes the twin down with it (;kill log stops both); ;kill
+  # logxml1 stops only the XML log. When Lich does not start the twin, the
+  # run says so and logs the text only.
+  #
+  # @param options [OpenStruct] this run's options, as {Opts.parse} returns
+  #   them
+  # @return [Object, nil] the started exec script, or nil when none started
+  def self.start_xml_twin(options)
+    twin_options = options.to_h.reject { |key, _| %i[both help].include?(key) }.merge(xml: true, TWIN_KEY => true)
+    twin = ExecScript.start("hide_me\n::#{name}.main(OpenStruct.new(#{twin_options.inspect}))", quiet: true, name: Logger::BOTH_XML_NAME)
+    unless twin
+      echo '--both: the XML log could not be started (Lich did not start a second script), so only the text log is written.'
+      return nil
+    end
+
+    Script.current.die_with.push(twin.name)
+    twin
+  rescue StandardError => e
+    echo "--both: the XML log could not be started (#{e.class}: #{e.message}), so only the text log is written."
+    nil
+  end
+
+  # Runs the logger for this run of the script until the script is killed
+  # (or a file error stops it): one +GameLogger::Logger+ with +options+, in
+  # the mode `GameLogger::Logger.mode_for` picks from them and the
+  # script's name (text mode, or XML mode for --xml or a run named
+  # logxml); see +GameLogger::Logger#run+. The Logger class is read once
+  # here, so the whole run keeps the one this evaluation set.
+  #
+  # @example What log.lic runs; ;log --xml --rnum gives these options
+  #   GameLogger.main
+  #   GameLogger.main(GameLogger::Opts.parse(%w[--xml --rnum]))
+  # @param options [OpenStruct] this run's options, as {Opts.parse}
+  #   returns them; parsed from the script's arguments when not given
+  # @option options [String, true, nil] :timestamp --timestamp=FMT, the
+  #   strftime format for line stamps; a bare --timestamp is ignored (see
+  #   {timestamp_format})
+  # @option options [String, true, nil] :rnum --rnum, or the word rnum:
+  #   any value adds room numbers to room titles
+  # @option options [String, true, nil] :roomnum --roomnum, the same as
+  #   +:rnum+
+  # @option options [String, Array<String>, true, nil] :exclude
+  #   --exclude=u7199,288: rooms whose lines are not written, by game UID
+  #   (u<uid>) or Lich room number (see {exclude_entries})
+  # @option options [String, true, nil] :lines --lines=N, the lines
+  #   written per file; an invalid count falls back to
+  #   {DEFAULT_LINES_PER_FILE} (see {lines_per_file})
+  # @option options [String, true, nil] :xml --xml, or the word xml: any
+  #   value picks XML mode, as a run named logxml does
+  # @option options [String, true, nil] :streams the word streams or
+  #   --streams: in XML mode, any value keeps every line, stream content
+  #   too; text mode ignores it
+  # @option options [String, true, nil] :both --both, or the word both:
+  #   any value logs the text here and the XML in a twin exec script (see
+  #   {start_xml_twin})
+  # @option options [String, true, nil] :"compress-after" --compress-after=N:
+  #   gzip this character's log files dated more than N days ago (see
+  #   {compress_after_days}); the log_compress_after setting does the same
+  #   when the option is not given
+  # @option options [true, nil] :"xml twin of --both" ({TWIN_KEY}) set
+  #   only by {start_xml_twin}, which leaves compressing to the text logger
+  # @option options [String, true, nil] :help the word help or --help:
+  #   shows {help_lines} instead of logging (see {show_help})
+  # @return [void]
+  # @raise [SystemCallError, IOError] when a log folder or file cannot be
+  #   made, opened or written (see +GameLogger::Logger#run+)
+  def self.main(options = Opts.parse)
+    return show_help if options.help
+
+    start_xml_twin(options) if options.both
+    logger = Logger
+    logger.new(options, mode: logger.mode_for(options, Script.current.name)).run
   end
 end
 
