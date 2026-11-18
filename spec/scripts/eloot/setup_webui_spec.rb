@@ -243,7 +243,8 @@ RSpec.describe 'ELoot::Setup' do
     it 're-renders when a gate changes, and only then' do
       setup = build({ skin_enable: false })
       nodes = render(setup)
-      expect(node(nodes, :skin_kneel)).not_to have_key(:on)
+      node(nodes, :skin_kneel)[:on][:change].call(Struct.new(:payload).new({ value: true }))
+      expect(refreshed).to be_empty
       node(nodes, :skin_enable)[:on][:change].call(Struct.new(:payload).new({ value: true }))
 
       expect(refreshed).to eq([:page])
