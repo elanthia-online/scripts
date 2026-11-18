@@ -91,6 +91,15 @@ module ::Lich
             expect(game_output).to match(/found \d+ match/)
           end
 
+          it "matches tags and names regardless of case, like the GUI filter" do
+            Service.run("search MOVEMENT")
+            expect(game_output).to include("go2.lic")
+            Service.run("script search ^GO2")
+            output = game_output
+            expect(output).to include("found 1 match")
+            expect(output).to include("go2.lic")
+          end
+
           it "matches nothing when neither the name nor a tag matches" do
             Service.run("script search zzzznotatagzzzz")
             expect(game_output).to include("found 0 matches")
@@ -116,6 +125,75 @@ module ::Lich
             expect(game_output).not_to include("go2")
           ensure
             GUI.instance_variable_set(:@alive, false)
+          end
+
+          describe "asset actions" do
+            def gui_row(file, tags = [])
+              { key: "elanthia-online/#{file}", file: file, repo: "elanthia-online", tags: tags }
+            end
+
+            before(:each) do
+              GUI.reset_state!
+              rows = [gui_row("bar.lic"), gui_row("foo.lic")]
+              GUI.instance_variable_set(:@assets, { script: rows, data: [] })
+              GUI.instance_variable_set(:@asset_index, { script: rows.to_h { |r| [r[:key], r] }, data: {} })
+              allow(GUI).to receive(:rebuild_assets)
+              GUI.perform(:select, :script, ["elanthia-online/foo.lic"])
+            end
+
+            it "does not install a selected row that the search has hidden" do
+              expect(CLI).not_to receive(:script_install)
+              GUI.perform(:filter, :script, "bar")
+              GUI.perform(:install, :script, true)
+              expect(GUI.instance_variable_get(:@log).last).to include("Select a script in the table first")
+            end
+
+            it "acts on the selection again once the filter is cleared" do
+              GUI.perform(:filter, :script, "bar")
+              GUI.perform(:clear_filter, :script)
+              expect(CLI).to receive(:script_install).with("foo.lic", "elanthia-online", force: false)
+              GUI.perform(:install, :script, false)
+            end
+
+            it "gives the search box a new key on Clear even when no filter was applied" do
+              expect { GUI.perform(:clear_filter, :script) }
+                .to change { GUI.instance_variable_get(:@input_generation)[:script] }.by(1)
+            end
+
+            it "keeps the search box key when an empty search is submitted with no filter applied" do
+              expect { GUI.perform(:filter, :script, "") }
+                .not_to(change { GUI.instance_variable_get(:@input_generation)[:script] })
+            end
+          end
+
+          describe "a second ;force jinx gui while a window is open" do
+            let(:owner) { Thread.new { sleep } }
+
+            after(:each) do
+              owner.kill
+              GUI.instance_variable_set(:@alive, false)
+              GUI.instance_variable_set(:@script_thread, nil)
+              GUI.instance_variable_set(:@page, nil)
+            end
+
+            it "is refused and leaves the open window's state alone" do
+              GUI.reset_state!
+              page = Object.new
+              commands = GUI.instance_variable_get(:@commands)
+              GUI.instance_variable_set(:@alive, true)
+              GUI.instance_variable_set(:@script_thread, owner)
+              GUI.instance_variable_set(:@page, page)
+
+              load "scripts/jinx.lic" # every ;jinx run re-evaluates the file
+              expect(GUI.alive?).to be(true)
+
+              GUI.start!
+              expect(game_output).to include("already open; close that window first")
+              expect(GUI.alive?).to be(true)
+              expect(GUI.instance_variable_get(:@page)).to equal(page)
+              expect(GUI.instance_variable_get(:@script_thread)).to equal(owner)
+              expect(GUI.instance_variable_get(:@commands)).to equal(commands)
+            end
           end
         end
 
