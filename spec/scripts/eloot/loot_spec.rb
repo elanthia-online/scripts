@@ -501,6 +501,12 @@ RSpec.describe 'ELoot::Loot.pool_direct_sell_recovery' do
       expect(order.index(:sell_box_contents)).to be < order.index(:save_trash_box)
       expect(order.index(:save_trash_box)).to be < order.index(:sell)
 
+      # The full tracking is cleared before the sell trip (as a plain sell run does), so
+      # a container the trip empties can take the note a shop pays with.
+      expect(order.index(:sacks_full=)).to be < order.index(:sell)
+      expect(order.index(:reset_disk_full)).to be < order.index(:sell)
+      expect(order.rindex(:sacks_full=)).to be > order.index(:sell)
+
       # Ends back at the pool room, ready for pool_return's loop to continue.
       expect(calls.select { |c| c.first == :go2 }.last).to eq([:go2, 'pool-room'])
     end
