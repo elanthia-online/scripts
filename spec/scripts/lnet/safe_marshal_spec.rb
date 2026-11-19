@@ -237,18 +237,22 @@ RSpec.describe 'lnet.lic' do
   end
 
   describe 'LNet::SafeMarshal.encode and .decode' do
+    # decode reduces text to ASCII (LNet.ascii); only the locate payload has
+    # a character outside it
+    let(:ascii_locate) { LnetSpec::REAL_PAYLOADS['locate'].merge('description' => 'This is the ? square.') }
+
     LnetSpec::REAL_PAYLOADS.each do |type, payload|
       it "round-trips the #{type} payload through the text of a <data> element" do
         text = lnet::SafeMarshal.encode(payload)
         expect(text).not_to end_with("\n")
-        expect(lnet::SafeMarshal.decode(text)).to eq(payload)
+        expect(lnet::SafeMarshal.decode(text)).to eq(type == 'locate' ? ascii_locate : payload)
       end
     end
 
     it 'decodes text wrapped across lines, as base64 arrives in a <data> element' do
       text = [Marshal.dump(LnetSpec::REAL_PAYLOADS['locate'])].pack('m')
       expect(text.count("\n")).to be > 1
-      expect(lnet::SafeMarshal.decode(text)).to eq(LnetSpec::REAL_PAYLOADS['locate'])
+      expect(lnet::SafeMarshal.decode(text)).to eq(ascii_locate)
     end
 
     [['empty text', ''], ['nil', nil], ['text that is not base64', '!!!***'], ['base64 of junk', ['junk'].pack('m')]].each do |label, text|
