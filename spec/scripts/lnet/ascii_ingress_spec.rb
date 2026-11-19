@@ -219,6 +219,63 @@ RSpec.describe 'lnet.lic ASCII-only input' do
     end
   end
 
+  # Ruby and REXML repeat parts of the input in their error messages (an
+  # unknown encoding name, an element or attribute name); lnet prints those
+  # messages, so they are reduced as well.
+  describe 'messages about what was sent' do
+    # a <data> string whose encoding is named "x" followed by a sharp s
+    let(:unknown_encoding) { "\x04\bI\"\x06a\x06:\rencoding\"\ax\xDF".b }
+
+    def debug_on = lnet.class_variable_get(:@@options)['debug'] = true
+
+    def printed(out) = out.map { |_kind, text| text.to_s }
+
+    def expect_ascii(out)
+      expect(out).not_to be_empty
+      printed(out).each do |text|
+        expect(text).to be_ascii_only, "printed #{text.dump}"
+      end
+    end
+
+    it 'reduces the refusal of a payload naming an unknown encoding' do
+      out = feed(%(<data type="info" from="Bob">#{[unknown_encoding].pack('m').strip}</data>))
+      expect_ascii(out)
+      expect(printed(out).join).to include('unknown encoding name - x?')
+    end
+
+    it 'reduces REXML errors that repeat a non-ASCII attribute name (debug)' do
+      debug_on
+      expect_ascii(feed(%(<message x#{LnetSpec::E_ACUTE}="1" x#{LnetSpec::E_ACUTE}="2"/>)))
+    end
+
+    it 'reduces REXML errors that repeat non-ASCII element names (debug)' do
+      debug_on
+      e = LnetSpec::E_ACUTE
+      expect_ascii(feed(%(<a#{e}><b#{e}>x</a#{e}></b#{e}>))) # balanced for StreamParser, crossed for REXML
+    end
+
+    it 'prints nothing but ASCII for random hostile elements (debug)' do
+      debug_on
+      rng = Random.new(5_150)
+      e = LnetSpec::E_ACUTE
+      pieces = [
+        -> { %(<data type="info" from="B#{e}b">#{[unknown_encoding].pack('m').strip}</data>) },
+        -> { %(<data type="locate" from="Bob">#{['junk'].pack('m').strip}</data>) },
+        -> { %(<message x#{e}="1" x#{e}="2"/>) },
+        -> { %(<a#{e}><b#{e}>x</a#{e}></b#{e}>) },
+        -> { %(<message type="channel" from="A#{e}" channel="C#{e}">t#{e}&#223;</message>) },
+        -> { %(<data type="bounty" from="Bob">#{lnet::SafeMarshal.encode("t\xDF".b.force_encoding('ISO-8859-1'))}</data>) },
+        -> { %(<request type="x#{e}" from="B#{e}"/>) },
+        -> { "<m a=\"\xFF\">\xFE</m>".b },
+        -> { %(<data type="info" from="Bob">#{['x'].pack('m').strip}#{e}</data>) }
+      ]
+      100.times do
+        xml = Array.new(rng.rand(1..4)) { pieces.sample(random: rng).call.b }.join("\n")
+        printed(feed(xml)).each { |text| expect(text).to be_ascii_only, "#{xml.dump} printed #{text.dump}" }
+      end
+    end
+  end
+
   describe ';locate room matching' do
     # what find_room did up to 1.26, kept to show 1.27 picks the same room
     def legacy_find_room(data)
