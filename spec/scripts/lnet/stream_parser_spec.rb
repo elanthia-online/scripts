@@ -96,11 +96,12 @@ RSpec.describe 'lnet.lic LNet::StreamParser' do
       end
     end
 
-    it 'keeps a UTF-8 character that is split between two reads' do
+    # rejoined first, so it becomes one '?' (LNet.ascii), not two
+    it 'rejoins a UTF-8 character that is split between two reads' do
       xml = %(<message type="channel" from="A" channel="X">caf#{LnetSpec::E_ACUTE}</message>).b
       cut = xml.index("\xC3".b) + 1
       deliver_all(xml.byteslice(0, cut), xml.byteslice(cut..))
-      expect(log.events).to include([:text, "caf#{LnetSpec::E_ACUTE}"])
+      expect(log.events).to include([:text, 'caf?'])
     end
 
     it 'returns how many elements each read completed' do
