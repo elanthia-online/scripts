@@ -3649,3 +3649,130 @@ RSpec.describe 'bigshot tail rally' do
     end
   end
 end
+
+# Bigshot::Group#all_present? decides when the leader stops waiting for
+# followers. It is extracted with its GROUP refresh helper and run against a
+# stub Group tracker, room roster and clock.
+module BigshotAllPresentSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  ALL_PRESENT_SRC = extract_from_source(SOURCE, /^    def all_present\?\n.*?^    def refresh_group_list\n.*?^    end\n(?:    private :refresh_group_list\n)?/m,
+                                        label: 'all_present? and refresh_group_list', source_path: SOURCE_PATH)
+
+  module Harness
+    Member = Struct.new(:noun)
+
+    # Stands in for one follower's remote Bigshot.
+    class Follower
+      def ping; end
+    end
+
+    module Lich
+      module Gemstone
+        module Claim
+          module Lock
+            def self.locked?
+              false
+            end
+          end
+        end
+
+        # Lich's tracker: +members+ is what Lich currently believes, and
+        # +check+ replaces it with what GROUP would report (+reply+).
+        module Group
+          class << self
+            attr_accessor :members, :reply, :checks
+
+            def check
+              self.checks += 1
+              self.members = reply.map { |noun| Member.new(noun) }
+            end
+          end
+        end
+      end
+    end
+
+    # The wait loop's clock, so the 5 second refresh limit can be stepped over.
+    class Time
+      class << self
+        attr_accessor :fake
+
+        def now
+          fake || ::Time.now
+        end
+      end
+    end
+
+    # A leader-side Bigshot::Group with its follower list and room roster.
+    class LeaderGroup
+      attr_accessor :room
+
+      def initialize(names)
+        @members = names.to_h { |name| [name, Follower.new] }
+        @room = names.dup
+      end
+
+      def member_online
+        @members.each { |name, member| yield(name, member) }
+      end
+
+      def checkpcs
+        room
+      end
+
+      module_eval(ALL_PRESENT_SRC)
+    end
+  end
+end
+
+RSpec.describe 'bigshot Bigshot::Group#all_present?' do
+  let(:h) { BigshotAllPresentSpec::Harness }
+  let(:group) { h::Lich::Gemstone::Group }
+  let(:leader_group) { h::LeaderGroup.new(%w[Bravo]) }
+
+  before do
+    group.members = [h::Member.new('Bravo')]
+    group.reply = %w[Bravo]
+    group.checks = 0
+    h::Time.fake = ::Time.at(1_000)
+  end
+
+  it 'is true when every follower is in the room and in the group, without sending GROUP' do
+    expect(leader_group.all_present?).to be(true)
+    expect(group.checks).to eq(0)
+  end
+
+  it 'is false while a follower is out of the room, without sending GROUP' do
+    leader_group.room = []
+    expect(leader_group.all_present?).to be(false)
+    expect(group.checks).to eq(0)
+  end
+
+  it 'refreshes the group when a follower is back in the room but missing from the list' do
+    group.members = []
+    expect(leader_group.all_present?).to be(true)
+    expect(group.checks).to eq(1)
+  end
+
+  it 'stays false if GROUP does not list them either' do
+    group.members = []
+    group.reply = []
+    expect(leader_group.all_present?).to be(false)
+    expect(group.checks).to eq(1)
+  end
+
+  it 'sends GROUP at most every 5 seconds while it waits' do
+    group.members = []
+    group.reply = []
+    3.times { leader_group.all_present? }
+    expect(group.checks).to eq(1)
+    h::Time.fake += 5
+    leader_group.all_present?
+    expect(group.checks).to eq(2)
+  end
+
+  it 'keeps the refresh private, so followers cannot call it over DRb' do
+    expect(leader_group.respond_to?(:refresh_group_list)).to be(false)
+  end
+end
