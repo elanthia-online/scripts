@@ -7,6 +7,10 @@
 # short name ("golden mushroom") while the foraged item carries the full name
 # ("golden hook mushroom"), so the short name must map to the full one or the
 # foraged count stays at 0.
+#
+# Also covers forage_not_found_regex: every "herb isn't here" forage reply must
+# match it, or the forage never sees a result, waits out the roundtime and
+# forages again in the same room forever.
 
 require_relative '../spec_helper'
 
@@ -15,6 +19,7 @@ module EBountySpec
   SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
   METHOD_SRC = extract_lic_method(SOURCE, 'open_container', source_path: SOURCE_PATH)
   HERB_METHOD_SRC = extract_lic_method(SOURCE, 'find_herb_stow_list', source_path: SOURCE_PATH)
+  NOT_FOUND_METHOD_SRC = extract_lic_method(SOURCE, 'forage_not_found_regex', source_path: SOURCE_PATH)
 end
 
 Object.send(:remove_const, :EBounty) if defined?(EBounty)
@@ -47,6 +52,7 @@ module EBounty
 
   module_eval(EBountySpec::METHOD_SRC)
   module_eval(EBountySpec::HERB_METHOD_SRC)
+  module_eval(EBountySpec::NOT_FOUND_METHOD_SRC)
 end
 
 RSpec.describe 'EBounty.open_container' do
@@ -140,5 +146,26 @@ RSpec.describe 'EBounty.find_herb_stow_list' do
   it 'still matches a full golden hook mushroom name directly' do
     stow('golden hook mushroom')
     expect(EBounty.find_herb_stow_list('golden hook mushroom').length).to eq(1)
+  end
+end
+
+RSpec.describe 'EBounty.forage_not_found_regex' do
+  [
+    # Wrong climate for the herb, from a player's log.
+    'As you carefully forage around you find no trace of what you are looking for.  ' \
+    'You are not even sure it could be found in this type of climate.',
+    'As you carefully forage around you can find no hint of what you are looking for right now, ' \
+    'though you are fairly certain this is where it can be found.',
+    'As you carefully forage around you can find no trace of what you are looking for.  ' \
+    'You briefly wonder if it could even thrive in this place.',
+    'As you carefully forage around you see no evidence of what you are looking for.',
+  ].each do |line|
+    it "matches: #{line[0, 70]}..." do
+      expect(line).to match(EBounty.forage_not_found_regex)
+    end
+  end
+
+  it 'does not match a successful forage' do
+    expect('You forage briefly and manage to find a strand of seaweed!').not_to match(EBounty.forage_not_found_regex)
   end
 end
