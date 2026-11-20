@@ -673,6 +673,23 @@ RSpec.describe 'analytics.lic' do
     end
   end
 
+  describe 'long rest alert' do
+    subject(:long) { result('long_rest') }
+
+    it 'alerts once a rest has gone on for alerts.long_rest_minutes, naming the step running' do
+      expect(long['counts'].first(3)).to eq([0, 1, 1])
+      expect(long['first']).to include('has rested 21 minutes (bounty running)')
+    end
+
+    it 'times a rest from its start through a flap and midnight, and alerts for the next rest' do
+      expect(long['counts'][3..5]).to eq([1, 1, 2])
+    end
+
+    it 'sends nothing when the setting is blank' do
+      expect(long['counts'].last).to eq(2)
+    end
+  end
+
   describe 'Database when busy' do
     subject(:busy) { result('busy_database') }
 

@@ -1559,6 +1559,44 @@ when 'midnight_rest'
   A::Database.flush
   result['item_alerts'] = OUT.grep(/ITEM LIMIT/).size
   result['item_rests'] = A::Database.one("SELECT COUNT(*) AS n FROM cycles WHERE cycle_type='rest' AND rest_reason LIKE '%item%'")['n']
+when 'long_rest'
+  # alerts.long_rest_minutes: one alert a rest, timed from the rest's start,
+  # which a flap (bigshot stopping again at once) and midnight both keep
+  A::Database.connect!
+  cfg = A::Settings.load(WHO)
+  manager = A::CycleManager
+  $running = []
+  manager.start(WHO, cfg)
+  manager.instance_variable_set(:@running, false)
+  manager.instance_variable_get(:@thread).join(2)
+  alerts = A::AlertManager
+  { :@who => WHO, :@cfg => cfg[:alerts], :@alerted_rest => nil }.each { |name, value| alerts.instance_variable_set(name, value) }
+  sent = -> { OUT.grep(/LONG REST/) }
+  at = ->(minutes) { alerts.send(:check_long_rest, manager.rest_since + (minutes * 60)); sent.call.size }
+  $rest_reason = 'encumbered.'
+  manager.send(:transition_to, :rest)
+  # it began an hour ago, so the next rest starts at another second
+  %i[@cycle_started_at @rest_since].each { |name| manager.instance_variable_set(name, Time.now.to_i - 3600) }
+  $running = ['ebounty']
+  counts = [at.call(19), at.call(21), at.call(25)]
+  # a hunt over at once goes back to the same rest
+  manager.send(:transition_to, :hunt)
+  manager.send(:transition_to, :rest)
+  counts << at.call(30)
+  manager.instance_variable_set(:@day, (Date.today - 1).to_s)
+  manager.send(:roll_over_midnight)
+  counts << at.call(40)
+  # a real hunt, then a new rest
+  manager.send(:transition_to, :hunt)
+  manager.instance_variable_set(:@cycle_started_at, Time.now.to_i - 600)
+  manager.send(:transition_to, :rest)
+  counts << at.call(21)
+  alerts.instance_variable_set(:@cfg, cfg[:alerts].merge(long_rest_minutes: nil))
+  manager.send(:transition_to, :hunt)
+  manager.instance_variable_set(:@cycle_started_at, Time.now.to_i - 600)
+  manager.send(:transition_to, :rest)
+  counts << at.call(60)
+  result = { 'counts' => counts, 'first' => sent.call.first.to_s }
 when 'weapon_check'
   # weapon_loadout with only a right hand set: a box in the left stays there,
   # and a gem in the right that won't stow (a full container) isn't dropped

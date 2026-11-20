@@ -343,6 +343,7 @@ module GS4Analytics
        'while resting, time goes to the first of these scripts running: { script: step }'],
       [:alerts, [
         [:no_kill_minutes, 10, 'alert when hunting this long without a kill'],
+        [:long_rest_minutes, 20, 'alert when one rest lasts this long'],
         [:silver_drop_pct, 50, 'alert when silver per hour falls this far below typical'],
         [:silver_check_after_hours, 2, 'start checking silver after this many hours'],
         [:daily_digest, true, "a summary of yesterday on the day's first start"],
@@ -3160,7 +3161,7 @@ module GS4Analytics
     REST_STEP_GRACE = 20
 
     class << self
-      attr_reader :current_state, :current_cycle_id, :hunt_start_time
+      attr_reader :current_state, :current_cycle_id, :hunt_start_time, :rest_since
 
       def start(who, cfg)
         @who = who
@@ -3173,6 +3174,7 @@ module GS4Analytics
         @last_step_at = nil
         @rest_steps = Hash.new(0.0)
         @rest_cycle = nil
+        @rest_since = nil
         @cycle_reason = nil
         @last_hunt = nil
         @ended = nil
@@ -3201,6 +3203,11 @@ module GS4Analytics
         names = SCRIPT_KEYS.map { |state, key| "#{state}: #{Array(@cfg[key]).join(', ').then { |s| s.empty? ? '(not set)' : s }}" }
         ["State: #{@current_state}", "Cycle: #{@current_cycle_id || 'none'}", "Login since: #{Collector.login_at ? Time.at(Collector.login_at).strftime('%Y-%m-%d %H:%M') : 'unknown'}",
          "Scripts: #{names.join('; ')}", "Bigshot status: #{bigshot_status.inspect}"]
+      end
+
+      # The step of the rest now running: the first listed script running, or nil
+      def rest_step
+        @cfg[:rest_steps].find { |script, _| running?(script) }&.last
       end
 
       private
@@ -3371,11 +3378,13 @@ module GS4Analytics
         # A rest goes on into the new day for the reason it started with, which
         # isn't news: its alert (the item limit) isn't sent again
         carried = @current_state == :rest ? @cycle_reason : nil
+        since = @rest_since
         end_current_cycle
         @carry_from = nil # the new day starts at midnight
         @ended = nil
         link_silver
         start_new_cycle(@current_state, reason: carried)
+        @rest_since = since if @current_state == :rest # still the same rest
       end
 
       # The id and every value are taken now and the write is queued, so a
@@ -3441,6 +3450,7 @@ module GS4Analytics
       end
 
       def start_rest(cycle_id, alert: true)
+        @rest_since = @cycle_started_at
         @rest_steps = Hash.new(0.0)
         @rest_cycle = cycle_id
         @rest_tick = monotonic
@@ -3559,8 +3569,7 @@ module GS4Analytics
         @rest_tick = now
         return if elapsed <= 0 || elapsed > 10 # skip stalls
 
-        label = @cfg[:rest_steps].find { |script, _| running?(script) }&.last || 'waiting'
-        @rest_steps[label] += elapsed
+        @rest_steps[rest_step || 'waiting'] += elapsed
       end
 
       def save_rest_steps(who, cycle_id, start_time, steps)
@@ -3736,6 +3745,7 @@ module GS4Analytics
         @cfg = cfg[:alerts]
         @active = true
         @alerted_hunt = nil
+        @alerted_rest = nil
         @silver_alerted_on = nil
         @last_silver_check = 0
         @digest_posted = nil
@@ -3758,6 +3768,7 @@ module GS4Analytics
         while @active
           begin
             check_no_kills
+            check_long_rest
             check_silver_rate if Time.now.to_i - @last_silver_check >= SILVER_CHECK_SECONDS
             check_digest if @cfg[:daily_digest]
           rescue StandardError => e
@@ -3786,6 +3797,25 @@ module GS4Analytics
         profile = Util.safely('') { UserVars.op['profile_current'].to_s }
         Notifier.alert('NO KILLS', "#{@who.name} has hunted #{quiet / 60} minutes without a kill" \
                                    "#{profile.empty? ? '' : " (profile #{profile})"}")
+      end
+
+      # ----- long rest -------------------------------------------------------
+      # A rest that doesn't end: still encumbered or out of mana, the rest script
+      # gives up and bigshot stops again at once (one rest, as the cycles count
+      # it), or a rest step such as ebounty loops on its own. Once a rest,
+      # counted from its start before midnight split it.
+
+      def check_long_rest(now = Time.now.to_i)
+        limit = @cfg[:long_rest_minutes]
+        since = CycleManager.rest_since
+        return unless limit && CycleManager.current_state == :rest && since && @alerted_rest != since
+
+        resting = now - since.to_i
+        return if resting < limit * 60
+
+        @alerted_rest = since
+        step = CycleManager.rest_step
+        Notifier.alert('LONG REST', "#{@who.name} has rested #{resting / 60} minutes#{" (#{step} running)" if step}")
       end
 
       # ----- silver drop -----------------------------------------------------
