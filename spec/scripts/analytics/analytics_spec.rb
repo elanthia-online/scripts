@@ -691,6 +691,10 @@ RSpec.describe 'analytics.lic' do
     it 'tells a busy database from other errors' do
       expect(busy['busy_tells_apart']).to eq([false, false])
     end
+
+    it "waits for another session's write lock instead of failing a write that reads first" do
+      expect(result('busy_wait')).to eq('attempts' => 1, 'busy_reported' => false, 'rows' => %w[held mine])
+    end
   end
 
   describe 'Database' do

@@ -99,7 +99,8 @@ $bank_lines = BANK_LINES
 $lich_char_regex = Regexp.union(',', ';')
 
 # Stand-in for Lich's SQLite helper: Lich's busy timeout, and a record of
-# every connection it set up (Lich's own after_connect installs its lock wait)
+# every connection it set up. Like Lich's own after_connect, it waits for a
+# lock in Ruby, sleeping, so the thread holding the lock runs meanwhile.
 $sqlite_busy_ms = 5000
 $sqlite_opened = []
 $sqlite_hooked = []
@@ -107,7 +108,15 @@ $sqlite_hooked = []
 module Lich
   def self.open_sequel_sqlite(path)
     $sqlite_opened << path
-    Sequel.sqlite(path, timeout: $sqlite_busy_ms, after_connect: ->(conn) { $sqlite_hooked << conn.object_id })
+    Sequel.sqlite(path, timeout: $sqlite_busy_ms, after_connect: lambda { |conn|
+      $sqlite_hooked << conn.object_id
+      deadline = nil
+      conn.busy_handler do |count|
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + ($sqlite_busy_ms / 1000.0) if count.zero?
+        sleep 0.001
+        Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      end
+    })
   end
 
   module Messaging
@@ -431,6 +440,39 @@ when 'busy_database'
     'failure_reported' => OUT.any? { |line| line.include?('ERROR (queued write): RuntimeError: not a busy error') },
     'busy_tells_apart' => [A::Database.send(:busy_error?, Sequel::DatabaseError.new('constraint')),
                            A::Database.send(:busy_error?, RuntimeError.new('other'))]
+  }
+  A::Database.close
+
+when 'busy_wait'
+  # Another session holds the write lock. A queued write that reads first
+  # waits for it at BEGIN, rather than failing at its first write and being
+  # retried after the backoff with "database busy" reported.
+  $sqlite_busy_ms = 5000
+  A::Database.connect!
+  reader, writer = IO.pipe
+  holder = Process.spawn(RbConfig.ruby, '-rsqlite3', '-e', <<~HOLD, A::Database.file, out: writer)
+    db = SQLite3::Database.new(ARGV[0])
+    db.busy_timeout = 5000
+    db.transaction(:immediate) do
+      db.execute("INSERT INTO metadata (key, value, updated_at) VALUES ('held', 'x', 1)")
+      $stdout.puts 'locked'
+      $stdout.flush
+      sleep 0.6
+    end
+  HOLD
+  writer.close
+  reader.gets # the other session has the lock
+  attempts = 0
+  A::Database.async do
+    attempts += 1
+    A::Database.one('SELECT COUNT(*) AS n FROM metadata')
+    A::Database.db[:metadata].insert(key: 'mine', value: 'y', updated_at: 1)
+  end
+  A::Database.flush(8)
+  Process.wait(holder)
+  result = {
+    'attempts' => attempts, 'busy_reported' => OUT.any? { |line| line.include?('database busy') },
+    'rows' => A::Database.all("SELECT key FROM metadata WHERE key IN ('held', 'mine') ORDER BY key").map { |row| row['key'] }
   }
   A::Database.close
 
@@ -1024,12 +1066,23 @@ when 'close_writes'
   writer.kill
   writer.join
   running = Queue.new
-  # (it writes after the hook's, so the two don't wait on each other's lock)
-  db.instance_variable_get(:@queue) << lambda {
-    running << true
-    sleep 0.3
-    event.call('leftover')
-  }
+  # close pauses before the leftover's transaction (a write takes the lock at
+  # BEGIN), so the hook's write comes while close drains and goes first
+  pause = Module.new do
+    private
+
+    def run_write(job)
+      if (gate = $close_gate)
+        $close_gate = nil
+        gate << true
+        sleep 0.3
+      end
+      super
+    end
+  end
+  db.singleton_class.prepend(pause)
+  $close_gate = running
+  db.instance_variable_get(:@queue) << -> { event.call('leftover') }
   late = Thread.new do
     running.pop
     db.async { event.call('late') }
