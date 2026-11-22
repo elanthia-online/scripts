@@ -13,11 +13,23 @@ Tracks your current room on visual maps
       author: elanthia-online
       game: Gemstone
       tags: core, movement, mapping
-      required: Lich >= 5.13.0
+      required: Lich >= 5.26.0
       version: 3.0.0
 
   changelog:
-    v3.0.0 (2026-11-17)
+    v3.0.0 (2026-11-22)
+      * Needs Lich 5.26.0 or later, the first Lich that loads its WebUI. On an
+        older Lich map says to update and exits; under --no-gui it says there
+        is no window. map no longer loads Lich's WebUI library itself.
+      * Changing the scale, Expanded Canvas or the map from the menu centres on
+        the room again, as 2.x did.
+      * A centring request the scroller cannot reach (near a sheet edge, or a
+        sheet smaller than the window) no longer stops a drag from pausing
+        Keep Centered.
+      * The Scale menu has the 2.x steps (10% to 200%). Ctrl+wheel zoom now
+        stops at 800% (2.x: 1000%), the most the WebUI draws.
+      * ;map reset leaves the window's size and position alone: Lich keeps
+        those itself now.
       * Rewritten from GTK to Lich's WebUI (contract 2.52). The window is a
         browser app window served by Lich; the map sheet, the room circle, the
         tag and location X markers and the note pins are drawn by the browser
@@ -62,25 +74,30 @@ Tracks your current room on visual maps
 i_stand_alone
 clear
 
-# Only if Lich has not already loaded it. `require` keys on the literal path,
-# and Lich's own LIB_DIR can differ from this one by case alone, which Windows
-# treats as the same file and Ruby does not; requiring it twice would define a
-# second Lich::WebUI::Contract and a tree built against one set of constants
-# then fails validation against the other.
-begin
-  require File.join(LIB_DIR, 'webui.rb') unless defined?(::Lich::WebUI::Contract)
-rescue LoadError
-  # No lib/webui.rb: this Lich predates the WebUI; the check below says so.
-end
 require 'json'
 require 'erb'
 
-unless defined?(::Lich::WebUI::Contract) && ::Lich::WebUI::Contract::VERSION.split('.').first(2).map(&:to_i).then { |major, minor| major == 2 && minor >= 52 }
-  found = defined?(::Lich::WebUI::Contract) ? ::Lich::WebUI::Contract::VERSION : 'none'
+# Lich loads its WebUI at boot from 5.26.0 on, and Lich::API.webui_page
+# exists only then. 5.25.0 ships lib/webui but never loads it, so map does
+# not load it either: a WebUI started by a script there cannot open a window.
+unless defined?(::Lich::API) && ::Lich::API.respond_to?(:webui_page) && defined?(::Lich::WebUI::Contract)
   respond
-  respond "Your version of Lich does not fit this script: it needs the WebUI at contract 2.52 or later within contract 2 (this Lich loaded #{found})."
-  respond 'Update Lich to 5.26.0 or later.' if found == 'none'
+  respond 'map needs Lich 5.26.0 or later (Lich\'s WebUI). Update Lich to 5.26.0 or later.'
+  respond
+  exit
+end
+
+unless ::Lich::WebUI::Contract::VERSION.split('.').first(2).map(&:to_i).then { |major, minor| major == 2 && minor >= 52 }
+  respond
+  respond "Your version of Lich does not fit this script: it needs the WebUI at contract 2.52 or later within contract 2 (this Lich loaded #{::Lich::WebUI::Contract::VERSION})."
   respond 'The library is read when Lich starts; if lib/webui was updated since, restart Lich.'
+  respond
+  exit
+end
+
+unless ::Lich::WebUI.presentation_enabled?
+  respond
+  respond 'map has no window while Lich runs with --no-gui.'
   respond
   exit
 end
@@ -93,7 +110,8 @@ if Script.current.vars[1] == 'help'
   respond "   ;map <text to search>       - shows room# that first matches text instead of current room"
   respond "   ;map fix                    - enables coordinate fix mode (ctrl+shift+click to set room) "
   respond "   ;map trouble                - enables debug output for troubleshooting window issues     "
-  respond "   ;map reset                  - resets map settings to default values                      "
+  respond "   ;map reset                  - resets map settings to default values (Lich keeps the      "
+  respond "                                 window's size and position itself; reset leaves them)      "
   respond "                                      keep_above = true                                     "
   respond "                                      keep_centered = true                                  "
   respond "                                      expanded_canvas = true                                "
@@ -103,9 +121,6 @@ if Script.current.vars[1] == 'help'
   respond "                                      dynamic_indicator_size = false                        "
   respond "                                      opacity = 1.0                                         "
   respond "                                      map_scale = {}                                        "
-  respond "                                      window_width = 400                                    "
-  respond "                                      window_height = 300                                   "
-  respond "                                      primary window_position = [0, 0]                      "
   respond "                                                                                            "
   respond "   In-Map Controls:                                                                         "
   respond "      click                    - navigate to room or follow map link, then back to the game "
@@ -214,7 +229,7 @@ module ElanthiaMap
   class Window
     PAGE_ID = 'map'
     OPACITY_STEPS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0].freeze
-    SCALE_STEPS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0].freeze
+    SCALE_STEPS = [0.10, 0.25, 0.33, 0.50, 0.66, 0.75, 0.90, 1.0, 1.10, 1.25, 1.33, 1.50, 1.66, 1.75, 1.90, 2.0].freeze
 
     attr_reader :settings, :trouble_mode, :current_map
     attr_reader :follow_mode
@@ -611,7 +626,29 @@ module ElanthiaMap
       ox, oy = offsets
       x = ((ox + mx) * s - @viewport[:width] / 2.0).round
       y = ((oy + my) * s - @viewport[:height] / 2.0).round
-      push_scroll([x, 0].max, [y, 0].max)
+      push_scroll(*reachable_scroll(x, y))
+    end
+
+    # Caps a scroll target at what the scroller can reach (the scaled canvas
+    # less the viewport). A target the browser clamps would never be matched
+    # by its report, and the viewer's next drag would not pause centring.
+    def reachable_scroll(x, y)
+      width, height = canvas_size
+      s = scale
+      viewport = @viewport || { width: 0, height: 0 }
+      max_x = [(width * s).round - viewport[:width], 0].max
+      max_y = [(height * s).round - viewport[:height], 0].max
+      [x.clamp(0, max_x), y.clamp(0, max_y)]
+    end
+
+    # Centres on the room again after the sheet or its scale changed, as 2.x
+    # did. Call under @lock.
+    def recenter_on_room
+      room = @fake_room || @current_room
+      coords = room_coordinates(room)
+      return unless coords && room.image && @current_map == File.join(@map_dir, room.image)
+
+      center_on((coords[0] + coords[2]) / 2.0, (coords[1] + coords[3]) / 2.0)
     end
 
     # Moves the scroller on the next render. The composite's scroll_origin is
@@ -981,6 +1018,7 @@ module ElanthiaMap
       @lock.synchronize do
         @settings[setting] = value ? true : false
         bump_menu(:scale) if setting == :global_scale_enabled
+        recenter_on_room if %i[expanded_canvas global_scale_enabled].include?(setting)
       end
       settings_changed
       refresh
@@ -1003,7 +1041,10 @@ module ElanthiaMap
     end
 
     def on_scale(value)
-      @lock.synchronize { set_scale(value) }
+      @lock.synchronize do
+        set_scale(value)
+        recenter_on_room
+      end
       settings_changed
       refresh
     end
@@ -1018,7 +1059,7 @@ module ElanthiaMap
     end
 
     def on_choose_map(path)
-      changed = @lock.synchronize { change_map(path) }
+      changed = @lock.synchronize { change_map(path).tap { |did| recenter_on_room if did } }
       refresh if changed
     end
 
@@ -1187,7 +1228,7 @@ module ElanthiaMap
         new = scale
         target = [[(middle_x * new - viewport[:width] / 2.0).round, 0].max, [(middle_y * new - viewport[:height] / 2.0).round, 0].max]
       end
-      @lock.synchronize { push_scroll(*target) } if target
+      @lock.synchronize { push_scroll(*reachable_scroll(*target)) } if target
       settings_changed
       refresh
     end
