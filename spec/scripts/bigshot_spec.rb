@@ -3776,3 +3776,176 @@ RSpec.describe 'bigshot Bigshot::Group#all_present?' do
     expect(leader_group.respond_to?(:refresh_group_list)).to be(false)
   end
 end
+
+module BigshotCondemnSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  CMD_CONDEMN_SRC = extract(/^  def cmd_condemn\(npc\).*?^  end$/m, 'cmd_condemn')
+  CONDEMN_CHARGES_SRC = extract(/^  def condemn_charges.*?^  end$/m, 'condemn_charges')
+
+  # cmd_condemn relies on cmd_spell to re-check the target after the query.
+  extract(%r{^  def cmd_spell\(.*?^    return if id\.to_s !~ /902\|411/ && \(dead_or_gone\?\(target\) \|\| !still_targetable\?\(target\.id\)\)$}m,
+          'cmd_spell target re-check')
+
+  DISPATCH_SRC = extract(/^    elsif \(command =~ \/\^condemn.*?\/i\)\n      cmd_condemn\(npc\)$/,
+                         'condemn dispatch')
+  DISPATCH_RE = Regexp.new(DISPATCH_SRC[%r{=~ /(.*?)/i}, 1], Regexp::IGNORECASE)
+
+  # Representative SPELL output using the wording from the game log.
+  def self.spell_output(charges)
+    [
+      '<output class="mono"/>',
+      'Current spells:',
+      "You have stored enough holy magic for #{charges} out of 8 empowered casts of Condemn, with 3/7 toward your next charge.",
+      '<output class=""/>',
+      '<prompt time="1">&gt;</prompt>'
+    ]
+  end
+
+  Target = Struct.new(:id)
+
+  class Harness
+    module Lich
+      module Util
+        class << self
+          attr_accessor :reply, :calls
+        end
+
+        def self.quiet_command_xml(command, start_pattern, end_pattern = /<prompt/, *_rest)
+          (@calls ||= []) << [command, start_pattern, end_pattern]
+          reply.call
+        end
+      end
+    end
+
+    class SpellDouble
+      attr_accessor :known
+
+      def initialize
+        @known = true
+      end
+
+      def known?
+        @known
+      end
+    end
+
+    class Spell
+      def self.book
+        @book ||= Hash.new { |h, k| h[k] = SpellDouble.new }
+      end
+
+      def self.[](num)
+        book[num]
+      end
+    end
+
+    attr_accessor :gone, :targetable
+    attr_reader :spell_calls
+
+    def initialize
+      @gone = false
+      @targetable = true
+      @spell_calls = []
+    end
+
+    def debug_msg(*); end
+    def dead_or_gone?(_npc) = @gone
+    def still_targetable?(_id) = @targetable
+
+    # Stands in for cmd_spell, including its target re-check.
+    def cmd_spell(id:, extra:, target:, **)
+      return if dead_or_gone?(target) || !still_targetable?(target.id)
+
+      @spell_calls << [id, extra.to_s.strip, target.id.to_s]
+    end
+
+    class_eval(CMD_CONDEMN_SRC, SOURCE_PATH)
+    class_eval(CONDEMN_CHARGES_SRC, SOURCE_PATH)
+  end
+end
+
+RSpec.describe 'bigshot cmd_condemn' do
+  let(:h) { BigshotCondemnSpec::Harness }
+  let(:bs) { h.new }
+  let(:npc) { BigshotCondemnSpec::Target.new('555') }
+
+  before do
+    h::Spell.book.clear
+    h::Lich::Util.calls = []
+    reply(BigshotCondemnSpec.spell_output(1))
+  end
+
+  def reply(lines)
+    h::Lich::Util.reply = -> { lines }
+  end
+
+  def evoked
+    bs.spell_calls.select { |id, extra, _| id == 309 && extra == 'evoke' }.map(&:last)
+  end
+
+  describe 'command parsing' do
+    it('matches "condemn"') do
+      expect('condemn').to match(BigshotCondemnSpec::DISPATCH_RE)
+    end
+
+    it 'does not match a longer word' do
+      expect('condemnation').not_to match(BigshotCondemnSpec::DISPATCH_RE)
+    end
+  end
+
+  it 'evokes Condemn at the target with one stored charge' do
+    bs.cmd_condemn(npc)
+    expect(evoked).to eq(['555'])
+  end
+
+  it 'does not evoke with zero stored charges' do
+    reply(BigshotCondemnSpec.spell_output(0))
+    bs.cmd_condemn(npc)
+    expect(evoked).to be_empty
+  end
+
+  it 'fails closed when the SPELL query times out (empty reply)' do
+    reply([])
+    bs.cmd_condemn(npc)
+    expect(evoked).to be_empty
+  end
+
+  it 'fails closed when the charge line is missing from SPELL output' do
+    reply([
+            '<output class="mono"/>',
+            'Current spells:',
+            '<prompt time="1">&gt;</prompt>'
+          ])
+    bs.cmd_condemn(npc)
+    expect(evoked).to be_empty
+  end
+
+  it 'does not query SPELL when 309 is not known' do
+    h::Spell[309].known = false
+    bs.cmd_condemn(npc)
+    expect(h::Lich::Util.calls).to be_empty
+  end
+
+  it 'does not evoke when the target dies during the SPELL query' do
+    h::Lich::Util.reply = lambda {
+      bs.gone = true
+      BigshotCondemnSpec.spell_output(1)
+    }
+    bs.cmd_condemn(npc)
+    expect(evoked).to be_empty
+  end
+
+  # issue_command shows lines before start_pattern on screen, so capture
+  # must begin at SPELL's first line.
+  it 'starts the quiet SPELL capture at the first line of SPELL output' do
+    bs.cmd_condemn(npc)
+    _command, start_pattern, = h::Lich::Util.calls.first
+    expect(BigshotCondemnSpec.spell_output(1).first).to match(start_pattern)
+  end
+end
