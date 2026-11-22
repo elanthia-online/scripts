@@ -354,3 +354,54 @@ RSpec.describe 'go2 travel time estimates' do
     end
   end
 end
+
+RSpec.describe 'go2 setup on a Lich that cannot open the window' do
+  source_path = find_lic_source('go2.lic', from: __dir__)
+  source = File.read(source_path)
+
+  let(:go2) do
+    Module.new.tap do |mod|
+      %w[webui_lich? setup_unavailable_reason].each do |name|
+        mod.module_eval(extract_lic_method(source, name, source_path: source_path), source_path)
+      end
+    end
+  end
+
+  around do |example|
+    saved = $lich_char
+    $lich_char = ';'
+    example.run
+  ensure
+    $lich_char = saved
+  end
+
+  before do
+    stub_const('Script', Class.new)
+    allow(Script).to receive(:current).and_return(double(name: 'go2'))
+  end
+
+  it 'tells a Lich without Lich::API to update' do
+    hide_const('Lich::API')
+    expect(go2.setup_unavailable_reason).to include('needs Lich 5.26.0 or later').and include('Please update Lich')
+  end
+
+  it 'tells a Lich whose API has no WebUI (5.25 and older) to update, even if Lich::WebUI was loaded' do
+    stub_const('Lich::API', Module.new)
+    stub_const('Lich::WebUI', Module.new { def self.presentation_enabled? = false })
+    expect(go2.setup_unavailable_reason).to include('Please update Lich')
+  end
+
+  it 'says --no-gui, not update, when the WebUI is loaded but has no window' do
+    stub_const('Lich::API', Module.new { def self.webui_page(**) = nil })
+    stub_const('Lich::WebUI', Module.new { def self.presentation_enabled? = false })
+    reason = go2.setup_unavailable_reason
+    expect(reason).to include('--no-gui').and include(';go2 help')
+    expect(reason).not_to include('update Lich')
+  end
+
+  it 'has no reason when the window can open' do
+    stub_const('Lich::API', Module.new { def self.webui_page(**) = nil })
+    stub_const('Lich::WebUI', Module.new { def self.presentation_enabled? = true })
+    expect(go2.setup_unavailable_reason).to be_nil
+  end
+end
