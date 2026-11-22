@@ -1,1 +1,0 @@
-Dir[File.join(__dir__, "migration", "**", "*.rb")].each do |file| require(file) end
