@@ -379,6 +379,68 @@ module ::Lich
             expect(output).to include("+ Updated all 1 assets: go2.lic")
           end
         end
+
+        describe "with a default repo set" do
+          def outdate(name)
+            File.write(File.join($script_dir, name), "local copy that differs from every repo")
+          end
+
+          it "updates from the default repo, not the repo the asset was installed from" do
+            Service.run("repo add archive https://archive.lich.elanthia.online")
+            Service.run("script install noop --repo=elanthia-online")
+            Service.run("repo default archive")
+            outdate("noop.lic")
+            game_output
+
+            updates = AutoUpdater.check_for_updates
+            expect(updates.map { |u| [u[:name], u[:repo][:name]] }).to eq([["noop.lic", :archive]])
+
+            Service.run("auto-update --force")
+            game_output
+            expect(ScriptMetadata.to_h.dig("noop.lic", :repo)).to eq(:archive)
+          end
+
+          it "leaves an asset the default repo does not have as installed, and says how to update it" do
+            Service.run("script install go2")
+            Service.run("repo default mirror")
+            outdate("go2.lic")
+            game_output
+
+            updates = AutoUpdater.check_for_updates
+            output = game_output
+            expect(updates).to be_empty
+            expect(output).to include("1 not in repo(mirror), left as installed")
+            expect(output).to include("add --all to update each from the repo it was installed from")
+            expect(output).to include("go2.lic")
+            expect(output).not_to include("errors")
+          end
+
+          it "updates each asset from the repo it was installed from with --all" do
+            Service.run("script install go2")
+            Service.run("repo default mirror")
+            outdate("go2.lic")
+            game_output
+
+            Service.run("auto-update --all --force")
+            expect(game_output).to include("+ Updated all 1 assets: go2.lic")
+          end
+
+          it "uses --repo over the default" do
+            Service.run("script install go2")
+            Service.run("repo default mirror")
+            outdate("go2.lic")
+            game_output
+
+            updates = AutoUpdater.check_for_updates("elanthia-online")
+            expect(updates.map { |u| u[:repo][:name] }).to eq([:"elanthia-online"])
+            expect(game_output).not_to include("your default repo")
+          end
+
+          it "refuses --repo together with --all" do
+            expect { Service.run("auto-update --repo=mirror --all") }
+              .to raise_error(Jinx::Error, /--repo and --all cannot be used together/)
+          end
+        end
       end
     end
   end
