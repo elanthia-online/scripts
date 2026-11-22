@@ -8,7 +8,7 @@
   contributors: SpiffyJr, Tillmen, Kalros, Hazado, Tysong, Athias, Falicor, Deysh, Nisugi
           game: Gemstone
           tags: hunting, bigshot, combat
-       version: 5.17.5
+       version: 5.17.8
       required: Lich >= 5.22.0
 
   Setup Instructions: https://gswiki.play.net/Script_Bigshot
@@ -17,6 +17,15 @@
 
   Version Control:
   Major_change.feature_addition.bugfix
+  v5.17.8  (2026-11-20)
+    - fix: the leader could wait forever for a follower who stepped out of the room and came back (e.g. fogged away), until GROUP was typed by hand
+  v5.17.7  (2026-11-18)
+    - fix: tail now only follows a rally from your own group leader
+    - group hunting now stays on your own computer; to group with a character on another computer in your home, start the leader with ";bigshot head lan" (it warns that anyone on that network could control your Lich)
+    - to group with a friend over your own VPN or Tailscale, the leader uses ";bigshot head lan <ip>" and the follower uses ";bigshot link <uri>"; both show a warning
+    - a follower whose computer blocks the leader (e.g. a firewall) now says so and stops, instead of retrying for minutes
+  v5.17.6  (2026-11-18)
+    - fix: bigshot could lock up after fear (or any forced move) put it in a room someone else was hunting, instead of moving on
   v5.17.5  (2026-11-08)
     - fix: commands with a repeat, e.g. "incant 214 (m20 webbed frozen) (x2)", ignored their checks (mana, status, etc.) and always ran; a space before a comma did the same
   v5.17.4  (2026-11-06)
@@ -226,6 +235,8 @@ end
 # All Requirements
 require 'yaml'
 require 'drb'
+require 'ipaddr'
+require 'socket'
 require 'fileutils'
 require 'logger'
 
@@ -570,6 +581,230 @@ class Bigshot
       respond
       exit
     end
+  end
+end
+
+# Rally discovery for tail/follow
+class Bigshot
+  # Parses a leader's rally whisper out of a raw downstream line.
+  #
+  # The leader announces its DRb URI to the group with WHISPER OOC GROUP; a
+  # follower receives:
+  #   <preset id="whisper">(OOC) Alpha's player whispers to the group,</preset> "Bigshot members (0/2) rallying at druby://host:port."
+  # The game's whisper markup must open the line (other tags such as a stream
+  # push may come first), and the text left once tags are stripped is
+  # anchored at both ends. So the rally text quoted in someone's say, a bare
+  # line of recited text, a direct OOC whisper, or a group whisper that only
+  # quotes the leader's rally does not match. This only says who sent the
+  # rally; the wait loop decides whether to trust it.
+  #
+  # Runs inside a DownstreamHook, so it must stay cheap and never issue
+  # commands.
+  #
+  # @param line [String] raw downstream line (XML)
+  # @return [Array(String, String), nil] [sender name, DRb URI], or nil
+  def self.parse_rally(line)
+    raw = line.to_s
+    return nil unless raw.match?(/\A\s*(?:<[^>]*>\s*)*<preset id=(["'])whisper\1>\(OOC\) /)
+
+    text = raw.gsub(/<[^>]*>/, '').strip
+    match = text.match(%r{\A\(OOC\) (?<sender>[A-Z][a-z]+)'s player whispers to the group, "Bigshot members \(\d+/\d+\) rallying at (?<uri>druby://[^\s"]+)\."\z})
+    return nil unless match
+
+    [match[:sender], match[:uri]]
+  end
+
+  # The current group leader's name, from Lich's Group tracking.
+  #
+  # Lich keeps the leader from the last group line it parsed, so the tail wait
+  # loop sends GROUP for each rally it accepts and this reads the leader from
+  # that reply ("You are grouped with <leader> who is leading, ..."). In
+  # GemStone every group member is in the same room, so the reply only lists
+  # people here. Lich looks the leader up among the objects it currently
+  # knows, and a leader it cannot find reads as nil.
+  #
+  # @return [String, nil] the leader's noun, or nil when there is no group,
+  #   we are leading it ourselves, or Lich cannot resolve the leader
+  def self.group_leader_name
+    leader = Lich::Gemstone::Group.leader
+    leader.is_a?(GameObj) ? leader.noun : nil
+  end
+
+  # Whether a rally came from this character's own group leader.
+  #
+  # @param sender [String] name parsed by {parse_rally}
+  # @return [Boolean]
+  def self.rally_from_leader?(sender)
+    leader = group_leader_name
+    !leader.nil? && leader == sender
+  end
+
+  # The host part of a druby://host:port URI. Hosts with a "/" or "?" (an
+  # address mask, a DRb option) are refused: IPAddr would read 10.1.2.3/8 as
+  # an address while DRb looks it up as a name.
+  #
+  # @param uri [String]
+  # @return [String, nil]
+  def self.drb_host(uri)
+    uri.to_s[%r{\Adruby://([^/?\s]+):\d+\z}, 1]
+  end
+
+  # A DRb URI's host as a numeric IP address. Names (including localhost)
+  # and bracketed forms are refused, because DRb hands those to the resolver.
+  #
+  # @param uri [String]
+  # @return [IPAddr, nil]
+  def self.drb_ip(uri)
+    host = drb_host(uri).to_s
+    return nil if host.include?('[')
+
+    IPAddr.new(host)
+  rescue IPAddr::Error
+    nil
+  end
+
+  # Whether a DRb URI points at this computer, by number.
+  #
+  # @param uri [String]
+  # @return [Boolean]
+  def self.loopback_drb_uri?(uri)
+    drb_ip(uri)&.loopback? || false
+  end
+
+  # Whether a DRb URI points at this computer or the home network (a private
+  # IPv4 address). Tail auto-discovery connects to nothing else; `link` can,
+  # after a warning.
+  #
+  # @param uri [String]
+  # @return [Boolean]
+  def self.local_drb_uri?(uri)
+    ip = drb_ip(uri)
+    return false if ip.nil?
+
+    ip.loopback? || (ip.ipv4? && ip.private?)
+  end
+
+  # Whether a DRb URI's host is an IPv4 address (what `link` can route to).
+  #
+  # @param uri [String]
+  # @return [Boolean]
+  def self.ipv4_drb_uri?(uri)
+    drb_ip(uri)&.ipv4? || false
+  end
+
+  # The address to run this side's DRb server on.
+  #
+  # Without +lan+, the server only listens on this computer (127.0.0.1). With
+  # +lan+, it listens on this computer's home-network IPv4 address: the one the
+  # system would use to reach +toward+ (the leader's host, for a follower) or
+  # the internet (for a leader). Nothing is sent; connecting a UDP socket only
+  # picks the route. Returns nil when that address is not private (no home
+  # network, or a public address), and the caller must not fall back to
+  # listening everywhere. +any_address+ lifts the private-address rule for a
+  # `link` the user typed to a leader outside the home network; it still
+  # listens on that one address, and needs a host to route toward.
+  #
+  # @param lan [Boolean] listen on the home network instead of this computer only
+  # @param toward [String, nil] host to route toward
+  # @param any_address [Boolean] accept a non-private route address
+  # @return [String, nil] a druby:// bind URI with port 0 (any free port), or nil
+  def self.drb_bind_uri(lan, toward = nil, any_address: false)
+    return 'druby://127.0.0.1:0' unless lan
+    return nil if any_address && toward.nil?
+
+    addr = UDPSocket.open do |socket|
+      socket.connect(toward || '192.0.2.1', 9)
+      socket.addr.last
+    end
+    ip = IPAddr.new(addr)
+    return nil unless any_address || (ip.ipv4? && (ip.private? || ip.loopback?))
+
+    "druby://#{addr}:0"
+  rescue SocketError, SystemCallError, IPAddr::Error
+    nil
+  end
+
+  # The address given after `lan` (`head 3 lan 100.101.102.103`), for a
+  # leader that friends reach over a VPN, Tailscale or port forward. A count
+  # and bigshot's words that work in any position (once, single, bounty) may
+  # sit between them or follow `lan` alone; none of those is an address.
+  #
+  # @param args [Array<String>] the script's words after its name
+  # @return [String, nil] the word as typed, or nil when there is none
+  def self.lan_address(args)
+    index = args.index { |arg| arg.to_s =~ /\Alan\z/i }
+    return nil unless index
+
+    skip = /\A(?:-?\d+|once|single|bounty)\z/i
+    args[(index + 1)..].map(&:to_s).find { |word| !word.match?(skip) }
+  end
+
+  # The bind URI for an address the leader named. Only a valid dotted IPv4
+  # address is accepted, and never 0.0.0.0, which would listen on every
+  # interface.
+  #
+  # @param ip [String] the word from {lan_address}
+  # @return [String, nil] a druby:// bind URI with port 0, or nil
+  def self.explicit_bind_uri(ip)
+    return nil unless ip.match?(/\A\d{1,3}(?:\.\d{1,3}){3}\z/)
+    return nil if IPAddr.new(ip).to_i.zero?
+
+    "druby://#{ip}:0"
+  rescue IPAddr::Error
+    nil
+  end
+
+  # The warning to show once a DRb server is listening beyond this computer.
+  #
+  # @param bind_uri [String]
+  # @return [String, nil] nil for this computer only
+  def self.listener_warning(bind_uri)
+    return nil if loopback_drb_uri?(bind_uri)
+
+    "WARNING: bigshot is listening on #{drb_host(bind_uri)}. Anyone who can reach that address can run commands in your Lich while bigshot runs. Only do this on a network you trust."
+  end
+
+  # Starts a DRb server. Every server bigshot runs starts here, and only on
+  # one specific IP address, so nothing listens on every interface.
+  #
+  # @param bind_uri [String] from {drb_bind_uri} or {explicit_bind_uri}
+  # @param front [Object, nil] the object to serve
+  # @raise [ArgumentError] for a missing, malformed or all-interfaces address
+  # @return [DRb::DRbServer]
+  def self.start_drb(bind_uri, front = nil)
+    ip = begin
+      IPAddr.new(drb_host(bind_uri).to_s)
+    rescue IPAddr::Error
+      nil
+    end
+    raise ArgumentError, "bigshot will not listen on #{bind_uri.inspect}" if ip.nil? || ip.native.to_i.zero?
+
+    DRb.start_service(bind_uri, front)
+  end
+
+  # Whether a follower should stop trying to join. A leader that rallied from
+  # 127.0.0.1 but cannot be reached is almost always on another computer
+  # without `lan`, so stop after a few tries instead of whispering the group
+  # for the full minute.
+  #
+  # @param uri [String] the leader's URI
+  # @param failures [Integer] failed connections so far
+  # @return [Boolean]
+  def self.give_up_joining?(uri, failures)
+    loopback_drb_uri?(uri) && failures >= 3
+  end
+
+  # Whether joining failed because the leader could not connect back to this
+  # follower's own DRb server. The leader calls back into the follower while
+  # adding it, and DRb names the address it failed to reach, so an error that
+  # starts with our own URI means the leader was reached but this computer
+  # was not (usually a firewall dropping incoming connections).
+  #
+  # @param error [Exception] what joining raised
+  # @param own_uri [String, nil] this follower's DRb URI (DRb.uri)
+  # @return [Boolean]
+  def self.callback_blocked?(error, own_uri)
+    error.message.to_s.start_with?("#{own_uri} - ")
   end
 end
 
@@ -931,6 +1166,12 @@ class Bigshot
     # Waits out any in-flight Claim lock first, so the room roster is settled
     # before it is checked.
     #
+    # A member who is in the room but missing from Lich's group list gets one
+    # GROUP refresh (see {#refresh_group_list}) before counting as absent: GROUP
+    # only lists members who are in the room, and GemStone prints nothing to
+    # the leader when one who stepped out (e.g. fogged away and back) returns,
+    # so without a refresh the leader would wait for them forever.
+    #
     # @return [Boolean]
     def all_present?
       sleep(0.1) while Lich::Gemstone::Claim::Lock.locked?
@@ -938,11 +1179,26 @@ class Bigshot
       member_online do |name, member|
         member.ping
         return false unless checkpcs.include?(name)
+        next if Lich::Gemstone::Group.members.map(&:noun).include?(name)
+        refresh_group_list
         return false unless Lich::Gemstone::Group.members.map(&:noun).include?(name)
       end
 
       return true
     end
+
+    # Refreshes Lich's group list with GROUP, at most once every 5 seconds, so
+    # a wait loop polling {#all_present?} does not send GROUP on every poll.
+    #
+    # @return [Boolean] whether a refresh was sent
+    def refresh_group_list
+      return false if @group_list_refreshed_at && Time.now - @group_list_refreshed_at < 5
+
+      @group_list_refreshed_at = Time.now
+      Lich::Gemstone::Group.check
+      true
+    end
+    private :refresh_group_list
 
     # @return [Boolean] true once every member has finished its rest preparation
     def rest_prep_complete?
@@ -2605,8 +2861,10 @@ class Bigshot
       ["#{$lich_char}#{name} <creature>",             "Rangers: TRACK toward the named creature"],
       [:separator, :separator],
       ["#{$lich_char}#{name} head <count>",           "Lead a group; waits for <count> followers"],
+      ["#{$lich_char}#{name} head <count> lan",       "Lead followers on other computers in your home (warns)"],
+      ["#{$lich_char}#{name} head <count> lan <ip>",  "Lead on one of your addresses, e.g. a VPN (warns)"],
       ["#{$lich_char}#{name} tail",                   "Follow a group leader (auto-discovers)"],
-      ["#{$lich_char}#{name} link <uri>",             "Follow a leader at an explicit DRb URI"],
+      ["#{$lich_char}#{name} link <uri>",             "Follow a leader at an explicit DRb URI (warns unless on this computer)"],
       [:separator, :separator],
       ["#{$lich_char}#{name} setup",                  "Open the settings window"],
       ["#{$lich_char}#{name} profile load <name>",    "Load a saved profile"],
@@ -2988,7 +3246,7 @@ class Bigshot
 
     instance_variable_set("@CORRECT_PERCENT_MIND", check_mind)
 
-    @TRACKING_CREATURE = options[0].to_s.gsub(/\b(?:solo|bounty|quick|single|once|head|lead|tail|\d+)\b\s*/i, '').strip
+    @TRACKING_CREATURE = options[0].to_s.gsub(%r{\bdruby://\S+\s*|\b\d{1,3}(?:\.\d{1,3}){3}\b\s*|\b(?:solo|bounty|quick|single|once|head|lead|tail|follow|link|lan|\d+)\b\s*}i, '').strip
     @BANDIT_NOUN_REGEX = /bandit|brigand|robber|thug|thief|rogue|outlaw|mugger|marauder|highwayman/i
 
     @DAGGER_REGEX = /alfange|basilard|bodkin|cinquedea|dagger|dirk|knife|kozuka|ice pick|misericord|parazonium|pavade|poignard|pugio|scramasax|sgian achlais|spike|stiletto|tanto|sidearm-of-Onar/i
@@ -7112,7 +7370,10 @@ class Bigshot
       # Remove stale events to avoid stale ATTACK commands when entering a room
       @event_stack.reject!(&:stale?)
 
-      while ((target = find_target(target, just_arrived)) && !should_rest? && no_players_hunt && !should_flee?)
+      # attack_break refuses to fight without the claim, so stop picking
+      # targets here once it's gone (e.g. fear dragged us into an occupied
+      # room) and go wander instead of spinning on the same creature.
+      while ((target = find_target(target, just_arrived)) && bigclaim?(check_disks: false) && !should_rest? && no_players_hunt && !should_flee?)
         debug_msg(@DEBUG_COMBAT, "inside do_hunt loop | target: #{target}")
 
         if !priority(target)
@@ -9236,18 +9497,21 @@ class Bigshot
     while true # wander, check for players
       return if should_rest?
 
-      # Check the room for creatures but only if it's our claim
-      if (bigclaim? || !new_room) && !should_flee?(true)
+      # Check the room for creatures but only if it's our claim. The room we
+      # were just hunting in (!new_room) skips only the disk check, never the
+      # claim itself: attack_break would refuse every target anyway.
+      if (bigclaim? || (!new_room && bigclaim?(check_disks: false))) && !should_flee?(true)
         new_room = true
         sort_npcs.each { |i| return i if valid_target?(i, true) }
 
         # wait for @WANDER_WAIT time unless we need to flee
         sleep @WANDER_WAIT unless should_flee?(true)
 
-        # check for creatures again after waiting
+        # check for creatures again after waiting; fear or another forced
+        # move during the wait can leave us in a room we don't own
         unless should_flee?(true)
           fleeing = false
-          sort_npcs.each { |i| return i if valid_target?(i, false) }
+          sort_npcs.each { |i| return i if valid_target?(i, false) } if bigclaim?(check_disks: false)
         end
 
         if $bigshot_bandits
@@ -9255,7 +9519,7 @@ class Bigshot
           wait_rt
           bandit_track()
           wait_rt
-          sort_npcs.each { |i| return i if valid_target?(i, false) }
+          sort_npcs.each { |i| return i if valid_target?(i, false) } if bigclaim?(check_disks: false)
         end
       end
 
@@ -9756,15 +10020,41 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
   Lich::Util.quiet_command_xml("group open", /Your group status/)
   fput('unhide') if hidden?
 
+  # Listen on this computer only, unless asked to reach the home network.
+  # Both DRb servers need the same address: followers call back into the
+  # leader's Bigshot object, which lives on the second one.
+  lan = Script.current.vars[1..].any? { |var| var.to_s =~ /\Alan\z/i }
+  lan_ip = Bigshot.lan_address(Script.current.vars[1..])
+  bind_uri = lan_ip ? Bigshot.explicit_bind_uri(lan_ip) : Bigshot.drb_bind_uri(lan)
+  if bind_uri.nil?
+    if lan_ip
+      Lich::Messaging.msg("yellow", "\"lan\" needs one of this computer's own IPv4 addresses, not #{lan_ip}. Exiting.")
+    else
+      Lich::Messaging.msg("yellow", "Could not find this computer's home network address for \"lan\". Exiting.")
+    end
+    exit
+  end
+
   # launch DRb server
-  DRb.start_service(nil, Bigshot::Group.new)
+  begin
+    Bigshot.start_drb(bind_uri, Bigshot::Group.new)
+  rescue SocketError, SystemCallError => e
+    Lich::Messaging.msg("yellow", "Could not listen on #{lan_ip || bind_uri}: #{e.message}. Exiting.")
+    exit
+  end
+  if lan_ip && !Bigshot.local_drb_uri?(bind_uri)
+    Lich::Messaging.msg("yellow", "WARNING: #{lan_ip} is not this computer or your home network.")
+  end
+  if (warning = Bigshot.listener_warning(bind_uri))
+    Lich::Messaging.msg("yellow", warning)
+  end
 
   uri = DRb.uri
 
   Thread.new { DRb.thread.join }
 
   # launch DRb client
-  DRb.start_service()
+  Bigshot.start_drb(bind_uri)
 
   bs = Bigshot.new(Script.current.vars)
 
@@ -9832,11 +10122,18 @@ elsif (Script.current.vars[1] =~ /head|lead/i)
   my_group = DRbObject.new(nil, uri)
   my_group.set_leader(bs)
 
+  rally_start = Time.now
+  lan_hint_shown = false
   until my_group.size() > current_count
     # announce/go
     respond
     Lich::Util.issue_command("whisper ooc group Bigshot members (#{my_group.size - 1}/#{current_count}) rallying at #{uri}", /<pushStream id="speech"/, silent: true, quiet: false)
     respond
+    if !lan && !lan_hint_shown && Time.now - rally_start > 30
+      lan_hint_shown = true
+      Lich::Messaging.msg("yellow", "Followers on another computer? Restart with: #{$lich_char}#{Script.current.name} head #{group_count} lan".squeeze(' '))
+      Lich::Messaging.msg("yellow", "With lan, anyone who can reach this computer on your network can run commands in your Lich while you lead.")
+    end
     sleep short_pause
   end
 
@@ -9852,45 +10149,146 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
   group = nil
   bs = nil
   uri = nil
+  link_outside = false
 
   max_attempts = 60
   retry_interval = 0.5
   attempts = 0
-
-  # Watch for rally
-  uri_status = proc { |server|
-    if server.to_s =~ /rallying at (.*)\."/
-      uri = Regexp.last_match(1)
-    end
-    server
-  }
-  DownstreamHook.add('uri_status', uri_status)
 
   if Script.current.vars[1] =~ /link/i
     if Script.current.vars[2].nil?
       Lich::Messaging.msg("text", "Must supply target URI when using LINK option")
       exit
     else
-      uri = Script.current.vars[2]
+      # localhost is this computer; spell it as a number so every numeric
+      # rule (no warning, the follower's loopback bind, giving up after a
+      # few failed tries) applies to it.
+      uri = Script.current.vars[2].to_s.sub(%r{\Adruby://localhost:}i, 'druby://127.0.0.1:')
+      if Bigshot.drb_host(uri).nil?
+        Lich::Messaging.msg("yellow", "LINK needs a URI like druby://192.168.1.5:12345, not #{uri}. Exiting.")
+        exit
+      end
+      # A typed URI may go past this computer and the home network (e.g. a
+      # friend over a VPN or Tailscale), but only because the user asked.
+      unless Bigshot.local_drb_uri?(uri)
+        link_outside = true
+        Lich::Messaging.msg("yellow", "WARNING: #{uri} is not on this computer or your home network.")
+        Lich::Messaging.msg("yellow", "WARNING: Only link to a leader you trust. Their bigshot can run commands in your Lich, and yours will accept connections from their network.")
+      end
     end
-  end
+  else
+    # Watch for the leader's rally. The hook only records what it saw; whether
+    # the sender is our group leader is checked below, on the script thread,
+    # because refreshing the group means sending GROUP and waiting on the reply.
+    rally = nil
+    uri_status = proc { |server|
+      if (parsed = Bigshot.parse_rally(server))
+        rally = parsed
+      end
+      server
+    }
+    before_dying { DownstreamHook.remove('uri_status') }
+    DownstreamHook.add('uri_status', uri_status)
 
-  while group.nil? || bs.nil? || !(group.members&.keys&.include?(Char.name))
-    # Resolve URI
-    loop do
-      if uri
-        DownstreamHook.remove('uri_status')
-        break
+    ignored_senders = []
+    refused_uris = []
+    unanswered_notice = false
+    unlisted_notice = false
+    last_group_check = nil
+    until uri
+      if rally
+        sender, rally_uri = rally
+        rally = nil
+
+        # Ask the game about the group: Lich's leader can be stale (a
+        # leadership line can change it) or empty (we joined before Lich
+        # started). Refusals refresh at most every 10 seconds, or at once if
+        # the last GROUP went unanswered; a rally is only accepted on an
+        # answered GROUP sent for that rally that lists the leader (below).
+        fresh_check = false
+        if last_group_check.nil? || Time.now - last_group_check > 10 || !Lich::Gemstone::Group.checked?
+          last_group_check = Time.now
+          Lich::Gemstone::Group.check
+          fresh_check = true
+        end
+
+        if !Lich::Gemstone::Group.checked?
+          unless unanswered_notice
+            unanswered_notice = true
+            Lich::Messaging.msg("yellow", "No answer to GROUP; waiting for the next Bigshot rally.")
+          end
+        elsif !Bigshot.rally_from_leader?(sender)
+          unless ignored_senders.include?(sender)
+            ignored_senders << sender
+            leader = Bigshot.group_leader_name
+            Lich::Messaging.msg("yellow", "Ignoring a Bigshot rally from #{sender}: your group leader, as of the last GROUP check, is #{leader || 'unknown'}.")
+          end
+        elsif !Bigshot.local_drb_uri?(rally_uri)
+          unless refused_uris.include?(rally_uri)
+            refused_uris << rally_uri
+            Lich::Messaging.msg("yellow", "Ignoring #{sender}'s Bigshot rally: their bigshot is out of date, or #{rally_uri} is not on this computer or your home network.")
+            if Bigshot.ipv4_drb_uri?(rally_uri)
+              Lich::Messaging.msg("yellow", "If you trust #{sender} and that network, use: #{$lich_char}#{Script.current.name} link #{rally_uri}")
+            end
+          end
+        else
+          unless fresh_check
+            last_group_check = Time.now
+            Lich::Gemstone::Group.check
+          end
+          # Group.check empties Lich's member list and marks the group
+          # unchecked; the game's reply refills the list ("You are grouped
+          # with <leader> who is leading, ...") and its status line marks it
+          # checked. So require both: a lost reply, or a stray status line
+          # with no member list, cannot leave a stale leader trusted.
+          if !Lich::Gemstone::Group.checked?
+            unless unanswered_notice
+              unanswered_notice = true
+              Lich::Messaging.msg("yellow", "No answer to GROUP; waiting for the next Bigshot rally.")
+            end
+          elsif Bigshot.rally_from_leader?(sender) && Lich::Gemstone::Group.include?(Lich::Gemstone::Group.leader)
+            uri = rally_uri
+          elsif !unlisted_notice
+            unlisted_notice = true
+            Lich::Messaging.msg("yellow", "GROUP did not list #{sender} as your group leader; waiting for the next Bigshot rally.")
+          end
+        end
       end
 
-      sleep retry_interval
+      sleep retry_interval unless uri
     end
+    DownstreamHook.remove('uri_status')
+  end
+
+  # Run our DRb server where the leader can call back into it: this computer
+  # for a leader on this computer; otherwise the one address this computer
+  # uses to reach the leader (home network, or for an outside `link` any
+  # IPv4 route). Started once, before trying to join.
+  bind_uri = Bigshot.drb_bind_uri(!Bigshot.loopback_drb_uri?(uri), Bigshot.drb_host(uri), any_address: link_outside)
+  if bind_uri.nil?
+    if link_outside
+      Lich::Messaging.msg("yellow", "Could not find an IPv4 address on this computer that reaches #{uri}. Exiting.")
+    else
+      Lich::Messaging.msg("yellow", "Could not find a home network address on this computer that reaches #{uri}. Exiting.")
+    end
+    exit
+  end
+  begin
+    Bigshot.start_drb(bind_uri)
+  rescue SocketError, SystemCallError => e
+    Lich::Messaging.msg("yellow", "Could not listen on #{bind_uri}: #{e.message}. Exiting.")
+    exit
+  end
+  if (warning = Bigshot.listener_warning(bind_uri))
+    Lich::Messaging.msg("yellow", warning)
+  end
+
+  connection_failures = 0
+  while group.nil? || bs.nil? || !(group.members&.keys&.include?(Char.name))
 
     Lich::Util.issue_command("whisper ooc group Joining group at #{uri}", /<pushStream id="speech"/, silent: true, quiet: false)
 
     begin
-      DRb.start_service()
-
       group ||= DRbObject.new(nil, uri)
       bs ||= Bigshot.new(Script.current.vars, group)
 
@@ -9900,11 +10298,21 @@ elsif (Script.current.vars[1] =~ /tail|follow|link/i)
         begin
           group.add_member(bs)
         rescue => e
+          if Bigshot.callback_blocked?(e, DRb.uri)
+            Lich::Messaging.msg("yellow", "The leader could not connect back to this computer at #{Bigshot.drb_host(DRb.uri)}. A firewall here is probably blocking incoming connections from the leader.")
+            Lich::Messaging.msg("yellow", "On Windows, allow Lich's Ruby through the firewall on private networks. On Linux, allow incoming TCP from the leader (e.g. with ufw). Exiting.")
+            exit
+          end
           Lich::Messaging.msg("yellow", "Failed to add character to group: #{e.message}")
         end
       end
     rescue DRb::DRbConnError => e
       Lich::Messaging.msg("yellow", "DRb connection failed: #{e.message}")
+      connection_failures += 1
+      if Bigshot.give_up_joining?(uri, connection_failures)
+        Lich::Messaging.msg("yellow", "Could not reach the leader at #{uri}. If the leader is on another computer, they need to start with: #{$lich_char}#{Script.current.name} head lan")
+        exit
+      end
     rescue => e
       Lich::Messaging.msg("yellow", "Unexpected error: #{e.class} - #{e.message}")
     end

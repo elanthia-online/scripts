@@ -2514,3 +2514,1265 @@ RSpec.describe 'bigshot split_xx command parsing' do
     expect(bs.split_xx('incant 903, kill (x2)')).to eq(['incant 903', 'kill', 'kill'])
   end
 end
+
+# Room-claim handling while hunting. When bigshot lands in a room it doesn't
+# own (fear or another forced move, or the claim otherwise lapsing),
+# attack_break refuses to attack ("No Claim"). do_hunt and bs_wander must not
+# keep handing it a target there, or bigshot spins in place without moving,
+# without attacking, and without ever sleeping.
+module BigshotClaimSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  DO_HUNT_SRC = extract(/^  def do_hunt\(\).*?^  end$/m, 'do_hunt')
+  BS_WANDER_SRC = extract(/^  def bs_wander\(new_room: true\).*?^  end$/m, 'bs_wander')
+
+  # Raised by stubs to stop do_hunt/bs_wander's endless loops once a spec
+  # has seen what it needs.
+  class Stop < StandardError; end
+
+  class Harness
+    module Lich
+      module Gemstone
+        module Group
+          def self.broken?
+            false
+          end
+        end
+      end
+    end
+
+    module Stats
+      def self.prof
+        'Rogue'
+      end
+    end
+
+    Followers = Struct.new(:events) do
+      def add_event(event)
+        events << event
+      end
+
+      def all_present?
+        true
+      end
+
+      def looting_done
+        true
+      end
+
+      def roundtime?
+        false
+      end
+    end
+
+    Inbounds = Struct.new(:valid?)
+
+    attr_accessor :claim, :disks_clear, :npcs, :on_sleep, :attacks, :moves, :wander_calls, :attack_limit
+
+    def initialize
+      @claim = true
+      @disks_clear = true
+      @npcs = []
+      @attacks = []
+      @moves = 0
+      @wander_calls = []
+      @attack_limit = 3
+      @followers = Followers.new([])
+      @event_stack = []
+      @inbounds = Inbounds.new(true)
+      @WANDER_WAIT = 0
+      @FINAL_LOOT = false
+      @DELAY_LOOT = false
+      @TRACKING_CREATURE = []
+    end
+
+    def bigclaim?(check_disks: true)
+      return false unless @claim
+
+      !check_disks || @disks_clear
+    end
+
+    def sleep(*)
+      @on_sleep&.call
+    end
+
+    def sort_npcs
+      @npcs
+    end
+
+    def valid_target?(*)
+      true
+    end
+
+    def find_target(*)
+      @npcs.first
+    end
+
+    def attack(target)
+      @attacks << target
+      raise Stop, 'attacked repeatedly without leaving the room' if @attacks.size >= @attack_limit
+    end
+
+    def bs_move
+      @moves += 1
+      raise Stop, 'moved'
+    end
+
+    def debug_msg(*); end
+    def message(*); end
+    def start_watch; end
+    def reset_variables(*); end
+    def prepare_for_movement(*); end
+    def check_for_deaders_prone; end
+    def cast_signs(*); end
+    def wait_rt; end
+    def wait_while; end
+    def escape_rooms; end
+    def groupcheck; end
+    def single_stop; end
+    def cmd_hide(*); end
+    def bandit_track; end
+
+    def should_rest?
+      false
+    end
+
+    def should_flee?(*)
+      false
+    end
+
+    def no_players_hunt
+      true
+    end
+
+    def priority(*)
+      true
+    end
+
+    def time_between(*)
+      false
+    end
+
+    def group_member_stunned?
+      false
+    end
+
+    def solo?
+      true
+    end
+
+    def leading?
+      true
+    end
+
+    def hidden
+      false
+    end
+
+    class_eval(BS_WANDER_SRC)
+    alias_method :real_bs_wander, :bs_wander
+    class_eval(DO_HUNT_SRC)
+  end
+end
+
+RSpec.describe 'bigshot room claim while hunting' do
+  let(:bs) { BigshotClaimSpec::Harness.new }
+  let(:conjurer) { Struct.new(:id, :name).new(1, 'gaudy phantasmic conjurer') }
+
+  before do
+    $bigshot_quick = false
+    $bigshot_bandits = false
+    $bigshot_sneaky_hunt = false
+    $bigshot_flee = false
+    $wander_rooms = []
+  end
+
+  # Returns what bs_wander handed back, or :moved if it went to move on.
+  def wander(**)
+    bs.real_bs_wander(**)
+  rescue BigshotClaimSpec::Stop
+    :moved
+  end
+
+  describe 'bs_wander' do
+    it 'returns a creature in a room it owns' do
+      bs.npcs = [conjurer]
+      expect(wander).to eq(conjurer)
+      expect(wander(new_room: false)).to eq(conjurer)
+    end
+
+    it 'moves on instead of returning a creature found after being pulled into an occupied room during the wait' do
+      # Empty, owned room on arrival; fear drags us next door mid-wait.
+      bs.on_sleep = lambda do
+        bs.claim = false
+        bs.npcs = [conjurer]
+      end
+      expect(wander).to eq(:moved)
+    end
+
+    it 'moves on instead of returning a creature found by the bandit rescan after being pulled into an occupied room' do
+      $bigshot_bandits = true
+      bs.on_sleep = lambda do
+        bs.claim = false
+        bs.npcs = [conjurer]
+      end
+      expect(wander).to eq(:moved)
+    end
+
+    it 'moves on instead of returning a creature in a room it does not own, even straight after a fight' do
+      bs.claim = false
+      bs.npcs = [conjurer]
+      expect(wander(new_room: false)).to eq(:moved)
+    end
+
+    it 'still ignores other players\' disks in the room it was just hunting' do
+      bs.disks_clear = false
+      bs.npcs = [conjurer]
+      expect(wander(new_room: false)).to eq(conjurer)
+      expect(wander).to eq(:moved)
+    end
+  end
+
+  describe 'do_hunt' do
+    # bs_wander is stubbed: hands back the conjurer on the initial call, then
+    # records the follow-up call and stops.
+    before do
+      calls = bs.wander_calls
+      target = conjurer
+      bs.define_singleton_method(:bs_wander) do |new_room: true|
+        calls << new_room
+        raise BigshotClaimSpec::Stop, 'wandered' if calls.size > 1
+
+        target
+      end
+    end
+
+    def hunt
+      bs.do_hunt
+    rescue BigshotClaimSpec::Stop => e
+      e.message
+    end
+
+    it 'attacks the creature in a room it owns' do
+      bs.npcs = [conjurer]
+      bs.attack_limit = 1
+      expect(hunt).to eq('attacked repeatedly without leaving the room')
+      expect(bs.attacks).to eq([conjurer])
+    end
+
+    it 'leaves to wander instead of re-attacking when the room is not its claim' do
+      bs.claim = false
+      bs.npcs = [conjurer]
+      expect(hunt).to eq('wandered')
+      expect(bs.attacks).to be_empty
+      expect(bs.wander_calls).to eq([true, false])
+    end
+  end
+end
+
+# tail/follow learns the leader's DRb URI from the leader's rally whisper. The
+# helpers, the follower's hook and wait loop, and the `link` check are
+# extracted from bigshot.lic and run against stub Group/Messaging/
+# DownstreamHook/DRb. The wait loop is driven by feeding raw lines to the real
+# hook, so a hook that sets the URI itself, or matches loosely, fails here.
+require 'ipaddr'
+
+module BigshotRallySpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  RALLY_SRC = extract_from_source(SOURCE, /^# Rally discovery for tail\/follow\nclass Bigshot\n.*?^end$/m,
+                                  label: 'rally helpers', source_path: SOURCE_PATH)
+  WAIT_SRC = extract_from_source(SOURCE, /^    rally = nil\n    uri_status = proc.*?^    DownstreamHook\.remove\('uri_status'\)$/m,
+                                 label: 'tail rally hook and wait loop', source_path: SOURCE_PATH)
+  LINK_SRC = extract_from_source(SOURCE, /^    if Script\.current\.vars\[2\]\.nil\?\n.*?^    end$/m,
+                                 label: 'link URI check', source_path: SOURCE_PATH)
+  TRACKING_SRC = extract_from_source(SOURCE, /^    @TRACKING_CREATURE = options\[0\].*$/,
+                                     label: 'TRACKING_CREATURE', source_path: SOURCE_PATH)
+  # Each bind block is cut from its leading comment to the next line that is
+  # not part of it, so an edit to any line inside is tested, not just unparsed.
+  LEADER_BIND_SRC = extract_from_source(SOURCE, /^  # Listen on this computer only, unless asked to reach the home network\.\n.*?(?=^  uri = DRb\.uri$)/m,
+                                        label: 'leader bind', source_path: SOURCE_PATH)
+  FOLLOWER_BIND_SRC = extract_from_source(SOURCE, /^  # Run our DRb server where the leader can call back into it.*?(?=^  connection_failures = 0$)/m,
+                                          label: 'follower bind', source_path: SOURCE_PATH)
+
+  JOIN_SRC = extract_from_source(SOURCE, /^      # Add member if not already included\n.*?(?=^    rescue DRb::DRbConnError => e$)/m,
+                                 label: 'join add_member block', source_path: SOURCE_PATH)
+
+  class Stop < StandardError; end
+
+  module Harness
+    GameObj = Struct.new(:noun)
+
+    # Stands in for the route lookup in drb_bind_uri: records where it was
+    # asked to route and answers with a canned local address (or raises).
+    class UDPSocket
+      class << self
+        attr_accessor :local_addr, :error, :routed_to
+      end
+
+      def self.open
+        raise error if error
+
+        yield new
+      end
+
+      def connect(host, _port)
+        self.class.routed_to = host
+      end
+
+      def addr
+        ['AF_INET', 0, self.class.local_addr, self.class.local_addr]
+      end
+    end
+
+    module DRb
+      class << self
+        attr_accessor :error, :uri
+
+        def started
+          @started ||= []
+        end
+
+        def start_service(uri, front)
+          raise error if error
+
+          started << [uri, front]
+        end
+      end
+    end
+
+    # The wait loop's clock, so the 10 second re-check can be stepped over.
+    class Time
+      class << self
+        attr_accessor :fake
+
+        def now
+          fake || ::Time.now
+        end
+      end
+    end
+
+    module Lich
+      module Gemstone
+        module Group
+          class << self
+            attr_accessor :leader, :on_check, :checks, :answers, :lists
+
+            # Like Lich: GROUP empties the member list and marks the group
+            # unchecked; the game's reply lists the members (leader first)
+            # and its status line marks the group checked. +answers+ false
+            # stands for a GROUP that got no reply, :members_only for a reply
+            # whose status line did not arrive in time; +lists+ false for a
+            # status line that arrived without the member list.
+            def check
+              self.checks = (checks || 0) + 1
+              @members = []
+              @checked = false
+              on_check&.call
+              return if answers == false
+
+              @members = [leader].grep(GameObj) unless lists == false
+              @checked = true unless answers == :members_only
+            end
+
+            def checked?
+              @checked || false
+            end
+
+            def include?(member)
+              (@members || []).include?(member)
+            end
+          end
+        end
+      end
+
+      module Messaging
+        class << self
+          def messages
+            @messages ||= []
+          end
+
+          def texts
+            messages.map(&:last).join("\n")
+          end
+
+          def msg(type, text)
+            messages << [type, text]
+          end
+        end
+      end
+    end
+
+    module DownstreamHook
+      class << self
+        attr_accessor :hook
+
+        def added
+          @added ||= []
+        end
+
+        def removed
+          @removed ||= []
+        end
+
+        def add(name, proc)
+          added << name
+          self.hook = proc
+        end
+
+        def remove(name)
+          removed << name
+        end
+      end
+    end
+
+    module Script
+      class << self
+        attr_accessor :current
+      end
+    end
+
+    # Inside Bigshot a bare Group is Bigshot's follower tracker.
+    class Bigshot
+      class Group; end
+    end
+
+    module_eval(RALLY_SRC)
+
+    def self.before_dying; end
+
+    # Runs the real hook and wait loop. Each `sleep` hands the next raw line
+    # to the installed hook (or runs it, if it is a step such as a leader
+    # change); with no lines left it raises, so a refused rally ends the run
+    # instead of waiting forever.
+    module_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+      def self.wait_for_rally(*lines)
+        Script.current = Struct.new(:vars, :name).new(%w[tail], 'bigshot')
+        uri = nil
+        retry_interval = 0.5
+        queue = lines.dup
+        define_singleton_method(:sleep) do |_s|
+          raise BigshotRallySpec::Stop if queue.empty?
+
+          item = queue.shift
+          item.respond_to?(:call) ? item.call : DownstreamHook.hook.call(item)
+        end
+        begin
+          #{WAIT_SRC}
+        rescue BigshotRallySpec::Stop
+          nil
+        end
+        uri
+      end
+    RUBY
+
+    # Runs the real `link <uri>` check. `exit` raises so a refusal ends the run.
+    module_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+      def self.link_uri(vars)
+        Script.current = Struct.new(:vars).new(vars)
+        uri = nil
+        link_outside = false
+        define_singleton_method(:exit) { raise BigshotRallySpec::Stop }
+        begin
+          #{LINK_SRC}
+        rescue BigshotRallySpec::Stop
+          return [nil, link_outside]
+        end
+        [uri, link_outside]
+      end
+    RUBY
+
+    # Runs the real leader bind block for `;bigshot <words>`. `exit` raises.
+    module_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+      def self.leader_bind(*words)
+        Script.current = Struct.new(:vars, :name).new([words.join(' '), *words], 'bigshot')
+        define_singleton_method(:exit) { raise BigshotRallySpec::Stop }
+        begin
+          #{LEADER_BIND_SRC}
+        rescue BigshotRallySpec::Stop
+          return nil
+        end
+        bind_uri
+      end
+    RUBY
+
+    # Runs the real follower bind block for a leader at +uri+. `exit` raises.
+    module_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+      def self.follower_bind(uri, link_outside = false)
+        define_singleton_method(:exit) { raise BigshotRallySpec::Stop }
+        begin
+          #{FOLLOWER_BIND_SRC}
+        rescue BigshotRallySpec::Stop
+          return nil
+        end
+        bind_uri
+      end
+    RUBY
+
+    module Char
+      def self.name
+        'Bravo'
+      end
+    end
+
+    # The leader's group as the follower sees it: +add_member+ raises +error+.
+    class LeaderStub
+      attr_accessor :error
+
+      def members
+        {}
+      end
+
+      def add_member(_member)
+        raise error if error
+      end
+    end
+
+    # Runs the real add_member block. `exit` raises; returns whether it exited.
+    module_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+      def self.join_once(group)
+        bs = :follower
+        define_singleton_method(:exit) { raise BigshotRallySpec::Stop }
+        #{JOIN_SRC}
+        false
+      rescue BigshotRallySpec::Stop
+        true
+      end
+    RUBY
+
+    # @TRACKING_CREATURE as Bigshot#initialize computes it.
+    module_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+      def self.tracking_creature(options)
+        #{TRACKING_SRC.strip}
+        @TRACKING_CREATURE
+      end
+    RUBY
+  end
+
+  # A rally line as the game sends it to the group.
+  def self.rally_line(sender, uri, count: '0/2')
+    %{<pushStream id="speech"/><preset id="whisper">(OOC) <a exist="-1" noun="#{sender}">#{sender}</a>'s player whispers to the group,</preset> "Bigshot members (#{count}) rallying at #{uri}."\r\n<popStream/>}
+  end
+end
+
+RSpec.describe 'bigshot tail rally' do
+  let(:h) { BigshotRallySpec::Harness }
+  let(:bigshot) { h::Bigshot }
+  let(:group) { h::Lich::Gemstone::Group }
+  let(:messages) { h::Lich::Messaging }
+  let(:uri) { 'druby://127.0.0.1:54733' }
+
+  def rally(sender, uri, **opts)
+    BigshotRallySpec.rally_line(sender, uri, **opts)
+  end
+
+  before do
+    group.leader = h::GameObj.new('Alpha')
+    group.on_check = nil
+    group.checks = 0
+    group.answers = nil
+    group.lists = nil
+    messages.messages.clear
+    h::DownstreamHook.added.clear
+    h::DownstreamHook.removed.clear
+    h::DownstreamHook.hook = nil
+    h::DRb.started.clear
+    h::DRb.error = nil
+    h::DRb.uri = 'druby://192.168.4.60:34229'
+    h::Time.fake = nil
+    h::UDPSocket.local_addr = '192.168.1.4'
+    h::UDPSocket.error = nil
+    h::UDPSocket.routed_to = nil
+  end
+
+  describe '.parse_rally' do
+    it 'reads the sender and URI from the rally as the game sends it' do
+      expect(bigshot.parse_rally(rally('Alpha', uri))).to eq(['Alpha', uri])
+    end
+
+    it 'reads it with the name as plain text and single-quoted markup' do
+      line = %{<preset id='whisper'>(OOC) Alpha's player whispers to the group,</preset> "Bigshot members (1/2) rallying at druby://10.0.0.5:61809."}
+      expect(bigshot.parse_rally(line)).to eq(['Alpha', 'druby://10.0.0.5:61809'])
+    end
+
+    it 'reads an IPv6 URI with a zone id' do
+      expect(bigshot.parse_rally(rally('Alpha', 'druby://fe80::1%8:54733'))).to eq(['Alpha', 'druby://fe80::1%8:54733'])
+    end
+
+    it 'ignores the rally text without the whisper markup, e.g. a line of recited text' do
+      line = %{(OOC) Alpha's player whispers to the group, "Bigshot members (0/2) rallying at druby://10.0.0.9:1."}
+      expect(bigshot.parse_rally(line)).to be_nil
+      expect(bigshot.parse_rally("  #{line}")).to be_nil
+    end
+
+    it 'ignores the rally text in an ACT line, which the game wraps in parentheses' do
+      line = %{(OOC) Alpha's player whispers to the group, "Bigshot members (0/2) rallying at druby://10.0.0.9:1.")}
+      expect(bigshot.parse_rally("(#{line}")).to be_nil
+      expect(bigshot.parse_rally(%{<preset id="whisper">(#{line}</preset>})).to be_nil
+    end
+
+    it 'ignores the rally text quoted in speech' do
+      line = %{<preset id="speech">Mallory says, "</preset>(OOC) Alpha's player whispers to the group, "Bigshot members (0/2) rallying at druby://10.0.0.9:1."}
+      expect(bigshot.parse_rally(line)).to be_nil
+    end
+
+    it "ignores a group whisper that quotes the leader's rally and lets the game close the quote" do
+      line = %{<preset id="whisper">(OOC) Mallory's player whispers to the group,</preset> "(OOC) Alpha's player whispers to the group, "Bigshot members (0/2) rallying at druby://10.0.0.9:1."}
+      expect(bigshot.parse_rally(line)).to be_nil
+    end
+
+    it 'ignores the rally format from before members were counted' do
+      line = %{<preset id="whisper">(OOC) Alpha's player whispers to the group,</preset> "Bigshot rallying at druby://10.0.0.5:61809."}
+      expect(bigshot.parse_rally(line)).to be_nil
+    end
+
+    it 'ignores a direct OOC whisper' do
+      line = %{<preset id="whisper">(OOC) Mallory's player whispers,</preset> "Bigshot members (0/2) rallying at druby://10.0.0.9:1234."}
+      expect(bigshot.parse_rally(line)).to be_nil
+    end
+
+    it 'ignores trailing text after the rally' do
+      expect(bigshot.parse_rally(%{#{rally('Alpha', uri)} Mallory says, "hi"})).to be_nil
+    end
+
+    it 'ignores other DRb schemes' do
+      expect(bigshot.parse_rally(rally('Alpha', 'drbunix:/tmp/x'))).to be_nil
+    end
+
+    it "ignores a follower's joining whisper" do
+      line = %{<preset id="whisper">(OOC) Bravo's player whispers to the group,</preset> "Joining group at #{uri}."}
+      expect(bigshot.parse_rally(line)).to be_nil
+    end
+  end
+
+  describe '.group_leader_name' do
+    it "names Lich's group leader, and nothing when we lead or there is none" do
+      expect(bigshot.group_leader_name).to eq('Alpha')
+      group.leader = :self
+      expect(bigshot.group_leader_name).to be_nil
+      group.leader = nil
+      expect(bigshot.group_leader_name).to be_nil
+    end
+  end
+
+  describe '.rally_from_leader?' do
+    it 'accepts the group leader' do
+      expect(bigshot.rally_from_leader?('Alpha')).to be(true)
+    end
+
+    it 'rejects anyone else' do
+      expect(bigshot.rally_from_leader?('Mallory')).to be(false)
+    end
+
+    it 'rejects everyone when we lead or have no group' do
+      group.leader = :self
+      expect(bigshot.rally_from_leader?('Alpha')).to be(false)
+      group.leader = nil
+      expect(bigshot.rally_from_leader?('Alpha')).to be(false)
+    end
+  end
+
+  describe 'DRb addresses' do
+    it 'treats this computer and the home network as local' do
+      expect(bigshot.local_drb_uri?('druby://127.0.0.1:5000')).to be(true)
+      expect(bigshot.local_drb_uri?('druby://192.168.1.4:5000')).to be(true)
+      expect(bigshot.local_drb_uri?('druby://10.0.0.5:5000')).to be(true)
+      expect(bigshot.local_drb_uri?('druby://172.16.0.9:5000')).to be(true)
+    end
+
+    it 'treats public, IPv6 link-local and other named hosts as not local' do
+      expect(bigshot.local_drb_uri?('druby://203.0.113.5:5000')).to be(false)
+      expect(bigshot.local_drb_uri?('druby://fe80::1%8:5000')).to be(false)
+      expect(bigshot.local_drb_uri?('druby://example.com:5000')).to be(false)
+      expect(bigshot.local_drb_uri?('not a uri')).to be(false)
+    end
+
+    it 'takes only numeric hosts as local, since DRb resolves names and brackets' do
+      expect(bigshot.local_drb_uri?('druby://localhost:5000')).to be(false)
+      expect(bigshot.loopback_drb_uri?('druby://localhost:5000')).to be(false)
+      expect(bigshot.local_drb_uri?('druby://[::1]:5000')).to be(false)
+      expect(bigshot.loopback_drb_uri?('druby://[::1]:5000')).to be(false)
+    end
+
+    it 'reads only numeric, unbracketed hosts as an address' do
+      expect(bigshot.drb_ip('druby://10.0.0.5:5000')).to eq(IPAddr.new('10.0.0.5'))
+      expect(bigshot.drb_ip('druby://fe80::1%8:5000')).to be_a(IPAddr)
+      expect(bigshot.drb_ip('druby://[::1]:5000')).to be_nil
+      expect(bigshot.drb_ip('druby://localhost:5000')).to be_nil
+      expect(bigshot.drb_ip('druby://10.1.2.3/8:5000')).to be_nil
+    end
+
+    it 'does not take a private IPv6 (ULA) host as the home network' do
+      expect(bigshot.local_drb_uri?('druby://fd00::1:5000')).to be(false)
+    end
+
+    it 'tells which hosts are IPv4' do
+      expect(bigshot.ipv4_drb_uri?('druby://203.0.113.5:5000')).to be(true)
+      expect(bigshot.ipv4_drb_uri?('druby://fe80::1%8:5000')).to be(false)
+      expect(bigshot.ipv4_drb_uri?('druby://example.com:5000')).to be(false)
+    end
+
+    it 'refuses a host with a mask or option, which DRb would look up as a name' do
+      expect(bigshot.drb_host('druby://10.1.2.3/8:4000')).to be_nil
+      expect(bigshot.local_drb_uri?('druby://10.1.2.3/8:4000')).to be(false)
+      expect(bigshot.local_drb_uri?('druby://127.0.0.1/255.0.0.0:4000')).to be(false)
+      expect(bigshot.loopback_drb_uri?('druby://127.0.0.1/8:4000')).to be(false)
+      expect(bigshot.drb_host('druby://10.1.2.3:4000?x')).to be_nil
+    end
+
+    it 'tells a leader on this computer from one elsewhere' do
+      expect(bigshot.loopback_drb_uri?('druby://127.0.0.1:5000')).to be(true)
+      expect(bigshot.loopback_drb_uri?('druby://192.168.1.4:5000')).to be(false)
+    end
+
+    it 'listens on this computer only by default' do
+      expect(bigshot.drb_bind_uri(false)).to eq('druby://127.0.0.1:0')
+      expect(h::UDPSocket.routed_to).to be_nil
+    end
+
+    it 'listens on the home network address with lan' do
+      expect(bigshot.drb_bind_uri(true)).to eq('druby://192.168.1.4:0')
+    end
+
+    it "routes a follower toward the leader's host" do
+      bigshot.drb_bind_uri(true, '192.168.1.7')
+      expect(h::UDPSocket.routed_to).to eq('192.168.1.7')
+    end
+
+    it 'gives up rather than listen on a public address' do
+      h::UDPSocket.local_addr = '203.0.113.5'
+      expect(bigshot.drb_bind_uri(true)).to be_nil
+      h::UDPSocket.local_addr = '2001:db8::5'
+      expect(bigshot.drb_bind_uri(true)).to be_nil
+    end
+
+    it 'listens on a non-private address only for a link outside the home network' do
+      h::UDPSocket.local_addr = '100.64.1.2'
+      expect(bigshot.drb_bind_uri(true, '100.101.102.103')).to be_nil
+      expect(bigshot.drb_bind_uri(true, '100.101.102.103', any_address: true)).to eq('druby://100.64.1.2:0')
+    end
+
+    it 'needs a host to route toward before lifting the private rule' do
+      h::UDPSocket.local_addr = '203.0.113.7'
+      expect(bigshot.drb_bind_uri(true, nil, any_address: true)).to be_nil
+    end
+
+    it 'gives up when there is no route' do
+      h::UDPSocket.error = Errno::ENETUNREACH
+      expect(bigshot.drb_bind_uri(true)).to be_nil
+    end
+
+    it 'reads the word given after lan, but not a count' do
+      expect(bigshot.lan_address(['head', '3', 'lan', '100.101.102.103'])).to eq('100.101.102.103')
+      expect(bigshot.lan_address(['head', 'lan', '100.101.102.103', '3'])).to eq('100.101.102.103')
+      expect(bigshot.lan_address(['head', 'lan', '3', '100.101.102.103'])).to eq('100.101.102.103')
+      expect(bigshot.lan_address(%w[head 3 lan mybox.tail1234.ts.net])).to eq('mybox.tail1234.ts.net')
+      expect(bigshot.lan_address(%w[head 3 lan])).to be_nil
+      expect(bigshot.lan_address(%w[head 2 lan once])).to be_nil
+      expect(bigshot.lan_address(%w[head lan 2 single])).to be_nil
+      expect(bigshot.lan_address(%w[head lan 2 bounty])).to be_nil
+      expect(bigshot.lan_address(%w[head lan once 2 10.0.0.5])).to eq('10.0.0.5')
+      expect(bigshot.lan_address(%w[head lan 3 quick])).to eq('quick')
+      expect(bigshot.lan_address(%w[head lan 3])).to be_nil
+      expect(bigshot.lan_address(['head', '3', '100.101.102.103'])).to be_nil
+    end
+
+    it 'listens on a named IPv4 address, never on every interface' do
+      expect(bigshot.explicit_bind_uri('100.101.102.103')).to eq('druby://100.101.102.103:0')
+      expect(bigshot.explicit_bind_uri('0.0.0.0')).to be_nil
+      expect(bigshot.explicit_bind_uri('000.0.00.0')).to be_nil
+    end
+
+    it 'refuses a named address that is not a valid IPv4 address' do
+      expect(bigshot.explicit_bind_uri('fd7a:115c:a1e0::5')).to be_nil
+      expect(bigshot.explicit_bind_uri('mybox.tail1234.ts.net')).to be_nil
+      expect(bigshot.explicit_bind_uri('999.1.1.1')).to be_nil
+      expect(bigshot.explicit_bind_uri('10.0.0')).to be_nil
+    end
+
+    it 'has a warning for listening anywhere but this computer' do
+      expect(bigshot.listener_warning('druby://127.0.0.1:0')).to be_nil
+      expect(bigshot.listener_warning('druby://192.168.1.4:0')).to include('WARNING', '192.168.1.4', 'can run commands in your Lich')
+      expect(bigshot.listener_warning('druby://100.64.1.2:0')).to include('100.64.1.2')
+    end
+
+    it 'starts a DRb server on one specific address' do
+      bigshot.start_drb('druby://127.0.0.1:0', :front)
+      bigshot.start_drb('druby://192.168.1.4:0')
+      expect(h::DRb.started).to eq([['druby://127.0.0.1:0', :front], ['druby://192.168.1.4:0', nil]])
+    end
+
+    it 'refuses to start a DRb server on every interface or no address' do
+      [nil, 'druby://:0', 'druby://0.0.0.0:0', 'druby://[::]:0', 'druby://::ffff:0.0.0.0:0', 'druby://localhost:0', 'garbage'].each do |bad|
+        expect { bigshot.start_drb(bad) }.to raise_error(ArgumentError)
+      end
+      expect(h::DRb.started).to be_empty
+    end
+
+    it "tells a blocked callback to this follower from other join errors" do
+      own = 'druby://192.168.4.60:34229'
+      blocked = RuntimeError.new("#{own} - #<IO::TimeoutError: Blocking operation timed out!>")
+      refused = RuntimeError.new("#{own} - #<Errno::ECONNREFUSED: Connection refused>")
+      leader_down = RuntimeError.new('druby://192.168.4.50:61738 - #<Errno::ECONNREFUSED: Connection refused>')
+      expect(bigshot.callback_blocked?(blocked, own)).to be(true)
+      expect(bigshot.callback_blocked?(refused, own)).to be(true)
+      expect(bigshot.callback_blocked?(leader_down, own)).to be(false)
+      expect(bigshot.callback_blocked?(RuntimeError.new('boom'), own)).to be(false)
+      expect(bigshot.callback_blocked?(blocked, nil)).to be(false)
+      expect(bigshot.callback_blocked?(RuntimeError.new('druby://192.168.4.60:342290 - x'), own)).to be(false)
+    end
+
+    it 'stops joining a leader on this computer that cannot be reached' do
+      expect(bigshot.give_up_joining?('druby://127.0.0.1:5000', 2)).to be(false)
+      expect(bigshot.give_up_joining?('druby://127.0.0.1:5000', 3)).to be(true)
+      expect(bigshot.give_up_joining?('druby://192.168.1.7:5000', 30)).to be(false)
+    end
+  end
+
+  describe 'DRb servers in the script' do
+    # The bind address is the fix: this fails if any server goes back to
+    # DRb.start_service() / DRb.start_service(nil, ...), which listen on
+    # every interface, or starts a server some other way.
+    let(:source) { BigshotRallySpec::SOURCE }
+
+    it 'starts DRb only through Bigshot.start_drb' do
+      expect(source.scan(/DRb\.start_service\b/).size).to eq(1)
+      expect(BigshotRallySpec::RALLY_SRC).to include('    DRb.start_service(bind_uri, front)')
+      expect(source).not_to match(/DRbServer\.new/)
+    end
+
+    it 'starts every server on bind_uri, and nothing else' do
+      calls = source.scan(/Bigshot\.start_drb\((.*)\)/).flatten
+      expect(calls).to eq(['bind_uri, Bigshot::Group.new', 'bind_uri', 'bind_uri'])
+    end
+
+    it 'treats a follower as auto-discovered unless its link says otherwise' do
+      expect(source).to match(/^  uri = nil\n  link_outside = false$/)
+      expect(source.scan(/link_outside = true/).size).to eq(1)
+    end
+
+    it "gives a link outside the home network the follower's one-address bind" do
+      expect(source).to match(/^  bind_uri = Bigshot\.drb_bind_uri\(.*, any_address: link_outside\)$/)
+    end
+
+    it "binds a leader's named address only through explicit_bind_uri" do
+      expect(source).to include('  bind_uri = lan_ip ? Bigshot.explicit_bind_uri(lan_ip) : Bigshot.drb_bind_uri(lan)')
+    end
+
+    it 'warns on both ends once listening beyond this computer' do
+      expect(source.scan('if (warning = Bigshot.listener_warning(bind_uri))').size).to eq(2)
+    end
+
+    it 'stops joining an unreachable leader on this computer' do
+      expect(source).to include('if Bigshot.give_up_joining?(uri, connection_failures)')
+    end
+  end
+
+  describe 'the leader bind' do
+    it 'listens on this computer only for a plain head' do
+      expect(h.leader_bind('head', '3')).to eq('druby://127.0.0.1:0')
+      expect(h::DRb.started.map(&:first)).to eq(['druby://127.0.0.1:0'])
+      expect(messages.messages).to be_empty
+    end
+
+    it 'listens on the home network with lan, and warns' do
+      expect(h.leader_bind('head', '3', 'lan')).to eq('druby://192.168.1.4:0')
+      expect(messages.texts).to include('bigshot is listening on 192.168.1.4', 'can run commands in your Lich')
+      expect(messages.texts).not_to include('is not this computer or your home network')
+    end
+
+    it 'listens on a named private address with one warning' do
+      expect(h.leader_bind('head', '3', 'lan', '10.8.0.1')).to eq('druby://10.8.0.1:0')
+      expect(messages.texts).to include('bigshot is listening on 10.8.0.1')
+      expect(messages.texts).not_to include('is not this computer or your home network')
+    end
+
+    it 'listens on a named outside address with both warnings, whatever the word order' do
+      expect(h.leader_bind('head', 'lan', '3', '100.101.102.103')).to eq('druby://100.101.102.103:0')
+      expect(messages.texts).to include('100.101.102.103 is not this computer or your home network', 'bigshot is listening on 100.101.102.103')
+    end
+
+    it 'exits on an address it will not use, before listening' do
+      expect(h.leader_bind('head', '3', 'lan', '0.0.0.0')).to be_nil
+      expect(h.leader_bind('head', '3', 'lan', 'mybox.ts.net')).to be_nil
+      expect(messages.texts).to include("needs one of this computer's own IPv4 addresses, not 0.0.0.0", 'not mybox.ts.net')
+      expect(h::DRb.started).to be_empty
+    end
+
+    it 'does not claim to be listening when the bind fails' do
+      h::DRb.error = Errno::EADDRNOTAVAIL
+      expect(h.leader_bind('head', '3', 'lan', '100.101.102.103')).to be_nil
+      expect(messages.texts).to include('Could not listen on 100.101.102.103')
+      expect(messages.texts).not_to include('WARNING')
+    end
+  end
+
+  describe 'the follower bind' do
+    it 'listens on this computer only for a leader on this computer' do
+      expect(h.follower_bind('druby://127.0.0.1:5000')).to eq('druby://127.0.0.1:0')
+      expect(h::DRb.started.map(&:first)).to eq(['druby://127.0.0.1:0'])
+      expect(messages.messages).to be_empty
+    end
+
+    it 'listens on the home network for a leader there, and warns' do
+      expect(h.follower_bind('druby://192.168.1.7:5000')).to eq('druby://192.168.1.4:0')
+      expect(h::UDPSocket.routed_to).to eq('192.168.1.7')
+      expect(messages.texts).to include('bigshot is listening on 192.168.1.4')
+    end
+
+    it 'listens on the route toward an outside leader only for an outside link' do
+      h::UDPSocket.local_addr = '100.64.1.2'
+      expect(h.follower_bind('druby://100.101.102.103:5000', true)).to eq('druby://100.64.1.2:0')
+      expect(messages.texts).to include('bigshot is listening on 100.64.1.2')
+      messages.messages.clear
+      h::DRb.started.clear
+      expect(h.follower_bind('druby://100.101.102.103:5000')).to be_nil
+      expect(messages.texts).to include('Could not find a home network address on this computer that reaches')
+      messages.messages.clear
+      h::UDPSocket.error = Errno::ENETUNREACH
+      expect(h.follower_bind('druby://100.101.102.103:5000', true)).to be_nil
+      expect(messages.texts).to include('Could not find an IPv4 address on this computer that reaches')
+      expect(h::DRb.started).to be_empty
+    end
+
+    it 'exits cleanly, without the warning, when the bind fails' do
+      h::DRb.error = Errno::EADDRINUSE
+      expect(h.follower_bind('druby://192.168.1.7:5000')).to be_nil
+      expect(messages.texts).to include('Could not listen on druby://192.168.1.4:0')
+      expect(messages.texts).not_to include('WARNING')
+    end
+  end
+
+  describe 'joining the leader' do
+    let(:leader) { h::LeaderStub.new }
+
+    it 'stops with a firewall hint when the leader cannot connect back to this computer' do
+      leader.error = RuntimeError.new('druby://192.168.4.60:34229 - #<IO::TimeoutError: Blocking operation timed out!>')
+      expect(h.join_once(leader)).to be(true)
+      expect(messages.texts).to include('The leader could not connect back to this computer at 192.168.4.60', 'firewall')
+      expect(messages.texts).not_to include('Failed to add character to group')
+    end
+
+    it 'keeps trying after any other join error' do
+      leader.error = RuntimeError.new('druby://192.168.4.50:61738 - #<Errno::ECONNREFUSED: Connection refused>')
+      expect(h.join_once(leader)).to be(false)
+      expect(messages.texts).to include('Failed to add character to group')
+      expect(messages.texts).not_to include('could not connect back')
+    end
+
+    it 'says nothing when joining works' do
+      expect(h.join_once(leader)).to be(false)
+      expect(messages.messages).to be_empty
+    end
+  end
+
+  describe 'link <uri>' do
+    it 'follows a leader on this computer or the home network without the trust warning' do
+      expect(h.link_uri(['link druby://127.0.0.1:5000', 'link', 'druby://127.0.0.1:5000'])).to eq(['druby://127.0.0.1:5000', false])
+      expect(h.link_uri(['link druby://localhost:5000', 'link', 'druby://localhost:5000'])).to eq(['druby://127.0.0.1:5000', false])
+      expect(h.link_uri(['link druby://LOCALHOST:5000', 'link', 'druby://LOCALHOST:5000'])).to eq(['druby://127.0.0.1:5000', false])
+      expect(h.link_uri(['link druby://192.168.1.5:5000', 'link', 'druby://192.168.1.5:5000'])).to eq(['druby://192.168.1.5:5000', false])
+      expect(messages.messages).to be_empty
+    end
+
+    it 'follows a leader elsewhere, with a warning, as a link outside the home network' do
+      expect(h.link_uri(['link druby://100.101.102.103:5000', 'link', 'druby://100.101.102.103:5000'])).to eq(['druby://100.101.102.103:5000', true])
+      expect(messages.texts).to include('WARNING', 'not on this computer or your home network', 'Only link to a leader you trust')
+      messages.messages.clear
+      expect(h.link_uri(['link druby://mypc.example:5000', 'link', 'druby://mypc.example:5000'])).to eq(['druby://mypc.example:5000', true])
+      expect(messages.texts).to include('WARNING')
+    end
+
+    it 'refuses a URI it cannot read' do
+      ['druby:/10.0.0.5:5000', '10.0.0.5:5000', 'druby://10.0.0.5:5000?x', 'druby://10.1.2.3/8:5000'].each do |bad|
+        messages.messages.clear
+        expect(h.link_uri(["link #{bad}", 'link', bad])).to eq([nil, false])
+        expect(messages.texts).to include('LINK needs a URI like')
+      end
+    end
+
+    it 'still asks for a URI when none is given' do
+      expect(h.link_uri(%w[link link])).to eq([nil, false])
+      expect(messages.texts).to include('Must supply target URI')
+    end
+  end
+
+  describe 'arguments that are not a creature to track' do
+    it 'drops lan, follow, link, the link URI and an address' do
+      expect(h.tracking_creature(['head 3 lan'])).to eq('')
+      expect(h.tracking_creature(['head lan 3'])).to eq('')
+      expect(h.tracking_creature(['follow'])).to eq('')
+      expect(h.tracking_creature(['link druby://127.0.0.1:5000'])).to eq('')
+      expect(h.tracking_creature(['head 3 lan 100.101.102.103'])).to eq('')
+    end
+
+    it 'keeps a real creature name' do
+      expect(h.tracking_creature(['giant rat'])).to eq('giant rat')
+    end
+  end
+
+  describe 'the follower hook and wait loop' do
+    it "takes the leader's URI after checking with the game, and drops the hook" do
+      expect(h.wait_for_rally(rally('Alpha', uri))).to eq(uri)
+      expect(group.checks).to eq(1)
+      expect(h::DownstreamHook.added).to eq(['uri_status'])
+      expect(h::DownstreamHook.removed).to eq(['uri_status'])
+    end
+
+    it 'takes nothing from lines that only look like a rally' do
+      said = %{<preset id="speech">Mallory says, "</preset>rallying at druby://10.0.0.9:1."}
+      recited = %{(OOC) Alpha's player whispers to the group, "Bigshot members (0/2) rallying at druby://10.0.0.9:1."}
+      expect(h.wait_for_rally(said, recited)).to be_nil
+      expect(group.checks).to eq(0)
+    end
+
+    it 'finds the leader when Lich did not know it yet' do
+      group.leader = nil
+      group.on_check = -> { group.leader = h::GameObj.new('Alpha') }
+      expect(h.wait_for_rally(rally('Alpha', uri))).to eq(uri)
+    end
+
+    it 'refuses a leader the game no longer reports in this room' do
+      group.on_check = -> { group.leader = nil }
+      expect(h.wait_for_rally(rally('Alpha', uri))).to be_nil
+      expect(messages.texts).to include('Ignoring a Bigshot rally from Alpha', 'unknown')
+    end
+
+    it "refuses a rally from someone Lich wrongly took for the leader, once the game corrects it" do
+      group.leader = h::GameObj.new('Mallory')
+      group.on_check = -> { group.leader = h::GameObj.new('Alpha') }
+      expect(h.wait_for_rally(rally('Mallory', 'druby://10.0.0.9:1'))).to be_nil
+    end
+
+    it 'asks the game again before accepting a rally inside the 10 second window' do
+      group.on_check = -> { group.leader = h::GameObj.new('Alpha') }
+      stale_leader = -> { group.leader = h::GameObj.new('Mallory') }
+      expect(h.wait_for_rally(rally('Mallory', 'druby://10.0.0.9:1'), stale_leader, rally('Mallory', 'druby://10.0.0.9:1'))).to be_nil
+      expect(group.checks).to eq(2)
+    end
+
+    it 'checks again after 10 seconds, so a leader turned down earlier is followed' do
+      h::Time.fake = ::Time.at(1_000)
+      group.on_check = -> { group.leader = nil }
+      later = lambda {
+        h::Time.fake += 11
+        group.on_check = -> { group.leader = h::GameObj.new('Alpha') }
+      }
+      expect(h.wait_for_rally(rally('Alpha', uri), later, rally('Alpha', uri))).to eq(uri)
+      expect(group.checks).to eq(2)
+    end
+
+    it 'does not ask the game again for every refused rally inside the window' do
+      h::Time.fake = ::Time.at(1_000)
+      expect(h.wait_for_rally(rally('Mallory', 'druby://10.0.0.9:1'), rally('Bravo', 'druby://10.0.0.9:1'))).to be_nil
+      expect(group.checks).to eq(1)
+    end
+
+    it 'does not follow a rally when GROUP gets no answer, and says so once' do
+      group.answers = false
+      expect(h.wait_for_rally(rally('Alpha', uri), rally('Alpha', uri))).to be_nil
+      expect(messages.texts.scan('No answer to GROUP').size).to eq(1)
+    end
+
+    it 'follows the next rally once GROUP is answered again' do
+      group.answers = false
+      answered = -> { group.answers = nil }
+      expect(h.wait_for_rally(rally('Alpha', uri), answered, rally('Alpha', uri))).to eq(uri)
+    end
+
+    it 'does not take a stray group status line for the answer: the reply must list the leader' do
+      group.lists = false
+      expect(h.wait_for_rally(rally('Alpha', uri), rally('Alpha', uri))).to be_nil
+      expect(messages.texts.scan('GROUP did not list Alpha as your group leader').size).to eq(1)
+      group.lists = nil
+      expect(h.wait_for_rally(rally('Alpha', uri))).to eq(uri)
+    end
+
+    it 'says so when the re-check for this rally names someone else as leader' do
+      group.on_check = -> { group.leader = h::GameObj.new('Alpha') }
+      stale_leader = -> { group.leader = h::GameObj.new('Mallory') }
+      expect(h.wait_for_rally(rally('Mallory', 'druby://10.0.0.9:1'), stale_leader, rally('Mallory', 'druby://10.0.0.9:1'))).to be_nil
+      expect(messages.texts).to include('GROUP did not list Mallory as your group leader')
+    end
+
+    it 'does not follow when the member list came but the status line did not' do
+      group.answers = :members_only
+      expect(h.wait_for_rally(rally('Alpha', uri))).to be_nil
+      expect(messages.texts).to include('No answer to GROUP')
+    end
+
+    it "does not follow when the re-check for this rally loses its status line" do
+      reply_cut_short = -> { group.answers = :members_only }
+      lines = [rally('Mallory', 'druby://10.0.0.9:1'), reply_cut_short, rally('Alpha', uri)]
+      expect(h.wait_for_rally(*lines)).to be_nil
+      expect(group.checks).to eq(2)
+    end
+
+    it 'says GROUP went unanswered rather than naming a remembered leader' do
+      group.answers = false
+      expect(h.wait_for_rally(rally('Mallory', 'druby://10.0.0.9:1'))).to be_nil
+      expect(messages.texts).to include('No answer to GROUP')
+      expect(messages.texts).not_to include('Ignoring a Bigshot rally from Mallory')
+    end
+
+    it 'refuses a rally from someone who is not the leader' do
+      expect(h.wait_for_rally(rally('Mallory', 'druby://10.0.0.9:1234'))).to be_nil
+      expect(messages.texts).to include('Ignoring a Bigshot rally from Mallory')
+    end
+
+    it "takes the leader's home network URI" do
+      expect(h.wait_for_rally(rally('Alpha', 'druby://192.168.1.7:5000'))).to eq('druby://192.168.1.7:5000')
+    end
+
+    it "refuses the leader's URI when it is not on this computer or the home network" do
+      expect(h.wait_for_rally(rally('Alpha', 'druby://203.0.113.5:54733'))).to be_nil
+      expect(messages.texts).to include("Ignoring Alpha's Bigshot rally", 'link druby://203.0.113.5:54733')
+    end
+
+    it 'does not suggest a link that cannot work for an out-of-date IPv6 rally' do
+      expect(h.wait_for_rally(rally('Alpha', 'druby://fe80::1%8:54733'))).to be_nil
+      expect(messages.texts).to include("Ignoring Alpha's Bigshot rally")
+      expect(messages.texts).not_to include('link druby://fe80')
+    end
+
+    it 'still explains a refused URI from a sender it already turned down once' do
+      group.on_check = -> { group.leader = nil }
+      leader_returns = -> { group.leader = h::GameObj.new('Alpha') }
+      h.wait_for_rally(rally('Alpha', uri), leader_returns, rally('Alpha', 'druby://203.0.113.5:1'))
+      expect(messages.texts).to include('your group leader, as of the last GROUP check, is unknown', "Ignoring Alpha's Bigshot rally")
+    end
+  end
+end
+
+# Bigshot::Group#all_present? decides when the leader stops waiting for
+# followers. It is extracted with its GROUP refresh helper and run against a
+# stub Group tracker, room roster and clock.
+module BigshotAllPresentSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  ALL_PRESENT_SRC = extract_from_source(SOURCE, /^    def all_present\?\n.*?^    def refresh_group_list\n.*?^    end\n(?:    private :refresh_group_list\n)?/m,
+                                        label: 'all_present? and refresh_group_list', source_path: SOURCE_PATH)
+
+  module Harness
+    Member = Struct.new(:noun)
+
+    # Stands in for one follower's remote Bigshot.
+    class Follower
+      def ping; end
+    end
+
+    module Lich
+      module Gemstone
+        module Claim
+          module Lock
+            def self.locked?
+              false
+            end
+          end
+        end
+
+        # Lich's tracker: +members+ is what Lich currently believes, and
+        # +check+ replaces it with what GROUP would report (+reply+).
+        module Group
+          class << self
+            attr_accessor :members, :reply, :checks
+
+            def check
+              self.checks += 1
+              self.members = reply.map { |noun| Member.new(noun) }
+            end
+          end
+        end
+      end
+    end
+
+    # The wait loop's clock, so the 5 second refresh limit can be stepped over.
+    class Time
+      class << self
+        attr_accessor :fake
+
+        def now
+          fake || ::Time.now
+        end
+      end
+    end
+
+    # A leader-side Bigshot::Group with its follower list and room roster.
+    class LeaderGroup
+      attr_accessor :room
+
+      def initialize(names)
+        @members = names.to_h { |name| [name, Follower.new] }
+        @room = names.dup
+      end
+
+      def member_online
+        @members.each { |name, member| yield(name, member) }
+      end
+
+      def checkpcs
+        room
+      end
+
+      module_eval(ALL_PRESENT_SRC)
+    end
+  end
+end
+
+RSpec.describe 'bigshot Bigshot::Group#all_present?' do
+  let(:h) { BigshotAllPresentSpec::Harness }
+  let(:group) { h::Lich::Gemstone::Group }
+  let(:leader_group) { h::LeaderGroup.new(%w[Bravo]) }
+
+  before do
+    group.members = [h::Member.new('Bravo')]
+    group.reply = %w[Bravo]
+    group.checks = 0
+    h::Time.fake = ::Time.at(1_000)
+  end
+
+  it 'is true when every follower is in the room and in the group, without sending GROUP' do
+    expect(leader_group.all_present?).to be(true)
+    expect(group.checks).to eq(0)
+  end
+
+  it 'is false while a follower is out of the room, without sending GROUP' do
+    leader_group.room = []
+    expect(leader_group.all_present?).to be(false)
+    expect(group.checks).to eq(0)
+  end
+
+  it 'refreshes the group when a follower is back in the room but missing from the list' do
+    group.members = []
+    expect(leader_group.all_present?).to be(true)
+    expect(group.checks).to eq(1)
+  end
+
+  it 'stays false if GROUP does not list them either' do
+    group.members = []
+    group.reply = []
+    expect(leader_group.all_present?).to be(false)
+    expect(group.checks).to eq(1)
+  end
+
+  it 'sends GROUP at most every 5 seconds while it waits' do
+    group.members = []
+    group.reply = []
+    3.times { leader_group.all_present? }
+    expect(group.checks).to eq(1)
+    h::Time.fake += 5
+    leader_group.all_present?
+    expect(group.checks).to eq(2)
+  end
+
+  it 'keeps the refresh private, so followers cannot call it over DRb' do
+    expect(leader_group.respond_to?(:refresh_group_list)).to be(false)
+  end
+end

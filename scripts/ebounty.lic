@@ -9,19 +9,22 @@
   contributors: Deysh, Nisugi, Tysong, Rinualdo
           game: Gemstone
           tags: bounty, adventure's guild, advguild, bounties
-      required: Lich >= 5.19.0
-       version: 1.13.0
+      required: Lich >= 5.26.0
+       version: 2.0.0
 
   Version Control:
   Major_change.feature_addition.bugfix
-  v1.13.0 (2026-11-17)
-    - the setup window is now a Lich WebUI page instead of GTK, and needs a Lich with WebUI
+  v2.0.0 (2026-11-22)
+    - the setup window is now a Lich WebUI page instead of GTK, and needs Lich 5.26.0 or later
+    - ;ebounty setup now says why there is no window (Lich older than 5.26.0, or --no-gui) and that the command line still works
     - fix: ;ebounty no longer fails to load when GTK is missing, and ;ebounty list no longer needs it
     - fix: adding or deleting an exclusion in setup could error when the list had no duplicates
     - setup saves with Save & Close; Cancel or closing the window discards changes
     - fix: setup no longer fails to open when a saved wander wait is off its 0.1 step
     - fix: after Add or Delete in an exclusion list, the highlighted row and Delete now agree
     - fix: turning off "Run one bounty and quit" now also clears "Get new bounty before quitting" when saved
+  v1.12.9 (2026-11-20)
+    - fix: foraging no longer loops forever on an herb that can't be found in the room's climate
   v1.12.8 (2026-11-14)
     - fix: golden mushroom forage bounties now count the golden hook mushrooms you have foraged
   v1.12.7 (2026-11-13)
@@ -197,7 +200,7 @@
 
 lich_gem_requires = Script.list.find { |x| x.name == Script.current.name }.inspect[/required: Lich >= (\d+\.\d+\.\d+)/i, 1]
 
-if Gem::Version.new(LICH_VERSION) < Gem::Version.new(lich_gem_requires)
+if Gem::Version.new(LICH_VERSION).release < Gem::Version.new(lich_gem_requires)
   if $frontend == 'stormfront' || $frontend == 'profanity'
     _respond "\<preset id=\"speech\"\>" + "########################################" + "\<\/preset\>"
     _respond "\<preset id=\"thought\"\>" + "Script:#{script.name} now requires a newer version of Lich(#{lich_gem_requires}+) to run." + "\<\/preset\>"
@@ -254,7 +257,14 @@ module EBounty
   end
 
   def self.settings_cli_notice
-    EBounty.msg("info", " The setup window is not available. Please use CLI to change options")
+    if !(defined?(Lich::API) && Lich::API.respond_to?(:webui_page))
+      EBounty.msg("info", " Setup needs Lich 5.26.0 or later (Lich's WebUI). Please update Lich.")
+    elsif !(defined?(Lich::WebUI) && Lich::WebUI.respond_to?(:presentation_enabled?) && Lich::WebUI.presentation_enabled?)
+      EBounty.msg("info", " There is no setup window while Lich runs with --no-gui.")
+    else
+      EBounty.msg("info", " The setup window is not available.")
+    end
+    EBounty.msg("info", " The command line still works: #{$lich_char}#{Script.current.name} help")
     EBounty.msg("info", " Format is #{$lich_char}#{Script.current.name} settings <setting_to_change> <new_value>")
     EBounty.msg("info", " For list/array setting syntax #{$lich_char}#{Script.current.name} settings help")
   end
@@ -668,6 +678,12 @@ module EBounty
     end
 
     return result
+  end
+
+  # Forage replies meaning the herb can't be found in this room right now
+  # (picked clean, or the wrong climate for it), so foraging moves on.
+  def self.forage_not_found_regex
+    /^As you carefully forage around you (?:can )?(?:find no (?:hint|trace)|see no evidence) of what you are looking for/
   end
 
   def self.get_script_version
@@ -1113,7 +1129,7 @@ module EBounty
         /^You make so much noise that only the dead would not notice you thrashing about in your unsuccessful search\.$/,
         /^You stumble about in a fruitless attempt at foraging\.$/,
         /you are unable to find anything useful/,
-        /^As you carefully forage around you (?:can find no (?:hint|trace)|see no evidence) of what you are looking for(?: right now, though you are fairly certain this is where it can be found)?\.(?:  You briefly wonder if it could even thrive in this place\.)?/,
+        EBounty.forage_not_found_regex,
         /^As you forage around you suddenly feel a sharp pain/,
       )
 
@@ -1463,19 +1479,31 @@ module EBounty
     @form_class = nil
 
     def self.form_class
-      @form_class ||= Class.new(Lich::WebUI::ListSettingsForm) do
+      base = Lich::WebUI::ListSettingsForm
+      # Only patch when the private methods it wraps exist; otherwise use the
+      # form as Lich ships it.
+      return @form_class = base unless %i[render_field change_list].all? { |name| base.private_method_defined?(name) || base.method_defined?(name) }
+
+      @form_class ||= Class.new(base) do
         private
 
         def render_field(tree, field, refs, **overrides)
           ref = super
-          (@tables ||= {})[field[:key]] = ref if field && @lists.key?(field[:key])
+          lists = instance_variable_defined?(:@lists) ? @lists : nil
+          if field.is_a?(Hash) && lists.respond_to?(:key?) && lists.key?(field[:key]) && ref.respond_to?(:cid)
+            (@tables ||= {})[field[:key]] = ref
+          end
           ref
         end
 
         def change_list(key, action, event)
-          super
+          result = super
           table = @tables&.[](key)
-          @page.set(table.cid, :selected, [], viewer: event.viewer_id) if table
+          page = instance_variable_defined?(:@page) ? @page : nil
+          if table && page.respond_to?(:set) && event.respond_to?(:viewer_id)
+            page.set(table.cid, :selected, [], viewer: event.viewer_id)
+          end
+          result
         end
       end
     end
@@ -3246,7 +3274,7 @@ module EBounty
             elsif forage_result =~ EBounty.data.forage_injury
               EBounty.wait_rt
               Spell[114].cast if Spell[114].known? and Spell[114].affordable? && !Map.current.tags.include?("meta:nomagic")
-            elsif forage_result.nil? || (forage_result =~ /^As you carefully forage around you (?:can find no (?:hint|trace)|see no evidence) of what you are looking for(?: right now, though you are fairly certain this is where it can be found)?\.(?:  You briefly wonder if it could even thrive in this place\.)?/)
+            elsif forage_result.nil? || forage_result =~ EBounty.forage_not_found_regex
               break
             elsif forage_result =~ /^As you forage around, you notice that someone has been foraging here recently and you are unable to find anything useful\./
               unless Effects::Cooldowns.active?("Nature's Bounty Foraging") || Skills.slblessings < 15 || !Spell[604].affordable? || !Spell[604].known? || !EBounty.data.settings[:forage_options].include?("use_604evoke") || Map.current.tags.include?("meta:nomagic")

@@ -38,9 +38,18 @@ RSpec.describe 'EBounty::Setup' do
 
       def initialize(**options)
         @options = options
+        @lists = options[:lists] || {}
+        @page = Struct.new(:sets) { def set(*args, **kw) = sets << [args, kw] }.new([])
       end
 
-      def page = @page ||= Struct.new(:sets) { def set(*args, **kw) = sets << [args, kw] }.new([])
+      attr_reader :page
+
+      private
+
+      # The shape of ListSettingsForm's private hooks that Setup.form_class wraps.
+      def render_field(_tree, field, _refs, **_overrides) = Struct.new(:cid).new("cid-#{field[:key]}")
+
+      def change_list(key, action, _event) = (@changes ||= []) << [key, action]
     end
   end
 
@@ -68,7 +77,7 @@ RSpec.describe 'EBounty::Setup' do
       ns.const_set(:XMLData, Module.new { define_singleton_method(:game) { game_name } })
       ns.const_set(:Char, Module.new { define_singleton_method(:name) { 'Harness' } })
       ns.const_set(:EBounty, Module.new {
-        define_singleton_method(:get_script_version) { '1.13.0' }
+        define_singleton_method(:get_script_version) { '2.0.0' }
         define_singleton_method(:save_profile) { |settings| saves << settings }
         define_singleton_method(:msg) { |*| nil }
       })
@@ -362,5 +371,35 @@ RSpec.describe 'EBounty::Setup' do
       expect(settings[:gem_exclude]).to eq(['zircon'])
       expect(spec).to include(clear_after_add: true)
     end
+
+    it "clears the viewer's table selection after Add and Delete" do
+      form = build.form
+      event = Struct.new(:viewer_id).new('v1')
+      form.send(:render_field, nil, { key: :gem_exclude }, nil)
+      form.send(:render_field, nil, { key: :gem_max }, nil)
+
+      form.send(:change_list, :gem_exclude, :add, event)
+      form.send(:change_list, :gem_exclude, :delete, event)
+      form.send(:change_list, :gem_max, :add, event)
+
+      expect(form.instance_variable_get(:@changes)).to eq([%i[gem_exclude add], %i[gem_exclude delete], %i[gem_max add]])
+      expect(form.page.sets).to eq([[['cid-gem_exclude', :selected, []], { viewer: 'v1' }]] * 2)
+    end
+
+    it 'falls back to the plain form when the hooks it wraps are missing' do
+      bare = Class.new { def initialize(**) = nil }
+      setup_class.instance_variable_set(:@form_class, nil)
+      namespace.const_get(:Lich)::WebUI.send(:remove_const, :ListSettingsForm)
+      namespace.const_get(:Lich)::WebUI.const_set(:ListSettingsForm, bare)
+
+      expect(setup_class.form_class).to be(bare)
+    end
+  end
+
+  it 'binds Get new bounty before quitting so clearing it reaches the window' do
+    handler = node(render(build({ once_and_done: true })), :new_bounty_on_exit)[:on]
+
+    expect(handler).to be_a(Hash)
+    expect(handler[:change]).to respond_to(:call)
   end
 end
