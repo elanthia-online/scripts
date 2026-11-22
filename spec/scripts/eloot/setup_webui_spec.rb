@@ -36,9 +36,18 @@ RSpec.describe 'ELoot::Setup' do
 
       def initialize(**options)
         @options = options
+        @lists = options[:lists] || {}
+        @page = Struct.new(:sets) { def set(*args, **kw) = sets << [args, kw] }.new([])
       end
 
       def page = :page
+
+      private
+
+      # The shape of ListSettingsForm's private hooks that Setup.form_class wraps.
+      def render_field(_tree, field, _refs, **_overrides) = Struct.new(:cid).new("cid-#{field[:key]}")
+
+      def change_list(key, action, _event) = (@changes ||= []) << [key, action]
     end
   end
 
@@ -53,7 +62,7 @@ RSpec.describe 'ELoot::Setup' do
     stub = form_stub
     spell = Struct.new(:num, :name, :known) { def known? = known }
     Module.new.tap do |ns|
-      ns.const_set(:Spell, Module.new { define_singleton_method(:[]) { |n| n.to_i.zero? ? nil : spell.new(n.to_i, "Spell #{n.to_i}", spells.include?(n.to_i)) } })
+      ns.const_set(:Spell, Module.new { define_singleton_method(:[]) { |n| [0, 9999].include?(n.to_i) ? nil : spell.new(n.to_i, "Spell #{n.to_i}", spells.include?(n.to_i)) } })
       ns.const_set(:Stats, Module.new { define_singleton_method(:prof) { 'Warrior' } })
       ns.const_set(:Script, Module.new { define_singleton_method(:current) { :script } })
       ns.const_set(:UserVars, Module.new { define_singleton_method(:mapdb_fwi_trinket) { false } })
@@ -64,7 +73,7 @@ RSpec.describe 'ELoot::Setup' do
         end
       })
       ns.const_set(:ELoot, Module.new {
-        define_singleton_method(:get_script_version) { '2.15.0' }
+        define_singleton_method(:get_script_version) { '3.0.0' }
         define_singleton_method(:save_profile) { saves << :saved }
         define_singleton_method(:msg) { |**| nil }
       })
@@ -347,7 +356,10 @@ RSpec.describe 'ELoot::Setup' do
       expect(spec[:value].call.map(&:to_s)).to eq(%w[101 101v 303])
       spec[:add].call('nope')
       expect(spec[:value].call.size).to eq(3)
-      expect(setup.status).to include('nope')
+      expect(setup.status).to include('nope', 'does not start with a spell number')
+      spec[:add].call('9999')
+      expect(spec[:value].call.size).to eq(3)
+      expect(setup.status).to eq('9999 is not a known spell number.')
       spec[:add].call('202 vibrant')
       expect(spec[:value].call.map(&:to_s)).to eq(['101', '101v', '202 vibrant', '303'])
     end
@@ -357,6 +369,29 @@ RSpec.describe 'ELoot::Setup' do
 
       expect(rows).to eq([{ 'number' => '101', 'name' => 'Spell 101', 'vibrant' => '' },
                           { 'number' => '101', 'name' => 'Spell 101', 'vibrant' => 'Vibrant' }])
+    end
+
+    it "clears the viewer's table selection after Add and Delete" do
+      form = build.form
+      event = Struct.new(:viewer_id).new('v1')
+      form.send(:render_field, nil, { key: :loot_keep }, nil)
+      form.send(:render_field, nil, { key: :alpha_rate }, nil)
+
+      form.send(:change_list, :loot_keep, :add, event)
+      form.send(:change_list, :loot_keep, :delete, event)
+      form.send(:change_list, :alpha_rate, :add, event)
+
+      expect(form.instance_variable_get(:@changes)).to eq([%i[loot_keep add], %i[loot_keep delete], %i[alpha_rate add]])
+      expect(form.instance_variable_get(:@page).sets).to eq([[['cid-loot_keep', :selected, []], { viewer: 'v1' }]] * 2)
+    end
+
+    it 'falls back to the plain form when the hooks it wraps are missing' do
+      bare = Class.new { def initialize(**) = nil }
+      setup_class.instance_variable_set(:@form_class, nil)
+      namespace.const_get(:Lich)::WebUI.send(:remove_const, :ListSettingsForm)
+      namespace.const_get(:Lich)::WebUI.const_set(:ListSettingsForm, bare)
+
+      expect(setup_class.form_class).to be(bare)
     end
   end
 end
