@@ -32,10 +32,14 @@ RSpec.describe 'Ewaggle::Setup' do
 
   let(:known) { { 101 => 'Spirit Warding I', 107 => 'Spirit Shield', 712 => 'Cloak of Shadows', 1009 => 'Sonic Shield', 1012 => 'Sonic Weapon' } }
   let(:saved) { [] }
+  let(:forms) { [] }
+  let(:submit) { { cancel: false } }
 
   let(:namespace) do
     spells = known
     saves = saved
+    shown = forms
+    outcome = submit
     spell = Struct.new(:num, :name, :time_per, :known) { def known? = known }
     Module.new.tap do |ns|
       ns.const_set(:Spell, Module.new {
@@ -54,8 +58,24 @@ RSpec.describe 'Ewaggle::Setup' do
         define_singleton_method(:save_profile) { saves << :saved }
         define_singleton_method(:data) { Struct.new(:settings).new({}) }
       })
-      form = Module.new { define_singleton_method(:choice_options) { |choices| choices.map { |v| { value: v, label: v } } } }
-      ns.const_set(:Lich, Module.new { const_set(:WebUI, Module.new { const_set(:SettingsForm, form) }) })
+      # SettingsForm.new records its options; show.wait submits the displayed values
+      # through normalize, as Save & Close does, or returns nil for Cancel.
+      form = Module.new do
+        define_singleton_method(:choice_options) { |choices| choices.map { |v| { value: v, label: v } } }
+        define_singleton_method(:new) do |**options|
+          shown << options
+          result = outcome[:cancel] ? nil : options[:normalize].call(options[:values].dup)
+          Struct.new(:page) do
+            define_method(:show) { Struct.new(:wait).new(result) }
+            define_method(:close) { nil }
+          end.new(nil)
+        end
+      end
+      messaging = Module.new { define_singleton_method(:msg) { |*| nil } }
+      ns.const_set(:Lich, Module.new {
+        const_set(:WebUI, Module.new { const_set(:SettingsForm, form) })
+        const_set(:Messaging, messaging)
+      })
       ns.module_eval(setup_source, path)
       ns.const_get(:Setup).class_eval { define_method(:respond) { |*| nil } }
     end
@@ -170,6 +190,35 @@ RSpec.describe 'Ewaggle::Setup' do
 
       expect(result).to include(use_multicast: false, start_at: 250, sonic_weapon: 'sword', cast_list: ['107  Spirit Shield'])
       expect(result[:not_to_cast]).not_to include('107  Spirit Shield')
+    end
+
+    it 'Save keeps a sonic armor typed in another case, in the list spelling' do
+      result = build({ sonic_armor: 'full plate' }).start
+
+      expect(result[:sonic_armor]).to eq('Full Plate')
+      expect(saved).to eq([:saved])
+    end
+
+    it 'offers and keeps a sonic armor that is not on the list as a custom choice' do
+      result = build({ sonic_armor: 'Mithril Plate' }).start
+      armor = forms.last[:fields].find { |f| f[:key] == :sonic_armor }
+
+      expect(armor[:options]).to include({ value: 'Mithril Plate', label: 'Mithril Plate (custom)' })
+      expect(result[:sonic_armor]).to eq('Mithril Plate')
+    end
+
+    it 'Save keeps an untouched out-of-range number, and clamps only on display' do
+      result = build({ reserve_mana: 1500 }).start
+
+      expect(forms.last[:values][:reserve_mana]).to eq(1000)
+      expect(result[:reserve_mana]).to eq(1500)
+    end
+
+    it 'Cancel does not save the profile' do
+      submit[:cancel] = true
+
+      expect(build({ sonic_armor: 'full plate' }).start).to be_nil
+      expect(saved).to be_empty
     end
 
     it 'reports an error from a callback instead of raising it into the dispatcher' do
