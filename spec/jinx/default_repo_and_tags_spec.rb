@@ -107,10 +107,41 @@ module ::Lich
         end
 
         describe "gui" do
-          it "explains that the GUI needs a Lich with WebUI when it is missing" do
+          it "tells an older Lich to update when the WebUI is missing" do
             expect(defined?(::Lich::API)).to be_nil
             expect { Service.run("gui") }.not_to raise_error
-            expect(game_output).to include("The jinx GUI needs a newer Lich")
+            output = game_output
+            expect(output).to include("jinx gui needs Lich 5.26.0 or later")
+            expect(output).to include("Please update Lich")
+          end
+
+          it "marks the gui command in help as needing Lich 5.26.0 on an older Lich" do
+            Service.run("help")
+            expect(game_output).to include("launch graphical interface (needs Lich 5.26.0+)")
+          end
+
+          it "says --no-gui, not update, when the WebUI is loaded but has no window" do
+            api = Module.new { def self.webui_page(**) = raise("must not register a page") }
+            webui = Module.new { def self.presentation_enabled? = false }
+            stub_const("::Lich::API", api)
+            stub_const("::Lich::WebUI", webui)
+            expect { Service.run("gui") }.not_to raise_error
+            output = game_output
+            expect(output).to include("jinx gui has no window while Lich runs with --no-gui")
+            expect(output).not_to include("update Lich")
+          end
+
+          it "passes non-UTF-8 text from a repo header to the window as valid UTF-8" do
+            GUI.instance_variable_set(:@log, [])
+            # a curly apostrophe (UTF-8 bytes) and a stray Latin-1 byte, as Net::HTTP returns them
+            apostrophe = [0x2019].pack("U")
+            header = "for when you#{apostrophe}re away ".b + [0xE9].pack("C")
+            captured = GUI.capture_output { GUI.mono(header) }
+            expect(captured.map(&:encoding).uniq).to eq([Encoding::UTF_8])
+            expect(captured.all?(&:valid_encoding?)).to be(true)
+            expect(captured.first).to include("you#{apostrophe}re away ?")
+            GUI.append_log(header)
+            expect(GUI.instance_variable_get(:@log).last).to be_valid_encoding
           end
 
           it "keeps routing output into the open window after jinx.lic is reloaded" do
@@ -118,6 +149,7 @@ module ::Lich
             load "scripts/jinx.lic"
             GUI.instance_variable_set(:@log, [])
             GUI.instance_variable_set(:@alive, true)
+            GUI.instance_variable_set(:@script_thread, Thread.current)
             captured = GUI.capture_output { Log.mono("<b>go2.lic</b> (repo: elanthia-online)") }
             expect(captured).to eq(["go2.lic (repo: elanthia-online)"])
             Log.mono("installed &lt;go2&gt;")
@@ -125,6 +157,21 @@ module ::Lich
             expect(game_output).not_to include("go2")
           ensure
             GUI.instance_variable_set(:@alive, false)
+            GUI.instance_variable_set(:@script_thread, nil)
+          end
+
+          it "prints a ;force jinx run's output in the game while another run owns the window" do
+            owner = Thread.new { sleep }
+            GUI.instance_variable_set(:@log, [])
+            GUI.instance_variable_set(:@alive, true)
+            GUI.instance_variable_set(:@script_thread, owner)
+            Log.mono("found 3 matches")
+            expect(game_output).to include("found 3 matches")
+            expect(GUI.instance_variable_get(:@log)).to eq([])
+          ensure
+            owner&.kill
+            GUI.instance_variable_set(:@alive, false)
+            GUI.instance_variable_set(:@script_thread, nil)
           end
 
           describe "asset actions" do

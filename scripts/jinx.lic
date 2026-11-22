@@ -14,12 +14,16 @@
    author: elanthia-online
      tags: utility, util, repository, repo, update, upgrade, meta, ruby, development
   version: 1.0.0
+ required: Lich >= 5.26.0
 
   Changelog:
-  1.0.0 (2026-11-17)
+  1.0.0 (2026-11-22)
     search now finds scripts by their tags as well as their names, ignoring case
     add ;jinx repo default to choose a repo that commands use unless you pass --repo or --all
-    GUI now opens in Lich's WebUI window instead of GTK (needs a newer Lich; the GTK GUI is removed)
+    GUI now opens in Lich's WebUI window instead of GTK (the GTK GUI is removed)
+    the GUI needs Lich 5.26.0 or later; on older Lich ;jinx gui says to update, and every command still works
+    the GUI no longer closes when showing info for a script whose description has accented or curly characters
+    ;force jinx commands run while the GUI is open print in the game window instead of the GUI log
   0.8.1 (2026-02-07)
     fix constant redefinition on subsequent launches
   0.8.0 (2026-01-08)
@@ -96,7 +100,9 @@ module ::Lich
         # file and redefines these methods
         def self.gui
           gui = defined?(::Lich::Common::Jinx::GUI) ? ::Lich::Common::Jinx::GUI : nil
-          gui if gui.respond_to?(:alive?) && gui.alive?
+          # only the run that owns the window; a ;force jinx run alongside it
+          # prints to the game as usual
+          gui if gui.respond_to?(:alive?) && gui.alive? && gui.respond_to?(:owner_thread?) && gui.owner_thread?
         end
 
         def self.out(msg, label: :debug)
@@ -1551,13 +1557,8 @@ module ::Lich
 
           # jinx gui - launch GUI interface
           if argv.gui.eql?(true) && args.length.eql?(1)
-            unless ::Lich::Common::Jinx::GUI.available?
-              Log.mono <<~ERROR
-          <b>The jinx GUI needs a newer Lich</b>
-
-          It uses Lich's WebUI window, which this Lich does not have yet.
-          Every GUI action is also a command; see ;jinx help
-        ERROR
+            if (reason = ::Lich::Common::Jinx::GUI.unavailable_reason)
+              Log.mono reason
               return
             end
             begin
@@ -1615,7 +1616,7 @@ module ::Lich
           --dry-run                                         check for updates without installing
 
         Examples:
-          ;jinx gui                                        launch graphical interface
+          ;jinx gui                                        launch graphical interface#{GUI.webui_lich? ? '' : ' (needs Lich 5.26.0+)'}
           ;jinx install go2                                install the go2 script
           ;jinx update spell-list.xml                      update spell data file
           ;jinx search map                                 find all assets with "map" in the name or tags
@@ -1947,12 +1948,38 @@ module ::Lich
 
         @alive = false unless defined?(@alive)
 
-        def available?
+        # Lich::API.webui_page is loaded only from Lich 5.26.0, so it tells an old
+        # Lich (where Lich::WebUI can exist once another script required it) from
+        # one running with --no-gui.
+        def webui_lich?
           defined?(::Lich::API) && ::Lich::API.respond_to?(:webui_page) ? true : false
+        end
+
+        # nil when the window can open, otherwise why not
+        def unavailable_reason
+          if !webui_lich?
+            "<b>jinx gui needs Lich 5.26.0 or later</b>\nIt uses Lich's WebUI window. Please update Lich; every GUI action is also a command (;jinx help)."
+          elsif !::Lich::WebUI.presentation_enabled?
+            "<b>jinx gui has no window while Lich runs with --no-gui</b>\nEvery GUI action is also a command (;jinx help)."
+          end
+        end
+
+        def available?
+          unavailable_reason.nil?
         end
 
         def alive?
           @alive
+        end
+
+        # whether the caller is the run that owns the window (see Log.gui)
+        def owner_thread?
+          @script_thread.equal?(Thread.current)
+        end
+
+        # the WebUI carries only valid UTF-8; repo headers arrive as raw bytes
+        def utf8(text)
+          text.to_s.dup.force_encoding(Encoding::UTF_8).scrub("?")
         end
 
         # =====================
@@ -1963,6 +1990,10 @@ module ::Lich
             Log.out("already open; close that window first", label: %i(jinx gui))
             return
           end
+          if (reason = unavailable_reason)
+            Log.mono reason
+            return
+          end
           reset_state!
           @script_thread = Thread.current
           @page = ::Lich::API.webui_page(
@@ -1970,17 +2001,13 @@ module ::Lich
             props: { size: [1100, 700], viewport: true, density: :compact },
             on: { close: proc { GUI.enqueue(:close) } }
           ) { |ui| GUI.render(ui) }
-          unless ::Lich::WebUI.presentation_enabled?
-            Log.mono "<b>jinx gui cannot open a window</b>\nLich was started with --no-gui (or has no window support); use the ;jinx commands instead."
-            return
-          end
           @alive = true
           append_log("[jinx.gui] Starting up...")
           publish!(force: true)
           ::Lich::API.webui_start
           unless ::Lich::API.webui_open(page: @page)
             @alive = false
-            Log.mono "<b>jinx gui could not open a window</b>\nLich may have been started with --no-gui, or no browser could be found."
+            Log.mono "<b>jinx gui could not open a window</b>\nLich could not open a browser window for it."
             return
           end
           enqueue(:reload)
@@ -2418,7 +2445,7 @@ module ::Lich
         # Log bridge
         # =====================
         def append_log(line)
-          text = line.to_s
+          text = utf8(line)
           return if text.strip.empty? || text =~ NOISE
 
           text = text[0, MAX_LOG_LINE_LENGTH] + "..." if text.length > MAX_LOG_LINE_LENGTH
@@ -2439,7 +2466,7 @@ module ::Lich
 
         # receives Log.mono output while the window is open (see Log.gui)
         def mono(text)
-          clean = CGI.unescapeHTML(text.to_s.gsub(/<[^>]+>/, ""))
+          clean = CGI.unescapeHTML(utf8(text).gsub(/<[^>]+>/, ""))
           if (buffer = Thread.current[:jinx_gui_capture])
             buffer << clean
           else
