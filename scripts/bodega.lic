@@ -9,10 +9,28 @@
 
   Author: Ondreian
   Requirements: Ruby >= 2.3
-  version: 0.8.1
+  version: 0.9.2
   tags: playershops
 
   changelog:
+    v0.9.2 (2026-11-24)
+           - A shop is no longer skipped when one of its items can't be
+             inspected; only that item is left out
+           - Ta'Vaalor and Ta'Illistim no longer risk being scanned under
+             each other's shorter name after a slow reply
+           - Smart scan summary counts removed items after a server reboot
+    v0.9.1 (2026-11-24)
+           - Full scans no longer inspect every item twice after a server
+             reboot renumbers shop stock
+           - Items keep their shop room after a server reboot instead of all
+             showing in the shop's first room
+           - Include the v0.8.1 asset download fix
+    v0.9 - Scan towns the game rejects by full name (e.g. Kraken's Fall)
+           - shop direc falls back to a unique leading token when the full
+             advertised name returns "Unknown town specified"
+           - Rewrite the per-shop SHOP BROWSE command to the same accepted
+             token (the advertised browse command is rejected the same way)
+           - Fix Oxford-comma town-list parse ("Cysaegir," stray entry)
     v0.8.1 - Fix asset downloads on Ruby 3 and later: open asset URLs with
              URI.open, since Kernel#open no longer fetches URLs
     v0.8 - Capture shop location from the new SHOP BROWSE preamble format
@@ -43,6 +61,9 @@ require "json"
 require "net/http"
 require "fileutils"
 require "pp"
+# Needed on Ruby < 3.4; redundant on the Ruby 4.0 CI runs and the
+# elanthia-online/scripts repo lints against.
+require "pathname" # rubocop:disable Lint/RedundantRequireStatement
 
 unless Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("2.3")
   fail "your ruby@#{RUBY_VERSION} is too old"
@@ -591,7 +612,13 @@ module Bodega
     def self.fetch_towns()
       case (result = dothistimeout("shop direc", 5, Messages::TOWNS))
       when Messages::TOWNS
-        result.match(Messages::TOWNS)[:towns].gsub(" and ", ", ").split(", ")
+        # Oxford-comma list: "..., Cysaegir, and Kraken's Fall". Drop the
+        # trailing "and " on the final item, then split, so we don't end up
+        # with a stray "Cysaegir," entry.
+        result.match(Messages::TOWNS)[:towns]
+              .split(/,\s*/)
+              .map { |t| t.sub(/\Aand\s+/, "").strip }
+              .reject(&:empty?)
       else
         fail "unknown outcome for parsing available towns"
       end
@@ -601,9 +628,49 @@ module Bodega
       @towns ||= fetch_towns
     end
 
+    # The game's "shop direc" town matcher rejects some full names that it
+    # nonetheless advertises (e.g. "Kraken's Fall" -> "Unknown town
+    # specified"), apparently choking on an apostrophe followed by a space.
+    # A unique leading token ("Kraken") is accepted. Try the full name
+    # first (keeps every working town verbatim) and fall back to the token
+    # before the first apostrophe/space only if that fails. The token is
+    # only used when no other advertised town starts with it: Ta'Vaalor and
+    # Ta'Illistim would both shorten to "Ta", which can't tell them apart.
+    def self.shop_direc_variants(town, all_towns = towns)
+      variants = [town]
+      short = town[/\A[^'\s]+/]
+      return variants if short.nil? || short == town
+
+      shared = all_towns.count { |t| t.downcase.start_with?(short.downcase) } > 1
+      variants << short unless shared
+      variants
+    end
+
+    # True if the game accepts this town name for "shop direc" (responds
+    # with a shop directory rather than "Unknown town specified"). Used to
+    # pick a working command form before the full Collector scan.
+    def self.shop_direc_accepted?(town)
+      accepted = %r[~*~ .*? Shops ~*~]
+      rejected = %r[Unknown town specified]
+      case dothistimeout(%[shop direc #{town}], 5, Regexp.union(accepted, rejected))
+      when accepted then true
+      else false
+      end
+    end
+
     def self.shops(town)
+      variants = shop_direc_variants(town)
+
+      # If a fallback exists, probe non-final variants cheaply: the game
+      # answers a bad town name immediately with "Unknown town specified",
+      # so we skip to the fallback without burning the Collector's full
+      # 3x5s timeout. The last variant always goes through the Collector.
+      cmd_town = variants.find.with_index do |candidate, i|
+        i == variants.size - 1 || shop_direc_accepted?(candidate)
+      end
+
       coll = Collector.new(
-        command: %[shop direc #{town}],
+        command: %[shop direc #{cmd_town}],
         start: %r[~*~ (?<title>.*?) Shops ~*~],
         close: %[You can use the SHOP BROWSE]
       )
@@ -611,6 +678,17 @@ module Bodega
       result = coll.run()
 
       next_command = result.last.match(Messages::COMMAND)[:command]
+
+      # The advertised browse command echoes the same full town name the
+      # game rejects (e.g. "SHOP BROWSE KRAKEN'S FALL {SHOP#}" -> "Unknown
+      # town specified"). When we had to fall back to a token for the
+      # directory, rewrite the browse command's town segment to that same
+      # accepted token so per-shop inspection works too.
+      if cmd_town != town
+        next_command = next_command.sub(/\A(SHOP BROWSE )(.+?)( \{SHOP#\})\z/i) do
+          "#{Regexp.last_match(1)}#{cmd_town.upcase}#{Regexp.last_match(3)}"
+        end
+      end
 
       by_shop_number = result.slice(1..-2)
                              .map(&:strip).map do |row| row.split(/\s{2,}/) end # split columns
@@ -702,12 +780,19 @@ module Bodega
            room.items = room.items.take(max_item_depth).map do |item_data|
              # item_data is now a hash with {id: ..., browse_price: ..., quantity: ... (optional)}
              # Use raw mode if --raw-only flag is set
-             if Opts.raw_only || Opts["raw-only"]
-               Parser.scan_item_raw(item_data[:id] || item_data, item_data[:browse_price], item_data[:quantity])
-             else
-               Parser.scan_item(item_data[:id] || item_data, item_data[:browse_price], item_data[:quantity])
+             # One inspect that never comes back (sold mid-scan, lag) skips
+             # just that item instead of dropping the whole shop.
+             begin
+               if Opts.raw_only || Opts["raw-only"]
+                 Parser.scan_item_raw(item_data[:id] || item_data, item_data[:browse_price], item_data[:quantity])
+               else
+                 Parser.scan_item(item_data[:id] || item_data, item_data[:browse_price], item_data[:quantity])
+               end
+             rescue => e
+               Log.out("Failed to inspect item #{item_data[:id] || item_data}: #{e.message}")
+               nil
              end
-           end
+           end.compact
            room
          end
       .map(&:to_h)
@@ -871,6 +956,7 @@ module Bodega
         Log.out("Shop ID #{shop_id} owner mismatch: cached=#{cached_owner}, current=#{current_owner} - game reset likely reordered shops. Wiping cache and doing full scan.", label: :smart)
 
         @smart_stats[:shops_scanned] += 1
+        @smart_stats[:new_items] += current_ids.size
         return {
           preamble: preamble,
           town: town,
@@ -890,6 +976,26 @@ module Bodega
       unchanged_ids = current_ids & existing_ids
 
       Log.out("Smart diff for shop #{shop_id}: #{new_ids.size} new, #{removed_ids.size} removed, #{unchanged_ids.size} unchanged", label: :smart)
+
+      # Step 5.5: No cached stock ID matches. A server reboot renumbers stock
+      # while the owner stays the same, so this is the whole shop, not a few
+      # new arrivals. Merging would drop every item into the first room
+      # (add_items_to_shop can't know rooms from IDs), so do a full parse of
+      # the browse output we already have instead: it keeps the room layout
+      # and sends no extra commands.
+      if unchanged_ids.empty? && new_ids.any?
+        Log.out("Shop #{shop_id}: no cached stock IDs match (reboot renumbered stock?) - performing full scan", label: :smart)
+        @smart_stats[:shops_scanned] += 1
+        @smart_stats[:new_items] += current_ids.size
+        @smart_stats[:removed_items] += removed_ids.size
+        return {
+          preamble: preamble,
+          town: town,
+          id: shop_id,
+          shop_owner: current_owner,
+          inv: parse_inv(inv.map(&:strip))
+        }.merge(location_fields(preamble))
+      end
 
       # Track statistics
       @smart_stats[:new_items] += new_ids.size
@@ -1053,8 +1159,21 @@ module Bodega
       end
       Log.out("=" * 60, label: :smart)
 
+      # Keep a copy for headless.lic, which reads it after Script.run returns
+      # to decide whether a full scan still needs its second (full) pass.
+      @last_smart_stats = stats.dup
+
       # Reset stats for next run
       @smart_stats = nil
+    end
+
+    # Stats from the most recent completed smart pass, or nil if none ran.
+    def self.last_smart_stats
+      @last_smart_stats
+    end
+
+    def self.clear_last_smart_stats
+      @last_smart_stats = nil
     end
 
     def self.scan_item(id, browse_price = nil, quantity = nil)
