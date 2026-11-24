@@ -385,6 +385,18 @@ RSpec.describe 'ELoot::Setup' do
       expect(form.instance_variable_get(:@page).sets).to eq([[['cid-loot_keep', :selected, []], { viewer: 'v1' }]] * 2)
     end
 
+    it 'keeps the list change when the window closed before the selection clear' do
+      lich = namespace.const_get(:Lich)
+      lich::WebUI.const_set(:Error, Class.new(StandardError)) unless lich::WebUI.const_defined?(:Error, false)
+      form = build.form
+      form.send(:render_field, nil, { key: :loot_keep }, nil)
+      page = form.instance_variable_get(:@page)
+      page.define_singleton_method(:set) { |*, **| raise lich::WebUI::Error, 'viewer is not attached to page' }
+
+      expect { form.send(:change_list, :loot_keep, :add, Struct.new(:viewer_id).new('v1')) }.not_to raise_error
+      expect(form.instance_variable_get(:@changes)).to eq([%i[loot_keep add]])
+    end
+
     it 'falls back to the plain form when the hooks it wraps are missing' do
       bare = Class.new { def initialize(**) = nil }
       setup_class.instance_variable_set(:@form_class, nil)
