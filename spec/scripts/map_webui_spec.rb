@@ -261,4 +261,17 @@ RSpec.describe 'ElanthiaMap::Window' do
 
     expect(window.scroll_origin_prop[:scroll_origin]).not_to eq(first)
   end
+
+  it 'counts a drag after the same room is shown again, so Keep Centered pauses' do
+    window.instance_variable_set(:@viewport, { width: 400, height: 300 })
+    scrolled = ->(x, y) { window.on_scrolled(Struct.new(:payload).new({ position_x: x, position: y })) }
+    window.center_on(100, 100)
+    origin = window.scroll_origin_prop[:scroll_origin]
+    scrolled.call(*origin)
+
+    window.center_on(100, 100)
+    scrolled.call(origin[0] + 500, origin[1] + 400)
+
+    expect(window.instance_variable_get(:@last_user_scroll)).not_to be_nil
+  end
 end
