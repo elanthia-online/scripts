@@ -1,0 +1,384 @@
+=begin
+
+  Ever had your familiar/eye stranded somewhere?
+
+  This script tells your familiar to walk to a room#.
+  It's not fool-proof since they sometimes cannot enter certain areas.
+
+  Note:
+  The script will pause if there's a special procedure for the area.
+  It's up to you to figure out what to tell you pet from then on.
+  Unpause the script when you resolve the special procedures.
+
+  --Drafix
+
+  Fork of famgo2.lic by Drafix.
+
+         author: elanthia-online
+           game: any
+           tags: movement, step2, go2, move2, familiar, eye
+        version: 1.0.0
+
+  Change Log:
+    v1.0.0 (2025-05-01)
+      - initial release and fork from famgo2.lic
+      - add support for u##### (real ID#s)
+=end
+
+module EFamGo2
+  VERSION = '2.0.0'
+
+  # Custom exceptions for better error handling
+  class NavigationError < StandardError; end
+  class RoomNotFoundError < NavigationError; end
+  class PathfindingError < NavigationError; end
+  class UnknownLocationError < NavigationError; end
+
+  # Represents the familiar or eye companion
+  class Companion
+    PROFESSION_MAPPING = {
+      'Wizard'   => 'familiar',
+      'Sorcerer' => 'eye'
+    }.freeze
+
+    attr_reader :type, :current_room
+
+    def initialize
+      @type = determine_type
+      @current_room = nil
+    end
+
+    # Determines companion type based on character profession
+    def determine_type
+      PROFESSION_MAPPING[Char.prof] || raise(NavigationError, "Character profession doesn't have a companion")
+    end
+
+    # Locates the companion's current room
+    def locate_current_room
+      command("look")
+      fput("look #{Char.name}")
+      line = get until line == 'At yourself?'
+
+      @current_room = find_room_by_uid || find_room_by_details
+
+      raise UnknownLocationError, "Companion's room is unknown" unless @current_room
+
+      @current_room
+    end
+
+    # Sends a movement command to the companion
+    def move(direction)
+      command("go #{direction}")
+    end
+
+    private
+
+    def command(action)
+      fput("tell #{@type} to #{action}")
+    end
+
+    # Attempts to find room by UID in title
+    def find_room_by_uid
+      return nil unless XMLData.familiar_room_title
+
+      match = XMLData.familiar_room_title.match(/\] \((?<id>-?\d+)\)$/)
+      return nil unless match
+
+      room_id = Map.ids_from_uid(match[:id].to_i).first
+      Map[room_id]
+    end
+
+    # Attempts to find room by title, description, and exits
+    def find_room_by_details
+      return nil unless XMLData.familiar_room_title && XMLData.familiar_room_description
+
+      title = XMLData.familiar_room_title.strip
+      description = XMLData.familiar_room_description.strip
+      exits_pattern = build_exits_pattern
+
+      find_room_with_exact_match(title, description, exits_pattern) ||
+        find_room_with_regex_match(title, description, exits_pattern)
+    end
+
+    def build_exits_pattern
+      return nil unless XMLData.familiar_room_exits
+      /#{XMLData.familiar_room_exits.join(', ')}/
+    end
+
+    def find_room_with_exact_match(title, description, exits_pattern)
+      Map.list.find do |room|
+        room.title.include?(title) &&
+          room.desc.include?(description) &&
+          room.paths.any? { |path| path =~ exits_pattern }
+      end
+    end
+
+    def find_room_with_regex_match(title, description, exits_pattern)
+      desc_regex = build_description_regex(description)
+
+      Map.list.find do |room|
+        room.title.include?(title) &&
+          room.paths.any? { |path| path =~ exits_pattern } &&
+          room.desc.any? { |desc| desc =~ desc_regex }
+      end
+    end
+
+    def build_description_regex(description)
+      escaped = Regexp.escape(description)
+      pattern = escaped.gsub(/\\\.(?:\\\.\\\.)?/, '|')
+      /#{pattern}/
+    end
+  end
+
+  # Handles room lookups and validation
+  class RoomResolver
+    # Resolves a room argument to a Room object
+    def self.resolve(room_arg)
+      return nil if room_arg.nil? || room_arg.empty?
+
+      if uid_format?(room_arg)
+        resolve_uid(room_arg)
+      elsif numeric?(room_arg)
+        resolve_room_id(room_arg)
+      else
+        raise RoomNotFoundError, "Invalid room format: #{room_arg}"
+      end
+    end
+
+    def self.uid_format?(arg)
+      arg =~ /^u[0-9]+$/
+    end
+
+    def self.numeric?(arg)
+      arg =~ /^[0-9]+$/
+    end
+
+    def self.resolve_uid(uid_string)
+      uid = uid_string[1..-1].to_i
+      room_id = Map.ids_from_uid(uid).first
+
+      raise RoomNotFoundError, "Room with UID #{uid} not found in map database" unless room_id
+      room = Room[room_id]
+      room
+    end
+
+    def self.resolve_room_id(room_id_string)
+      room = Room[room_id_string]
+
+      raise RoomNotFoundError, "Room #{room_id_string} not found in map database" unless room
+
+      room
+    end
+  end
+
+  # Handles pathfinding and navigation
+  class Navigator
+    attr_reader :companion, :path, :current_room, :destination_room
+
+    def initialize(companion, start_room, destination_room)
+      @companion = companion
+      @current_room = start_room
+      @destination_room = destination_room
+      @path = []
+    end
+
+    # Calculates the path from start to destination
+    def calculate_path
+      if @current_room == @destination_room
+        raise NavigationError, 'Start room and destination room are the same'
+      end
+
+      # Check if we can reuse the existing path
+      if can_reuse_existing_path?
+        return @path
+      end
+
+      @path = find_shortest_path
+
+      unless @path && @path.any?
+        raise PathfindingError,
+              "Failed to find a path between room #{@current_room.id} and room #{@destination_room.id}"
+      end
+
+      @path
+    end
+
+    # Navigates the companion along the calculated path
+    def navigate
+      calculate_path if @path.empty?
+
+      while (next_room = get_next_room)
+        move_to_room(next_room)
+
+        if @current_room == @destination_room
+          return true
+        end
+      end
+
+      true
+    end
+
+    private
+
+    def can_reuse_existing_path?
+      return false unless $step2_path
+
+      start_index = $step2_path.index(@current_room.id)
+      dest_index = $step2_path.index(@destination_room.id)
+
+      start_index && dest_index && start_index < dest_index
+    end
+
+    def find_shortest_path
+      previous, _distances = Map.dijkstra(@current_room.id, @destination_room.id)
+
+      return nil unless previous[@destination_room.id]
+
+      build_path_from_previous(previous)
+    end
+
+    def build_path_from_previous(previous)
+      path = [@destination_room.id]
+      path.push(previous[path[-1]]) until previous[path[-1]].nil?
+      path.reverse!
+
+      # Store in global for potential reuse
+      $step2_path = path
+
+      path
+    end
+
+    def get_next_room
+      current_index = @path.index(@current_room.id)
+      return nil unless current_index
+
+      next_room_id = @path[current_index + 1]
+      return nil unless next_room_id
+
+      Room[next_room_id.to_s]
+    end
+
+    def move_to_room(next_room)
+      next_room_id = next_room.id.to_s
+      wayto = @current_room.wayto[next_room_id]
+
+      case wayto
+      when String
+        handle_string_wayto(wayto)
+      when Proc
+        handle_proc_wayto(wayto)
+      else
+        raise NavigationError, 'Error in the map database: invalid wayto type'
+      end
+
+      sleep 0.01
+      @current_room = next_room
+    end
+
+    def handle_string_wayto(wayto)
+      direction = parse_direction_from_string(wayto)
+      @companion.move(direction)
+    end
+
+    def parse_direction_from_string(wayto)
+      if wayto =~ /^(go|climb)\s+(.+)$/
+        $2
+      else
+        wayto
+      end
+    end
+
+    def handle_proc_wayto(wayto)
+      direction = parse_direction_from_proc(wayto)
+
+      if direction
+        @companion.move(direction)
+      else
+        # Procedure exists but we couldn't parse a direction
+        # This might require manual intervention
+        respond "Warning: Complex procedure at room #{@current_room.id}, attempting to continue"
+      end
+    end
+
+    def parse_direction_from_proc(wayto)
+      inspection = wayto.inspect
+
+      if inspection =~ /(?:go|climb)\s+(.+?)'/
+        $1
+      elsif inspection =~ /(northeast|northwest|southeast|southwest|north|east|south|west|up|down|out)/
+        $1
+      end
+    end
+  end
+
+  # Main controller for the script
+  class Controller
+    def initialize(destination_arg)
+      @destination_arg = destination_arg
+      @seeking_state = $go2_use_seeking
+    end
+
+    def run
+      setup
+
+      begin
+        execute_navigation
+        echo 'Finished'
+      rescue NavigationError => e
+        Lich::Messaging.msg('error', e.message)
+      ensure
+        cleanup
+      end
+    end
+
+    private
+
+    def setup
+      ensure_map_loaded
+      disable_seeking
+      setup_cleanup_hook
+      $step2_path = []
+    end
+
+    def ensure_map_loaded
+      Map.load if Map.list.empty?
+    end
+
+    def disable_seeking
+      $go2_use_seeking = false
+    end
+
+    def setup_cleanup_hook
+      before_dying { $go2_use_seeking = @seeking_state }
+    end
+
+    def execute_navigation
+      companion = Companion.new
+      start_room = companion.locate_current_room
+      destination_room = RoomResolver.resolve(@destination_arg)
+
+      navigator = Navigator.new(companion, start_room, destination_room)
+      navigator.navigate
+    end
+
+    def cleanup
+      $go2_use_seeking = @seeking_state
+    end
+  end
+
+  # Entry point
+  def self.run(args)
+    destination = args[1]
+
+    unless destination
+      echo "Usage: #{Script.current.name} <room_id> or #{Script.current.name} u<uid>"
+      exit
+    end
+
+    controller = Controller.new(destination)
+    controller.run
+  end
+end
+
+# Script execution
+EFamGo2.run(Script.current.vars)

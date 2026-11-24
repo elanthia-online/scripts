@@ -1,0 +1,502 @@
+=begin
+  A utility for editing StringProc objects in the MapDB
+
+  ;proctor --help is informative
+  
+  Required: Lich 4.3.12
+  Tags: core, util, mapdb, strinprocs
+  Author: Ondreian
+  version: 1.0.1
+
+  changelog:
+    v1.0.1: Use Gem.ruby for finding the real ruby path to verify syntax
+            do not rate limit non-HTTP beautifier
+
+=end
+
+if $SAFE > 0
+  echo "error: This script needs to be trusted to work. (;trust #{script.name})"
+  exit
+end
+
+module Proctor
+  require "ostruct"
+  ##
+  ## minimal options parser
+  ##
+  module Opts
+    FLAG_PREFIX    = "--"
+    
+    def self.parse_command(h, c)
+      h[c.to_sym] = true
+    end
+
+    def self.parse_flag(h, f)
+      (name, val) = f[2..-1].split("=")
+      if val.nil?
+        h[name.to_sym] = true
+      else
+        val = val.split(",")
+
+        h[name.to_sym] = val.size == 1 ? val.first : val
+      end
+    end
+
+    def self.parse(args = Script.current.vars[1..-1])        
+      OpenStruct.new(**args.to_a.reduce(Hash.new) do |opts, v|
+        if v.start_with?(FLAG_PREFIX)
+          Opts.parse_flag(opts, v)
+        else
+          Opts.parse_command(opts, v)
+        end
+        opts
+      end)
+    end
+
+    def self.method_missing(method, *args)
+      parse.send(method, *args)
+    end
+  end
+end
+
+module Proctor
+  ##
+  ## contextual logging
+  ##
+  module Log
+    def self.bold(msg)
+      _respond "<pushBold/>#{msg}<popBold/>"
+    end
+    
+    def self.out(msg, label: :debug)
+      #return unless Opts.to_h.fetch(:debug, false)
+
+      if msg.is_a?(Exception)
+        msg = %{
+          #{msg.message}
+          #{msg.backtrace.join("\n")}
+        }
+      end
+      # don't overflow
+      if (msg.is_a?(Array))
+        msg = msg.take(5).inspect
+      end
+
+      _respond _view(msg, label)
+    end
+
+    def self._view(msg, label)
+      label = [Script.current.name, label].flatten.compact.join(".")
+      %{[#{label}] #{msg}}
+    end
+
+    def self.pp(msg, label = :debug)
+      respond _view(msg, label)
+    end
+
+    def self.dump(*args)
+      pp *args
+    end
+  end
+end
+
+module Proctor
+  module FS
+    def self.sanitize(name) 
+      name
+        .gsub(/^.*(\\|\/)/, '')
+        .gsub(/[^0-9A-Za-z.\-]/, '_') # Strip out the non-ascii character
+        .gsub(/^_/, "")
+        .gsub(/_$/, "")
+        .gsub(/_+/, "_").downcase
+    end
+
+    def self.file_name(room, wayto_id, sproc, tail = DateTime.now.strftime('%Q'))
+      PROC_DIR + %{#{sanitize(room.title.first)}_#{room.id}_#{wayto_id}_#{tail}.rb}
+    end
+
+    def self.lookup(room, wayto_id, sproc)
+      Dir[file_name(room, wayto_id, sproc, "*")].sort
+    end
+
+    def self.all()
+      Dir[PROC_DIR + %{*.rb}]
+    end
+
+    def self.compare(room, wayto_id, string_proc)
+      current_checksum = Compiler.checksum(string_proc)
+      FS.lookup(room, wayto_id, string_proc).each do |file|
+        yield(current_checksum, Digest::SHA256.file(file).hexdigest, file)
+      end
+    end
+  end
+end
+
+module Proctor
+  module Task
+    def self.setup()
+      return self if File.exist?(PROC_DIR)
+      Log.out("creating #{PROC_DIR}", 
+        label: %i[setup])
+      FileUtils.mkdir_p(PROC_DIR)
+      return self
+    end
+  end
+end
+
+module Proctor
+  module Beautify
+    require 'net/https'
+    require 'uri'
+    SERVICE_URL = URI.parse("https://tools.tutorialspoint.com/format_ruby.php")
+
+    def self.ruby(code)
+      expanded = Compiler.expand(code)
+
+      return expanded unless Opts.beautify
+
+      begin
+        res = Net::HTTP.post_form(SERVICE_URL,
+            {'code' => URI.encode(expanded._dump)})
+
+        pretty = JSON.parse(res.body)["code"]
+        Log.out(pretty) if Opts.debug
+        StringProc.new URI.decode(pretty)
+        
+      rescue Exception => e
+        Log.out(e, label: %i[error])
+        expanded
+      end
+    end
+  end
+end
+
+module Proctor
+  module Compiler
+    require 'digest'
+
+    def self.checksum(sproc_or_string)
+      sproc_or_string = sproc_or_string._dump if sproc_or_string.is_a?(StringProc)
+      Digest::SHA256.hexdigest sproc_or_string.to_s
+    end
+
+    def self.beautify(sproc_or_string)
+      sproc_or_string = sproc_or_string._dump if sproc_or_string.is_a?(StringProc)
+      Beautify.ruby(sproc_or_string)
+    end
+
+    def self.expand(sproc_or_string)
+      sproc_or_string = sproc_or_string._dump if sproc_or_string.is_a?(StringProc)
+      StringProc.new sproc_or_string.split(";").join("\n")
+    end
+
+    def self.compress(sproc)
+      fail Exception, %[Compiler#compress does not work on #{sproc.class.name}] unless sproc.is_a?(StringProc)
+      StringProc.new sproc._dump.split("\n").join(";")
+    end
+  end
+end
+
+module Proctor
+  class ProctorError < Exception
+    def initialize(message, room, wayto_id, current_checksum, sibling_checksum, file)
+      super(<<-ERROR
+      \n
+      #{message}
+
+      current checksum: #{current_checksum}
+      pending checksum: #{sibling_checksum}
+                  from: #{room.title.first}:#{room.id}
+                    to: #{Room[wayto_id].title.first}:#{wayto_id}
+                  file: #{file}
+
+      ERROR
+      )
+    end
+  end
+  class DuplicateChecksum < ProctorError; end;
+  class HasUncommitedChanges < ProctorError; end;
+  class NoUncommitedChanges < ProctorError; end;
+
+  module Validate
+    require 'open3'
+
+    def self.room_and_wayto(room_id, wayto_id)
+      room = Room[room_id] or fail Exception, %(could not find Room[#{room_id} in --room])
+      string_proc = room.wayto.fetch(wayto_id, false) or fail Exception, %(could not find a wayto #{wayto_id} in Room[#{room_id} from argument --wayto]\n\n#{Room[room_id].wayto})
+      fail Exception, %[this wayto is not a StringProc] unless string_proc.is_a?(StringProc)
+      [room, string_proc]
+    end
+
+    def self.no_duplicates(room, wayto_id, string_proc)
+      FS.compare(room, wayto_id, string_proc) do |current_checksum, sibling_checksum, file|
+        current_checksum.eql?(sibling_checksum) and
+          raise DuplicateChecksum.new(%[duplicate working file detected], 
+            room, wayto_id, current_checksum, sibling_checksum, file)
+      end
+    end
+
+    def self.no_uncommited_changes(room, wayto_id, string_proc)
+      FS.compare(room, wayto_id, string_proc) do |current_checksum, sibling_checksum, file|
+        current_checksum.eql?(sibling_checksum) or
+          raise HasUncommitedChanges.new(%[detected uncommitted changes],
+            room, wayto_id, current_checksum, sibling_checksum, file)
+      end
+    end
+
+    def self.has_uncommited_change(room, wayto_id, string_proc)
+      FS.compare(room, wayto_id, string_proc) do |current_checksum, sibling_checksum, file|
+        current_checksum.eql?(sibling_checksum) and
+        raise NoUncommitedChanges.new(%[no uncommitted changes found],
+          room, wayto_id, current_checksum, sibling_checksum, file)
+      end
+    end
+
+    def self.verify_syntax(file)
+      Log.out("verifying syntax with [#{Gem.ruby} -c #{file}]", label: %i[syntax.verifier])
+      (stdin, stdout, stderr) = Open3.popen3(%[#{Gem.ruby} -c #{file}])
+      stdin.close
+      result = stdout.read
+      stdout.close
+      return [:ok, result] if result.strip.eql?(%[Syntax OK])
+      err = stderr.read
+      stderr.close
+      return [:err, err]
+    end
+  end
+end
+
+module Proctor
+  module Filter
+    def self.is_string_proc?
+      -> t { t.is_a?(StringProc) }
+    end
+
+    def self.has_wayto_string_proc?
+      -> room { room.wayto.values.any?(&Filter.is_string_proc?) }
+    end
+  end
+end
+
+module Proctor
+  module To
+    def self.room
+      -> id { Room[id] }
+    end
+
+    def self.string_proc_array
+      -> sproc { sproc._dump.split(/;|\n/) }
+    end
+  end
+end 
+
+module Proctor
+  module CLI
+    def self.index()
+      return index_disk if Opts.disk
+      return index_mapdb
+    end
+
+    def self.index_disk()
+      label = %i[index disk]
+      Log.out("<b>uncommited changes</b>", 
+        label: label)
+      Log.out((["-"] * 50).join, 
+        label: label)
+      FS.all.map do |file| file.split("_").reverse end
+        .sort do |a, b| a[2] <=> b[2] end
+        .each do |parts|
+          (_, wayto_id, room_id) = parts
+          room = Room[room_id]
+          to   = Room[wayto_id]
+          Log.out("<b>#{room.title.first}:#{room.id} to #{to.title.first}:#{to.id}</b>",
+            label: label)
+        end
+    end
+
+    def self.index_mapdb()
+      Proctor.rooms_with_string_procs
+        .take(Opts.index.is_a?(TrueClass) ? 5 : Opts.index.to_i)
+        .each do |row| 
+          (room, to, sproc) = row
+          label =  %i[index id] + [room.id]
+          Log.out((["-"] * 50).join, 
+            label: label)
+          Log.out("<b>#{room.title.first}:#{room.id} to #{to.title.first}:#{to.id}</b>",
+            label: label)
+          To.string_proc_array.(sproc).each do |line|
+            Log.out(line, 
+              label: label)
+          end
+        end
+    end
+
+    def self.edit(room_id, wayto_id, create: false, 
+                                     silent: false)
+      
+      room = Room[room_id] or fail "Room[#{room_id}] does not exist"
+      # for fresh changes we need a common fallback
+      # so we don't need to litter our code with Maybe type
+      string_proc = room.wayto.fetch(wayto_id.to_s, NOOP_STRING_PROC)
+      out = FS.file_name(room, wayto_id, string_proc)
+      pretty_string_proc = Compiler.beautify(string_proc)._dump
+      Validate.no_duplicates(room, wayto_id, pretty_string_proc)
+      Validate.no_uncommited_changes(room, wayto_id, pretty_string_proc)
+      string_proc.eql?(NOOP_STRING_PROC) and not create and fail <<-ERROR
+        \n
+        refusing to implicitly create a new StringProc between:
+        
+        from: #{room.title.first}:#{room.id}
+          to: #{Room[wayto_id].title.first}:#{wayto_id} 
+
+        if you wish to do this you can try the --create flag
+        \n\n
+      ERROR
+      File.open(out, "w") do |f| f.write(pretty_string_proc) end
+      return if silent
+      if string_proc._dump.size.eql?(0)
+        Log.out("created new StringProc for #{Room[room_id].title.first} -> #{Room[wayto_id].title.first}\n\tfile: #{out}\n", 
+          label: %i[create])
+      else
+        Log.out("editing existing StringProc for #{Room[room_id].title.first} -> #{Room[wayto_id].title.first}\nfile: #{out}\n", 
+          label: %i[edit])
+      end
+    end
+
+    def self.commit(room_id, wayto_id)
+      room = Room[room_id] or fail "Room[#{room_id}] does not exist"
+      # for fresh changes we need a common fallback
+      # so we don't need to litter our code with Maybe type
+      string_proc = room.wayto.fetch(wayto_id, NOOP_STRING_PROC)
+      Validate.has_uncommited_change(room, wayto_id, string_proc)
+      candidates = FS.lookup(room, wayto_id, string_proc)
+      candidates.size.eql?(1) or fail Exception, %[multiple unstaged commits for this coord, keep only one]
+      commit = candidates.first
+      (outcome, message) = Validate.verify_syntax(commit)
+
+      if outcome.eql?(:err)
+        Log.out("<b>refusing to commit</b>", label: %i[error fatal])
+        return Log.out("ERROR:\n\n#{message}", label: %i[error fatal])
+      end
+
+      Log.out(commit, label: %i[compile], label: %i[commit])
+      code = File.read(commit)
+      minified = Compiler.compress(
+        StringProc.new(code))
+
+      room.wayto[wayto_id] = minified
+
+      File.delete(commit)
+      Log.out(%{cleaned up commited changes from working directory}, label: %i[string_proc.cleanup])
+    end
+
+    def self.dump()
+      rooms = Proctor.rooms_with_string_procs
+    
+      rooms.select! do |row|
+        (room, to, _) = row
+        room.id and to.id
+      end
+
+      Opts.location or fail "--location flag was missing and is required"
+
+      location = Opts.location.eql?("current") ? Room.current.location : Opts.location.downcase
+
+      rooms.select! do |row|
+        row.first.location.downcase.include?(location)
+      end
+
+      rooms.empty? and fail "No rooms found for #{location}"
+
+      if rooms.size > 100 and not Opts.force
+        Log.out(%[about to attempt writing #{rooms.size} StringProcs to your filesystem you have 10 seconds to cancel this], label: %i[warn])
+        sleep(10)
+      end
+
+      stats = {wrote: 0, duplicates: 0, total: rooms.size}
+
+      rooms.each_with_index do |row, idx|
+        (room, to, sproc) = row
+        begin
+          edit(room.id, to.id, silent: true) 
+          stats.merge!({wrote: stats.fetch(:wrote) + 1})
+          sleep(1)
+          if ((idx + 1) % 10 == 0) 
+            # extra sleep for API
+            sleep(9) if Opts.beautify
+            Log.out("completed #{idx + 1}/#{rooms.size}", label: %[progress])
+          end
+        rescue DuplicateChecksum
+          stats.merge!({duplicates: stats.fetch(:duplicates) + 1})
+          # silence is golden
+        end
+      end
+
+      Log.out(stats, label: %i[dump.stats])
+    end
+
+    def self.help()
+      _respond <<-HELP
+        \n
+        <b>proctor</b>
+
+        proctor is a tool for editing and maintaining StringProc objects in the MapDB
+
+        <b>how does it help?</b>
+
+        1. verifies the syntax of the StringProc
+        2. expands a StringProc and dumps it to your disk to make it easier to edit with your code editor
+
+        <b>commands:</b>
+
+            edit --room={room_id} --wayto={wayto_id}   dump a StringProc to #{PROC_DIR}
+                 [--beautify]                          use an HTTP service to beautify Ruby code
+                 [--create]                            a new "pending" StringProc will be created if none exists                                           
+
+          commit --room={room_id} --wayto={wayto_id}   commit your changes to the MapDB for a an updated StringProc
+
+            dump --location={substr|current}           dump StringProcs from MapDB to the string_proc/ directory
+                 [--beautify]                          use an HTTP service to beautify Ruby code
+                 [--force]                             with not give the option to stop large writes
+        \n
+      HELP
+    end
+  end
+end
+
+module Proctor
+  require "pathname"
+  require "fileutils"
+
+  PROC_DIR = Pathname.new($lich_dir) + %[string_procs]
+  NOOP_STRING_PROC = StringProc.new("")
+
+  def self.rooms_with_string_procs()
+    Room.list.select(&Filter.has_wayto_string_proc?)
+      .map do |room| 
+        room.wayto.select do |_, way| way.is_a?(StringProc) end.map do |id, sproc| 
+          [room, Room[id], sproc]
+        end 
+      end.flatten(1)
+  end
+
+  def self.sort_by_distance(from: Room.current, rooms: [])
+    target_list = rooms.map(&:to_i)
+    Log.out(target_list.size)
+    previous, shortest_distances = Map.dijkstra(from.id, target_list)
+    target_list.delete_if { |room_num| shortest_distances[room_num].nil? }
+    Log.out(target_list.size)
+    target_list.sort { |a,b| shortest_distances[a] <=> shortest_distances[b] }.map(&To.room)
+  end
+
+  def self.main()
+    return CLI.index() if Opts.index
+    return CLI.edit(Opts.room || Room.current.id, Opts.wayto, create: Opts.create || false) if Opts.edit
+    return CLI.commit(Opts.room, Opts.wayto) if Opts.commit
+    return CLI.dump() if Opts.dump
+    return CLI.help()
+  end
+
+  Task.setup() unless Opts.help
+  Proctor.main()
+end

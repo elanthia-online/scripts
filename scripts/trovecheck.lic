@@ -1,0 +1,318 @@
+=begin
+
+  Checks for Ebon Gate Trove wins
+
+  Usage:
+    ;trovecheck [optional room numbers]
+
+   author: elanthia-online
+     game: gs4
+     tags: ebon gate, trove
+  version: 1.0.1
+
+  Improvements:
+  Major_change.feature_addition.bugfix
+  v1.0.1  (2025-10-27)
+    - check PROPERTY MINE to prevent checking property trove
+    - bypass property trove and troves 3-5 for Shattered
+  v1.0.0  (2025-10-26)
+    - initial release
+
+=end
+
+module TroveCheck
+  # Embedded list of rooms to check
+  DEFAULT_ROOMS = [
+    Map.ids_from_uid(8084732).first, # property trove
+    Map.ids_from_uid(8084012).first,
+    Map.ids_from_uid(8084011).first,
+    Map.ids_from_uid(8084019).first,
+    Map.ids_from_uid(8084013).first,
+    Map.ids_from_uid(8084014).first,
+  ]
+
+  class RoomResult
+    attr_accessor :room_id, :status, :item_name, :item_id, :message
+
+    def initialize(room_id)
+      @room_id = room_id
+      @status = :not_checked
+      @item_name = nil
+      @item_id = nil
+      @message = ""
+    end
+  end
+
+  class << self
+    def run
+      # Empty hands at start
+      empty_hands
+
+      # Store starting room
+      starting_room = Room.current.id
+
+      # Get room list - use arguments if provided, otherwise use default list
+      room_list = get_room_list
+
+      echo "Starting room: #{starting_room}"
+      echo "Will check #{room_list.length} rooms: #{room_list.join(', ')}"
+      echo "=" * 50
+
+      # Track results for final summary
+      results = []
+
+      # Visit each room
+      room_list.each do |room|
+        result = RoomResult.new(room)
+        results << result
+
+        # Shattered only gets two troves, and no property trove, return false for Shattered
+        if XMLData.game.eql?("GSF") && (Map.ids_from_uid(8084732).include?(room) || Map.ids_from_uid(8084019).include?(room) || Map.ids_from_uid(8084013).include?(room) || Map.ids_from_uid(8084014).include?(room))
+          result.status = :unreachable
+          result.message = "Shattered doesn't have all troves!"
+          echo result.message
+          next
+        end
+
+        # Check if currently own a property
+        if Map.ids_from_uid(8084732).include?(room)
+          response = dothistimeout('property mine', 2, /You do not own a private property|Owner: /)
+          if response.is_a?(String) && response =~ /You do not own a private property/
+            result.status = :unreachable
+            result.message = "Could not reach room (no private property)"
+            echo result.message
+            next
+          end
+        end
+
+        echo "Traveling to room #{room}..."
+
+        # Attempt to navigate to room
+        unless navigate_to_room(room)
+          result.status = :unreachable
+          result.message = "Could not reach room (no service pass?)"
+          echo result.message
+          next
+        end
+
+        # Check the rack
+        check_result = check_rack(room)
+        result.status = check_result[:status]
+        result.item_name = check_result[:item_name]
+        result.item_id = check_result[:item_id]
+        result.message = check_result[:message]
+
+        echo result.message
+
+        # Handle winning scenario
+        if result.status == :won
+          handle_win(room)
+        end
+
+        pause 0.5
+        echo ""
+      end
+
+      # Return to starting room
+      return_to_start(starting_room)
+
+      # Print final summary
+      print_summary(results)
+
+      # Make sure hands are filled back to original state
+      fill_hands
+    end
+
+    private
+
+    def get_room_list
+      if Script.current.vars[1]
+        room_list = Script.current.vars[1..-1]
+        echo "Using provided room list: #{room_list.inspect}"
+        room_list
+      else
+        echo "Using default room list"
+        DEFAULT_ROOMS
+      end
+    end
+
+    def navigate_to_room(room)
+      max_attempts = 100 # Prevent infinite loops
+      attempts = 0
+
+      until Room.current.id.eql?(room) || attempts >= max_attempts
+        current_room = Room.current.id
+
+        unless $step2_path && (s = $step2_path.index(Room.current.id)) && (d = $step2_path.index(room)) && (s < d)
+          previous, _shortest_distances = Map.dijkstra(Room.current.id, room)
+          unless previous[room]
+            echo "Error: Failed to find a path between current room (#{Room.current.id}) and destination (#{room})"
+            return false
+          end
+          $step2_path = [room]
+          $step2_path.push(previous[$step2_path[-1]]) until previous[$step2_path[-1]].nil?
+          $step2_path.reverse!
+        end
+
+        way = Room.current.wayto[$step2_path[$step2_path.index(Room.current.id) + 1].to_s]
+
+        waitrt?
+        if way.class == String
+          move(way, 2)
+        elsif way.class == Proc
+          way.call
+        else
+          echo 'Error in the map database'
+          return false
+        end
+
+        # Check if we didn't move
+        break if current_room == Room.current.id
+        attempts += 1
+      end
+
+      Room.current.id.eql?(room)
+    end
+
+    def check_rack(room)
+      echo "Checking rack in room #{room}..."
+
+      # Look at the rack and capture XML response
+      response = Lich::Util.quiet_command_xml("look on long rack", /On the|There is nothing/)
+      response_text = response.join("\n")
+
+      # Check if rack is empty
+      if response_text =~ /There is nothing on the/
+        return {
+          status: :empty,
+          message: "Rack is empty in room #{room}",
+          item_name: nil,
+          item_id: nil
+        }
+      end
+
+      # Find ALL exist IDs in the response
+      exist_ids = response_text.scan(/<a exist="(\d+)" noun="([^"]+)">/).map { |id, noun| [id, noun] }
+
+      # Get unique IDs and filter out the rack itself
+      unique_items = exist_ids.uniq.select { |_id, noun| noun != "rack" }
+
+      if unique_items.length == 0
+        return {
+          status: :empty,
+          message: "No items found on rack in room #{room}",
+          item_name: nil,
+          item_id: nil
+        }
+      end
+
+      item_id = unique_items[0][0]
+      item_noun = unique_items[0][1]
+
+      echo "Found item: #{item_noun} (ID: #{item_id})"
+
+      # Try to get the item
+      clear
+      fput "get ##{item_id}"
+      pause 0.5
+
+      result = reget(10).join("\n")
+
+      if result =~ /doesn't belong to you|may want it/
+        return {
+          status: :unavailable,
+          message: "Item not available (belongs to someone else)",
+          item_name: item_noun,
+          item_id: item_id
+        }
+      elsif result =~ /You (?:pick up|grab|take|remove)/
+        return {
+          status: :won,
+          message: "*** YOU WON THE ITEM! ***",
+          item_name: item_noun,
+          item_id: item_id
+        }
+      else
+        return {
+          status: :error,
+          message: "Unexpected response: #{result}",
+          item_name: item_noun,
+          item_id: item_id
+        }
+      end
+    end
+
+    def handle_win(room)
+      _respond "<pushBold/><output class=\"mono\"/>*** YOU WON THE ITEM IN ROOM #{room}! ***<output class=\"\"/><popBold/>"
+      echo ""
+      echo "=" * 50
+      echo "YOU WON! Item is in your hands."
+      echo "=" * 50
+
+      # Pause so user can decide what to do
+      pause_script
+
+      # After unpause, try to stow it
+      fput "stow all"
+      pause 0.5
+    end
+
+    def return_to_start(starting_room)
+      echo "=" * 50
+      echo "Returning to starting room #{starting_room}..."
+      Script.run('go2', "#{starting_room}")
+    end
+
+    def print_summary(results)
+      echo ""
+      echo "=" * 70
+      echo "TROVE CHECK SUMMARY"
+      echo "=" * 70
+
+      won_count = results.count { |r| r.status == :won }
+      empty_count = results.count { |r| r.status == :empty }
+      unavailable_count = results.count { |r| r.status == :unavailable }
+      unreachable_count = results.count { |r| r.status == :unreachable }
+      error_count = results.count { |r| r.status == :error }
+
+      echo ""
+      echo "Total rooms checked: #{results.length}"
+      echo "  - Items WON: #{won_count}"
+      echo "  - Empty racks: #{empty_count}"
+      echo "  - Items unavailable (owned by others): #{unavailable_count}"
+      echo "  - Unreachable rooms: #{unreachable_count}"
+      echo "  - Errors: #{error_count}"
+      echo ""
+
+      if won_count > 0
+        echo "ITEMS WON:"
+        results.select { |r| r.status == :won }.each do |r|
+          echo "  Room #{r.room_id}: #{r.item_name} (ID: #{r.item_id})"
+        end
+        echo ""
+      end
+
+      if unavailable_count > 0
+        echo "ITEMS FOUND (but unavailable):"
+        results.select { |r| r.status == :unavailable }.each do |r|
+          echo "  Room #{r.room_id}: #{r.item_name}"
+        end
+        echo ""
+      end
+
+      if unreachable_count > 0
+        echo "UNREACHABLE ROOMS:"
+        results.select { |r| r.status == :unreachable }.each do |r|
+          echo "  Room #{r.room_id}: #{r.message}"
+        end
+        echo ""
+      end
+
+      echo "=" * 70
+      echo "Script complete!"
+    end
+  end
+end
+
+# Run the script
+TroveCheck.run

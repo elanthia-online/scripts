@@ -1,0 +1,19 @@
+migrate :aggressive_npc do
+  insert(:name, %{water hound})
+  insert(:name, %{vapor hound})
+  insert(:name, %{storm hound})
+  insert(:name, %{lightning fiend})
+  insert(:name, %{titan stormcaller})
+  insert(:name, %{tempest tyrant})
+  insert(:name, %{Veiki herald})
+end
+
+migrate :skin, :furrier do
+  insert(:name, %{storm hound paw})
+  insert(:name, %{vapor hound tail})
+  insert(:name, %{water hound pelt})
+end
+
+migrate :undead, :aggressive_npc, :noncorporeal do
+  insert(:name, %{swirling spectre})
+end

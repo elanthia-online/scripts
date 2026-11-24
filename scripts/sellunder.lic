@@ -1,0 +1,831 @@
+=begin
+  sellunder.lic
+
+  Sells items to gemshop and pawnshop only if they're valued at or under a specified price ceiling
+
+  Usage: ;sellunder [price_ceiling] [--return]
+         ;sellunder <price_ceiling> --single (sell item in hand only)
+         ;sellunder setup (opens GUI configuration)
+         ;sellunder list (shows current settings)
+         ;sellunder help (displays usage information)
+         ;sellunder <price_ceiling> --shop_type=gemshop,pawnshop
+         ;sellunder <price_ceiling> --stow_list=gem,default,treasure
+         ;sellunder --shop_type=gemshop,pawnshop (updates settings without running)
+         ;sellunder --stow_list=gem,default,treasure (updates settings without running)
+
+  Options:
+    --return    Return to starting room after completion
+    --single    Sell only the item in right hand at current location
+
+  Example: ;sellunder 60000
+    This will sell items valued at 60,000 silvers or under and save the price ceiling
+
+  Example: ;sellunder 60000 --return
+    Sell items and return to starting room when finished
+
+  Example: ;sellunder 60000 --single
+    Quick sell - sell only the item in your right hand at current location
+
+  Example: ;sellunder
+    Uses previously saved price ceiling (must be set via setup or command line first)
+
+  Example: ;sellunder --shop_type=gemshop
+    Updates shop type setting to gemshop only without running the script
+
+        author: elanthia-online
+          game: Gemstone
+          tags: selling, pawnshop, gemshop
+       version: 1.0.0
+
+  changelog:
+    1.0.0 (2026-01-11)
+      initial release
+=end
+
+require 'yaml'
+
+module SellUnder
+  SELL_RESPONSES = Regexp.union(
+    /I have no use for that\./,
+    /glances at it briefly, then hands you/,
+    /scribbles out a .+ and hands it to you/,
+    /worth (?:at least|about) [\d,]+/
+  ).freeze unless const_defined?(:SELL_RESPONSES)
+
+  DEFAULT_SHOP_TYPES = %w[gemshop pawnshop].freeze unless const_defined?(:DEFAULT_SHOP_TYPES)
+  DEFAULT_CONTAINER_TYPES = %i[default treasure gem overflow_container secondary_overflow].freeze unless const_defined?(:DEFAULT_CONTAINER_TYPES)
+
+  # Available container types that can be configured
+  AVAILABLE_CONTAINER_TYPES = %i[
+    box gem herb skin wand scroll potion trinket reagent
+    lockpick treasure forageable collectible default
+    overflow_container secondary_overflow
+  ].freeze unless const_defined?(:AVAILABLE_CONTAINER_TYPES)
+
+  # Manages persistent settings for the script
+  class Settings
+    # Get the path to the settings file
+    #
+    # @return [String] Full path to the YAML settings file
+    def self.settings_file
+      dir = File.join(DATA_DIR, XMLData.game, XMLData.name)
+      FileUtils.mkdir_p(dir) unless File.directory?(dir)
+      File.join(dir, "sellunder.yaml")
+    end
+
+    # Load settings from YAML file or return defaults
+    #
+    # @return [Hash] Settings hash with :shop_types, :container_types, :price_ceiling, and :return_to_start
+    def self.load
+      if File.exist?(settings_file)
+        begin
+          saved = YAML.load_file(settings_file)
+
+          if saved && saved.is_a?(Hash)
+            {
+              shop_types: saved['shop_types'] || DEFAULT_SHOP_TYPES.dup,
+              container_types: (saved['container_types'] || DEFAULT_CONTAINER_TYPES.dup).map(&:to_sym),
+              price_ceiling: saved['price_ceiling'],
+              return_to_start: saved['return_to_start'] || false
+            }
+          else
+            default_settings
+          end
+        rescue => e
+          Lich::Messaging.msg("error", "Warning: Failed to load settings from #{settings_file}")
+          Lich::Messaging.msg("error", "Error: #{e.message}")
+          Lich::Messaging.msg("error", "Using default settings")
+          default_settings
+        end
+      else
+        default_settings
+      end
+    end
+
+    # Save settings to YAML file
+    #
+    # @param shop_types [Array<String>] Shop types to sell at
+    # @param container_types [Array<Symbol>] Container types to check
+    # @param price_ceiling [Integer, nil] Maximum price to sell items at
+    # @param return_to_start [Boolean] Whether to return to starting room after completion
+    # @return [void]
+    def self.save(shop_types:, container_types:, price_ceiling: nil, return_to_start: false)
+      settings = {
+        'shop_types'      => shop_types,
+        'container_types' => container_types.map(&:to_s),
+        'price_ceiling'   => price_ceiling,
+        'return_to_start' => return_to_start
+      }
+
+      begin
+        File.open(settings_file, 'w') do |file|
+          file.write(YAML.dump(settings))
+        end
+        Lich::Messaging.msg("info", "Settings saved to #{settings_file}")
+      rescue => e
+        Lich::Messaging.msg("error", "Error: Failed to save settings")
+        Lich::Messaging.msg("error", "Error: #{e.message}")
+      end
+    end
+
+    # Get default settings
+    #
+    # @return [Hash] Default settings hash
+    def self.default_settings
+      {
+        shop_types: DEFAULT_SHOP_TYPES.dup,
+        container_types: DEFAULT_CONTAINER_TYPES.dup,
+        price_ceiling: nil,
+        return_to_start: false
+      }
+    end
+  end
+
+  # GTK GUI for configuring script settings
+  class SetupGUI
+    # Initialize and display the setup GUI
+    #
+    # @return [void]
+    def self.run
+      begin
+        require 'gtk3'
+      rescue LoadError
+        Lich::Messaging.msg("error", "Error: GTK3 is required for the setup interface")
+        Lich::Messaging.msg("error", "Please install gtk3 gem or configure via CLI options")
+        exit
+      end
+
+      new.show
+    end
+
+    # Initialize the GUI
+    def initialize
+      @settings = Settings.load
+      @window = nil
+      @container_checkboxes = {}
+      @shop_checkboxes = {}
+      @price_ceiling_entry = nil
+      @return_to_start_checkbox = nil
+      @running = true
+    end
+
+    # Display the GUI window
+    #
+    # @return [void]
+    def show
+      Gtk.queue do
+        build_window
+        @window.show_all
+      end
+
+      # Keep script running while window is open
+      wait_while { @running }
+    end
+
+    private
+
+    # Build the main window and all widgets
+    #
+    # @return [void]
+    def build_window
+      @window = Gtk::Window.new("SellUnder Configuration")
+      @window.set_default_size(500, 550)
+      @window.border_width = 10
+      @window.signal_connect('delete_event') do
+        @running = false
+        @window.destroy
+        false
+      end
+
+      main_box = Gtk::Box.new(:vertical, 10)
+
+      # Add sections
+      main_box.pack_start(build_price_section, expand: false, fill: true, padding: 5)
+      main_box.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: true, padding: 5)
+      main_box.pack_start(build_shop_section, expand: false, fill: true, padding: 5)
+      main_box.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: true, padding: 5)
+      main_box.pack_start(build_container_section, expand: false, fill: true, padding: 5)
+      main_box.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: true, padding: 5)
+      main_box.pack_start(build_options_section, expand: false, fill: true, padding: 5)
+      main_box.pack_start(build_button_section, expand: false, fill: true, padding: 5)
+
+      @window.add(main_box)
+    end
+
+    # Build the price ceiling configuration section
+    #
+    # @return [Gtk::Box]
+    def build_price_section
+      box = Gtk::Box.new(:vertical, 5)
+
+      label = Gtk::Label.new
+      label.set_markup("<b>Price Ceiling</b>")
+      label.halign = :start
+      box.pack_start(label, expand: false, fill: true, padding: 0)
+
+      help_label = Gtk::Label.new("Maximum price (in silvers) to sell items at:")
+      help_label.halign = :start
+      help_label.wrap = true
+      box.pack_start(help_label, expand: false, fill: true, padding: 0)
+
+      @price_ceiling_entry = Gtk::Entry.new
+      @price_ceiling_entry.text = @settings[:price_ceiling].to_s if @settings[:price_ceiling]
+      @price_ceiling_entry.placeholder_text = "e.g., 60000"
+      box.pack_start(@price_ceiling_entry, expand: false, fill: true, padding: 5)
+
+      box
+    end
+
+    # Build the shop types configuration section
+    #
+    # @return [Gtk::Box]
+    def build_shop_section
+      box = Gtk::Box.new(:vertical, 5)
+
+      label = Gtk::Label.new
+      label.set_markup("<b>Shop Types</b>")
+      label.halign = :start
+      box.pack_start(label, expand: false, fill: true, padding: 0)
+
+      help_label = Gtk::Label.new("Select which shop types to sell at:")
+      help_label.halign = :start
+      help_label.wrap = true
+      box.pack_start(help_label, expand: false, fill: true, padding: 0)
+
+      # Create grid for checkboxes (2 columns)
+      grid = Gtk::Grid.new
+      grid.column_spacing = 20
+      grid.row_spacing = 5
+
+      # Create checkboxes for each shop type
+      %w[gemshop pawnshop].each_with_index do |shop_type, index|
+        checkbox = Gtk::CheckButton.new(shop_type)
+        checkbox.active = @settings[:shop_types].include?(shop_type)
+        @shop_checkboxes[shop_type] = checkbox
+        grid.attach(checkbox, index % 2, index / 2, 1, 1)
+      end
+
+      box.pack_start(grid, expand: false, fill: true, padding: 5)
+
+      box
+    end
+
+    # Build the container types configuration section
+    #
+    # @return [Gtk::Box]
+    def build_container_section
+      box = Gtk::Box.new(:vertical, 5)
+
+      label = Gtk::Label.new
+      label.set_markup("<b>Stow List Containers to Check</b>")
+      label.halign = :start
+      box.pack_start(label, expand: false, fill: true, padding: 0)
+
+      help_label = Gtk::Label.new("Select which container types to check for sellable items:")
+      help_label.halign = :start
+      help_label.wrap = true
+      box.pack_start(help_label, expand: false, fill: true, padding: 0)
+
+      # Create grid for checkboxes (2 columns)
+      grid = Gtk::Grid.new
+      grid.column_spacing = 20
+      grid.row_spacing = 5
+      grid.column_homogeneous = true
+
+      AVAILABLE_CONTAINER_TYPES.each_with_index do |container_type, index|
+        checkbox = Gtk::CheckButton.new(container_type.to_s)
+        checkbox.active = @settings[:container_types].include?(container_type)
+        @container_checkboxes[container_type] = checkbox
+        grid.attach(checkbox, index % 2, index / 2, 1, 1)
+      end
+
+      box.pack_start(grid, expand: false, fill: true, padding: 5)
+
+      box
+    end
+
+    # Build the options section
+    #
+    # @return [Gtk::Box]
+    def build_options_section
+      box = Gtk::Box.new(:vertical, 5)
+
+      label = Gtk::Label.new
+      label.set_markup("<b>Options</b>")
+      label.halign = :start
+      box.pack_start(label, expand: false, fill: true, padding: 0)
+
+      @return_to_start_checkbox = Gtk::CheckButton.new("Return to starting room after completion")
+      @return_to_start_checkbox.active = @settings[:return_to_start]
+      box.pack_start(@return_to_start_checkbox, expand: false, fill: true, padding: 2)
+
+      box
+    end
+
+    # Build the button section (Save/Cancel)
+    #
+    # @return [Gtk::Box]
+    def build_button_section
+      box = Gtk::Box.new(:horizontal, 10)
+      box.halign = :end
+
+      save_button = Gtk::Button.new(label: "Save")
+      save_button.signal_connect('clicked') { save_and_close }
+      box.pack_start(save_button, expand: false, fill: true, padding: 0)
+
+      cancel_button = Gtk::Button.new(label: "Cancel")
+      cancel_button.signal_connect('clicked') do
+        @running = false
+        @window.destroy
+      end
+      box.pack_start(cancel_button, expand: false, fill: true, padding: 0)
+
+      box
+    end
+
+    # Save settings and close the window
+    #
+    # @return [void]
+    def save_and_close
+      # Parse price ceiling
+      price_text = @price_ceiling_entry.text.strip
+      price_ceiling = nil
+
+      unless price_text.empty?
+        price_ceiling = price_text.to_i
+        if price_ceiling <= 0
+          show_error("Price ceiling must be a positive number")
+          return
+        end
+      end
+
+      # Get selected shop types
+      shop_types = @shop_checkboxes.select { |_k, v| v.active? }.keys
+
+      if shop_types.empty?
+        show_error("Please select at least one shop type")
+        return
+      end
+
+      # Get selected containers
+      container_types = @container_checkboxes.select { |_k, v| v.active? }.keys
+
+      if container_types.empty?
+        show_error("Please select at least one container type")
+        return
+      end
+
+      # Get return to start option
+      return_to_start = @return_to_start_checkbox.active?
+
+      Settings.save(
+        shop_types: shop_types,
+        container_types: container_types,
+        price_ceiling: price_ceiling,
+        return_to_start: return_to_start
+      )
+      @running = false
+      @window.destroy
+    end
+
+    # Show an error dialog
+    #
+    # @param message [String] Error message to display
+    # @return [void]
+    def show_error(message)
+      dialog = Gtk::MessageDialog.new(
+        parent: @window,
+        flags: :modal,
+        type: :error,
+        buttons: :ok,
+        message: message
+      )
+      dialog.run
+      dialog.destroy
+    end
+  end
+
+  # Main class for handling item sales under a price ceiling
+  class Seller
+    attr_reader :price_ceiling, :shop_types, :container_types, :return_to_start, :starting_room
+
+    # Initialize the seller with a price ceiling and optional configuration
+    #
+    # @param price_ceiling [Integer] Maximum price to sell items at
+    # @param shop_types [Array<String>] Shop types to sell at
+    # @param container_types [Array<Symbol>] Container types to check
+    # @param return_to_start [Boolean] Whether to return to starting room after completion
+    def initialize(price_ceiling, shop_types: nil, container_types: nil, return_to_start: false)
+      @price_ceiling = price_ceiling
+      @shop_types = shop_types
+      @container_types = container_types
+      @return_to_start = return_to_start
+      @starting_room = Room.current.id
+    end
+
+    # Main execution method
+    #
+    # @return [void]
+    def run
+      Lich::Messaging.msg("info", "Selling items valued at #{price_ceiling} silvers or under")
+      Lich::Messaging.msg("info", "Checking shops: #{shop_types.join(', ')}")
+      Lich::Messaging.msg("info", "Checking containers: #{container_types.join(', ')}")
+      empty_hands
+
+      shop_types.each do |shop_type|
+        process_shop(shop_type)
+      end
+
+      fill_hands
+      Lich::Messaging.msg("info", "Selling complete!")
+
+      # Return to starting room if enabled
+      if return_to_start && Room.current.id != starting_room
+        Lich::Messaging.msg("info", "Returning to starting room...")
+        Script.run("go2", starting_room.to_s)
+      end
+    end
+
+    private
+
+    # Process all sellable items for a specific shop type
+    #
+    # @param shop_type [String] The type of shop (gemshop or pawnshop)
+    # @return [void]
+    def process_shop(shop_type)
+      navigate_to_shop(shop_type)
+
+      stow_containers.each do |container|
+        sellable_items = find_sellable_items(container, shop_type)
+        sellable_items.each { |item| process_item(item, container) }
+      end
+    end
+
+    # Get list of valid stow containers
+    #
+    # @return [Array<GameObj>] Array of container objects
+    def stow_containers
+      StowList.check(silent: true, quiet: true) unless StowList.valid?
+      container_types.filter_map do |container_type|
+        StowList.stow_list[container_type]
+      end
+    end
+
+    # Navigate to the specified shop if not already there
+    #
+    # @param shop_type [String] The type of shop to navigate to
+    # @return [void]
+    def navigate_to_shop(shop_type)
+      return if Room.current.tags.include?(shop_type)
+
+      Lich::Messaging.msg("info", "Traveling to #{shop_type}...")
+      Script.run("go2", shop_type)
+    end
+
+    # Find all items in a container that are sellable at the specified shop
+    #
+    # @param container [GameObj] The container to search
+    # @param shop_type [String] The type of shop
+    # @return [Array<GameObj>] Array of sellable items
+    def find_sellable_items(container, shop_type)
+      container_contents = GameObj.containers[container.id]
+      return [] unless container_contents
+
+      container_contents.find_all { |item| item.sellable =~ /#{shop_type}/ }
+    end
+
+    # Process a single item - check price and sell if under ceiling
+    #
+    # @param item [GameObj] The item to process
+    # @param container [GameObj] The container the item came from
+    # @return [void]
+    def process_item(item, container)
+      fput("_drag ##{item.id} right")
+
+      sell_result = dothistimeout("sell ##{item.id}", 3, SELL_RESPONSES)
+
+      if sell_result.nil?
+        Lich::Messaging.msg("error", "Response not recognized for #{item.name}")
+        return_to_container(container)
+        return
+      end
+
+      check_and_sell(item, sell_result, container)
+    end
+
+    # Check if item price is under ceiling and sell if so
+    #
+    # @param item [GameObj] The item being evaluated
+    # @param sell_result [String] The response from the sell attempt
+    # @param container [GameObj] The container to return item to if not sold
+    # @return [void]
+    def check_and_sell(item, sell_result, container)
+      price_match = /(?:at least|about) ([\d,]+)/.match(sell_result)
+
+      if price_match
+        item_value = price_match[1].gsub(',', '').to_i
+
+        if item_value <= price_ceiling
+          Lich::Messaging.msg("info", "#{item.name} valued at #{item_value} silvers - selling")
+          fput("sell ##{item.id}")
+        else
+          Lich::Messaging.msg("info", "#{item.name} valued at #{item_value} silvers - over ceiling, keeping")
+          return_to_container(container)
+        end
+      else
+        # Item was bought without price check (worthless items)
+        return_to_container(container)
+      end
+    end
+
+    # Return any held items back to their container
+    #
+    # @param container [GameObj] The container to return items to
+    # @return [void]
+    def return_to_container(container)
+      fput("_drag right ##{container.id}") if GameObj.right_hand.id
+      fput("_drag left ##{container.id}") if GameObj.left_hand.id
+    end
+  end
+
+  # Sell a single item from right hand at current location
+  #
+  # @param price_ceiling [Integer] Maximum price to sell items at
+  # @return [void]
+  def self.sell_single_item(price_ceiling)
+    # Check if item in hand
+    item = GameObj.right_hand
+    unless item && item.id
+      Lich::Messaging.msg("error", "Error: No item in right hand")
+      exit
+    end
+
+    Lich::Messaging.msg("info", "Attempting to sell #{item.name} (ID: #{item.id})")
+    Lich::Messaging.msg("info", "Price ceiling: #{price_ceiling} silvers")
+
+    # Attempt to sell the item
+    sell_result = dothistimeout("sell ##{item.id}", 3, SELL_RESPONSES)
+
+    if sell_result.nil?
+      Lich::Messaging.msg("error", "Response not recognized for #{item.name}")
+      Lich::Messaging.msg("error", "Item remains in hand")
+      return
+    end
+
+    # Check if merchant rejected it
+    if sell_result =~ /I have no use for that\./
+      Lich::Messaging.msg("info", "#{item.name} - merchant has no use for this item")
+      return
+    end
+
+    # Check price and sell if under ceiling
+    price_match = /(?:at least|about) ([\d,]+)/.match(sell_result)
+
+    if price_match
+      item_value = price_match[1].gsub(',', '').to_i
+
+      if item_value <= price_ceiling
+        Lich::Messaging.msg("info", "#{item.name} valued at #{item_value} silvers - selling")
+        fput("sell ##{item.id}")
+      else
+        Lich::Messaging.msg("info", "#{item.name} valued at #{item_value} silvers - over ceiling, keeping")
+      end
+    else
+      # Item was bought without price check (worthless items)
+      Lich::Messaging.msg("info", "Item sold immediately (worthless or no price check)")
+    end
+  end
+
+  # Parse command line arguments
+  #
+  # @param args [Array<String>] Command line arguments
+  # @return [Hash] Parsed arguments
+  def self.parse_args(args)
+    result = {
+      price_ceiling: nil,
+      shop_types: nil,
+      container_types: nil,
+      return_to_start: nil,
+      single_item_mode: false,
+      show_setup: false,
+      show_help: false,
+      show_list: false
+    }
+
+    args.each do |arg|
+      case arg
+      when 'setup'
+        result[:show_setup] = true
+      when 'help'
+        result[:show_help] = true
+      when 'list'
+        result[:show_list] = true
+      when /^--shop_type=(.+)$/
+        result[:shop_types] = $1.split(',').map(&:strip)
+      when /^--stow_list=(.+)$/
+        result[:container_types] = $1.split(',').map { |c| c.strip.to_sym }
+      when '--return'
+        result[:return_to_start] = true
+      when '--single'
+        result[:single_item_mode] = true
+      when /^\d+$/
+        result[:price_ceiling] = arg.to_i
+      end
+    end
+
+    result
+  end
+
+  # Parse command line arguments and run the script
+  #
+  # @return [void]
+  def self.main
+    args = parse_args(Script.current.vars[1..-1] || [])
+
+    # Show help if requested
+    if args[:show_help]
+      display_usage
+      exit
+    end
+
+    # Show setup GUI if requested
+    if args[:show_setup]
+      SetupGUI.run
+      exit
+    end
+
+    # Show current settings if requested
+    if args[:show_list]
+      display_settings
+      exit
+    end
+
+    # Handle single item mode (sell item in hand at current location)
+    if args[:single_item_mode]
+      settings = Settings.load
+      price_ceiling = args[:price_ceiling] || settings[:price_ceiling]
+
+      unless price_ceiling
+        Lich::Messaging.msg("error", "Error: Price ceiling not specified")
+        Lich::Messaging.msg("error", "Use: ;sellunder <price_ceiling> --single")
+        exit
+      end
+
+      if price_ceiling <= 0
+        Lich::Messaging.msg("error", "Error: Price ceiling must be a positive number")
+        exit
+      end
+
+      sell_single_item(price_ceiling)
+      exit
+    end
+
+    # Load settings (CLI args override saved settings)
+    settings = Settings.load
+    price_ceiling = args[:price_ceiling] || settings[:price_ceiling]
+    shop_types = args[:shop_types] || settings[:shop_types]
+    container_types = args[:container_types] || settings[:container_types]
+    return_to_start = args[:return_to_start].nil? ? settings[:return_to_start] : args[:return_to_start]
+
+    # If shop_type or stow_list provided without price_ceiling, just save settings and exit
+    if !args[:price_ceiling] && (args[:shop_types] || args[:container_types])
+      Settings.save(
+        shop_types: shop_types,
+        container_types: container_types,
+        price_ceiling: settings[:price_ceiling],
+        return_to_start: return_to_start
+      )
+      Lich::Messaging.msg("info", "Settings updated:")
+      Lich::Messaging.msg("info", "  Shop Types: #{shop_types.join(', ')}")
+      Lich::Messaging.msg("info", "  Container Types: #{container_types.join(', ')}")
+      exit
+    end
+
+    # Validate price ceiling
+    unless price_ceiling
+      Lich::Messaging.msg("error", "Error: Price ceiling not specified")
+      Lich::Messaging.msg("error", "Set a price ceiling via GUI (;sellunder setup) or command line")
+      display_usage
+      exit
+    end
+
+    if price_ceiling <= 0
+      Lich::Messaging.msg("error", "Error: Price ceiling must be a positive number")
+      display_usage
+      exit
+    end
+
+    # Validate settings
+    if shop_types.empty?
+      Lich::Messaging.msg("error", "Error: No shop types configured")
+      Lich::Messaging.msg("error", "Run ';sellunder setup' to configure or use --shop_type option")
+      exit
+    end
+
+    if container_types.empty?
+      Lich::Messaging.msg("error", "Error: No container types configured")
+      Lich::Messaging.msg("error", "Run ';sellunder setup' to configure or use --stow_list option")
+      exit
+    end
+
+    # Save settings if price_ceiling was provided via CLI (for future runs without arguments)
+    if args[:price_ceiling]
+      Settings.save(
+        shop_types: shop_types,
+        container_types: container_types,
+        price_ceiling: price_ceiling,
+        return_to_start: return_to_start
+      )
+    end
+
+    # Run the seller
+    seller = Seller.new(
+      price_ceiling,
+      shop_types: shop_types,
+      container_types: container_types,
+      return_to_start: return_to_start
+    )
+    seller.run
+  end
+
+  # Display current settings
+  #
+  # @return [void]
+  def self.display_settings
+    settings = Settings.load
+
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "Current Settings:")
+    Lich::Messaging.msg("info", "=" * 50)
+
+    if settings[:price_ceiling]
+      Lich::Messaging.msg("info", "Price Ceiling: #{settings[:price_ceiling]} silvers")
+    else
+      Lich::Messaging.msg("info", "Price Ceiling: Not set")
+    end
+
+    Lich::Messaging.msg("info", "Shop Types: #{settings[:shop_types].join(', ')}")
+    Lich::Messaging.msg("info", "Container Types: #{settings[:container_types].join(', ')}")
+    Lich::Messaging.msg("info", "Return to Start: #{settings[:return_to_start] ? 'Yes' : 'No'}")
+    Lich::Messaging.msg("info", "")
+  end
+
+  # Display usage information
+  #
+  # @return [void]
+  def self.display_usage
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "Usage:")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} [price_ceiling] [--return]")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} <price_ceiling> --single")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} setup")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} list")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} help")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} <price_ceiling> --shop_type=gemshop,pawnshop")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} <price_ceiling> --stow_list=gem,default,treasure")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} --shop_type=gemshop,pawnshop")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} --stow_list=gem,default,treasure")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "Options:")
+    Lich::Messaging.msg("info", "  --return    Return to starting room after completion")
+    Lich::Messaging.msg("info", "  --single    Sell only the item in right hand at current location")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "Examples:")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} 60000")
+    Lich::Messaging.msg("info", "    Sell items valued at 60,000 silvers or under and save this price ceiling")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} 60000 --return")
+    Lich::Messaging.msg("info", "    Sell items and return to starting room when finished")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} 60000 --single")
+    Lich::Messaging.msg("info", "    Sell only the item in right hand at current location (quick sell)")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name}")
+    Lich::Messaging.msg("info", "    Use previously saved price ceiling (must set via setup or command line first)")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} setup")
+    Lich::Messaging.msg("info", "    Open configuration GUI to set price ceiling and other options")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} list")
+    Lich::Messaging.msg("info", "    Show current saved settings")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} help")
+    Lich::Messaging.msg("info", "    Display this help information")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} 50000 --shop_type=gemshop")
+    Lich::Messaging.msg("info", "    Sell only at gemshop, override saved shop settings")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} 75000 --stow_list=gem,treasure")
+    Lich::Messaging.msg("info", "    Check only gem and treasure containers, override saved container settings")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} --shop_type=gemshop")
+    Lich::Messaging.msg("info", "    Update shop type setting to gemshop only (doesn't run script)")
+    Lich::Messaging.msg("info", "")
+    Lich::Messaging.msg("info", "  #{$lich_char}#{Script.current.name} --stow_list=gem,treasure")
+    Lich::Messaging.msg("info", "    Update container types to gem and treasure only (doesn't run script)")
+    Lich::Messaging.msg("info", "")
+  end
+end
+
+# Run the script
+SellUnder.main

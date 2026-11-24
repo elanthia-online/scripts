@@ -1,0 +1,456 @@
+=begin
+
+  Automatically starts scripts when Lich starts.
+
+  ;autostart help
+
+        author: Tillmen (tillmen@lichproject.org)
+ maintained by: Elanthia-Online
+  contributors: Athias
+          game: any
+          tags: core
+       version: 0.75
+      required: Lich >= 4.6.58
+
+  changelog:
+    0.75 (2026-07-05):
+      Perform ACCOUNT/PLAYED command non-squelched due to other game feed MONO lines coming in, unable to reliably squelch proper line
+    0.74 (2026-07-03):
+      YAML autostarts (get_settings.autostarts) accept optional per-script args:
+        bare "name", "name arg1 arg2", or { name:, args: } hash forms
+      on duplicate names an args-carrying entry wins over a bare duplicate
+      retire the legacy UserVars.autostart_scripts store (superseded by YAML autostarts);
+        one-time login check clears it, quietly if every entry is already in YAML/DB,
+        or with a loud notice naming any gap and how to re-add it (never auto-migrates)
+      extract normalize_autostart_entry / yaml_autostart_entries / launch_autostart
+    0.73 (2026-07-02):
+      force ACCOUNT command population if subscription is not free/premium/normal
+    0.72 (2026-05-27):
+      remove legacy DR dependency path (dependency.lic enforces 5.17.2 for DR)
+      keep respond_to? guards for GS backward compatibility on older lich
+    0.71 (2026-05-07):
+      Force population of Account.subscription for newer Lich5 when using non-Lich authentication
+    0.70 (2026-05-07):
+      fix: use Script.run to block until dependency finishes before starting DR scripts
+    0.69 (2026-05-06):
+      fix: start dependency before autostart scripts so parse_args() bridge is available
+    0.68 (2026-05-05):
+      game-agnostic YAML autostarts, wayto overrides, and double-start guard
+    0.67 (2026-04-03):
+      DR: when core lich provides get_settings/start_scripts_if_available,
+      own the autostart loop directly instead of delegating to dependency.lic
+    0.66 (2025-09-01):
+      cleanup of single-run logic pieces
+      always show lich5 announce updates
+    0.65 (2025-04-15):
+      updated .class type check to .is_a? type check
+    0.64 (2024-11-14):
+      Ensure repository always runs before dependency for DR. Rejig first run detection.
+    0.63 (2024-08-03):
+      Prevent blindly automatic updating of Lich5, there be dragons!
+    0.62 (2024-06-13):
+      Prep for Lich5 5.10.0 release and infomon DB refresh API
+    0.61 (2024-05-20):
+      Use internal Lich5 update module on Lich > 5.6.2 instead of script
+    0.60 (2023-09-07):
+      Removal of #quiet to prevent script being ran in quiet mode.
+    0.59 (2023-07-29):
+      Update to Infomon.sync db check to prevent race condition against possible XML stream
+    0.58 (2023-06-04):
+      Change Infomon::CLI.sync to Infomon.sync
+    0.57 (2023-03-12):
+      Prep work for infomon.rb library to not run older infomon.lic script
+    0.56 (2022-05-29):
+      Change default started scripts for fresh install
+    0.55 (2022-03-31):
+      Added messaging for DR users noting this script isn't normally used with DR-Scripts
+      Adding check for dependency, with note.
+    0.54 (2022-03-15):
+      Added logic to welcome Dragonrealms.
+      DragonRealms/GemstoneIV infomon detection
+      Removed xnarost from default autostarting
+    0.53 (2021-07-27):
+      Fixed defect where autostart would error if a completely new / fresh install with no lich.db3 existing.
+    0.52 (2021-05-10):
+      Fixed removal of lich being updated when running Lich5
+    0.51 (2020-09-09):
+      Added LR detect GTK version
+      Forcing unset-lich-updatable to prevent overwriting GTK3-enabled Lich only if GTK3 detected
+      Exclude narost / alias from update list if GTK3 detected
+      The above are only intended to be used in the GTK3 distro.
+    0.5 (2020-07-05):
+      Forced infomon and repository update to run at start
+      Prevented duplicate runs of infomon
+      Fixed bug with repository update not running
+      Made go2 and narost defaults
+      Formatting changes
+    0.4 (2015-07-12):
+      start infomon before other scripts
+    0.3 (2014-11-23):
+      add default settings on first run
+    0.2 (2014-11-10):
+      auto add infomon to global autostart list
+
+=end
+
+def gtk_version
+  begin
+    return 'not installed' unless Object.const_defined?(:Gtk)
+    return 'unknown' unless Gtk.const_defined?(:Version)
+    return Gtk::Version::STRING
+  rescue
+    return 'error'
+  end
+end
+
+# Normalizes a single YAML autostart entry into a [name, args] pair.
+#
+# Autostart entries may take three forms:
+#   - a bare script name:   "lichbot"          -> ["lichbot", []]
+#   - a name with args:     "lichbot start"    -> ["lichbot", ["start"]]
+#   - a { name:, args: } hash                  -> ["lichbot", ["start"]]
+# Hash keys may be Symbols (:name / :args) or Strings ('name' / 'args'), since
+# YAML parses inline hash keys as Strings. Both forms are accepted.
+#
+# This is the single source of truth for autostart entry formats; adding a
+# future format is a localized change here.
+#
+# @param entry [String, Hash, nil] a YAML autostart entry.
+# @return [Array(String, Array<String>)] the script name and its argument list.
+#   The name is "" when the entry carries no usable name (callers guard on this).
+# @example Bare name
+#   normalize_autostart_entry('lichbot')                 # => ['lichbot', []]
+# @example Name with whitespace-separated args
+#   normalize_autostart_entry('lichbot start')           # => ['lichbot', ['start']]
+# @example Symbol-keyed hash
+#   normalize_autostart_entry(:name => 'lichbot', :args => ['start']) # => ['lichbot', ['start']]
+# @example String-keyed hash (as produced by YAML)
+#   normalize_autostart_entry('name' => 'lichbot', 'args' => ['start']) # => ['lichbot', ['start']]
+def normalize_autostart_entry(entry)
+  if entry.is_a?(Hash)
+    name = (entry[:name] || entry['name']).to_s.strip
+    args = Array(entry[:args] || entry['args']).map(&:to_s)
+    [name, args]
+  else
+    parts = entry.to_s.split
+    [parts.first.to_s, parts[1..].to_a]
+  end
+end
+
+# Collects, normalizes, and de-dups the profile's YAML autostart entries.
+#
+# Reads get_settings.autostarts, normalizes every entry to a [name, args] pair
+# via {#normalize_autostart_entry}, drops entries with a blank name, and de-dups
+# by name. On a name collision an entry that carries args wins over a bare
+# (arg-less) duplicate; if several carry args, the first wins (so a duplicate
+# bare "lichbot" won't strip the args off a "lichbot start" entry). Start order
+# follows first occurrence of a name.
+#
+# @return [Array<Array(String, Array<String>)>] normalized [name, args] pairs.
+def yaml_autostart_entries
+  get_settings.autostarts.to_a
+              .map { |entry| normalize_autostart_entry(entry) }
+              .reject { |name, _args| name.nil? || name.empty? }
+              .group_by { |name, _args| name }
+              .map { |_name, group| group.find { |_n, args| !args.empty? } || group.first }
+end
+
+# The set of script names already covered by the autostart configuration.
+#
+# Combines the profile YAML `autostarts:` list (when get_settings is available)
+# with the global and per-character DB autostart lists (Settings['scripts'] and
+# CharSettings['scripts']). Used to decide whether a legacy UserVars entry would
+# actually be lost if it were dropped.
+#
+# @return [Array<String>] unique, non-blank script names already autostarted.
+def autostart_covered_names
+  names = []
+  names.concat(get_settings.autostarts.to_a.map { |entry| normalize_autostart_entry(entry).first }) if respond_to?(:get_settings, true)
+  [Settings['scripts'], CharSettings['scripts']].each do |list|
+    names.concat(list.map { |info| info[:name] }) if list.is_a?(Array)
+  end
+  names.compact.map(&:to_s).reject(&:empty?).uniq
+end
+
+# Reads, reports on, and clears any legacy UserVars.autostart_scripts.
+#
+# UserVars.autostart_scripts was the old (now-removed) DR autostart store and is
+# no longer read as a launch source. This retires it read-only: it compares the
+# stale names against what is already covered by the YAML `autostarts:` list and
+# the ;autostart DB lists ({#autostart_covered_names}), then clears the UserVar.
+#
+# - If every stale entry is already covered, it just prints a brief note that the
+#   unused UserVar is being cleared (no action needed).
+# - If any stale entry is NOT in the YAML list or the DB, that script would stop
+#   autostarting, so it prints a loud notice naming the gap and the two ways to
+#   re-add it (profile YAML `autostarts:` list, or ;autostart add for the DB).
+#
+# Nothing is ever re-added automatically -- the user chooses where each script
+# should live. The UserVar is always cleared so the check runs only once.
+#
+# @return [void]
+def migrate_legacy_uservars_autostarts
+  legacy = UserVars.autostart_scripts.to_a
+  return if legacy.empty?
+
+  covered = autostart_covered_names
+  gaps = legacy.map { |entry| normalize_autostart_entry(entry).first }
+               .reject { |name| name.nil? || name.empty? }
+               .uniq
+               .reject { |name| covered.include?(name) }
+
+  if gaps.empty?
+    respond "\n--- autostart: clearing the legacy UserVars.autostart_scripts store -- it is no longer used and every entry is already in your YAML 'autostarts:' list or your ;autostart DB list. No action needed.\n\n"
+  else
+    plural = gaps.size == 1 ? 'script is' : 'scripts are'
+    respond "\n*** autostart: ACTION NEEDED ***"
+    respond "    The legacy UserVars.autostart_scripts store is being retired, but the following #{plural}"
+    respond "    NOT in your profile YAML 'autostarts:' list or your ;autostart DB list, so #{gaps.size == 1 ? 'it' : 'they'} will stop autostarting:"
+    respond "      #{gaps.join(', ')}"
+    respond "    To keep #{gaps.size == 1 ? 'it' : 'them'} starting at login, add each to EITHER:"
+    respond "      - your profile YAML 'autostarts:' list (args supported, e.g.  - lichbot start), or"
+    respond "      - the autostart database:  #{$clean_lich_char}autostart add <script> [args]   (or --global <script> [args])"
+    respond "    Clearing UserVars.autostart_scripts now.\n\n"
+  end
+
+  UserVars.autostart_scripts = nil
+end
+
+# Starts a single normalized YAML autostart entry, applying the shared
+# skip-guards: 'dependency', obsolete DR scripts, already-running, and
+# missing-on-disk (which emits the "not found, skipping" notice).
+#
+# @param name [String] the normalized script name to start.
+# @param args [Array<String>] arguments to pass to the script.
+# @return [Boolean] true if the script was started, false if a guard skipped it.
+def launch_autostart(name, args)
+  return false if name == 'dependency'
+  return false if defined?(DR_OBSOLETE_SCRIPTS) && DR_OBSOLETE_SCRIPTS.include?(name)
+  return false if Script.running?(name)
+
+  unless Script.exists?(name)
+    respond "\n--- autostart: '#{name}' not found, skipping\n\n"
+    return false
+  end
+
+  start_script(name, args)
+  true
+end
+
+if defined?(Lich::Common::Account) && (Lich::Common::Account.subscription.nil? || (Lich::Common::Account.subscription.is_a?(String) && Lich::Common::Account.subscription !~ /free|normal|premium/i))
+  respond "Retrieving Account subscription information due to currently undetected!"
+  waitrt?
+  case XMLData.game
+  when /^DR/i
+    Lich::Util.issue_command("PLAYED", /^Account Info for /, /<prompt/, include_end: true, timeout: 5, silent: false, usexml: true, quiet: false)
+  when /^GS/i
+    Lich::Util.issue_command("ACCOUNT", /^(?:<pushBold\/>)?Game Instance:(?:<popBold\/>)? /, /<prompt/, include_end: true, timeout: 5, silent: false, usexml: true, quiet: false)
+  end
+  respond "Account subscription detected as #{Lich::Common::Account.subscription}"
+end
+
+if Settings['scripts'].nil?
+  Settings['scripts'] = Array.new
+  Settings['scripts'].push(:name => 'alias', :args => [])
+  # Settings['scripts'].push(:name => 'lnet', :args => [])
+end
+
+# Let's go find out if we need to switch lich from updatable state
+
+def lich_no_update
+  script_name = "repository"
+  scope = ":"
+  blob = Hash.new
+
+  begin
+    blob = Lich.db.get_first_value('SELECT hash FROM script_auto_settings WHERE script=? AND scope=?;', script_name.encode('UTF-8'), scope.encode('UTF-8'))
+  rescue SQLite3::BusyException
+    sleep 0.1
+    retry
+  end
+
+  hash = Marshal.load(blob) if blob
+  if hash['updatable'][:lich] || !hash
+    return true
+  else
+    return false
+  end
+end
+
+if script.vars.empty?
+  sleep 0.5
+  # Wait after login then unset lich updatable before any other action (GTK3 option only)
+  start_script 'repository', ['unset-lich-updatable'] if gtk_version > "3" && lich_no_update()
+  200.times { sleep 0.1; break if !running?('repository') }
+  did_something = false
+
+  # Run repository to update scripts
+  Script.run('repository', 'download-updates')
+
+  # Run infomon
+  if XMLData.game !~ /^DR/ && defined?(Infomon) && Infomon.get("infomon.last_sync").nil?
+    if defined?(Infomon.db_refresh_needed?)
+      sleep(1) while Infomon.db_refresh_needed?
+    else
+      Infomon.sync
+    end
+  elsif XMLData.game !~ /^DR/ && defined?(Infomon).nil?
+    Script.start("infomon")
+  end
+
+  # Check for Lich5 updates and announce if available
+  if defined?(Lich::Util::Update)
+    Lich::Util::Update.request("--announce")
+  end
+
+  # DR: load dependency for its runtime helpers (bankbot, slackbot, hometown).
+  # Core lich 5.17.2+ provides parse_args, get_settings, map overrides natively.
+  if XMLData.game =~ /^DR/
+    Script.run('dependency') if Script.exists?('dependency') && !Script.running?('dependency')
+    did_something = true
+  end
+
+  # One-time migration: warn about and clear the legacy UserVars.autostart_scripts
+  # store (superseded by the profile YAML `autostarts:` list and the ;autostart DB).
+  migrate_legacy_uservars_autostarts
+
+  # YAML-based autostarts (get_settings.autostarts) and wayto overrides.
+  # Guarded for GS backward compatibility on lich < 5.17.
+  #
+  # Each entry in the profile's `autostarts:` list may take one of three forms:
+  #   - a bare script name          - "lichbot"
+  #   - a name with arguments       - "lichbot start"
+  #   - a { name:, args: } hash     - { name: lichbot, args: [start] }
+  # Entries are normalized to [name, args] and de-duped by name; on a name
+  # collision an entry that carries args wins over a bare duplicate (so a
+  # duplicate bare "lichbot" won't strip the args off a "lichbot start" entry).
+  # See normalize_autostart_entry / yaml_autostart_entries / launch_autostart.
+  #
+  # NOTE: the normalizer is intentionally scoped to this YAML path and not
+  # shared with the Settings/CharSettings DB loop below. That loop already
+  # stores normalized { :name, :args } hashes and carries a distinct guard set
+  # (infomon/repository skips, lich5-update skip, DR dependency removal), so
+  # reusing the normalizer there would add coupling without removing duplication.
+  if respond_to?(:get_settings, true)
+    entries = yaml_autostart_entries
+
+    Map.apply_wayto_overrides if Map.respond_to?(:apply_wayto_overrides)
+
+    entries.each { |name, args| launch_autostart(name, args) }
+    did_something = true unless entries.empty?
+  end
+
+  for script_list in [Settings['scripts'], CharSettings['scripts']]
+    if script_list.is_a?(Array)
+      # Loop through list
+      for script_info in script_list
+        if ['infomon', 'repository', 'dependency'].include?(script_info[:name])
+          next
+        elsif script_info[:name] == 'lich5-update' && defined?(Lich::Util::Update)
+          next
+        elsif script_info[:name] == 'dependency' && XMLData.game =~ /^DR/
+          respond "\n--- dependency found in autostart list. Attempting to remove it now. If unsuccessful, it can be safely removed with '#{$clean_lich_char}autostart remove --global dependency'"
+          temp_script_list = Settings['scripts']
+          if (temp_script_list.is_a?(Array)) and (temp_script_info = temp_script_list.find { |s| s[:name] == script_info[:name] })
+            temp_script_list.delete(temp_script_info)
+            Settings['scripts'] = temp_script_list
+            respond "\n--- #{script_info[:name]} was removed from the global autostart list\n\n"
+          end
+          temp_script_list = CharSettings['scripts']
+          if (temp_script_list.is_a?(Array)) and (temp_script_info = temp_script_list.find { |s| s[:name] == script_info[:name] })
+            temp_script_list.delete(temp_script_info)
+            CharSettings['scripts'] = temp_script_list
+            respond "\n--- #{script_info[:name]} was removed from #{XMLData.name}'s autostart list\n\n"
+          end
+          next
+        else
+          next if Script.running?(script_info[:name])
+
+          Script.start(script_info[:name], :args => script_info[:args])
+        end
+
+        did_something = true
+      end
+    end
+  end
+  unless did_something
+    echo 'nothing to do'
+  end
+elsif (script.vars[1] =~ /^add$/i) and script.vars[2] and (script.vars[3] or script.vars[2] !~ /^\-\-global$/i)
+  if script.vars[2] =~ /^\-\-global$/i
+    script_list = Settings['scripts']
+    script_list = Array.new unless script_list.is_a?(Array)
+    if not Script.exists?(script.vars[3])
+      respond "\n--- #{script.vars[3]} does not appear to be a valid script\n\n"
+    elsif script_list.any? { |s| s[:name] == script.vars[3].downcase }
+      respond "\n--- #{script.vars[3]} is already set to start at login for all characters\n\n"
+    else
+      script_list.push(:name => script.vars[3].downcase, :args => script.vars[4..-1])
+      Settings['scripts'] = script_list
+      respond "\n--- #{script.vars[3]} will now start at login for all characters\n\n"
+    end
+  else
+    script_list = CharSettings['scripts']
+    script_list = Array.new unless script_list.is_a?(Array)
+    if not Script.exists?(script.vars[2])
+      respond "\n--- #{script.vars[2]} does not appear to be a valid script\n\n"
+    elsif script_list.any? { |s| s[:name] == script.vars[2].downcase }
+      respond "\n--- #{script.vars[2]} is already set to start at login for #{Char.name}\n\n"
+    else
+      script_list.push(:name => script.vars[2].downcase, :args => script.vars[3..-1])
+      CharSettings['scripts'] = script_list
+      respond "\n--- #{script.vars[2]} will now start at login for #{Char.name}\n\n"
+    end
+  end
+elsif script.vars[1] =~ /^rem(?:ove)?$|^del(?:ete)?$/ and script.vars[2] and (script.vars[3] or script.vars[2] !~ /^\-\-global$/i)
+  if script.vars[2] =~ /^\-\-global$/i
+    script_list = Settings['scripts']
+    if (script_list.is_a?(Array)) and (script_info = script_list.find { |s| s[:name] == script.vars[3].downcase })
+      script_list.delete(script_info)
+      Settings['scripts'] = script_list
+      respond "\n--- #{script.vars[3]} was removed from the global autostart list\n\n"
+    else
+      respond "\n--- #{script.vars[3]} was not found in the global autostart list\n\n"
+    end
+  else
+    script_list = CharSettings['scripts']
+    if (script_list.is_a?(Array)) and (script_info = script_list.find { |s| s[:name] == script.vars[2].downcase })
+      script_list.delete(script_info)
+      CharSettings['scripts'] = script_list
+      respond "\n--- #{script.vars[2]} was removed from #{XMLData.name}'s autostart list\n\n"
+    else
+      respond "\n--- #{script.vars[2]} was not found in #{XMLData.name}'s autostart list\n\n"
+    end
+  end
+elsif script.vars[1] =~ /^list$/i
+  script_list = Settings['scripts']
+  output = "\n--- Global autostart scripts: "
+  if (script_list.is_a?(Array)) and not script_list.empty?
+    output.concat script_list.collect { |script_information| if script_information[:args].empty?; script_information[:name]; else; "#{script_information[:name]} (args: #{script_information[:args].join(' ')})"; end }.join(', ')
+    output.concat "\n\n"
+  else
+    output.concat "(none)\n\n"
+  end
+  script_list = CharSettings['scripts']
+  output.concat "--- #{XMLData.name}'s autostart scripts: "
+  if (script_list.is_a?(Array)) and not script_list.empty?
+    output.concat script_list.collect { |script_information| if script_information[:args].empty?; script_information[:name]; else; "#{script_information[:name]} (args: #{script_information[:args].join(' ')})"; end }.join(', ')
+    output.concat "\n\n"
+  else
+    output.concat "(none)\n\n"
+  end
+  respond output
+else
+  output = "\n"
+  output.concat "Usage:\n"
+  output.concat "\n"
+  output.concat "     #{$clean_lich_char}autostart add <script name> <args>\n"
+  output.concat "     #{$clean_lich_char}autostart add --global <script name> <args>\n"
+  output.concat "\n"
+  output.concat "     #{$clean_lich_char}autostart remove <script name>\n"
+  output.concat "     #{$clean_lich_char}autostart remove --global <script name>\n"
+  output.concat "\n"
+  output.concat "     #{$clean_lich_char}autostart list\n"
+  output.concat "\n"
+  respond output
+end

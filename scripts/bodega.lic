@@ -1,0 +1,1668 @@
+=begin
+
+  this script uses the new playershop system by Naos to parse in-game shop directories
+  and generate JSON files that can be consumed by external systems.
+
+  This script also exposes the Bodega module that other scripts may call.
+
+  ;bodega --help is your friend
+
+  Author: Ondreian
+  Requirements: Ruby >= 2.3
+  version: 0.8.1
+  tags: playershops
+
+  changelog:
+    v0.8.1 - Fix asset downloads on Ruby 3 and later: open asset URLs with
+             URI.open, since Kernel#open no longer fetches URLs
+    v0.8 - Capture shop location from the new SHOP BROWSE preamble format
+           - Extract room_name, room_number (game's official room id), and
+             exterior as shop-level fields on every scan (full and smart)
+           - Remove shop_mapping.json load/save plumbing; location data now
+             flows through the town JSONs instead
+    v0.7 - Preserve complete item inspection details in raw data
+           - Fix issue where parsed properties were removed from raw output
+           - Raw data now contains full item inspection regardless of parsing
+    v0.6 - Fix shop ID swap handling during maintenance reboots
+           - Smart scan now automatically syncs room_title with preamble
+           - Prevents stale room metadata when shop IDs are reassigned
+           - Maintains shop type detection during synchronization
+    v0.5 - Add smart parsing mode for 90%+ performance improvement
+           - New --smart flag for intelligent item inspection
+           - Loads existing JSON, compares IDs, only inspects new items
+           - Automatic removal of deleted items from cache
+           - Comprehensive efficiency reporting and change detection
+           - Clean non-invasive implementation with graceful fallbacks
+    v0.4 - Add API-based upload to github site.
+    v0.3 - Update for Lich 5.11 compatibility
+    v0.2 - Update for Ruby v3 compatibility
+
+=end
+require "ostruct"
+require "json"
+require "net/http"
+require "fileutils"
+require "pp"
+
+unless Gem::Version.new(RUBY_VERSION) >= Gem::Version.new("2.3")
+  fail "your ruby@#{RUBY_VERSION} is too old"
+end
+##
+## check if a String is an int
+##
+class ::String
+  def is_i?
+    !!(self =~ /\A[-+]?[0-9]+\z/)
+  end
+end
+
+##
+## polyfill for working with MatchData
+##
+class ::MatchData
+  def to_struct
+    OpenStruct.new to_h
+  end
+
+  def to_h
+    Hash[self.names.map(&:to_sym).zip(self.captures.map(&:strip).map do |capture|
+      if capture.is_i? then capture.to_i else capture end
+    end)]
+  end
+end
+
+module Bodega
+  ##
+  ## contextual logging
+  ##
+  module Log
+    def self.out(msg, label: :debug)
+      if msg.is_a?(Exception)
+        msg = %{
+          #{msg.message}
+          #{msg.backtrace.join("\n")}
+        }
+      end
+
+      msg = _view(msg, label)
+
+      if Opts.headless
+        $stdout.write(msg + "\n")
+      else
+        _respond Preset.as(:debug, msg)
+      end
+    end
+
+    def self._view(msg, label)
+      label = [Script.current.name, label].flatten.compact.join(".")
+      safe = msg.inspect
+      safe = safe.gsub("<", "(").gsub(">", ")") if safe.include?("<") and safe.include?(">")
+      "[#{label}] #{safe}"
+    end
+
+    def self.pp(msg, label = :debug)
+      respond _view(msg, label)
+    end
+
+    def self.dump(*args)
+      pp(*args)
+    end
+
+    module Preset
+      def self.as(kind, body)
+        %[<preset id="#{kind}">#{body}</preset>]
+      end
+    end
+  end
+
+  ##
+  ## minimal options parser
+  ##
+  module Opts
+    FLAG_PREFIX = "--"
+
+    def self.parse_command(h, c)
+      if c == "smart"
+        h[:smart] = true
+      else
+        h[c.to_sym] = true
+      end
+    end
+
+    def self.parse_flag(h, f)
+      (name, val) = f[2..-1].split("=")
+      if val.nil?
+        h[name.to_sym] = true
+      else
+        val = val.split(",")
+
+        h[name.to_sym] = val.size == 1 ? val.first : val
+      end
+    end
+
+    def self.parse(args = Script.current.vars[1..-1])
+      return @opts ||= _parse(args) if @script.eql?(Script.current)
+      @script = Script.current
+      return @opts = _parse(args) if @script.eql?(Script.current)
+    end
+
+    def self._parse(args)
+      OpenStruct.new(**args.to_a.reduce(Hash.new) do |opts, v|
+        if v.start_with?(FLAG_PREFIX)
+          Opts.parse_flag(opts, v)
+        else
+          Opts.parse_command(opts, v)
+        end
+        opts
+      end)
+    end
+
+    def self.method_missing(method, *args)
+      parse.send(method, *args)
+    end
+  end
+end
+
+module Bodega
+  module Messages
+    TOWNS    = %r[Valid options include: (?<towns>.*?)\.]
+    COMMAND  = %r[You can use the (?<command>.*?) command to browse the inventory of a particular shop.]
+    NEW_ROOM = %r[^(?<room_title>.*)\s\((?<branch>\w+)\)$]
+    SIGN     = %r[^Written on]
+    ITEM     = %r[^\s*(?<item_id>\d+)\).*?for\s+(?<price>[\d,]+)\s+silver(?:\s*\((?<quantity>\d+)\s+available\))?]
+  end
+end
+
+module Bodega
+  class Collector
+    MAX_TRIES = Opts.to_h.fetch("max-tries", 3)
+
+    attr_reader :start, :close, :command
+
+    def initialize(start:, close:, command:)
+      @start   = start
+      @close   = close
+      @command = command
+    end
+
+    def blow_up(ttl)
+      fail StandardError, "Collector(start: #{@start}, close: #{@close}) failed to complete in #{ttl} seconds after #{MAX_TRIES} tries"
+    end
+
+    def compare(line, pattern)
+      return line.include?(pattern) if pattern.is_a?(String)
+      return pattern.match(line)    if pattern.is_a?(Regexp)
+      fail "Unable to compare #{pattern.class} <=> #{line.class}"
+    end
+
+    def run(seconds = 5, tries: 0)
+      Log.out(@command, label: :retry) if tries > 0
+      fput @command
+      result = []
+      ttl    = Time.now + seconds
+      while (Time.now < ttl)
+        line = get?
+        if line.nil?
+          sleep 0.1
+          next
+        end
+        result.push(line) if compare(line, @start) or not result.empty?
+        return result     if compare(line, @close) and not result.empty?
+      end
+
+      # Timed out. Retry while tries remain, otherwise raise. Previously the
+      # boundary case tries == MAX_TRIES fell through both conditions and
+      # returned nil, causing confusing NoMethodError crashes at call sites
+      # instead of the intended blow_up message.
+      return run(seconds, tries: tries + 1) if tries < Collector::MAX_TRIES
+      blow_up(seconds)
+    end
+  end
+end
+
+module Bodega
+  class Extractor
+    BLACKLIST = Regexp.union(
+      %r[^There is nothing there to read\.$],
+      %r[^You carefully inspect],
+      %r[^You get no sense of whether or not (.*?) may be further lightened.],
+      %r[there is no recorded information on that item],
+      %r[^You determine that you could not wear the shard\.],
+      %r[^You see nothing unusual\.$],
+      %r[^It imparts no bonus more than usual\.$],
+      %r[^It is difficult to see the (.*?) clearly from this distance\.]
+    )
+
+    ENHANCIVE = {
+      boost: %r[^It provides a boost of (?<boost>\d+) to (?<ability>.*?)\.],
+      level_req: %r[^This enhancement may not be used by adventurers who have not trained (?<level>\d+) times.],
+    }
+
+    BOOLS = {
+      max_deep: %r[pockets could not possibly get any deeper],
+      max_light: %r[^You can tell that the (?:.*?) is as light as it can get],
+      purpose: %r[appears to serve some purpose],
+      deepenable: %r[you might be able to have a talented merchant deepen its pockets for you],
+      lightenable: %r[You might be able to have a talented merchant lighten (.*?) for you.],
+      persists: %r[^It will persist after its last charge is depleted|^It will persist after its last enhancive charge],
+      crumbly: %r[but crumble after its last enhancive charge is depleted|^It will crumble into dust after its last charge is depleted\.$|^It will disintegrate after its last charge is depleted\.$],
+      small: %r[^It is a small item, under a pound],
+      imbeddable: %r[^It is a magical item which could be imbedded with a spell],
+      not_wearable: %r[^You determine that you could not wear],
+      holy: %r[^It is a holy item\.],
+      is_gemstone: %r[^The jewel appears to be a powerful relic that can convey wondrous abilities on its wielder],
+      # Combat Modifiers
+      spiked: %r[It is spiked\.],
+      # Resistances
+      magic_resistant: %r[It is magic resistant\.],
+      # Special Features
+      scripted: %r[Additional scripts have been applied|has a Custom.*script|Shield Cape Collection|It is Tier \d+|Blink Weapon|briar flare weapon|has some unknown \(scripted\) benefit],
+      flourish: %r[It has the .* Flourish],
+      # Holy Fire (separate from sanctify tier)
+      holy_fire: %r[permanent Holy Fire flares],
+      # Greater Undead Bane (GUB) - appears with sanctified weapons
+      gub: %r[provides an additional \+\d+ AS bonus against the undead],
+    }
+
+    PROPS = {
+      skill: %r[requires skill in (?<skill>.*?) to use effectively\.],
+      enchant: %r[^It imparts a bonus of \+(?<enchant>\d+) more than usual\.],
+      weight: %r[^It appears to weigh about (?<weight>\d+) pounds.],
+      # flare: %r[^It has been infused with the power of an? (?<flare>.*?)\.],
+      material: %r[^It looks like this item has been mainly crafted out of (?<material>.*?)\.],
+      material_enhanced: %r[^It is predominantly crafted of (?<material>.*?)\.\s*(?:It is (?<material_detail>(?:greater|lesser|pristine) .*?)\.)?],
+      cost: %r[will cost (?<cost>\d+) coins\.$],
+      worn: %r[The .*? can be worn(?:, slinging it across the |, hanging it from the |, attaching it to the | around the | in the | on the | over(?: the)? )(?<worn>[^.]+)(?=.)],
+      activator: %r[^It could be activated by (?<activator>\w+) it\.$],
+      spell: %r[^It is currently imbedded with the (?<spell>.*?) spell.],
+      charges: %r[The (?:\w+) looks to have (?<charges>.*?) charges remaining\.$|It has (?<charges>.*?) charges remaining.],
+      shield_size: %r[Your careful inspection of an ornate villswood shield allows you to conclude that it is a (?<size>\w+) shield that],
+      armor_type: %r[ allows you to conclude that it is (?<armor_type>.*?)\.],
+      flare: %r[It has been infused with (?<flare>.*?)\.$],
+      gemstone_bound_to: %r[jewel is bound to (?<gemstone_bound_to>\w+),],
+      # TD Bonus
+      td_bonus: %r[protects against magical attacks with a bonus of (?<td_bonus>\d+)],
+      # Sanctification tier (1-5)
+      sanctify: %r[has been sanctified (?<sanctify>\d+) times?],
+      # Ensorcell tier (1-5)
+      ensorcell: %r[has been ensorcelled (?<ensorcell>\d+) times?],
+      # ARMOR: Padding (captures descriptor)
+      dmg_padding: %r[(?<dmg_padding>somewhat|fairly|heavily|very heavily|masterfully) padded to lessen the damage],
+      crit_padding: %r[(?<crit_padding>somewhat|fairly|heavily|very heavily|masterfully) padded against critical blows],
+      # WEAPON: Weighting (captures descriptor)
+      dmg_weighting: %r[(?<dmg_weighting>lightly|somewhat|fairly|heavily|very heavily|exceptionally) weighted to inflict more damage],
+      crit_weighting: %r[(?<crit_weighting>lightly|somewhat|fairly|heavily|very heavily|exceptionally) weighted to inflict more critical wounds],
+      # RANGED: Sighting (captures descriptor)
+      sighting: %r[(?<sighting>somewhat|fairly|heavily|very heavily) sighted to assist in aiming],
+      # FORGED: Quality tier from forging (captures forger name and AvD bonus, can be negative)
+      forged_by: %r[It is forged by (?<forged_by>.*?) and has (?:increased|decreased) \((?<forged_avd>[+-]?\d+)\) effectiveness in combat],
+    }
+
+    def self.of(details)
+      # todo: implement detail extractor
+      return new(details).to_h
+    end
+
+    attr_reader :props
+
+    def initialize(details)
+      @props = { raw: [], tags: [] }
+      _extract(details)
+    end
+
+    def maybe_raw(line)
+      # Always add non-blacklisted lines to raw, regardless of parsing
+      return if BLACKLIST.match(line)
+      @props[:raw] << line
+    end
+
+    def _extract(details)
+      # Convert to array for indexed access (needed for jewel property parsing)
+      details_array = details.to_a
+
+      details_array.each_with_index do |line, index|
+        # Try to parse gemstone properties first (multi-line blocks)
+        next if _gemstone_property(details_array, index)
+
+        # Always add to raw (unless blacklisted)
+        maybe_raw(line)
+
+        # Then handle single-line patterns for extraction
+        _props(line)
+        _bools(line)
+        _enhancive(line.strip)
+      end
+    end
+
+    def _bools(line)
+      BOOLS.select do |prop, pattern|
+        line.match(pattern) and @props[:tags].push(prop)
+      end.size > 0
+    end
+
+    def _enhancive(line)
+      if (boost = line.match(ENHANCIVE[:boost]))
+        enhancives = @props[:enhancives] ||= []
+        enhancives.push(boost.to_h)
+        return true
+      end
+
+      if (level_req = line.match(ENHANCIVE[:level_req]))
+        enhancives.last.merge!(level_req.to_h)
+        return true
+      end
+
+      return false
+    end
+
+    def _gemstone_property(lines, index)
+      # Parse gemstone property blocks that span multiple lines
+      return false unless lines[index].match(/^Property:\s+(.+)$/)
+
+      property = { name: $1.strip }
+
+      # Look for Rarity on next line
+      if index + 1 < lines.size && lines[index + 1].match(/^Rarity:\s+(.+)$/)
+        property[:rarity] = $1.strip
+      end
+
+      # Look for Mnemonic
+      if index + 2 < lines.size && lines[index + 2].match(/^Mnemonic:\s+(.+)$/)
+        property[:mnemonic] = $1.strip
+      end
+
+      # Look for Description (may span multiple lines)
+      if index + 3 < lines.size && lines[index + 3].match(/^Description:\s+(.+)$/)
+        description = $1.strip
+
+        # Check for continuation on next lines (not starting with known patterns)
+        current_index = index + 4
+        while current_index < lines.size
+          # Stop if we hit another property block or known pattern
+          break if lines[current_index].match(/^Property:|^\*|^You note|^The jewel/)
+          # Add continuation lines
+          unless lines[current_index].strip.empty?
+            description += " " + lines[current_index].strip
+          end
+          current_index += 1
+        end
+
+        property[:description] = description
+      end
+
+      # Check for activation marker
+      if lines.size > index + 4 && lines[index + 4].match(/^\s*\*\s+Activated/)
+        property[:activated] = true
+      elsif lines.size > index + 5 && lines[index + 5].match(/^\s*\*\s+Activated/)
+        property[:activated] = true
+      end
+
+      @props[:gemstone_properties] ||= []
+      @props[:gemstone_properties] << property
+
+      return true
+    end
+
+    def _props(line)
+      PROPS.select do |prop, pattern|
+        if prop == :worn && line =~ /anywhere on the body/i
+          @props[:worn] = "pin"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /around the chest, beneath another garment/i
+          @props[:worn] = "undershirt"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /on the feet, beneath shoes or boots/i
+          @props[:worn] = "socks"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /slinging it across the shoulders and back/i
+          @props[:worn] = "shoulders"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /hanging it from the shoulders/i
+          @props[:worn] = "cloak"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /leggings/i
+          @props[:worn] = "leggings"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /on the legs/i
+          @props[:worn] = "pants"
+          true  # Return true to indicate a match was found
+        elsif prop == :worn && line =~ /around the legs/i
+          @props[:worn] = "legs"
+          true  # Return true to indicate a match was found
+        elsif (result = line.match(pattern))
+          @props.merge!(result.to_h)
+          true
+        else
+          false
+        end
+      end.size > 0
+    end
+
+    def to_h
+      @props
+    end
+  end
+end
+
+module Bodega
+  module Assets
+    $lich_dir = "/tmp" unless defined? $lich_dir
+
+    LOCAL_FS_ROOT = Pathname.new($lich_dir) + (Opts.local_dir || "bodega")
+    URL           = Opts.remote || "https://bodega.surge.sh"
+
+    begin
+      FileUtils.mkdir_p(LOCAL_FS_ROOT)
+    rescue => exception
+      Log.out("Failed to create bodega directory: #{LOCAL_FS_ROOT}")
+      Log.out("Error: #{exception.message}")
+      Log.out("lich_dir: #{$lich_dir}")
+      Log.out("local_dir option: #{Opts.local_dir}")
+      fail "Cannot create bodega directory - check permissions and paths"
+    end
+
+    def self.local_path(file)
+      LOCAL_FS_ROOT + file
+    end
+
+    def self.remote_path(file)
+      [URL, file].join("/")
+    end
+
+    def self.checksum(file)
+      require "digest"
+      file = local_path(file)
+      if File.exist?(file)
+        Digest::SHA256.file(file).hexdigest
+      else
+        false
+      end
+    end
+
+    def self.glob(pattern)
+      Dir[LOCAL_FS_ROOT + pattern]
+    end
+
+    def self.read_local_json(file)
+      Utils.read_json local_path(file)
+    end
+
+    def self.write_local_json(data, file)
+      Utils.write_json(data,
+                       local_path(file + ".json"))
+    end
+
+    def self.get_remote(file)
+      url = remote_path(file)
+      uri = URI(url)
+      Net::HTTP.get(uri)
+    end
+
+    def self.is_stale?(remote)
+      remote = OpenStruct.new(remote)
+      not Assets.checksum(remote.base_name).eql?(remote.checksum)
+    end
+
+    def self.cached_files()
+      glob("*.json").reject do |f| f.include?("manifest.json") end
+    end
+
+    def self.stream_download(remote)
+      require("open-uri")
+      remote = OpenStruct.new(remote)
+      path = local_path(remote.base_name)
+      Log.out("updating".rjust(10) + " ... #{remote.base_name.gsub(".json", "").rjust(20)} >> #{remote.size}", label: :download)
+      IO.copy_stream(URI.parse(remote.url).open, path)
+    end
+  end
+end
+
+module Bodega
+  module Utils
+    def self.parse_json(str)
+      begin
+        JSON.parse(str, symbolize_names: true)
+      rescue => exception
+        Script.log(exception)
+        Script.log(exception.backtrace)
+        return {}
+      end
+    end
+
+    def self.read_json(file)
+      parse_json File.read(file)
+    end
+
+    def self.write_json(data, file)
+      Log.out("... writing #{file}", label: :filesystem)
+      File.open(file, 'w') do |f|
+        data = JSON.pretty_generate(data) unless data.is_a?(String)
+        f.write(data)
+      end
+    end
+
+    def self.fmt_time(diff)
+      return "#{(diff * 1_000.0).to_i}ms" if diff < 1
+      (h, m, s) = (diff / 60).as_time.split(":").map(&:to_i)
+
+      h = h % 24
+      d = h / 24
+
+      fmted = []
+      fmted << d.to_s.rjust(2, "0") + "d" if d > 0
+      fmted << h.to_s.rjust(2, "0") + "h" if h > 0
+      fmted << m.to_s.rjust(2, "0") + "m" if m > 0
+      fmted << s.to_s.rjust(2, "0") + "s" if s > 0
+      return fmted.join(" ")
+    end
+
+    def self.benchmark(**args)
+      template = args.fetch(:template, "{{run_time}}")
+      label    = args.fetch(:label, :benchmark)
+      start    = Time.now
+      result   = yield
+      run_time = Utils.fmt_time(Time.now - start)
+      Log.out(template.gsub("{{run_time}}", run_time), label: label)
+      return result
+    end
+
+    def self.safe_string(t)
+      # Kept in sync with processor.rb safe_string and data-loader.js
+      # safeString. Used here only for town/shop filenames; signatures are
+      # generated server-side in processor.rb.
+      t.to_s.downcase
+       .gsub("ta'", "ta_")
+       .gsub(/['",]/, "")
+       .gsub(/-|\s/, "_")
+    end
+
+    def self.pp(o)
+      begin
+        _respond PP.pp(o, "")
+      rescue => _ex
+        respond o.inspect
+      end
+    end
+  end
+end
+
+module Bodega
+  module Parser
+    def self.fetch_towns()
+      case (result = dothistimeout("shop direc", 5, Messages::TOWNS))
+      when Messages::TOWNS
+        result.match(Messages::TOWNS)[:towns].gsub(" and ", ", ").split(", ")
+      else
+        fail "unknown outcome for parsing available towns"
+      end
+    end
+
+    def self.towns()
+      @towns ||= fetch_towns
+    end
+
+    def self.shops(town)
+      coll = Collector.new(
+        command: %[shop direc #{town}],
+        start: %r[~*~ (?<title>.*?) Shops ~*~],
+        close: %[You can use the SHOP BROWSE]
+      )
+
+      result = coll.run()
+
+      next_command = result.last.match(Messages::COMMAND)[:command]
+
+      by_shop_number = result.slice(1..-2)
+                             .map(&:strip).map do |row| row.split(/\s{2,}/) end # split columns
+                             .flatten.map do |col| col.split(") ") end # split number/shop name
+
+      if Opts.shop
+        by_shop_number = Hash[by_shop_number.select do |_id, title| title.downcase.include?(Opts.shop.downcase) end]
+      end
+
+      Parser.scan_shops(town, Hash[by_shop_number], next_command)
+    end
+
+    def self.scan_shops(town, shops, cmd_template)
+      max_shop_depth = (Opts["max-shop-depth"] || 10_000).to_i
+      shops = shops.take(max_shop_depth)
+      shops.map.with_index do |k_v, idx|
+        (id, name) = k_v
+        right_col = "scanning [#{idx + 1}/#{shops.size}]".rjust(30)
+        Log.out(right_col + " ... Shop(id: #{id}, name: #{name})",
+                label: Utils.safe_string(town))
+        begin
+          # Route to smart or regular parsing based on --smart flag
+          if Opts.smart
+            Parser.smart_scan_inv(town, id, name, cmd_template.gsub("{SHOP#}", id))
+          else
+            Parser.scan_inv(town, id, name, cmd_template.gsub("{SHOP#}", id))
+          end
+        rescue => exception
+          Log.out(exception)
+          nil
+        end
+      end.compact # prune errored shops
+    end
+
+    def self.scan_inv(town, id, _name, cmd)
+      coll = Collector.new(
+        start: %[is located in],
+        close: %[You can use the SHOP INSPECT {STOCK#}],
+        command: cmd
+      )
+
+      (preamble, *inv) = coll.run()
+
+      result = { preamble: preamble,
+                 town: town,
+                 id: id,
+                 shop_owner: extract_shop_name_from_preamble(preamble),
+                 inv: parse_inv(inv.map(&:strip)) }.merge(location_fields(preamble))
+
+      result
+    end
+
+    def self.add_room(acc, row)
+      acc.push(
+        OpenStruct.new(
+          row.match(Messages::NEW_ROOM).to_h.merge({ items: [] })
+        )
+      )
+    end
+
+    def self.add_sign(acc, row)
+      acc.last.sign ||= []
+      acc.last.sign.push(row)
+    end
+
+    def self.add_item(acc, row)
+      match = row.match(Messages::ITEM)
+      # Store item_id, price, and quantity (if present) from browse output
+      item_data = {
+        id: match[:item_id],
+        browse_price: match[:price]&.gsub(',', '')&.to_i
+      }
+      # Only add quantity if it was captured
+      item_data[:quantity] = match[:quantity].to_i if match[:quantity]
+      acc.last.items.push(item_data)
+    end
+
+    def self.parse_inv(inv)
+      inv.reduce([]) do |acc, row|
+        # we are at the terminal line for this shop
+        break acc if row.include?("SHOP INSPECT")
+        Parser.add_room(acc, row) if row.match(Messages::NEW_ROOM)
+        Parser.add_sign(acc, row) if row.match(Messages::SIGN) or not acc.last.sign.nil?
+        Parser.add_item(acc, row) if row.match(Messages::ITEM) and acc.last.sign.nil?
+        acc
+      end
+         .map do |room|
+           max_item_depth = (Opts["max-item-depth"] || 100).to_i
+           room.items = room.items.take(max_item_depth).map do |item_data|
+             # item_data is now a hash with {id: ..., browse_price: ..., quantity: ... (optional)}
+             # Use raw mode if --raw-only flag is set
+             if Opts.raw_only || Opts["raw-only"]
+               Parser.scan_item_raw(item_data[:id] || item_data, item_data[:browse_price], item_data[:quantity])
+             else
+               Parser.scan_item(item_data[:id] || item_data, item_data[:browse_price], item_data[:quantity])
+             end
+           end
+           room
+         end
+      .map(&:to_h)
+    end
+
+    def self.get_browse_ids(inv)
+      # Extract item IDs, prices, and quantities from browse output without doing full inspection
+      item_data = {}
+
+      inv.reduce([]) do |acc, row|
+        break acc if row.include?("SHOP INSPECT")
+        Parser.add_room(acc, row) if row.match(Messages::NEW_ROOM)
+        Parser.add_sign(acc, row) if row.match(Messages::SIGN) or not acc.last.sign.nil?
+
+        # Extract item ID, price, and quantity without full inspection
+        if row.match(Messages::ITEM) and acc.last.sign.nil?
+          match = row.match(Messages::ITEM)
+          item_id = match[:item_id]
+          price = match[:price]&.gsub(',', '')&.to_i
+          item_info = { price: price }
+          item_info[:quantity] = match[:quantity].to_i if match[:quantity]
+          item_data[item_id] = item_info
+        end
+        acc
+      end
+
+      item_data
+    end
+
+    def self.load_and_validate_town_json(town)
+      # Load existing town JSON file with validation
+      filename = Utils.safe_string(town) + ".json"
+      file_path = Assets.local_path(filename)
+
+      return nil unless File.exist?(file_path)
+
+      begin
+        data = JSON.parse(File.read(file_path))
+
+        # Basic structure validation
+        unless data.is_a?(Hash) && data['shops'].is_a?(Array)
+          Log.out("Invalid JSON structure for #{town}, falling back to full parsing", label: :smart)
+          return nil
+        end
+
+        # Validate each shop has required fields
+        data['shops'].each do |shop|
+          unless shop.is_a?(Hash) && shop['id'] && shop['inv'].is_a?(Array)
+            Log.out("Invalid shop structure in #{town}, falling back to full parsing", label: :smart)
+            return nil
+          end
+        end
+
+        Log.out("Loaded existing data for #{town} (#{data['shops'].size} shops)", label: :smart)
+        data
+      rescue JSON::ParserError => e
+        Log.out("Corrupted JSON for #{town}: #{e.message}, falling back to full parsing", label: :smart)
+        nil
+      rescue => e
+        Log.out("Failed to load #{town}: #{e.message}, falling back to full parsing", label: :smart)
+        nil
+      end
+    end
+
+    def self.find_shop_by_id(town_data, shop_id)
+      # Find specific shop in town data by shop ID
+      return nil unless town_data && town_data['shops']
+
+      shop_data = town_data['shops'].find { |shop| shop['id'].to_s == shop_id.to_s }
+
+      if shop_data
+        Log.out("Found existing shop #{shop_id} in cached data", label: :smart)
+      else
+        Log.out("Shop #{shop_id} not found in cached data (new shop)", label: :smart)
+      end
+
+      shop_data
+    end
+
+    def self.extract_item_ids_from_shop(shop_data)
+      # Extract all item IDs from a shop's inventory structure
+      item_ids = Set.new
+
+      return item_ids unless shop_data && shop_data['inv']
+
+      shop_data['inv'].each do |room|
+        next unless room['items']
+        room['items'].each do |item|
+          item_ids.add(item['id'].to_s) if item['id']
+        end
+      end
+
+      item_ids
+    end
+
+    def self.smart_scan_inv(town, shop_id, _name, cmd)
+      # Smart parsing: load existing data, compare IDs, only inspect new items
+      Log.out("Smart scanning shop #{shop_id}", label: :smart)
+
+      # Initialize tracking if not exists
+      @smart_stats ||= { new_items: 0, removed_items: 0, unchanged_items: 0, shops_scanned: 0 }
+      @removed_items_tracker ||= {}
+
+      # Step 1: Get current browse IDs from shop scan
+      coll = Collector.new(
+        start: %[is located in],
+        close: %[You can use the SHOP INSPECT {STOCK#}],
+        command: cmd
+      )
+
+      (preamble, *inv) = coll.run()
+      current_items = get_browse_ids(inv.map(&:strip)) # Now returns {id => price}
+      current_ids = current_items.keys.to_set
+
+      Log.out("Found #{current_ids.size} items currently in shop #{shop_id}", label: :smart)
+
+      # Step 2: Load and validate existing town data
+      town_data = load_and_validate_town_json(town)
+
+      # Step 3: Find existing shop data
+      existing_shop = find_shop_by_id(town_data, shop_id)
+
+      if existing_shop.nil?
+        # New shop or no existing data - fall back to full parsing
+        Log.out("No existing data for shop #{shop_id}, performing full scan", label: :smart)
+
+        # Track that we had to do a full scan
+        @smart_stats[:shops_scanned] += 1
+        @smart_stats[:new_items] += current_ids.size # All items are "new" on first run
+
+        return {
+          preamble: preamble,
+          town: town,
+          id: shop_id,
+          shop_owner: extract_shop_name_from_preamble(preamble),
+          inv: parse_inv(inv.map(&:strip))
+        }.merge(location_fields(preamble))
+      end
+
+      # Step 4: Check if shop ID now points to a different owner (game reset reordered SHOP list)
+      current_owner = extract_shop_name_from_preamble(preamble)
+      cached_owner = existing_shop['shop_owner']
+
+      # If we cannot confirm the current owner from the preamble, we cannot
+      # trust that this shop_id still points to the same shop (IDs are
+      # reassigned on server reboots). Do a full rescan rather than merging
+      # into a possibly-wrong cached shop, which would silently corrupt it.
+      if current_owner == 'unknown'
+        Log.out("Shop ID #{shop_id} owner could not be determined from preamble - cannot verify cache identity, performing full scan.", label: :smart)
+        @smart_stats[:shops_scanned] += 1
+        @smart_stats[:new_items] += current_ids.size
+        return {
+          preamble: preamble,
+          town: town,
+          id: shop_id,
+          inv: parse_inv(inv.map(&:strip))
+        }.merge(location_fields(preamble))
+      end
+
+      if cached_owner && cached_owner.downcase != current_owner.downcase
+        Log.out("Shop ID #{shop_id} owner mismatch: cached=#{cached_owner}, current=#{current_owner} - game reset likely reordered shops. Wiping cache and doing full scan.", label: :smart)
+
+        @smart_stats[:shops_scanned] += 1
+        return {
+          preamble: preamble,
+          town: town,
+          id: shop_id,
+          shop_owner: current_owner,
+          inv: parse_inv(inv.map(&:strip))
+        }.merge(location_fields(preamble))
+      end
+
+      # Step 5: Extract existing item IDs
+      existing_ids = extract_item_ids_from_shop(existing_shop)
+      Log.out("Found #{existing_ids.size} items in cached shop #{shop_id}", label: :smart)
+
+      # Step 5: Calculate differences
+      new_ids = current_ids - existing_ids
+      removed_ids = existing_ids - current_ids
+      unchanged_ids = current_ids & existing_ids
+
+      Log.out("Smart diff for shop #{shop_id}: #{new_ids.size} new, #{removed_ids.size} removed, #{unchanged_ids.size} unchanged", label: :smart)
+
+      # Track statistics
+      @smart_stats[:new_items] += new_ids.size
+      @smart_stats[:removed_items] += removed_ids.size
+      @smart_stats[:unchanged_items] += unchanged_ids.size
+      @smart_stats[:shops_scanned] += 1
+
+      # Step 6: Remove deleted items from existing shop structure
+      # (Tracking moved to processor.rb)
+      if removed_ids.any?
+        remove_items_from_shop(existing_shop, removed_ids)
+      end
+
+      # Step 7: Batch inspect new items
+      new_items = []
+      if new_ids.any?
+        max_item_depth = (Opts["max-item-depth"] || 100).to_i
+        Log.out("Inspecting #{new_ids.size} new items for shop #{shop_id}", label: :smart)
+
+        new_ids.take(max_item_depth).each do |item_id|
+          begin
+            # Pass browse price and quantity to scan_item for more reliable cost tracking
+            item_info = current_items[item_id]
+            browse_price = item_info[:price]
+            quantity = item_info[:quantity]
+            # Use raw mode if --raw-only flag is set
+            item_data = if Opts.raw_only || Opts["raw-only"]
+                          scan_item_raw(item_id, browse_price, quantity)
+                        else
+                          scan_item(item_id, browse_price, quantity)
+                        end
+            new_items << item_data
+            # Item tracking moved to processor.rb
+          rescue => e
+            Log.out("Failed to inspect item #{item_id}: #{e.message}", label: :smart)
+          end
+        end
+      end
+
+      # Step 8: Add new items to existing shop structure
+      if new_items.any?
+        add_items_to_shop(existing_shop, new_items)
+      end
+
+      # Step 8.5: Update quantities for all current items from browse data
+      # This ensures quantities stay current even for unchanged items
+      existing_shop['inv']&.each do |room|
+        room['items']&.each do |item|
+          item_id = item['id'].to_s
+          if current_items[item_id]
+            item_info = current_items[item_id]
+            # Update quantity from browse data if it exists
+            if item_info[:quantity]
+              item['quantity'] = item_info[:quantity]
+            else
+              # Remove quantity field if no longer present in browse
+              item.delete('quantity')
+            end
+          end
+        end
+      end
+
+      # Return the updated shop structure, preserving room_id if it exists
+      # NOTE: Room titles are preserved exactly as captured from the game.
+      # The preamble owner (deed holder) may differ from room title owner (shop brand).
+      result = {
+        preamble: preamble,
+        town: town,
+        id: shop_id,
+        shop_owner: extract_shop_name_from_preamble(preamble),
+        inv: existing_shop['inv']
+      }.merge(location_fields(preamble))
+
+      result
+    end
+
+    # Item tracking (load/save added_items.json and removed_items.json)
+    # has been moved to processor.rb for the scrape -> process -> display architecture
+
+    def self.extract_shop_name_from_preamble(preamble)
+      # Extract shop name from preamble like "Starsworn's Shop is located in..."
+      return 'unknown' unless preamble
+
+      match = preamble.match(/^(.*?)'s?\s+Shop\s+is\s+located/i) ||
+              preamble.match(/^(.*?)\s+is\s+located/i)
+
+      match ? match[1].strip : 'unknown'
+    end
+
+    def self.extract_exterior_from_preamble(preamble)
+      # Extract exterior description from preamble
+      # Format: "... at a <exterior>, and is currently..."
+      return nil unless preamble
+
+      match = preamble.match(/at (?:a|an) (.*?), and is currently/)
+      match ? match[1].strip : nil
+    end
+
+    def self.extract_room_info_from_preamble(preamble)
+      # Extract room name and game room number from preamble
+      # Format: "... is located in [Heleconia Way] (739405) at a ..."
+      # Room number is optional (older bracket-only format lacks it)
+      return {} unless preamble
+
+      match = preamble.match(/is located in \[(?<room_name>[^\]]+)\](?:\s*\((?<room_number>\d+)\))?/)
+      return {} unless match
+
+      { room_name: match[:room_name].strip, room_number: match[:room_number] }.compact
+    end
+
+    def self.location_fields(preamble)
+      extract_room_info_from_preamble(preamble)
+        .merge({ exterior: extract_exterior_from_preamble(preamble) }.compact)
+    end
+
+    def self.remove_items_from_shop(shop_data, item_ids_to_remove)
+      # Remove specific item IDs from shop's inventory structure
+      return unless shop_data && shop_data['inv']
+
+      shop_data['inv'].each do |room|
+        next unless room['items']
+        room['items'].reject! { |item| item_ids_to_remove.include?(item['id'].to_s) }
+      end
+    end
+
+    def self.add_items_to_shop(shop_data, new_items)
+      # Add new items to the first room of the shop (simplified approach)
+      return unless shop_data && shop_data['inv'] && new_items.any?
+
+      # Ensure at least one room exists
+      if shop_data['inv'].empty?
+        shop_data['inv'] = [{ 'room_title' => 'Main Room', 'branch' => 'entry', 'items' => [] }]
+      end
+
+      # Add all new items to the first room (we don't know their original room structure from browse)
+      first_room = shop_data['inv'].first
+      first_room['items'] ||= []
+      first_room['items'].concat(new_items)
+    end
+
+    def self.display_smart_summary
+      return unless @smart_stats && @smart_stats[:shops_scanned] > 0
+
+      stats = @smart_stats
+      total_items = stats[:new_items] + stats[:unchanged_items]
+      efficiency = total_items > 0 ? (stats[:unchanged_items].to_f / total_items * 100).round(1) : 0
+
+      Log.out("=" * 60, label: :smart)
+      Log.out("SMART PARSING SUMMARY", label: :smart)
+      Log.out("=" * 60, label: :smart)
+      Log.out("Shops scanned: #{stats[:shops_scanned]}", label: :smart)
+      Log.out("New items found: #{stats[:new_items]}", label: :smart)
+      Log.out("Items removed: #{stats[:removed_items]}", label: :smart)
+      Log.out("Items unchanged: #{stats[:unchanged_items]}", label: :smart)
+      Log.out("Cache efficiency: #{efficiency}% (#{stats[:unchanged_items]}/#{total_items} items cached)", label: :smart)
+
+      if stats[:new_items] > 0 || stats[:removed_items] > 0
+        Log.out("*** CHANGES DETECTED - JSON updated with #{stats[:new_items]} new and #{stats[:removed_items]} removed items ***", label: :smart)
+      else
+        Log.out("*** NO CHANGES DETECTED - All items matched cache ***", label: :smart)
+      end
+      Log.out("=" * 60, label: :smart)
+
+      # Reset stats for next run
+      @smart_stats = nil
+    end
+
+    def self.scan_item(id, browse_price = nil, quantity = nil)
+      coll = Collector.new(
+        command: %[shop inspect #{id}],
+        start: %[You request a thorough inspection of],
+        close: %[You can use SHOP PURCHASE #{id} to purchase]
+      )
+
+      details = coll.run()
+      extracted_details = Extractor.of(details.slice(1..-2))
+
+      # Add browse price if available (more reliable than parsing from inspect output)
+      extracted_details[:cost] = browse_price if browse_price
+
+      result = {
+        id: id,
+        name: details.first.gsub("You request a thorough inspection of ", "").gsub(%r[\sfrom [A-Z].*?\.$], ""),
+        details: extracted_details
+      }
+
+      # Preserve quantity from browse data if it exists
+      result[:quantity] = quantity if quantity
+
+      result
+    end
+
+    # Raw capture mode - minimal processing, just stores raw INSPECT output
+    def self.scan_item_raw(id, browse_price = nil, quantity = nil)
+      coll = Collector.new(
+        command: %[shop inspect #{id}],
+        start: %[You request a thorough inspection of],
+        close: %[You can use SHOP PURCHASE #{id} to purchase]
+      )
+
+      details = coll.run()
+
+      result = {
+        id: id,
+        name: details.first.gsub("You request a thorough inspection of ", "").gsub(%r[\sfrom [A-Z].*?\.$], ""),
+        browse_price: browse_price,
+        raw_inspect: details.slice(1..-2) # Just the raw lines, no Extractor processing
+      }
+
+      # Preserve quantity from browse data if it exists
+      result[:quantity] = quantity if quantity
+
+      result
+    end
+
+    def self.towns_to_search()
+      if Opts.town.nil? then
+        towns
+      else
+        towns.select do |town| town.downcase.include?(Opts.town.downcase) end
+      end
+    end
+
+    def self.all()
+      towns_to_search.map do |town|
+        { town: town,
+          shops: Parser.shops(town) }
+      end
+    end
+
+    def self.to_json(*_args)
+      @created_files = []
+
+      # First, collect all the data
+      all_town_data = []
+
+      Utils.benchmark(template: "scanned shops in {{run_time}}") do
+        towns_to_search.each do |town|
+          start = Time.now
+          shops = Parser.shops(town)
+
+          # ALWAYS update timestamp when parser runs - shows last scan time on website
+          # This ensures users see when we last checked for updates, not when data last changed
+          town_data = {
+            created_at: Time.now.utc,
+            run_time: Utils.fmt_time(Time.now - start),
+            town: town,
+            shops: shops || []
+          }
+
+          all_town_data << town_data
+        end
+      end
+
+      # Now save all the data
+      all_town_data.each do |data|
+        filename = save_json(name: data[:town], data: data)
+        @created_files << filename if filename
+      end
+
+      # Display smart parsing summary if we were in smart mode
+      display_smart_summary if Opts.smart
+
+      # Item tracking (added/removed) is now handled by processor.rb
+
+      # Add removed_items.json to created files list for upload
+      if File.exist?(Assets.local_path("removed_items.json"))
+        @created_files << "removed_items.json"
+      end
+
+      @created_files
+    end
+
+    def self.created_files
+      @created_files || []
+    end
+
+    def self.save_json(name:, data:)
+      return Utils.pp(data) if Opts["dry-run"]
+      filename = Utils.safe_string(Opts.to_h.fetch(:shop, name))
+
+      # Add format_version for raw mode
+      if Opts.raw_only || Opts["raw-only"]
+        data[:format_version] = "raw_v1"
+        # Prefix filename with raw/ subdirectory
+        filename = "raw/#{filename}"
+        # Ensure raw directory exists
+        raw_dir = Assets::LOCAL_FS_ROOT + "raw"
+        FileUtils.mkdir_p(raw_dir) unless File.directory?(raw_dir)
+      end
+
+      Assets.write_local_json(data, filename)
+      return "#{filename}.json"
+    end
+
+    def self.manifest(url_root: Opts.to_h.fetch(:url, Assets::URL), _file: nil)
+      assets = Assets.cached_files()
+      fail "no assets found" if assets.empty?
+      assets = assets.map do |asset|
+        abs_file_name = Assets.local_path(asset)
+        base_name     = File.basename(asset)
+        data          = Utils.read_json(abs_file_name)
+        { url: url_root + "/" + base_name,
+          base_name: base_name,
+          size: '%.2fmb' % (File.size(abs_file_name).to_f / (2**20)), # mbs
+          run_time: data.fetch(:run_time, nil),
+          checksum: Assets.checksum(asset),
+          updated_at: data.fetch(:created_at, nil) }
+      end
+
+      manifest = { created_at: Time.now.utc, assets: assets }
+      Utils.pp(manifest)
+      return if Opts["dry-run"]
+      Assets.write_local_json(manifest, "manifest")
+    end
+  end
+end
+
+module Bodega
+  class Index
+    class DuplicateIndexError < StandardError; end
+
+    STAR = "*"
+
+    SPECIAL_GS_WORDS = %w(ora)
+
+    def self.keywords(str)
+      str.split(/\s+/).reject do |token|
+        COMMON_TOKENS.include?(token)
+      end
+    end
+
+    attr_reader :lookup
+
+    def initialize()
+      clear()
+    end
+
+    def clear()
+      @lookup = {
+        by_keyword: {},
+        by_id: {},
+        by_shop: {},
+        by_item: {},
+        by_town: {}
+      }
+    end
+
+    def by_id(id)
+      @lookup[:by_id].fetch(id, nil)
+    end
+
+    def has_id?(id)
+      not by_id(id).nil?
+    end
+
+    def add_id(id, obj)
+      id = id.to_s
+      fail StandardError, "nil id" if id.nil?
+      # shop id
+      return if has_id?(id)
+      if has_id?(id)
+        _respond <<~ERROR
+          DuplicateIdError:#{' '}
+            new: \n#{PP.pp(obj, "")}\n
+            old: \n#{PP.pp(by_id(id), "")}\n
+        ERROR
+      end
+      @lookup[:by_id][id] = obj
+    end
+
+    def add_keyword(word, _id)
+      # skip short words
+      return if word.size < 4 and not (SPECIAL_GS_WORDS.include?(word) or word.is_i?)
+      Log.out(word)
+    end
+
+    ##
+    ## shop table storage
+    ##
+    def _sts(town:)
+      all = Assets.glob("*.json")
+      return all if town.eql?(STAR)
+      all.select do |file| file.include?(town) end
+    end
+
+    def _load(town: STAR)
+      _sts(town: town).each do |town_fs_data|
+        town = Utils.read_json(town_fs_data)
+        town.fetch(:shops, []).each do |shop|
+          shop[:id] = shop[:town] + shop[:id]
+          # numbers auto increment for each town
+          # which means duplicate ids for each town
+          add_id(shop[:id], shop)
+          shop[:inv].each do |room|
+            room[:items].each do |item|
+              add_id(item[:id], item.merge(
+                                  { branch: room[:branch],
+                                    room_title: room[:room_title] }
+                                ))
+            end
+          end
+        end
+      end
+    end
+
+    def query(**params)
+    end
+  end
+end
+
+module Bodega
+  module SearchEngine
+    ##
+    ## resync raw assets from the CDN
+    ##
+    def self.sync()
+      manifest = Utils.parse_json Bodega::Assets.get_remote("manifest.json")
+      stale = manifest.fetch(:assets, []).select do |remote| Assets.is_stale?(remote) or Opts.flush end
+      return if stale.empty?
+      Utils.benchmark(template: ("sync".rjust(10) + " ... " + "completed".rjust(20) + " >> {{run_time}}"), label: :download) do
+        stale.map do |remote|
+          begin
+            Thread.new do Assets.stream_download(remote) end
+          rescue => exception
+            Log.out(exception)
+            Log.out(exception.backtrace)
+          end
+        end.map(&:value)
+      end
+    end
+    ##
+    ## the base index object
+    ##
+    @index ||= Index.new
+
+    @index.clear if Opts["flush-index"]
+
+    def self.build_index()
+      Utils.benchmark(template: "built index in {{run_time}}") do
+        @index._load()
+      end
+    end
+
+    def self._index
+      @index
+    end
+
+    def self.attach()
+      SearchEngine.sync()
+      SearchEngine.build_index() if Opts["force-index"]
+    end
+  end
+end
+
+module Bodega
+  module Uploader
+    # Upload endpoints - API method preferred for better reliability
+    API_ENDPOINTS = [
+      "https://bodega-netlify-api.netlify.app/.netlify/functions/upload",
+      "https://bodega-vercel-api.vercel.app/api/upload",
+      # Additional fallback endpoints can be added here
+    ]
+
+    def self.upload_all_files(specific_files = nil)
+      return if Opts["dry-run"]
+
+      Log.out("Starting upload process...", label: :upload)
+
+      # Only use API upload - no fallbacks
+      if upload_via_api(specific_files)
+        Log.out("Upload complete via API!", label: :upload)
+      else
+        Log.out("Upload failed - all API endpoints failed", label: :upload)
+      end
+    end
+
+    def self.split_large_file(filename, json_content)
+      require 'json'
+
+      begin
+        data = JSON.parse(json_content)
+
+        # Only split files that have a 'shops' array
+        unless data['shops'] && data['shops'].is_a?(Array)
+          Log.out("#{filename} doesn't have shops array, cannot split", label: :upload)
+          return { filename => json_content }
+        end
+
+        shops = data['shops']
+        total_shops = shops.length
+
+        # Split into chunks of 50 shops each (should be ~2.5MB per chunk)
+        chunk_size = 50
+        chunks = {}
+
+        shops.each_slice(chunk_size).with_index do |shop_chunk, index|
+          chunk_number = index + 1
+          total_chunks = (total_shops / chunk_size.to_f).ceil
+
+          # Create chunk filename like: wehnimers_landing_part1of3.json
+          base_name = filename.gsub('.json', '')
+          chunk_filename = "#{base_name}_part#{chunk_number}of#{total_chunks}.json"
+
+          # Create chunk data with same structure but subset of shops
+          chunk_data = data.dup
+          chunk_data['shops'] = shop_chunk
+          chunk_data['chunk_info'] = {
+            'original_file'  => filename,
+            'part'           => chunk_number,
+            'total_parts'    => total_chunks,
+            'shops_in_chunk' => shop_chunk.length,
+            'total_shops'    => total_shops
+          }
+
+          chunks[chunk_filename] = JSON.generate(chunk_data)
+
+          Log.out("Created #{chunk_filename}: #{shop_chunk.length} shops, #{chunks[chunk_filename].bytesize} bytes", label: :upload)
+        end
+
+        return chunks
+      rescue JSON::ParserError => e
+        Log.out("Failed to parse #{filename} as JSON: #{e.message}", label: :upload)
+        return { filename => json_content }
+      end
+    end
+
+    def self.upload_via_api(specific_files = nil)
+      begin
+        require 'net/http'
+        require 'uri'
+        require 'json'
+
+        # Get specific files list or all JSON files
+        if specific_files && !specific_files.empty?
+          Log.out("Uploading specific files: #{specific_files.join(', ')}", label: :upload)
+          files = specific_files
+        else
+          Log.out("No specific files provided, uploading all cached files", label: :upload)
+          files = Assets.cached_files()
+        end
+
+        if files.empty?
+          Log.out("No files to upload", label: :upload)
+          return true # Nothing to upload is success
+        end
+
+        # Collect all files
+        files_to_upload = {}
+        files.each do |file|
+          basename = File.basename(file)
+          file_path = Assets.local_path(basename)
+          if File.exist?(file_path)
+            json_content = File.read(file_path)
+
+            # Split large files (>5MB) into smaller chunks
+            if json_content.bytesize > 5_000_000
+              Log.out("#{basename} is large (#{json_content.bytesize} bytes), splitting...", label: :upload)
+              split_files = split_large_file(basename, json_content)
+              split_files.each do |split_name, split_content|
+                files_to_upload[split_name] = split_content
+                Log.out("Preparing #{split_name} for upload (#{split_content.bytesize} bytes)", label: :upload)
+              end
+            else
+              files_to_upload[basename] = json_content
+              Log.out("Preparing #{basename} for upload", label: :upload)
+            end
+          end
+        end
+
+        if files_to_upload.empty?
+          Log.out("No valid files to upload", label: :upload)
+          return true
+        end
+
+        # Try file-by-file upload to each endpoint
+        API_ENDPOINTS.each do |endpoint|
+          Log.out("Uploading #{files_to_upload.size} files to #{endpoint} one by one...", label: :upload)
+
+          begin
+            if upload_files_individually(endpoint, files_to_upload)
+              Log.out("Successfully uploaded via API", label: :upload)
+              return true
+            end
+          rescue => e
+            Log.out("Endpoint #{endpoint} failed: #{e.message}", label: :upload)
+          end
+        end
+
+        Log.out("All API endpoints failed", label: :upload)
+        return false
+      rescue => e
+        Log.out("API upload error: #{e.message}", label: :upload)
+        return false
+      end
+    end
+
+    def self.upload_files_individually(endpoint, files)
+      require 'net/http'
+      require 'uri'
+      require 'json'
+
+      uri = URI(endpoint)
+      session_id = Time.now.to_i.to_s + rand(1000).to_s
+      total_files = files.size
+      file_index = 0
+
+      Log.out("Starting multi-file upload session: #{session_id}", label: :upload)
+
+      files.each do |filename, content|
+        file_index += 1
+        is_final_file = (file_index == total_files)
+
+        payload = {
+          filename: filename,
+          content: content,
+          session_id: session_id,
+          file_index: file_index,
+          total_files: total_files,
+          is_final: is_final_file,
+          timestamp: Time.now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+          source: "bodega-script-individual"
+        }
+
+        json_data = payload.to_json
+        Log.out("Uploading #{filename} (#{content.bytesize} bytes) - #{file_index}/#{total_files}", label: :upload)
+
+        request = Net::HTTP::Post.new(uri)
+        request['Content-Type'] = 'application/json'
+        request['User-Agent'] = 'Bodega-Script/2.0'
+        request.body = json_data
+
+        response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true, read_timeout: 60) do |http|
+          http.request(request)
+        end
+
+        if response.code.to_i >= 200 && response.code.to_i < 300
+          response_data = JSON.parse(response.body)
+          Log.out("#{filename} uploaded: #{response_data['message']}", label: :upload)
+
+          # If this was the final file, check if gist was created
+          if is_final_file && response_data['gist_url']
+            Log.out("Multi-file upload complete! Gist: #{response_data['gist_url']}", label: :upload)
+            return true
+          end
+        else
+          Log.out("Failed to upload #{filename} - HTTP #{response.code}: #{response.body}", label: :upload)
+          return false
+        end
+
+        # Small delay between uploads to be nice to the server
+        sleep(0.5) unless is_final_file
+      end
+
+      return true
+    rescue => e
+      Log.out("Individual file upload error: #{e.message}", label: :upload)
+      return false
+    end
+
+    def self.count_items_in_json(parsed_json)
+      total_items = 0
+
+      if parsed_json.is_a?(Hash) && parsed_json['shops']
+        parsed_json['shops'].each do |shop|
+          if shop['inv']
+            shop['inv'].each do |room|
+              if room['items']
+                total_items += room['items'].length
+              end
+            end
+          end
+        end
+      end
+
+      total_items
+    end
+  end
+end
+
+module Bodega
+  module CLI
+    def self.help_menu()
+      <<~HELP_MENU
+          \n
+        bodega.lic
+
+          this script uses the new playershop system by Naos to parse in-game shop directories
+          and generate JSON files that can be consumed by external systems.
+
+          This script also exposes the Bodega module that other scripts may call.
+
+        parse mode:
+          --dry-run             run but print JSON to your FE                 [used primarily for testing]
+          --town                index all shops in one town                   [used primarily for testing]
+          --max-shop-depth      index only a certain number of shops per town [used primarily for testing]
+          --max-item-depth      index only a certain number of items per shop [used primarily for testing]
+          --shop                index a shop by name                          [used primarily for testing]
+          --save                dump the results to the filesystem            [required in standalone mode]
+          --out                 the location on the filesystem to write to    [defaults to $lich_dir/bodega/]
+          --manifest            create a manifest file of the assets
+          --upload              upload generated JSON files via API or gist fallback
+
+        smart mode:
+          --smart               enable smart parsing - only inspect new items for 90%+ speed boost
+                                loads existing JSON, compares item IDs, only inspects truly new items
+                                automatically removes deleted items and adds new ones
+                                first run still full speed, subsequent runs are much faster
+
+        raw mode:
+          --raw-only            capture raw INSPECT output without local extraction
+                                processing is deferred to server-side processor.rb
+
+        upload mode:
+          --upload              upload existing JSON files from local filesystem
+
+        search mode:
+          --flush               forces a resync of the search index from the CDN
+          --force-index         forces the search index to be built as fast as possible
+          \n
+      HELP_MENU
+    end
+    begin
+      ##
+      ## HALP
+      ##
+      if Opts.help
+        respond CLI.help_menu()
+        exit
+      end
+      ##
+      ## handle Parser command
+      ##
+      if Opts.parser
+        Log.out(Opts.to_h, label: :opts)
+        created_files = Bodega::Parser.to_json() if (Opts.save or Opts["dry-run"])
+        Bodega::Parser.manifest() if Opts.manifest
+
+        # Auto-upload after parsing if requested
+        if Opts.upload and (Opts.save or Opts["dry-run"])
+          # Only upload files that were just created during parsing
+          Bodega::Uploader.upload_all_files(created_files)
+        end
+      end
+
+      # Handle standalone upload mode
+      if Opts.upload and not Opts.parser
+        Log.out("Upload mode: uploading existing JSON files", label: :upload)
+        Bodega::Uploader.upload_all_files
+      end
+
+      if Opts.search
+        Bodega::SearchEngine.attach()
+      end
+    rescue => exception
+      Log.out(exception)
+    end
+  end
+end
+
+# Ruby automation module methods for clean integration
+module Bodega
+  module Parser
+    def self.smart_scan
+      Log.out("Starting smart scan mode", label: :automation)
+      Script.run("bodega", "--parser", "--smart", "--save", "--raw-only")
+    end
+
+    def self.full_scan
+      Log.out("Starting full scan mode", label: :automation)
+      # Full scan does smart scan first (to catch removals), then full scan
+      Script.run("bodega", "--parser", "--smart", "--save", "--raw-only")
+      Script.run("bodega", "--parser", "--save", "--raw-only")
+    end
+  end
+end
