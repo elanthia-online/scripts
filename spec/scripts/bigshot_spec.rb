@@ -3949,3 +3949,166 @@ RSpec.describe 'bigshot cmd_condemn' do
     expect(BigshotCondemnSpec.spell_output(1).first).to match(start_pattern)
   end
 end
+
+# Profile loads (CLI ";bigshot profile load", the settings window's Load
+# Profile, and settings already in UserVars.op at startup) fill missing keys
+# with Setup's defaults. A profile with no flee_message key left
+# UserVars.op["flee_message"] nil, and the downstream monitor's
+# /#{UserVars.op["flee_message"]}/i then matched every game line and set
+# $bigshot_flee, so bigshot left rooms right after targeting.
+module BigshotSettingsDefaultsSpec
+  SOURCE_PATH = find_lic_source('bigshot.lic', from: __dir__)
+  SOURCE = File.read(SOURCE_PATH).gsub("\r\n", "\n")
+
+  def self.extract(pattern, label)
+    extract_from_source(SOURCE, pattern, label: label, source_path: SOURCE_PATH)
+  end
+
+  CATEGORIES_SRC = extract(/^    @@categories = \{\n.*?^    \}$/m, 'Setup @@categories')
+  TRANSIENT_KEYS_SRC = extract(/^    TRANSIENT_KEYS = %i\[.*?\]\.freeze$/m, 'Setup::TRANSIENT_KEYS')
+  WITH_DEFAULTS_SRC = extract(/^    def self\.with_defaults\(.*?^    end$/m, 'Setup.with_defaults')
+  PROFILE_SRC = extract(/^  def self\.profile\(vars\).*?^  end$/m, 'Bigshot.profile')
+  ON_PROFILE_LOAD_SRC = extract(/^    def on_profile_load\n.*?^    end$/m, 'Setup#on_profile_load')
+  SETUP_INITIALIZE_SRC = extract(/^    def initialize\(settings\)\n.*?^    end$/m, 'Setup#initialize')
+  BIGSHOT_INITIALIZE_SRC = extract(/^  def initialize\(options = nil, group = nil\)\n.*?^  end$/m, 'Bigshot#initialize')
+  FLEE_MESSAGE_COND_SRC = extract(/(?<=elsif )server_string =~ \/#\{UserVars\.op\["flee_message"\]\}\/i && .*$/,
+                                  'flee_message monitor condition')
+
+  # Gtk-free stand-in for Bigshot::Setup holding the real table and helper.
+  class Setup
+    class_eval(CATEGORIES_SRC)
+    class_eval(TRANSIENT_KEYS_SRC)
+    class_eval(WITH_DEFAULTS_SRC)
+  end
+
+  module UserVars
+    class << self
+      attr_accessor :op
+    end
+  end
+
+  # Evaluates the monitor's real flee_message condition against +op+.
+  def self.flee_message_matches?(op, line)
+    UserVars.op = op
+    scope = binding
+    scope.local_variable_set(:server_string, line)
+    scope.eval(FLEE_MESSAGE_COND_SRC) ? true : false
+  end
+end
+
+RSpec.describe 'bigshot Setup.with_defaults' do
+  let(:setup) { BigshotSettingsDefaultsSpec::Setup }
+
+  # Trimmed from the reported profile: no flee_message, lone_targets_only, etc.
+  let(:reported_profile) do
+    {
+      'resting_room_id'    => '1438',
+      'hunting_room_id'    => '5287',
+      'hunting_boundaries' => '5644,5323,5297,5268',
+      'always_flee_from'   => "pra'eda,mezic,spectral shade",
+      'invalid_targets'    => '',
+      'targets'            => '.*tree spirit',
+      'profile_current'    => 'tree spirit',
+      'flee_count'         => '3',
+      'pull'               => true,
+      'deader'             => false,
+      'hunting_commands'   => 'incant 912, incant 903 channel evoke(xx)',
+      'boons_flee'         => ['magic_resistance'],
+      'flee_clouds'        => true,
+      'save_profile_name'  => ''
+    }
+  end
+
+  it 'fills a missing flee_message with an empty string' do
+    expect(setup.with_defaults(reported_profile)['flee_message']).to eq('')
+  end
+
+  it 'stops the monitor treating every game line as a flee message' do
+    line = '<dialogData id=\'Buffs\' clear=\'t\'></dialogData>'
+    expect(BigshotSettingsDefaultsSpec.flee_message_matches?(reported_profile, line)).to be(true)
+    expect(BigshotSettingsDefaultsSpec.flee_message_matches?(setup.with_defaults(reported_profile), line)).to be(false)
+  end
+
+  it 'still honors a configured flee_message' do
+    filled = setup.with_defaults(reported_profile.merge('flee_message' => 'ground trembles'))
+    expect(BigshotSettingsDefaultsSpec.flee_message_matches?(filled, 'The ground trembles violently!')).to be(true)
+    expect(BigshotSettingsDefaultsSpec.flee_message_matches?(filled, 'Your disk arrives.')).to be(false)
+  end
+
+  it 'fills other keys an older profile lacks' do
+    filled = setup.with_defaults(reported_profile)
+    expect(filled['lone_targets_only']).to be(false)
+    expect(filled['flee_webs']).to be(false)
+    expect(filled['boons_ignore']).to eq([])
+  end
+
+  it 'fills deader as false, matching the runtime default' do
+    expect(setup.with_defaults({})['deader']).to be(false)
+  end
+
+  it 'never overwrites existing values, including false and empty strings' do
+    filled = setup.with_defaults(reported_profile.merge('pull' => false, 'flee_message' => ''))
+    expect(filled['pull']).to be(false)
+    expect(filled['flee_message']).to eq('')
+    expect(filled['flee_count']).to eq('3')
+    expect(filled['targets']).to eq('.*tree spirit')
+    expect(filled['boons_flee']).to eq(['magic_resistance'])
+  end
+
+  it 'replaces nil values with defaults' do
+    expect(setup.with_defaults({ 'flee_message' => nil })['flee_message']).to eq('')
+  end
+
+  it 'keeps unknown keys' do
+    expect(setup.with_defaults({ 'my_custom_key' => 'x' })['my_custom_key']).to eq('x')
+  end
+
+  it 'does not add widget-only keys unless asked' do
+    filled = setup.with_defaults({})
+    setup::TRANSIENT_KEYS.each { |key| expect(filled).not_to have_key(key.to_s) }
+
+    with_transient = setup.with_defaults({}, string_keys: false, include_transient: true)
+    setup::TRANSIENT_KEYS.each { |key| expect(with_transient).to have_key(key) }
+  end
+
+  it 'keeps the requested key type' do
+    expect(setup.with_defaults({}).keys).to all(be_a(String))
+    expect(setup.with_defaults({}, string_keys: false).keys).to all(be_a(Symbol))
+  end
+
+  it 'does not modify its argument' do
+    profile = reported_profile.dup
+    setup.with_defaults(profile)
+    expect(profile).to eq(reported_profile)
+  end
+
+  it 'treats nil settings as empty' do
+    expect(setup.with_defaults(nil)['flee_message']).to eq('')
+  end
+
+  it 'does not share array defaults between filled hashes' do
+    a = setup.with_defaults({})
+    b = setup.with_defaults({})
+    a['boons_ignore'] << 'regen'
+    expect(b['boons_ignore']).to eq([])
+  end
+
+  describe 'wiring' do
+    it 'fills defaults on CLI profile load' do
+      expect(BigshotSettingsDefaultsSpec::PROFILE_SRC).to include('UserVars.op = Setup.with_defaults(from_file)')
+    end
+
+    it 'fills defaults on settings-window profile load' do
+      expect(BigshotSettingsDefaultsSpec::ON_PROFILE_LOAD_SRC)
+        .to match(/@settings = Setup\.with_defaults\(from_file\.transform_keys\(&:to_sym\), string_keys: false/)
+    end
+
+    it 'fills defaults when the settings window opens' do
+      expect(BigshotSettingsDefaultsSpec::SETUP_INITIALIZE_SRC).to include('Setup.with_defaults(@settings, string_keys: false')
+    end
+
+    it 'fills defaults for settings already loaded when bigshot starts' do
+      expect(BigshotSettingsDefaultsSpec::BIGSHOT_INITIALIZE_SRC).to include('UserVars.op = Setup.with_defaults(UserVars.op)')
+    end
+  end
+end
