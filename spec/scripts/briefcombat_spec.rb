@@ -246,6 +246,25 @@ RSpec.describe 'briefcombat.lic' do
       expect(summary).not_to include('KILLED')
     end
 
+    it 'shortens creature attacks on you that Lich\'s definitions don\'t know' do
+      args.replace(['--you'])
+      myrmidon = '<pushBold/>a <a exist="26006044" noun="myrmidon">chitinous kiramon myrmidon</a><popBold/>'
+      its = '<pushBold/><a exist="26006044" noun="myrmidon">its</a><popBold/>'
+      slash = "Surging forward powerfully, #{myrmidon} slashes at you with #{its} bladed foreleg!\r\n"
+      roll = "  AS: +534 vs DS: +1001 with AvD: +23 + d100 roll: +40 = -404\r\n"
+      expect(feed(slash, roll, "   A clean miss.\r\n")).to all(be_nil)
+      summary = client.call(BriefCombatSpec::PROMPT.dup)
+      expect(summary).to start_with(slash.chomp)
+      expect(summary).to include('AS: +534', 'A clean miss.')
+    end
+
+    it 'sends a line aimed at you as it came when no combat follows' do
+      args.replace(['--you'])
+      terror = "#{BriefCombatSpec::WARDEN.sub('a <a', 'A <a')} looks at you in utter terror!\r\n"
+      expect(client.call(terror.dup)).to be_nil
+      expect(client.call(BriefCombatSpec::PROMPT.dup)).to eq("#{terror}#{BriefCombatSpec::PROMPT}")
+    end
+
     it 'folds lines about you into someone else\'s round' do
       args.replace(['--you'])
       feed(BriefCombatSpec::ATTACK, BriefCombatSpec::HIT)

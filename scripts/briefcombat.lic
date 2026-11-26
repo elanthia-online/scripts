@@ -48,7 +48,8 @@
         - Two players acting in the same moment now get separate summaries
         - Other players' bleeding is now shortened too
         - New --creatures option to also shorten creatures' attacks on other players
-        - New --you option, and "everything", to also shorten attacks on you and what happens to you
+        - New --you option, and "everything", to also shorten attacks on you and what happens to you,
+          including creature attacks Lich doesn't recognize yet
         - Kills come from the game's creature data instead of guessing from death messages
         - No more blank line after each summary
         - Fix the Wrayth/StormFront compass sometimes not updating after a move that has roundtime
@@ -186,7 +187,7 @@ module BriefCombat
   # openers they don't cover. Built from whatever the running Lich provides,
   # so a family a release lacks is skipped rather than failing.
   class Classifier
-    %i[CREATURE_LINK PLAYER_LINK ACTOR OPENERS ROLL_TEXT BOUNTY DEATH ATTACK_HINT DAMAGE_TEXT PREP STATUS_TEXT].each do |name|
+    %i[CREATURE_LINK PLAYER_LINK ACTOR OPENERS ROLL_TEXT BOUNTY DEATH ATTACK_HINT DAMAGE_TEXT PREP STATUS_TEXT AIMED_AT_YOU OUTCOME].each do |name|
       remove_const(name) if const_defined?(name, false)
     end
 
@@ -231,6 +232,14 @@ module BriefCombat
     # only when a number comes right before "damage".
     DAMAGE_TEXT = /(?:\.\.\. |\bfor |additional )(?:and hits? for )?(\d+) (?:points? of )?damage!/
 
+    # A creature (or trap) line aimed at you. Lich's definitions miss many
+    # creature-specific attacks ("attempts to pincer you!"), and this also
+    # matches flavor ("looks at you in utter terror!"), so a round it opens
+    # is provisional: see Round#fought?.
+    AIMED_AT_YOU = /\b(?:at|toward|towards|into) you\b|\battempts? to \w+ you\b|\bengages you\b/
+    # How an attack ended, when there is no roll or damage line.
+    OUTCOME = /\bmiss(?:es)?\b|\bevade|\bblock|\bparr(?:y|ies)|\bdodge|\bdeflect|harmlessly/i
+
     # Opening lines that only say a spell is coming; the actor's next action
     # line ("hurls a seething blast of steam at ...") makes a better header.
     PREP = /gestures?\b|chants? a reverent litany|weave another verse|draws? an intricately glowing pattern/
@@ -269,17 +278,32 @@ module BriefCombat
     # What a line opens, if it starts someone's combat.
     #
     # @param text [String] the line, out-of-band XML already removed
+    # @param provisional [Boolean] also offer a provisional attack on you
+    #   (only --you summarizes those)
     # @return [Hash, nil] parse_attack's result, or the same shape for an opener
-    def opener(text)
+    def opener(text, provisional: false)
       attack = attack(text)
       return attack if attack
-      return nil unless OPENERS.any? { |pattern| text.match?(pattern) }
+      return (provisional ? aimed_at_you(text) : nil) unless OPENERS.any? { |pattern| text.match?(pattern) }
 
       result = { name: :cast, target: first_creature(text) || {} }
       result[:inbound] = true if text.match?(/\b(?:at|toward|over) you[.!]?\s*\z/)
       actor = text[ACTOR, :actor]
       result[:attacker] = { id: actor[/-\d+/].to_i, name: actor.gsub(/<[^>]+>/, '') } if actor && actor != 'You'
       result
+    end
+
+    # @return [Hash, nil] a provisional attack on you, for a creature or trap
+    #   line aimed at you that parse_attack doesn't know
+    def aimed_at_you(text)
+      return nil if text.start_with?(' ') || !text.match?(/<a exist="\d/)
+
+      plain = text.gsub(/<[^>]+>/, '')
+      return nil if plain.match?(/\A\s*You\b/) || !plain.match?(AIMED_AT_YOU)
+
+      creature = first_creature(text)
+      { name: :attack, target: {}, inbound: true, tentative: true,
+        attacker: creature && { id: creature[:id], noun: creature[:noun], name: creature[:name] } }
     end
 
     # @return [Hash, nil] parse_attack's result, for a line that may hold one.
@@ -369,7 +393,7 @@ module BriefCombat
     end
     YOU = { id: :you, name: 'you' }.freeze
 
-    attr_reader :first, :actor, :key, :spell, :targets, :bounty, :last_line, :action_line
+    attr_reader :first, :actor, :key, :spell, :targets, :bounty, :last_line, :action_line, :lines
 
     # @param text [String] the opening line
     # @param opener [Hash] Classifier#opener's result
@@ -378,6 +402,9 @@ module BriefCombat
     def initialize(text, opener, actor, classifier)
       @classifier = classifier
       @first = text.chomp
+      @lines = [@first]
+      @tentative = opener[:tentative]
+      @fought = !@tentative
       @actor = actor
       @key = Round.key(actor, opener)
       @spell = spell_name(opener[:name])
@@ -405,9 +432,11 @@ module BriefCombat
     # @param attack [Hash, false, nil] the line's parse_attack result, if known
     def add(text, attack: nil)
       line = text.chomp
+      @lines << line
       return if line.strip.empty?
 
       kind, data = @classifier.event(line, after_damage: @after_damage, attack: attack)
+      @fought ||= %i[roll damage crit status].include?(kind) || line.match?(Classifier::OUTCOME)
       @after_damage = kind == :damage
       # a line about you ("You are stunned ...") is about you, whoever acted
       switch_to(YOU) if %i[status damage crit].include?(kind) && line.match?(/\A\s*(?:<[^>]+>)*You\b/)
@@ -426,6 +455,11 @@ module BriefCombat
 
     # @return [Array<Target>] the creatures this round touched, in order
     def touched = @targets.values
+
+    # False for a provisional round (a line aimed at you that Lich doesn't
+    # know) that never turned into combat: no roll, damage, status or
+    # outcome before the prompt. Such a round is sent as it came.
+    def fought? = @fought
 
     # Who acted: rounds by different actors are kept apart.
     def self.key(actor, opener)
@@ -530,6 +564,8 @@ module BriefCombat
     # @param closing [String, nil] the prompt line that ended the round
     # @return [String] newline-terminated client text
     def render(round, closing)
+      return "#{[*round.lines, closing&.chomp].compact.join("\r\n")}\r\n" unless round.fought?
+
       targets = round.touched
       targets.each { |target| target.killed ||= @dead.call(target.id) if target.id.is_a?(Integer) && target.id.positive? }
       lines = [header(round, targets)]
@@ -696,7 +732,7 @@ module BriefCombat
       return text if excluded?(text)
       return nil if squelched?(text)
 
-      if (opener = @classifier.opener(text))
+      if (opener = @classifier.opener(text, provisional: @settings.compress_you?))
         return open_round(text, opener)
       end
 
@@ -727,7 +763,7 @@ module BriefCombat
         return summary
       end
 
-      opener = @classifier.opener(text)
+      opener = @classifier.opener(text, provisional: @settings.compress_you?)
       if opener && (!opener[:inbound] || @settings.compress_you?) && new_actor?(text, opener)
         # someone else starts acting: this round is over, theirs begins
         return next_round(text, opener)
