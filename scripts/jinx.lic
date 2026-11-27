@@ -13,9 +13,18 @@
 
    author: elanthia-online
      tags: utility, util, repository, repo, update, upgrade, meta, ruby, development
-  version: 0.8.1
+  version: 1.0.0
+ required: Lich >= 5.26.0
 
   Changelog:
+  1.0.0 (2026-11-22)
+    search now finds scripts by their tags as well as their names, ignoring case
+    add ;jinx repo default to choose a repo that commands use unless you pass --repo or --all
+    ;jinx auto-update follows the default repo too; add --all to update each asset from the repo it came from
+    GUI now opens in Lich's WebUI window instead of GTK (the GTK GUI is removed)
+    the GUI needs Lich 5.26.0 or later; on older Lich ;jinx gui says to update, and every command still works
+    the GUI no longer closes when showing info for a script whose description has accented or curly characters
+    ;force jinx commands run while the GUI is open print in the game window instead of the GUI log
   0.8.1 (2026-02-07)
     fix constant redefinition on subsequent launches
   0.8.0 (2026-01-08)
@@ -63,6 +72,7 @@ require 'net/https'
 require 'net/http'
 require 'open-uri'
 require 'cgi'
+require 'digest/sha1'
 require 'pathname' # rubocop:disable Lint/RedundantRequireStatement
 
 module ::Lich
@@ -86,7 +96,25 @@ module ::Lich
   module Common
     module Jinx
       module Log
+        # while the GUI window is open, output is routed into it. This lives here,
+        # not in a patch applied by the GUI, because each ;jinx run reloads this
+        # file and redefines these methods
+        def self.gui
+          gui = defined?(::Lich::Common::Jinx::GUI) ? ::Lich::Common::Jinx::GUI : nil
+          # only the run that owns the window; a ;force jinx run alongside it
+          # prints to the game as usual
+          gui if gui.respond_to?(:alive?) && gui.alive? && gui.respond_to?(:owner_thread?) && gui.owner_thread?
+        end
+
         def self.out(msg, label: :debug)
+          if (gui = self.gui)
+            if msg.is_a?(StandardError)
+              gui.append_log("[#{label}] #{msg.message}")
+              msg.backtrace.to_a.slice(0..5).each { |frame| gui.append_log(frame) }
+            else
+              gui.append_log("[#{label}] #{msg}")
+            end
+          end
           return _write _view(msg, label) unless msg.is_a?(StandardError)
           ## pretty-print exception
           _write _view(msg.message, label)
@@ -125,6 +153,8 @@ module ::Lich
         end
 
         def self.mono(text)
+          return gui.mono(text) if gui
+
           _respond %[<output class="mono"/>]
           _respond text
           _respond %[<output class=""/>]
@@ -345,6 +375,31 @@ end
 module ::Lich
   module Common
     module Jinx
+      # small key/value store for jinx-wide preferences (e.g. the default repo)
+      # kept apart from repos.yaml, where every top-level key is a repo
+      module Settings
+        FILE = "settings.yaml" unless defined?(FILE)
+
+        def self.get(key)
+          return nil unless File.exist?(Folder.path(FILE))
+          Folder.read_yaml(FILE)[key.to_sym]
+        end
+
+        def self.set(key, value)
+          FileUtils.touch(Folder.path(FILE)) unless File.exist?(Folder.path(FILE))
+          Folder.atomic(FILE) { |settings|
+            value.nil? ? settings.delete(key.to_sym) : settings[key.to_sym] = value
+            settings
+          }
+        end
+      end
+    end
+  end
+end
+
+module ::Lich
+  module Common
+    module Jinx
       module Repo
         FILE = "repos.yaml" unless defined?(FILE)
 
@@ -426,6 +481,56 @@ module ::Lich
               Log.mono("<b>repo(%s) has been removed</b>" % repo_name)
               repos
             }
+            if Settings.get(:default_repo).to_s.eql?(repo[:name].to_s)
+              Settings.set(:default_repo, nil)
+              Log.mono("repo(%s) was your default repo, so the default has been cleared" % repo_name)
+            end
+          end
+
+          # the default repo name as a Symbol, or nil when none is set
+          # (a default that points at a repo which no longer exists is ignored)
+          def default_name
+            name = Settings.get(:default_repo)
+            return nil if name.nil? || name.to_s.empty?
+            # read repos.yaml directly instead of via each/exists?: those take
+            # the Folder lock, and this is called from inside Repo.each blocks
+            known = File.exist?(Folder.path(FILE)) ? Folder.read_yaml(FILE) : {}
+            known.key?(name.to_sym) ? name.to_sym : nil
+          end
+
+          def default?(repo)
+            !default_name.nil? && repo[:name].to_s.eql?(default_name.to_s)
+          end
+
+          def set_default(repo_name)
+            repo = lookup(repo_name)
+            Settings.set(:default_repo, repo[:name].to_s)
+            repo
+          end
+
+          def clear_default
+            Settings.set(:default_repo, nil)
+          end
+
+          # which repos a command should look at:
+          #   --repo=<name>  just that repo
+          #   --all          every repo
+          #   otherwise      the default repo if one is set, else every repo
+          def resolve(repo_name = nil, all: false)
+            if repo_name && all
+              fail Jinx::Error, "--repo and --all cannot be used together"
+            end
+            return [lookup(repo_name)] if repo_name
+            return to_a if all
+            default = default_name
+            return [lookup(default)] if default
+            to_a
+          end
+
+          # extra advice for "not found" messages when only the default repo was checked
+          def default_scope_hint(sources)
+            return "" unless sources.size.eql?(1) && default?(sources.first)
+            "\nrepo(#{sources.first[:name]}) is your default repo; add --all to look in every repo"
           end
 
           def assets_in(repo)
@@ -459,7 +564,7 @@ module ::Lich
           end
 
           def dump(repo, scripts: false, data: false, engines: false)
-            Log.mono "<b>%s:</b>" % repo[:name]
+            Log.mono "<b>%s:</b>%s" % [repo[:name], default?(repo) ? " (default)" : ""]
             Log.mono "url=".rjust(10) + repo[:url]
             Log.mono "error=".rjust(10) + repo[:err] if repo[:err]
             Log.mono "updated=".rjust(10) + "%s ago" % Util.ago(repo[:last_updated]) if repo[:last_updated]
@@ -506,6 +611,21 @@ module ::Lich
             end
 
             results
+          end
+
+          def tags_of(asset)
+            Array(asset[:tags]).map(&:to_s).reject(&:empty?)
+          end
+
+          # an asset matches a search pattern when its file name or any of its tags match
+          def matches_search?(asset, pattern)
+            return true if File.basename(asset[:file].to_s) =~ pattern
+            tags_of(asset).any? { |tag| tag =~ pattern }
+          end
+
+          def format_tags(asset)
+            tags = tags_of(asset)
+            tags.empty? ? "" : " [tags: #{tags.join(', ')}]"
           end
 
           def detect_asset_type(name, repos)
@@ -671,7 +791,7 @@ module ::Lich
 
           if sources.size.eql?(1) && advertised.size.eql?(0)
             fail Jinx::Error, <<~ERROR
-          repo(#{sources.first[:name]}) does not advertise asset(#{file_name})
+          repo(#{sources.first[:name]}) does not advertise asset(#{file_name})#{Repo.default_scope_hint(sources)}
         ERROR
           end
 
@@ -725,7 +845,19 @@ module ::Lich
   module Common
     module Jinx
       module AutoUpdater
-        def self.check_for_updates
+        # The repo every asset is updated from, like the other commands:
+        # --repo=<name>, else the default repo when one is set. nil (--all, or
+        # no default) updates each asset from the repo it was installed from.
+        def self.pinned_repo(repo_name = nil, all: false)
+          fail Jinx::Error, "--repo and --all cannot be used together" if repo_name && all
+          return nil if all
+
+          name = repo_name || Repo.default_name
+          name && Repo.lookup(name)
+        end
+
+        def self.check_for_updates(repo_name = nil, all: false)
+          pinned = pinned_repo(repo_name, all: all)
           installed = Metadata.all_installed
 
           if installed.empty?
@@ -736,17 +868,22 @@ module ::Lich
           updates_available = []
           errors = []
           cleaned_up = []
+          not_in_pinned = []
 
           installed.each do |item|
             begin
-              # Find the asset in its original repo
-              repo = Repo.lookup(item[:metadata][:repo])
+              # Find the asset in the pinned repo, else in its original repo
+              repo = pinned || Repo.lookup(item[:metadata][:repo])
               Repo.manifest(repo) unless repo[:available].is_a?(Array)
 
               asset = Lookup.find_asset_in(repo, item[:name])
 
               if asset.nil?
-                errors << "#{item[:name]} (no longer available in repo:#{item[:metadata][:repo]})"
+                if pinned
+                  not_in_pinned << item[:name]
+                else
+                  errors << "#{item[:name]} (no longer available in repo:#{item[:metadata][:repo]})"
+                end
                 next
               end
 
@@ -794,11 +931,18 @@ module ::Lich
           end
 
           # Report findings
+          if not_in_pinned.any?
+            hint = repo_name ? "" : " (your default repo; add --all to update each from the repo it was installed from)"
+            _respond "#{not_in_pinned.size} not in repo(#{pinned[:name]}), left as installed#{hint}: #{not_in_pinned.join(", ")}"
+          end
+          # assets the pinned repo doesn't have were never compared, so they
+          # are not counted as checked (or as up to date)
+          checked = installed.size - not_in_pinned.size
           if updates_available.empty? && errors.empty? && cleaned_up.empty?
-            _respond "Checked #{installed.size} assets - all up to date!"
+            _respond(checked.zero? ? "No other assets to check." : "Checked #{checked} assets - all up to date!")
           else
             parts = []
-            parts << "Checked #{installed.size} assets"
+            parts << "Checked #{checked} assets"
             if updates_available.any?
               update_list = updates_available.map { |u| "#{u[:name]}(#{u[:type]})" }.join(", ")
               parts << "#{updates_available.size} updates: #{update_list}"
@@ -816,8 +960,8 @@ module ::Lich
           updates_available
         end
 
-        def self.update_all(force: false, dry_run: false)
-          updates = check_for_updates
+        def self.update_all(force: false, dry_run: false, repo_name: nil, all: false)
+          updates = check_for_updates(repo_name, all: all)
 
           return if updates.empty?
 
@@ -915,7 +1059,7 @@ module ::Lich
 
           if detected_type.nil?
             fail Jinx::Error, <<~ERROR
-          No asset named '#{asset_name}' found in any repository.
+          No asset named '#{asset_name}' found in any repository.#{Repo.default_scope_hint(sources)}
 
           Try one of:
           - ;jinx list              to see all available assets
@@ -1297,12 +1441,36 @@ module ::Lich
         def self.main(args)
           @vars = args
           argv = Opts.parse(args)
+          # flags parsed on their own, so a bare word such as "repo" or "all"
+          # (easily a search term) is never mistaken for --repo or --all
+          flags = Opts.parse(args.select { |arg| arg.start_with?(Opts::FLAG_PREFIX) })
+          scope_repo = flags.repo
+          if scope_repo.eql?(true) || scope_repo.is_a?(Array)
+            fail Jinx::Error, "--repo needs exactly one repo name, e.g. --repo=elanthia-online"
+          end
+          all = flags.all.eql?(true)
           # prune flags
           args = args.reject { |arg| arg.start_with?("--") }
 
           # help
           if (argv.help.eql?(true) && args.length.eql?(1)) || args.empty?
             return CLI.help()
+          end
+
+          # searches are matched on the positional words, ahead of everything else,
+          # because their pattern can be any word (list, info, gui, ...)
+          # script search <pattern>
+          if args.length.eql?(3) && args[0].eql?("script") && args[1].eql?("search")
+            return CLI.script_search(args.last, scope_repo, all: all)
+          end
+          # search <pattern> - search all asset types
+          if args.length.eql?(2) && args[0].eql?("search")
+            return CLI.search_all(args.last, scope_repo, all: all)
+          end
+
+          # repo default [<repo_name>] [--clear]
+          if args[0].eql?("repo") && args[1].eql?("default")
+            return CLI.repo_default(args[2], clear: flags.clear.eql?(true))
           end
 
           # === ORIGINAL NAMESPACED COMMANDS (backward compatibility) ===
@@ -1345,47 +1513,43 @@ module ::Lich
           end
           # script list
           if argv.script.eql?(true) && argv.list.eql?(true)
-            return CLI.script_list(argv.repo)
+            return CLI.script_list(scope_repo, all: all)
           end
           # script info <script_name>
           if argv.script.eql?(true) && argv.info.eql?(true)
-            return CLI.script_info(args.last, argv.repo)
+            return CLI.script_info(args.last, scope_repo, all: all)
           end
           # script install <script_name>
           if argv.script.eql?(true) && argv.install.eql?(true)
-            return CLI.script_install(args.last, argv.repo, force: argv.force)
+            return CLI.script_install(args.last, scope_repo, all: all, force: argv.force)
           end
           # script update <script_name>
           if argv.script.eql?(true) && argv.update.eql?(true)
-            return CLI.script_update(args.last, argv.repo, force: argv.force)
-          end
-          # script search <substring>
-          if argv.script.eql?(true) && argv.search.eql?(true)
-            return CLI.script_search(args.last, argv.repo)
+            return CLI.script_update(args.last, scope_repo, all: all, force: argv.force)
           end
           # data list
           if argv.data.eql?(true) && argv.list.eql?(true)
-            return CLI.data_list(argv.repo)
+            return CLI.data_list(scope_repo, all: all)
           end
           # data info <data_name>
           if argv.data.eql?(true) && argv.info.eql?(true)
-            return CLI.data_info(args.last, argv.repo)
+            return CLI.data_info(args.last, scope_repo, all: all)
           end
           # data install <data_name>
           if argv.data.eql?(true) && argv.install.eql?(true)
-            return CLI.data_install(args.last, argv.repo, force: argv.force)
+            return CLI.data_install(args.last, scope_repo, all: all, force: argv.force)
           end
           # data update <data_name>
           if argv.data.eql?(true) && argv.update.eql?(true)
-            return CLI.data_update(args.last, argv.repo, force: argv.force)
+            return CLI.data_update(args.last, scope_repo, all: all, force: argv.force)
           end
           # engine list
           if argv.engine.eql?(true) && argv.list.eql?(true)
-            return CLI.engine_list(argv.repo)
+            return CLI.engine_list(scope_repo, all: all)
           end
           # engine update <engine_name>
           if argv.engine.eql?(true) && argv.update.eql?(true)
-            return CLI.engine_update(args[2], argv.repo, force: argv.force)
+            return CLI.engine_update(args[2], scope_repo, all: all, force: argv.force)
           end
 
           # === NEW UNIFIED COMMANDS (no namespace required) ===
@@ -1393,46 +1557,37 @@ module ::Lich
 
           # jinx list - show all assets
           if argv.list.eql?(true) && args.length.eql?(1)
-            return CLI.list_all(argv.repo)
+            return CLI.list_all(scope_repo, all: all)
           end
 
           # jinx info <asset_name> - smart info detection
           if argv.info.eql?(true) && args.length.eql?(2)
-            return CLI.smart_info(args.last, argv.repo)
+            return CLI.smart_info(args.last, scope_repo, all: all)
           end
 
           # jinx install <asset_name> - smart install
           if argv.install.eql?(true) && args.length.eql?(2)
-            return CLI.smart_install(args.last, argv.repo, force: argv.force, type: argv.type)
+            return CLI.smart_install(args.last, scope_repo, all: all, force: argv.force, type: argv.type)
           end
 
           # jinx update <asset_name> - smart update
           if argv.update.eql?(true) && args.length.eql?(2)
-            return CLI.smart_update(args.last, argv.repo, force: argv.force, type: argv.type)
-          end
-
-          # jinx search <pattern> - search all asset types
-          if argv.search.eql?(true) && args.length.eql?(2)
-            return CLI.search_all(args.last, argv.repo)
+            return CLI.smart_update(args.last, scope_repo, all: all, force: argv.force, type: argv.type)
           end
 
           # jinx auto-update - check and update all installed assets
           if argv.auto_update.eql?(true) || (argv.auto.eql?(true) && argv.update.eql?(true)) || args.include?("auto-update")
-            return CLI.auto_update(force: argv.force, dry_run: argv.dry_run || argv.dry)
+            return CLI.auto_update(force: argv.force, dry_run: argv.dry_run || argv.dry, repo_name: scope_repo, all: all)
           end
 
           # jinx gui - launch GUI interface
-          if argv.gui.eql?(true)
-            begin
-              require 'gtk3'
-              return ::Lich::Common::Jinx::GUI.start!
-            rescue LoadError
-              Log.mono <<~ERROR
-          <b>GTK3 not available</b>
-
-          The GUI requires GTK3. Please install it!
-        ERROR
+          if argv.gui.eql?(true) && args.length.eql?(1)
+            if (reason = ::Lich::Common::Jinx::GUI.unavailable_reason)
+              Log.mono reason
               return
+            end
+            begin
+              return ::Lich::Common::Jinx::GUI.start!
             rescue => e
               Log.out(e, label: %i(gui error))
               return
@@ -1465,7 +1620,7 @@ module ::Lich
           info    &lt;name&gt;                                  show details about an asset
           install &lt;name&gt;                                  install an asset
           update  &lt;name&gt;                                  update an installed asset
-          search  &lt;pattern&gt;                               search for assets by name pattern
+          search  &lt;pattern&gt;                               search for assets by name or tag
           auto-update                                      check and update all installed assets
           gui                                              launch graphical user interface
 
@@ -1475,19 +1630,24 @@ module ::Lich
           repo info   &lt;name&gt;                              show repository details
           repo rm     &lt;name&gt;                              remove a repository
           repo change &lt;name&gt; &lt;url&gt;                        change repository URL
+          repo default [&lt;name&gt;]                            show or set the default repository
+          repo default --clear                             stop using a default repository
 
         Options:
           --repo=&lt;name&gt;                                   target a specific repository
+          --all                                            use every repository, ignoring the default
           --type={script|data|engine}                      override auto-detected asset type
           --force                                           overwrite without confirmation
           --dry-run                                         check for updates without installing
 
         Examples:
-          ;jinx gui                                        launch graphical interface
+          ;jinx gui                                        launch graphical interface#{GUI.webui_lich? ? '' : ' (needs Lich 5.26.0+)'}
           ;jinx install go2                                install the go2 script
           ;jinx update spell-list.xml                      update spell data file
-          ;jinx search map                                 find all assets with "map" in the name
-          ;jinx install go2 --repo=core                    install from specific repository
+          ;jinx search map                                 find all assets with "map" in the name or tags
+          ;jinx install go2 --repo=elanthia-online         install from specific repository
+          ;jinx repo default elanthia-online               only use elanthia-online unless told otherwise
+          ;jinx search loot --all                          search every repository, not just the default
           ;jinx auto-update                                check and update all installed assets
           ;jinx auto-update --dry-run                      preview available updates without installing
 
@@ -1495,6 +1655,8 @@ module ::Lich
           - Asset type (script/data/engine) is automatically detected from repository metadata
           - Use --type flag only when you need to override the auto-detection
           - Use --repo flag when the same asset exists in multiple repositories
+          - With a default repository set, commands only use it; add --all to use every repository
+          - auto-update follows the default too; with --all it updates each asset from the repo it was installed from
           - Legacy namespaced commands (script/data/engine) are still supported for compatibility
 
         HELP
@@ -1520,6 +1682,24 @@ module ::Lich
           Repo.remove(name: repo_name)
         end
 
+        def self.repo_default(repo_name = nil, clear: false)
+          if clear
+            Repo.clear_default
+            return Log.mono("<b>default repo cleared</b>; commands use every repo unless you pass --repo")
+          end
+
+          if repo_name.nil?
+            default = Repo.default_name
+            if default
+              return Log.mono("<b>default repo: %s</b>\nadd --all to a command to use every repo, or clear the default with ;jinx repo default --clear" % default)
+            end
+            return Log.mono("<b>no default repo set</b>; commands use every repo\nset one with ;jinx repo default &lt;name&gt;")
+          end
+
+          repo = Repo.set_default(repo_name)
+          Log.mono("<b>default repo set to %s</b>\ncommands now use only this repo unless you pass --repo=&lt;name&gt; or --all" % repo[:name])
+        end
+
         def self.repo_change(repo_name, repo_url)
           repo = Repo.lookup(repo_name)
           Repo.atomic { |repos|
@@ -1533,16 +1713,16 @@ module ::Lich
           }
         end
 
-        def self.script_list(repo_name = nil)
+        def self.script_list(repo_name = nil, all: false)
           # Log.out(repo_name, label: %i(script_list))
           Repo
-            .select { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+            .resolve(repo_name, all: all)
             .map    { |repo| repo.merge(Repo.manifest(repo)) }
             .each   { |repo| Repo.dump(repo, scripts: true) }
         end
 
-        def self.script_info(script_name, repo_name = nil)
-          repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.script_info(script_name, repo_name = nil, all: false)
+          repos = Repo.resolve(repo_name, all: all)
           repo = Installer.ensure_specific(script_name, repos)
           script_metadata = Repo.scripts(repo).find { |asset|
             File.basename(asset[:file])
@@ -1559,48 +1739,55 @@ module ::Lich
           end
         end
 
-        def self.script_install(script, repo_name = nil, force: false)
-          sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.script_install(script, repo_name = nil, all: false, force: false)
+          sources = Repo.resolve(repo_name, all: all)
           env = defined?(Urnon) ? Jinx::UrnonScript : Jinx::LichScript
           env.install(script, sources, overwrite: force, force: force)
         end
 
-        def self.script_update(script, repo_name = nil, force: false)
-          sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.script_update(script, repo_name = nil, all: false, force: false)
+          sources = Repo.resolve(repo_name, all: all)
           env = defined?(Urnon) ? Jinx::UrnonScript : Jinx::LichScript
           env.install(script, sources, overwrite: true, force: force)
         end
 
-        def self.script_search(pattern, repo_name)
-          pattern = Regexp.compile(pattern)
-          candidate_repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.script_search(pattern, repo_name = nil, all: false)
+          pattern = Regexp.compile(pattern, Regexp::IGNORECASE)
+          candidate_repos = Repo.resolve(repo_name, all: all)
           matches = candidate_repos
                     .each { |repo| Repo.manifest(repo) }
                     .select { |repo| repo[:available].is_a?(Array) }
                     .map { |repo| Repo.scripts(repo).map { |script| script.merge({ repo: repo[:name] }) } }
                     .flatten(1)
-                    .select { |script| File.basename(script[:file]) =~ pattern }
+                    .select { |script| Lookup.matches_search?(script, pattern) }
 
-          Log.mono "<b>found %s #{matches.size == 1 ? "match" : "matches"}</b>" % matches.size
+          Log.mono "<b>found %s #{matches.size == 1 ? "match" : "matches"}</b>%s" % [matches.size, search_scope_note(candidate_repos)]
           matches.each { |script|
-            Log.mono "%s> %s (last updated: %s ago)" % [
+            Log.mono "%s> %s (last updated: %s ago)%s" % [
               script[:repo].to_s.rjust(15),
               File.basename(script[:file]).rjust(20),
-              Util.ago(script[:last_commit])
+              Util.ago(script[:last_commit]),
+              Lookup.format_tags(script)
             ]
           }
         end
 
-        def self.data_list(repo_name = nil)
+        # tells the user when a search only looked at their default repo
+        def self.search_scope_note(candidate_repos)
+          hint = Repo.default_scope_hint(candidate_repos)
+          hint.empty? ? "" : "\n(searched only repo(#{candidate_repos.first[:name]}), your default repo; add --all to search every repo)"
+        end
+
+        def self.data_list(repo_name = nil, all: false)
           Log.out(repo_name, label: %i(data_list))
           Repo
-            .select { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+            .resolve(repo_name, all: all)
             .map    { |repo| repo.merge(Repo.manifest(repo)) }
             .each   { |repo| Repo.dump(repo, data: true) }
         end
 
-        def self.data_info(datafile_name, repo_name = nil)
-          repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.data_info(datafile_name, repo_name = nil, all: false)
+          repos = Repo.resolve(repo_name, all: all)
           repo = Installer.ensure_specific(datafile_name, repos)
           datafile_metadata = Repo.data(repo).find { |asset|
             File.basename(asset[:file])
@@ -1617,50 +1804,50 @@ module ::Lich
           end
         end
 
-        def self.data_install(datafile, repo_name = nil, force: false)
-          sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.data_install(datafile, repo_name = nil, all: false, force: false)
+          sources = Repo.resolve(repo_name, all: all)
           env = defined?(Urnon) ? Jinx::UrnonData : Jinx::LichData
           env.install(datafile, sources, overwrite: force, force: force)
         end
 
-        def self.data_update(datafile, repo_name = nil, force: false)
-          sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.data_update(datafile, repo_name = nil, all: false, force: false)
+          sources = Repo.resolve(repo_name, all: all)
           env = defined?(Urnon) ? Jinx::UrnonData : Jinx::LichData
           env.install(datafile, sources, overwrite: true, force: force)
         end
 
-        def self.engine_list(repo_name = nil)
+        def self.engine_list(repo_name = nil, all: false)
           Log.out(repo_name, label: %i(engine_list)) if repo_name
           Repo
-            .select { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+            .resolve(repo_name, all: all)
             .map    { |repo| repo.merge(Repo.manifest(repo)) }
             .each   { |repo| Repo.dump(repo, engines: true) }
         end
 
-        def self.engine_update(engine, repo_name = nil, force: false)
-          sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.engine_update(engine, repo_name = nil, all: false, force: false)
+          sources = Repo.resolve(repo_name, all: all)
           env = defined?(Urnon) ? Jinx::UrnonEngine : Jinx::LichEngine
           env.install(engine, sources, overwrite: true, force: force)
         end
 
         # === NEW UNIFIED COMMAND IMPLEMENTATIONS ===
 
-        def self.list_all(repo_name = nil)
+        def self.list_all(repo_name = nil, all: false)
           Repo
-            .select { |repo| repo_name.nil? or repo[:name].eql?(repo_name.to_sym) }
+            .resolve(repo_name, all: all)
             .map    { |repo| repo.merge(Repo.manifest(repo)) }
             .each   { |repo|
               Repo.dump(repo, scripts: true, data: true, engines: true)
             }
         end
 
-        def self.smart_info(asset_name, repo_name = nil)
-          repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.smart_info(asset_name, repo_name = nil, all: false)
+          repos = Repo.resolve(repo_name, all: all)
           matches = Lookup.find_asset_across_repos(asset_name, repos)
 
           if matches.empty?
             Log.mono <<~ERROR
-          No asset named '#{asset_name}' found.
+          No asset named '#{asset_name}' found.#{Repo.default_scope_hint(repos)}
 
           Try:
           - ;jinx search #{asset_name}    to find similar names
@@ -1695,19 +1882,19 @@ module ::Lich
           end
         end
 
-        def self.smart_install(asset_name, repo_name = nil, force: false, type: nil)
-          sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.smart_install(asset_name, repo_name = nil, all: false, force: false, type: nil)
+          sources = Repo.resolve(repo_name, all: all)
           SmartInstaller.install(asset_name, sources, overwrite: false, force: force, type: type)
         end
 
-        def self.smart_update(asset_name, repo_name = nil, force: false, type: nil)
-          sources = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.smart_update(asset_name, repo_name = nil, all: false, force: false, type: nil)
+          sources = Repo.resolve(repo_name, all: all)
           SmartInstaller.install(asset_name, sources, overwrite: true, force: force, type: type)
         end
 
-        def self.search_all(pattern, repo_name = nil)
-          pattern = Regexp.compile(pattern)
-          candidate_repos = repo_name.nil? ? Repo.to_a : [Repo.lookup(repo_name)]
+        def self.search_all(pattern, repo_name = nil, all: false)
+          pattern = Regexp.compile(pattern, Regexp::IGNORECASE)
+          candidate_repos = Repo.resolve(repo_name, all: all)
 
           all_matches = []
 
@@ -1716,12 +1903,13 @@ module ::Lich
             next unless repo[:available].is_a?(Array)
 
             repo[:available].each do |asset|
-              if File.basename(asset[:file]) =~ pattern
+              if Lookup.matches_search?(asset, pattern)
                 type_str = asset[:type] || "script"
                 all_matches << {
                   repo: repo[:name],
                   file: File.basename(asset[:file]),
                   type: type_str,
+                  tags: asset[:tags],
                   last_commit: asset[:last_commit]
                 }
               end
@@ -1729,29 +1917,30 @@ module ::Lich
           end
 
           if all_matches.empty?
-            Log.mono "<b>No matches found for pattern: #{pattern.source}</b>"
+            Log.mono "<b>No matches found for pattern: #{pattern.source}</b>#{search_scope_note(candidate_repos)}"
             return
           end
 
           # Group by type
           by_type = all_matches.group_by { |m| m[:type] }
 
-          Log.mono "<b>Found #{all_matches.size} #{all_matches.size == 1 ? "match" : "matches"}:</b>"
+          Log.mono "<b>Found #{all_matches.size} #{all_matches.size == 1 ? "match" : "matches"}:</b>#{search_scope_note(candidate_repos)}"
 
           by_type.each do |type, matches|
             Log.mono "\n<b>#{type.capitalize}s:</b>"
             matches.sort_by { |m| m[:file] }.each do |match|
-              Log.mono "%s> %s (updated: %s ago)" % [
+              Log.mono "%s> %s (updated: %s ago)%s" % [
                 match[:repo].to_s.rjust(15),
                 match[:file].ljust(25),
-                Util.ago(match[:last_commit])
+                Util.ago(match[:last_commit]),
+                Lookup.format_tags(match)
               ]
             end
           end
         end
 
-        def self.auto_update(force: false, dry_run: false)
-          AutoUpdater.update_all(force: force, dry_run: dry_run)
+        def self.auto_update(force: false, dry_run: false, repo_name: nil, all: false)
+          AutoUpdater.update_all(force: force, dry_run: dry_run, repo_name: repo_name, all: all)
         end
       end
     end
@@ -1765,913 +1954,590 @@ end
 module ::Lich
   module Common
     module Jinx
+      # Graphical front end on Lich's WebUI.
+      #
+      # WebUI callbacks run on a Lich host thread, not on this script's thread,
+      # so they only push commands onto @commands. The script thread pops them,
+      # does the slow work (manifest downloads, installs), updates the state, and
+      # publishes a frozen snapshot (@view) that the render block reads.
       module GUI
         extend self
 
-        # =====================
-        # Cache for performance
-        # =====================
-        @manifest_cache = {}
-        @manifest_cache_mutex = Mutex.new
-        @full_asset_lists = { script: [], data: [] }
-        @is_loading = false
-        @alive = false
-        @model_mutex = Mutex.new
-        @refresh_threads = {}
+        PAGE_ID = "jinx" unless defined?(PAGE_ID)
+        TAB_NAMES = %w[Log Repos Scripts Data].freeze unless defined?(TAB_NAMES)
+        KIND_TABS = { script: "Scripts", data: "Data" }.freeze unless defined?(KIND_TABS)
+        MAX_LOG_LINES = 2_000 unless defined?(MAX_LOG_LINES)
+        MAX_LOG_LINE_LENGTH = 1_000 unless defined?(MAX_LOG_LINE_LENGTH)
+        PUBLISH_INTERVAL = 0.15 unless defined?(PUBLISH_INTERVAL)
+        QUIET_COMMANDS = %i[select repo_select].freeze unless defined?(QUIET_COMMANDS)
+        NOISE = /uberbar|dialogData|progressBar|anchor_left|Target Window|label id=/i unless defined?(NOISE)
 
-        # =====================
-        # Thread/UI helper
-        # =====================
-        def ui(&blk)
-          return unless @alive
-          if Gtk.respond_to?(:queue)
-            Gtk.queue { blk.call if @alive }
-          else
-            GLib::Idle.add { @alive ? blk.call : false; false }
+        @alive = false unless defined?(@alive)
+
+        # Lich::API.webui_page is loaded only from Lich 5.26.0, so it tells an old
+        # Lich (where Lich::WebUI can exist once another script required it) from
+        # one running with --no-gui.
+        def webui_lich?
+          defined?(::Lich::API) && ::Lich::API.respond_to?(:webui_page) ? true : false
+        end
+
+        # nil when the window can open, otherwise why not
+        def unavailable_reason
+          if !webui_lich?
+            "<b>jinx gui needs Lich 5.26.0 or later</b>\nIt uses Lich's WebUI window. Please update Lich; every GUI action is also a command (;jinx help)."
+          elsif !::Lich::WebUI.presentation_enabled?
+            "<b>jinx gui has no window while Lich runs with --no-gui</b>\nEvery GUI action is also a command (;jinx help)."
           end
         end
 
-        # =====================
-        # Time helper
-        # =====================
-        def safe_ago(ts)
-          return '-' if ts.nil?
-          ::Lich::Common::Jinx::Util.ago(ts) rescue '-'
+        def available?
+          unavailable_reason.nil?
         end
 
-        # =====================
-        # Log bridge
-        # =====================
-        def install_log_bridge!
-          return unless defined?(::Lich::Common::Jinx::Log)
-          log_class = ::Lich::Common::Jinx::Log.singleton_class
+        def alive?
+          @alive
+        end
 
-          # Hook Log.out once
-          if log_class.method_defined?(:out) && !log_class.method_defined?(:out__orig)
-            log_class.send(:alias_method, :out__orig, :out)
-            log_class.send(:define_method, :out) do |msg, label: :debug|
-              if defined?(::Lich::Common::Jinx::GUI) && ::Lich::Common::Jinx::GUI.alive?
-                if msg.is_a?(StandardError)
-                  ::Lich::Common::Jinx::GUI.append_log("[#{label}] #{msg.message}")
-                  msg.backtrace.to_a.slice(0..5).each { |frame| ::Lich::Common::Jinx::GUI.append_log(frame) }
-                else
-                  ::Lich::Common::Jinx::GUI.append_log("[#{label}] #{msg}")
-                end
-              end
-              out__orig(msg, label: label)
-            end
-          end
+        # whether the caller is the run that owns the window (see Log.gui)
+        def owner_thread?
+          @script_thread.equal?(Thread.current)
+        end
 
-          # Hook Log.mono once
-          if log_class.method_defined?(:mono) && !log_class.method_defined?(:mono__orig)
-            log_class.send(:alias_method, :mono__orig, :mono)
-            log_class.send(:define_method, :mono) do |text|
-              if defined?(::Lich::Common::Jinx::GUI) && ::Lich::Common::Jinx::GUI.alive?
-                # Strip HTML tags and log to GUI safely
-                clean_text = text.to_s.gsub(/<[^>]+>/, '')
-                ::Lich::Common::Jinx::GUI.append_log(clean_text)
-                # Don't call the original mono which would try to use _respond
-                nil
-              else
-                mono__orig(text)
-              end
-            end
-          end
+        # the WebUI carries only valid UTF-8; repo headers arrive as raw bytes
+        def utf8(text)
+          text.to_s.dup.force_encoding(Encoding::UTF_8).scrub("?")
         end
 
         # =====================
         # App bootstrap
         # =====================
         def start!
+          if @alive && @script_thread&.alive? && !@script_thread.equal?(Thread.current)
+            Log.out("already open; close that window first", label: %i(jinx gui))
+            return
+          end
+          if (reason = unavailable_reason)
+            Log.mono reason
+            return
+          end
+          reset_state!
+          @script_thread = Thread.current
+          @page = ::Lich::API.webui_page(
+            owner: Script.current, id: PAGE_ID, title: "Jinx - Package Manager",
+            props: { size: [1100, 700], viewport: true, density: :compact },
+            on: { close: proc { GUI.enqueue(:close) } }
+          ) { |ui| GUI.render(ui) }
           @alive = true
-          install_log_bridge!
-
-          # Setup cleanup handler
-          if defined?(before_dying)
-            before_dying { cleanup! }
+          append_log("[jinx.gui] Starting up...")
+          publish!(force: true)
+          ::Lich::API.webui_start
+          unless ::Lich::API.webui_open(page: @page)
+            @alive = false
+            Log.mono "<b>jinx gui could not open a window</b>\nLich could not open a browser window for it."
+            return
           end
-
-          ui do
-            @win = Gtk::Window.new(Gtk::Window::TOPLEVEL)
-            @win.title = 'Jinx - Package Manager'
-            @win.set_default_size(1100, 700)
-            @win.signal_connect('destroy') {
-              @alive = false
-            }
-
-            notebook = Gtk::Notebook.new
-            notebook.tab_pos = Gtk::PositionType::TOP
-
-            # Build tabs
-            log_tab = build_log_tab
-            @repos_model,   repos_tab   = build_repos_tab
-            @scripts_model, scripts_tab = build_assets_tab(:script)
-            @data_model,    data_tab    = build_assets_tab(:data)
-
-            # Add Log tab first for better initial UX
-            notebook.append_page(log_tab,     Gtk::Label.new('Log'))
-            notebook.append_page(repos_tab,   Gtk::Label.new('Repos'))
-            notebook.append_page(scripts_tab, Gtk::Label.new('Scripts'))
-            notebook.append_page(data_tab,    Gtk::Label.new('Data'))
-
-            @win.add(notebook)
-            @win.show_all
-
-            # Show loading message immediately
-            append_log("[jinx.gui] Starting up...")
-            append_log("[jinx.gui] Loading repository data, this may take 20-30 seconds...")
-
-            # Set loading indicators
-            ui do
-              @model_mutex.synchronize do
-                @repos_model.clear
-                iter = @repos_model.append
-                iter[0] = "Loading repositories..."
-                iter[1] = "Please wait..."
-                iter[2] = "Fetching manifests..."
-
-                [@scripts_model, @data_model].each do |model|
-                  model.clear
-                  iter = model.append
-                  iter[0] = "Loading..."
-                  iter[1] = "Please wait..."
-                end
-              end
-            end
-
-            # Start initial refresh
-            initial_refresh
-          end
-
-          # Keep the main script thread alive while GUI is running
-          while @alive
-            sleep 0.1
-          end
-
-          # Clean exit
+          enqueue(:reload)
+          run_loop
           Log.out("GUI closed", label: %i(jinx gui))
-        end
-
-        # =====================
-        # Initial refresh with caching
-        # =====================
-        def initial_refresh
-          Thread.new do
-            return unless @alive
-            @is_loading = true
-            append_log("[jinx.gui] Fetching repository manifests...")
-            refresh_repos(cache_only: false) do
-              if @alive
-                append_log("[jinx.gui] Initial load complete!")
-                @is_loading = false
-              end
-            end
-          end
-        end
-
-        # =====================
-        # Repos Tab (name, url, status)
-        # =====================
-        def build_repos_tab
-          model = Gtk::ListStore.new(String, String, String)
-          view  = Gtk::TreeView.new(model)
-          view.enable_grid_lines = :both
-          add_text_column(view, 'Name',   0, sortable: true)
-          add_text_column(view, 'URL',    1, sortable: true)
-          add_text_column(view, 'Status', 2, sortable: true)
-
-          name_entry = Gtk::Entry.new; name_entry.placeholder_text = 'repo name'
-          url_entry  = Gtk::Entry.new; url_entry.placeholder_text  = 'https://...'
-
-          add_btn     = Gtk::Button.new(label: 'Add')
-          rm_btn      = Gtk::Button.new(label: 'Remove')
-          chg_btn     = Gtk::Button.new(label: 'Change URL')
-          refresh_btn = Gtk::Button.new(label: 'Refresh Manifests')
-
-          add_btn.signal_connect('clicked') do
-            name = name_entry.text.to_s.strip
-            url  = url_entry.text.to_s.strip
-            next if name.empty? || url.empty?
-            Thread.new do
+        ensure
+          # only the run that owns the window tears it down; a refused second run
+          # (;force jinx gui) must not close the live page
+          if @script_thread.equal?(Thread.current)
+            @alive = false
+            if @page && defined?(::Lich::WebUI) && ::Lich::WebUI.respond_to?(:close)
               begin
-                ::Lich::Common::Jinx::CLI.repo_add(name, url)
-                clear_all_caches! # Clear cache when repos change
-              rescue => e
-                append_log("[repo add] #{e.message}")
-              ensure
-                refresh_repos(cache_only: false)
-              end
-            end
-          end
-
-          rm_btn.signal_connect('clicked') do
-            iter = selected_iter(view); next unless iter
-            repo = iter[0]
-            Thread.new do
-              begin
-                ::Lich::Common::Jinx::CLI.repo_rm(repo)
-                clear_all_caches! # Clear cache when repos change
-              rescue => e
-                append_log("[repo rm] #{e.message}")
-              ensure
-                refresh_repos(cache_only: false)
-              end
-            end
-          end
-
-          chg_btn.signal_connect('clicked') do
-            iter = selected_iter(view); next unless iter
-            repo = iter[0]
-            new_url = url_entry.text.to_s.strip; next if new_url.empty?
-            Thread.new do
-              begin
-                ::Lich::Common::Jinx::CLI.repo_change(repo, new_url)
-                clear_all_caches! # Clear cache when repos change
-              rescue => e
-                append_log("[repo change] #{e.message}")
-              ensure
-                refresh_repos(cache_only: false)
-              end
-            end
-          end
-
-          refresh_btn.signal_connect('clicked') do
-            Thread.new do
-              clear_all_caches!
-              refresh_repos(cache_only: false)
-            end
-          end
-
-          scroller = Gtk::ScrolledWindow.new; scroller.add(view)
-          ctrls = Gtk::Box.new(:horizontal, 6)
-          ctrls.pack_start(name_entry,  expand: true,  fill: true,  padding: 0)
-          ctrls.pack_start(url_entry,   expand: true,  fill: true,  padding: 0)
-          ctrls.pack_start(add_btn,     expand: false, fill: false, padding: 0)
-          ctrls.pack_start(chg_btn,     expand: false, fill: false, padding: 0)
-          ctrls.pack_start(rm_btn,      expand: false, fill: false, padding: 0)
-          ctrls.pack_start(refresh_btn, expand: false, fill: false, padding: 0)
-
-          box = Gtk::Box.new(:vertical, 8); box.margin = 8
-          box.pack_start(ctrls, expand: false, fill: false, padding: 0)
-          box.pack_start(scroller, expand: true, fill: true, padding: 0)
-
-          @repos_view = view
-          [model, box]
-        end
-
-        def refresh_repos(cache_only: false, &callback)
-          Thread.new do
-            return unless @alive # Exit early if shutting down
-            append_log("[jinx.gui] Refreshing repositories#{cache_only ? ' (from cache)' : ''}...")
-            repos = begin ::Lich::Common::Jinx::Repo.to_a rescue [] end
-            rows  = []
-            repos.each do |r|
-              break unless @alive # Check if still alive
-              name, url, status = r[:name].to_s, r[:url].to_s, 'ok'
-              begin
-                if cache_only
-                  @manifest_cache_mutex.synchronize do
-                    @manifest_cache[name] ||= manifest_with_retries(r)
-                  end
-                else
-                  m = manifest_with_retries(r)
-                  @manifest_cache_mutex.synchronize { @manifest_cache[name] = m }
-                end
-              rescue => e
-                status = "error: #{e.message}"
-                append_log("[WARN] Failed to fetch manifest for #{name}: #{e.message}")
-              end
-              rows << [name, url, status]
-            end
-
-            return unless @alive # Don't update UI if shutting down
-            ui do
-              return unless @repos_model && @alive
-              @model_mutex.synchronize do
-                @repos_model.clear
-                rows.sort_by! { |row| row[0].to_s }
-                rows.each do |r|
-                  it = @repos_model.append
-                  (0..2).each { |i| it[i] = r[i] }
-                end
-              end
-            end
-            append_log("[jinx.gui] Repositories refreshed")
-
-            # If not caching, also refresh the asset lists
-            unless cache_only
-              clear_asset_cache! # Only clear asset lists, keep manifests
-              refresh_assets(:script, filter: nil, use_cache: false)
-              refresh_assets(:data, filter: nil, use_cache: false)
-            end
-
-            callback.call if callback
-          end
-        end
-
-        # =====================
-        # Scripts/Data Tabs (name, repo, installed, modified, updated)
-        # =====================
-        def build_assets_tab(kind)
-          model = Gtk::ListStore.new(String, String, String, String, String)
-          view  = Gtk::TreeView.new(model)
-
-          view.selection.mode = :browse
-          view.activate_on_single_click = true rescue nil
-          view.signal_connect('button-press-event') do |w, event|
-            begin
-              if event.button == 1
-                path, col, _cx, _cy = w.get_path_at_pos(event.x.to_i, event.y.to_i)
-                if path
-                  w.selection.select_path(path)
-                  w.set_cursor(path, col, false)
-                end
-              end
-            rescue => e
-              append_log("[DEBUG] click-select failed: #{e.message}")
-            end
-            false
-          end
-          view.signal_connect('row-activated') { |w, path, _| w.selection.select_path(path) }
-          view.enable_grid_lines = :both
-
-          add_text_column(view, 'Name',         0, sortable: true)
-          add_text_column(view, 'Repo',         1, sortable: true)
-          add_text_column(view, 'Installed',    2, sortable: true)
-          add_text_column(view, 'Modified',     3, sortable: true)
-          add_text_column(view, 'Updated (ago)', 4, sortable: true)
-
-          # --- Controls (button-driven search; no auto-run) ---
-          search = Gtk::SearchEntry.new
-          search.placeholder_text = 'search by name... (empty = show all)'
-
-          search_btn  = Gtk::Button.new(label: 'Search')
-          clear_btn   = Gtk::Button.new(label: 'Clear')
-          info_btn    = Gtk::Button.new(label: 'Info')
-          install_btn = Gtk::Button.new(label: 'Install')
-          update_btn  = Gtk::Button.new(label: 'Update')
-
-          force_toggle = Gtk::CheckButton.new
-          force_toggle.label = 'Force overwrite'
-
-          # Define search action as a proc to avoid duplication
-          perform_search = proc do
-            search_text = search.text.to_s.strip
-
-            # Update info panel
-            ui do
-              t = (kind == :script) ? @script_info_text : @data_info_text
-              if t && !t.destroyed?
-                if search_text.empty?
-                  t.buffer.text = "Showing all #{kind}s..."
-                else
-                  t.buffer.text = "Searching for '#{search_text}'..."
-                end
-              end
-            end
-
-            # Empty search = show all
-            filter = search_text.empty? ? nil : search_text
-            refresh_assets(kind, filter: filter, use_cache: true)
-          end
-
-          # Search with caching - much faster!
-          search_btn.signal_connect('clicked', &perform_search)
-
-          # Also trigger search when Enter is pressed in the search box
-          search.signal_connect('activate', &perform_search)
-          # Clear button
-          clear_btn.signal_connect('clicked') do
-            search.text = ''
-            ui do
-              t = (kind == :script) ? @script_info_text : @data_info_text
-              t.buffer.text = "Showing all #{kind}s..." if t && !t.destroyed?
-            end
-            refresh_assets(kind, filter: nil, use_cache: true)
-          end
-
-          # Info button - thread-safe capture without global Log.mono override
-          local_view = view
-          info_btn.signal_connect('clicked') do
-            iter = selected_iter(local_view)
-            unless iter
-              append_log("[jinx.gui] No item selected ..."); next
-            end
-
-            keep_name = iter[0].to_s
-            keep_repo = iter[1].to_s
-            name      = keep_name
-            repo      = keep_repo
-
-            ui do
-              t = (kind == :script) ? @script_info_text : @data_info_text
-              t.buffer.text = "Fetching info for #{name}..." if t && !t.destroyed?
-            end
-
-            Thread.new do
-              captured = []
-
-              # Create a temporary capturing logger
-              capture_logger = Object.new
-              capture_logger.define_singleton_method(:mono) do |text|
-                clean = text.to_s.gsub(/<[^>]+>/, '')
-                captured << clean
+                ::Lich::WebUI.close(@page)
+              rescue StandardError
                 nil
               end
-
-              # Store original logger
-              original_log = ::Lich::Common::Jinx::Log rescue nil
-
-              begin
-                # Temporarily replace the Log module with our capturing version
-                # This is thread-local and won't affect other threads
-                if original_log
-                  ::Lich::Common::Jinx.send(:remove_const, :Log)
-                  ::Lich::Common::Jinx.const_set(:Log, capture_logger)
-                end
-
-                if kind == :script
-                  ::Lich::Common::Jinx::CLI.script_info(name, repo)
-                else
-                  ::Lich::Common::Jinx::CLI.data_info(name, repo)
-                end
-              rescue => e
-                captured << "Error: #{e.message}"
-              ensure
-                # Restore original Log module
-                if original_log
-                  ::Lich::Common::Jinx.send(:remove_const, :Log)
-                  ::Lich::Common::Jinx.const_set(:Log, original_log)
-                end
-              end
-
-              ui do
-                # Update side panel
-                t = (kind == :script) ? @script_info_text : @data_info_text
-                if t && !t.destroyed?
-                  t.buffer.text = (captured.any? ? captured.join("\n") : "No info available")
-                end
-
-                # Restore selection to the same (name, repo) row if still present
-                model = (kind == :script) ? @scripts_model : @data_model
-                view  = (kind == :script) ? @scripts_view  : @data_view
-                if model && view && !view.destroyed?
-                  @model_mutex.synchronize do
-                    it = model.iter_first
-                    while it
-                      if it[0].to_s == keep_name && it[1].to_s == keep_repo
-                        path = it.path
-                        view.selection.select_path(path)
-                        view.set_cursor(path, view.columns.first, false)
-                        break
-                      end
-                      break unless it.next!
-                    end
-                  end
-                end
-              end
-            end
-          end
-
-          # Install button
-          install_btn.signal_connect('clicked') do
-            iter = selected_iter(local_view)
-            unless iter
-              append_log("[jinx.gui] No item selected for install"); next
-            end
-
-            name = iter[0].to_s
-            repo = iter[1].to_s
-            force = force_toggle.active?
-
-            Thread.new do
-              begin
-                if kind == :script
-                  ::Lich::Common::Jinx::CLI.script_install(name, repo, force: force)
-                else
-                  ::Lich::Common::Jinx::CLI.data_install(name, repo, force: force)
-                end
-                # Refresh just this asset type after install
-                refresh_assets(kind, filter: nil, use_cache: true)
-              rescue => e
-                append_log("[install] #{e.message}")
-              end
-            end
-          end
-
-          # Update button
-          update_btn.signal_connect('clicked') do
-            iter = selected_iter(local_view)
-            unless iter
-              append_log("[jinx.gui] No item selected for update"); next
-            end
-
-            name = iter[0].to_s
-            repo = iter[1].to_s
-            force = force_toggle.active?
-
-            Thread.new do
-              begin
-                if kind == :script
-                  ::Lich::Common::Jinx::CLI.script_update(name, repo, force: force)
-                else
-                  ::Lich::Common::Jinx::CLI.data_update(name, repo, force: force)
-                end
-                # Refresh just this asset type after update
-                refresh_assets(kind, filter: nil, use_cache: true)
-              rescue => e
-                append_log("[update] #{e.message}")
-              end
-            end
-          end
-
-          # Layout
-          paned = Gtk::Paned.new(:horizontal)
-          scroller = Gtk::ScrolledWindow.new; scroller.add(view)
-
-          info_frame = Gtk::Frame.new("Information")
-          info_text = Gtk::TextView.new
-          info_text.editable = false
-          info_text.wrap_mode = :word
-          info_text.buffer.text = "Select an item and click Info to see details"
-          info_scroller = Gtk::ScrolledWindow.new; info_scroller.add(info_text)
-          info_frame.add(info_scroller)
-
-          if kind == :script
-            @script_info_text = info_text
-            @scripts_view     = view
-          else
-            @data_info_text   = info_text
-            @data_view        = view
-          end
-
-          paned.pack1(scroller, true, false)
-          paned.pack2(info_frame, false, true)
-          paned.position = 700
-
-          ctrls = Gtk::Box.new(:horizontal, 6)
-          ctrls.pack_start(search,       expand: true,  fill: true,  padding: 0)
-          ctrls.pack_start(search_btn,   expand: false, fill: false, padding: 0)
-          ctrls.pack_start(clear_btn,    expand: false, fill: false, padding: 0)
-          ctrls.pack_start(info_btn,     expand: false, fill: false, padding: 0)
-          ctrls.pack_start(install_btn,  expand: false, fill: false, padding: 0)
-          ctrls.pack_start(update_btn,   expand: false, fill: false, padding: 0)
-          ctrls.pack_start(force_toggle, expand: false, fill: false, padding: 0)
-
-          box = Gtk::Box.new(:vertical, 8)
-          box.margin = 8
-          box.pack_start(ctrls,  expand: false, fill: false, padding: 0)
-          box.pack_start(paned,  expand: true,  fill: true,  padding: 0)
-
-          [model, box]
-        end
-
-        def refresh_assets(kind, filter: nil, use_cache: true)
-          # Cancel any existing refresh for this kind
-          if @refresh_threads[kind]&.alive?
-            @refresh_threads[kind].kill rescue nil
-          end
-
-          @refresh_threads[kind] = Thread.new do
-            return unless @alive # Exit early if shutting down
-
-            # Remember current selection to restore after repopulating
-            view   = (kind == :script) ? @scripts_view : @data_view
-            model  = (kind == :script) ? @scripts_model : @data_model
-            prev_name = prev_repo = nil
-
-            if view && !view.destroyed?
-              @model_mutex.synchronize do
-                if (it = selected_iter(view))
-                  prev_name = it[0].to_s
-                  prev_repo = it[1].to_s
-                end
-              end
-            end
-
-            rows = []
-
-            if use_cache && @full_asset_lists[kind].any?
-              # Use cached data and just filter it
-              append_log("[jinx.gui] Using cached #{kind} data for search...")
-              rows = @full_asset_lists[kind]
-
-              # Apply filter if present
-              if filter && !filter.empty?
-                pattern = Regexp.new(Regexp.escape(filter), Regexp::IGNORECASE)
-                rows = rows.select { |r| r[0] =~ pattern }
-                append_log("[jinx.gui] Found #{rows.size} #{kind}(s) matching '#{filter}'")
-              else
-                append_log("[jinx.gui] Showing all #{rows.size} #{kind}(s)")
-              end
-            else
-              # Full refresh - fetch from repos
-              append_log("[jinx.gui] Building #{kind} list from repositories...")
-              pattern = filter && !filter.empty? ? Regexp.new(Regexp.escape(filter), Regexp::IGNORECASE) : nil
-
-              repos = begin ::Lich::Common::Jinx::Repo.to_a rescue [] end
-              successful_repos = 0
-
-              repos.each do |repo|
-                break unless @alive # Check if still alive
-                # Use cached manifest if available
-                m = @manifest_cache_mutex.synchronize { @manifest_cache[repo[:name].to_s] }
-                if m.nil?
-                  begin
-                    append_log("[jinx.gui] Fetching manifest for #{repo[:name]}...")
-                    m = manifest_with_retries(repo)
-                    @manifest_cache_mutex.synchronize { @manifest_cache[repo[:name].to_s] = m }
-                  rescue => e
-                    append_log("[ERROR] Failed to load #{repo[:name]}: #{e.message}")
-                    m = (repo || {}).dup
-                    m[:available] = []
-                  end
-                end
-
-                # Check if manifest has an error
-                if m[:err]
-                  append_log("[WARN] #{repo[:name]} has error: #{m[:err]}")
-                end
-
-                assets = (kind == :script) ? safe_repo_scripts(m) : safe_repo_data(m)
-                if assets.any?
-                  successful_repos += 1
-                  append_log("[jinx.gui] Found #{assets.size} #{kind}(s) in #{repo[:name]}")
-                elsif m[:available].is_a?(Array) && m[:available].empty?
-                  append_log("[INFO] #{repo[:name]} has no #{kind}s available")
-                elsif !m[:available].is_a?(Array)
-                  append_log("[WARN] #{repo[:name]} has invalid manifest structure")
-                else
-                  # Repository has items but none of this type
-                  other_count = m[:available].size
-                  append_log("[INFO] #{repo[:name]} has #{other_count} total assets but no #{kind}s")
-                end
-
-                assets.each do |asset|
-                  fname = File.basename(CGI.unescape(asset[:file].to_s))
-                  next if fname.empty?
-
-                  installed = installed_status(kind, fname)
-                  modified  = modified_status(kind, fname, asset)
-                  updated   = safe_ago(asset[:last_commit])
-
-                  row = [fname, m[:name].to_s, installed, modified, updated]
-                  rows << row
-                end
-              end
-
-              append_log("[jinx.gui] Successfully loaded #{kind}s from #{successful_repos}/#{repos.size} repositories")
-
-              # Cache the full list
-              @full_asset_lists[kind] = rows
-
-              # Apply filter if present
-              if pattern
-                rows = rows.select { |r| r[0] =~ pattern }
-                append_log("[jinx.gui] Found #{rows.size} #{kind}(s) matching '#{filter}'")
-              else
-                append_log("[jinx.gui] Total: #{rows.size} #{kind}(s)")
-              end
-            end
-
-            return unless @alive # Don't update UI if shutting down
-            ui do
-              return unless model && view && @alive
-              begin
-                @model_mutex.synchronize do
-                  model.clear
-                  # Sort by Name, then Repo (keeps identical names adjacent but separate by repo)
-                  rows.sort_by! { |r| [r[0].to_s, r[1].to_s] }
-                  rows.each { |r| it = model.append; (0..4).each { |i| it[i] = r[i] } }
-
-                  # Restore previous selection if possible
-                  if prev_name && prev_repo && view && !view.destroyed?
-                    it = model.iter_first
-                    while it
-                      if it[0].to_s == prev_name && it[1].to_s == prev_repo
-                        path = it.path
-                        view.selection.select_path(path)
-                        view.set_cursor(path, view.columns.first, false)
-                        break
-                      end
-                      break unless it.next!
-                    end
-                  end
-                end
-
-                # Update info panel if search completed
-                if filter
-                  t = (kind == :script) ? @script_info_text : @data_info_text
-                  if t && !t.destroyed?
-                    if rows.empty?
-                      t.buffer.text = "No #{kind}s found matching '#{filter}'"
-                    else
-                      t.buffer.text = "Found #{rows.size} #{kind}(s) matching '#{filter}'\n\nSelect an item and click Info to see details"
-                    end
-                  end
-                end
-              rescue
-                # Silently ignore errors during shutdown
-              end
             end
           end
         end
 
-        # Clear only asset cache (keep manifests)
-        def clear_asset_cache!
-          @full_asset_lists = { script: [], data: [] }
-          append_log("[jinx.gui] Asset cache cleared")
+        def reset_state!
+          @commands = Queue.new
+          @log = []
+          @busy = nil
+          @dirty = true
+          @last_publish = Time.at(0)
+          @publishing = false
+          @manifests = {}
+          @repo_rows = []
+          @repo_selected = nil
+          # a refresh keeps each viewer's typed text, so clearing an input means
+          # giving it a new key (generation) rather than rendering an empty value
+          @input_generation = { repo_form: 0, script: 0, data: 0 }
+          @assets = { script: [], data: [] }
+          @asset_index = { script: {}, data: {} }
+          @filter = { script: "", data: "" }
+          @selected = { script: nil, data: nil }
+          @info = {
+            script: "Select a script and click Info to see details",
+            data: "Select a data file and click Info to see details"
+          }
+          @view = nil
         end
 
-        # Clear all caches (manifests and assets)
-        def clear_all_caches!
-          @manifest_cache_mutex.synchronize { @manifest_cache.clear }
-          @full_asset_lists = { script: [], data: [] }
-          append_log("[jinx.gui] All caches cleared")
+        # =====================
+        # Script-thread command loop
+        # =====================
+        def enqueue(*command)
+          @commands << command if @commands
+          nil
         end
 
-        # Retry wrapper for manifest fetches
+        def run_loop
+          while @alive
+            command = @commands.pop(timeout: PUBLISH_INTERVAL)
+            perform(*command) if command
+            publish!
+          end
+        end
+
+        def perform(name, *args)
+          case name
+          when :close then @alive = false
+          when :reload then reload(fetch: true)
+          when :refresh_manifests then (@manifests.clear; reload(fetch: true))
+          when :filter then apply_filter(args[0], args.length > 1 ? args[1] : @filter[args[0]])
+          when :clear_filter then apply_filter(args[0], "", clear: true)
+          when :clear_log then @log = ["Log cleared at #{Time.now}"]
+          when :select then select_asset(args[0], args[1])
+          when :info then show_info(args[0])
+          when :install then install(args[0], overwrite: false, force: args[1])
+          when :update then install(args[0], overwrite: true, force: args[1])
+          when :repo_select then @repo_selected = Array(args[0]).first
+          when :repo_add then repo_add(args[0], args[1])
+          when :repo_change then repo_change(args[0])
+          when :repo_remove then repo_remove
+          when :repo_default then repo_default(clear: args[0])
+          end
+          # selecting a row changes nothing on screen; republishing for it would
+          # bump the page generation and make WebUI refuse a click already in flight
+          @dirty = true unless QUIET_COMMANDS.include?(name)
+        rescue Jinx::Error => e
+          append_log("[jinx.gui] #{e.message.strip}")
+        rescue StandardError => e
+          append_log("[jinx.gui] #{name} failed: #{e.message}")
+          e.backtrace.to_a.first(5).each { |frame| append_log("  #{frame}") }
+        ensure
+          @busy = nil
+        end
+
+        def busy(message)
+          @busy = message
+          append_log("[jinx.gui] #{message}")
+          publish!(force: true)
+        end
+
+        # =====================
+        # Data loading
+        # =====================
+        def reload(fetch:)
+          busy("Loading repository data, this may take a little while...")
+          repos = Repo.to_a
+          @manifests.select! { |name, _| repos.any? { |repo| repo[:name].to_s.eql?(name) } }
+          rows = repos.map do |repo|
+            name = repo[:name].to_s
+            status = "ok"
+            if fetch || !@manifests.key?(name)
+              busy("Fetching manifest for #{name}...")
+              begin
+                @manifests[name] = manifest_with_retries(repo)
+              rescue StandardError => e
+                @manifests[name] = repo.merge(available: [], err: e.message)
+              end
+            end
+            manifest = @manifests[name]
+            status = "error: #{manifest[:err]}" if manifest[:err]
+            { name: name, url: repo[:url].to_s, status: status, default: Repo.default?(repo) }
+          end
+          @repo_rows = rows.sort_by { |row| row[:name] }
+          @repo_selected = nil unless @repo_rows.any? { |row| repo_key(row[:name]).eql?(@repo_selected) }
+          rebuild_assets
+          append_log("[jinx.gui] Loaded #{@assets[:script].size} scripts and #{@assets[:data].size} data files from #{repos.size} repos")
+        end
+
         def manifest_with_retries(repo, attempts: 3, delay: 1.0)
-          last_e = nil
+          last_error = nil
           attempts.times do |i|
-            begin
-              append_log("[DEBUG] Attempt #{i + 1}/#{attempts} to fetch manifest for #{repo[:name]}...")
-              m = ::Lich::Common::Jinx::Repo.manifest(repo)
+            manifest = Repo.manifest(repo.dup)
+            return manifest if manifest.is_a?(Hash) && (manifest[:err] || manifest[:available].is_a?(Array))
 
-              # Check if it's actually a valid manifest
-              if m.is_a?(Hash)
-                if m[:err]
-                  # Repo.manifest returns error in :err field
-                  append_log("[DEBUG] #{repo[:name]} returned error: #{m[:err]}")
-                  return m # Return it anyway so we can handle it properly
-                elsif m[:available].is_a?(Array)
-                  append_log("[DEBUG] #{repo[:name]} manifest loaded successfully with #{m[:available].size} assets")
-                  return m
-                else
-                  append_log("[DEBUG] #{repo[:name]} manifest missing :available array")
-                  raise "invalid manifest structure - no :available array"
-                end
-              else
-                append_log("[DEBUG] #{repo[:name]} returned non-Hash: #{m.class}")
-                raise "manifest is not a Hash: #{m.class}"
+            last_error = "invalid manifest structure"
+            append_log("[jinx.gui] #{repo[:name]}: attempt #{i + 1}/#{attempts} failed: #{last_error}")
+            sleep(delay) if i < attempts - 1
+          end
+          raise last_error
+        end
+
+        # rebuilds the Scripts and Data rows from the cached manifests (no network)
+        def rebuild_assets
+          @assets = { script: [], data: [] }
+          @asset_index = { script: {}, data: {} }
+          @manifests.each do |repo_name, manifest|
+            { script: Repo.scripts(manifest), data: Repo.data(manifest) }.each do |kind, assets|
+              assets.each do |asset|
+                file = File.basename(CGI.unescape(asset[:file].to_s))
+                next if file.empty?
+
+                row = {
+                  key: asset_key(repo_name, file), file: file, repo: repo_name,
+                  tags: Lookup.tags_of(asset), asset: asset,
+                  installed: installed_status(kind, file),
+                  modified: modified_status(kind, file, asset),
+                  updated: safe_ago(asset[:last_commit])
+                }
+                @assets[kind] << row
+                @asset_index[kind][row[:key]] = row
               end
-            rescue => e
-              last_e = e
-              append_log("[DEBUG] Attempt #{i + 1} failed: #{e.message}")
-              sleep(delay) if i < attempts - 1
             end
           end
-          append_log("[ERROR] All #{attempts} attempts failed for #{repo[:name]}")
-          raise(last_e || "manifest failed after #{attempts} attempts")
+          @assets.each_value { |rows| rows.sort_by! { |row| [row[:file], row[:repo]] } }
+          @selected.each_key { |kind| @selected[kind] = nil unless @asset_index[kind].key?(@selected[kind]) }
+        end
+
+        def visible_assets(kind)
+          text = @filter[kind].to_s.strip
+          return @assets[kind] if text.empty?
+
+          pattern = Regexp.new(Regexp.escape(text), Regexp::IGNORECASE)
+          @assets[kind].select { |row| row[:file] =~ pattern || row[:tags].any? { |tag| tag =~ pattern } }
+        end
+
+        # Clear always gets a new input key, even with no filter applied, so text typed
+        # but never submitted is discarded too
+        def apply_filter(kind, text, clear: false)
+          @input_generation[kind] += 1 if clear || (text.to_s.empty? && !@filter[kind].to_s.empty?)
+          @filter[kind] = text.to_s
+          found = visible_assets(kind).size
+          @info[kind] =
+            if @filter[kind].strip.empty?
+              "Showing all #{@assets[kind].size} #{kind} files"
+            else
+              "Found #{found} #{kind} file(s) matching '#{@filter[kind].strip}' by name or tag\n\nSelect an item and click Info to see details"
+            end
+        end
+
+        def select_asset(kind, rows)
+          key = Array(rows).first
+          @selected[kind] = @asset_index[kind].key?(key) ? key : nil
+        end
+
+        # the selection survives a filter (so clearing the filter restores it, in step
+        # with the browser's highlight), but a row the filter hides is not acted on
+        def selected_row(kind)
+          row = @asset_index[kind][@selected[kind]]
+          row = nil unless row && visible_assets(kind).include?(row)
+          append_log("[jinx.gui] Select a #{kind} in the table first") unless row
+          row
+        end
+
+        # =====================
+        # Actions
+        # =====================
+        def show_info(kind)
+          row = selected_row(kind) or return
+          busy("Fetching info for #{row[:file]}...")
+          lines = capture_output do
+            if kind == :script
+              CLI.script_info(row[:file], row[:repo])
+            else
+              CLI.data_info(row[:file], row[:repo])
+            end
+          end
+          @info[kind] = lines.any? ? lines.join("\n") : "No info available"
+        end
+
+        def install(kind, overwrite:, force:)
+          row = selected_row(kind) or return
+          force = force ? true : false
+          busy("#{overwrite ? 'Updating' : 'Installing'} #{row[:file]} from #{row[:repo]}...")
+          if kind == :script
+            overwrite ? CLI.script_update(row[:file], row[:repo], force: force) : CLI.script_install(row[:file], row[:repo], force: force)
+          else
+            overwrite ? CLI.data_update(row[:file], row[:repo], force: force) : CLI.data_install(row[:file], row[:repo], force: force)
+          end
+          rebuild_assets
+        end
+
+        def selected_repo
+          row = @repo_rows.find { |r| repo_key(r[:name]).eql?(@repo_selected) }
+          append_log("[jinx.gui] Select a repo in the table first") unless row
+          row
+        end
+
+        def repo_add(name, url)
+          name = name.to_s.strip
+          url = url.to_s.strip
+          if name.empty? || url.empty?
+            return append_log("[jinx.gui] Enter both a repo name and a URL to add a repo")
+          end
+          unless url.start_with?("http://", "https://")
+            return append_log("[jinx.gui] Repo URLs must start with http:// or https://")
+          end
+
+          CLI.repo_add(name, url)
+          @input_generation[:repo_form] += 1
+          reload(fetch: false)
+        end
+
+        def repo_change(url)
+          row = selected_repo or return
+          url = url.to_s.strip
+          return append_log("[jinx.gui] Enter the new URL first") if url.empty?
+
+          CLI.repo_change(row[:name], url)
+          @manifests.delete(row[:name])
+          @input_generation[:repo_form] += 1
+          reload(fetch: false)
+        end
+
+        def repo_remove
+          row = selected_repo or return
+          CLI.repo_rm(row[:name])
+          @manifests.delete(row[:name])
+          reload(fetch: false)
+        end
+
+        def repo_default(clear:)
+          if clear
+            CLI.repo_default(nil, clear: true)
+          else
+            row = selected_repo or return
+            CLI.repo_default(row[:name])
+          end
+          reload(fetch: false)
+        end
+
+        # =====================
+        # Rendering
+        # =====================
+        def publish!(force: false)
+          return unless @alive && @page && !@publishing
+          return unless @dirty || force
+          return if !force && (Time.now - @last_publish) < PUBLISH_INTERVAL
+          return unless Thread.current.equal?(@script_thread)
+
+          @publishing = true
+          @dirty = false
+          view = snapshot
+          return if !force && view == @view # nothing visible changed
+
+          @view = view
+          @last_publish = Time.now
+          ::Lich::API.webui_refresh(@page)
+        rescue StandardError => e
+          # the page is gone (closed, or the script is shutting down), or it did not render
+          @alive = false
+          Log.out(e, label: %i(jinx gui))
+        ensure
+          @publishing = false
+        end
+
+        def snapshot
+          {
+            busy: @busy,
+            log: @log.dup.freeze,
+            repos: @repo_rows.map(&:dup).freeze,
+            assets: { script: visible_assets(:script).dup.freeze, data: visible_assets(:data).dup.freeze }.freeze,
+            filter: @filter.dup.freeze,
+            info: @info.dup.freeze,
+            generation: @input_generation.dup.freeze
+          }.freeze
+        end
+
+        # runs on whichever thread WebUI renders on; reads only the frozen @view
+        def render(ui)
+          view = @view || snapshot
+          ui.stack(key: "root", gap: 6, fill: true) do
+            ui.text(key: "status", content: view[:busy] || "Ready", tone: view[:busy] ? :caution : :neutral)
+            # the browser keeps each viewer's own tab; binding select is what lets tabs switch
+            ui.tabs(key: "tabs", names: TAB_NAMES, selected: 0, on: { select: proc {} }) do
+              GUI.render_log_tab(ui, view)
+              GUI.render_repos_tab(ui, view)
+              KIND_TABS.each { |kind, tab| GUI.render_assets_tab(ui, view, kind, tab) }
+            end
+          end
+        end
+
+        def GUI.render_log_tab(ui, view)
+          ui.stack(slot: "Log", key: "log_tab", gap: 6, fill: true) do
+            ui.button(key: "clear_log", label: "Clear Log", align: :start, on: { activate: proc { GUI.enqueue(:clear_log) } })
+            ui.log(key: "log", lines: view[:log], max_lines: MAX_LOG_LINES, follow: true, wrap: :word_char)
+          end
+        end
+
+        def GUI.render_repos_tab(ui, view)
+          ui.stack(slot: "Repos", key: "repos_tab", gap: 6, fill: true) do
+            name = url = nil
+            ui.stack(key: "controls", orientation: :horizontal, gap: 6) do
+              name = ui.text_input(key: "name_#{view[:generation][:repo_form]}", value: "", placeholder: "repo name")
+              url = ui.text_input(key: "url_#{view[:generation][:repo_form]}", value: "", placeholder: "https://...")
+              ui.button(key: "add", label: "Add", submit: [name, url], on: { activate: proc { |ev|
+                GUI.enqueue(:repo_add, ev.submission[name.cid], ev.submission[url.cid])
+              } })
+              ui.button(key: "change", label: "Change URL", submit: [url], on: { activate: proc { |ev|
+                GUI.enqueue(:repo_change, ev.submission[url.cid])
+              } })
+            end
+            ui.stack(key: "repo_actions", orientation: :horizontal, gap: 6) do
+              ui.button(key: "remove", label: "Remove", variant: :danger, confirm: "Remove the selected repo?",
+                        on: { activate: proc { GUI.enqueue(:repo_remove) } })
+              ui.button(key: "set_default", label: "Set Default", on: { activate: proc { GUI.enqueue(:repo_default, false) } })
+              ui.button(key: "clear_default", label: "Clear Default", on: { activate: proc { GUI.enqueue(:repo_default, true) } })
+              ui.button(key: "refresh", label: "Refresh Manifests", on: { activate: proc { GUI.enqueue(:refresh_manifests) } })
+            end
+            ui.text(key: "hint", emphasis: :subtle,
+                    content: "The default repo is the one ;jinx commands use unless you pass --repo or --all. This window always lists every repo.")
+            ui.table(
+              key: "repos", fill: true, scrollable: true, grid_lines: :both, selection: :single,
+              columns: [
+                { key: "name", label: "Name", sortable: true, resizable: true, min_width: 150 },
+                { key: "url", label: "URL", sortable: true, resizable: true, expand: true },
+                { key: "status", label: "Status", sortable: true, resizable: true },
+                { key: "default", label: "Default", resizable: true }
+              ],
+              rows: view[:repos].map { |row|
+                { key: GUI.repo_key(row[:name]),
+                  cells: { "name" => row[:name], "url" => row[:url], "status" => row[:status], "default" => row[:default] ? "yes" : "" } }
+              },
+              on: { selection_change: proc { |ev| GUI.enqueue(:repo_select, ev.payload[:rows]) } }
+            )
+          end
+        end
+
+        def GUI.render_assets_tab(ui, view, kind, tab)
+          ui.stack(slot: tab, key: "#{kind}_tab", gap: 6, fill: true) do
+            ui.stack(key: "controls", orientation: :horizontal, gap: 6) do
+              search = ui.text_input(
+                key: "search_#{view[:generation][kind]}", value: view[:filter][kind], search: true,
+                placeholder: "search by name or tag... (empty = show all)",
+                on: { submit: proc { |ev| GUI.enqueue(:filter, kind, ev.submission[search.cid]) } }
+              )
+              ui.submit(search, [search]) # Enter submits the box's own text
+              ui.button(key: "search_btn", label: "Search", submit: [search], on: { activate: proc { |ev|
+                GUI.enqueue(:filter, kind, ev.submission[search.cid])
+              } })
+              ui.button(key: "clear", label: "Clear", on: { activate: proc { GUI.enqueue(:clear_filter, kind) } })
+              ui.button(key: "info", label: "Info", on: { activate: proc { GUI.enqueue(:info, kind) } })
+              force = ui.checkbox(key: "force", label: "Force overwrite", checked: false)
+              ui.button(key: "install", label: "Install", variant: :primary, submit: [force], on: { activate: proc { |ev|
+                GUI.enqueue(:install, kind, ev.submission[force.cid])
+              } })
+              ui.button(key: "update", label: "Update", submit: [force], on: { activate: proc { |ev|
+                GUI.enqueue(:update, kind, ev.submission[force.cid])
+              } })
+            end
+            ui.split(key: "body", orientation: :horizontal, position: 65, fill: true) do
+              ui.table(
+                slot: "first", key: "assets", fill: true, scrollable: true, grid_lines: :both, selection: :single,
+                columns: [
+                  { key: "name", label: "Name", sortable: true, resizable: true, min_width: 170 },
+                  { key: "repo", label: "Repo", sortable: true, resizable: true, min_width: 120 },
+                  { key: "installed", label: "Installed", sortable: true, resizable: true },
+                  { key: "modified", label: "Modified", sortable: true, resizable: true },
+                  { key: "updated", label: "Updated (ago)", sortable: true, resizable: true, min_width: 110 },
+                  { key: "tags", label: "Tags", resizable: true, expand: true }
+                ],
+                rows: view[:assets][kind].map { |row|
+                  { key: row[:key],
+                    cells: { "name" => row[:file], "repo" => row[:repo], "installed" => row[:installed],
+                             "modified" => row[:modified], "updated" => row[:updated], "tags" => row[:tags].join(", ") } }
+                },
+                on: { selection_change: proc { |ev| GUI.enqueue(:select, kind, ev.payload[:rows]) },
+                      cursor_change: proc { |ev| GUI.enqueue(:select, kind, [ev.payload[:row]]) },
+                      row_activate: proc { |ev| GUI.enqueue(:select, kind, [ev.payload[:row]]); GUI.enqueue(:info, kind) } }
+              )
+              ui.group(slot: "second", key: "info", label: "Information", fill: true) do
+                ui.scroll(key: "info_scroll", fill: true) do
+                  ui.text(key: "info_text", content: view[:info][kind], wrap: true, font_family: "monospace")
+                end
+              end
+            end
+          end
+        end
+
+        # table row keys must be short identifiers; repo and file names can hold anything
+        def asset_key(repo_name, file)
+          "a" + Digest::SHA1.hexdigest("#{repo_name}/#{file}")[0, 20]
+        end
+
+        def repo_key(repo_name)
+          "r" + Digest::SHA1.hexdigest(repo_name.to_s)[0, 20]
+        end
+
+        # =====================
+        # Log bridge
+        # =====================
+        def append_log(line)
+          text = utf8(line)
+          return if text.strip.empty? || text =~ NOISE
+
+          text = text[0, MAX_LOG_LINE_LENGTH] + "..." if text.length > MAX_LOG_LINE_LENGTH
+          (@log ||= []) << text
+          @log.shift(@log.size - MAX_LOG_LINES) if @log.size > MAX_LOG_LINES
+          @dirty = true
+          publish!
+        end
+
+        # collects what Jinx::Log.mono prints while the block runs (used for Info)
+        def capture_output
+          Thread.current[:jinx_gui_capture] = []
+          yield
+          Thread.current[:jinx_gui_capture]
+        ensure
+          Thread.current[:jinx_gui_capture] = nil
+        end
+
+        # receives Log.mono output while the window is open (see Log.gui)
+        def mono(text)
+          clean = CGI.unescapeHTML(utf8(text).gsub(/<[^>]+>/, ""))
+          if (buffer = Thread.current[:jinx_gui_capture])
+            buffer << clean
+          else
+            clean.each_line { |l| append_log(l.chomp) }
+          end
+          nil
+        end
+
+        # =====================
+        # Helpers
+        # =====================
+        def safe_ago(ts)
+          return "-" if ts.nil?
+
+          Util.ago(ts)
+        rescue StandardError
+          "-"
+        end
+
+        def asset_dir(kind)
+          kind == :script ? Folder.script_dir : Folder.data_dir
+        rescue StandardError
+          nil
         end
 
         def installed_status(kind, filename)
-          dir =
-            if kind == :script
-              ::Lich::Common::Jinx::Folder.script_dir rescue nil
-            else
-              ::Lich::Common::Jinx::Folder.data_dir rescue nil
-            end
-          return 'unknown' unless dir.is_a?(String) && !dir.empty?
-          File.exist?(File.join(dir, filename)) ? 'yes' : 'no'
+          dir = asset_dir(kind)
+          return "unknown" unless dir.is_a?(String) && !dir.empty?
+
+          File.exist?(File.join(dir, filename)) ? "yes" : "no"
         end
 
         def modified_status(kind, filename, asset)
-          require 'digest/sha1'
-          dir =
-            if kind == :script
-              ::Lich::Common::Jinx::Folder.script_dir rescue nil
-            else
-              ::Lich::Common::Jinx::Folder.data_dir rescue nil
-            end
-          return '-' unless dir.is_a?(String) && !dir.empty?
+          dir = asset_dir(kind)
+          return "-" unless dir.is_a?(String) && !dir.empty?
+
           path = File.join(dir, filename)
-          return '-' unless File.exist?(path)
-          begin
-            remote_b64 = asset[:md5].to_s # upstream digest field is :md5 (base64 SHA1)
-            return 'unknown' if remote_b64.empty?
-            local_b64 = Digest::SHA1.base64digest(File.binread(path))
-            (local_b64 == remote_b64) ? 'clean' : 'modified'
-          rescue
-            'unknown'
-          end
-        end
+          return "-" unless File.exist?(path)
 
-        # =====================
-        # Log Tab with size limit
-        # =====================
-        MAX_LOG_LINES = 10000 unless defined?(MAX_LOG_LINES)
+          remote = asset[:md5].to_s # upstream digest field is :md5 (base64 SHA1)
+          return "unknown" if remote.empty?
 
-        def build_log_tab
-          @log_view = Gtk::TextView.new
-          @log_view.editable = false
-          @log_view.wrap_mode = :word_char
-          @log_buffer = @log_view.buffer
-          @log_buffer.text = "Jinx GUI initialized at #{Time.now}\n"
-
-          clear_btn = Gtk::Button.new(label: 'Clear Log')
-          clear_btn.signal_connect('clicked') do
-            ui {
-              @log_buffer.text = "Log cleared at #{Time.now}\n" if @log_buffer && !@log_view.destroyed?
-            }
-          end
-
-          scroller = Gtk::ScrolledWindow.new; scroller.add(@log_view)
-          box = Gtk::Box.new(:vertical, 8); box.margin = 8
-          box.pack_start(clear_btn, expand: false, fill: false, padding: 0)
-          box.pack_start(scroller, expand: true, fill: true, padding: 0)
-          box
-        end
-
-        def append_log(line)
-          # Filter out noisy non-Jinx output
-          return if line.to_s =~ /uberbar|dialogData|progressBar|anchor_left|Target Window|label id=/i
-          return if line.to_s.strip.empty?
-          return unless @alive # Don't try to update if shutting down
-
-          ui do
-            return unless @log_buffer && @log_view && @alive
-            begin
-              # Trim if too large
-              line_count = @log_buffer.line_count
-              if line_count > MAX_LOG_LINES
-                start_iter = @log_buffer.start_iter
-                end_iter = @log_buffer.get_iter_at_line(line_count - MAX_LOG_LINES + 100)
-                @log_buffer.delete(start_iter, end_iter)
-              end
-
-              it = @log_buffer.end_iter
-              @log_buffer.insert(it, line.to_s + "\n")
-              # Auto-scroll
-              mark = @log_buffer.create_mark(nil, it, false)
-              @log_view.scroll_mark_onscreen(mark) if @log_view && !@log_view.destroyed?
-              @log_buffer.delete_mark(mark) if mark
-            rescue
-              # Silently ignore errors during shutdown
-            end
-          end
-        end
-
-        # =====================
-        # Shared widget helpers
-        # =====================
-        def add_text_column(view, title, idx, sortable: false)
-          renderer = Gtk::CellRendererText.new
-          col = Gtk::TreeViewColumn.new(title, renderer, text: idx)
-          col.resizable = true
-          col.sort_column_id = idx if sortable
-          view.append_column(col)
-        end
-
-        def selected_iter(view)
-          return nil unless view && !view.destroyed?
-          sel  = view.selection
-          res  = sel.selected
-          iter = res.is_a?(Array) ? res[1] : res
-          if iter.nil?
-            begin
-              path, _col = view.cursor
-              iter = view.model.get_iter(path) if path
-            rescue => e
-              append_log("[DEBUG] selected_iter: cursor fallback err: #{e.message}")
-            end
-          end
-          iter
-        end
-
-        # =====================
-        # Safe wrappers (tolerate older Jinx)
-        # =====================
-        def safe_repo_scripts(repo)
-          ::Lich::Common::Jinx::Repo.respond_to?(:scripts) ? ::Lich::Common::Jinx::Repo.scripts(repo) : (repo[:scripts] || [])
-        end
-
-        def safe_repo_data(repo)
-          ::Lich::Common::Jinx::Repo.respond_to?(:data) ? ::Lich::Common::Jinx::Repo.data(repo) : (repo[:data] || [])
-        end
-
-        # =====================
-        # Keep-alive check
-        # =====================
-        def alive?
-          @alive
-        end
-
-        # =====================
-        # Cleanup method
-        # =====================
-        def cleanup!
-          @alive = false
-
-          # Cancel all refresh threads
-          @refresh_threads.each_value do |thread|
-            thread.kill if thread&.alive?
-          end rescue nil
-
-          # Destroy window
-          ui {
-            @win.destroy if @win && !@win.destroyed?
-          } rescue nil
+          Digest::SHA1.base64digest(File.binread(path)) == remote ? "clean" : "modified"
+        rescue StandardError
+          "unknown"
         end
       end
     end
