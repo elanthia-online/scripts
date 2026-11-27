@@ -300,6 +300,158 @@ module LogSpecHarness::Env
         Timeout.timeout(5) { start_main }
       end
 
+      # 1.8.0: the yaml can set every option (log_xml, log_both, log_streams,
+      # log_rnum, log_lines, log_exclude), so a plain ;log starts as the
+      # character's yaml says; an option on the command line wins.
+      context 'with option settings in the yaml' do
+        def files(extension) = Dir.glob(File.join(log_dir, '**', "*.#{extension}")).sort
+
+        def lines_of(path) = File.read(path).lines(chomp: true)
+
+        # Runs ;log +args+ with get_settings answering +settings+.
+        def run_log(args, **settings)
+          LogSpecHarness.settings = OpenStruct.new(settings)
+          LogSpecHarness.start_script(args)
+          run_main
+        end
+
+        it 'logs XML with every stream line and the yaml line count for a plain ;log' do
+          stream_lines = ['<pushStream id="inv"/>', '<output>In the pack: a torch.</output>', '<popStream/>']
+          LogSpecHarness.feed(stream_lines)
+
+          run_log('', log_xml: true, log_streams: true, log_lines: 2)
+
+          expect(files('log')).to be_empty
+          expect(files('xml').size).to eq(2)
+          expect(lines_of(files('xml').first)).to include(*stream_lines.first(2))
+          expect(lines_of(files('xml').last)).to include(stream_lines.last)
+          expect(LogSpecHarness.script.want_downstream_xml).to be(true)
+          expect(LogSpecHarness.echoes.grep(/is not/)).to be_empty
+        end
+
+        it 'skips the lines read in a log_exclude room' do
+          allow(XMLData).to receive(:room_id).and_return(7199)
+          LogSpecHarness.feed('You see a door.')
+
+          run_log('', log_exclude: ['u7199'])
+
+          expect(lines_of(files('log').first)).not_to include('You see a door.')
+        end
+
+        it 'lets a typed --lines win over log_lines' do
+          LogSpecHarness.feed('line 1', 'line 2')
+
+          run_log('--lines=5', log_lines: 1)
+
+          expect(files('log').size).to eq(1)
+        end
+
+        it 'starts the XML twin for log_both, and the twin reads no setting again' do
+          LogSpecHarness.feed('You see a door.')
+          run_log('', log_both: true, log_lines: 'lots')
+          code, = LogSpecHarness.exec_starts.first
+          LogSpecHarness.start_script('', name: 'logxml1')
+          LogSpecHarness.feed('<output>You see a door.</output>')
+
+          Timeout.timeout(5) { LogSpecHarness::Env.module_eval(code) }
+
+          expect(LogSpecHarness.exec_starts.size).to eq(1)
+          expect(files('log').size).to eq(1)
+          expect(files('xml').size).to eq(1)
+          expect(LogSpecHarness.echoes.grep(/log_lines/).size).to eq(1)
+        end
+
+        {
+          '--both over log_xml' => ['--both', { log_xml: true }, 1, false],
+          '--xml over log_both' => ['--xml', { log_both: true }, 0, true]
+        }.each do |label, (args, settings, twins, xml)|
+          it "lets a typed format option win: #{label}" do
+            run_log(args, **settings)
+
+            expect(LogSpecHarness.exec_starts.size).to eq(twins)
+            expect(LogSpecHarness.script.want_downstream_xml).to be(xml)
+          end
+        end
+
+        it 'does not start a twin for log_both in a run named logxml' do
+          LogSpecHarness.settings = OpenStruct.new(log_both: true)
+          LogSpecHarness.start_script('', name: 'logxml')
+
+          run_main
+
+          expect(LogSpecHarness.exec_starts).to be_empty
+          expect(LogSpecHarness.script.want_downstream_xml).to be(true)
+        end
+
+        it 'logs text as before when the yaml sets the switches to false' do
+          run_log('', log_xml: false, log_both: false, log_streams: false, log_rnum: false)
+
+          expect(files('log').size).to eq(1)
+          expect(files('xml')).to be_empty
+          expect(LogSpecHarness.exec_starts).to be_empty
+          expect(LogSpecHarness.echoes.grep(/ignored/)).to be_empty
+        end
+
+        describe 'GameLogger.apply_settings' do
+          def apply(args, settings, name = 'log')
+            GameLogger.apply_settings(GameLogger::Opts.parse(args), settings && OpenStruct.new(settings), name).to_h
+          end
+
+          it 'fills only the options the command line does not give' do
+            expect(apply(%w[--rnum --lines=5], log_xml: true, log_lines: 50_000, log_exclude: [288, 'u7199']))
+              .to eq(rnum: true, lines: '5', xml: true, exclude: %w[288 u7199])
+          end
+
+          it 'counts a typed --roomnum as --rnum, and the word rnum too' do
+            expect(apply(%w[--roomnum], log_rnum: true)).to eq(roomnum: true)
+            expect(apply(%w[rnum], log_rnum: true)).to eq(rnum: true)
+          end
+
+          it 'leaves the options alone with no settings or an empty yaml' do
+            expect(apply(%w[--xml], nil)).to eq(xml: true)
+            expect(apply([], {})).to eq({})
+          end
+
+          it 'keeps a bare typed option over the setting, as a typed value would' do
+            expect(apply(%w[--lines], log_lines: 50_000)).to eq(lines: true)
+          end
+        end
+
+        describe 'GameLogger.setting_value' do
+          {
+            [:log_xml, true]               => true,
+            [:log_xml, false]              => nil,
+            [:log_xml, nil]                => nil,
+            [:log_lines, 50_000]           => '50000',
+            [:log_lines, '50,000']         => '50,000',
+            [:log_exclude, 288]            => ['288'],
+            [:log_exclude, 'u7199,288']    => %w[u7199 288],
+            [:log_exclude, ['u7199', 288]] => %w[u7199 288],
+            [:log_exclude, []]             => []
+          }.each do |(setting, value), expected|
+            it "turns #{setting}: #{value.inspect} into #{expected.inspect}" do
+              expect(GameLogger.setting_value(setting, value)).to eq(expected)
+              expect(LogSpecHarness.echoes).to be_empty
+            end
+          end
+
+          {
+            [:log_rnum, 'yes']    => 'log_rnum "yes" is not true or false, so it is ignored.',
+            [:log_streams, 1]     => 'log_streams 1 is not true or false, so it is ignored.',
+            [:log_lines, 0]       => 'log_lines 0 is not a line count; use a whole number above 0, like log_lines: 50000. Using the default of 30000 lines per file.',
+            [:log_lines, '50,00'] => 'log_lines "50,00" is not a line count; use a whole number above 0, like log_lines: 50000. Using the default of 30000 lines per file.',
+            [:log_lines, true]    => 'log_lines true is not a line count; use a whole number above 0, like log_lines: 50000. Using the default of 30000 lines per file.',
+            [:log_exclude, true]  => 'log_exclude true is not a list of rooms; use Lich room numbers or u<uid> game room UIDs, like log_exclude: [u7199, 288]. No rooms are excluded.',
+            [:log_exclude, 1.5]   => 'log_exclude 1.5 is not a list of rooms; use Lich room numbers or u<uid> game room UIDs, like log_exclude: [u7199, 288]. No rooms are excluded.'
+          }.each do |(setting, value), message|
+            it "ignores #{setting}: #{value.inspect} and says why" do
+              expect(GameLogger.setting_value(setting, value)).to be_nil
+              expect(LogSpecHarness.echoes).to eq([message])
+            end
+          end
+        end
+      end
+
       # ;log --both writes the text log and the XML log at once. One Lich
       # script gets a single downstream buffer (the XML and the text lines
       # would arrive mixed), so this run logs the text and starts an exec
