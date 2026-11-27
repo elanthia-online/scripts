@@ -413,6 +413,24 @@ module ::Lich
             expect(output).to include("add --all to update each from the repo it was installed from")
             expect(output).to include("go2.lic")
             expect(output).not_to include("errors")
+            expect(output).not_to include("all up to date")
+            expect(output).to include("No other assets to check.")
+          end
+
+          it "counts only the assets it compared when some are not in the default repo" do
+            Service.run("repo add archive https://archive.lich.elanthia.online")
+            Service.run("script install go2")
+            Service.run("script install noop --repo=elanthia-online")
+            Service.run("repo default archive")
+            outdate("go2.lic")
+            game_output
+
+            updates = AutoUpdater.check_for_updates
+            output = game_output
+            expect(updates).to be_empty
+            expect(output).to include("1 not in repo(archive), left as installed")
+            expect(output).to include("Checked 1 assets - all up to date!")
+            expect(output).not_to include("Checked 2 assets")
           end
 
           it "updates each asset from the repo it was installed from with --all" do
