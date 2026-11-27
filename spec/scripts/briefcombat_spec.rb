@@ -216,6 +216,75 @@ RSpec.describe 'briefcombat.lic' do
     end
   end
 
+  # Review of 2.0.0 (scripts#2643): an attack on you inside an open round
+  # used to show its line but fold its roll and damage into the round,
+  # credited to whoever acted.
+  describe 'an attack on you during an open round' do
+    let(:jab) { "#{BriefCombatSpec::WARDEN.sub('a <a', 'The <a')} attempts to jab you!\r\n" }
+    let(:roll) { "  UAF: 414 vs UDF: 1048 = 0.395 * MM: 90 + d100: 11 = 46\r\n" }
+    let(:hit18) { "   ... and hit for 18 points of damage!\r\n" }
+
+    it 'ends another player\'s round, and its roll and damage stay yours' do
+      feed(BriefCombatSpec::ATTACK, BriefCombatSpec::HIT)
+      out = client.call(jab.dup)
+      expect(out).to include('.. 136 damage!')
+      expect(out).not_to include('154')
+      expect(out).to end_with(jab)
+      expect(feed(roll, hit18)).to eq([roll, hit18])
+      expect(client.call(BriefCombatSpec::PROMPT.dup)).to eq(BriefCombatSpec::PROMPT)
+    end
+
+    it 'ends your own round with all, and is never folded into it' do
+      args.replace(['all'])
+      feed("You swing a perfect mithril war-hammer at #{BriefCombatSpec::RAVAGER}!\r\n", BriefCombatSpec::HIT)
+      out = client.call(jab.dup)
+      expect(out).to include('.. 136 damage!')
+      expect(out).not_to include('and 1 other')
+      expect(out).to end_with(jab)
+      expect(feed(roll, hit18)).to eq([roll, hit18])
+    end
+
+    it 'is still summarized with --you' do
+      args.replace(['--you'])
+      feed(BriefCombatSpec::ATTACK, BriefCombatSpec::HIT)
+      expect(client.call(jab.dup)).to include('.. 136 damage!')
+      expect(feed(roll, hit18)).to all(be_nil)
+    end
+  end
+
+  describe 'lasting spells with two casters' do
+    let(:debris) { ->(creature) { "Fiery debris explodes from the ground beneath #{creature}!\r\n" } }
+
+    it 'keeps your cycles yours when another player casts the same spell on another creature' do
+      feed("You gesture at #{BriefCombatSpec::RAVAGER}.\r\n", debris.(BriefCombatSpec::RAVAGER), BriefCombatSpec::PROMPT)
+      feed(%(#{BriefCombatSpec::ADVENTURER} gestures at #{BriefCombatSpec::WARDEN}.\r\n), debris.(BriefCombatSpec::WARDEN), BriefCombatSpec::PROMPT)
+      # later cycles, nobody named
+      expect(client.call(debris.(BriefCombatSpec::RAVAGER))).to eq(debris.(BriefCombatSpec::RAVAGER))
+      client.call(BriefCombatSpec::PROMPT.dup)
+      expect(client.call(debris.(BriefCombatSpec::WARDEN))).to be_nil
+    end
+  end
+
+  describe 'inherited 1.x matching' do
+    it 'excludes whole player names only' do
+      args.replace(['--exclude=Advent'])
+      expect(client.call(BriefCombatSpec::ATTACK.dup)).to be_nil
+    end
+
+    it 'squelches arrow nocking but not "knocks a"' do
+      expect(client.call("<a exist=\"-1\" noun=\"Bob\">Bob</a> nocks an arrow.\r\n")).to be_nil
+      line = "<a exist=\"-1\" noun=\"Bob\">Bob</a> knocks a pebble off the ledge.\r\n"
+      expect(client.call(line.dup)).to eq(line)
+    end
+
+    it 'shows lines about you while another player\'s search is shortened' do
+      args.replace(['-x'])
+      feed(%(#{BriefCombatSpec::ADVENTURER} searches #{BriefCombatSpec::WARDEN}.\r\n))
+      expect(client.call("A few coins fall out.\r\n")).to be_nil
+      expect(client.call("You are stunned for 3 rounds!\r\n")).to eq("You are stunned for 3 rounds!\r\n")
+    end
+  end
+
   describe 'creatures attacking players' do
     let(:claw) { "#{BriefCombatSpec::WARDEN} swings a claw at #{BriefCombatSpec::HEALER}!\r\n" }
 

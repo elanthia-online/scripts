@@ -52,6 +52,7 @@
           including creature attacks Lich doesn't recognize yet
         - Kills come from the game's creature data instead of guessing from death messages
         - No more blank line after each summary
+        - --exclude now matches whole player names only ("Bob" no longer also leaves "Bobbington" alone)
         - Fix the Wrayth/StormFront compass sometimes not updating after a move that has roundtime
         - Fix the Bounties window not updating after a kill that was part of a shortened combat block
         - Fix vitals, experience, roundtime and other panels going stale while combat is shortened
@@ -663,7 +664,7 @@ module BriefCombat
       /briefly before decaying into dust\./,                # 709 decay
       /In a breathtaking display of ability and combat mastery|spins about looking mighty stirred up|looks determined and focused/, # mstrike prep
       /removes a single(.*)from/,                           # get arrow
-      /nocks? an?/,                                         # arrow nock
+      /\bnocks? an?\b/,                                     # arrow nock (not "knocks a")
       /surge of empowerment/
     ].freeze
     # Your own spell preparation, hidden with "all".
@@ -671,14 +672,14 @@ module BriefCombat
     SELF_SPELL_XML = /<castTime value='\d+'\/>|<spell exist='spell'>/
     SELF_SEARCH = %r{You search the <pushBold/>|<pushBold/>.*<popBold/> (?:had nothing of interest|didn't carry any silver|had nothing else of value)}
     OTHER_SEARCH = %r{<a exist="-\d+" noun="\w+">\w+</a> searches <pushBold/>.*<popBold/>}
-    # Lines about you: shown even inside someone else's round (a spell landing
-    # on you, a stun, a dodge, your own gear reacting), except a creature's
-    # death flavor, which only starts with "You hear".
     # Shown in every mode, --you included: awards, loot, your own death.
     ALWAYS_SHOW = /\AYou have been awarded|\bdiscover \d+ silvers?\b|\AYou (?:are|have been) (?:now )?(?:dead|slain)|\AYou have died/
     # A change to your own state (stunned, a spell landing, an award): shown
     # even inside your own round with "all".
     YOUR_STATE = /\A\s*You (?:are|have been)\b|\AYou .*\bdiscover \d+ silvers?\b/
+    # Lines about you: shown even inside someone else's round (a spell landing
+    # on you, a stun, a dodge, your own gear reacting), except a creature's
+    # death flavor, which only starts with "You hear".
     ABOUT_YOU = /\A\s*(?:You(?! hear a sound like)|Your)\b|\b(?:at|toward|towards) you[!.]\z|\byour (?:head|neck|chest|back|abdomen|arm|leg|hand|eye)/
 
     attr_reader :round
@@ -749,11 +750,20 @@ module BriefCombat
 
     private
 
+    # While another player's search is shortened, everything up to the
+    # prompt is its result, except lines about you and attacks on you.
     def search_line(text, prompt)
-      return nil unless prompt
+      if prompt
+        @search = false
+        return text
+      end
+      return text if plain(text).match?(ALWAYS_SHOW) || (!@settings.compress_you? && about_you_line?(text))
 
-      @search = false
-      text
+      nil
+    end
+
+    def about_you_line?(text)
+      plain(text).match?(ABOUT_YOU) || @classifier.opener(text)&.dig(:inbound) || false
     end
 
     def round_line(text, prompt)
@@ -764,6 +774,16 @@ module BriefCombat
       end
 
       opener = @classifier.opener(text, provisional: @settings.compress_you?)
+      # Without --you, an attack on you ends the open round: otherwise its
+      # roll and damage lines (which don't start with "You") fold into the
+      # round and are credited to whoever acted. That includes a creature
+      # line aimed at you that Lich doesn't recognize, except in your own
+      # round, where such a line is usually your own effect ("X looks at you
+      # in utter terror!" after your cry).
+      unless @settings.compress_you?
+        aimed = opener&.dig(:inbound) ? opener : (@round.actor != :self && @classifier.aimed_at_you(text))
+        return next_round(text, aimed) if aimed
+      end
       if opener && (!opener[:inbound] || @settings.compress_you?) && new_actor?(text, opener)
         # someone else starts acting: this round is over, theirs begins
         return next_round(text, opener)
@@ -822,12 +842,19 @@ module BriefCombat
 
       # An effect with no actor (Fiery debris explodes beneath ...) belongs to
       # whoever acted last before this prompt, and its later cycles to them.
+      # Keyed by spell AND target, so a second caster of the same lasting
+      # spell on another creature doesn't take over your cycles; the spell
+      # alone is the fallback for a cycle that hops to a new target.
       name = opener[:name]
+      target = opener.dig(:target, :id) || opener[:target_name] || @classifier.first_creature(text)&.dig(:id)
       if @last_actor
-        @effect_owner[name] = @last_actor if name
+        if name
+          @effect_owner[[name, target]] = @last_actor if target
+          @effect_owner[name] = @last_actor
+        end
         return @last_actor
       end
-      @effect_owner[name] || :ambient
+      (target && @effect_owner[[name, target]]) || @effect_owner[name] || :ambient
     end
 
     # @return [String, nil] why this round is left alone, or nil to shorten it
@@ -843,9 +870,10 @@ module BriefCombat
     # The line as the player reads it: tags removed, no line break.
     def plain(text) = text.gsub(/<[^>]+>/, '').chomp
 
+    # Whole names only: excluding "Bob" must not leave "Bobbington" alone.
     def excluded?(text)
       names = @settings.excluded
-      !names.empty? && names.any? { |name| text.include?(name) }
+      !names.empty? && names.any? { |name| text.match?(/(?<![A-Za-z])#{Regexp.escape(name)}(?![A-Za-z])/) }
     end
 
     def debug(message)
