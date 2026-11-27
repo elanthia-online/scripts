@@ -338,6 +338,15 @@ module LogSpecHarness::Env
           expect(lines_of(files('log').first)).not_to include('You see a door.')
         end
 
+        it 'skips the lines read in a log_exclude room written with a space after the comma' do
+          allow(XMLData).to receive(:room_id).and_return(8000)
+          LogSpecHarness.feed('You see a door.')
+
+          run_log('', log_exclude: 'u7199, u8000')
+
+          expect(lines_of(files('log').first)).not_to include('You see a door.')
+        end
+
         it 'lets a typed --lines win over log_lines' do
           LogSpecHarness.feed('line 1', 'line 2')
 
@@ -419,15 +428,18 @@ module LogSpecHarness::Env
 
         describe 'GameLogger.setting_value' do
           {
-            [:log_xml, true]               => true,
-            [:log_xml, false]              => nil,
-            [:log_xml, nil]                => nil,
-            [:log_lines, 50_000]           => '50000',
-            [:log_lines, '50,000']         => '50,000',
-            [:log_exclude, 288]            => ['288'],
-            [:log_exclude, 'u7199,288']    => %w[u7199 288],
-            [:log_exclude, ['u7199', 288]] => %w[u7199 288],
-            [:log_exclude, []]             => []
+            [:log_xml, true]                 => true,
+            [:log_xml, false]                => nil,
+            [:log_xml, nil]                  => nil,
+            [:log_lines, 50_000]             => '50000',
+            [:log_lines, '50,000']           => '50,000',
+            [:log_exclude, 288]              => ['288'],
+            [:log_exclude, 'u7199,288']      => %w[u7199 288],
+            [:log_exclude, 'u7199, 288']     => %w[u7199 288],
+            [:log_exclude, 'u7199, u8000']   => %w[u7199 u8000],
+            [:log_exclude, [' u7199 ', 288]] => %w[u7199 288],
+            [:log_exclude, ['u7199', 288]]   => %w[u7199 288],
+            [:log_exclude, []]               => []
           }.each do |(setting, value), expected|
             it "turns #{setting}: #{value.inspect} into #{expected.inspect}" do
               expect(GameLogger.setting_value(setting, value)).to eq(expected)
