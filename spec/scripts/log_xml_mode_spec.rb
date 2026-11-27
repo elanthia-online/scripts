@@ -149,7 +149,8 @@ module LogSpecHarness::Env
           expect(echoes).to eq(
             [
               "log_timestamp is on in your settings, but log_timestamp_format #{format.inspect} is not a format; using \"%F %T %Z\".",
-              started_echo
+              started_echo,
+              'settings: xml (typed); timestamp "%F %T %Z" (yaml)'
             ]
           )
         end
@@ -159,7 +160,7 @@ module LogSpecHarness::Env
         run_xml(args: '--timestamp=%H:%M', settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: nil))
 
         expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
-        expect(echoes).to eq([started_echo])
+        expect(echoes).to eq([started_echo, 'settings: xml, timestamp "%H:%M" (typed)'])
       end
     end
 
@@ -167,14 +168,14 @@ module LogSpecHarness::Env
       run_xml(settings: OpenStruct.new(log_timestamp: true, log_timestamp_format: '%H:%M'))
 
       expect(log_lines).to eq(['10:00', '10:00: <output>You see a door.</output>', '10:00'])
-      expect(echoes).to eq([started_echo])
+      expect(echoes).to eq([started_echo, 'settings: xml (typed); timestamp "%H:%M" (yaml)'])
     end
 
     it 'stays off when the yaml turns timestamps off, whatever the format' do
       run_xml(settings: OpenStruct.new(log_timestamp: false, log_timestamp_format: nil))
 
       expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
-      expect(echoes).to eq([started_echo])
+      expect(echoes).to eq([started_echo, 'settings: xml (typed)'])
     end
 
     context 'with an empty --timestamp=' do
@@ -185,7 +186,8 @@ module LogSpecHarness::Env
         expect(echoes).to eq(
           [
             'timestamp was given without a format, so it is ignored; to add timestamps use --timestamp="%F %T %Z".',
-            started_echo
+            started_echo,
+            'settings: xml (typed)'
           ]
         )
       end
@@ -632,7 +634,7 @@ module LogSpecHarness::Env
       expect(xml_script.vars).to eq([])
       expect(Dir.glob(File.join(log_dir, '**', '*.log'))).to eq([])
       expect(log_lines).to eq([default_header, '<output>You see a door.</output>', default_footer])
-      expect(echoes).to eq([started_echo])
+      expect(echoes).to eq([started_echo, 'settings: defaults'])
     end
 
     # The header is 12-hour with the hour's leading zero dropped.
@@ -1079,7 +1081,7 @@ module LogSpecHarness::Env
       it 'says nothing and leaves no line when the thread is killed, as ;kill log does' do
         run_xml(lines: ['<output>line 1</output>']) { sleep 0.05 }
 
-        expect(echoes).to eq([started_echo])
+        expect(echoes).to eq([started_echo, 'settings: xml (typed)'])
         expect(log_lines).to eq([default_header, '<output>line 1</output>', default_footer])
       end
     end
