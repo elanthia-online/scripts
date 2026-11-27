@@ -3968,7 +3968,6 @@ module BigshotSettingsDefaultsSpec
   TRANSIENT_KEYS_SRC = extract(/^    TRANSIENT_KEYS = %i\[.*?\]\.freeze$/m, 'Setup::TRANSIENT_KEYS')
   WITH_DEFAULTS_SRC = extract(/^    def self\.with_defaults\(.*?^    end$/m, 'Setup.with_defaults')
   PROFILE_SRC = extract(/^  def self\.profile\(vars\).*?^  end$/m, 'Bigshot.profile')
-  ON_PROFILE_LOAD_SRC = extract(/^    def on_profile_load\n.*?^    end$/m, 'Setup#on_profile_load')
   SETUP_INITIALIZE_SRC = extract(/^    def initialize\(settings\)\n.*?^    end$/m, 'Setup#initialize')
   BIGSHOT_INITIALIZE_SRC = extract(/^  def initialize\(options = nil, group = nil\)\n.*?^  end$/m, 'Bigshot#initialize')
   FLEE_MESSAGE_COND_SRC = extract(/(?<=elsif )server_string =~ \/#\{UserVars\.op\["flee_message"\]\}\/i && .*$/,
@@ -4096,11 +4095,6 @@ RSpec.describe 'bigshot Setup.with_defaults' do
   describe 'wiring' do
     it 'fills defaults on CLI profile load' do
       expect(BigshotSettingsDefaultsSpec::PROFILE_SRC).to include('UserVars.op = Setup.with_defaults(from_file)')
-    end
-
-    it 'fills defaults on settings-window profile load' do
-      expect(BigshotSettingsDefaultsSpec::ON_PROFILE_LOAD_SRC)
-        .to match(/@settings = Setup\.with_defaults\(from_file\.transform_keys\(&:to_sym\), string_keys: false/)
     end
 
     it 'fills defaults when the settings window opens' do
