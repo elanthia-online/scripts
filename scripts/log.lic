@@ -13,10 +13,13 @@
        author: elanthia-online
  contributors: Tillmen, Tysong, Xanlin, LostRanger
          game: any
-      version: 1.7.0
+      version: 1.8.0
      required: Lich >= 5.19.0
 
   changelog:
+    1.8.0 (2026-11-27):
+      * Your yaml (profiles/<name>-setup.yaml, GemStone or DragonRealms) can set every option (log_xml, log_both, log_streams, log_rnum, log_lines, log_exclude), so a plain ;log starts as it says; an option you type still wins.
+      * Starting a log now says which settings it logs with and where each came from, e.g. "settings: xml, rnum, lines 50000 (yaml); exclude u7199 (typed)".
     1.7.0 (2026-11-12):
       * New --compress-after=N option (or log_compress_after: N in DragonRealms yaml) gzips log files older than N days (0: all but today's).
     1.6.1 (2026-11-12):
@@ -131,6 +134,29 @@ module GameLogger
   # leaves compressing old logs to its text logger. It has spaces, so no
   # argument a player types parses to it.
   TWIN_KEY = :'xml twin of --both' unless defined?(TWIN_KEY)
+
+  # The yaml settings that stand in for an option the command line does not
+  # give (see {apply_settings}): setting name => option name. The switches
+  # take +true+ or +false+; log_lines takes a line count; log_exclude takes
+  # a list of rooms, or one room, or a comma-separated String.
+  SETTING_OPTIONS = {
+    log_xml: :xml,
+    log_both: :both,
+    log_streams: :streams,
+    log_rnum: :rnum,
+    log_lines: :lines,
+    log_exclude: :exclude
+  }.freeze unless defined?(SETTING_OPTIONS)
+
+  # The options that pick the log format. A command line that gives any of
+  # them (or a run named logxml) has picked the format, so log_xml and
+  # log_both are not read.
+  MODE_OPTIONS = %i[xml both].freeze unless defined?(MODE_OPTIONS)
+
+  # The option {apply_settings} sets to the names of the options it filled
+  # from the yaml, for the settings line ({Logger#settings_line}). It has
+  # spaces, so no argument a player types parses to it.
+  FROM_YAML_KEY = :'options filled from the yaml' unless defined?(FROM_YAML_KEY)
 
   # Log files open in this Lich process, by path ({open_log_path}), with how
   # many loggers hold each: every logger for a character runs in this one
@@ -284,7 +310,7 @@ module GameLogger
   end
 
   # Turns the --compress-after option, or the log_compress_after setting
-  # when the option is not given (DragonRealms yaml), into a number of
+  # when the option is not given (the character's yaml), into a number of
   # days: log files dated more than that many days before today are
   # gzipped (see +GameLogger::Logger.compress_old_logs+), so 0 means every
   # file dated before today. Today's files are never compressed: another
@@ -306,6 +332,75 @@ module GameLogger
 
     problem = value == true ? "#{source} was given without a number of days" : "#{source} #{value.inspect} is not a number of days"
     echo "#{problem}; use a whole number, 0 or above, like --compress-after=7. Old logs are not compressed."
+    nil
+  end
+
+  # Fills the options the command line does not give from the yaml
+  # settings in {SETTING_OPTIONS} (log_xml: true does what --xml does), so
+  # a plain ;log can start the way a character's yaml says. An option on
+  # the command line always wins: --lines=5 keeps 5 whatever log_lines
+  # says, and --roomnum counts as --rnum. A command line that picks the
+  # format (--xml or --both) or a run named +script_name+ logxml skips
+  # log_xml and log_both. A setting that is not a usable value echoes once
+  # and is ignored; false and an absent setting give nothing.
+  #
+  # @param options [OpenStruct] the run's options, as {Opts.parse} returns
+  #   them
+  # @param settings [Object, nil] the character's settings (get_settings);
+  #   read with +[]+, so an OpenStruct or a Hash with Symbol keys
+  # @param script_name [String, nil] the name the script runs as
+  # @return [OpenStruct] a new options object: +options+ with the settings
+  #   filled in and {FROM_YAML_KEY} naming them, or +options+ itself when
+  #   +settings+ is nil
+  # @example log_xml: true and log_lines: 50000 in the yaml, ;log --rnum typed
+  #   GameLogger.apply_settings(Opts.parse(%w[--rnum]), settings, 'log').to_h
+  #   # => {xml: true, lines: "50000", rnum: true, FROM_YAML_KEY => [:xml, :lines]}
+  def self.apply_settings(options, settings, script_name)
+    return options if settings.nil?
+
+    given = options.to_h
+    given = given.merge(rnum: true) if given[:roomnum]
+    mode_picked = MODE_OPTIONS.any? { |key| given[key] } || script_name == Logger::XML_SCRIPT_NAME
+    filled = SETTING_OPTIONS.each_with_object({}) do |(setting, key), found|
+      next unless given[key].nil?
+      next if mode_picked && MODE_OPTIONS.include?(key)
+
+      value = setting_value(setting, settings[setting])
+      found[key] = value unless value.nil?
+    end
+    OpenStruct.new(**filled, **options.to_h, FROM_YAML_KEY => filled.keys)
+  end
+
+  # Turns one {SETTING_OPTIONS} setting into the option value the command
+  # line would have given: +true+ for a switch set to true, the count as a
+  # String for log_lines (as --lines=50000 gives "50000"), and the rooms as
+  # Strings for log_exclude, each trimmed of spaces (as --exclude=u7199,288
+  # gives; "u7199, 288" gives the same). Echoes once for a value that is
+  # none of those.
+  #
+  # @param setting [Symbol] the setting name, e.g. :log_lines
+  # @param value [Object] the setting's value from the yaml
+  # @return [true, String, Array<String>, nil] the option value, or nil
+  #   when the setting gives none (absent, false, or not usable)
+  def self.setting_value(setting, value)
+    return nil if value.nil? || value == false
+
+    case setting
+    when :log_lines
+      count = value.is_a?(Integer) ? value.to_s : value
+      return count if count.is_a?(String) && count.match?(LINE_COUNT_PATTERN) && Integer(count.delete(',_'), 10).positive?
+
+      echo "#{setting} #{value.inspect} is not a line count; use a whole number above 0, like #{setting}: 50000. Using the default of #{DEFAULT_LINES_PER_FILE} lines per file."
+    when :log_exclude
+      rooms = value.is_a?(String) ? value.split(',') : Array(value)
+      return rooms.map { |room| room.to_s.strip } if rooms.all? { |room| room.is_a?(String) || room.is_a?(Integer) }
+
+      echo "#{setting} #{value.inspect} is not a list of rooms; use Lich room numbers or u<uid> game room UIDs, like #{setting}: [u7199, 288]. No rooms are excluded."
+    else
+      return true if value == true
+
+      echo "#{setting} #{value.inspect} is not true or false, so it is ignored."
+    end
     nil
   end
 
@@ -1747,7 +1842,9 @@ module GameLogger
 
     # Writes reget's lines and the reget marker at the top of the run's
     # first file when the run started within {REGET_WINDOW} seconds of
-    # login, then echoes where the log goes.
+    # login, then echoes where the log goes and the settings it logs with
+    # ({settings_line}; not for the XML twin of --both, whose text logger
+    # has said them).
     #
     # @param file [File] the run's first log file
     # @param filename [String] its path, for the echo
@@ -1759,7 +1856,45 @@ module GameLogger
       end
 
       @io.send(:echo, "#{@mode.started_text} #{filename}")
+      @io.send(:echo, settings_line) unless @options[GameLogger::TWIN_KEY]
       @started = true
+    end
+
+    # The settings this run logs with, once validated, each marked with where
+    # it came from: the yaml ({GameLogger.apply_settings} and the timestamp
+    # and compress settings) or the command line. Settings left at their
+    # defaults are not listed, so a run with none says so.
+    #
+    # @return [String] e.g. 'settings: xml, rnum, lines 50000 (yaml); exclude u7199 (typed)'
+    # @example ;log --exclude=u7199 with log_xml: true in the yaml
+    #   settings_line # => "settings: xml (yaml); exclude u7199 (typed)"
+    def settings_line
+      from_yaml = Array(@options[GameLogger::FROM_YAML_KEY])
+      sources = Hash.new { |hash, key| hash[key] = [] }
+      settings_items.each { |text, key| sources[key == :yaml || from_yaml.include?(key) ? 'yaml' : 'typed'] << text }
+      return 'settings: defaults' if sources.empty?
+
+      "settings: #{sources.map { |source, texts| "#{texts.join(', ')} (#{source})" }.join('; ')}"
+    end
+
+    # The run's settings that differ from the defaults, for {settings_line}.
+    #
+    # @return [Array<Array(String, Symbol)>] [text, option name] pairs; the
+    #   name is :yaml for a value only the yaml can have given
+    def settings_items
+      # A run named logxml is XML by its name, not by a setting.
+      xml = @options.both || @mode.extension == '.xml'
+      items = []
+      items << ['both', :both] if @options.both
+      items << ['xml', :xml] if @options.xml && !@options.both
+      items << ['streams', :streams] if xml && @options.streams
+      items << ['rnum', @options.roomnum ? :roomnum : :rnum] if @show_room_numbers
+      items << ["lines #{@lines_per_file}", :lines] if @lines_per_file != GameLogger::DEFAULT_LINES_PER_FILE
+      rooms = @uid_excludes + @id_excludes
+      items << ["exclude #{rooms.join(',')}", :exclude] unless rooms.empty?
+      items << ["timestamp #{@stamp_format.inspect}", GameLogger.timestamp_format?(@options.timestamp) ? :timestamp : :yaml] if @stamp_format
+      items << ["compress-after #{@compress_days}", @options[:'compress-after'].nil? ? :yaml : :'compress-after'] if @compress_days
+      items
     end
 
     # Writes lines to +file+ until --lines lines are written, or until a
@@ -1926,7 +2061,7 @@ module GameLogger
 
   # The usage text ;log help shows, one String per line: the commands, every
   # option, where the files go, how to log text and XML together, the
-  # DragonRealms yaml timestamp settings and an autostart example, with
+  # yaml settings and an autostart example, with
   # Lich's command character. Run as logxml (an install that still has
   # logxml.lic, see {Logger.mode_for}), it also says ;logxml is ;log --xml,
   # and that ;log and ;logxml run side by side under their own names.
@@ -1971,9 +2106,13 @@ module GameLogger
       '',
       *together,
       '',
-      '  DragonRealms: log_timestamp: true in your yaml turns timestamps on, in the',
-      '  log_timestamp_format format; --timestamp wins over both. log_compress_after: 7',
-      '  in your yaml does what --compress-after=7 does; the option wins.',
+      '  Your yaml (profiles/<name>-setup.yaml, in GemStone or DragonRealms) can set the options,',
+      '  so a plain ;log starts as it says. An option you type wins, and log_xml and log_both',
+      '  are skipped when you type --xml or --both. log_timestamp: true turns timestamps on, in',
+      '  the log_timestamp_format format.',
+      '    log_timestamp: true  log_timestamp_format: "%F %T %Z"  log_compress_after: 7',
+      '    log_xml: true        log_both: true       log_streams: true    log_rnum: true',
+      '    log_lines: 50000     log_exclude: [u7199, 288]',
       '',
       '  A reply that comes within about 50 ms of a typed command can be logged before it.',
       '',
@@ -2024,7 +2163,9 @@ module GameLogger
   # the mode `GameLogger::Logger.mode_for` picks from them and the
   # script's name (text mode, or XML mode for --xml or a run named
   # logxml); see +GameLogger::Logger#run+. The Logger class is read once
-  # here, so the whole run keeps the one this evaluation set.
+  # here, so the whole run keeps the one this evaluation set. Options the
+  # command line leaves out are first filled from the yaml settings (see
+  # {apply_settings}); the XML twin of --both gets them already filled.
   #
   # @example What log.lic runs; ;log --xml --rnum gives these options
   #   GameLogger.main
@@ -2066,6 +2207,7 @@ module GameLogger
   def self.main(options = Opts.parse)
     return show_help if options.help
 
+    options = apply_settings(options, (get_settings if respond_to?(:get_settings, true)), Script.current.name) unless options[TWIN_KEY]
     start_xml_twin(options) if options.both
     logger = Logger
     logger.new(options, mode: logger.mode_for(options, Script.current.name)).run
