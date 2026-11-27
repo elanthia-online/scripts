@@ -277,6 +277,25 @@ RSpec.describe 'briefcombat.lic' do
       expect(client.call(line.dup)).to eq(line)
     end
 
+    it 'shows an attack on you during a shortened search, with its roll and damage' do
+      args.replace(['-x'])
+      feed(%(#{BriefCombatSpec::ADVENTURER} searches #{BriefCombatSpec::WARDEN}.\r\n))
+      jab = "#{BriefCombatSpec::WARDEN.sub('a <a', 'The <a')} attempts to jab you!\r\n"
+      roll = "  UAF: 414 vs UDF: 1048 = 0.395 * MM: 90 + d100: 11 = 46\r\n"
+      hit = "   ... and hit for 18 points of damage!\r\n"
+      expect(feed(jab, roll, hit)).to eq([jab, roll, hit])
+    end
+
+    it 'shows an attack on you Lich does not recognize during a shortened search' do
+      args.replace(['-x'])
+      feed(%(#{BriefCombatSpec::ADVENTURER} searches #{BriefCombatSpec::WARDEN}.\r\n))
+      myrmidon = '<pushBold/>a <a exist="26006044" noun="myrmidon">chitinous kiramon myrmidon</a><popBold/>'
+      its = '<pushBold/><a exist="26006044" noun="myrmidon">its</a><popBold/>'
+      slash = "Surging forward powerfully, #{myrmidon} slashes at you with #{its} bladed foreleg!\r\n"
+      roll = "  AS: +534 vs DS: +1001 with AvD: +23 + d100 roll: +40 = -404\r\n"
+      expect(feed(slash, roll, "   A clean miss.\r\n")).to eq([slash, roll, "   A clean miss.\r\n"])
+    end
+
     it 'shows lines about you while another player\'s search is shortened' do
       args.replace(['-x'])
       feed(%(#{BriefCombatSpec::ADVENTURER} searches #{BriefCombatSpec::WARDEN}.\r\n))
