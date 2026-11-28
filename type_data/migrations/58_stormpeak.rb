@@ -8,6 +8,12 @@ migrate :aggressive_npc do
   insert(:name, %{Veiki herald})
 end
 
+migrate :skin, :furrier do
+  insert(:name, %{storm hound paw})
+  insert(:name, %{vapor hound tail})
+  insert(:name, %{water hound pelt})
+end
+
 migrate :undead, :aggressive_npc, :noncorporeal do
   insert(:name, %{swirling spectre})
 end

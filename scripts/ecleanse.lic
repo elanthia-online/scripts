@@ -5,10 +5,44 @@
   contributors: Tysong
           game: Gemstone
           tags: dispel, unpoison, undisease, disarmed, effects
-      required: Lich >= 5.12.10
-       version: 2.2.8
+      required: Lich >= 5.22.0
+       version: 2.3.7
 
   Improvements:
+  v2.3.7  (2026-11-06)
+    - finding a different lost weapon no longer ends the search for the one just disarmed
+    - keeps a list of up to 20 unrecovered disarms that survives a death or restart; see it with ;ecleanse last disarm
+    - added ;ecleanse disarmrecover to go back for the most recent unrecovered disarm
+    - stops searching right away when too injured to search, then puts your other weapon back in hand
+    - forgets saved disarms for a room once the game says there is nothing to recover there
+    - disarm detection now runs ahead of other scripts' text handling, so disarms are less likely to be missed
+    - now requires Lich 5.22.0 or newer
+  v2.3.6  (2026-09-07)
+    - fix use proper Feat.available?('escapeartist', min_rank: 5) for it's usage instead of having to scrape FEAT output
+  v2.3.5  (2026-09-01)
+    - on recover attempts, always attempt to go to room_id between attempts incase somehow moved away from room (group movement?)
+  v2.3.4  (2026-08-18)
+    - fixed a case where the script could wrongly think a disarmed weapon
+      was already back in hand (if another script, like eloot, briefly put
+      something else in that hand right after the disarm) and skip trying
+      to recover it at all
+  v2.3.3  (2026-08-18)
+    - fixed a bug where recovering a disarmed weapon could occasionally
+      grab an older, previously-dropped weapon instead of the one that was
+      just knocked away
+  v2.3.2  (2026-08-17)
+    - fixed weapon recovery not working correctly when dual-wielding two
+      weapons of the same type (e.g. two handaxes)
+  v2.3.1  (2026-08-05)
+    - hive traps: bound search/disarm attempts and add a wall-clock deadline
+    - hive traps: validate room between each search, break early if moved
+    - hive traps: break early if dead or muckled
+    - hive traps: fix SEARCH start_pattern so non-rolled results terminate the loop
+    - hive traps: fix event_stack push precedence that allowed duplicate events
+  v2.3.0  (2026-06-08)
+    - add break runestones option for Onslaughts
+  v2.2.9  (2026-04-21)
+    - fix to support dispelling cloud of acidic mist
   v2.2.8  (2026-01-03)
     - convert stunmaneuvers to CMan.use
   v2.2.7  (2025-11-29)
@@ -133,7 +167,7 @@
 =end
 
 # Check version of Lich for compatibility
-lich_gem_requires = '5.12.10'
+lich_gem_requires = '5.22.0'
 
 if Gem::Version.new(LICH_VERSION) < Gem::Version.new(lich_gem_requires)
   if $frontend == 'stormfront' || $frontend == 'profanity'
@@ -157,11 +191,16 @@ if Gem::Version.new(LICH_VERSION) < Gem::Version.new(lich_gem_requires)
 end
 
 require 'yaml'
+require 'securerandom'
 require 'terminal-table'
 
 module Ecleanse
   class CappedCollection
-    MAX_SIZE ||= 200
+    # Drop constants left by an earlier run this session so a restart loads the
+    # current definitions without already-initialized warnings.
+    %i[MAX_SIZE].each { |name| remove_const(name) if const_defined?(name, false) }
+
+    MAX_SIZE = 200
     attr_accessor :list, :max_size
 
     def initialize(max_size = MAX_SIZE)
@@ -186,7 +225,8 @@ end
 module Ecleanse
   class Data
     attr_accessor :settings, :did_something, :event_stack, :disease, :dispel, :poison, :webs, :injury_locations, :cloud, :globe, :web, :debuffs, :magic_globes,
-                  :recover_stuff, :creature, :target_regex, :bad_targets, :escape_artist_available, :hive_trap_room, :invalid_clouds
+                  :recover_stuff, :recover_stuff_seq, :creature, :target_regex, :bad_targets, :hive_trap_room, :invalid_clouds, :breeze_wind, :runestones,
+                  :runestone
 
     def initialize(settings)
       @settings = settings
@@ -198,12 +238,7 @@ module Ecleanse
       @dispel = [417, 1218, 119].map { |s| Spell[s] }.find { |s| s.known? }
       @poison = [114].map { |s| Spell[s] }.find { |s| s.known? }
       @webs = [209, 417, 1218, 119].map { |s| Spell[s] }.find { |s| s.known? }
-
-      @escape_artist_available = false
-      if Feat.known?("escapeartist")
-        lines = Util.get_lines("feat info", /<a exist="[\d-]+" noun="[A-Za-z]+">[A-Za-z]+<\/a>, your Feats are as follows:/)
-        @escape_artist_available = lines.join("\n") =~ /escapeartist'>escapeartist<\/d>\s+5\/5/ ? true : false
-      end
+      @breeze_wind = [912, 612].map { |s| Spell[s] }.find { |s| s.known? }
 
       @settings[:script_list] = @settings[:stop_scripts].split(",").map(&:strip)
       @settings[:script_list] << "go2" unless @settings[:script_list].include?("go2")
@@ -212,6 +247,7 @@ module Ecleanse
 
       @debuffs = /Confusion|Vertigo|Sounds|Thought Lash|Mindwipe|Pious Trial|Powersink/
       @magic_globes = /silvery blue globe|spiraling ghostly rift|chaotic spatial anomaly/i
+      @runestones = /pale hovering runestone/i
       @target_regex = Regexp.union(
         /^You can only target creatures, players, and creature-created hazards\.$/,
         /^Usage:  TARGET {player\|creature\|hazard}$/,
@@ -222,16 +258,18 @@ module Ecleanse
       )
       @invalid_clouds = [
         "cloud of acidic mist",
-        "cloud of thick ethereal fog"
+        "cloud of thick ethereal fog",
       ]
 
       # action variables
       @cloud = nil
       @globe = nil
+      @runestone = nil
       @web = nil
 
       # hook_variables
       @recover_stuff = {}
+      @recover_stuff_seq = 0
       @creature = nil
       @hive_trap_room = nil
     end
@@ -256,6 +294,7 @@ module Ecleanse
         use_berserk_webbed: { default: false },
         hive_traps_apparatus: { default: false },
         hive_traps_ground: { default: false },
+        break_runestone: { default: false },
         stop_scripts: { default: '' },
         script_list: { default: [] },
         determination: { default: false },
@@ -341,9 +380,10 @@ module Ecleanse
       </object><packing><property name="left-attach">2</property><property name="top-attach">1</property></packing></child><child><object class="GtkCheckButton" id="use_berserk_webbed"><property name="label" translatable="yes">Use Berserk when Webbed</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
       </object><packing><property name="left-attach">0</property><property name="top-attach">1</property></packing></child><child><object class="GtkCheckButton" id="hive_traps_apparatus"><property name="label" translatable="yes">Disarm Hive Apparatus</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="draw-indicator">True</property>
       </object><packing><property name="left-attach">3</property><property name="top-attach">0</property></packing></child><child><object class="GtkCheckButton" id="hive_traps_ground"><property name="label" translatable="yes">Disarm Hive Ground</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="draw-indicator">True</property>
-      </object><packing><property name="left-attach">3</property><property name="top-attach">1</property></packing></child><child><object class="GtkCheckButton" id="itchy_curse"><property name="label" translatable="yes">Manage Itchy Curse</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="draw-indicator">True</property>
+      </object><packing><property name="left-attach">3</property><property name="top-attach">1</property></packing></child><child><object class="GtkCheckButton" id="break_runestone"><property name="label" translatable="yes">Break Runestone</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="tooltip-text" translatable="yes">Attacks pale hovering runestones (Onslaught)</property><property name="halign">start</property><property name="margin-start">10</property><property name="draw-indicator">True</property>
+      </object><packing><property name="left-attach">3</property><property name="top-attach">2</property></packing></child><child><object class="GtkCheckButton" id="itchy_curse"><property name="label" translatable="yes">Manage Itchy Curse</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="draw-indicator">True</property>
       </object><packing><property name="left-attach">0</property><property name="top-attach">3</property></packing></child><child><object class="GtkEntry" id="safe_room"><property name="visible">True</property><property name="can-focus">True</property><property name="tooltip-text" translatable="yes">If left empty will run to nearest town or sanctuary.</property><property name="halign">start</property><property name="margin-start">20</property><property name="margin-bottom">10</property><property name="placeholder-text" translatable="yes">Itchy Curse Safe Rooom</property>
-      </object><packing><property name="left-attach">0</property><property name="top-attach">4</property><property name="width">2</property></packing></child><child><placeholder/></child><child><placeholder/></child><child><placeholder/></child><child><placeholder/></child><child><placeholder/></child></object></child><child type="label"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">Misc</property></object>
+      </object><packing><property name="left-attach">0</property><property name="top-attach">4</property><property name="width">2</property></packing></child><child><placeholder/></child><child><placeholder/></child><child><placeholder/></child><child><placeholder/></child></object></child><child type="label"><object class="GtkLabel"><property name="visible">True</property><property name="can-focus">False</property><property name="label" translatable="yes">Misc</property></object>
       </child></object><packing><property name="expand">False</property><property name="fill">True</property><property name="position">1</property></packing></child><child><object class="GtkFrame"><property name="visible">True</property><property name="can-focus">False</property><property name="border-width">10</property><property name="label-xalign">0</property><child><!-- n-columns=3 n-rows=3 --><object class="GtkGrid"><property name="visible">True</property><property name="can-focus">False</property><property name="margin-top">5</property><property name="margin-bottom">5</property><property name="row-spacing">5</property><property name="column-spacing">5</property><child><object class="GtkCheckButton" id="use_flee"><property name="label" translatable="yes">Stunman Flee</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">42</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
       </object><packing><property name="left-attach">2</property><property name="top-attach">0</property></packing></child><child><object class="GtkCheckButton" id="use_berserk_stunned"><property name="label" translatable="yes">Berserk</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
       </object><packing><property name="left-attach">0</property><property name="top-attach">1</property></packing></child><child><object class="GtkCheckButton" id="use_stunned1040"><property name="label" translatable="yes">Troubadour\'s Rally (1040)</property><property name="visible">True</property><property name="can-focus">True</property><property name="receives-default">False</property><property name="halign">start</property><property name="margin-start">10</property><property name="margin-bottom">5</property><property name="draw-indicator">True</property>
@@ -617,6 +657,7 @@ module Ecleanse
       :dispel_clouds        => false,
       :dispel_magic         => false,
       :avoid_webs           => CharSettings['avoid_webs'] || false,
+      :break_runestone      => CharSettings['break_runestone'] || false,
       :use_berserk_webbed   => false,
       :stop_scripts         => CharSettings['stop_scripts'] || '',
       :script_list          => [],
@@ -655,6 +696,10 @@ end
 # Main Script Methods
 module Ecleanse
   module Action
+    # Drop constants left by an earlier run this session so a restart loads the
+    # current definitions without already-initialized warnings.
+    %i[DISARM_MAX].each { |name| remove_const(name) if const_defined?(name, false) }
+
     def self.avoid_webs
       return unless Ecleanse.data.settings[:avoid_webs]
 
@@ -717,6 +762,31 @@ module Ecleanse
       Ecleanse.data.globe = nil
     end
 
+    def self.avoid_runestone
+      return unless Ecleanse.data.settings[:break_runestone]
+
+      # Return unless able to target object
+      result = dothistimeout("target ##{Ecleanse.data.runestone.id}", 2, Ecleanse.data.target_regex)
+      unless result.is_a?(String) && result =~ /^Suspecting that .+ is the origin of .+, you turn your attention towards \w+!$/
+        Ecleanse.data.bad_targets << Ecleanse.data.runestone.id
+        return
+      end
+
+      System.scripts_pause
+
+      attempts = 0
+      loop do
+        waitrt?
+        results = Lich::Util.issue_command("attack ##{Ecleanse.data.runestone.id}", /You bash/, /Roundtime: /, timeout: 2, usexml: false, quiet: false, silent: false)
+        attempts += 1
+        break if results.any? { |line| line =~ /It crashes to the ground and shatters into pale dust/ }
+        break if attempts >= 5
+        break unless GameObj.loot.map(&:id).include?(Ecleanse.data.runestone.id)
+      end
+
+      Ecleanse.data.runestone = nil
+    end
+
     def self.change_stance(new_stance)
       return if Effects::Debuffs.active?("Frenzy") || dead?
       return if Char.percent_stance == new_stance
@@ -767,22 +837,30 @@ module Ecleanse
       return unless Ecleanse.data.settings[:dispel_magic]
 
       cloud_dispel_ready = !Ecleanse.data.dispel.nil? && Util.able_to_cast
+      breeze_wind_ready  = !Ecleanse.data.breeze_wind.nil? && Util.able_to_cast
       spell_cleave_ready = CMan.known?("Spell Cleave") && Char.stamina >= 10
       spell_thieve_ready = CMan.known?("Spell Thieve") && Char.stamina >= 10
 
-      # Return unless able to perform an action to remove clouds
-      return unless cloud_dispel_ready || spell_cleave_ready || spell_thieve_ready
+      if Ecleanse.data.cloud.name.eql?("cloud of acidic mist")
+        return unless breeze_wind_ready
+      else
+        # Return unless able to perform an action to remove clouds
+        return unless cloud_dispel_ready || spell_cleave_ready || spell_thieve_ready
 
-      # Return unless able to target object
-      result = dothistimeout("target ##{Ecleanse.data.cloud.id}", 2, Ecleanse.data.target_regex)
-      unless result.is_a?(String) && result =~ /^Suspecting that .+ is the origin of .+, you turn your attention towards \w+!$/
-        Ecleanse.data.bad_targets << Ecleanse.data.cloud.id
-        return
+        # Return unless able to target object
+        result = dothistimeout("target ##{Ecleanse.data.cloud.id}", 2, Ecleanse.data.target_regex)
+        unless result.is_a?(String) && result =~ /^Suspecting that .+ is the origin of .+, you turn your attention towards \w+!$/
+          Ecleanse.data.bad_targets << Ecleanse.data.cloud.id
+          return
+        end
       end
 
       System.scripts_pause
 
-      if cloud_dispel_ready
+      if breeze_wind_ready && Ecleanse.data.cloud.name.eql?("cloud of acidic mist") && Ecleanse.data.breeze_wind.affordable?
+        Ecleanse.data.breeze_wind.force_incant if Ecleanse.data.breeze_wind.num.eql?(912)
+        Ecleanse.data.breeze_wind.cast("at ##{Ecleanse.data.cloud.id}") if Ecleanse.data.breeze_wind.num.eql?(612)
+      elsif cloud_dispel_ready
         Action.mana_pulse(Ecleanse.data.dispel.num)
         Ecleanse.data.dispel.cast("at ##{Ecleanse.data.cloud.id}") if Ecleanse.data.dispel.affordable?
       elsif CMan.known?("Spell Cleave") && Char.stamina >= 10
@@ -794,9 +872,9 @@ module Ecleanse
     end
 
     def self.go2(place)
-      fput('unhide') if (hidden? || invisible?)
-
       return if Room.current.id == place
+
+      fput('unhide') if (hidden? || invisible?)
 
       if Room.current.id.nil?
         respond "Currently in an unmapped room - Need to go to #{place}"
@@ -806,33 +884,112 @@ module Ecleanse
       Script.run('go2', "#{place} --disable-confirm", { quiet: true, force: true })
     end
 
+    # Hive trap tuning.  Methods rather than constants so a re-run of the script
+    # neither warns about an already initialized constant nor pins the old value.
+    def self.hive_search_attempts
+      3 # rolled SEARCH attempts before giving up
+    end
+
+    def self.hive_disarm_attempts
+      3 # DISARM attempts on a revealed apparatus
+    end
+
+    def self.hive_trap_deadline
+      20 # hard wall-clock ceiling per event, in seconds
+    end
+
+    # Lich::Util.issue_command discards every line before start_pattern and
+    # returns [] on timeout, so every outcome of the command has to be listed
+    # here.  A start_pattern of /d100: / alone means a non-rolled result comes
+    # back empty and cannot be tested for.
+    def self.hive_search_result
+      Regexp.union(
+        /d100: /,
+        /You don't find anything of interest here/,
+        /You can't see well enough to search around/
+      )
+    end
+
+    def self.hive_disarm_result
+      Regexp.union(
+        /d100: /,
+        /You want to disarm what\?/,
+        /You can't see well enough/
+      )
+    end
+
+    # SEARCH until the trap resolves, we leave the room, or we run out of
+    # attempts.  Returns a symbol so callers can decide what to do next:
+    #   :found     - rolled Success, trap revealed or disturbed
+    #   :clear     - nothing here to find
+    #   :blind     - cannot see well enough to search
+    #   :moved     - no longer in the room the trap fired in
+    #   :muckled   - dead, stunned, webbed, bound or asleep
+    #   :exhausted - out of attempts
+    #   :timeout   - hit the wall-clock ceiling
+    def self.hive_search
+      deadline = Time.now + hive_trap_deadline
+      attempts = 0
+
+      loop do
+        return :moved unless hive_trap_room?
+        return :muckled if dead? || muckled?
+        return :timeout if Time.now > deadline
+        return :exhausted if attempts >= hive_search_attempts
+
+        Util.wait_rt
+        attempts += 1
+        lines = Util.get_command("search", hive_search_result)
+
+        return :blind if lines.any? { |line| line =~ /You can't see well enough to search around/ }
+        return :clear if lines.any? { |line| line =~ /You don't find anything of interest here/ }
+        return :found if lines.any? { |line| line =~ /Success!/ }
+        # Failure! or an empty result (issue_command timed out) falls through and retries
+      end
+    end
+
+    # Guard against acting on a stale marker: an unmapped room reports nil, and
+    # nil == nil would otherwise read as a match.  Room defines no ==, so an
+    # object comparison is identity, which fails across a Map.load that rebuilds
+    # every Room instance.  Compare ids when we have them.
+    def self.hive_trap_room?
+      trap_room = Ecleanse.data.hive_trap_room
+      current = Room.current
+      return false if trap_room.nil? || current.nil?
+      return trap_room.id == current.id unless trap_room.id.nil? || current.id.nil?
+
+      trap_room == current
+    end
+
     def self.hive_traps_apparatus
       return unless Ecleanse.data.settings[:hive_traps_apparatus]
       return if Script.running?('go2')
-      return unless Ecleanse.data.hive_trap_room == Room.current
+      return unless hive_trap_room?
 
       System.scripts_pause
 
-      search_count = 0
-      loop do
-        Util.wait_rt
-        lines = Util.get_command("search", /d100: /)
-        search_count += 1
-        break if search_count >= 10
-        next if lines.any? { |l| l =~ /Failure!/ }
-        break if lines.any? { |l| l =~ /Success|You don't find anything of interest here/ }
+      result = hive_search
+
+      if result == :found
+        deadline = Time.now + hive_trap_deadline
+        attempts = 0
+
+        loop do
+          break unless hive_trap_room?
+          break if dead? || muckled?
+          break if Time.now > deadline
+          break if attempts >= hive_disarm_attempts
+
+          Util.wait_rt
+          attempts += 1
+          results = Util.get_command("disarm apparatus", hive_disarm_result)
+          break if results.any? { |line| line =~ /Success!|You want to disarm what\?/ }
+        end
       end
 
-      Util.wait_rt
-
-      search_count = 0
-      loop do
-        results = Util.get_command("disarm apparatus", /d100|You want to disarm what\?/)
-        search_count += 1
-        break if results.any? { |l| l =~ /Success|You want to disarm what\?/ }
-        return if search_count >= 10
-        Util.wait_rt
-      end
+      # Clear the marker so queued duplicate events no-op, except when we bailed
+      # for a condition that clears on its own and the trap will re-announce.
+      Ecleanse.data.hive_trap_room = nil unless [:moved, :muckled].include?(result)
 
       Util.wait_rt
     end
@@ -840,19 +997,12 @@ module Ecleanse
     def self.hive_traps_ground
       return unless Ecleanse.data.settings[:hive_traps_ground]
       return if Script.running?('go2')
-      return unless Ecleanse.data.hive_trap_room == Room.current
+      return unless hive_trap_room?
 
       System.scripts_pause
 
-      search_count = 0
-      loop do
-        Util.wait_rt
-        lines = Util.get_command("search", /d100: /)
-        search_count += 1
-        break if search_count >= 10
-        next if lines.any? { |l| l =~ /Failure!/ }
-        break if lines.any? { |l| l =~ /Success|You don't find anything of interest here/ }
-      end
+      result = hive_search
+      Ecleanse.data.hive_trap_room = nil unless [:moved, :muckled].include?(result)
 
       Util.wait_rt
     end
@@ -905,18 +1055,174 @@ module Ecleanse
       sleep 0.2
     end
 
-    def self.recover
+    # Returns true only when a hand holds an item whose id was NOT already
+    # accounted for at the moment of disarm, AND (when expected_noun is
+    # given) whose noun plausibly matches what was disarmed. This is
+    # resilient to:
+    #   - identical nouns on both weapons (two-weapon combat, matching pair)
+    #   - the recovered item coming back under a brand-new game object id
+    #     (ground pickup / bonded return / pry-from-webbing routinely do this)
+    #   - the surviving weapon getting shuffled between hands by nav
+    #   - an unrelated item type (e.g. a dagger another script drags into a
+    #     hand for its own purposes) being mistaken for the recovered weapon
+    # It is NOT resilient to an unrelated item of the SAME noun ending up in
+    # hand before genuine recovery - a narrower, much less likely version of
+    # the same class of gap. Callers that have an explicit in-game
+    # confirmation string available (e.g. "You spy ... and recover it!")
+    # should still treat that text as authoritative and only fall back to
+    # this check when no such text exists (e.g. bonded-weapon auto-return).
+    def self.recovered?(known_ids, expected_noun = nil)
+      [GameObj.right_hand, GameObj.left_hand].any? do |hand|
+        next false if hand.name == "Empty" || known_ids.include?(hand.id)
+
+        expected_noun.nil? || hand.noun.to_s.casecmp?(expected_noun.to_s)
+      end
+    end
+
+    # Snapshots the ids currently held in both hands at the moment a disarm
+    # is detected and files it under recover_stuff. Returns the new entry's
+    # key, or nil if the recovery feature is disabled - in which case
+    # nothing is tracked and no :recover event should be queued. Pass
+    # track: false for disarms RECOVER ITEM can't get back later (webbing,
+    # telekinetic); everything else is saved to UserVars.last_disarm here, not
+    # when the recovery runs, so being stopped or dying first can't lose it.
+    #
+    # Note: this intentionally does NOT dedupe against other pending entries
+    # by known_ids. In two-weapon combat, known_ids for a "one hand emptied"
+    # disarm is just the surviving weapon's id - and the same weapon is
+    # routinely the survivor across multiple, unrelated disarms of its
+    # partner over a session. Comparing known_ids across entries can match
+    # by coincidence and silently drop a genuine new disarm. Each entry is
+    # independently keyed and consumed by its own dispatch (see recover),
+    # so cross-entry dedup isn't needed for correctness.
+    def self.record_disarm(noun, track: true)
+      return nil unless Ecleanse.data.settings[:recover_disarmed]
+
+      disarm_id = track ? Action.disarm_add(noun) : nil
+      Action.queue_recover(Room.current, noun, disarm_id)
+    end
+
+    def self.queue_recover(room, noun, disarm_id)
+      known_ids = [GameObj.right_hand.id, GameObj.left_hand.id].reject { |id| id.nil? || id.to_s.empty? }
+      key = Ecleanse.data.recover_stuff_seq
+      Ecleanse.data.recover_stuff_seq += 1
+      Ecleanse.data.recover_stuff[key] = { room: room, noun: noun, known_ids: known_ids, disarm_id: disarm_id }
+      key
+    end
+
+    # The game's own recovery list holds 20 and drops the oldest for good.
+    DISARM_MAX = 20
+    # Here rather than on Data, which outlives script restarts: a Data built by
+    # an older version would have no lock, and nil.synchronize quietly skips
+    # its block under Lich's NilClass patch. Kept across runs rather than
+    # replaced, since a copy of the script started with ;force may be holding it.
+    DISARM_LOCK ||= Mutex.new
+
+    # Disarms not yet recovered, oldest first. UserVars.last_disarm was a bare
+    # room number before v2.3.7, which doesn't say whether anything is still
+    # lost, so any older value reads as an empty list.
+    def self.disarm_list
+      list = UserVars.last_disarm
+      list.is_a?(Array) ? list : []
+    end
+
+    def self.disarm_tracked?(id)
+      disarm_list.any? { |entry| entry[:id] == id }
+    end
+
+    # Runs on the downstream hook thread, while removals run on the main loop,
+    # so both take DISARM_LOCK around their read-modify-write. Must not raise:
+    # Lich removes a hook that does.
+    def self.disarm_add(noun)
+      room = Room.current
+      entry = { id: SecureRandom.hex(4), item: noun, room: room.id, title: Array(room.title).first.to_s, at: Time.now.to_i }
+      DISARM_LOCK.synchronize do
+        UserVars.last_disarm = (disarm_list + [entry]).last(DISARM_MAX)
+      end
+      entry[:id]
+    end
+
+    def self.disarm_remove(id)
+      DISARM_LOCK.synchronize do
+        UserVars.last_disarm = disarm_list.reject { |entry| entry[:id] == id }
+      end
+    end
+
+    # The game says the room is empty, so nothing else saved there can be found
+    # either. Unmapped rooms all save a nil id, so that says nothing about the others.
+    def self.disarm_remove_room(room_id, disarm_id)
+      DISARM_LOCK.synchronize do
+        UserVars.last_disarm = disarm_list.reject { |entry| entry[:id] == disarm_id || (!room_id.nil? && entry[:room] == room_id) }
+      end
+    end
+
+    # A search turned up an earlier disarm rather than the one being looked
+    # for. Dropping its entry also makes any recover event queued for it a no-op.
+    def self.disarm_remove_found(found, room_id)
+      entry = disarm_list.reverse.find { |e| e[:room] == room_id && Action.same_item?(found, e[:item]) }
+      Action.disarm_remove(entry[:id]) unless entry.nil?
+    end
+
+    # What a RECOVER ITEM result says was picked up: the noun when the line
+    # carries XML, otherwise its plain text. nil if nothing was.
+    def self.spied_item(lines)
+      line = lines.find { |l| l =~ /You spy .+ and recover it!/ }
+      return nil if line.nil?
+
+      line[/You spy .*?noun="([^"]+)"/, 1] || line.gsub(/<[^>]+>/, '')[/You spy (.+?) and recover it!/, 1]
+    end
+
+    def self.same_item?(found, noun)
+      found.to_s.match?(/\b#{Regexp.escape(noun.to_s)}\b/i)
+    end
+
+    # ;ecleanse last disarm - lists what is still lost, newest first.
+    def self.disarm_report
+      disarms = Action.disarm_list
+      Util.msg("yellow", " No unrecovered disarms.") if disarms.empty?
+      disarms.reverse_each do |entry|
+        Util.msg("yellow", " #{entry[:item]} - Room #{entry[:room]} #{entry[:title]} - #{(Time.now.to_i - entry[:at]) / 60} min ago")
+      end
+    end
+
+    # ;ecleanse disarmrecover - goes back for the most recent unrecovered disarm.
+    def self.disarm_recover
+      entry = disarm_list.last
+      if entry.nil?
+        Util.msg("yellow", " No unrecovered disarms to go back for.")
+        return
+      end
+      if dead?
+        Util.msg("yellow", " Can't go back for #{entry[:item]} while dead. It is in room #{entry[:room]}.")
+        return
+      end
+
+      # Room[nil] is a fuzzy title search rather than a miss, and an unmapped
+      # disarm room is saved with no id.
+      room = entry[:room].nil? ? nil : Room[entry[:room]]
+      if room.nil?
+        Util.msg("yellow", " Can't find the room #{entry[:item]} was lost in (#{entry[:title]}) on the map.")
+        return
+      end
+
+      Action.recover(Action.queue_recover(room, entry[:item], entry[:id]))
+    end
+
+    def self.recover(key)
       # standard disarm mechanics
-      return unless Ecleanse.data.settings[:recover_disarmed]
+      details = Ecleanse.data.recover_stuff[key]
+      return if details.nil? # already handled or never recorded (e.g. feature was off)
+
+      Ecleanse.data.recover_stuff.delete(key)
+      return unless Action.disarm_tracked?(details[:disarm_id]) # already turned up while searching for another disarm
+
       System.scripts_pause
 
-      details = Ecleanse.data.recover_stuff.first
-
-      Ecleanse.data.recover_stuff.delete(details[0])
-
-      item = details[0]
-      room_id = details[1].id
-      title = details[1].title
+      known_ids = details[:known_ids]
+      item = details[:noun]
+      disarm_id = details[:disarm_id]
+      room_id = details[:room].id
+      title = details[:room].title
 
       stop_213 = false
       stop_1011 = false
@@ -926,7 +1232,6 @@ module Ecleanse
       Util.msg("yellow", " ## Room Name: #{title.first}")
       Util.msg("yellow", " ## Looking for: #{item}")
       Util.msg("yellow", " ########## DISARMED!!! ##########")
-      UserVars.last_disarm = room_id
       Action.go2(room_id)
 
       Util.wait_rt
@@ -965,6 +1270,7 @@ module Ecleanse
             fput "stop 213"
           end
 
+          Action.disarm_remove(disarm_id)
           return
         end
       end
@@ -978,19 +1284,42 @@ module Ecleanse
       # Change to defensive stance
       Action.change_stance(100)
 
-      # It might be a bonded weapon
+      # It might be a bonded weapon. Bonded return has no distinct in-game
+      # confirmation text to key off of, so hand-occupancy is the only signal
+      # available here - accept the residual risk of a false positive if
+      # something else gets wielded into the empty hand during this window.
+      #
+      # This wait (and the resulting already_recovered check) is only
+      # meaningful for bonded weapons: that's the only mechanism by which
+      # the weapon could legitimately already be back in hand before we've
+      # even issued a "recover item" command. For everyone else, checking
+      # recovered? here has no legitimate case to catch and only exposed a
+      # real false-positive: a same-tick kill can trigger another script
+      # (e.g. an eloot variant) to drag an unrelated item into the
+      # just-emptied hand before this method's own scripts_pause takes
+      # effect, which used to skip the entire search loop below outright.
+      already_recovered = false
       if Feat.weapon_bonding == 5 || Spell[1625].known? # Fixme: Making an assumption you'd be using the bonded weapon
         wait_time = Time.now + 10
-        until [GameObj.right_hand.noun, GameObj.left_hand.noun].include?(item) || wait_time < Time.now
+        until Action.recovered?(known_ids, item) || wait_time < Time.now
           Util.wait_rt
         end
+        already_recovered = Action.recovered?(known_ids, item)
       end
 
-      unless [GameObj.right_hand.noun, GameObj.left_hand.noun].include?(item)
+      Action.disarm_remove(disarm_id) if already_recovered
+
+      # Each empty_hands saves its own set of items for one fill_hands to restore.
+      hand_fills = 1
+
+      unless already_recovered
         empty_hands
 
         search_count = 0
         until search_count.eql?(10)
+
+          # Move to the disarm room incase somehow moved away while attempting to search
+          Action.go2(room_id)
 
           until kneeling?
             dothistimeout("kneel", 2, /You kneel|You are already/i)
@@ -998,22 +1327,45 @@ module Ecleanse
 
           Util.wait_rt
 
-          lines = Util.get_command("recover item", /<dialogData|You spy|You continue to intently search the area|In order to recover something|You find nothing recoverable/)
+          lines = Util.get_command("recover item", /<dialogData|You spy|You continue to intently search the area|In order to recover something|You find nothing recoverable|You're not in any condition to be searching around/)
 
-          if lines.grep(/You spy (?:an|a) (?:.*) and recover it\!/).any? || [GameObj.right_hand.noun, GameObj.left_hand.noun].include?(item)
+          # Trust the game's own confirmation text first - it's tied directly
+          # to this command and can't be fooled by an unrelated item landing
+          # in a hand. It can name a different item though, since RECOVER ITEM
+          # picks up whatever is in the room: an earlier disarm isn't the one
+          # being looked for, so keep searching. Only fall back to the
+          # hand-occupancy check when that text is absent, and log it since
+          # it's an inferred (not confirmed) recovery.
+          found = Action.spied_item(lines)
+          if found && Action.same_item?(found, item)
+            Action.disarm_remove(disarm_id)
+            break
+          elsif found
+            Util.msg("yellow", " Recovered #{found} while looking for #{item}. Still searching.")
+            Action.disarm_remove_found(found, room_id)
+          elsif Action.recovered?(known_ids, item)
+            Util.msg("yellow", " No recovery message seen, but hand state changed - treating #{item} as recovered.")
+            Action.disarm_remove(disarm_id)
             break
           end
 
+          # The disarm stays saved, and the rest of this method still has to
+          # put the hands back and let the paused scripts resume.
           if lines.grep(/You're not in any condition to be searching around/).any?
-            Util.msg("yellow", " Unable to search. Exiting ecleanse.")
-            Util.msg("yellow", " #{item} is in room #{room_id}")
-            fput "stand" until standing?
-            System.scripts_resume
-            exit
+            Util.msg("yellow", " Unable to search. #{item} is in room #{room_id}. Use #{$lich_char}#{Script.current.name} disarmrecover to try again.")
+            break
+          end
+
+          # Only believed in the disarm room, in case go2 couldn't get back there.
+          if lines.grep(/You find nothing recoverable/).any? && Room.current.id == room_id
+            Util.msg("yellow", " Nothing to recover in room #{room_id}. No longer tracking disarms there.")
+            Action.disarm_remove_room(room_id, disarm_id)
+            break
           end
 
           if lines.grep(/In order to recover something/).any?
             empty_hands
+            hand_fills += 1
           end
 
           search_count += 1
@@ -1024,21 +1376,25 @@ module Ecleanse
 
       fput "stand" until standing?
       Util.wait_rt
-      fill_hands
+      # fill_hands restores the newest stash first, which would give anything the
+      # search turned up the free hand ahead of what was being held. Go oldest
+      # first instead; an extra item that no longer fits just stays stowed.
+      $fill_hands_actions.push(*$fill_hands_actions.pop(hand_fills).reverse) if hand_fills > 1
+      hand_fills.times { fill_hands }
       ReadyList.check(silent: true, quiet: true) unless ReadyList.valid?
 
       fput "stop 213" if stop_213
       fput "stop 1011" if stop_1011
     end
 
-    def self.recover_weapon_webbing
-      return unless Ecleanse.data.settings[:recover_disarmed]
+    def self.recover_weapon_webbing(key)
+      details = Ecleanse.data.recover_stuff[key]
+      return if details.nil?
+
+      Ecleanse.data.recover_stuff.delete(key)
       System.scripts_pause
 
-      details = Ecleanse.data.recover_stuff.first
-      Ecleanse.data.recover_stuff.delete(details[0])
-
-      item_noun = details[0]
+      item_noun = details[:noun]
 
       stop_213 = false
       stop_1011 = false
@@ -1122,7 +1478,7 @@ module Ecleanse
             fput "target ##{current_target}"
           end
         end
-      elsif Effects::Debuffs.active?("Rooted") && Ecleanse.data.escape_artist_available && Char.stamina >= 15
+      elsif Effects::Debuffs.active?("Rooted") && Feat.available?('escapeartist', min_rank: 5) && Char.stamina >= 15
         System.scripts_pause
         Feat.use('escapeartist')
       end
@@ -1242,7 +1598,7 @@ module Ecleanse
       spell_1040_ready = Spell[1040].known? && Spell[1040].affordable?
       berserk_ready = Ecleanse.data.settings[:use_berserk_webbed] && CMan.known?("Berserk") && Char.stamina >= 21
       beseech_1635 = Ecleanse.data.settings[:use_1635] && Spell[1635].known? && Spell[1635].affordable?
-      escape_ready = Ecleanse.data.escape_artist_available && Char.stamina >= 15
+      escape_ready = Feat.available?('escapeartist', min_rank: 5) && Char.stamina >= 15
 
       return unless spell_1040_ready || berserk_ready || beseech_1635 || escape_ready
 
@@ -1339,16 +1695,16 @@ module Ecleanse
       end
     end
 
-    def self.telekinetic_recover
+    def self.telekinetic_recover(key)
       # Telekinetic Disarm is cast in Moonsedge - Savant spell 1406
-      return unless Ecleanse.data.settings[:recover_disarmed]
+      details = Ecleanse.data.recover_stuff[key]
+      return if details.nil?
+
+      Ecleanse.data.recover_stuff.delete(key)
       System.scripts_pause
 
-      details = Ecleanse.data.recover_stuff.first
-
-      Ecleanse.data.recover_stuff.delete(details[0])
-
-      item = details[0]
+      known_ids = details[:known_ids]
+      item = details[:noun]
 
       # Make the room safer.
       Action.settle_room
@@ -1359,7 +1715,9 @@ module Ecleanse
       # Change to defensive stance
       Action.change_stance(100)
 
-      until [GameObj.right_hand.noun, GameObj.left_hand.noun].include?(item)
+      # No reliable in-game confirmation text exists for telekinetic
+      # retrieval, so hand-occupancy (recovered?) is the primary signal here.
+      until Action.recovered?(known_ids, item)
         if Ecleanse.data.dispel.nil?
           fput "get #{item}"
         else
@@ -1410,51 +1768,61 @@ module Ecleanse
     def self.set_hooks
       ecleanse_status = proc { |server|
         if server =~ /Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> is knocked from your grasp/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
-          Ecleanse.data.event_stack << :recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> at .+?\.  The weapon rebounds off of the hardened .+? and is wrenched from your hand\.  It slides along the ground and disappears into the shadows!\r?\n?$/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
-          Ecleanse.data.event_stack << :recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /^Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> strikes one of the bony protrusions on <pushBold\/>an? <a exist="\d+" noun="[^"]+">[^<]+<\/a><popBold\/> \w+ and it is wrenched out of your grasp!\r?\n?$/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
-          Ecleanse.data.event_stack << :recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /^You swing your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> at <pushBold\/>(?:an?|the) <a exist="[^"]+" noun="[^"]+">[^<]+<\/a><popBold\/>\.  The weapon strikes one of the bony protrusions on the <pushBold\/><a exist="[^"]+" noun="[^"]+">[^<]+<\/a><popBold\/> \w+ and it is wrenched out of your grasp!\r?\n?$/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
-          Ecleanse.data.event_stack << :recover
+          key = Action.record_disarm(Regexp.last_match(1))
+          Ecleanse.data.event_stack << { event: :recover, key: key } unless key.nil?
         elsif server =~ /Your <a exist="[^"]+" noun="([^"]+)">[^<]+<\/a> tears free from your hands and floats/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
-          Ecleanse.data.event_stack << :telekinetic_recover
+          key = Action.record_disarm(Regexp.last_match(1), track: false)
+          Ecleanse.data.event_stack << { event: :telekinetic_recover, key: key } unless key.nil?
         elsif server =~ /Striking with a serpent's unsettling quickness, (?:.*)\.  Vile (?:.*), kindling it into an unholy semblance of life.  The (?:.*) form twists and mutates, sprouting scales and cold eyes as it transforms into a <a exist="\d+" noun="([^"]+)">[^<]+<\/a>\!/
           Ecleanse.data.creature = Regexp.last_match(1)
-          Ecleanse.data.event_stack << :sanctum_recover && !Ecleanse.data.event_stack.include?(:sanctum_recover)
+          Ecleanse.data.event_stack << :sanctum_recover unless Ecleanse.data.event_stack.include?(:sanctum_recover)
         elsif server =~ /The flesh around the wound feels hot and cold at the same time, heavy with infection./
-          Ecleanse.data.event_stack << :use_vat && !Ecleanse.data.event_stack.include?(:use_vat)
+          Ecleanse.data.event_stack << :use_vat unless Ecleanse.data.event_stack.include?(:use_vat)
         elsif server =~ /The webbing entangles your <a exist=".*?" noun="(.*?)">.*?<\/a>, rendering it useless/
-          next if Ecleanse.data.recover_stuff[Regexp.last_match(1)]
-          Ecleanse.data.recover_stuff[Regexp.last_match(1)] = Room.current
-          Ecleanse.data.event_stack << :recover_weapon_webbing
+          key = Action.record_disarm(Regexp.last_match(1), track: false)
+          Ecleanse.data.event_stack << { event: :recover_weapon_webbing, key: key } unless key.nil?
         elsif server =~ /You notice a flickering glint in the shadows|The apparatus flickers with deadly radiance/
           Ecleanse.data.hive_trap_room = Room.current
-          Ecleanse.data.event_stack << :hive_traps_apparatus && !Ecleanse.data.event_stack.include?(:hive_traps_apparatus)
+          Ecleanse.data.event_stack << :hive_traps_apparatus unless Ecleanse.data.event_stack.include?(:hive_traps_apparatus)
         elsif server =~ /The ground churns violently as flashes of chitin jut from its depths|The ground underfoot churns violently and huge chitinous mandibles flash as the insectoid monstrosity below goes into a feeding frenzy!|Hindered by the churning terrain, you are helpless as the concealed assailant's mandibles snap at you from the safety of its pit trap!/
           Ecleanse.data.hive_trap_room = Room.current
-          Ecleanse.data.event_stack << :hive_traps_ground && !Ecleanse.data.event_stack.include?(:hive_traps_ground)
+          Ecleanse.data.event_stack << :hive_traps_ground unless Ecleanse.data.event_stack.include?(:hive_traps_ground)
         elsif server =~ /You shiver slightly as an invisible rash covers your body/
-          Ecleanse.data.event_stack << :itchy_curse && !Ecleanse.data.event_stack.include?(:itchy_curse)
+          Ecleanse.data.event_stack << :itchy_curse unless Ecleanse.data.event_stack.include?(:itchy_curse)
         elsif server =~ /^An unseen force entangles you, restricting your movement!\r?\n?$/
-          Ecleanse.data.event_stack << :remove_web_bound && !Ecleanse.data.event_stack.include?(:remove_web_bound)
+          Ecleanse.data.event_stack << :remove_web_bound unless Ecleanse.data.event_stack.include?(:remove_web_bound)
         end
         server
       }
-      DownstreamHook.add('ecleanse_status', ecleanse_status)
+      DownstreamHook.add('ecleanse_status', ecleanse_status, priority: 100)
+
+      # Lich won't start a second copy of a running script, so while this one
+      # is up it has to pick these commands off before Lich sees them. The work
+      # is queued rather than done here because this runs on the client's thread.
+      disarm_command = /^(?:<c>)?#{$lich_char_regex}(?:force\s+)?#{Regexp.escape(Script.current.name)}\s+(disarmrecover|last\s+disarm)\s*$/i
+      ecleanse_command = proc { |client|
+        if client =~ disarm_command
+          event = Regexp.last_match(1).casecmp?('disarmrecover') ? :disarm_recover : :disarm_report
+          Ecleanse.data.event_stack << event unless Ecleanse.data.event_stack.include?(event)
+          nil
+        else
+          client
+        end
+      }
+      UpstreamHook.add('ecleanse_command', ecleanse_command)
 
       before_dying {
         DownstreamHook.remove('ecleanse_status')
+        UpstreamHook.remove('ecleanse_command')
         Ecleanse.data.settings[:script_list].each { |script| Script.unpause(script) if Script.paused?(script) }
       }
     end
@@ -1596,7 +1964,8 @@ module Ecleanse
       rows << ["#{$lich_char}#{Script.current.name} setup", "UI configuration tool"]
       rows << ["#{$lich_char}#{Script.current.name} load", "Reloads all settings"]
       rows << ["#{$lich_char}#{Script.current.name} list", "Lists all settings"]
-      rows << ["#{$lich_char}#{Script.current.name} last disarm", "Lists last disarm room"]
+      rows << ["#{$lich_char}#{Script.current.name} last disarm", "Lists disarms not yet recovered (up to #{Action::DISARM_MAX})"]
+      rows << ["#{$lich_char}#{Script.current.name} disarmrecover", "Goes back for the most recent disarm not yet recovered"]
 
       table = Terminal::Table.new :title => "#{Script.current.name.capitalize} ver #{Util.get_script_version}", :rows => rows
       respond
@@ -1633,7 +2002,15 @@ module Ecleanse
     loop do
       while Ecleanse.data.event_stack.any?
         current_event = Ecleanse.data.event_stack.shift
-        Action.send(current_event)
+        # recover-type events are queued as { event:, key: } so they're
+        # dispatched against the exact recover_stuff entry they belong to,
+        # rather than a bare symbol that would fall back to picking
+        # whatever's oldest in recover_stuff.
+        if current_event.is_a?(Hash)
+          Action.send(current_event[:event], current_event[:key])
+        else
+          Action.send(current_event)
+        end
       end
 
       debuffs = Effects::Debuffs.to_h.keys.map(&:to_s)
@@ -1644,21 +2021,26 @@ module Ecleanse
       dispell_debuffs = debuffs.any? { |k| k =~ Ecleanse.data.debuffs }
       webbed_bound = checkwebbed || checkbound
       Ecleanse.data.cloud = GameObj.loot.find { |l| l.name =~ /cloud/i && !Ecleanse.data.invalid_clouds.include?(l.name) && l.type !~ /\bgem\b/i && !Ecleanse.data.bad_targets.include?(l.id) }
+      if Ecleanse.data.cloud.nil? && !Ecleanse.data.breeze_wind.nil?
+        Ecleanse.data.cloud = GameObj.loot.find { |l| l.name.eql?("cloud of acidic mist") && !Ecleanse.data.bad_targets.include?(l.id) }
+      end
       Ecleanse.data.globe = GameObj.loot.find { |l| l.name =~ Ecleanse.data.magic_globes && !Ecleanse.data.bad_targets.include?(l.id) }
+      Ecleanse.data.runestone = GameObj.loot.find { |l| l.name =~ Ecleanse.data.runestones && !Ecleanse.data.bad_targets.include?(l.id) }
       Ecleanse.data.web = GameObj.loot.find { |l| l.noun =~ /web/i && !Ecleanse.data.bad_targets.include?(l.id) }
       determination_injury = Ecleanse.data.settings[:determination] && Ecleanse.data.injury_locations.any? { |limb| XMLData.injuries[limb]["wound"] > 1 }
 
       conditions = {
-        poisoned             => :remove_poison,
-        checkdisease         => :remove_disease,
-        checkstunned         => :remove_stun,
-        webbed_bound         => :remove_web_bound,
-        rooted_pressed       => :remove_grounded,
-        dispell_debuffs      => :remove_magical,
-        Ecleanse.data.cloud  => :dispel_cloud,
-        Ecleanse.data.globe  => :avoid_globe,
-        Ecleanse.data.web    => :avoid_webs,
-        determination_injury => :determination
+        poisoned                => :remove_poison,
+        checkdisease            => :remove_disease,
+        checkstunned            => :remove_stun,
+        webbed_bound            => :remove_web_bound,
+        rooted_pressed          => :remove_grounded,
+        dispell_debuffs         => :remove_magical,
+        Ecleanse.data.cloud     => :dispel_cloud,
+        Ecleanse.data.globe     => :avoid_globe,
+        Ecleanse.data.runestone => :avoid_runestone,
+        Ecleanse.data.web       => :avoid_webs,
+        determination_injury    => :determination
       }
 
       # Add events if conditions are met
@@ -1679,12 +2061,15 @@ module Ecleanse
   when /^setup$/i
     Ecleanse::Setup.new(Ecleanse.data.settings).start
     Ecleanse.load(Ecleanse.load_profile)
+  when /^disarmrecover$/i
+    before_dying { Ecleanse::System.scripts_resume }
+    Ecleanse::Action.disarm_recover
   when /load/
     Ecleanse.load(Ecleanse.load_profile)
   when /list/
     Ecleanse::Setup.new(Ecleanse.data.settings).list
   when /last disarm/
-    Util.msg("yellow", " Last recorded disarm:  Room #{UserVars.last_disarm}.")
+    Ecleanse::Action.disarm_report
   when nil
     Ecleanse.data.did_something = false
     Ecleanse.data.event_stack = []
