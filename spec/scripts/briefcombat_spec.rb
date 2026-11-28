@@ -63,6 +63,13 @@ RSpec.describe 'briefcombat.lic' do
 
   def feed(*lines) = lines.map { |line| client.call(line.dup) }
 
+  it 'hooks below the default priority, so default-priority scripts see combat lines first, and above combatstream' do
+    # A line briefcombat holds never reaches a later hook (analytics.lic, the
+    # combat tracker); equal priorities run in start order.
+    expect(bc::HOOK_PRIORITY).to be_negative
+    expect(bc::HOOK_PRIORITY).to be > -1000
+  end
+
   describe 'other players\' combat' do
     it 'becomes one summary at the prompt: damage, crit and roll' do
       outputs = feed(BriefCombatSpec::ATTACK, BriefCombatSpec::ROLL, BriefCombatSpec::HIT, BriefCombatSpec::CRIT)
